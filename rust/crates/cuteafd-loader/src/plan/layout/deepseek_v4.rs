@@ -32,7 +32,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let checkpoint = input.checkpoint();
     let prefill = match resolve_prefill(report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
-            max_waves: if report.spark_ranks == 0 { 1 } else { 3 }, ..Default::default()
+            max_waves: if report.spark_ranks == 0 { 1 } else { crate::serving_capacity::prefill_waves::MAX_WAVES }, ..crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V4)
         }) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),

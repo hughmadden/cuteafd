@@ -1161,12 +1161,15 @@ pub(super) mod tests {
         assert!(automatic.memory_layout.context("automatic Kimi ledger")?.pool_tokens
             >= cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT as u64);
         let mut refused = 0;
-        for ((slots, prefix_slots, host_cache_bytes, entries, format), waves) in [
-            (16, Some(1), Some(0), 20, MlaCacheFormat::Fp8),
-            (8, None, None, 20, MlaCacheFormat::Fp8),
-            (16, None, Some(8 << 30), 20, MlaCacheFormat::Fp8),
-            (8, None, None, 20, MlaCacheFormat::Bf16),
-        ].into_iter().flat_map(|case| [2usize, 3, 4].map(move |waves| (case, waves))) {
+        for ((slots, prefix_slots, host_cache_bytes, entries, format, requested_pool), waves) in [
+            (16, Some(1), Some(0), 20, MlaCacheFormat::Fp8, None),
+            (8, None, None, 20, MlaCacheFormat::Fp8, None),
+            (16, None, Some(8 << 30), 20, MlaCacheFormat::Fp8, None),
+            (8, None, None, 20, MlaCacheFormat::Bf16, None),
+        ].into_iter().flat_map(|case| [2usize, 3, 4].map(move |waves| (case, waves)))
+            // Reduced Spark scratch lets all automatic pools fit; retain an
+            // explicitly infeasible pool to exercise the typed refusal path.
+            .chain([((8, None, None, 20, MlaCacheFormat::Bf16, Some(1 << 30)), 3)]) {
             let shape = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(6,
                 Default::default(), cuteafd_loader::serving_capacity::prefill_waves::PrefillOverrides {
                     waves: Some(waves as u64), ..Default::default()
@@ -1182,7 +1185,7 @@ pub(super) mod tests {
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
-                    context_tokens: context as u64, host_cache_bytes, mla_kv: format,
+                    context_tokens: context as u64, pool_tokens: requested_pool, host_cache_bytes, mla_kv: format,
                     workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
                     spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
             let report = plan::plan(snapshot.path(), &options)?;
@@ -1206,6 +1209,7 @@ pub(super) mod tests {
             let arch = ArchContext::for_device("sm_120", capacity);
             let mut i = inputs(&cfg);
             i.cache_format = format;
+            i.requested_pool = requested_pool;
             i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
             i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
@@ -1240,8 +1244,13 @@ pub(super) mod tests {
                         | PlacementError::PrefixMarks { source, .. } = typed {
                         typed = source;
                     }
-                    assert!(matches!(typed, PlacementError::BelowFloor { floor, pool, .. }
-                        if *floor == context as u64 && *pool < *floor), "{typed}");
+                    match typed {
+                        PlacementError::BelowFloor { floor, pool, .. } =>
+                            assert!(*floor == context as u64 && *pool < *floor, "{typed}"),
+                        PlacementError::PoolDoesNotFit { requested, fit, .. } =>
+                            assert!(requested_pool == Some(*requested) && *fit < *requested, "{typed}"),
+                        _ => panic!("unexpected Kimi capacity refusal: {typed}"),
+                    }
                     assert!(report.hints.iter().any(|hint| hint.what.contains(&typed.to_string())),
                         "planner/runtime capacity refusal differs: {:?}; {error:#}", report.hints);
                     assert_eq!(report.memory_layout.context("refused Kimi ledger")?.pool_tokens, 0);

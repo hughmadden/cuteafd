@@ -132,7 +132,7 @@ fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     let shape = prefill_shape(ranks, PrefillLimits {
         max_waves: if ranks == 0 { 1 } else { MAX_WAVES },
-        ..Default::default()
+        ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::glm::GLM5)
     }, PrefillOverrides {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(u64::from(args.prefill_waves)),
@@ -235,7 +235,7 @@ mod draft_cli_tests {
 
     #[test]
     fn layers_prefill_uses_shared_topology_and_pinned_waves() {
-        use cuteafd_loader::serving_capacity::prefill_waves::{planned_waves, unit_rows, PrefillError, MAX_WAVES};
+        use cuteafd_loader::serving_capacity::prefill_waves::{unit_rows, PrefillError, MAX_WAVES};
         for ranks in 0..=8 {
             let peers = (0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(",");
             for requested in std::iter::once(None).chain((1..=MAX_WAVES).map(Some)) {
@@ -245,7 +245,7 @@ mod draft_cli_tests {
                 if ranks > 0 { argv.extend(["--peers", peers.as_str()]); }
                 if let Some(value) = &wave_flag { argv.extend(["--prefill-waves", value.as_str()]); }
                 let mut args = Parse::try_parse_from(argv).unwrap().engine;
-                let waves = requested.unwrap_or_else(|| planned_waves(ranks));
+                let waves = requested.unwrap_or_else(|| cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::glm::GLM5).estimate.waves(ranks));
                 let result = resolve_prefill(&mut args);
                 if ranks == 0 && waves > 1 {
                     assert!(matches!(result.unwrap_err().downcast_ref::<PrefillError>(),

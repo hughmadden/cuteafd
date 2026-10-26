@@ -340,23 +340,17 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     }
 }
 
-/// Execution slots each Spark rank runs for a family: the most requests the
-/// coordinator keeps in flight to one rank. Prefill waves and decode lanes
-/// never share a rank at once (each family's scheduler stops decode for
-/// admission), so the bound is the larger of the two, not their sum.
+/// Spark compute concurrency follows decode lanes, not buffered network waves.
+/// The family owns any required lane floor (e.g. simultaneous legacy owners).
 pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
-    let prefill = match family {
-        // V4.1's two transports carry both prefill encoder streams at once.
-        "deepseek_v41" => 2,
-        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" | "deepseek_v4" | "qwen4" | "step5" => prefill_waves,
-        _ => 1,
-    };
-    let decode = u64::from(decode_lanes.max(1));
-    let slots = prefill.max(decode);
-    if prefill == 0 || slots > u64::from(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS) {
+    let descriptor = crate::plan::family::registry().iter().find(|entry| entry.id() == family)
+        .ok_or(crate::placement::PlacementError::Inventory("Spark execution slots require a family descriptor"))?;
+    let slots = decode_lanes.max(descriptor.spark_decode_lanes());
+    if !(1..=crate::serving_capacity::prefill_waves::MAX_WAVES).contains(&prefill_waves)
+        || decode_lanes == 0 || slots > cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
         return Err(crate::placement::PlacementError::Inventory("Spark execution slots exceed executor capability"));
     }
-    u8::try_from(slots).map_err(|_| crate::placement::PlacementError::Overflow("Spark execution slots"))
+    Ok(slots)
 }
 
 /// Device bytes of one Spark execution slot (stream, scratch, inputs and
@@ -462,16 +456,28 @@ mod selected_spark_io_tests {
     }
 
     #[test]
-    fn execution_slots_follow_admitted_waves_and_lanes_and_charge_their_unit_size() {
-        assert_eq!(spark_execution_slots("glm5", 2, 1).unwrap(), 2);
-        assert_eq!(spark_execution_slots("glm5", 4, 1).unwrap(), 4);
-        assert_eq!(spark_execution_slots("mimo_v2", 3, 2).unwrap(), 3);
-        assert_eq!(spark_execution_slots("mimo_v2", 1, 2).unwrap(), 2);
-        assert_eq!(spark_execution_slots("deepseek_v41", 1, 2).unwrap(), 2);
-        assert_eq!(spark_execution_slots("qwen4", 1, 1).unwrap(), 1);
-        assert!(spark_execution_slots("glm5", 9, 1).is_err());
-        assert!(spark_execution_slots("qwen4", 0, 1).is_err());
-        assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 3);
+    fn execution_slots_follow_descriptor_decode_lanes_not_prefill_waves() {
+        for descriptor in crate::plan::family::registry() {
+            for waves in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
+                for lanes in 1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
+                    assert_eq!(spark_execution_slots(descriptor.id(), waves, lanes).unwrap(),
+                        lanes.max(descriptor.spark_decode_lanes()));
+                }
+            }
+            for waves in [0, 5, u64::MAX] {
+                assert!(spark_execution_slots(descriptor.id(), waves, 1).is_err());
+            }
+            for lanes in [0, 5, u8::MAX] {
+                assert!(spark_execution_slots(descriptor.id(), 1, lanes).is_err());
+            }
+        }
+        assert_eq!(spark_execution_slots("deepseek_v41", 1, 1).unwrap(), 2);
+        assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 1);
+        assert!(spark_execution_slots("unknown", 1, 1).is_err());
+    }
+
+    #[test]
+    fn execution_slots_charge_their_unit_size() {
         // A smaller live unit does not shrink compiled-capacity scratch.
         assert_eq!(spark_slot_bytes("glm5", 2048), spark_slot_bytes("glm5", 4096));
         let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 2, ..Default::default() };
@@ -541,7 +547,7 @@ mod selected_spark_io_tests {
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
             assert_eq!(spark_slot_bytes("kimi_k3", unit), slot);
             let reserve = crate::families::kimi_k3::spark_reserve_bytes(waves, unit).unwrap();
-            assert_eq!(reserve, waves * slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+            assert_eq!(reserve, slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
             let rings = spark_ring_geometry(1);
@@ -553,7 +559,8 @@ mod selected_spark_io_tests {
             for _ in 0..2 {
                 charge_spark_io(&mut device, &working, ExpertGeometry::KIMI_K3, unit as u32,
                     false, rings, 0).unwrap();
-                charge_spark_slots(&mut device, &working, "kimi_k3", waves as u8, unit);
+                let slots = spark_execution_slots("kimi_k3", waves, 1).unwrap();
+                charge_spark_slots(&mut device, &working, "kimi_k3", slots, unit);
                 assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), expected,
                     "pre-solver Spark overhead and the final ledger must count each owner once");
             }
@@ -581,8 +588,8 @@ mod selected_spark_io_tests {
             charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
             assert!(device.items.is_empty());
         }
-        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::planned_waves(4)), 2);
-        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::planned_waves(0)), 1);
+        assert_eq!(spark_endpoints("glm5", crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(4)), 2);
+        assert_eq!(spark_endpoints("glm5", crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(0)), 1);
     }
 }
 

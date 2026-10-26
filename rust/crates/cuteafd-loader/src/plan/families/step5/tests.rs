@@ -1265,15 +1265,17 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
 
 #[test]
 fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
-    for (kind, gpus, sparks, default_unit, default_waves) in [
-        ("nvfp4", 1, 4, 2048, 2), ("fp8", 2, 6, 2048, 3),
-    ] {
+    for (kind, gpus, sparks) in [("nvfp4", 1, 4), ("fp8", 2, 6)] {
         let snapshot = snapshot(kind);
         let manifest = native_manifest(snapshot.path());
         for (unit, waves) in [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (512, 1),
             (1024, 2), (2752, 3), (2048, 4), (4096, 2)] {
-            let expected_unit = if unit == 0 { default_unit } else { unit };
-            let expected_waves = if waves == 0 { default_waves } else { waves };
+            let shape = crate::serving_capacity::prefill_waves::prefill_shape(sparks,
+                crate::plan::Family::prefill_limits(&super::STEP5),
+                crate::serving_capacity::prefill_waves::PrefillOverrides {
+                    unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+                }).unwrap();
+            let (expected_unit, expected_waves) = (shape.unit_rows, shape.waves);
             let report = plan::plan(snapshot.path(), &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(sparks),
                 draft_ownership: Some(spec::DraftOwnership::None),

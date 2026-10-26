@@ -18,14 +18,23 @@ pub struct Glm {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
+    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate,
 }
 
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
-    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving };
+    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving,
+        prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::Timing {
+            spark_ms: 13.0, turnaround_ms: 19.5, reference_ranks: 6, reference_unit_rows: 2752,
+            source: "https://github.com/tpurtell/cuteafd/issues/762; GLM K4 max W3 observed2752-row units, approximate S/T",
+        } };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM5_FLASH: Glm =
-    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving };
+    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving,
+        prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
+            waves: 2, reference_ranks: 4, larger_topology_waves: 3,
+            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; four-Spark EXL3/FP8 qualified k2; larger counts unmeasured, borrow GLM5 k3; no independent S/T",
+        } };
 
 fn str_list(config: &Value, key: &str) -> Vec<String> {
     config
@@ -40,6 +49,9 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 }
 
 impl Family for Glm {
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, ..Default::default() }
+    }
     fn id(&self) -> &'static str {
         self.id
     }

@@ -253,9 +253,11 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
 
 impl Family for KimiK3 {
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        use crate::serving_capacity::prefill_waves::{PrefillAutomatic, PrefillLimits};
-        PrefillLimits { automatic: PrefillAutomatic { max_unit_rows: 2752, ..Default::default() },
-            ..Default::default() }
+        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
+        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
+            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
+            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; K6/BF16 k3 versus legacy k2, no independent S/T",
+        }, ..Default::default() }
     }
     fn id(&self) -> &'static str { "kimi_k3" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }

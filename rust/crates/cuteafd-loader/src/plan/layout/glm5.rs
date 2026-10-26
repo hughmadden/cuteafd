@@ -58,7 +58,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         max_waves: if spark_ranks == 0 { 1 }
             else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
                 crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
-        ..Default::default()
+        ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
     };
     let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
         Ok(shape) => shape,
@@ -457,7 +457,7 @@ mod tests {
                 let mut native = crate::plan::empty_report(input.checkpoint(), &plan_options).unwrap();
                 let mut options = options;
                 let shape = crate::plan::layout::resolve_prefill(&mut native, &mut options, sparks,
-                    crate::serving_capacity::prefill_waves::PrefillLimits::default()).unwrap();
+                    crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)).unwrap();
                 native.family = exl3.family.clone();
                 native.spec = exl3.spec.clone();
                 native.cache_requirements = exl3.cache_requirements.clone();
@@ -469,7 +469,7 @@ mod tests {
                     r.prefill_span_rows, r.prefill_transports);
                 // Unpinned, the topology picks the waves (#762): 3 x 2752 at six
                 // Sparks, 2 x 4096 below; an explicit PREFILL_WAVES pins k.
-                let planned = crate::serving_capacity::prefill_waves::planned_waves(sparks);
+                let planned = crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(sparks);
                 let waves = if requested == 0 { planned } else { requested };
                 let rows = if unit != 0 { unit } else if waves > 1 {
                     crate::serving_capacity::prefill_waves::unit_rows(waves) } else { 4096 };

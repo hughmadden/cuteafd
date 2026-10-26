@@ -5453,15 +5453,19 @@ Every family that sends experts to Sparks prefills the same way.
 - **Units:** the prompt runs as a continuous stream of row units: a
   planner-admitted maximum of k units in flight inside one 8192-row reserve
   (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
-  capacity (k = 2/3/4 → 4096/2752/2048). Automatic units take the smaller of
-  that policy capacity and the family's measured unit ceiling. Each family
-  supplies its preference through the family descriptor, consumed identically
-  by planner, serve and golden; shared resolution has no family-name constants.
-  Measured automatic ceilings are not hard kernel limits: supported explicit
-  row pins remain unchanged. k hides raptor's turnaround T behind the Sparks'
-  per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks, 2 below,
-  subject to a measured automatic wave ceiling. A prompt that would cut units
-  below half a unit runs on fewer waves.
+  capacity (k = 2/3/4 → 4096/2752/2048). Each family descriptor supplies a
+  base estimate: Spark compute S_ref at a reference unit and N_ref Sparks,
+  plus raptor turnaround T. Shared code scales S = S_ref × N_ref / N and
+  admits k = ⌈T/S⌉ + 1, at most 4 and bounded by the hard executor/arena
+  capacities; zero Sparks use one wave. Families without independent S/T use
+  their measured best k, explicitly sourced in the descriptor. Unmeasured
+  families keep a conservative estimate; hard constraints (Qwen's two-slot
+  mapped-PLE ring) are separate. Planner, serve and golden consume the same
+  descriptor; there are no shared family-name constants, per-family automatic
+  row caps or Spark-count thresholds. Supported explicit pins override the
+  estimate, never hard capacities. Runtime S/T refinement (#762 stages 2–4)
+  follows separately. A short prompt that cannot half-fill units uses fewer
+  waves without reallocating or recapturing.
   `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
   5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
   (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't

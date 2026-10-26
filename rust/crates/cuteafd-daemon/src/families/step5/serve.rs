@@ -205,7 +205,8 @@ fn with_backend<T>(args: &ServeArgs,
         rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
         ModelAdmission::for_units(ExpertGeometry::STEP5, endpoint, args.prefill_rows, compiled,
-            spark_rings(config.max_frame_bytes)?, clients, args.prefill_waves)?)?;
+            spark_rings(config.max_frame_bytes)?, clients,
+            cuteafd_loader::plan::layout::spark_execution_slots("step5", u64::from(args.prefill_waves), 1)?)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
@@ -693,7 +694,7 @@ mod tests {
 
     #[test]
     fn topology_shapes_and_explicit_units_match_admission() -> Result<()> {
-        for (sparks, unit, waves, span) in [(4, 2048, 2, 4096), (6, 2048, 3, 6144)] {
+        for (sparks, unit, waves, span) in [(4, 2752, 3, 8256), (6, 2752, 3, 8256)] {
             let mut args = args();
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
@@ -703,8 +704,10 @@ mod tests {
             args.prefill_rows = unit as u32;
             args.prefill_waves = waves as u8;
             assert_eq!(args.span(), span as u32);
+            let slots = cuteafd_loader::plan::layout::spark_execution_slots("step5", waves, 1)?;
             let model = ModelAdmission::for_units(ExpertGeometry::STEP5, args.endpoint(), unit as u32,
-                4096, spark_rings(TcpTransportConfig::default().max_frame_bytes)?, 2, waves as u8)?;
+                4096, spark_rings(TcpTransportConfig::default().max_frame_bytes)?, 2, slots)?;
+            assert_eq!(model.execution_slots, 1);
             assert_eq!(model.endpoints[0].capacity, unit as u32);
             assert!(model.endpoints[0].capacity < args.span());
             for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
