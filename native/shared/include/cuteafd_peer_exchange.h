@@ -100,13 +100,6 @@ int32_t cuteafd_peer_wait_diagnostic(const uint32_t* flag, uint32_t* recv_state,
 int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* descriptor,
     const uint32_t* words, void* stream);
 
-// Write-mode Spark completions: one warp spins (acquire, system scope) until
-// each of `ranks` u64 flags (`stride_words` apart, device memory the NICs
-// write) carries the next sequence of `state` (u32 [1], zeroed; graph-safe) in
-// its low 32 bits, sets bit r of `error` for a rank whose flag has bit 63, then
-// advances `state`. Traps after 60 s.
-int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
-    uint32_t* state, uint32_t* error, void* stream);
 // Optional terminal cancellation. The legacy wait/symbol above is unchanged.
 // Initialize before enqueueing any abortable wait. `aborted` is a separate,
 // zeroed local u32 that outlives every eager/captured wait and is never reset.

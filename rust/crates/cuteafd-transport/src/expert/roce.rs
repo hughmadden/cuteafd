@@ -268,47 +268,6 @@ impl SparkExperts {
         self.clients.set_landing(landing)
     }
 
-    /// Write mode from the next connection on (`None` restores receives):
-    /// rank r's responses are RDMA-written into `targets[r]` and flagged
-    /// there; [`Self::post_written`] posts a wave and returns.
-    ///
-    /// # Safety
-    /// Every target range stays allocated until this transport is dropped or
-    /// its targets are replaced; the planes are written from each post until
-    /// the rank's flag shows its request id.
-    pub unsafe fn set_write_targets(&mut self, targets: Option<Vec<crate::DeviceWriteTarget>>) -> Result<()> {
-        let world = self.world_size();
-        let write = match targets {
-            Some(targets) => {
-                ensure!(targets.len() == world, "write mode needs one target per rank");
-                targets.into_iter().map(Some).collect()
-            }
-            None => vec![None; world],
-        };
-        self.open_waves.clear();
-        self.clients.set_write_targets(write)
-    }
-
-    /// Write mode: posts `request` to every rank without waiting for anything.
-    pub fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        if !self.open_waves.is_empty() {
-            self.open_waves.clear();
-            self.reset_connections();
-        }
-        ensure!((request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0)
-                == self.world.ownership_topology().is_some(),
-            "Spark request ownership flag differs from its declared wire");
-        crate::health::ensure_available()?;
-        let result = self.clients.post_written(request);
-        if let Err(error) = &result { crate::health::record_failure(format!("expert write failed: {error:#}")); }
-        if result.is_err() {
-            self.reset_connections();
-        } else if let Some(tap) = &mut self.route_tap {
-            tap.record(request, self.executors.len());
-        }
-        result
-    }
-
     /// Zero-copy request egress: allocates a pinned, device-mapped buffer of
     /// `bytes` that every rank's session registers (from the next connection
     /// on). Requests whose hidden payload comes from [`Self::egress_payload`]

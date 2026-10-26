@@ -1178,14 +1178,12 @@ mod tests {
         // Canonical worlds reject ownership before any I/O.
         let mut canonical_roce = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
         assert!(canonical_roce.dispatch(&flagged).await.is_err());
-        assert!(canonical_roce.post_written(&flagged).is_err());
         let mut canonical_tcp = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
         assert!(canonical_tcp.dispatch(&flagged).await.is_err());
 
         // Topology-bound transports require the flag; no silent canonical fallback.
         let mut bound_roce = SparkExperts::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 80, config.clone())?;
         assert!(bound_roce.dispatch(&canonical).await.is_err());
-        assert!(bound_roce.post_written(&canonical).is_err());
         let mut bound_tcp = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 80, config.clone())?;
         assert!(bound_tcp.dispatch(&canonical).await.is_err());
         Ok(())

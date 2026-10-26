@@ -205,35 +205,8 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             }
             let engine_sent_bytes = (peers.len() == ea_len && eb.keys().all(|peer| peers.iter().any(|p| &p.peer == peer)))
                 .then(|| peers.iter().fold(0u64, |n, p| n.saturating_add(p.sent_bytes)));
-            // One-sided writes have no receive CQE. Difference each actual
-            // sender at both edges, not its lifetime total when a QP appears.
-            let written_delta = || -> Option<BTreeMap<String, u64>> {
-                let pairs: BTreeSet<_> = a.engine.iter().filter(|s| s.device == port.device
-                    && s.port == port.port && s.receives_writes)
-                    .map(|s| (s.local_gid.as_str(), s.peer.as_str())).collect();
-                let mut bytes = BTreeMap::<String, u64>::new();
-                for (local, peer) in pairs {
-                    if local.is_empty() || peer.is_empty() { return None; }
-                    let (name, old) = before.hosts.iter().find(|(_, host)| host.engine.iter()
-                        .any(|s| s.local_gid == peer && s.peer == local))?;
-                    let new = after.hosts.get(name)?;
-                    if old.incarnation != new.incarnation || new.sampled_s <= old.sampled_s
-                        || !new.engine.iter().any(|s| s.local_gid == peer && s.peer == local) { return None; }
-                    let total = |host: &HostSample| host.engine.iter()
-                        .filter(|s| s.local_gid == peer && s.peer == local)
-                        .fold(0u64, |n, s| n.saturating_add(s.written_sent_bytes));
-                    let entry = bytes.entry(peer.into()).or_default();
-                    *entry = entry.saturating_add(total(new).checked_sub(total(old))?);
-                }
-                Some(bytes)
-            };
-            let engine_received_bytes = engine_sent_bytes.and_then(|_| {
-                let written = written_delta()?;
-                for peer in &mut peers {
-                    peer.received_bytes = peer.received_bytes.saturating_add(written.get(&peer.peer).copied().unwrap_or(0));
-                }
-                Some(peers.iter().fold(0u64, |n, p| n.saturating_add(p.received_bytes)))
-            });
+            let engine_received_bytes = engine_sent_bytes
+                .map(|_| peers.iter().fold(0u64, |n, p| n.saturating_add(p.received_bytes)));
             let sources = source_delta(b, a, &port.device, port.port);
             let storage = storage_delta(b, a, &port.device, port.port);
             let sparknest_sent_bytes = storage.map(|s| s.0);
@@ -476,28 +449,6 @@ mod tests {
         assert_eq!(interval("x",true,&before,&after).ports[0].sparknest_sent_bytes,None);
         after.hosts.get_mut("spark").unwrap().sources.clear();
         assert_eq!(interval("x",true,&before,&after).ports[0].foreign_sent_bytes,None);
-    }
-    #[test]
-    fn one_sided_receives_come_from_peer_posts() {
-        let mut before = snapshot(1.0, 0, 0);
-        let mut after = snapshot(2.0, 1000, 100);
-        for snapshot in [&mut before, &mut after] {
-            snapshot.hosts.get_mut("spark").unwrap().engine[0].local_gid = "local".into();
-            snapshot.hosts.get_mut("spark").unwrap().engine[0].receives_writes = true;
-            let bytes = if snapshot.hosts["spark"].sampled_s > 1.0 { 700 } else { 0 };
-            snapshot.hosts.insert("coordinator".into(), HostSample { incarnation: "peer".into(),
-                sampled_s: snapshot.hosts["spark"].sampled_s,
-                engine: vec![EngineSample { local_gid: "peer".into(), peer: "local".into(),
-                    written_sent_bytes: bytes, sent_bytes: bytes, ..Default::default() }], ..Default::default() });
-        }
-        let phase = interval("write", true, &before, &after);
-        assert_eq!(phase.ports[0].engine_received_bytes, Some(800));
-        assert_eq!(phase.ports[0].peers[0].received_bytes, 800);
-        assert_eq!(phase.ports[0].foreign_received_bytes, Some(200));
-        before.hosts.remove("coordinator");
-        assert_eq!(interval("missing", true, &before, &after).ports[0].engine_received_bytes, None);
-        after.hosts.remove("coordinator");
-        assert_eq!(interval("missing", true, &before, &after).ports[0].foreign_received_bytes, None);
     }
     #[test]
     fn stale_reset_restart_and_missing_are_not_traffic() {

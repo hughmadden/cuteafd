@@ -625,11 +625,9 @@ mod tests {
                 max_sge: 2,
             },
             client_native_endpoint: native,
-            write_target: None,
             flow_label,
             worker_selection_digest: None,
             model_endpoint: None,
-            chunking: super::super::request_write::SparkChunking::default(),
         }
     }
 
@@ -650,7 +648,6 @@ mod tests {
             expert_grouping: None,
             server_endpoint: session_start(0).client_endpoint,
             server_native_endpoint: endpoint(),
-            request_target: None,
             flow_label,
         };
         let old = serde_json::to_value(ready(0)).unwrap();
