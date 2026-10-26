@@ -60,7 +60,7 @@ impl ServeArgs {
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-        Ok(prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+        Ok(prefill_shape(6, PrefillLimits::for_family("kimi_k3"), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None,
         })?)
@@ -223,7 +223,8 @@ mod tests {
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         for (extra, expected) in [
             (vec![], (2752, 3, 8256)),
-            (vec!["--prefill-waves", "2"], (4096, 2, 8192)),
+            (vec!["--prefill-waves", "2"], (2752, 2, 5504)),
+            (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192)),
             (vec!["--prefill-waves", "3"], (2752, 3, 8256)),
             (vec!["--prefill-waves", "4"], (2048, 4, 8192)),
             (vec!["--prefill-rows", "1024", "--prefill-waves", "2"], (1024, 2, 2048)),

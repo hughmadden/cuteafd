@@ -775,7 +775,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint's frames hold one unit; the intake holds all live waves.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
-        assert_eq!(rows, 4096);
+        assert_eq!(rows, 2048);
         assert_eq!(result.prefill_waves, Some(2));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
@@ -1266,11 +1266,12 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
 #[test]
 fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
     for (kind, gpus, sparks, default_unit, default_waves) in [
-        ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 2752, 3),
+        ("nvfp4", 1, 4, 2048, 2), ("fp8", 2, 6, 2048, 3),
     ] {
         let snapshot = snapshot(kind);
         let manifest = native_manifest(snapshot.path());
-        for (unit, waves) in [(0, 0), (512, 1), (1024, 2), (2752, 3), (2048, 4), (4096, 2)] {
+        for (unit, waves) in [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (512, 1),
+            (1024, 2), (2752, 3), (2048, 4), (4096, 2)] {
             let expected_unit = if unit == 0 { default_unit } else { unit };
             let expected_waves = if waves == 0 { default_waves } else { waves };
             let report = plan::plan(snapshot.path(), &PlanOptions {

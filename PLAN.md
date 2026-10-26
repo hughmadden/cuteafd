@@ -5453,10 +5453,15 @@ Every family that sends experts to Sparks prefills the same way.
 - **Units:** the prompt runs as a continuous stream of row units: a
   planner-admitted maximum of k units in flight inside one 8192-row reserve
   (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
-  capacity (k = 2/3/4 → 4096/2752/2048). k hides raptor's turnaround T behind
-  the Sparks' per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks,
-  2 below. A prompt that would cut units below half a unit runs on fewer
-  waves. `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
+  capacity (k = 2/3/4 → 4096/2752/2048). Automatic units take the smaller of
+  that policy capacity and the family's measured unit ceiling, declared once
+  in the shared resolver (Step-5 2048; Kimi 2752; other ported families 4096).
+  Measured automatic ceilings are not hard kernel limits: supported explicit
+  row pins remain unchanged. k hides raptor's turnaround T behind the Sparks'
+  per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks, 2 below,
+  subject to a measured automatic wave ceiling. A prompt that would cut units
+  below half a unit runs on fewer waves.
+  `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
   5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
   (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
   fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.

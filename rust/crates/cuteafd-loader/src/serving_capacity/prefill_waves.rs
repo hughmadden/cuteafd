@@ -1,7 +1,7 @@
-//! Prefill wave count (#762, TJ 2026-10-25). Every family reserves the same
-//! 8192 prefill rows (today's 2 x 4096). The reserve is split into k waves of
-//! `reserve / k` rows, each run on its exact EXL3 capacity (2 -> 4096,
-//! 3 -> 2752, 4 -> 2048). k hides raptor's turnaround T behind the Sparks'
+//! Prefill wave count (#762, TJ 2026-10-25). Every family admits units inside
+//! the same 8192-row reserve. The policy splits it into k waves on exact EXL3
+//! capacities (2 -> 4096, 3 -> 2752, 4 -> 2048), bounded by the family's
+//! measured automatic unit limit. k hides raptor's turnaround T behind the Sparks'
 //! per-unit compute S: a Spark idles between units only if T > (k - 1) * S,
 //! so k = ceil(T / S) + 1, at most [`MAX_WAVES`].
 //!
@@ -30,18 +30,44 @@ pub fn unit_rows(waves: u64) -> u64 {
     }
 }
 
-/// Kernel and arena limits, not family-specific scheduling defaults.
+/// Measured scheduling ceilings, separate from hard executor limits. Explicit
+/// pins may exceed these ceilings, but must still satisfy every hard limit.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillAutomatic {
+    pub max_unit_rows: u64,
+    pub max_waves: u64,
+}
+
+impl PrefillAutomatic {
+    pub fn for_family(family: &str) -> Self {
+        Self { max_unit_rows: match family {
+            "step5" => 2048,
+            "kimi_k3" => 2752,
+            _ => 4096,
+        }, max_waves: MAX_WAVES }
+    }
+}
+
+/// Hard kernel/arena limits and the family's measured automatic ceilings.
 #[derive(Debug, Clone, Copy)]
 pub struct PrefillLimits {
     pub max_unit_rows: u64,
     /// Capacity of the intake arena, bounded by the shared live-slot reserve.
     pub max_span_rows: u64,
     pub max_waves: u64,
+    pub automatic: PrefillAutomatic,
+}
+
+impl PrefillLimits {
+    pub fn for_family(family: &str) -> Self {
+        Self { automatic: PrefillAutomatic::for_family(family), ..Default::default() }
+    }
 }
 
 impl Default for PrefillLimits {
     fn default() -> Self {
-        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES }
+        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES,
+            automatic: PrefillAutomatic::for_family("") }
     }
 }
 
@@ -65,7 +91,8 @@ pub struct PrefillOverrides {
 }
 
 /// The shape admitted before allocating workspace, Spark execution slots or
-/// landing rotation. The topology policy is identical for every family.
+/// landing rotation. Every family shares the topology policy and measured-cap
+/// resolution; only its declared automatic ceilings differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillPlan {
     pub unit_rows: u64,
@@ -81,8 +108,8 @@ impl PrefillPlan {
 
 pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
     explicit: PrefillOverrides) -> Result<PrefillPlan, PrefillError> {
-    let waves = explicit.waves.unwrap_or_else(|| planned_waves(spark_ranks));
-    let rows = explicit.unit_rows.unwrap_or_else(|| unit_rows(waves));
+    let waves = explicit.waves.unwrap_or_else(|| planned_waves(spark_ranks).min(limits.automatic.max_waves));
+    let rows = explicit.unit_rows.unwrap_or_else(|| unit_rows(waves).min(limits.automatic.max_unit_rows));
     let units = super::PrefillShape { unit_rows: rows, waves };
     if units.validate().is_err() {
         return Err(PrefillError::InvalidShape { unit_rows: rows, waves });
@@ -155,6 +182,66 @@ mod tests {
             assert!(unit * waves >= RESERVE_ROWS);
         }
         assert_eq!((2..=4).map(unit_rows).collect::<Vec<_>>(), [4096, 2752, 2048]);
+    }
+
+    #[test]
+    fn automatic_units_use_the_family_measurement_without_changing_topology() {
+        for (family, ceiling) in [("step5", 2048), ("kimi_k3", 2752), ("glm5", 4096),
+            ("glm5_flash", 4096), ("qwen4", 4096), ("qwen3_5", 4096),
+            ("deepseek_v4", 4096), ("mimo_v2", 4096), ("deepseek_v41", 4096)] {
+            let limits = PrefillLimits::for_family(family);
+            for ranks in 0..=8 {
+                let shape = prefill_shape(ranks, limits, PrefillOverrides::default()).unwrap();
+                let waves = planned_waves(ranks);
+                let rows = unit_rows(waves).min(ceiling);
+                assert_eq!(shape, PrefillPlan { unit_rows: rows, waves, span_rows: rows * waves },
+                    "{family} ranks={ranks}");
+            }
+            for waves in 1..=MAX_WAVES {
+                let shape = prefill_shape(6, limits, PrefillOverrides {
+                    waves: Some(waves), ..Default::default()
+                }).unwrap();
+                assert_eq!(shape.unit_rows, unit_rows(waves).min(ceiling), "{family} waves={waves}");
+            }
+        }
+    }
+
+    #[test]
+    fn measured_ceilings_do_not_rewrite_explicit_pins_or_hard_refusals() {
+        for family in ["step5", "kimi_k3"] {
+            let limits = PrefillLimits::for_family(family);
+            for (waves, rows) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
+                let shape = prefill_shape(6, limits, PrefillOverrides {
+                    unit_rows: Some(rows), waves: Some(waves), ..Default::default()
+                }).unwrap();
+                assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
+            }
+            let limits = PrefillLimits { max_unit_rows: 1024, ..limits };
+            let error = prefill_shape(6, limits, PrefillOverrides::default()).unwrap_err();
+            assert!(matches!(error, PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. }), "{error}");
+            let error = prefill_shape(6, limits, PrefillOverrides {
+                unit_rows: Some(2048), waves: Some(2), ..Default::default()
+            }).unwrap_err();
+            assert!(matches!(error, PrefillError::ExecutorCapacity { unit_rows: 2048, .. }), "{error}");
+            let error = prefill_shape(6, PrefillLimits::for_family(family), PrefillOverrides {
+                unit_rows: Some(4096), waves: Some(3), ..Default::default()
+            }).unwrap_err();
+            assert!(matches!(error, PrefillError::ReserveExceeded { .. }), "{error}");
+        }
+    }
+
+    #[test]
+    fn measured_wave_ceilings_only_bound_automatic_selection() {
+        let limits = PrefillLimits { automatic: PrefillAutomatic { max_unit_rows: 2048, max_waves: 2 },
+            ..Default::default() };
+        let shape = prefill_shape(6, limits, PrefillOverrides::default()).unwrap();
+        assert_eq!(shape, PrefillPlan { unit_rows: 2048, waves: 2, span_rows: 4096 });
+        let shape = prefill_shape(6, limits, PrefillOverrides { waves: Some(3), ..Default::default() }).unwrap();
+        assert_eq!(shape, PrefillPlan { unit_rows: 2048, waves: 3, span_rows: 6144 });
+        let error = prefill_shape(6, PrefillLimits { max_waves: 2, ..limits }, PrefillOverrides {
+            waves: Some(3), ..Default::default()
+        }).unwrap_err();
+        assert!(matches!(error, PrefillError::ExecutorCapacity { waves: 3, max_waves: 2, .. }));
     }
 
     #[test]

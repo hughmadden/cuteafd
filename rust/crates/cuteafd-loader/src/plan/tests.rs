@@ -271,6 +271,35 @@ fn shared_prefill_public_plan_honors_a_real_manifest_unit_bound() {
 }
 
 #[test]
+fn shared_prefill_measured_caps_match_admission_and_cannot_hide_hard_limits() {
+    use crate::serving_capacity::prefill_waves::{PrefillError, PrefillLimits};
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let mut report = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    let manifest = dir.path().join("bounded.json");
+    std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":1024}}"#).unwrap();
+    for (family, cap) in [("step5", 2048), ("kimi_k3", 2752), ("glm5", 4096)] {
+        report.family = Some(family.into());
+        for (unit, waves) in [(0, 2), (0, 3), (4096, 2)] {
+            let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
+            options.prefill_rows = unit;
+            options.prefill_lanes = waves;
+            let shape = layout::resolve_prefill(&mut report, &mut options, 6, PrefillLimits::default()).unwrap();
+            let expected = if unit == 0 { crate::serving_capacity::prefill_waves::unit_rows(waves).min(cap) }
+                else { unit };
+            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (expected, waves, expected * waves));
+            assert_eq!((options.prefill_rows, options.spark_capacity_rows), (expected, expected));
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(expected), Some(waves), Some(expected * waves)));
+        }
+        let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
+        options.workspace_manifest = Some(manifest.clone());
+        let error = layout::resolve_prefill(&mut report, &mut options, 6, PrefillLimits::default()).unwrap_err();
+        assert!(matches!(error.downcast_ref::<PrefillError>(),
+            Some(PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. })), "{family}: {error}");
+    }
+}
+
+#[test]
 fn shared_prefill_reserve_refusals_are_typed() {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillError, PrefillLimits, PrefillOverrides};
     for waves in [3, 4] {

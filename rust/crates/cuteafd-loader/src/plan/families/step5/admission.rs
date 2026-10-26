@@ -232,7 +232,7 @@ impl RuntimeInputs {
             "Step-5 span rows, prefill waves or sequence slots"
         );
         use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-        prefill_shape(self.inventory.spark_ranks, PrefillLimits::default(), PrefillOverrides {
+        prefill_shape(self.inventory.spark_ranks, PrefillLimits::for_family("step5"), PrefillOverrides {
             unit_rows: Some(self.unit_rows() as u64), waves: Some(self.waves as u64),
             span_rows: Some(self.rows as u64),
         })?;
