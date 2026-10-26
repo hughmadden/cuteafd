@@ -172,7 +172,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         if args.prefix_partial != Toggle::Off { return Err(MiniMaxError::Unsupported("partial prefix reuse").into()); }
-        let family = MiniMaxPrefix { cache: self.cache };
+        let family = MiniMaxPrefix::new(self.cache, self.execution.stream())?;
         let layout = family.layout();
         let args = args.with_scoring(self.rows, self.rows.min(64), self.vocabulary)?;
         let host = args.host_config(layout, self.cache.context, lanes)?.map(|config|

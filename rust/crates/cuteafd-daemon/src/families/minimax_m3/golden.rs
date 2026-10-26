@@ -359,35 +359,40 @@ fn state(cache: &Cache<'_>, p: &Placement, layers: usize) -> Result<Vec<u8>> {
 
 fn check_prefix(runner: &mut Runner<'_, '_>, tokens: &[u32]) -> Result<()> {
     ensure!(tokens.len() >= 66, "prefix qualification requires at least 66 input tokens");
-    let family = MiniMaxPrefix { cache:runner.cache };
+    let (cache, layers) = (runner.cache, runner.last_layer + 1);
+    let family = MiniMaxPrefix::new(cache, runner.execution.stream())?;
+    // Restores and captures queue their tail copies on the family's copy stream: a host read of
+    // the pages drains it first (steps are fenced after the copies on the device).
+    let read = |p: &Placement| -> Result<Vec<u8>> {
+        family.drain().map_err(|error| anyhow::anyhow!("MiniMax prefix copy drain: {error}"))?;
+        state(cache, p, layers)
+    };
     let mut pool = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
         entries:4, mark_slots:0, keep_logits:false, min_tokens:1 }, None)?;
     for frontier in [63, 64, 65] {
         pool.clear(&family)?;
         let mut source = pool.admit_cold(&family, frontier, frontier + 1, placement)?.placement;
         runner.prefill(pool.pool(), &mut source, &tokens[..frontier])?;
-        let expected = state(runner.cache, &source, runner.last_layer + 1)?;
+        let expected = read(&source)?;
         ensure!(pool.capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
             "prefix prompt capture failed");
         let admitted = pool.admit(&family, &tokens[..frontier + 1], frontier + 1, false, placement)?;
         ensure!(admitted.resume == frontier, "prefix restore missed deepest snapshot");
         let mut restored = admitted.placement;
-        ensure!(state(runner.cache, &restored, runner.last_layer + 1)? == expected, "restored cache bytes differ");
+        ensure!(read(&restored)? == expected, "restored cache bytes differ");
         let mut cold = pool.admit_cold(&family, frontier, frontier + 1, placement)?.placement;
         runner.prefill(pool.pool(), &mut cold, &tokens[..frontier])?;
-        ensure!(state(runner.cache, &cold, runner.last_layer + 1)? == expected, "cold prefix cache bytes differ");
+        ensure!(read(&cold)? == expected, "cold prefix cache bytes differ");
         let a = runner.evaluate(pool.pool(), &mut restored, &tokens[frontier..frontier + 1], false)?;
         let b = runner.evaluate(pool.pool(), &mut cold, &tokens[frontier..frontier + 1], false)?;
         ensure!(a.iter().map(|v| v.to_bits()).eq(b.iter().map(|v| v.to_bits())), "prefix continuation output differs");
-        ensure!(state(runner.cache, &restored, runner.last_layer + 1)? == state(runner.cache, &cold, runner.last_layer + 1)?,
-            "prefix continuation cache bytes differ");
-        ensure!(state(runner.cache, &source, runner.last_layer + 1)? == expected, "prefix append mutated captured pages");
+        ensure!(read(&restored)? == read(&cold)?, "prefix continuation cache bytes differ");
+        ensure!(read(&source)? == expected, "prefix append mutated captured pages");
         ensure!(pool.capture(&family, SnapshotKind::Turn, &tokens[..frontier + 1], &restored, After::default())?,
             "prefix turn capture failed");
         let mut next_turn = tokens[..frontier + 1].to_vec(); next_turn.push(tokens[0]);
         let turn = pool.admit(&family, &next_turn, frontier + 2, false, placement)?;
-        ensure!(turn.resume == frontier + 1
-            && state(runner.cache, &turn.placement, runner.last_layer + 1)? == state(runner.cache, &cold, runner.last_layer + 1)?,
+        ensure!(turn.resume == frontier + 1 && read(&turn.placement)? == read(&cold)?,
             "turn restore missed the deepest snapshot or changed cache bytes");
         pool.release(&family, &turn.placement.pages)?;
         for p in [&source, &restored, &cold] { pool.release(&family, &p.pages)?; }

@@ -1,4 +1,5 @@
 use super::{cache::{Cache, PAGE_ROWS}, MiniMaxError};
+use crate::shared::prefix::{PrefixCopies, Reader};
 use cuteafd_core::MediaSpan;
 use cuteafd_engine::{media::RequestMedia, prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore,
     PageOwners, PrefixFamily, ReuseRule, TailCopy}};
@@ -19,7 +20,21 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn spans(&self) -> &[MediaSpan] { self.media.spans() }
 }
 
-pub(super) struct MiniMaxPrefix<'e, 'a> { pub cache: &'e Cache<'a> }
+/// The pages-only prefix family over the KV cache. Its tail copies run on a prefix copy stream
+/// fenced against the execution's stream, the one stream that reads and writes the pages (the
+/// drafters run on it too); a drain waits for both, never synchronizing the execution stream.
+pub(super) struct MiniMaxPrefix<'e, 'a> {
+    pub cache: &'e Cache<'a>,
+    copies: PrefixCopies<'a>,
+}
+impl<'e, 'a> MiniMaxPrefix<'e, 'a> {
+    /// `stream` is the execution's stream ([`super::execution::Execution::stream`]), on the
+    /// cache's device and live as long as this family.
+    pub fn new(cache: &'e Cache<'a>, stream: *mut std::ffi::c_void) -> anyhow::Result<Self> {
+        let copies = PrefixCopies::new(cache.library, vec![vec![Reader { device: cache.device, stream }]])?;
+        Ok(Self { cache, copies })
+    }
+}
 impl PrefixFamily for MiniMaxPrefix<'_, '_> {
     type Placement = Placement;
     fn layout(&self) -> FamilyLayout {
@@ -42,8 +57,15 @@ impl PrefixFamily for MiniMaxPrefix<'_, '_> {
         placement.committed = len;
         Ok(())
     }
-    fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> { self.cache.copy_rows(copy).map_err(Into::into) }
-    fn drain(&self) -> Result<(), BoxError> { Ok(()) }
+    fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
+        let copies = self.cache.tail_copies(copy)?;
+        // SAFETY: every view lies inside this cache's live planes (checked by `view`); the cache
+        // drains this family before it hands either page to anyone else.
+        Ok(unsafe { self.copies.copy_d2d(&copies) }?)
+    }
+    fn drain(&self) -> Result<(), BoxError> {
+        Ok(self.copies.drain()?)
+    }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         if page as usize >= self.cache.pages { return Vec::new(); }
         self.cache.planes().map(|plane| plane.page(page as usize)).collect()
@@ -72,7 +94,9 @@ mod tests {
         let layout = MiniMaxCacheLayout { layers: 2, context: 256, kv_page_bytes: KV_PAGE_BYTES as u64,
             index_page_bytes: INDEX_PAGE_BYTES as u64, page_bytes: 2 * (2 * KV_PAGE_BYTES + INDEX_PAGE_BYTES) as u64 };
         let cache = Cache::new(&library, 0, &layout, 16, 2, layout.page_bytes * 16 + 256)?;
-        let family = MiniMaxPrefix { cache: &cache };
+        // The execution stream every compute step runs on; the family's copies are fenced against it.
+        let execution = crate::shared::memory::device::Stream::new(crate::shared::memory::device::Device { library: &library, id: 0 })?;
+        let family = MiniMaxPrefix::new(&cache, execution.raw)?;
         let mut shared = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
             entries: 4, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?;
         let placement = |pages| Placement { pages, sequence: 0, committed: 0,
@@ -92,7 +116,17 @@ mod tests {
             }
             assert!(shared.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::default())?);
             let mut longer = tokens.clone(); longer.push(99);
+            let before = fixture.events()?.len();
             let restored = shared.admit(&family, &longer, len + 1, false, placement)?;
+            // A partial tail page is copied (K, V, index keys and scales of each layer) as one
+            // batch on the copy stream, fenced on both sides against the execution stream (the
+            // fixture logs R record, W wait, C copy); the drain fences again and synchronizes
+            // the copy stream alone (S).
+            let tail = if len % 64 == 0 { String::new() } else { format!("RW{}RW", "C".repeat(4 * layout.layers)) };
+            assert_eq!(&fixture.events()?[before..], tail, "{len}-row prefix restore");
+            let before = fixture.events()?.len();
+            family.drain()?;
+            assert_eq!(&fixture.events()?[before..], "RWRWS", "{len}-row prefix drain");
             assert_eq!(restored.resume, len);
             assert_eq!(restored.placement.committed, len);
             // The continuation's append wave passes the serving checks (golden's prefix check runs it).

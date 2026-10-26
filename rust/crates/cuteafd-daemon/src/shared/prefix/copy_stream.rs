@@ -222,6 +222,7 @@ mod tests {
             ("qwen3_5", include_str!("../../families/qwen3_5/prefix.rs"), "copies.drain()"),
             ("kimi_k3", include_str!("../../families/kimi_k3/prefix.rs"), "copies.drain()"),
             ("qwen4", include_str!("../../families/qwen4/prefix.rs"), "copies.drain()"),
+            ("minimax_m3", include_str!("../../families/minimax_m3/prefix.rs"), "copies.drain()"),
             // Step-5's per-rank cache owner drains through its own lane fence (checked below).
             ("step5", include_str!("../../families/step5/prefix.rs"), "owner.borrow().drain()"),
         ];

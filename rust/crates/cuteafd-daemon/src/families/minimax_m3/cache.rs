@@ -72,13 +72,15 @@ impl<'a> Cache<'a> {
         self.layers.iter().flat_map(|l| planes(l.key.buffer, l.value.buffer, l.index.buffer))
     }
 
-    pub fn copy_rows(&self, copy: TailCopy) -> Result<()> {
+    /// A tail copy's device copies `(rank 0, destination, source)`: the copy's rows of every
+    /// layer's K, V and index planes, for the prefix copy stream to queue as one batch.
+    pub fn tail_copies(&self, copy: TailCopy) -> Result<Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>> {
         let (from, to, rows) = tail_pages(copy, self.pages)?;
-        self.library.cuda_set_device(self.device)?;
+        let mut copies = Vec::new();
         for plane in self.planes() {
-            for (dst, src) in plane.tail(from, to, rows)? { self.library.copy_d2d(dst, src, src.bytes)?; }
+            copies.extend(plane.tail(from, to, rows)?.into_iter().map(|(dst, src)| (0, dst, src)));
         }
-        Ok(())
+        Ok(copies)
     }
 }
 
