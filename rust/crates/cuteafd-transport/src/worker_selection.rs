@@ -84,6 +84,100 @@ pub struct ModelAdmission {
     pub execution_slots: u8,
 }
 
+/// One independently scheduled decode lane. Capacities come from the family's
+/// admitted decode extent and its covering package export, never prefill rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeExecution {
+    pub capacity: u32,
+    pub compiled_capacity: u32,
+}
+
+/// Exactly one scratch/stream owner per Spark. Network units retain independent
+/// request/reply storage but enqueue on this stream without awaiting earlier replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefillExecution {
+    /// Largest unit on the admitted prefill ladder, not the selected k's rows.
+    pub capacity: u32,
+    /// Family package's covering export for that maximum unit.
+    pub compiled_capacity: u32,
+    /// Retained in-flight I/O units; this does not multiply scratch or streams.
+    pub buffered_units: u8,
+}
+
+/// Typed compute owners, independent of persistent endpoints and network rings.
+/// The daemon allocates each decode entry once and the singleton prefill owner
+/// once. Per-unit completion events retain all mapped I/O until its own reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkExecutions {
+    /// Vector index is the request's execution lane for Decode and MtpVerify.
+    pub decode: Vec<DecodeExecution>,
+    /// Prefill and Benchmark rows use this owner, irrespective of endpoint lane.
+    pub prefill: PrefillExecution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOwner { Decode(usize), Prefill }
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExecutionAdmissionError {
+    #[error("Spark decode lane count {lanes} must be 1..={maximum}")]
+    DecodeLanes { lanes: usize, maximum: usize },
+    #[error("{owner} live capacity {capacity} requires a covering export, got {compiled}")]
+    Capacity { owner: &'static str, capacity: u32, compiled: u32 },
+    #[error("Spark prefill buffered units {units} must be 1..={maximum}")]
+    BufferedUnits { units: u8, maximum: u8 },
+    #[error("Spark decode lane {lane} is outside {lanes} admitted lanes")]
+    DecodeLane { lane: u32, lanes: usize },
+    #[error("{owner} rows {rows} exceed admitted capacity {capacity}, or are empty")]
+    Rows { owner: &'static str, rows: u32, capacity: u32 },
+}
+
+impl SparkExecutions {
+    pub fn validate(&self) -> std::result::Result<(), ExecutionAdmissionError> {
+        let maximum = usize::from(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS);
+        if self.decode.is_empty() || self.decode.len() > maximum {
+            return Err(ExecutionAdmissionError::DecodeLanes { lanes: self.decode.len(), maximum });
+        }
+        let check = |owner, capacity, compiled| {
+            if capacity == 0 || compiled < capacity {
+                Err(ExecutionAdmissionError::Capacity { owner, capacity, compiled })
+            } else { Ok(()) }
+        };
+        for lane in &self.decode { check("decode", lane.capacity, lane.compiled_capacity)?; }
+        check("prefill", self.prefill.capacity, self.prefill.compiled_capacity)?;
+        let maximum = crate::worker_selection::MAX_BUFFERED_PREFILL_UNITS;
+        if !(1..=maximum).contains(&self.prefill.buffered_units) {
+            return Err(ExecutionAdmissionError::BufferedUnits { units: self.prefill.buffered_units, maximum });
+        }
+        Ok(())
+    }
+
+    /// Validate the actual request against its typed owner before any GPU launch.
+    /// An endpoint lane is not a compute slot and never selects prefill scratch.
+    pub fn owner(&self, source: crate::ExpertV2SourceKind, lane: u32, rows: u32)
+        -> std::result::Result<ExecutionOwner, ExecutionAdmissionError> {
+        self.validate()?;
+        let (owner, capacity, name) = match source {
+            crate::ExpertV2SourceKind::Prefill | crate::ExpertV2SourceKind::Benchmark =>
+                (ExecutionOwner::Prefill, self.prefill.capacity, "prefill"),
+            crate::ExpertV2SourceKind::Decode | crate::ExpertV2SourceKind::MtpVerify => {
+                let entry = self.decode.get(lane as usize)
+                    .ok_or(ExecutionAdmissionError::DecodeLane { lane, lanes: self.decode.len() })?;
+                (ExecutionOwner::Decode(lane as usize), entry.capacity, "decode")
+            }
+        };
+        if rows == 0 || rows > capacity {
+            return Err(ExecutionAdmissionError::Rows { owner: name, rows, capacity });
+        }
+        Ok(owner)
+    }
+}
+
+pub const MAX_BUFFERED_PREFILL_UNITS: u8 = 4;
+
 fn one_slot() -> u8 { 1 }
 fn is_one_slot(slots: &u8) -> bool { *slots == 1 }
 
@@ -924,6 +1018,37 @@ impl Drop for EndpointReservation {
 mod tests {
     use super::*;
     fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
+    #[test]
+    fn typed_execution_owners_keep_decode_prefill_and_buffered_io_independent() {
+        let plan = SparkExecutions { decode: vec![
+            DecodeExecution { capacity: 80, compiled_capacity: 80 },
+            DecodeExecution { capacity: 64, compiled_capacity: 128 }],
+            prefill: PrefillExecution { capacity: 4096, compiled_capacity: 8192, buffered_units: 3 } };
+        plan.validate().unwrap();
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        assert_eq!(serde_json::from_slice::<SparkExecutions>(&encoded).unwrap(), plan);
+        use crate::ExpertV2SourceKind::*;
+        assert_eq!(plan.owner(Decode, 0, 80).unwrap(), ExecutionOwner::Decode(0));
+        assert_eq!(plan.owner(MtpVerify, 1, 64).unwrap(), ExecutionOwner::Decode(1));
+        for source in [Prefill, Benchmark] {
+            assert_eq!(plan.owner(source, 7, 2752).unwrap(), ExecutionOwner::Prefill);
+        }
+        assert!(matches!(plan.owner(Decode, 1, 65), Err(ExecutionAdmissionError::Rows { .. })));
+        assert!(matches!(plan.owner(Decode, 2, 1), Err(ExecutionAdmissionError::DecodeLane { .. })));
+        assert!(plan.owner(Prefill, 0, 4097).is_err());
+        assert!(plan.owner(Prefill, 0, 0).is_err());
+        for units in [0, 5] {
+            let mut invalid = plan.clone(); invalid.prefill.buffered_units = units;
+            assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::BufferedUnits { .. })));
+        }
+        let mut invalid = plan.clone(); invalid.decode[0].compiled_capacity = 64;
+        assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::Capacity { owner: "decode", .. })));
+        invalid = plan.clone(); invalid.prefill.compiled_capacity = 2048;
+        assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::Capacity { owner: "prefill", .. })));
+        invalid = plan; invalid.decode.clear();
+        assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::DecodeLanes { .. })));
+    }
+
     #[test]
     fn model_admission_bounds_execution_slots_and_older_admissions_decode_as_one_slot() {
         let endpoint = cuteafd_core::SparkEndpoint { capacity: 64,
