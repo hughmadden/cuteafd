@@ -234,7 +234,8 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
 
 @pytest.mark.parametrize('full', [False, True])
 @pytest.mark.parametrize('inventory', ['home', 'hf-home', 'override'])
-def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monkeypatch, full, inventory):
+@pytest.mark.parametrize('programs_override', [False, True])
+def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monkeypatch, full, inventory, programs_override):
     (tmp_path / 'logs').mkdir()
     calls = []
     def run_logged(cmd, path, env, cwd, timeout):
@@ -251,11 +252,12 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
         env['HF_HOME'] = expected = str(tmp_path / 'hf-home')
     if inventory == 'override':
         env['CUTEAFD_DEPLOYMENT_TEST_HF_HOME'] = expected = str(tmp_path / 'selected-inventory')
-    env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] = str(tmp_path / 'PROGRAMS.json')
+    if programs_override:
+        env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] = str(tmp_path / 'PROGRAMS.json')
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), env)
     assert result['status'] == 'pass'
     assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == (expected if full or inventory == 'override' else None)
-    assert calls[1]['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS']
+    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS') == env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
     assert ('CUTEAFD_DEPLOYMENT_TEST_HF_HOME' in env) == (inventory == 'override')
 
 

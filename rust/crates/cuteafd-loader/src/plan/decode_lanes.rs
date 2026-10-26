@@ -10,8 +10,9 @@ use super::PlanError;
 /// Most decode lanes one coordinator runs.
 pub const MAX_DECODE_LANES: u8 = 2;
 
-/// The reason of a family whose decode still runs a private loop.
-pub const UNPORTED: &str = "this family's decode is not on the shared lane owners yet (#744)";
+/// The reason of a descriptor with no decode loop of its own (a drafter
+/// checkpoint, which drafts inside its target family's lane).
+pub const DRAFTER: &str = "a drafter has no decode loop of its own: it drafts inside its target family's lane";
 
 /// What a family's executor supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,13 +100,24 @@ mod tests {
     }
 
     #[test]
-    fn shared_scheduler_families_run_one_lane_with_a_recorded_reason() {
-        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5"] {
+    fn one_lane_families_record_their_reason() {
+        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2", "glm5", "glm5_flash", "deepseek_v4"] {
             let family = crate::plan::spark_executions::descriptor(id).unwrap();
             let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
-            assert!(reason != UNPORTED && reason.contains("#744"), "{id}: {reason}");
+            assert!(reason != DRAFTER && reason.contains("#744"), "{id}: {reason}");
             assert!(matches!(resolve(family, Some(2), 16),
                 Err(PlanError::UnsupportedOption { reason: refused, .. }) if refused == reason), "{id}");
+        }
+    }
+
+    /// Every target family runs decode on the shared lane owners (#744): only
+    /// drafter descriptors keep the default.
+    #[test]
+    fn only_drafters_keep_the_default_reason() {
+        for family in super::super::family::registry() {
+            let drafter = matches!(family.id(), "dflash2" | "dspark");
+            let default = family.decode_lanes() == (LaneSupport::One { reason: DRAFTER });
+            assert_eq!(default, drafter, "{}", family.id());
         }
     }
 

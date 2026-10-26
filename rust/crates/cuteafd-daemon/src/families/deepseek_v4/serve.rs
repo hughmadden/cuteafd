@@ -17,6 +17,7 @@ use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
+use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use crate::shared::draft::{binding::{self, DraftPass, RoundRecord, RoundRequest}, clock::RoundClock,
     evidence::{Censor, DraftSource, Evidence}, resource, runtime::SharedPolicy};
 use crate::shared::draft_policy::DraftHistory;
@@ -626,7 +627,9 @@ fn schedule(
     mut shared: Option<SharedPolicy>,
     ready: impl FnOnce(),
 ) -> Result<()> {
-    let (mut observed, mut skipped) = (0u64, 0u64);
+    let mut lane = DecodeLane::default();
+    // V4's only decode lane (`LaneSupport::One`), polled on this thread.
+    let lanes = LaneSet::default();
     let (family, mut cache) = prefix_cache(engine, prefix, host_config)?;
     let markers = crate::shared::prefix::marker_ids(&loaded.snapshot, &MESSAGE_STARTS)?;
     let mut states: Vec<usize> = (0..engine.shape.sequences).rev().collect();
@@ -908,57 +911,9 @@ fn schedule(
             continue;
         }
         let cycle = Instant::now();
-        let mut tally = console::Step::begin(0);
-        let engine_before = tally.live().then(|| engine.profile.borrow().seconds);
-        let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
-        let mut shape = StepShape::default();
-        let caching = cache.enabled();
-        // Undrafted rounds use the same route and resource observations.
-        let step = if let Some(shared) = shared.as_mut() {
-            speculative_step(engine, &mut active, shared, &mut observed, &mut skipped, eos,
-                transports, runtime, selector, caching, &mut shape, cycle)
-        } else {
-            let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
-            let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
-            let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
-            let timer = Instant::now();
-            engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
-                let (selected, mut poisoned) = select_rows(selector, &logits, &active, &sequences, &starts)?;
-                crate::shared::spark_waves::healthy()?;
-                shape.verify_us = console::us(timer);
-                Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
-                    let token = match poisoned[row].take() {
-                        Some(error) => Err(anyhow::anyhow!(error)),
-                        None => take(request.constraint.as_mut(), selected),
-                    };
-                    finish_row(request, token, eos, &logits, row, caching, engine.library)
-                }).collect::<Vec<bool>>())
-            })
-        };
-        let finished = match step {
-            Ok(finished) => finished,
-            Err(error) => {
-                tracing::warn!("decode step failed: {error:#}");
-                for request in active.drain(..) {
-                    if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
-                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    release(&family, &mut cache, &mut states, &request.placement);
-                }
-                continue;
-            }
-        };
-        for (i, request) in active.iter().enumerate() {
-            let proposal = shape.drafts.get(i).map_or(&[][..], Vec::as_slice);
-            tally.member(&request.ticket, proposal, shape.verified.get(i).copied().unwrap_or(0),
-                &request.history[before[i]..], request.constraint.is_some(), finished[i]);
-        }
-        tally.end(|| {
-            let engine_now = engine.profile.borrow().seconds;
-            let phase = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
-            let emit = 1e6 * cycle.elapsed().as_secs_f64() - shape.draft_us - shape.verify_us;
-            vec![("draft", shape.draft_us), ("verify", shape.verify_us), ("emit", emit),
-                ("router_sync", phase(0)), ("routing", phase(1)), ("experts", phase(2)), ("head", phase(3))]
-        });
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, eos, transports,
+            runtime, &mut lane, &mut active, &mut shared, selector, &family, &mut cache, &mut states, cycle)))?
+            else { continue };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -987,6 +942,111 @@ fn schedule(
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
+    }
+}
+
+/// Lane-owned decode state: V4's only lane (`LaneSupport::One`), with its
+/// observed and skipped draft-policy rounds.
+#[derive(Default)]
+struct DecodeLane {
+    observed: u64,
+    skipped: u64,
+}
+
+/// The lane's commit. V4 commits by position inside the round: a verify
+/// advances each sequence's length by its rows and emission sets it back to the
+/// kept rows; compressor state and the dSpark main KV are addressed by
+/// position, so rejected rows' writes are overwritten when their positions are
+/// processed again. Nothing remains to enqueue, wait for or drain here.
+struct Committed;
+
+impl LaneCommit for Committed {
+    fn begin(&mut self) -> Result<()> { Ok(()) }
+    fn ready(&mut self) -> Result<bool> { Ok(true) }
+    fn publish(&mut self) -> Result<()> { Ok(()) }
+    fn abort_and_drain(&mut self) -> Result<()> { Ok(()) }
+}
+
+/// One round of lane 0: (speculative) verify or decode on the lane's decode
+/// links, select, emit and commit. `None` when the step failed and its
+/// requests were released.
+#[allow(clippy::too_many_arguments)]
+async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, eos: u32,
+    transports: &mut [crate::shared::spark_intake::SparkLink<'_>], runtime: &tokio::runtime::Runtime,
+    lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<SharedPolicy>,
+    selector: &mut TokenSelector<'_>, family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
+    states: &mut Vec<usize>, cycle: Instant) -> Result<Option<Vec<bool>>> {
+    let mut tally = console::Step::begin(lease.index());
+    let engine_before = tally.live().then(|| engine.profile.borrow().seconds);
+    let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
+    let mut shape = StepShape::default();
+    let caching = cache.enabled();
+    // Undrafted rounds use the same route and resource observations.
+    let step = if let Some(shared) = shared.as_mut() {
+        speculative_step(engine, active, shared, &mut lane.observed, &mut lane.skipped, eos,
+            transports, runtime, selector, caching, &mut shape, cycle)
+    } else {
+        let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
+        let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+        let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
+        let timer = Instant::now();
+        engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
+            let (selected, mut poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
+            crate::shared::spark_waves::healthy()?;
+            shape.verify_us = console::us(timer);
+            Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
+                let token = match poisoned[row].take() {
+                    Some(error) => Err(anyhow::anyhow!(error)),
+                    None => take(request.constraint.as_mut(), selected),
+                };
+                finish_row(request, token, eos, &logits, row, caching, engine.library)
+            }).collect::<Vec<bool>>())
+        })
+    };
+    let finished = match step {
+        Ok(finished) => finished,
+        Err(error) => {
+            tracing::warn!("decode step failed: {error:#}");
+            for request in active.drain(..) {
+                if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                release(family, cache, states, &request.placement);
+            }
+            return Ok(None);
+        }
+    };
+    lanes::commit(&mut Committed).await?;
+    for (i, request) in active.iter().enumerate() {
+        let proposal = shape.drafts.get(i).map_or(&[][..], Vec::as_slice);
+        tally.member(&request.ticket, proposal, shape.verified.get(i).copied().unwrap_or(0),
+            &request.history[before[i]..], request.constraint.is_some(), finished[i]);
+    }
+    tally.end(|| {
+        let engine_now = engine.profile.borrow().seconds;
+        let phase = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
+        let emit = 1e6 * cycle.elapsed().as_secs_f64() - shape.draft_us - shape.verify_us;
+        vec![("draft", shape.draft_us), ("verify", shape.verify_us), ("emit", emit),
+            ("router_sync", phase(0)), ("routing", phase(1)), ("experts", phase(2)), ("head", phase(3))]
+    });
+    Ok(Some(finished))
+}
+
+#[cfg(test)]
+mod lane_tests {
+    #[test]
+    fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
+        let source = include_str!("serve.rs");
+        let schedule = source.split_once("\nfn schedule(").unwrap().1
+            .split_once("\n/// Lane-owned decode state").unwrap().0;
+        // One lane (`LaneSupport::One`): every decode round, and only it, runs on the set.
+        assert_eq!(schedule.matches("lanes.run_one(|lease| decode_round(lease,").count(), 1);
+        assert!(!schedule.contains("lanes.run(") && !schedule.contains("lanes.join("));
+        assert!(!schedule.contains("speculative_step(") && !schedule.contains("engine.decode_device("),
+            "no private decode round remains");
+        let round = source.split_once("\nasync fn decode_round").unwrap().1
+            .split_once("\n#[cfg(test)]").unwrap().0;
+        assert!(round.contains("console::Step::begin(lease.index())"));
+        assert!(round.contains("lanes::commit(&mut Committed).await?;"));
     }
 }
 
