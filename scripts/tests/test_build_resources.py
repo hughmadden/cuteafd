@@ -912,3 +912,43 @@ def test_context_hook_initializes_stream_under_host_guard(tmp_path, monkeypatch)
     finally:
         for callback in callbacks:
             callback()
+
+
+def test_measured_footprint_updates_shared_charge_and_live_lease(tmp_path, monkeypatch):
+    import types
+    monkeypatch.setattr(export.resource, 'getrusage', lambda kind: types.SimpleNamespace(ru_maxrss=3072 * 1024))
+    monkeypatch.setattr(export, 'host_allocatable_memory', lambda: 110000 * 1024**2)
+    cuda = types.SimpleNamespace(max_memory_allocated=lambda: 768 * 1024**2,
+                                 max_memory_reserved=lambda: 1024 * 1024**2)
+    lease = (tmp_path / 'context.0.lock').open('w+')
+    lease.write('1536')
+    lease.flush()
+    monkeypatch.setattr(export, '_context_lease', lease)
+    try:
+        text = export._record_footprint(types.SimpleNamespace(cuda=cuda), tmp_path, 120000)
+        assert 'rss_peak=3072 MiB' in text
+        assert 'torch_allocated_peak=768 MiB' in text
+        assert 'torch_reserved_peak=1024 MiB' in text
+        assert (tmp_path / 'context-footprint-mib').read_text() == '4096'
+        assert (tmp_path / 'context.0.lock').read_text() == '4096'
+        assert 'init_dip=10000 MiB' in text
+        (tmp_path / 'context-footprint-mib').write_text('8192')
+        export._record_footprint(types.SimpleNamespace(cuda=cuda), tmp_path, 120000)
+        assert (tmp_path / 'context-footprint-mib').read_text() == '8192'
+    finally:
+        lease.close()
+
+
+def test_discrete_context_hook_preserves_existing_lazy_initialization(tmp_path, monkeypatch):
+    import types
+    events = []
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setattr(export, '_gb10_host', lambda: False)
+    cuda = types.SimpleNamespace(_lazy_init=lambda: events.append('torch'))
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(export, 'context_admission', lambda: events.append('admit'))
+    monkeypatch.setattr(export, 'gpu_admission', lambda: events.append('gpu'))
+    export.install_context_admission()
+    cuda._lazy_init()
+    assert events == ['admit', 'gpu', 'torch']
+    assert not (tmp_path / 'context-init.lock').exists()
