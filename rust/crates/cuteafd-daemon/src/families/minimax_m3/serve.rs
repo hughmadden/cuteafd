@@ -72,12 +72,12 @@ pub(crate) struct ServeArgs {
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
-    /// Lanes a Spark prefill chunk runs in, each with its own Spark exchange in flight while the
-    /// other lanes' GPU layers run (1 to 4): a chunk of up to lanes x --prefill-rows rows. The
-    /// lanes share one set of attention temporaries; each holds its own rank connections and rings.
-    #[arg(long, default_value_t = prefill_lanes::DEFAULT_PREFILL_LANES,
+    /// Spark waves a prefill chunk keeps in flight (1 to 4): the chunk runs in up to this many
+    /// lanes of --prefill-rows rows, each lane's routed wave in flight on the one Spark link while
+    /// the other lanes' GPU layers run. --prefill-lanes is a deprecated alias.
+    #[arg(long, alias = "prefill-lanes", default_value_t = prefill_lanes::DEFAULT_PREFILL_LANES,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_lanes::MAX_PREFILL_LANES as u64))]
-    prefill_lanes: usize,
+    prefill_waves: usize,
     /// Project every prefill row's logits (prefill-shaped probe scoring);
     /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
@@ -200,19 +200,21 @@ pub(super) struct Runtime<'a> {
 
 /// The start-up after admission, shared by serve and golden: Spark worker admission runs while
 /// the target weights, token embedding and local experts load, then the KV cache is allocated and
-/// the Spark exchange connects (one connection set per prefill lane).
-pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
+/// the Spark link connects (one connection per rank; one return slot per prefill lane).
+pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, device: i32,
     programs: &'a cuteafd_ffi::programs::Programs<'a>, start: Start<'_>) -> Result<Runtime<'a>> {
+    let library = library_owner.as_ref();
     let Start { snapshot, checkpoint, cfg, sizing, ledger, cache, local_layers, spark_layers, peers, catalog,
         package, embed, available, draft } = start;
     let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.rows)?, ingress: SparkIngress::Bf16 };
-    let config = TcpTransportConfig::default();
+    let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
+    // One link carries decode and every prefill lane's waves: one persistent client per rank.
     let pending = if spark_layers.is_empty() { None } else {
         let working = SparkWorkingSet { rtx_layers: local_layers.to_vec(), spark_layers: spark_layers.to_vec(),
-            spark_ranks: peers.len(), prefill_lanes: sizing.lanes as u64 };
+            spark_ranks: peers.len(), prefill_lanes: 1 };
         Some(SparkAdmission::plan(snapshot, ExpertGeometry::MINIMAX_M3, Some(catalog), &working, peers.len(), None,
             ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, endpoint.capacity,
-                spark_rings(config.max_frame_bytes)?, sizing.lanes)?)?.start(peers)?)
+                spark_rings(config.max_frame_bytes)?, 1)?)?.start(peers)?)
     };
     let buffer = |name: &str| -> Result<Allocation<'a>> {
         let bytes = ledger.bytes(name).with_context(|| format!("MiniMax {name} admission"))?;
@@ -251,9 +253,9 @@ pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
     let spark = match spark_layers.first() {
         None => None,
         Some(&first) => {
-            cuteafd_transport::worker_selection::require_peer_clients(peers, endpoint, sizing.lanes)?;
-            Some(super::routed::Spark::connect(library, device, SparkWorld::canonical(peers.len())?, peers,
-                sizing.rows, config, first, request, sizing.lanes, sizing.host_landing)?)
+            cuteafd_transport::worker_selection::require_peer_clients(peers, endpoint, 1)?;
+            Some(super::routed::Spark::connect(library_owner, device, SparkWorld::canonical(peers.len())?, peers,
+                sizing.rows, config, first, request, sizing.lanes)?)
         }
     };
     let routed = if local.is_none() && spark.is_none() {None} else {Some(Routed::new(local, spark)?)};
@@ -272,9 +274,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         .map_err(|_| MiniMaxError::Invalid("expert geometry already installed"))?;
     let library = Arc::new(cuteafd_ffi::minimax::load_library(&args.native_lib)?);
     library.cuda_set_device(args.device)?;
+    super::routed::require_device_landing(&library, args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
-    let (rows, sequences, lanes) = (args.prefill_rows as usize, args.max_sequences as usize, args.prefill_lanes);
+    let (rows, sequences, lanes) = (args.prefill_rows as usize, args.max_sequences as usize, args.prefill_waves);
     let chunk = prefill_lanes::lane_capacity(lanes, rows, cuteafd_loader::families::minimax_m3::cache::PAGE_ROWS as usize);
     let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::plan::families::minimax::admission::default_draft_rings(
         sequences, rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS)));
@@ -361,22 +364,17 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
             Ok(super::execution::Drafter::Dflash(draft)) => Some(draft.selector_prior()?),
             _ => None,
         } };
-    // Every decode row count the scheduler can form, recorded before ready
-    // against these buffers and this expert owner (the admitted inventory).
-    let graphs = &admitted.graphs;
-    let recorded = execution.warm_graphs(&graphs.keys, backend.embedded.buffer, &cache.layers, cache.pages,
-        &mut *backend.experts.borrow_mut())?;
-    tracing::info!(executables = graphs.keys.len(), measured_bytes = recorded, reserved_bytes = graphs.inventory.bytes(0),
-        bytes_per_executable = recorded.div_ceil(graphs.keys.len().max(1) as u64), reserve = "estimated",
-        "MiniMax startup graph census");
-    anyhow::ensure!(recorded <= graphs.inventory.bytes(0), "MiniMax startup graphs exceed their admitted reserve");
+    // Decode runs eagerly: the Spark exchange's stream waits and writes are never captured, so no
+    // whole step is recorded and serving captures nothing after this point.
+    tracing::info!(graph_keys = admitted.graphs.keys.len(), reserved_bytes = admitted.graphs.inventory.bytes(0),
+        "MiniMax decode runs eagerly; the admitted decode graph reserve stays unused");
     backend.startup_captures.set(Some(cuteafd_ffi::graph_captures()));
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
-        lane_rows=sizing.rows, prefill_lanes=lanes, chunk_rows=chunk, logit_rows=sizing.logit_rows, draft_rings,
+        lane_rows=sizing.rows, prefill_waves=lanes, chunk_rows=chunk, logit_rows=sizing.logit_rows, draft_rings,
         speculator=%args.speculator, draft_bytes,
-        "MiniMax native target; decode replays its startup recordings, prefill uses the MSA index-prefill and attention-extend kernels");
+        "MiniMax native target; decode runs eagerly, prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator!="off" {
         scheduler::Drafts::Neural {depth:args.draft_fixed.map_or(7,usize::from),fixed:args.draft_fixed.is_some()}
     } else {scheduler::Drafts::None};
@@ -388,11 +386,6 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeLimits};
     args.validate()?;
-    // Every MiniMax deployment reaches its routed experts over Spark (validate requires the
-    // peers), and MiniMax is not on the v4 Spark exchange yet: refuse before loading anything.
-    if !args.peers.is_empty() {
-        return Err(MiniMaxError::Unsupported(super::routed::SPARK_EXCHANGE_PENDING).into());
-    }
     let snapshot = args.snapshot.clone();
     let encoding = ModelEncoding::MiniMaxM3(Arc::new(cuteafd_api::openai::chat::minimax_m3::MiniMaxEncoding::from_snapshot(&snapshot)?));
     let eos = encoding.eos_token_ids();
@@ -457,6 +450,21 @@ mod tests {
         let Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) = parse("3") else { panic!("depth 3") };
         assert_eq!(a.draft_fixed, Some(3));
         assert!(parse("0").is_err() && parse("8").is_err());
+    }
+
+    /// `--prefill-waves` is the waves the one Spark link keeps in flight (a lane each, today);
+    /// `--prefill-lanes` stays a deprecated alias of it.
+    #[test]
+    fn minimax_prefill_waves_take_the_deprecated_lane_alias() {
+        let waves = |extra: &[&str]| match crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot",
+            "/model", "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2"].into_iter().chain(extra.iter().copied())) {
+            Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) => Some((a.prefill_rows, a.prefill_waves)),
+            _ => None,
+        };
+        assert_eq!(waves(&[]), Some((4096, prefill_lanes::DEFAULT_PREFILL_LANES)));
+        assert_eq!(waves(&["--prefill-rows", "2048", "--prefill-waves", "3"]), Some((2048, 3)));
+        assert_eq!(waves(&["--prefill-lanes", "1"]), Some((4096, 1)));
+        for refused in ["0", "5"] { assert_eq!(waves(&["--prefill-waves", refused]), None, "{refused} waves"); }
     }
 
     #[test]

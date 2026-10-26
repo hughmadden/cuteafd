@@ -588,11 +588,6 @@ fn draft_diagnostics(args: &GoldenArgs, cfg: &MiniMaxM3Config, checkpoint: &Chec
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
-    // Spark-backed goldens need the v4 Spark exchange MiniMax is not on yet; RTX-local and
-    // draft-only goldens (no peers) still run.
-    if !args.peers.is_empty() {
-        return Err(MiniMaxError::Unsupported(super::routed::SPARK_EXCHANGE_PENDING).into());
-    }
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
@@ -649,9 +644,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             ensure!(selected == remote, "golden runner worker layers differ from executed remote layers");
         }
     }
-    // Serve's start-up, without its startup decode recordings: every golden step runs eagerly, so
-    // the gate scores the kernels themselves. A served replay is the same launch sequence
-    // (CUTEAFD_MINIMAX_GRAPH_VERIFY=1 checks replay against eager bit for bit).
+    // Serve's start-up: one Spark link with one return slot (golden runs one lane), and every step
+    // eager, as serving's are.
     let super::serve::Runtime { execution, cache, embedding, token_ids, embedded, routed } =
         super::serve::start(&library, args.device, &programs, super::serve::Start {
             snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &admitted.ledger, cache: &admitted.cache,
