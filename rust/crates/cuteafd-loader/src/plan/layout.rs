@@ -347,7 +347,7 @@ pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8)
         .ok_or(crate::placement::PlacementError::Inventory("Spark execution slots require a family descriptor"))?;
     let slots = decode_lanes.max(descriptor.spark_decode_lanes());
     if !(1..=crate::serving_capacity::prefill_waves::MAX_WAVES).contains(&prefill_waves)
-        || decode_lanes == 0 || slots > cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
+        || decode_lanes == 0 || slots > cuteafd_core::MAX_BUFFERED_PREFILL_UNITS {
         return Err(crate::placement::PlacementError::Inventory("Spark execution slots exceed executor capability"));
     }
     Ok(slots)
@@ -459,7 +459,7 @@ mod selected_spark_io_tests {
     fn execution_slots_follow_descriptor_decode_lanes_not_prefill_waves() {
         for descriptor in crate::plan::family::registry() {
             for waves in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
-                for lanes in 1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
+                for lanes in 1..=cuteafd_core::MAX_BUFFERED_PREFILL_UNITS {
                     assert_eq!(spark_execution_slots(descriptor.id(), waves, lanes).unwrap(),
                         lanes.max(descriptor.spark_decode_lanes()));
                 }

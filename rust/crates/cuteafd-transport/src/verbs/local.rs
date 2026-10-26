@@ -921,10 +921,10 @@ mod budget_tests {
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress,
             SparkRings, SparkRuntimeInventory, SparkSlice};
         let selection = placement_selection(&[13]).with_model(ModelAdmission {
-            capacity: 80, compiled_capacity: 80,
+            executions: crate::worker_selection::SparkExecutions::admit(&[80], 80, 80, 1, &cuteafd_core::EXL3_CAPACITIES)?,
             endpoints: depths.iter().map(|&ring_depth| SparkEndpoint {
                 capacity: 80, ingress: SparkIngress::Bf16, ring_depth }).collect(),
-            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
         })?;
         let report = ModelAdmissionResponse {
             rank: 0, resident_bytes: 1,
