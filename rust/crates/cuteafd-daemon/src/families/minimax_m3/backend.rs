@@ -29,6 +29,13 @@ fn prefix_tier<E: CopyEngine>(layout: FamilyLayout, args: &PrefixArgs,
     Ok(cache)
 }
 
+/// Serving captures no graph after ready: decode runs eagerly (the Spark exchange's stream memory
+/// operations are never captured), so the capture count stays at its ready value.
+fn check_captures(startup: u64, current: u64) -> Result<()> {
+    ensure!(current == startup, "MiniMax zero-steady-capture contract: startup={startup}, current={current}");
+    Ok(())
+}
+
 fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, State, ()>]) -> Result<()> {
     if verified.iter().any(|v| !step.matches(v.placement.sequence, v.start, v.rows)
         || (v.kept.is_none() && !v.finished)) {
@@ -93,7 +100,7 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub rings: RefCell<Rings>,
     pub full_prefill_logits: bool,
     pub trace: RefCell<Option<super::diagnostics::LogitTrace>>,
-    /// Graph captures once the startup recordings finished: serving adds none.
+    /// Graph captures at ready: serving adds none.
     pub startup_captures: std::cell::Cell<Option<u64>>,
     /// DFlash2's keyed selector prior (the scheduler prices its drafts' features); none for DSpark.
     pub selector: Option<scheduler::SelectorPrior>,
@@ -193,10 +200,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn require_live(&self) -> Result<()> {
         self.pending.borrow_mut().take();
-        if let Some(startup) = self.startup_captures.get() {
-            let current = cuteafd_ffi::graph_captures();
-            ensure!(current == startup, "MiniMax zero-steady-capture contract: startup={startup}, current={current}");
-        }
+        if let Some(startup) = self.startup_captures.get() { check_captures(startup, cuteafd_ffi::graph_captures())?; }
         self.execution.drain()
     }
     fn prefill_device(&self, p: &mut Placement, tokens: &[u32], logit_rows: usize,
@@ -309,6 +313,14 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
 mod tests {
     use super::*;
     use scheduler::Placement as _;
+
+    #[test]
+    fn minimax_serving_adds_no_graph_capture_after_ready() {
+        check_captures(0, 0).unwrap();
+        check_captures(7, 7).unwrap();
+        let error = check_captures(7, 8).unwrap_err().to_string();
+        assert!(error.contains("zero-steady-capture") && error.contains("startup=7, current=8"), "{error}");
+    }
 
     #[test]
     fn minimax_prefix_tier_reports_the_admitted_kv_pool_to_the_bench() -> Result<()> {
