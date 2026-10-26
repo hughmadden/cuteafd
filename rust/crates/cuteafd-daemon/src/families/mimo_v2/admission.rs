@@ -332,7 +332,7 @@ pub(super) fn preflight(
     for (rank, &device) in devices.iter().enumerate() {
         let device_id = u32::try_from(device).context("negative CUDA device id")?;
         let (free, total) =
-            crate::shared::peer_split::on_device(library, device, args.device, || {
+            crate::shared::peer_split::on_device(library, device, || {
                 library.cuda_memory_info()
             })?;
         memory.push(DeviceMemory {

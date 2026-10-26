@@ -397,7 +397,7 @@ pub(crate) fn with_engine<T>(
     if let Some(device) = split_device {
         ensure!(device != args.device, "--split-device must differ from --device");
         loaded.library.cuda_enable_peer(device)?;
-        crate::shared::peer_split::on_device(&loaded.library, device, args.device,
+        crate::shared::peer_split::on_device(&loaded.library, device,
             || loaded.library.cuda_enable_peer(args.device))?;
     }
     // One inventory sample per GPU around the family's own program modules
@@ -411,7 +411,7 @@ pub(crate) fn with_engine<T>(
         Ok(())
     })?;
     let peer_stream = match split_device {
-        Some(device) => Some((device, crate::shared::peer_split::on_device(&loaded.library, device, args.device,
+        Some(device) => Some((device, crate::shared::peer_split::on_device(&loaded.library, device,
             || loaded.library.cuda_stream_create())?)),
         None => None,
     };
@@ -449,7 +449,7 @@ pub(crate) fn with_engine<T>(
                 loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
                 &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
                     &[loaded.family, &format!("{}2", loaded.family)]))?;
-            crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
+            crate::shared::peer_split::on_device(&loaded.library, device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending)
                     .saturating_sub(if rank == 0 { embedding_bytes } else { 0 }) }))
@@ -530,7 +530,7 @@ pub(crate) fn with_engine<T>(
                 loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
                 &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
                     &[loaded.family, &format!("{}2", loaded.family)]))?;
-            crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
+            crate::shared::peer_split::on_device(&loaded.library, device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
             })

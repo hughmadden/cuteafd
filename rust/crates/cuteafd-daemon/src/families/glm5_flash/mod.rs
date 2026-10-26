@@ -1773,7 +1773,7 @@ impl Opened {
             let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
             let mut scratch = 0;
             for device in std::iter::once(args.device).chain(split_device) {
-                let bytes = crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                let bytes = crate::shared::peer_split::on_device(&self.library, device, || {
                     let sms = self.library.sm_count()?;
                     let mut bytes = 0;
                     for begin in [0, self.cfg.heads / 2] {
@@ -2184,7 +2184,7 @@ impl Opened {
         // SAFETY: the engine that used the streams is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
         if let Some((device, peer_stream)) = peer_stream {
-            crate::shared::peer_split::on_device(&self.library, device, args.device,
+            crate::shared::peer_split::on_device(&self.library, device,
                 // SAFETY: as above.
                 || unsafe { self.library.cuda_stream_destroy(peer_stream) })?;
         }
