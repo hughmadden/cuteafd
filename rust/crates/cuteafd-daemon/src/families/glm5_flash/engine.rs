@@ -2757,7 +2757,7 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Runs `body` with rank `rank`'s device current (this engine's device again after).
+    /// Runs `body` with rank `rank`'s device current, preserving the caller's device.
     pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
         let device = if rank == 1 { self.peer()?.device } else { self.device };
         crate::shared::memory::device::Device { library: self.library, id: device }.run(body)

@@ -767,7 +767,7 @@ impl<'a> GlmfLoader<'a> {
             return body();
         }
         let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
-        crate::shared::peer_split::on_device(self.library, peer.device, self.device, body)
+        crate::shared::peer_split::on_device(self.library, peer.device, body)
     }
 
     /// `first` (on rank 0) and a device copy of it on every other rank (peer access to rank 0
