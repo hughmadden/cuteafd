@@ -111,9 +111,12 @@ pub(crate) struct ServeArgs {
 }
 impl ServeArgs {
     pub(crate) fn validate(&self) -> Result<Option<usize>> {
-        if self.device < 0 || !matches!(self.peers.len(), 2 | 3 | 4 | 6)
+        // The Spark worlds the expert package ships (the shared Spark-range policy).
+        let worlds = admission::spark_worlds();
+        if self.device < 0 || !worlds.contains(&self.peers.len())
             || self.peers.iter().enumerate().any(|(i, p)| self.peers[..i].contains(p)) {
-            return Err(MiniMaxError::Invalid("one coordinator and distinct TP2/TP3/TP4/TP6 peers required").into());
+            anyhow::bail!("MiniMax serves one coordinator with distinct peers for a Spark world its expert package \
+                ships ({worlds:?}), not {} peers", self.peers.len());
         }
         if self.kv_cache != Qwen4KvCache::Fp8 { return Err(MiniMaxError::Unsupported("BF16 KV has no exported MiniMax kernel").into()); }
         if !matches!(self.speculator.as_str(),"off"|"dspark"|"dflash2") {
@@ -469,9 +472,10 @@ mod tests {
 
     #[test]
     fn minimax_serves_two_three_four_or_six_distinct_spark_ranks() {
-        for count in 0u16..=7 {
+        assert_eq!(admission::spark_worlds(), [2, 3, 4, 6]);
+        for count in 0u16..=8 {
             let mut a=args(); a.peers=(1..=count).map(|port| SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port)).collect();
-            assert_eq!(a.validate().is_ok(), matches!(count, 2 | 3 | 4 | 6), "{count} peers");
+            assert_eq!(a.validate().is_ok(), admission::spark_worlds().contains(&(count as usize)), "{count} peers");
         }
         let mut a=args(); a.peers=vec![a.peers[0]; 6]; assert!(a.validate().is_err());
     }

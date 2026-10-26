@@ -18,6 +18,8 @@ pub enum AdmissionError {
     Overflow(&'static str),
     #[error("MiniMax allocation needs {needed} bytes, available {available}")]
     Budget { needed: u64, available: u64 },
+    #[error("MiniMax admission does not support {ranks} Spark ranks: its expert package ships Spark worlds {worlds:?}")]
+    SparkWorld { ranks: usize, worlds: Vec<usize> },
     #[error(transparent)]
     Cache(#[from] crate::serving_capacity::CacheGeometryError),
 }
@@ -28,6 +30,14 @@ fn sum(values: impl IntoIterator<Item = u64>) -> Result<u64> {
 }
 fn product(values: &[u64]) -> Result<u64> {
     values.iter().try_fold(1u64, |a, b| a.checked_mul(*b).ok_or(AdmissionError::Overflow("product")))
+}
+
+/// The Spark worlds MiniMax's expert package ships, from the shared Spark-range policy
+/// (`plan::experts::spark_worlds`, the recipes `spark_recipe` can build for `minimax:nvfp4`): 2, 3, 4
+/// and 6 for the release's 3072-wide experts. Serve and golden check their peers against it before
+/// the checkpoint is read, so the release geometry fixes the width.
+pub fn spark_worlds() -> Vec<usize> {
+    crate::plan::experts::spark_worlds(super::PACKAGE, cuteafd_core::ExpertGeometry::MINIMAX_M3.intermediate as usize)
 }
 
 /// The prefill shape and Spark exchange one coordinator admits (PLAN "Prefill contract"): `lanes`
@@ -79,8 +89,9 @@ impl RuntimeSizing {
         if self.context == 0 || self.context > cfg.max_position as u64 {
             return Err(AdmissionError::Unsupported("context outside the checkpoint extent"));
         }
-        if !matches!(self.spark_ranks, 0 | 2 | 3 | 4 | 6) {
-            return Err(AdmissionError::Unsupported("expert world outside local, TP2, TP3, TP4 or TP6"));
+        let worlds = crate::plan::experts::spark_worlds(super::PACKAGE, cfg.moe_intermediate);
+        if self.spark_ranks != 0 && !worlds.contains(&self.spark_ranks) {
+            return Err(AdmissionError::SparkWorld { ranks: self.spark_ranks, worlds });
         }
         cfg.release_geometry().map_err(|e| manifest(e.to_string()))
     }
@@ -331,9 +342,10 @@ pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedge
     Ok(Admission { cache, pool_pages, pool_tokens: pool_pages * PAGE_ROWS, cache_bytes, fixed_bytes, total_bytes })
 }
 
-/// The package manifest is selected explicitly; a missing capacity is refused.
+/// The package manifest is selected explicitly; a missing capacity is refused. `world` is the
+/// coordinator's TP1 layout or a Spark world the package ships ([`spark_worlds`]).
 pub fn expert_workspace(manifest_value: &Value, world: usize, rows: usize) -> Result<u64> {
-    if !matches!(world, 1..=4 | 6) { return Err(AdmissionError::Unsupported("expert package TP degree")); }
+    if world != 1 && !spark_worlds().contains(&world) { return Err(AdmissionError::Unsupported("expert package TP degree")); }
     let layout = format!("tp{world}");
     let info = &manifest_value["layouts"][&layout];
     if info["hidden"] != 6144 || info["intermediate"] != 3072 || info["experts"] != 128
@@ -753,12 +765,27 @@ pub(crate) mod tests {
         let programs = ProgramSizes::from_manifest(&programs_manifest(), local).unwrap();
         let ledger = RuntimeLedger::new(&config(), local, &programs).unwrap();
         assert_eq!(ledger.bytes("spark_intake"), Some(256));
-        for spark_ranks in [1, 5, 7] {
-            assert!(RuntimeSizing { spark_ranks, ..local }.validate(&config()).is_err());
+    }
+
+    /// The Spark worlds MiniMax admits are the ones its expert package ships (the shared Spark-range
+    /// policy), not a list of its own: 2, 3, 4 and 6 at the release's 3072-wide experts. Five and
+    /// seven ranks have no recipe; eight would be whole 384-row slices but ship no package.
+    #[test]
+    fn spark_worlds_come_from_the_packaged_recipes() {
+        assert_eq!(spark_worlds(), [2, 3, 4, 6]);
+        assert_eq!(spark_worlds(), crate::plan::experts::spark_worlds(super::super::PACKAGE, config().moe_intermediate));
+        let local = RuntimeSizing { spark_ranks: 0, ..sizing() };
+        assert!(local.validate(&config()).is_ok());
+        for spark_ranks in 1..=8 {
+            let result = RuntimeSizing { spark_ranks, ..local }.validate(&config());
+            assert_eq!(result.is_ok(), spark_worlds().contains(&spark_ranks), "{spark_ranks} ranks");
+            if let Err(error) = result {
+                assert!(matches!(&error, AdmissionError::SparkWorld { ranks, .. } if *ranks == spark_ranks), "{error}");
+                assert!(error.to_string().contains("ships Spark worlds [2, 3, 4, 6]"), "{error}");
+            }
         }
-        for spark_ranks in [2, 3, 4, 6] {
-            assert!(RuntimeSizing { spark_ranks, ..local }.validate(&config()).is_ok());
-        }
+        assert!(matches!(crate::plan::experts::spark_recipe(super::super::PACKAGE, 3072, 8),
+            Err(crate::plan::experts::SparkRecipeRefusal::MissingPackage { world: 8, .. })));
     }
 
     /// Golden's recipe: exactly its layers, no Spark ceiling and no startup graphs, reserving

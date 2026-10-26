@@ -1772,8 +1772,10 @@ if [[ "$family" == step5 ]]; then
     release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"
 fi
 if [[ "$family" == minimax_m3 ]]; then
-  [[ "$backend" != local && "$ranks" =~ ^[2346]$ ]] ||
-    release_die "MiniMax requires Spark TP2, TP3, TP4 or TP6"
+  # MiniMax has no local-expert layout. The plan admits the Spark worlds its expert package ships
+  # (plan::experts::spark_worlds) and refuses any other count by name.
+  [[ "$backend" != local && "$ranks" != 0 ]] ||
+    release_die "MiniMax requires Spark experts (a SPARK_COUNT its expert package ships; cuteafd plan names them)"
   minimax_concurrency="$(get CONCURRENCY 64)"
   # PREFILL_LANES (1-4) lanes of PREFILL_BATCH_TOKENS rows take each prefill chunk, every lane
   # with its own Spark exchange in flight (the engine's default: two lanes of 4096).

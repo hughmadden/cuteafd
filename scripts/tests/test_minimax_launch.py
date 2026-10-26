@@ -84,8 +84,7 @@ def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, k
     ("RTX_EXPERT_LAYERS=58\n", "checkpoint has 57 routed layers"),
     ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
     ("HOST_CACHE_STORE=always\n", "HOST_CACHE_STORE must be on-evict or on-retain"),
-    ("SPARK_COUNT=5\n", "requires Spark TP2, TP3, TP4 or TP6"),
-    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "requires Spark TP2, TP3, TP4 or TP6"),
+    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "MiniMax requires Spark experts"),
     ("CONCURRENCY=65\n", "CONCURRENCY must be 1..64"),
     ("PREFILL_BATCH_TOKENS=4097\n", "PREFILL_BATCH_TOKENS must be 1..4096"),
     ("CONCURRENCY=16\nPREFILL_BATCH_TOKENS=8\n", "CONCURRENCY must not exceed PREFILL_BATCH_TOKENS"),
@@ -99,6 +98,17 @@ def test_minimax_refuses_unsupported_launch(tmp_path, keys, diagnostic):
     result = _launch(tmp_path, keys)
     assert result.returncode != 0
     assert diagnostic in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_minimax_spark_counts_come_from_the_plan(tmp_path):
+    # The launcher sets no list of its own: the plan refuses a count the expert package does not
+    # ship (plan::experts::spark_worlds), and the launch stops on its deployment guard.
+    refusal = "native placement refused: MiniMax admission does not support 5 Spark ranks: its expert package ships Spark worlds [2, 3, 4, 6]"
+    result = _launch(tmp_path, ranks=5, encoder_plan={
+        **PLANNED, "placement_supported": False, "hints": [{"what": refusal, "how": "Choose a packaged world."}]})
+    assert result.returncode != 0
+    assert refusal in result.stderr and "invalid deployment specification" in result.stderr
     assert "docker run -d" not in result.stderr
 
 

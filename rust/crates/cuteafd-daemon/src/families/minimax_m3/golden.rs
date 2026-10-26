@@ -93,9 +93,9 @@ pub(crate) struct GoldenArgs {
 
 fn selection(args: &GoldenArgs) -> Result<Vec<usize>> {
     ensure!(args.last_layer < 60 && args.device >= 0, MiniMaxError::Invalid("golden layer or device"));
-    ensure!(matches!(args.peers.len(), 0 | 2 | 3 | 4 | 6)
+    ensure!((args.peers.is_empty() || super::admission::spark_worlds().contains(&args.peers.len()))
         && args.peers.iter().enumerate().all(|(i, p)| !args.peers[..i].contains(p)),
-        MiniMaxError::Invalid("golden peers require distinct TP2/TP3/TP4/TP6 endpoints"));
+        MiniMaxError::Invalid("golden peers require distinct endpoints of a Spark world the expert package ships"));
     ensure!(args.expert_layers.iter().all(|&l| (3..=args.last_layer).contains(&l))
         && args.expert_layers.windows(2).all(|w| w[0] < w[1]),
         MiniMaxError::Invalid("local expert layers must be increasing executed routed layers"));

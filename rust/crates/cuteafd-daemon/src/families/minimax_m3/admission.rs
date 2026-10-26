@@ -6,7 +6,7 @@ use cuteafd_loader::{
     plan::{checkpoint::Checkpoint, families::minimax::admission::{self, Reservations}},
 };
 use std::path::{Path, PathBuf};
-pub(super) use admission::{LocalLayers, Request, RuntimeLedger, RuntimeSizing};
+pub(super) use admission::{spark_worlds, LocalLayers, Request, RuntimeLedger, RuntimeSizing};
 
 pub(super) struct Admitted {
     pub cache: admission::Admission,
