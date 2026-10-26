@@ -1175,7 +1175,7 @@ wip_remote_export() {
   env_file="$(mktemp "${TMPDIR:-/tmp}/wip-export-env.XXXXXXXX")"
   printf '%s\n' "${coordinator_build[@]}" | grep -E '^CUTEAFD_[A-Z0-9_]+=' >"$env_file"
   printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
-  echo "WIP coordinator export: remote on $host${CUTEAFD_EXPORT_HOST_ADDR:+ ($CUTEAFD_EXPORT_HOST_ADDR)}"
+  echo "WIP coordinator export: remote on $host"
   local layers status=0
   layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"
   "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \

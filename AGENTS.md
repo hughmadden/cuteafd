@@ -133,7 +133,7 @@ before → after tables with conditions.
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
 - Coordinator export placement: `auto` probes a free capped raptor GPU
-  without waiting, then oliver (config `CUTEAFD_EXPORT_HOST`, environment
+  without waiting, then maxq (config `CUTEAFD_EXPORT_HOST`, environment
   override wins), with bounded remote retry and no queued GPU-turn fallback.
   Independent EXL3 variants use bounded spawned workers; all exporters share
   host-wide CPU/context admission. Raptor Ninja CPU jobs are independent of
@@ -367,6 +367,11 @@ facts recorded somewhere for agents working on it.
 Host policy and read-only inventory: [host tuning](docs/host-tuning.md).
 
 ### Hosts
+
+- `maxq`: WSL2 x86-64, RTX PRO 6000 Blackwell Max-Q 96 GB (SM120),
+  reached as `ssh maxq`. Builds, AOT exports, quants, CPU gates and
+  single-GPU correctness only; never perf A/B, cards or serving. Its
+  hardware lock is `~/.cache/cuteafd/maxq.lock` on raptor.
 
 - `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
   power-limited by the gpu-powerd daemon (900 W shared budget, thermal

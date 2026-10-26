@@ -145,15 +145,27 @@ def test_canonical_order_and_unknown_locks():
         hwlock.canonical(['gpu2'])
 
 
+def test_maxq_lock_uses_the_standard_flock_path(lockdir):
+    assert hwlock.canonical(['maxq.lock']) == ['maxq']
+    handles = hwlock._try_flocks(['maxq'])
+    assert handles is not None
+    try:
+        assert (lockdir / 'maxq.lock').is_file()
+        assert hwlock._try_flocks(['maxq']) is None
+    finally:
+        for handle in handles:
+            handle.close()
+
+
 def test_lan_seed_locks_are_known_and_ordered_after_serving_then_export_turns():
     # The LAN-only seeds' leases sort after every serving lock, and each seed's
     # GPU-export turn after every lease: a build holds its lease when it queues
     # for the export, so the turn must come later in the one canonical order.
     assert hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
-    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'oliver')
+    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'maxq')
     assert hwlock.canonical(['cassowary-export', 'kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
         ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary', 'cassowary-export']
-    assert hwlock.canonical(['oliver', 'gpu0']) == ['gpu0', 'oliver']
+    assert hwlock.canonical(['maxq', 'gpu0']) == ['gpu0', 'maxq']
 
 
 def test_hold_stops_waiting_when_cancelled(lockdir, monkeypatch):

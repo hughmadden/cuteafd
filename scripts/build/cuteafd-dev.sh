@@ -131,7 +131,7 @@ elif [[ "$role" != cpu ]]; then
   release_resolve_coordinator_gpu_identity
   # Under hwlock, the GPU this container gets must be one the caller holds: the
   # config (not the environment) selects it, so a mismatch is a wrong config. A
-  # single-GPU host other than raptor (oliver) is locked by its host name.
+  # single-GPU host other than raptor (maxq) is locked by its host name.
   if [[ -n "${CUTEAFD_HW_LOCKS_HELD:-}" && ",$CUTEAFD_HW_LOCKS_HELD," != *",gpu$RELEASE_COORDINATOR_GPU_HOST_INDEX,"* \
       && ",$CUTEAFD_HW_LOCKS_HELD," != *",$(hostname -s),"* ]]; then
     echo "coordinator GPU $RELEASE_COORDINATOR_GPU_HOST_INDEX is not among held locks ($CUTEAFD_HW_LOCKS_HELD); set COORDINATOR_GPU in CUTEAFD_CONFIG" >&2

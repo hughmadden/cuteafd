@@ -10,7 +10,7 @@ ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
 order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, kakapo-export,
-cassowary-export, oliver), so callers that still use plain flock stay excluded (they are
+cassowary-export, maxq), so callers that still use plain flock stay excluded (they are
 just not queued fairly). Exit 75 when the wait expires.
 
 Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
@@ -51,10 +51,10 @@ from pathlib import Path
 # lease's. Each seed's GPU-export turn (SEED-export) comes last: a build takes it
 # while its counting lease on that seed is live (scripts/build/build-resource.py).
 LAN_SEEDS = ('kakapo', 'cassowary')
-# oliver's RTX PRO 6000 Max-Q (SM120, WSL2) runs single-GPU kernel correctness,
-# profiles and same-session A/B, never serving; nothing else is held with it.
+# maxq's RTX PRO 6000 Max-Q (SM120, WSL2) handles builds, AOT exports, quants,
+# CPU gates and single-GPU correctness, never perf A/B, cards or serving.
 ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export' for seed in LAN_SEEDS),
-         'oliver')
+         'maxq')
 LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 POLL_S = 2.0
 # How long a signalled CMD may take to exit (its teardown) before it is killed;

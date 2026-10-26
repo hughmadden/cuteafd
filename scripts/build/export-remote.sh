@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Coordinator native/AOT export on a remote SM120 export host (oliver), with no
+# Coordinator native/AOT export on a remote SM120 export host (maxq), with no
 # GPU turn on raptor. Run from raptor by wip.sh's coordinator native phase.
 #
 #   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_LAYERS
 #
 # STAGING_DIR is wip.sh's frozen source tree; KEY the native key raptor's Rust
 # phase recorded; ENV_FILE the coordinator build scopes (KEY=VALUE lines).
-# Bulk data moves only through sparknest (the remote host's link is a slow
-# per-connection WSL2 vSwitch): the source goes up as one sealed archive
+# Bulk data moves only through sparknest: the source goes up as one sealed archive
 # replicated to HOST, and the export comes back through the existing native
 # tier (build-cache/wip-native/x86_64/coordinator-120/KEY.tar.zst), which
 # wip.sh imports and restores with CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1.
@@ -28,10 +27,8 @@ host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
 # under the key raptor's own build expects.
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "export-remote: bad native key" >&2; exit 2; }
 NO_TURN=75
-# HOST's own ssh configuration (user, identity agent) applies; the address only
-# replaces its route, and the host key is still checked under HOST's name.
-fqdn="${CUTEAFD_EXPORT_HOST_ADDR:-$host}"
-ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o "HostName=$fqdn" -o "HostKeyAlias=$host" "$host")
+# Connect by name using HOST's own ssh configuration.
+ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host")
 run_id="$$-$(date +%s%N)"
 area="/mnt/sparknest/build-cache/export/$key-$run_id"
 archive="/mnt/sparknest/build-cache/wip-native/x86_64/coordinator-120/$key.tar.zst"
