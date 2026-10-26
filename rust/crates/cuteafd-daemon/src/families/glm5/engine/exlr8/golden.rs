@@ -293,13 +293,11 @@ fn native_layer3_same_quant() -> Result<()> {
         let mut transport = transport;
         let peers = engine.peer_workspaces(false, 1)?.context("native gate needs two GPUs")?;
         let w1 = peers.get(0)?;
-        // Retain the admitted serial workspace and drain on both success and error
-        // before with_engine drops transport or native owners.
-        let mut workspaces = engine.lane_workspaces.borrow_mut();
-        if workspaces.is_empty() {
-            workspaces.push(engine.workspace(*ROWS.last().unwrap(), false)?);
-        }
+        // The admitted serial slot (depth 1) on both ranks; drain on both success
+        // and error before with_engine drops transport or native owners.
+        let workspaces = engine.slot_workspaces(1)?;
         let w = &workspaces[0];
+        ensure!(w.rows >= *ROWS.last().unwrap(), "native gate needs {}-row prefill units", ROWS.last().unwrap());
         let result = (|| {
             for rows in ROWS {
                 let h = engine.cfg.hidden;
@@ -549,7 +547,9 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<
                 let mut link = engine.prefill_link.borrow_mut();
                 let link = link.as_mut().context("EXLR8 lane golden needs the prefill link")?;
                 let runtime = engine.prefill_runtime.as_ref().context("prefill runtime")?;
-                let logits = engine.host_logits(engine.step_lanes(tables, chunks, usize::from(last), link, runtime)?)?;
+                // Pinned waves: the admitted depth, at its full unit.
+                let depth = engine.depth.next();
+                let logits = engine.host_logits(engine.step_lanes(tables, chunks, depth, usize::from(last), link, runtime)?)?;
                 if last { pipelined = logits; }
                 else { ensure!(logits.is_none(), "zero-row pipeline prefill returned logits"); }
             }

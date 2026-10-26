@@ -123,7 +123,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn native_scratch<'w>(&self, _rank: usize, w: &'w Workspace<'_>) -> Result<&'w NativeScratch<'w>> {
-        w.native_dense.as_ref().context("lane native dense scratch")
+        w.native_dense.as_deref().context("prefill native dense scratch")
     }
 
     /// `out = x @ W^T` (F32 `[rows, N]`) for native projection `projection` of

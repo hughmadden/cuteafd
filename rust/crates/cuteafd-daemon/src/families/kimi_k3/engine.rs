@@ -249,7 +249,8 @@ impl<'a> Engine<'a> {
         let (state, _) = local.prefix_banks();
         Ok(crate::shared::qwen::scheduler::Geometry { family: "kimi_k3",
             vocab_size: local.config().vocab_size, max_context: local.max_context(),
-            slots: state.slots(), prefill_rows: local.rows(), decode_rows: local.rows().min(64),
+            // A call is whole units at every depth the controller may run (#762).
+            slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
             full_prefill_logits: false })
     }
 

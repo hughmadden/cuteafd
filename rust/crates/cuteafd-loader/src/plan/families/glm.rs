@@ -55,7 +55,10 @@ impl Family for Glm {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, ..Default::default() }
+        // GLM 5 re-cuts its depth per call inside four admitted slots (#762);
+        // GLM Flash keeps its static depth.
+        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill,
+            adaptive: self.id == "glm5", ..Default::default() }
     }
     fn id(&self) -> &'static str {
         self.id

@@ -74,7 +74,7 @@ pub(super) struct GlmContextSplit<'a> {
 /// A view of `bytes` at `offset` inside `dev`.
 fn view(dev: &Dev<'_>, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(offset + bytes <= dev.buffer.bytes, "view of {bytes} B at {offset} past a {} B buffer", dev.buffer.bytes);
-    Ok(GlmEngine::region(dev, offset, bytes))
+    Ok(GlmEngine::region(dev.buffer, offset, bytes))
 }
 
 impl<'a> GlmContextSplit<'a> {

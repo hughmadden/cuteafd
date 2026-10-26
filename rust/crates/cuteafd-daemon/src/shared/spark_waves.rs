@@ -283,36 +283,6 @@ impl LinkPace {
     }
 }
 
-/// Hysteresis over the idle signal at the prefill->decode boundary (#762):
-/// Sparks idle between units (gap above `IDLE_ADD` of a round trip) asks for
-/// one more wave; no gap (below `IDLE_DROP`) for `HOLD` boundaries in a row
-/// tries one fewer. One step at a time, within 1..=`max`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct WaveDepth { pub waves: usize, pub max: usize, quiet: u32 }
-
-impl WaveDepth {
-    pub(crate) const IDLE_ADD: f64 = 0.05;
-    pub(crate) const IDLE_DROP: f64 = 0.01;
-    pub(crate) const HOLD: u32 = 3;
-    pub(crate) fn new(waves: usize, max: usize) -> Self { Self { waves: waves.clamp(1, max.max(1)), max: max.max(1), quiet: 0 } }
-    /// One boundary's observation; returns the recommended wave count.
-    pub(crate) fn observe(&mut self, round_trip_us: u32, idle_us: u32) -> usize {
-        if round_trip_us == 0 { return self.waves; }
-        let share = f64::from(idle_us) / f64::from(round_trip_us);
-        if share > Self::IDLE_ADD {
-            self.quiet = 0;
-            self.waves = (self.waves + 1).min(self.max);
-        } else if share < Self::IDLE_DROP {
-            self.quiet += 1;
-            if self.quiet >= Self::HOLD {
-                self.quiet = 0;
-                self.waves = self.waves.saturating_sub(1).max(1);
-            }
-        } else { self.quiet = 0; }
-        self.waves
-    }
-}
-
 /// What the worker needs from the GPU and the transport; [`Native`] in
 /// serving, a fake in the CPU tests.
 pub(crate) trait Backend {
@@ -1041,9 +1011,6 @@ impl<'a> Waves<'a> {
 
     /// Return slots of the current cut.
     pub(crate) fn waves(&self) -> usize { self.geometry.cut().waves }
-
-    /// The link's running means: (round trip us, Spark idle gap us, waves).
-    pub(crate) fn pace(&self) -> (u32, u32, u32) { self.pace.sample() }
 
     /// Starts a prefill call (#762): every wave sent until
     /// [`Self::end_prefill`] reports its ranks' measured unit pace. Clears the

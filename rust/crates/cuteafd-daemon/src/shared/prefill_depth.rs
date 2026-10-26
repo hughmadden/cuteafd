@@ -9,7 +9,7 @@
 //! [`reserve_rows`], and the Spark prefill owner accepts any unit up to the
 //! admitted one.
 
-use cuteafd_loader::serving_capacity::wave_control::{reserve_rows, Decision, PrefillPace, WaveControl};
+use cuteafd_loader::serving_capacity::wave_control::{call_rows, reserve_rows, Decision, PrefillPace, WaveControl};
 use std::cell::RefCell;
 
 /// The shape of one prefill: `waves` units of at most `unit_rows` in flight.
@@ -42,6 +42,11 @@ impl PrefillDepth {
     pub(crate) fn unit_cap(&self) -> usize { self.unit_cap }
     /// Rows every per-slot plane spans so any depth's slots are views in it.
     pub(crate) fn reserve_rows(&self) -> usize { reserve_rows(self.slots as u64, self.unit_cap as u64) as usize }
+    /// Longest prefill call: whole units at every depth the controller may pick.
+    pub(crate) fn call_rows(&self) -> usize {
+        if self.control.borrow().pinned() { return self.reserve_rows(); }
+        call_rows(self.slots as u64, self.unit_cap as u64) as usize
+    }
 
     /// The shape of the next prefill.
     pub(crate) fn next(&self) -> Depth {
@@ -75,6 +80,8 @@ mod tests {
     fn depths_stay_inside_the_admitted_slots_and_reserve() -> anyhow::Result<()> {
         let depth = PrefillDepth::new(3, 4, 2752, false)?;
         assert_eq!((depth.next(), depth.reserve_rows()), (Depth { waves: 3, unit_rows: 2752 }, 8256));
+        assert_eq!(depth.call_rows(), 8192);
+        assert_eq!(PrefillDepth::new(3, 3, 2752, true)?.call_rows(), 8256);
         let pinned = PrefillDepth::new(2, 4, 4096, true)?;
         let starving = PrefillPace { rows: 60_000, ranks: vec![(1_000_000, 500_000); 6] };
         for _ in 0..4 { pinned.finish(2, &starving); }

@@ -675,25 +675,6 @@ fn pacing_spins_through_the_hybrid_window_before_sleeping() {
     assert!(!Pace::early(None, 0.020));
 }
 
-/// Hysteresis: idle Sparks add one wave per boundary up to the admitted
-/// maximum; a gapless link drops one only after `HOLD` quiet boundaries.
-#[test]
-fn wave_depth_steps_one_wave_with_hysteresis() {
-    let mut depth = WaveDepth::new(2, 4);
-    assert_eq!(depth.observe(13_000, 3_000), 3);
-    assert_eq!(depth.observe(13_000, 3_000), 4);
-    assert_eq!(depth.observe(13_000, 3_000), 4);
-    // Between the thresholds: hold, and reset the quiet run.
-    assert_eq!(depth.observe(13_000, 300), 4);
-    for _ in 1..WaveDepth::HOLD { assert_eq!(depth.observe(13_000, 0), 4); }
-    assert_eq!(depth.observe(13_000, 0), 3);
-    // Unmeasured links never move.
-    assert_eq!(depth.observe(0, 5_000), 3);
-    let mut one = WaveDepth::new(1, 1);
-    for _ in 0..8 { assert_eq!(one.observe(13_000, 13_000), 1); }
-    for _ in 0..8 { assert_eq!(one.observe(13_000, 0), 1); }
-}
-
 /// #762: a prefill call's pace sums every rank's reported busy/idle after
 /// its first unit, counts the rows of those units, and ignores ranks that
 /// report nothing (decode owners) and waves sent outside the call.

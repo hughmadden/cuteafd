@@ -14,10 +14,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    let layers = report.requested_attention == Some(crate::placement::AttentionPlacement::Layers);
     let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
         max_waves: if spark_ranks == 0 { 1 }
-            else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
-                crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
+            else if layers { crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
+        // Owned attention runs one unit per slot at a fixed depth.
+        adaptive: !layers && crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).adaptive,
         ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
     };
     let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
@@ -65,7 +67,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
     }
-    let lanes = prefill.waves;
+    // Admitted slots (#762): every per-slot owner covers the deepest depth.
+    let lanes = prefill.slots;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
@@ -284,7 +287,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let lanes = options.prefill_waves;
+    let lanes = options.prefill_slots.max(options.prefill_waves);
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
@@ -372,11 +375,11 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             gpu_count, rank, cfg.layers, cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim,
             cfg.kv_lora_rank).map_err(anyhow::Error::from)).collect::<anyhow::Result<Vec<_>>>()?
     } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
-    let lanes = options.prefill_waves;
+    let lanes = options.prefill_slots.max(options.prefill_waves);
     let dense_scratch = if native {
         let a8 = options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8;
         let bytes = crate::plan::exlr8::dense::lane_charge_bytes(&cfg, gpu_count, glm::DECODE_ROWS as usize,
-            rows as usize, lanes as usize, a8);
+            rows as usize, a8);
         vec![bytes as u64; gpu_count]
     } else { Vec::new() };
     let mut devices = Vec::new();
@@ -487,7 +490,10 @@ mod tests {
                 let waves = if requested == 0 { planned } else { requested };
                 let rows = if unit != 0 { unit } else if waves > 1 {
                     crate::serving_capacity::prefill_waves::unit_rows(waves) } else { 4096 };
-                assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(rows * waves)), Some(1)));
+                // An unpinned shape admits four slots of its unit inside one reserve (#762).
+                let admitted = if requested == 0 && span.is_none() {
+                    crate::serving_capacity::wave_control::reserve_rows(4, rows) } else { rows * waves };
+                assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(admitted)), Some(1)));
                 assert_eq!(geometry(&native), geometry(&exl3), "{gpus} RTX/{sparks} Sparks");
                 let spec = native.spec.as_ref().unwrap();
                 let moe = spec.moe.as_ref().unwrap();
@@ -539,13 +545,14 @@ mod tests {
                 assert!(records > 0);
                 let context = format!("{gpus} RTX/{sparks} Sparks/{rows} rows/{lanes} lanes");
                 for gpu in 0..gpus {
+                    // Every slot shares one prefill scratch and its records (#762).
                     assert_eq!(scratch(&a16, gpu), (dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
-                        + lanes as usize * dense::scratch_bytes(&cfg, heads, inter, rows as usize)) as u64, "{context}");
-                    assert_eq!(scratch(&a8, gpu), scratch(&a16, gpu) + lanes * records, "{context} gpu {gpu}");
+                        + dense::scratch_bytes(&cfg, heads, inter, rows as usize)) as u64, "{context}");
+                    assert_eq!(scratch(&a8, gpu), scratch(&a16, gpu) + records, "{context} gpu {gpu}");
                 }
                 // The automatic pool takes what is left, so it absorbs the records (never grows) ...
                 assert!(a8_placement.pool_tokens <= a16_placement.pool_tokens, "{context}");
-                assert!(a8_placement.pool_tokens < a16_placement.pool_tokens || records * lanes < 1 << 20, "{context}");
+                assert!(a8_placement.pool_tokens < a16_placement.pool_tokens || records < 1 << 20, "{context}");
                 // ... and with the pool pinned, nothing but the scratch item differs.
                 let pinned = |activations| native_layout(&checkpoint, &LayoutOptions { pool_tokens: Some(1 << 19),
                     exlr8_prefill_activations: activations, ..options.clone() },
@@ -553,7 +560,7 @@ mod tests {
                 let (pinned_a16, pinned_a8) = (pinned(PrefillActivations::A16), pinned(PrefillActivations::A8));
                 assert_eq!(pinned_a8.pool_tokens, 1 << 19, "{context}");
                 for gpu in 0..gpus {
-                    assert_eq!(scratch(&pinned_a8, gpu), scratch(&pinned_a16, gpu) + lanes * records, "{context}");
+                    assert_eq!(scratch(&pinned_a8, gpu), scratch(&pinned_a16, gpu) + records, "{context}");
                 }
                 assert_eq!(rest(&pinned_a8), rest(&pinned_a16), "{context}");
             }

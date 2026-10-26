@@ -50,6 +50,14 @@ pub fn reserve_rows(slots: u64, unit_cap: u64) -> u64 {
     (1..=slots.clamp(1, MAX_WAVES)).map(|k| k * unit_for(k, unit_cap)).max().unwrap_or(0)
 }
 
+/// Rows one prefill call takes so that every candidate depth cuts it into
+/// whole units: the smallest `k * unit_for(k)` over [`candidates`] (8192 for
+/// four slots of 2752: 3 x 2752 cuts it 2752/2752/2688, 4 x 2048 exactly),
+/// never the reserve itself (8256 at 4 x 2048 would cut eight 1088-row units).
+pub fn call_rows(slots: u64, unit_cap: u64) -> u64 {
+    candidates(slots, unit_cap).into_iter().map(|k| k * unit_for(k, unit_cap)).min().unwrap_or(0)
+}
+
 /// The depths worth running under `slots` and `unit_cap`: for each distinct
 /// unit, its deepest depth (more units in flight at the same unit only hide
 /// more turnaround at the same Spark cost per row). Ascending.
@@ -271,6 +279,9 @@ mod tests {
         assert_eq!(WaveControl::new(1, 4, 2752, false).waves(), 3);
         assert_eq!(WaveControl::new(1, 4, 2752, true).waves(), 1);
         assert_eq!(WaveControl::new(9, 2, 4096, false).waves(), 2);
+        // One call is whole units at every candidate depth (never 8 x 1088 at 4 x 2048).
+        assert_eq!((call_rows(4, 2752), call_rows(4, 4096), call_rows(4, 2048), call_rows(3, 2752), call_rows(2, 4096)),
+            (8192, 8192, 8192, 8256, 8192));
     }
 
     #[test]
