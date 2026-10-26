@@ -5640,7 +5640,7 @@ file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
 |---|---|---|
 | DeepSeek V4.1 Flash | min 1 RTX + 3 Sparks; reference 1 RTX + 4 Sparks; max 2 RTX + 6 Sparks | hardware levels |
 | DeepSeek V4 Flash | min; reference 1 RTX + 4 Sparks; max | hardware levels |
-| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6 | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), hardware levels |
+| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6; **EXLR8 max 2 RTX + 6 with A8 prefill (`glm53-exlr8-a8-max`)** | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), A16 vs A8 prefill at max, hardware levels |
 | Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
 | Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
 | Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`); 27B BF16 min 1 RTX, speculation off (`qwen38-27b-bf16-min-nospec`); 27B FP8 min 1 RTX, speculation off (`qwen38-27b-fp8-min-nospec`) | sizes, quants and dSpark vs no speculator (all 0 Sparks, no TP2 card; no MTP comparison card) |
@@ -5650,6 +5650,11 @@ EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
 (`EXLR8_MANIFEST=bit325`, the checkpoint's KL-optimized 3.25 bpw
 manifest; ~75 GB of routed experts per rank at TP4), so the family shows
 the up1-vs-bit325 trade at the same hardware.
+
+The EXLR8 A8 max card (TJ, 2026-10-26) is the max card with
+`EXLR8_PREFILL_ACTIVATIONS=a8`: expert prefill quantizes activations to FP8
+on the compressed-weight paths. It shows the A8 prefill speed and its
+fidelity beside the default A16 max card.
 
 **Retired section** (below the family sections): every model that no
 longer ships keeps its last Release-smoke card, one per row with its
