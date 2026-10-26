@@ -93,6 +93,7 @@ impl<'a> NativeOwners<'a> {
                     cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
+        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
         admit_native(&admission, available, reservations, || {
             let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
@@ -124,7 +125,9 @@ impl<'a> NativeOwners<'a> {
                         Ffn::Dense(DenseFfn::load_plan_in(device, programs, checkpoint, plan, Some((&arena, offset)))?)
                     } else {
                         let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
-                            .with_span(span)?;
+                            .with_span(span)?
+                            .with_expert_format(catalog.as_ref().and_then(|c| c.fp8())
+                                .context("Step-5 native expert headers missing")?.layer_format(layer)?);
                         Ffn::Routed(RoutedFfn::load_in(device, programs, checkpoint, layer, plan, Some((&arena, offset)))?)
                     };
                     ranks[rank].push(Some(Layer { attention, ffn }));
@@ -816,12 +819,12 @@ fn owner_of(execution: &MainExecution<'_, '_>, layer: usize) -> Result<Option<us
 }
 
 fn expert_request(identity: u64, placement_version: u64, layer: usize,
-    rows: Vec<ExpertProtocolV2RowDescriptor>, routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes,
+    dtype: ExpertV2Dtype, rows: Vec<ExpertProtocolV2RowDescriptor>, routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes,
 ) -> Result<ExpertProtocolV2Request> {
     ensure!(identity != 0 && placement_version != 0 && (3..91).contains(&layer),
         "Step-5 routed request identity, placement or target layer");
     let mut request = ExpertProtocolV2Request::new_bytes(identity, placement_version,
-        u32::try_from(layer)?, H as u32, ExpertV2Dtype::Bf16, rows, routes, wire)?;
+        u32::try_from(layer)?, H as u32, dtype, rows, routes, wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
 }
@@ -835,7 +838,9 @@ pub(super) fn bootstrap_request(rows: usize, placement_version: u64) -> Result<E
     let routes = (0..rows * 8).map(|i| ExpertProtocolV2RouteEntry {
         row_index: (i / 8) as u32, expert_id: (i % 352) as u32, gate_weight: 0.,
     }).collect();
-    expert_request(1, placement_version, 3, descriptors, routes, vec![0; rows * H * 2].into())
+    // Bootstrap does not execute a layer: retain BF16-max staging for native tails.
+    expert_request(1, placement_version, 3, ExpertV2Dtype::Bf16, descriptors, routes,
+        vec![0; rows * H * 2].into())
 }
 
 fn check_captures(startup: u64, current: u64) -> Result<()> {
@@ -1004,7 +1009,8 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                     })?;
                     if dispatch {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
-                        let layout = RouteStaging::new(self.rows(), 8, H * 2)?;
+                        let layout = RouteStaging::new(self.rows(), 8, ffn.wire_row_bytes())?;
+                        let dtype = ffn.wire_dtype();
                         let descriptors = self.step.expert_rows(self.kind)?;
                         let ordinal = execution.requests.get();
                         let identity = request_identity(ordinal)?;
@@ -1022,7 +1028,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                             // this lane stream; the copies read them in order.
                             unsafe { exchange.send(rows, layout, [ids, weights, input], meta.stream.raw,
                                 Box::new(move |routes, wire| expert_request(identity, placement_version, layer,
-                                    descriptors, routes, wire))) }
+                                    dtype, descriptors, routes, wire))) }
                         }))?;
                         drop(transport);
                         // The shared expert runs while the worker sends and the Sparks compute.
@@ -1203,12 +1209,16 @@ mod tests {
         let routes = (0..8).map(|expert| ExpertProtocolV2RouteEntry {
             row_index: 0, expert_id: expert, gate_weight: 0.125 }).collect::<Vec<_>>();
         let wire = bytes::Bytes::from(vec![0; H * 2]);
-        let request = expert_request(39, 812, 88, rows.clone(), routes.clone(), wire.clone())?;
+        let request = expert_request(39, 812, 88, ExpertV2Dtype::Bf16, rows.clone(), routes.clone(), wire.clone())?;
         assert_eq!((request.header.request_id, request.header.placement_version, request.header.layer_id), (39, 812, 88));
         assert_eq!(request.rows, rows);
+        let fp8 = expert_request(40, 812, 3, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            rows.clone(), routes.clone(), vec![0; H + H / 32].into())?;
+        assert_eq!(fp8.header.hidden_dtype, ExpertV2Dtype::Fp8E4m3Ue8m0K32);
+        assert_eq!(fp8.header.hidden_row_stride_bytes, (H + H / 32) as u32);
         assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
         for (id, version, layer) in [(0, 812, 88), (39, 0, 88), (39, 812, 2), (39, 812, 91)] {
-            assert!(expert_request(id, version, layer, rows.clone(), routes.clone(), wire.clone()).is_err());
+            assert!(expert_request(id, version, layer, ExpertV2Dtype::Bf16, rows.clone(), routes.clone(), wire.clone()).is_err());
         }
         Ok(())
     }

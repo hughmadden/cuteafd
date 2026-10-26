@@ -150,7 +150,16 @@ impl<'a> Weights<'a> {
                 experts.iter().all(|group| !group.wire_input() || group.bf16_module.is_some())),
         };
         for endpoint in &model.endpoints {
-            let supported = supports_ingress(endpoint.ingress, fp8, bf16);
+            let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Native {
+                match self {
+                    Self::Fp8(experts) => !experts.is_empty() && experts.iter().all(|group| {
+                        use cuteafd_ffi::fp8_moe::Fp8MoeWeights;
+                        let bf16 = matches!(group.module.info().weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4);
+                        group.wire_input() != bf16
+                    }),
+                    _ => false,
+                }
+            } else { supports_ingress(endpoint.ingress, fp8, bf16) };
             ensure!(supported, "loaded Spark backend does not support sealed ingress {:?}", endpoint.ingress);
         }
         Ok(())
@@ -499,6 +508,7 @@ fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) 
     match ingress {
         cuteafd_core::SparkIngress::Fp8K32 => fp8,
         cuteafd_core::SparkIngress::Bf16 => bf16,
+        cuteafd_core::SparkIngress::Native => fp8 || bf16,
         // FP8 remains legal at every row count, including the BF16 decode extent.
         cuteafd_core::SparkIngress::Bf16Decode { .. } => fp8 && bf16,
     }

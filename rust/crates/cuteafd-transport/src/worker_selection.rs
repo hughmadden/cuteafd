@@ -899,6 +899,8 @@ fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
     let ingress = match spec.ingress {
         SparkIngress::Fp8K32 => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         SparkIngress::Bf16 => header.hidden_dtype == ExpertV2Dtype::Bf16,
+        SparkIngress::Native => matches!(header.hidden_dtype,
+            ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32),
         SparkIngress::Bf16Decode { rows } => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32
             || (header.hidden_dtype == ExpertV2Dtype::Bf16 && header.row_count <= rows),
     };
@@ -1183,6 +1185,34 @@ mod tests {
         drop(_seal);
         assert!(reserve_peer_endpoint(peer, &header, None, Some(2)).is_err());
         assert!(reserve_peer_endpoint(peer, &header, None, None)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn native_endpoint_accepts_both_row_types_but_not_other_dtypes_or_layers() -> Result<()> {
+        let mut selection = admission_selection();
+        selection.model.as_mut().unwrap().endpoints[0].ingress = cuteafd_core::SparkIngress::Native;
+        selection.validate()?;
+        let mut header = crate::ExpertProtocolV2RequestHeader {
+            request_id: 1, placement_version: 1, layer_id: 13, row_count: 4096,
+            hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+            hidden_row_stride_bytes: 12288, route_count: 4096 * 8, row_descriptor_bytes: 40,
+            route_bytes: 12, hidden_payload_bytes: 4096 * 12288, flags: 0,
+        };
+        for dtype in [crate::ExpertV2Dtype::Bf16, crate::ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
+            header.hidden_dtype = dtype;
+            validate_endpoint_request(&selection, 0, &header)?;
+        }
+        for dtype in [crate::ExpertV2Dtype::F16, crate::ExpertV2Dtype::F32, crate::ExpertV2Dtype::Fp8Debug] {
+            header.hidden_dtype = dtype;
+            assert!(validate_endpoint_request(&selection, 0, &header).is_err());
+        }
+        header.hidden_dtype = crate::ExpertV2Dtype::Bf16;
+        header.layer_id = 14;
+        assert!(validate_endpoint_request(&selection, 0, &header).is_err());
+        header.layer_id = 13;
+        header.row_count = 4097;
+        assert!(validate_endpoint_request(&selection, 0, &header).is_err());
         Ok(())
     }
 

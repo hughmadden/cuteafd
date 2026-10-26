@@ -3,6 +3,7 @@ use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
+    launch_grid::Fp8QuantizeGrid,
     spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
@@ -19,7 +20,7 @@ use std::ffi::c_void;
 
 /// Builds a gate's Spark request for (layer, rows) from its staged routes and
 /// wire rows, on the link's exchange worker.
-pub(crate) type GateRequest = fn(usize, usize, Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, bytes::Bytes)
+pub(crate) type GateRequest = fn(usize, usize, cuteafd_transport::ExpertV2Dtype, Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, bytes::Bytes)
     -> Result<cuteafd_transport::ExpertProtocolV2Request>;
 
 const H: usize = 4096;
@@ -40,13 +41,14 @@ const ZERO: usize = 10;
 const WIDE: usize = 11;
 const COMBINED: usize = 12;
 const OUTPUT: usize = 13;
+const WIRE: usize = 14;
 
 #[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
     /// Rows of every in-flight unit held by the live planes (`span >= rows`).
     span: usize,
-    planes: [usize; 14],
+    planes: [usize; 15],
     bytes: u64,
     /// A whole-owned (CSA) layer takes the second replicated-reply plane.
     full: bool,
@@ -95,8 +97,14 @@ pub(super) struct RoutedPlan {
     admission: Admission,
     activation: String,
     epsilon: f32,
+    bf16_input: bool,
 }
 impl RoutedPlan {
+    pub(super) fn with_expert_format(mut self, format: cuteafd_loader::formats::fp8_experts::ExpertFormat) -> Self {
+        self.bf16_input = format.bf16_input();
+        self
+    }
+
     pub fn bytes(&self) -> u64 {
         self.admission.bytes
     }
@@ -105,7 +113,7 @@ impl RoutedPlan {
     pub(super) fn with_span(mut self, span: usize) -> Result<Self> {
         ensure!(span >= self.admission.rows, "Step-5 routed span smaller than unit capacity");
         let live = cuteafd_loader::plan::families::step5::native::routed_planes(span)?;
-        for plane in 0..14 {
+        for plane in 0..15 {
             if cuteafd_loader::plan::families::step5::native::routed_live(plane) {
                 self.admission.planes[plane] = live[plane];
             }
@@ -252,11 +260,12 @@ impl RoutedPlan {
             admission,
             activation,
             epsilon: contract.norms.post_attention,
+            bf16_input: true,
         })
     }
 }
 
-fn definitions(activation: &str) -> [(&str, &[&str], &[u8]); 8] {
+fn definitions(activation: &str) -> [(&str, &[&str], &[u8]); 9] {
     [
         (
             "step5_hidden_norm",
@@ -274,6 +283,7 @@ fn definitions(activation: &str) -> [(&str, &[&str], &[u8]); 8] {
         ("step5_shared_down", &["x", "w", "out"], b"i"),
         ("step5_residual_bf16", &["residual", "delta", "out"], b"i"),
         ("step5_residual_f32", &["residual", "delta", "out"], b"i"),
+        ("step5_expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"], b"ii"),
     ]
 }
 
@@ -282,6 +292,8 @@ struct RoutedWeights<'a> {
     programs: Vec<Program<'a>>,
     epsilon: f32,
     layer: usize,
+    bf16_input: bool,
+    quantize_grid: Fp8QuantizeGrid,
 }
 
 pub(super) struct RoutedFfn<'a> {
@@ -328,6 +340,8 @@ impl<'a> RoutedFfn<'a> {
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, plan.admission, std::rc::Rc::new(RoutedWeights {
             weights, programs: resolved, epsilon: plan.epsilon, layer,
+            bf16_input: plan.bf16_input,
+            quantize_grid: Fp8QuantizeGrid::new(device.library.sm_count()?, None)?,
         }), arena)
     }
 
@@ -419,15 +433,16 @@ impl<'a> RoutedFfn<'a> {
         );
         self.frontend_on(rows, stream)?;
         let layer = self.immutable.layer;
-        let layout = crate::shared::experts::staging::RouteStaging::new(rows, 8, 4096 * 2)?;
+        let layout = crate::shared::experts::staging::RouteStaging::new(rows, K, self.wire_row_bytes())?;
+        let dtype = self.wire_dtype();
         let mut link = link.borrow_mut();
         let exchange = link.exchange()?;
         let wave = stream.device.run(|| {
             // SAFETY: the diagnostic owner retains normalized rows and routes
             // through drainage; the copies read them in stream order.
             unsafe {
-                exchange.send(rows, layout, [self.plane(IDS), self.plane(ROUTES), self.plane(NORM)], stream.raw,
-                    Box::new(move |routes, wire| request(layer, rows, routes, wire)))
+                exchange.send(rows, layout, self.wave_inputs(), stream.raw,
+                    Box::new(move |routes, wire| request(layer, rows, dtype, routes, wire)))
             }
         })?;
         self.shared_on(rows, stream)?;
@@ -442,8 +457,17 @@ impl<'a> RoutedFfn<'a> {
         self.finish_on(rows, stream)
     }
 
+    pub fn wire_dtype(&self) -> cuteafd_transport::ExpertV2Dtype {
+        if self.immutable.bf16_input { cuteafd_transport::ExpertV2Dtype::Bf16 }
+        else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 }
+    }
+
+    pub fn wire_row_bytes(&self) -> usize {
+        if self.immutable.bf16_input { H * 2 } else { H + H / 32 }
+    }
+
     pub fn wave_inputs(&self) -> [CuteafdDeviceBuffer; 3] {
-        [self.plane(IDS), self.plane(ROUTES), self.plane(NORM)]
+        [self.plane(IDS), self.plane(ROUTES), self.plane(if self.immutable.bf16_input { NORM } else { WIRE })]
     }
 
     pub fn routed_output(&self) -> CuteafdDeviceBuffer {
@@ -466,7 +490,7 @@ impl<'a> RoutedFfn<'a> {
         self.launch(0, &[p(INPUT), weight, weight, weight, weight, weight, p(NORM)], rows, stream)
     }
 
-    /// Produce native BF16 wire rows and biased top-8 routes without choosing a transport.
+    /// Produce native wire rows and biased top-8 routes without choosing a transport.
     pub fn frontend_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.normalize_on(rows, stream)?;
         let p = |i: usize| self.plane(i).ptr;
@@ -499,6 +523,16 @@ impl<'a> RoutedFfn<'a> {
         })?;
         // The selector mutates only its copy. Recompute official (sigmoid+bias)-bias weights from raw logits.
         self.launch(2, &[p(LOGITS), w(2), p(IDS), p(ROUTES)], rows, stream)?;
+        if !self.immutable.bf16_input {
+            let grid = self.immutable.quantize_grid.blocks(rows, H);
+            stream.device.run(|| {
+                // SAFETY: the admitted wire plane holds packed values and K32 scales;
+                // its source and outputs stay live until stream-ordered staging drains.
+                unsafe { self.immutable.programs[8].launch(
+                    &[p(NORM), p(WIRE), p(WIRE).wrapping_byte_add(H), p(ZERO)],
+                    &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)], stream.raw) }
+            })?;
+        }
         Ok(())
     }
 
@@ -566,6 +600,7 @@ mod tests {
         assert_eq!(one.planes[IDS], 256);
         assert_eq!(one.planes[ZERO], H * 4);
         assert_eq!(one.planes[COMBINED], H * 4);
+        assert_eq!(one.planes[WIRE], H + H / 32);
         assert_eq!(one.bytes, one.planes.iter().sum::<usize>() as u64);
         assert!(Admission::new(0, &[], u64::MAX, &[]).is_err());
         assert!(Admission::new(4097, &[], u64::MAX, &[]).is_err());

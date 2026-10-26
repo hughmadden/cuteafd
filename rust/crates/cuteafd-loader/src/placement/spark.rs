@@ -43,7 +43,8 @@ impl SparkWorkingSet {
                 .ok_or(PlacementError::Inventory("invalid Spark endpoint ring depth"))?;
             let ring = SparkRingGeometry { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment, endpoints: 1 };
-            let bf16 = endpoint.ingress == cuteafd_core::SparkIngress::Bf16;
+            let bf16 = matches!(endpoint.ingress,
+                cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
             let io = self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)?;
             bytes.intake = bytes.intake.max(io.intake);
             if let cuteafd_core::SparkIngress::Bf16Decode { rows } = endpoint.ingress {
