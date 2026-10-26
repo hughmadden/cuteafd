@@ -229,19 +229,24 @@ pub(crate) fn parse_storage_metadata(path: &std::path::Path, bytes: &[u8],
     derived: Option<&Exl3StorageMap>) -> anyhow::Result<Value> {
     use anyhow::{ensure, Context};
     use serde::de::{IgnoredAny, MapAccess, Visitor, Error};
+    // Missing optional fields are allowed, but explicit null still needs validation.
+    fn present<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+    where D: serde::Deserializer<'de>, T: serde::Deserialize<'de> {
+        T::deserialize(de).map(Some)
+    }
     #[derive(serde::Deserialize)]
     struct StoredTensor {
-        #[serde(default)] torch_dtype: Option<String>,
+        #[serde(default, deserialize_with = "present")] torch_dtype: Option<String>,
         #[serde(default)] dtype: Option<String>,
         shape: Vec<usize>,
-        #[serde(default)] n_bytes: Option<u64>,
+        #[serde(default, deserialize_with = "present")] n_bytes: Option<u64>,
     }
     #[derive(serde::Deserialize)]
     struct StorageEntry {
-        #[serde(default)] quant_format: Option<Value>,
+        #[serde(default, deserialize_with = "present")] quant_format: Option<Value>,
         #[serde(default)] bits_per_weight: Option<Value>,
-        #[serde(default)] mcg_multiplier: Option<Value>,
-        #[serde(default)] mul1_multiplier: Option<Value>,
+        #[serde(default, deserialize_with = "present")] mcg_multiplier: Option<Value>,
+        #[serde(default, deserialize_with = "present")] mul1_multiplier: Option<Value>,
         #[serde(default)] stored_tensors: Option<std::collections::HashMap<String, StoredTensor>>,
     }
     struct Storage(std::collections::HashMap<String, StorageEntry>);
@@ -553,6 +558,40 @@ mod tests {
         for bad in ["{\"bits\":4,\"bits\":3}", "{\"tensor_storage\":{},\"tensor_storage\":{}}", "{} trailing"] {
             std::fs::write(&path, bad).unwrap();
             assert!(read_storage_metadata(&path, 1 << 20, None).is_err());
+        }
+    }
+
+    #[test]
+    fn streaming_metadata_distinguishes_missing_optional_fields_from_null() {
+        let path = std::path::Path::new("quantize_config.json");
+        let derived = derive_storage_map(&projection("m.up_proj", 256, 512, 4, &[1])).unwrap();
+        let mut document = serde_json::json!({"tensor_storage": {
+            "m.up_proj": gptqmodel_entry("m.up_proj", 4, 512, 256, serde_json::json!([1])),
+            "m.norm": {}}});
+        document["tensor_storage"]["m.up_proj"].as_object_mut().unwrap().remove("mcg_multiplier");
+        let check = |value: &Value| parse_storage_metadata(path, &serde_json::to_vec(value).unwrap(), Some(&derived));
+        check(&document).unwrap();
+        let mut declared = document.clone();
+        declared["tensor_storage"]["m.up_proj"]["mcg_multiplier"] = serde_json::json!(EXL3_MCG_MULTIPLIER);
+        declared["tensor_storage"]["m.up_proj"]["stored_tensors"]["m.up_proj.trellis"]["n_bytes"] = serde_json::json!(65536);
+        check(&declared).unwrap();
+        for pointer in [
+            "/tensor_storage/m.up_proj/quant_format",
+            "/tensor_storage/m.norm/quant_format",
+            "/tensor_storage/m.up_proj/mcg_multiplier",
+            "/tensor_storage/m.up_proj/mul1_multiplier",
+            "/tensor_storage/m.up_proj/stored_tensors/m.up_proj.trellis/n_bytes",
+            "/tensor_storage/m.up_proj/stored_tensors/m.up_proj.trellis/torch_dtype",
+        ] {
+            let mut corrupt = document.clone();
+            let (parent, field) = pointer.rsplit_once('/').unwrap();
+            corrupt.pointer_mut(parent).unwrap().as_object_mut().unwrap().insert(field.into(), Value::Null);
+            if field == "torch_dtype" {
+                corrupt.pointer_mut(parent).unwrap()["dtype"] = serde_json::json!("int16");
+            }
+            assert!(check(&corrupt).is_err(), "accepted explicit null at {pointer}");
+            assert!(parse_storage_map("quantize_config.json", &corrupt["tensor_storage"]).is_err(),
+                "legacy parser accepted explicit null at {pointer}");
         }
     }
 
