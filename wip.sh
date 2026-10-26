@@ -764,7 +764,7 @@ mkdir -p "$root/home"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 cuteafd_cdi_gpu_args all || exit 2
 args=(
-  run -d --name "$container" --restart no
+  run -d --init --name "$container" --restart no
   --label "io.cuteafd.build-caches=${CUTEAFD_BUILD_CACHES:-on}:${12:?}"
   --user "$(id -u):$(id -g)"
   -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)"
