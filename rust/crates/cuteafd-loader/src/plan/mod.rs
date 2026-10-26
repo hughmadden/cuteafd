@@ -540,9 +540,23 @@ impl PlanInput {
 
     /// Exclusive wall times; first-use checkpoint/catalog work is charged once.
     pub fn plan_with_timings(&self, options: &PlanOptions) -> (Result<PlanReport, PlanError>, PlanTimings) {
+        self.with_timings(options, || plan_of(self, options))
+    }
+
+    pub fn exlr8_native_plan(&self, selected: &str, options: &PlanOptions,
+        speculator: &str) -> anyhow::Result<exlr8::NativePlan> {
+        self.exlr8_native_plan_with_timings(selected, options, speculator).0
+    }
+
+    pub fn exlr8_native_plan_with_timings(&self, selected: &str, options: &PlanOptions,
+        speculator: &str) -> (anyhow::Result<exlr8::NativePlan>, PlanTimings) {
+        self.with_timings(options, || exlr8::native_plan_of(self, selected, options, speculator))
+    }
+
+    fn with_timings<T>(&self, options: &PlanOptions, operation: impl FnOnce() -> T) -> (T, PlanTimings) {
         let before = self.phases.snapshot();
         let start = Instant::now();
-        let result = plan_of(self, options);
+        let result = operation();
         let elapsed = start.elapsed();
         let after = self.phases.snapshot();
         let [catalog, layout, admission] = std::array::from_fn(|i| Duration::from_nanos(after[i].saturating_sub(before[i])));
