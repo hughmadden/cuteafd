@@ -344,8 +344,8 @@ impl Family for Step5 {
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
         PrefillLimits { initial_unit_rows: Some(2048), estimate: PrefillEstimate::MeasuredWaves {
-            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
-            source: "https://github.com/tpurtell/cuteafd/pull/791; fixed2048 k3 preserves prefill parity with one owner, S/T not recorded",
+            waves: 4, reference_ranks: 6, larger_topology_waves: 4,
+            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6412873210; fixed2048 k4 wins the four-arm prefill oracle with one owner",
         }, ..Default::default() }
     }
     fn id(&self) -> &'static str { "step5" }

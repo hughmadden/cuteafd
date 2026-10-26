@@ -718,7 +718,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let r = report_context(dir.path(), 2, 96, 6, Some(262_144), 262_144);
     assert!(r.wip_launchable(), "{:?}", r.hints);
     assert_eq!((r.prefill_unit_rows, r.prefill_waves, r.prefill_span_rows),
-        (Some(2048), Some(3), Some(6144)));
+        (Some(2048), Some(4), Some(8192)));
     assert!(!r.executable());
     assert!(r.native_serving_admitted);
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
@@ -776,10 +776,10 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint's frames hold one unit; the intake holds all live waves.
-        // The measured k3/2048 preference leaves unused reserve, not smaller hard caps.
+        // The measured k4/2048 preference fills the row reserve, with one scratch owner.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
         assert_eq!(rows, 2048);
-        assert_eq!(result.prefill_waves, Some(3));
+        assert_eq!(result.prefill_waves, Some(4));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
         let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
@@ -1285,7 +1285,7 @@ fn measured_initial_unit_is_step_only_and_preserves_explicit_shapes() {
     assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows), (4096, 4, 8256));
     for ranks in [4, 6] {
         assert_eq!(prefill_shape(ranks, limits, Default::default()).unwrap(),
-            PrefillPlan { unit_rows: 2048, waves: 3, span_rows: 6144 });
+            PrefillPlan { unit_rows: 2048, waves: 4, span_rows: 8192 });
         for (unit, waves) in [(256, 3), (2752, 3), (4096, 2)] {
             assert_eq!(prefill_shape(ranks, limits, PrefillOverrides {
                 unit_rows: Some(unit), waves: Some(waves), span_rows: None,
