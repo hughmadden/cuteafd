@@ -210,48 +210,100 @@ pub fn derive_storage_map<'a>(
     Ok(map)
 }
 
-/// Keep compact configuration fields, streaming the per-tensor map instead of
-/// retaining its million-node JSON tree. When supplied, headers remain the authority.
+/// Keep compact fields, decoding storage entries into typed metadata when cross-checking.
+/// The safetensors headers remain authoritative; no per-module JSON tree is built.
 pub(crate) fn read_storage_metadata(path: &std::path::Path, limit: u64,
     derived: Option<&Exl3StorageMap>) -> anyhow::Result<Value> {
     use anyhow::{ensure, Context};
-    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor, Error};
     use std::io::Read;
-    struct Storage<'a> { file: &'a str, derived: &'a Exl3StorageMap }
-    impl<'de> DeserializeSeed<'de> for Storage<'_> {
-        type Value = ();
-        fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<(), D::Error> {
-            de.deserialize_map(self)
-        }
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+    ensure!(size <= limit, "{} exceeds metadata size limit", path.display());
+    let mut bytes = Vec::with_capacity(usize::try_from(size)?.checked_add(1).context("metadata size overflow")?);
+    file.take(limit.checked_add(1).context("metadata limit overflow")?).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "{} exceeds metadata size limit", path.display());
+    parse_storage_metadata(path, &bytes, derived)
+}
+
+pub(crate) fn parse_storage_metadata(path: &std::path::Path, bytes: &[u8],
+    derived: Option<&Exl3StorageMap>) -> anyhow::Result<Value> {
+    use anyhow::{ensure, Context};
+    use serde::de::{IgnoredAny, MapAccess, Visitor, Error};
+    #[derive(serde::Deserialize)]
+    struct StoredTensor {
+        #[serde(default)] torch_dtype: Option<String>,
+        #[serde(default)] dtype: Option<String>,
+        shape: Vec<usize>,
+        #[serde(default)] n_bytes: Option<u64>,
     }
-    impl<'de> Visitor<'de> for Storage<'_> {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("EXL3 tensor_storage map") }
-        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
-            let mut seen = std::collections::BTreeSet::new();
-            let mut entries = 0;
-            while let Some(name) = map.next_key::<String>()? {
-                let entry: Value = map.next_value()?;
-                entries += 1;
-                let declared = parse_storage_map(self.file, &serde_json::json!({&name: entry}))
-                    .map_err(M::Error::custom)?;
-                if let Some(value) = declared.get(&name) {
-                    let Some((key, actual)) = self.derived.get_key_value(&name) else {
-                        return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: the map lists this module; the checkpoint has no such EXL3 tensors", self.file)));
-                    };
-                    if !seen.insert(key.as_str()) { return Err(M::Error::custom(format!("duplicate EXL3 module {name}"))); }
-                    if value != actual {
-                        return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: map {}, headers {}",
-                            self.file, describe_module(value), describe_module(actual))));
+    #[derive(serde::Deserialize)]
+    struct StorageEntry {
+        #[serde(default)] quant_format: Option<Value>,
+        #[serde(default)] bits_per_weight: Option<Value>,
+        #[serde(default)] mcg_multiplier: Option<Value>,
+        #[serde(default)] mul1_multiplier: Option<Value>,
+        #[serde(default)] stored_tensors: Option<std::collections::HashMap<String, StoredTensor>>,
+    }
+    struct Storage(std::collections::HashMap<String, StorageEntry>);
+    impl<'de> serde::Deserialize<'de> for Storage {
+        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+            struct Entries;
+            impl<'de> Visitor<'de> for Entries {
+                type Value = Storage;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("EXL3 tensor_storage map") }
+                fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Storage, M::Error> {
+                    let mut entries = std::collections::HashMap::new();
+                    while let Some((name, entry)) = map.next_entry::<String, StorageEntry>()? {
+                        if entries.insert(name.clone(), entry).is_some() {
+                            return Err(M::Error::custom(format!("duplicate EXL3 module {name}")));
+                        }
                     }
+                    Ok(Storage(entries))
                 }
             }
-            if entries == 0 { return Err(M::Error::custom("tensor_storage missing or empty")); }
-            if let Some(name) = self.derived.keys().find(|name| !seen.contains(name.as_str())) {
-                return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: the checkpoint stores this EXL3 module; the map does not list it", self.file)));
-            }
-            Ok(())
+            de.deserialize_map(Entries)
         }
+    }
+    fn check_storage(file: &str, storage: Storage, derived: &Exl3StorageMap) -> anyhow::Result<()> {
+        ensure!(!storage.0.is_empty(), "tensor_storage missing or empty");
+        let actual: std::collections::HashMap<&str, &Exl3Module> = derived.iter().map(|(name, module)| (name.as_str(), module)).collect();
+        let mut seen = std::collections::HashSet::with_capacity(actual.len());
+        let mut entries = storage.0.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (name, entry) in entries {
+            let Some(format) = entry.quant_format else { continue };
+            ensure!(format == "exl3", "{file} at {name}: quant_format {format} (expected exl3)");
+            let module = actual.get(name.as_str()).with_context(|| format!("{file} disagrees with the safetensors headers at {name}: the map lists this module; the checkpoint has no such EXL3 tensors"))?;
+            if let Some(multiplier) = &entry.mcg_multiplier {
+                ensure!(multiplier.as_u64() == Some(EXL3_MCG_MULTIPLIER), "{name}.mcg: MCG multiplier {multiplier} (the decoders implement 0xCBAC1FED)");
+                ensure!(module.codebook == Exl3Codebook::Mcg, "{file} at {name}: declared multiplier disagrees with header codebook marker");
+            }
+            if let Some(multiplier) = &entry.mul1_multiplier {
+                ensure!(multiplier.as_u64() == Some(EXL3_MUL1_MULTIPLIER), "{file} at {name}: unsupported MUL1 multiplier {multiplier}");
+                ensure!(module.codebook == Exl3Codebook::Mul1, "{file} at {name}: declared multiplier disagrees with header codebook marker");
+            }
+            ensure!(entry.bits_per_weight.as_ref().and_then(Value::as_u64) == Some(module.bits as u64),
+                "{file} disagrees with the safetensors headers at {name}: map K{} (bits_per_weight {}) headers K{}",
+                entry.bits_per_weight.as_ref().unwrap_or(&Value::Null), entry.bits_per_weight.as_ref().unwrap_or(&Value::Null), module.bits);
+            let tensors = entry.stored_tensors.with_context(|| format!("{file} at {name}: no stored_tensors"))?;
+            ensure!(tensors.len() == module.tensors.len(), "{file} disagrees with the safetensors headers at {name}: stored tensor count");
+            for (tensor_name, tensor) in tensors {
+                let suffix = tensor_name.strip_prefix(&name).and_then(|rest| rest.strip_prefix('.'))
+                    .with_context(|| format!("{file} at {name}: stored tensor {tensor_name} belongs to another module"))?;
+                let header = module.tensors.get(suffix).with_context(|| format!("{file} at {name}: unexpected tensor {tensor_name}"))?;
+                let dtype_text = tensor.torch_dtype.or(tensor.dtype).with_context(|| format!("{tensor_name} has no dtype"))?;
+                let dtype = dtype_from_map(&dtype_text).with_context(|| format!("{tensor_name} has unknown dtype {dtype_text}"))?;
+                let bytes = tensor.shape.iter().try_fold(dtype_bytes(&dtype), |bytes, dim| bytes.checked_mul(*dim as u64)).context("stored tensor bytes overflow")?;
+                ensure!(tensor.n_bytes.is_none_or(|declared| declared == bytes), "{tensor_name}: n_bytes disagrees with dtype/shape");
+                ensure!(dtype == header.dtype && tensor.shape == header.shape,
+                    "{file} disagrees with the safetensors headers at {name}: map {suffix} {} {:?}, headers {suffix} {} {:?}", dtype_label(&dtype), tensor.shape, dtype_label(&header.dtype), header.shape);
+            }
+            seen.insert(name);
+        }
+        if let Some(name) = derived.keys().find(|name| !seen.contains(name.as_str())) {
+            anyhow::bail!("{file} disagrees with the safetensors headers at {name}: the checkpoint stores this EXL3 module; the map does not list it");
+        }
+        Ok(())
     }
     struct Metadata<'a> { file: &'a str, derived: Option<&'a Exl3StorageMap> }
     impl<'de> Visitor<'de> for Metadata<'_> {
@@ -265,7 +317,8 @@ pub(crate) fn read_storage_metadata(path: &std::path::Path, limit: u64,
                     if storage { return Err(M::Error::custom("duplicate tensor_storage")); }
                     storage = true;
                     if let Some(derived) = self.derived {
-                        map.next_value_seed(Storage { file: self.file, derived })?;
+                        let storage = map.next_value::<Storage>()?;
+                        check_storage(self.file, storage, derived).map_err(M::Error::custom)?;
                         fields.insert(key, Value::Bool(true));
                     } else { map.next_value::<IgnoredAny>()?; }
                 } else {
@@ -279,13 +332,6 @@ pub(crate) fn read_storage_metadata(path: &std::path::Path, limit: u64,
             Ok(Value::Object(fields))
         }
     }
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let size = file.metadata()?.len();
-    ensure!(size <= limit, "{} exceeds metadata size limit", path.display());
-    // Slice parsing avoids serde_json's per-byte Read adapter; no JSON tree is retained.
-    let mut bytes = Vec::with_capacity(usize::try_from(size)?.checked_add(1).context("metadata size overflow")?);
-    file.take(limit.checked_add(1).context("metadata limit overflow")?).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= limit, "{} exceeds metadata size limit", path.display());
     let mut de = serde_json::Deserializer::from_slice(&bytes);
     let label = path.file_name().and_then(|s| s.to_str()).unwrap_or("metadata");
     let result = serde::Deserializer::deserialize_map(&mut de, Metadata { file: label, derived })
