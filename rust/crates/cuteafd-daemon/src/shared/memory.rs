@@ -219,16 +219,12 @@ impl<'a> BlockingWait<'a> {
         };
         // SAFETY: the event belongs to the current device, as does `stream`
         // (the caller's contract); it lives until this wait drops. Polls it
-        // for the first `BLOCK_SPIN` (a per-layer router completes within
-        // that, and the wake-up of a blocking sync would be on the critical
-        // path), then sleeps in the driver.
+        // for the first `BLOCK_SPIN` (10 ms: every per-layer decode wait
+        // completes within that, and the wake-up of a blocking sync would be
+        // on the critical path), then sleeps in the driver.
         unsafe {
             self.library.cuda_event_record(event, stream)?;
-            let started = std::time::Instant::now();
-            while started.elapsed() < cuteafd_transport::wait_policy::BLOCK_SPIN {
-                if self.library.cuda_event_query(event)? { return Ok(()); }
-                std::hint::spin_loop();
-            }
+            if cuteafd_transport::wait_policy::spin_window(|| self.library.cuda_event_query(event))? { return Ok(()); }
             self.library.cuda_event_synchronize(event)
         }
     }
