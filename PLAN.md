@@ -6008,3 +6008,20 @@ the two-thread streaming audit and evidence live in the readiness cache.
 Non-login SSH admission also resolves WSL's `/usr/lib/wsl/lib/nvidia-smi`
 when it is absent from PATH. The final CPU gate passes 96 cases, including
 both normal Linux and minimal-PATH WSL admission.
+
+The fresh full run started 2026-10-26 19:53 Taipei, attempt
+`1793015633854537011`, at the same production/export paths above. All 282
+weight shards and six configuration/tokenizer assets (1,403.22 GiB) passed
+direct comparison with the pinned HF revision's published SHA-256/Git-blob
+hashes in a 614-second two-thread streaming audit. Fresh CUDA qualification
+passes 16 cases. The real-weight proof finishes normally with 798 calibrated
+projections, byte-exact native/staged target boundaries at 2,205 tokens and
+byte-exact MTP/shared-head norm at 2,204 valid pairs; peak CUDA allocation is
+27.06 GiB. The separate completed-proof audit also passes. The same reserved
+local GPU lease spans qualification and the foreground production supervisor;
+its container guard runs before the lease releases. The immutable numerical
+producer, source revision, token manifest and fork pin are unchanged. Resume
+an interrupted reserved run explicitly with `--resume --foreground
+--use-held-lock` under a newly acquired enclosing lease; ordinary detached
+recovery without a reservation still uses `--resume`. Publication remains
+separate and requires TJ's confirmation once the completed artifact is ready.
