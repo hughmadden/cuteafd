@@ -104,7 +104,7 @@ fn main() -> Result<()> {
                 let mut tp = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
                         timeout: Duration::from_secs(10),
                         max_frame_bytes: 2 * 1024 * 1024,
-                    })?;
+                    }, 0)?;
                 for id in 1..=12 {
                     let rows = [1, 2, 6, 16, 80][(id as usize - 1) % 5];
                     let request = request(rows, id)?;

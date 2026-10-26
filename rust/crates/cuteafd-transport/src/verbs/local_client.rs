@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
     config: TcpTransportConfig,
+    execution_lane: u32,
     sessions: Vec<Option<VerbsHostProtocolV2PersistentClientSession>>,
     /// Bootstrap seals survive a QP reconnect and are never queried per request.
     expert_grouping: Vec<Option<crate::worker_selection::InstalledExpertGrouping>>,
@@ -37,10 +38,7 @@ pub(crate) struct LocalTp4Client {
 }
 impl LocalTp4Client {
     /// Generic peer set for the declared physical rank counts 1 through 6.
-    pub(crate) fn new_ranks(peers: Vec<SocketAddr>, config: TcpTransportConfig) -> Self {
-        Self::with_peers(peers, config)
-    }
-    fn with_peers(peers: Vec<SocketAddr>, config: TcpTransportConfig) -> Self {
+    pub(crate) fn new_ranks(peers: Vec<SocketAddr>, config: TcpTransportConfig, execution_lane: u32) -> Self {
         let world = peers.len();
         // Placed now, before any request is in flight on the fabric.
         let flows = super::flows::FlowSlots::prepare(&peers);
@@ -48,6 +46,7 @@ impl LocalTp4Client {
             flows,
             peers,
             config,
+            execution_lane,
             sessions: (0..world).map(|_| None).collect(),
             expert_grouping: vec![None; world],
             retired: Vec::new(),
@@ -66,6 +65,7 @@ impl LocalTp4Client {
             terminal_released: false,
         }
     }
+    pub(crate) fn execution_lane(&self) -> u32 { self.execution_lane }
     pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
     pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
         anyhow::ensure!(endpoint < 8, "ModelAdmission endpoint index must be below eight");
@@ -133,7 +133,7 @@ impl LocalTp4Client {
         let capacity = self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
             && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0);
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
-            self.peers[rank], &self.config, request, landing,
+            self.peers[rank], &self.config, request, self.execution_lane(), landing,
             if egress { self.egress.as_ref() } else { None },
             self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
         self.retain_grouping(rank)
@@ -512,6 +512,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn independent_local_transports_do_not_collide_on_one_decode_owner() -> Result<()> {
+        use crate::worker_selection::{execution_owner, ExecutionOwner, SparkExecutions};
+        let peers = vec!["127.0.0.1:19454".parse()?];
+        let owners = SparkExecutions::admit(&[64, 64], 1024, 1024, 2, &[1, 80, 1024])?;
+        let mut retained = [false; 2];
+        for lane in 0..2 {
+            let mut client = LocalTp4Client::new_ranks(peers.clone(), TcpTransportConfig::default(), lane as u32);
+            for source in [crate::ExpertV2SourceKind::Decode, crate::ExpertV2SourceKind::MtpVerify] {
+                let owner = execution_owner(&owners, source, client.execution_lane(), 62)?;
+                assert_eq!(owner, ExecutionOwner::Decode(lane));
+            }
+            let ExecutionOwner::Decode(owner) = execution_owner(&owners,
+                crate::ExpertV2SourceKind::MtpVerify, client.execution_lane(), 62)? else { unreachable!() };
+            assert!(!std::mem::replace(&mut retained[owner], true),
+                "Spark execution owner {owner} already retains its admitted 1 units");
+            assert_eq!(execution_owner(&owners, crate::ExpertV2SourceKind::Prefill,
+                client.execution_lane(), 1024)?, ExecutionOwner::Prefill);
+            client.reset();
+            assert_eq!(client.execution_lane(), lane as u32, "reconnect must retain lane identity");
+        }
+        assert_eq!(retained, [true; 2]);
+        Ok(())
+    }
+
+    #[test]
     fn multi_slot_landing_reconnects_only_in_phase() {
         let landing = |slots: usize| Some(DeviceLanding { ptr: 4096, bytes: slots * 12288, slot_bytes: 12288 });
         for waves in 1..=4 {
@@ -543,7 +568,7 @@ mod tests {
             for slot in 0..waves {
                 for gpu in [false, true] {
                     let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig { timing: false,
-                        timeout: Duration::from_millis(200), max_frame_bytes: 1 << 20 });
+                        timeout: Duration::from_millis(200), max_frame_bytes: 1 << 20 }, 0);
                     client.set_max_waves(waves)?;
                     if gpu { client.set_landing(vec![Some(landing)])?; }
                     // As after `slot` dispatches on live sessions that then dropped.
@@ -602,7 +627,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let client = TcpStream::connect(listener.local_addr()?)?;
         let (_server, _) = listener.accept()?;
-        let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default());
+        let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default(), 0);
         transport.retired.push(client);
         let first = transport.drain_retired_with_timeout(Duration::from_millis(10)).unwrap_err();
         let started = Instant::now();
@@ -636,7 +661,7 @@ mod tests {
     #[test]
     fn grouping_without_a_bootstrap_names_the_missing_session() -> Result<()> {
         let peers = ["127.0.0.1:19451".parse()?, "127.0.0.1:19452".parse()?];
-        let client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig::default());
+        let client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig::default(), 0);
         assert!(client.sessions.iter().all(Option::is_none));
         let error = format!("{:#}", client.installed_grouping().unwrap_err());
         assert!(error.contains("rank 0 has no live Spark session"), "{error}");
@@ -648,7 +673,7 @@ mod tests {
     #[test]
     fn explicit_model_endpoint_is_immutable_and_survives_reset() -> Result<()> {
         let peer = "127.0.0.1:19453".parse()?;
-        let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default(), 0);
         assert!(client.bind_model_endpoint(8).is_err());
         assert!(client.model_endpoint.is_none());
         client.bind_model_endpoint(2)?;
@@ -656,7 +681,7 @@ mod tests {
         client.reset();
         assert_eq!(client.model_endpoint, Some(2));
         assert!(client.bind_model_endpoint(1).is_err());
-        let mut unbound = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        let mut unbound = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default(), 0);
         let (_sender, chunks) = tokio::sync::mpsc::unbounded_channel();
         let (_done, completed) = tokio::sync::oneshot::channel();
         unbound.waves.push_back(OpenWave { chunks, done: vec![completed], deadline: None, polls: 0 });
@@ -686,7 +711,7 @@ mod tests {
     fn waves_are_admitted_up_to_the_limit_and_served_oldest_first() -> Result<()> {
         let peers = ["127.0.0.1:19443".parse()?];
         let mut client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig { timing: false,
-            timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 });
+            timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 }, 0);
         assert!(client.set_max_waves(0).is_err() && client.set_max_waves(5).is_err());
         client.set_max_waves(2)?;
         let mut senders = Vec::new();
@@ -720,7 +745,7 @@ mod tests {
         let peers = ["127.0.0.1:19441".parse()?, "127.0.0.1:19442".parse()?];
         let mut client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000,
-        });
+        }, 0);
         let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_completion, completed) = tokio::sync::oneshot::channel();
         client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: Some(Instant::now()), polls: 0 });
@@ -787,7 +812,7 @@ mod tests {
             for registered in [false, true] {
                 for waves in 1..=4usize {
                     let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
-                        timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+                        timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 }, 0);
                     client.set_max_waves(waves)?;
                     if registered { client.enable_egress(plane_bytes)?; }
                     let mut plane = None;
@@ -893,7 +918,7 @@ mod tests {
         let plane_bytes = rows as usize * hidden as usize * 2;
         for registered in [false, true] {
             let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
-                timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+                timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 }, 0);
             if registered { client.enable_egress(plane_bytes)?; }
             let plane = if gpu {
                 let buffer = library.alloc_device_buffer(plane_bytes)?;

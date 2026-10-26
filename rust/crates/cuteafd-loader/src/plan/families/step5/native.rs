@@ -19,6 +19,12 @@ pub struct RankAdmission {
     pub workspace: u64,
 }
 
+pub fn validate_span_rows(rows: usize) -> Result<()> {
+    let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows;
+    ensure!(rows > 0 && rows as u64 <= limit, "Step-5 allocation span must be 1..={limit} rows");
+    Ok(())
+}
+
 pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 16]> {
     ensure!(
         (1..=4096).contains(&rows) && matches!(heads, 32 | 64),
@@ -90,7 +96,7 @@ pub fn csa_planes(rows: usize) -> Result<[usize; 32]> {
 }
 
 pub fn routed_planes(rows: usize) -> Result<[usize; 14]> {
-    ensure!((1..=4096).contains(&rows), "Step-5 routed allocation rows");
+    validate_span_rows(rows)?;
     const E: usize = 352;
     const K: usize = 8;
     const I: usize = 1536;
@@ -114,7 +120,7 @@ pub fn routed_planes(rows: usize) -> Result<[usize; 14]> {
 }
 
 pub fn dense_planes(rows: usize) -> Result<[usize; 6]> {
-    ensure!((1..=4096).contains(&rows), "Step-5 dense allocation rows");
+    validate_span_rows(rows)?;
     Ok([(H, 4), (H, 2), (2 * 13824, 2), (13824, 2), (H, 2), (H, 4)]
         .map(|(width, elem)| (rows * width * elem).max(256)))
 }
@@ -143,13 +149,13 @@ fn region(sizes: &[usize], order: &[usize], start: usize) -> Result<(Vec<(usize,
 /// Live planes hold every in-flight unit's rows (`span` rows, each unit at its
 /// own row offset); FFN scratch is hook-local and holds one unit.
 fn routed_sizes(unit: usize, span: usize) -> Result<[usize; 14]> {
-    ensure!(unit > 0 && unit <= span, "Step-5 FFN unit rows exceed the span");
+    ensure!((1..=4096).contains(&unit) && unit <= span, "Step-5 FFN unit rows exceed kernel capacity or span");
     let (local, live) = (routed_planes(unit)?, routed_planes(span)?);
     Ok(std::array::from_fn(|plane| if ROUTED_LIVE.contains(&plane) { live[plane] } else { local[plane] }))
 }
 
 fn dense_sizes(unit: usize, span: usize) -> Result<[usize; 6]> {
-    ensure!(unit > 0 && unit <= span, "Step-5 FFN unit rows exceed the span");
+    ensure!((1..=4096).contains(&unit) && unit <= span, "Step-5 FFN unit rows exceed kernel capacity or span");
     let (local, live) = (dense_planes(unit)?, dense_planes(span)?);
     Ok(std::array::from_fn(|plane| if DENSE_LIVE.contains(&plane) { live[plane] } else { local[plane] }))
 }
@@ -221,7 +227,7 @@ pub fn head_rows(rows: usize, full_prefill_logits: bool) -> usize {
 }
 
 pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
-    ensure!((1..=4096).contains(&rows), "Step-5 head allocation rows");
+    validate_span_rows(rows)?;
     Ok([rows * H * 2, rows * H * 2, rows * 128896 * 4, 4 << 20])
 }
 
@@ -374,7 +380,7 @@ mod tests {
             assert!(region < usize::try_from(plane_bytes(&routed_planes(rows)?)? + plane_bytes(&dense_planes(rows)?)?)?);
         }
         // Units: live planes span every in-flight unit's rows, scratch holds one unit.
-        for (unit, span) in [(256, 512), (512, 1024), (2048, 4096)] {
+        for (unit, span) in [(256, 512), (512, 1024), (2048, 4096), (4096, 8192), (2752, 8256), (2048, 8192)] {
             let routed = routed_layout(unit, span, true)?;
             let dense = dense_layout(unit, span)?;
             for plane in 0..14 {
@@ -385,8 +391,19 @@ mod tests {
                 let expected = if dense_live(plane) { dense_planes(span)?[plane] } else { dense_planes(unit)?[plane] };
                 assert_eq!(dense[plane].1, expected);
             }
-            assert!(ffn_region_bytes(unit, span)? < ffn_region_bytes(span, span)?);
+            if span <= 4096 { assert!(ffn_region_bytes(unit, span)? < ffn_region_bytes(span, span)?); }
         }
+        let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows as usize;
+        for span in [0, limit + 1, usize::MAX] {
+            assert!(routed_planes(span).is_err());
+            assert!(dense_planes(span).is_err());
+            assert!(head_planes(span).is_err());
+            assert!(routed_layout(512, span, false).is_err());
+            assert!(dense_layout(512, span).is_err());
+        }
+        assert!(routed_planes(limit).is_ok());
+        assert!(dense_planes(limit).is_ok());
+        assert!(head_planes(limit).is_ok());
         assert!(routed_layout(512, 256, false).is_err());
         Ok(())
     }

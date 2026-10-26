@@ -10,40 +10,22 @@ use super::*;
 /// (exact rank I/O and rings are charged from the selected working set).
 const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190), basis: Basis::Calibrated };
 
-/// Both checkpoint formats publish the same slot-owned GLM prefill geometry
-/// before device or host admission. The continuous span owns no workspace.
-///
-/// Unpinned, the topology picks the waves (#762): the 8192-row reserve split
-/// into `planned_waves(spark_ranks)` units of `unit_rows(k)` (3 x 2752 at six
-/// Sparks, 2 x 4096 below). `PREFILL_WAVES` pins k (its unit follows k unless
-/// `PREFILL_ROWS` pins that too); benchmarks and golden runs pin both.
-pub(crate) fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
-    rows: u64, spark_ranks: usize) -> crate::serving_capacity::PrefillShape {
-    use crate::serving_capacity::prefill_waves::{planned_waves, unit_rows};
-    let pinned = if options.prefill_lanes > 0 { Some(options.prefill_lanes) }
-        else if options.prefill_waves > 1 { Some(options.prefill_waves) } else { None };
-    let waves = crate::placement::families::glm5::prefill_lanes(spark_ranks,
-        pinned.unwrap_or_else(|| planned_waves(spark_ranks).max(1)));
-    // Shape::resolve fills prefill_unit_rows from the manifest default when
-    // nothing is pinned; only an explicit PREFILL_ROWS keeps its unit.
-    let unit = if options.prefill_rows > 0 { options.prefill_unit_rows.unwrap_or(rows) }
-        else if waves > 1 { unit_rows(waves) } else { rows };
-    let shape = crate::serving_capacity::PrefillShape { unit_rows: unit, waves };
-    options.prefill_rows = shape.unit_rows;
-    options.prefill_unit_rows = Some(shape.unit_rows);
-    options.prefill_lanes = shape.waves;
-    options.prefill_waves = shape.waves;
-    report.prefill_unit_rows = Some(shape.unit_rows);
-    report.prefill_waves = Some(shape.waves);
-    report.prefill_transports = Some(shape.waves);
-    report.prefill_span_rows = Some(options.prefill_span_rows.unwrap_or(GLM_DEFAULT_PREFILL_SPAN_ROWS));
-    shape
-}
-
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
+        max_waves: if spark_ranks == 0 { 1 }
+            else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
+                crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
+        ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
+    };
+    let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
     let mut shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    report.prefill_span_rows = Some(prefill.span_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };
@@ -83,14 +65,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
     }
-    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let prefill = resolve_prefill(report, options, shape.prefill_rows, spark_ranks);
-    shape.prefill_rows = prefill.unit_rows;
     let lanes = prefill.waves;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &working,
+    let mut sparks = spark_devices(report, model, input, options, SPARK, &working,
         spark_endpoints("glm5", lanes), &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
@@ -140,9 +119,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
-    report.prefill_transports = Some(working.prefill_lanes);
+    report.prefill_transports = Some(u64::from(!working.spark_layers.is_empty()));
     // Reapply after admission has selected its executable suffix and lane count.
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &working, spark_endpoints("glm5", working.prefill_lanes),
+    charge_spark_devices(report, model, input, options, SPARK, &working, spark_endpoints("glm5", working.prefill_lanes),
         &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));
     if report.encoder.is_none() {
         resolve_encoder(report, &Towers::checkpoint(report), &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
@@ -305,9 +284,10 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let mut lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { glm_prefill_lanes(None) as u64 });
-    if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) { lanes = lanes.min(2); }
+    let lanes = options.prefill_waves;
+    anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
+        || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
+        "layer-owned prefill lacks capacity for {lanes} waves");
     let (draft, draft_staging, active_drafts) = drafter_admission(options)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
@@ -355,6 +335,13 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
 pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
     workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>)
     -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
+    native_layout_with_metadata(checkpoint, options, shared_bytes, workspace, spark_ranks, manifest, selected, None)
+}
+
+pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
+    workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>,
+    metadata: Option<&crate::plan::exlr8::residency::MetadataInput>)
+    -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     let gpu_count = options.rtx_bytes.len();
     anyhow::ensure!((1..=2).contains(&gpu_count) && shared_bytes.len() == gpu_count,
@@ -385,8 +372,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
             gpu_count, rank, cfg.layers, cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim,
             cfg.kv_lora_rank).map_err(anyhow::Error::from)).collect::<anyhow::Result<Vec<_>>>()?
     } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
-    let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { glm_prefill_lanes(None) as u64 });
+    let lanes = options.prefill_waves;
     let dense_scratch = if native {
         let a8 = options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8;
         let bytes = crate::plan::exlr8::dense::lane_charge_bytes(&cfg, gpu_count, glm::DECODE_ROWS as usize,
@@ -413,8 +399,15 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
         let manifest_path = options.workspace_manifest.as_deref()
             .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-        glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
-            glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
+        if let Some(metadata) = metadata.filter(|_| gpu_count == 2
+            && onboard.layers(cfg.layers.saturating_sub(catalog.routed_experts().first_layer)) != Some(0)
+            && cfg.layers > catalog.routed_experts().first_layer) {
+            Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers, rows, lanes,
+                glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
+        } else {
+            glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
+                glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
+        }
     } else { None };
     let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));
@@ -465,8 +458,8 @@ mod tests {
         std::fs::write(&path, manifest.to_string()).unwrap();
         for (gpus, sparks) in [(1, 4), (2, 6)] {
             // CLI maps PREFILL_WAVES to prefill_lanes, preserving explicit N1.
-            for (unit, requested, span) in [(0, 0, None), (2048, 1, Some(8192)),
-                (4096, 2, Some(32768)), (1024, 3, None)] {
+            for (unit, requested, span) in [(0, 0, None), (2048, 1, Some(2048)),
+                (4096, 2, Some(8192)), (1024, 3, None)] {
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: unit,
                     prefill_lanes: requested, prefill_waves: requested.max(1), prefill_span_rows: span,
                     workspace_manifest: Some(path.clone()), context_tokens: 65536,
@@ -477,8 +470,8 @@ mod tests {
                 let exl3 = input.plan(&plan_options).unwrap();
                 let mut native = crate::plan::empty_report(input.checkpoint(), &plan_options).unwrap();
                 let mut options = options;
-                let rows = if unit == 0 { 4096 } else { unit };
-                let shape = resolve_prefill(&mut native, &mut options, rows, sparks);
+                let shape = crate::plan::layout::resolve_prefill(&mut native, &mut options, sparks,
+                    crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)).unwrap();
                 native.family = exl3.family.clone();
                 native.spec = exl3.spec.clone();
                 native.cache_requirements = exl3.cache_requirements.clone();
@@ -490,26 +483,26 @@ mod tests {
                     r.prefill_span_rows, r.prefill_transports);
                 // Unpinned, the topology picks the waves (#762): 3 x 2752 at six
                 // Sparks, 2 x 4096 below; an explicit PREFILL_WAVES pins k.
-                let planned = crate::serving_capacity::prefill_waves::planned_waves(sparks);
+                let planned = crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(sparks);
                 let waves = if requested == 0 { planned } else { requested };
                 let rows = if unit != 0 { unit } else if waves > 1 {
                     crate::serving_capacity::prefill_waves::unit_rows(waves) } else { 4096 };
-                assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(16384)), Some(waves)));
+                assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(rows * waves)), Some(1)));
                 assert_eq!(geometry(&native), geometry(&exl3), "{gpus} RTX/{sparks} Sparks");
                 let spec = native.spec.as_ref().unwrap();
                 let moe = spec.moe.as_ref().unwrap();
                 let expert = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
                     topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-                let endpoints = spark_endpoints("glm5", waves) as u64;
+                let endpoints = native.prefill_transports.unwrap();
                 let endpoint = SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Fp8K32 };
                 let (request, response) = endpoint.wire_bytes(expert).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
                 let host = native.host_ledger.as_ref().unwrap();
                 let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
-                assert_eq!(bytes("spark-intake"), shape.slot_rows() * expert.hidden as u64 * 4 * endpoints * sparks as u64);
+                assert_eq!(bytes("spark-intake"), shape.span_rows * expert.hidden as u64 * 4 * endpoints * sparks as u64);
                 assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(expert, rings).unwrap() as u64 * endpoints * sparks as u64);
-                assert_eq!(bytes("workspace/router"), (shape.slot_rows() + 64) * (expert.hidden as u64 * 2 + expert.topk as u64 * 8));
+                assert_eq!(bytes("workspace/router"), (shape.unit_rows + 64) * (expert.hidden as u64 * 2 + expert.topk as u64 * 8));
                 assert_eq!(host.shortfall_bytes, 0);
             }
         }

@@ -336,7 +336,6 @@ impl RecordGuard {
 
 const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 /// Maximum in-flight prefill units on the single expert link.
-pub(crate) const DEFAULT_PREFILL_WAVES: usize = 2;
 pub(crate) const MAX_PREFILL_WAVES: usize = 4;
 
 /// What a packed pass's `on_logits` returns for one sequence ([`GlmfEngine::prefill_packed`]):
@@ -1537,10 +1536,6 @@ pub(crate) fn workspace_reserve(plan: &StepPlan<'_, '_>, prefill_rows: usize, la
 /// `lanes` prefill lanes and (`drafter`) the drafter's.
 fn workspace_reserve_bytes(tracked: u64, lanes: usize, drafter: bool) -> u64 {
     tracked + cuteafd_loader::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, drafter)
-}
-
-pub(crate) fn configured_prefill_waves(complete: bool, waves: usize) -> usize {
-    if complete { waves } else { 1 }
 }
 
 fn startup_graph_policy(graphs: Option<&str>, startup: Option<&str>) -> bool {

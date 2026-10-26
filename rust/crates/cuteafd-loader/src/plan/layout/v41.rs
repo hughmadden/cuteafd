@@ -132,7 +132,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
     let mut working = SparkWorkingSet { rtx_layers: (0..placement.onboard_layers).collect(),
         spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: 1 };
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &working, 2, &mut waste, &mut notes);
+    let mut sparks = spark_devices(report, model, input, options, SPARK, &working, 2, &mut waste, &mut notes);
     update_sparks(catalog, &working, &mut sparks)?;
     // A mandatory encoder displaces an optional expert prefix, not the pool.
     // Resolve its policy against only compulsory experts, then admit its owners.
@@ -164,7 +164,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     working.spark_layers = (placement.onboard_layers..40).collect();
     if working.spark_layers.is_empty() { sparks.clear(); }
     update_sparks(catalog, &working, &mut sparks)?;
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &working,
+    charge_spark_devices(report, model, input, options, SPARK, &working,
         spark_endpoints("deepseek_v41", working.prefill_lanes), &mut sparks, &mut notes,
         |d| format!("Spark rank {} I/O admission", d.index));
     for spark in &mut sparks {

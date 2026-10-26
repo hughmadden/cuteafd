@@ -89,7 +89,7 @@ impl Reservation {
 }
 
 pub fn input_bytes(rows: usize) -> Result<u64> {
-    ensure!((1..=4096).contains(&rows), "Step-5 input row capacity");
+    super::native::validate_span_rows(rows)?;
     Ok((rows * (4 + 4096 * 6)) as u64)
 }
 
@@ -221,8 +221,9 @@ impl RuntimeInputs {
             self.inventory.spark_ranks > 0 && self.inventory.spark_ranks <= 8,
             "Step-5 target serving requires native Spark expert ranks"
         );
+        super::native::validate_span_rows(self.rows)?;
         ensure!(
-            (1..=4096).contains(&self.rows)
+            (1..=4096).contains(&self.unit_rows())
                 && (1..=4).contains(&self.waves)
                 && self.rows % self.waves == 0
                 && (self.waves == 1 || self.unit_rows() % 64 == 0)
@@ -230,6 +231,11 @@ impl RuntimeInputs {
                 && self.sequences <= self.unit_rows(),
             "Step-5 span rows, prefill waves or sequence slots"
         );
+        use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        prefill_shape(self.inventory.spark_ranks, crate::plan::Family::prefill_limits(&super::STEP5), PrefillOverrides {
+            unit_rows: Some(self.unit_rows() as u64), waves: Some(self.waves as u64),
+            span_rows: Some(self.rows as u64),
+        })?;
         ensure!(
             cfg.max_context == EXTENT && (FLOOR..=EXTENT).contains(&self.context),
             "Step-5 requires 1M compiled extent and at least 256K request context"
@@ -299,6 +305,7 @@ impl RuntimeInputs {
             attention_by_kind: vec![],
             peer_row_bytes: 0,
             onboard_layers: 0,
+            max_pool_tokens_no_onboard: 0,
             layers: modes
                 .iter()
                 .enumerate()
@@ -343,10 +350,10 @@ pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usiz
 pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
     if depth == 0 { return admit(checkpoint, inputs); }
     let cfg = Config::parse(checkpoint)?;
-    ensure!((1..=cfg.mtp).contains(&depth) && inputs.rows > depth,
+    ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
     let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
-    let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth, inputs.kv_format)?;
+    let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
             let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
@@ -892,6 +899,34 @@ mod tests {
         inputs.marks.host = false;
         inputs.context = FLOOR;
         run(&inputs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_spans_keep_unit_sized_hooks_and_exact_input_charges() -> Result<()> {
+        let cfg = config();
+        for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
+            let mut input = inputs(2);
+            input.rows = unit * waves;
+            input.waves = waves;
+            input.validate(&cfg)?;
+            assert_eq!(input.unit_rows(), unit);
+            assert_eq!(input_bytes(input.rows)?, (unit * waves * (4 + 4096 * 6)) as u64);
+            assert_eq!(input.logit_rows(), 64);
+            input.full_prefill_logits = true;
+            assert_eq!(input.logit_rows(), input.rows);
+            assert!(super::super::native::mtp_forecast_workspace(unit, 3, input.kv_format).is_ok());
+            assert!(super::super::native::mtp_forecast_workspace(input.rows, 3, input.kv_format).is_err());
+        }
+        for (rows, waves) in [(8192, 1), (8257, 3), (16384, 4), (5000, 5)] {
+            let mut input = inputs(2);
+            input.rows = rows;
+            input.waves = waves;
+            assert!(input.validate(&cfg).is_err(), "{rows} rows / {waves} waves");
+        }
+        let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows as usize;
+        assert!(input_bytes(limit).is_ok());
+        for rows in [0, limit + 1, usize::MAX] { assert!(input_bytes(rows).is_err()); }
         Ok(())
     }
 

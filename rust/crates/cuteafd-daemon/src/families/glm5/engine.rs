@@ -455,7 +455,7 @@ impl<'a> GlmEngine<'a> {
             staged: Cell::new(library.cuda_event_create_ordering()?),
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
-            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
@@ -796,16 +796,13 @@ impl<'a> GlmEngine<'a> {
         self.prefill_lanes > 1 && self.weights.layers.len() == self.cfg.layers && self.prefill_link.borrow().is_some()
     }
 
-    /// Longest chunk one prefill call takes. Pipelined, a call is a continuous
-    /// stream of units (`prefill_span_rows`, default 16384 rows), so the Sparks
-    /// drain only at span ends, not every `waves x unit` rows.
+    /// Longest chunk one prefill call takes, bounded by the shared admitted span.
     pub fn prefill_capacity(&self) -> usize {
         if self.pipelined() { self.prefill_span_rows().max(self.prefill_lanes * self.prefill_rows) }
         else { self.prefill_rows }
     }
 
-    /// Rows one pipelined prefill call streams through its units
-    /// (`--prefill-span-rows`; `waves x unit` restores fixed chunks).
+    /// Rows one pipelined prefill call streams through its units.
     fn prefill_span_rows(&self) -> usize {
         self.prefill_span_rows.clamp(256, self.max_context.max(256))
     }
@@ -2450,9 +2447,6 @@ where B: Fn(usize) -> Result<()>,
     }
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
 }
-
-/// Default rows per continuous prefill span (shared PREFILL_SPAN_ROWS key).
-pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = cuteafd_loader::plan::layout::GLM_DEFAULT_PREFILL_SPAN_ROWS as usize;
 
 
 /// The expert request of `t` staged rows: expert ids (U32) and gate

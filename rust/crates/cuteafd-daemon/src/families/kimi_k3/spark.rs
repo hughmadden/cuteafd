@@ -316,9 +316,14 @@ mod tests {
         bytes[..4].copy_from_slice(&896u32.to_le_bytes());
         assert!(request(1, 1, 1, ExpertV2SourceKind::Decode, &layout, &bytes).is_err());
         assert!(demand(0, 1, 0).is_err());
-        assert!(demand(8193, 1, 0).is_err());
-        assert!(demand(8192, 2, 0).is_ok(), "two 4096-row units on one lane");
-        assert!(demand(4096, 3, 0).is_ok() && demand(128, 3, 0).is_err());
+        assert!(demand(8257, 1, 0).is_err());
+        for (rows, waves, unit) in [(8192, 2, 4096), (8256, 3, 2752), (8192, 4, 2048)] {
+            let charge = demand_with(rows, waves, Some(unit), 0)?;
+            assert_eq!(charge.bytes, (rows * 6 * LATENT * 2) as u64);
+            assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
+                cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }, 0));
+        }
+        assert!(demand(8256, 3, 0).is_ok() && demand(4096, 3, 0).is_err() && demand(128, 3, 0).is_err());
         Ok(())
     }
 }

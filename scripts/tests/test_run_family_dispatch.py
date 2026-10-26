@@ -747,8 +747,9 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_attention_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, lanes);" in admission
-    assert "configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves)" in admission
-    assert "admitted_prefill_waves(attention.mode, lanes as u64)" in admission
+    assert "configured_prefill_waves(" not in admission
+    assert "admitted_prefill_waves(attention.mode, args.prefill_waves as u64)?" in admission
+    assert body.index("resolve_prefill(") < body.index("self.admit(")
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
     pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// The continuous span", 1)[0]
     assert "self.weights.layers.len() == self.cfg.layers" in pipeline
@@ -943,11 +944,12 @@ report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
-shared = family in {"step5", "kimi_k3"}
-glm = family == "glm5"
-unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
-waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
-span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
+shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4"}
+waves = int(value("--prefill-waves", "0")) or (1 if not shared or ranks == 0 else 2 if ranks < 6 else 3)
+if "--prefill-waves" not in args and family in {"qwen4", "step5"}:
+    waves = min(waves, 2)
+unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]
+span = int(value("--prefill-span-rows", "0")) or unit * waves
 decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
 if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41" and decode_lanes != 1):
     sys.exit("unsupported --decode-lanes for " + family)
@@ -1496,14 +1498,14 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, explicit):
-    keys = "PREFILL_ROWS=2048\nPREFILL_WAVES=3\nPREFILL_SPAN_ROWS=8192\n" if explicit else ""
+    keys = "PREFILL_ROWS=2048\nPREFILL_WAVES=3\nPREFILL_SPAN_ROWS=6144\n" if explicit else ""
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 9, "first_k_dense_replace": 3,
     }, "test/glm", keys)
     assert result.returncode == 0, result.stderr
     plan = next(shlex.split(line) for line in result.stderr.splitlines()
                 if "cuteafd plan" in line and "--deployment" in line)
-    unit, waves, span = (2048, 3, 8192) if explicit else (4096, 2, 16384)
+    unit, waves, span = (2048, 3, 6144) if explicit else (4096, 2, 8192)
     if explicit:
         for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
             assert plan[plan.index(flag) + 1] == str(value)
@@ -1884,14 +1886,15 @@ def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("", [], ["--prefill-waves", "--prefill-rows", "--headroom-gib", "--graph-budget-mib"]),
+    ("", ["--prefill-waves 2", "--prefill-rows 4096", "--prefill-span-rows 8192"],
+     ["--headroom-gib", "--graph-budget-mib"]),
     ("PREFILL_WAVES=4\nPREFILL_ROWS=2048\n",
-     ["--prefill-waves 4", "--prefill-rows 2048"], []),
-    ("PREFILL_WAVES=1\n", ["--prefill-waves 1"], ["--prefill-rows"]),
-    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-waves"]),
+     ["--prefill-waves 4", "--prefill-rows 2048", "--prefill-span-rows 8192"], []),
+    ("PREFILL_WAVES=1\n", ["--prefill-waves 1", "--prefill-rows 4096", "--prefill-span-rows 4096"], []),
+    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1", "--prefill-waves 2"], []),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", ["--graph-budget-mib 512"], ["--headroom-gib"]),
 ])
-def test_glmf_units_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+def test_glmf_resolved_units_and_optional_headroom_are_forwarded(tmp_path, keys, expected, absent):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -1900,6 +1903,14 @@ def test_glmf_units_and_headroom_are_forwarded_only_when_set(tmp_path, keys, exp
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in expected:
         assert option in launch, launch
+    argv = shlex.split(launch)
+    for flag in ["--prefill-rows", "--prefill-waves", "--prefill-span-rows"]:
+        assert argv.count(flag) == 1, launch
+    plan = next(shlex.split(line) for line in result.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    if "PREFILL_WAVES=" in keys:
+        assert plan[plan.index("--prefill-waves") + 1] == keys.split("PREFILL_WAVES=", 1)[1].splitlines()[0]
+    assert "--prefill-lanes" not in plan
     for option in absent:
         assert option not in launch, launch
 
@@ -2531,7 +2542,7 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
     assert ("CUTEAFD_ATTENTION_PLACEMENT=layers" in launch) == dual
     assert ("--local-experts" in launch) == (ranks == 0)
     assert "--prefill-rows 4096" in launch
-    assert "--prefill-waves 1" in launch
+    assert f"--prefill-waves {1 if ranks == 0 else 2}" in launch
     if dual:
         assert "--rtx-expert-layers all" in launch
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)

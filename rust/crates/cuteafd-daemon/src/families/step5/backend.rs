@@ -118,7 +118,6 @@ pub(super) struct Inputs<'a> {
 }
 impl<'a> Inputs<'a> {
     pub(super) fn bytes(rows: usize) -> Result<u64> {
-        ensure!((1..=4096).contains(&rows), "Step-5 input row capacity");
         cuteafd_loader::plan::families::step5::admission::input_bytes(rows)
     }
 
@@ -590,8 +589,9 @@ mod tests {
 
     #[test]
     fn input_admission_checks_row_bounds_and_complete_bridge_storage() -> Result<()> {
-        for rows in [1, 16, 4096] { assert_eq!(Inputs::bytes(rows)?, (rows * (4 + H * 6)) as u64); }
-        for rows in [0, 4097, usize::MAX] { assert!(Inputs::bytes(rows).is_err()); }
+        let limit = cuteafd_loader::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows as usize;
+        for rows in [1, 16, 4096, 8192, limit] { assert_eq!(Inputs::bytes(rows)?, (rows * (4 + H * 6)) as u64); }
+        for rows in [0, limit + 1, usize::MAX] { assert!(Inputs::bytes(rows).is_err()); }
         Ok(())
     }
 }

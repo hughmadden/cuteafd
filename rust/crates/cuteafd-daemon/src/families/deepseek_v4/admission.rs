@@ -34,31 +34,58 @@ pub(crate) struct Inputs<'a> {
 
 #[cfg(test)]
 mod spark_tests {
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for backend in [SparkBackend::Fp8, SparkBackend::Native, SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
+            for (waves, unit) in [(1usize, 4096usize), (2, 4096), (3, 2752), (4, 2048)] {
+                assert_eq!(super::spark_model(backend, 64, unit, waves)?.executions,
+                    planned("deepseek_v4", backend, Some(64), unit as u64, waves as u64));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn v4_spark_endpoints_match_the_decode_and_prefill_links() -> anyhow::Result<()> {
-        for decode_rows in [16, 64, 80] {
-            let model = super::spark_model(decode_rows)?;
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for (decode_rows, compiled) in [(16, 16), (64, 80), (80, 80)] {
+            let model = super::spark_model(SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest), decode_rows, 2752, 3)?;
             model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
-            assert_eq!((model.capacity, model.compiled_capacity), (4096, 4096));
+            // The static prefill owner holds the selected unit; EXL3 exports m2752.
+            assert_eq!((model.capacity(), model.compiled_capacity()), (2752, 2752));
+            assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
+                capacity: decode_rows as u32, compiled_capacity: compiled }]);
+            assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units), (2752, 3));
             assert_eq!(model.endpoints.len(), 2);
             assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
-            assert_eq!(model.endpoints[1].capacity, 4096);
+            assert_eq!(model.endpoints[1].capacity, 2752);
             assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
         }
         Ok(())
     }
 }
 
-pub(crate) fn spark_model(decode_rows: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+pub(crate) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
+    decode_rows: usize, unit_rows: usize, waves: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
+    // The installed coordinator manifest fixes this build's decode rows.
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("deepseek_v4", &backend.exports(),
+        Some(u32::try_from(decode_rows)?), unit_rows as u64, waves as u64)?;
     let endpoints = vec![
         SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },
-        SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 },
+        SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows.max(decode_rows))?, ingress: SparkIngress::Fp8K32 },
     ];
-    Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity: 4096, compiled_capacity: 4096, endpoints,
-        rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
-    })
+    cuteafd_transport::worker_selection::ModelAdmission::new(endpoints,
+        crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
 
 /// Future pinned owners in the coordinator process, summed across its RTX ranks.
@@ -82,7 +109,7 @@ impl PinnedTables {
         let mul = |a: u64, b: u64| a.checked_mul(b).context("V4 pinned table multiplication overflow");
         let add = |a: u64, b: u64| a.checked_add(b).context("V4 pinned table addition overflow");
         ensure!(self.units > 0 && self.prefill_rows > 0 && self.decode_rows > 0
-            && (1..=3).contains(&self.waves) && (1..=2).contains(&self.ranks)
+            && (1..=cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES).contains(&self.waves) && (1..=2).contains(&self.ranks)
             && self.c128_width > 0 && self.hidden > 0 && self.topk > 0,
             "invalid V4 pinned table geometry");
         let mut tables = Vec::new();
@@ -241,7 +268,11 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     // cache owners rather than the caller's nextn configuration.
     let mut cache_cfg = inputs.cfg.clone();
     cache_cfg.n_mtp_layers = inputs.cache_stages;
-    let (prefill, decode) = (inputs.prefill_rows as u64, inputs.decode_rows as u64);
+    let shape = args.prefill_shape(inputs.manifest["capacities"]["prefill_rows"]
+        .as_u64().context("V4 manifest prefill_rows")?, None)?;
+    let (prefill, decode) = (shape.unit_rows, inputs.decode_rows as u64);
+    ensure!(inputs.prefill_rows as u64 == prefill,
+        "V4 runtime unit rows {} disagree with admitted shape {prefill}", inputs.prefill_rows);
     let context = v4::manifest_context(inputs.manifest, inputs.family, inputs.cfg.n_heads, decode);
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
     let resolved = attention.unwrap_or(if gpus == 2 && context.is_some() {
@@ -255,7 +286,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
         inputs.manifest, inputs.family, gpus == 2, prefill, decode)?;
     let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(&cache_cfg, prefill, decode,
-        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, args.prefill_waves as u64, scratch)?;
+        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, shape.waves, scratch)?;
     let onboard = args.onboard()?;
     let stages = if args.dspark && !args.skip_routed_experts { inputs.cache_stages } else { 0 };
     let routed = *inputs.catalog.routed_experts();
@@ -286,7 +317,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
     let request = v4::request(&v4::V4Inputs { automatic_context: args.max_context == 0, cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, headroom_floor: 0, spark_ranks,
-        sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: args.prefill_waves as u64, decode_rows: decode,
+        sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
         workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,

@@ -31,8 +31,9 @@ impl NativeScratch {
 
 /// Most rows one kernel launch (one prefill unit) handles.
 pub const UNIT_ROWS_MAX: usize = 4096;
-/// Most rows a lane holds: two units of the largest size in flight.
-pub const LANE_ROWS_MAX: usize = 2 * UNIT_ROWS_MAX;
+/// Largest shared live span: three page-aligned units of 2752 rows.
+/// Each lane allocates its exact admitted span, never this validation ceiling.
+pub const LANE_ROWS_MAX: usize = (crate::serving_capacity::prefill_waves::RESERVE_ROWS + 64) as usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeLaneLayout {
@@ -295,22 +296,18 @@ pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize) -
         crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows, 6, 3584), Basis::Exact)
 }
 
-/// Kimi's lane operands are row planes of one prefill call: each unit owns its
-/// rows of them. With `waves` in flight a unit is at most `rows / waves` rows
-/// (page aligned), and each in-flight wave holds one return slot of that size.
-pub fn prefill_shape(rows: usize, waves: usize) -> Result<crate::serving_capacity::PrefillShape> {
-    prefill_shape_with(rows, waves, None)
-}
-
-/// `unit` overrides the derived unit rows; it must be page aligned and the
-/// lane must hold `waves` of them (one wave of up to the lane is always valid).
+/// Row planes hold exactly the admitted units; scratch and return slots serve
+/// one unit each. Diagnostic callers normalize their shape before allocation.
 pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
     -> Result<crate::serving_capacity::PrefillShape> {
-    ensure!(waves > 0 && rows >= 64 * waves, "Kimi lane rows {rows} hold fewer than {waves} units");
-    let derived = if waves == 1 { rows.next_multiple_of(64).min(UNIT_ROWS_MAX) } else { rows / waves / 64 * 64 };
-    let unit = unit.unwrap_or(derived);
-    ensure!(unit * waves <= rows.next_multiple_of(64), "Kimi lane rows {rows} hold fewer than {waves} units of {unit}");
-    crate::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }.validate()
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    ensure!((1..=crate::serving_capacity::prefill_waves::MAX_WAVES as usize).contains(&waves)
+        && (1..=LANE_ROWS_MAX).contains(&rows) && rows >= 64 * waves,
+        "Kimi lane row/wave capacity: {rows} rows x {waves} waves");
+    Ok(prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+        unit_rows: Some(unit.unwrap_or(rows / waves) as u64), waves: Some(waves as u64),
+        span_rows: Some(rows as u64),
+    })?.units())
 }
 
 pub fn exchange_demand(rows: usize, rank: u8, f32_partials: bool, progress: usize) -> Result<Demand> {
@@ -349,18 +346,13 @@ pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> 
         .find(|path| path.is_dir()).context("Kimi installed TP2 expert workspace manifests missing")
 }
 
-/// Kimi's default prefill units (PLAN "Prefill contract"). Serving and the
-/// planner share it.
-pub const DEFAULT_PREFILL_UNIT_ROWS: usize = 2048;
-pub const DEFAULT_PREFILL_WAVES: usize = 2;
-
-/// `shape.waves` units of `shape.unit_rows` on one lane of `unit x waves` rows.
+/// Lane row planes plus `shape.waves` return slots of `shape.unit_rows` each.
 pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
-    shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
+    rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
     core: &super::core::CoreInventory, heads: bool) -> Result<Vec<Demand>> {
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
-    let rows = unit.checked_mul(usize::try_from(shape.waves)?).context("Kimi lane rows overflow")?;
+    prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
     let layout = NativeLaneLayout::new(cfg, rows, unit, context, NativeScratch::from_manifest(manifest)?)?;
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
@@ -406,9 +398,35 @@ mod tests {
             "MLA query", "MLA attention", "MLA page table", "MLA lengths"] {
             assert_eq!(two.operands[name], one.operands[name], "{name} is one unit's");
         }
-        // Units never exceed the kernels' 4096 rows nor the lane; lanes hold two.
-        for (rows, unit) in [(8193, 4096), (8192, 4097), (2048, 4096), (4096, 0)] {
+        // Units never exceed the kernels' 4096 rows nor the admitted lane.
+        for (rows, unit) in [(LANE_ROWS_MAX + 1, 4096), (8192, 4097), (2048, 4096), (4096, 0)] {
             assert!(NativeLaneLayout::new(&cfg, rows, unit, 1_048_576, scratch).is_err(), "{rows}/{unit}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_wave_shapes_allocate_exact_row_planes_and_unit_scratch() -> Result<()> {
+        use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        let cfg = cfg();
+        let scratch = NativeScratch { kda: 1024, mla: [512, 0, 1024] };
+        for (waves, unit, rows) in [(2, 4096, 8192), (3, 2752, 8256), (4, 2048, 8192)] {
+            let plan = prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+                waves: Some(waves), ..Default::default()
+            })?;
+            assert_eq!((plan.unit_rows, plan.span_rows), (unit, rows));
+            let shape = prefill_shape_with(rows as usize, waves as usize, Some(unit as usize))?;
+            assert_eq!(shape, plan.units());
+            let one = NativeLaneLayout::new(&cfg, unit as usize, unit as usize, 1_048_576, scratch)?;
+            let lane = NativeLaneLayout::new(&cfg, rows as usize, unit as usize, 1_048_576, scratch)?;
+            assert_eq!(lane.arena_bytes, one.arena_bytes);
+            for name in ["residual arena", "delta", "expert combined", "router logits", "route ids", "expert wire"] {
+                assert_eq!(lane.operands[name], waves as usize * one.operands[name], "{name}");
+            }
+            assert_eq!(lane.operands["KDA slots"], unit as usize * 4);
+            assert_eq!(lane.operands["MLA slots"], unit as usize * 8);
+            assert_eq!(spark_demand(shape, 0).bytes, rows * 6 * 3584 * 2);
+            assert!(prefill_shape_with(rows as usize - 64, waves as usize, Some(unit as usize)).is_err());
         }
         Ok(())
     }
@@ -419,9 +437,12 @@ mod tests {
         assert_eq!(unit(8192, 2, None)?, 4096);
         assert_eq!(unit(8192, 2, Some(4096))?, 4096);
         assert_eq!(unit(4096, 2, None)?, 2048);
-        assert_eq!(unit(8192, 1, None)?, 4096);
+        assert_eq!(unit(4096, 1, None)?, 4096);
+        assert!(unit(8192, 1, None).is_err(), "a unit is at most 4096 rows");
         assert!(unit(8192, 2, Some(8192)).is_err(), "a unit is at most 4096 rows");
         assert!(unit(4096, 2, Some(4096)).is_err(), "the lane holds both units");
+        assert!(unit(8192, 2, Some(2048)).is_err(), "the lane cannot exceed the exact live units");
+        assert!(unit(4097, 2, None).is_err(), "the lane cannot hide a rounded tail");
         Ok(())
     }
 }

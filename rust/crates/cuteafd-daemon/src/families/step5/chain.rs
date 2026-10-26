@@ -537,7 +537,7 @@ mod tests {
     }
 
     fn link<'a>(device: Device<'a>, snapshot: &Path, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-        use crate::shared::placement::{spark_rings, SparkAdmission};
+        use crate::shared::placement::SparkAdmission;
         let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?
             .split(',')
             .map(str::parse)
@@ -568,20 +568,7 @@ mod tests {
                 && tp4["tp"] == peers.len(),
             "sealed Step-5 expert geometry"
         );
-        let capacities = tp4["capacities"]
-            .as_array()
-            .context("sealed FP8 TP capacities")?;
-        let compiled = capacities
-            .iter()
-            .map(|c| c["capacity"].as_u64().context("FP8 capacity integer"))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .context("empty FP8 capacities")?;
-        ensure!(
-            (64..=4096).contains(&compiled),
-            "FP8 package must cover chain rows"
-        );
+        let exports = crate::families::step5::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
         SparkAdmission::plan(
             snapshot,
             ExpertGeometry::STEP5,
@@ -594,15 +581,9 @@ mod tests {
             },
             peers.len(),
             None,
-            ModelAdmission {
-                capacity: 64,
-                compiled_capacity: u32::try_from(compiled)?,
-                endpoints: vec![SparkEndpoint { ring_depth: None,
-                    capacity: 64,
-                    ingress: SparkIngress::Bf16
-                }],
-                rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1
-            },
+            crate::families::step5::serve::spark_model(&exports,
+                SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16 },
+                1, 1, config.max_frame_bytes)?,
         )?
         .select(&peers)?;
         let warm = request(

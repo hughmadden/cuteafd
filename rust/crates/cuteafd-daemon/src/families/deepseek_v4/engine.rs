@@ -68,6 +68,8 @@ pub(crate) struct Engine<'a> {
     /// Export row capacity used for program names, independent of live unit cuts.
     pub prefill_kernel_rows: usize,
     pub prefill_waves: usize,
+    /// Frozen outer intake; independent of live slots and compiled kernel rows.
+    pub prefill_span_rows: usize,
     pub full_prefill_logits: bool,
     pub c128_width: usize,
     /// Longest sequence the exported programs' cache extents cover.
@@ -144,7 +146,8 @@ const LOCAL_EXPERTS: usize = usize::MAX;
 /// `exchange` result for a layer whose routed experts were skipped.
 const SKIPPED_EXPERTS: usize = usize::MAX - 1;
 
-/// Independently outstanding row units on the single Spark link.
+/// Two-wave reference geometry used by allocation contract tests.
+#[cfg(test)]
 pub(crate) const PREFILL_WAVES: usize = 2;
 
 
@@ -265,6 +268,8 @@ pub(crate) struct EngineParts<'a> {
     /// Export row capacity used for program names, independent of live unit cuts.
     pub prefill_kernel_rows: usize,
     pub prefill_waves: usize,
+    /// Frozen outer intake; independent of live slots and compiled kernel rows.
+    pub prefill_span_rows: usize,
     pub c128_width: usize,
     pub max_context: usize,
     pub stream: *mut c_void,
@@ -578,6 +583,7 @@ impl<'a> Engine<'a> {
             prefill_rows: parts.prefill_rows,
             prefill_kernel_rows: parts.prefill_kernel_rows,
             prefill_waves: parts.prefill_waves,
+            prefill_span_rows: parts.prefill_span_rows,
             full_prefill_logits: false,
             c128_width: parts.c128_width,
             max_context: parts.max_context,
@@ -826,7 +832,7 @@ impl<'a> Engine<'a> {
 
     /// Longest chunk one [`Self::prefill`] call takes.
     pub fn prefill_capacity(&self) -> usize {
-        std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(16384)
+        self.prefill_span_rows
     }
 
     /// Prefills the next chunk of a sequence (rows continue at its length) and

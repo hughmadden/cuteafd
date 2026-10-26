@@ -115,6 +115,9 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
 }
 
 impl Family for MiMo {
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        Some(crate::plan::spark_executions::SparkDecode { rows: crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u32 })
+    }
     fn id(&self) -> &'static str {
         "mimo_v2"
     }

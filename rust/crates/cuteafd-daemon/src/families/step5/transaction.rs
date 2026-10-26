@@ -122,6 +122,16 @@ impl<'a> Staging<'a> {
         available: usize,
         sequences: usize,
     ) -> Result<Self> {
+        Self::new_for_units(device, programs, cache, available, sequences,
+            usize::try_from(cache.layout().ring.step)?.min(4096))
+    }
+
+    pub(super) fn new_for_units(
+        device: Device<'a>, programs: &'a Programs<'a>, cache: &CacheRank<'a>,
+        available: usize, sequences: usize, unit_rows: usize,
+    ) -> Result<Self> {
+        ensure!((1..=4096).contains(&unit_rows) && unit_rows as u64 <= cache.layout().ring.step,
+            "Step-5 staging unit capacity");
         ensure!(sequences <= usize::try_from(cache.sequences())?,
             "Step-5 staging sequence capacity exceeds cache admission");
         let bytes = Self::bytes_for_sequences(cache.layout(), cache.rank(), sequences)?;
@@ -168,7 +178,7 @@ impl<'a> Staging<'a> {
             let heads = state.sliding.iter().filter(|s| !s.mtp).map(|s| s.query_heads)
                 .chain(state.regions.iter().map(|s| s.query_heads)).collect::<BTreeSet<_>>()
                 .into_iter().collect::<Vec<_>>();
-            Some(CompactKv::new(device, programs, rows, &heads, sizes, None)?)
+            Some(CompactKv::new(device, programs, unit_rows, &heads, sizes, None)?)
         };
         let stream = Rc::new(Stream::new(device)?);
         cache.register_lane(&stream)?;

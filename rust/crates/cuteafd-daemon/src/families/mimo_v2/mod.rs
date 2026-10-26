@@ -960,12 +960,15 @@ impl Opened {
                 else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
                     rows: u32::try_from(engine::DECODE_ROWS)? } }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
-            let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress };
-                    usize::try_from(preflight.working_set.prefill_lanes)?],
-                rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
-            };
+            // MiMo lanes are independent links; each lane's unit queues on the one prefill owner.
+            let catalog = self.catalog.as_ref().context("MiMo Spark admission requires routed expert headers")?;
+            let lanes = preflight.working_set.prefill_lanes;
+            let executions = cuteafd_loader::plan::spark_executions::admit_family("mimo_v2",
+                &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(), None,
+                u64::from(capacity), lanes)?;
+            let model = cuteafd_transport::worker_selection::ModelAdmission::new(
+                vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }; usize::try_from(lanes)?],
+                crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?;
             // Each coordinator GPU joins the Spark push group as one more rank with

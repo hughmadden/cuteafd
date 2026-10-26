@@ -337,6 +337,17 @@ impl Model {
 }
 
 impl Family for Step5 {
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        // Step-5 decode/verify steps send at most 64 rows (`rows.min(64)`).
+        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+    }
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
+        PrefillLimits { initial_unit_rows: Some(2048), estimate: PrefillEstimate::MeasuredWaves {
+            waves: 4, reference_ranks: 6, larger_topology_waves: 4,
+            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6412873210; fixed2048 k4 wins the four-arm prefill oracle with one owner",
+        }, ..Default::default() }
+    }
     fn id(&self) -> &'static str { "step5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

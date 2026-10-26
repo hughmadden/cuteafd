@@ -8,6 +8,15 @@ pub use rope::{ImageSpan, RopeError, RopePositions};
 pub use config::{Qwen4Attention, Qwen4Config};
 pub use ngram::{NgramHasher, NgramHistory};
 
+/// Whole-step local owners are serial. Spark prefill retains the descriptor's
+/// hard two-slot mapped-PLE ring limit (#717), independently of its estimate.
+pub fn prefill_limits(local: bool) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+    crate::serving_capacity::prefill_waves::PrefillLimits {
+        max_waves: if local { 1 } else { 2 },
+        ..crate::plan::Family::prefill_limits(&crate::plan::families::qwen::QWEN4)
+    }
+}
+
 /// Destination extents shared by workspace allocation and ordered H2D admission.
 #[derive(Debug)]
 pub struct StepTableBytes {

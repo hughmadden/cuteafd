@@ -49,12 +49,12 @@ pub(crate) struct EngineArgs {
     /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
     #[arg(long)]
     pub sms: Option<usize>,
-    /// Rows per prefill unit; defaults to the export's maximum capacity.
+    /// Rows per prefill unit; defaults to the shared topology's wave shape.
     #[arg(long)]
     pub prefill_rows: Option<usize>,
-    /// Independently outstanding units on one Spark transport.
-    #[arg(long, default_value_t = engine::PREFILL_WAVES)]
-    pub prefill_waves: usize,
+    /// Independently outstanding units; defaults to one locally, two below six Sparks, three otherwise.
+    #[arg(long)]
+    pub prefill_waves: Option<usize>,
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
@@ -189,7 +189,75 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
     text.parse()
 }
 
+#[cfg(test)]
+mod prefill_shape_tests {
+    use super::*;
+    use clap::Parser;
+    use cuteafd_loader::serving_capacity::prefill_waves::{PrefillError, PrefillLimits, PrefillOverrides};
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    #[test]
+    fn runtime_shape_matches_planner_policy_and_preserves_explicit_pins() -> Result<()> {
+        let base = Cli::try_parse_from(["v4", "--snapshot", "/missing", "--native-lib", "/missing.so"])?.engine;
+        assert_eq!(base.prefill_waves, None);
+        for ranks in 0..=8 {
+            let mut args = base.clone();
+            args.peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19000 + rank)).collect::<Vec<_>>().join(",");
+            args.skip_routed_experts = ranks == 0;
+            let shape = args.prefill_shape(4096, None)?;
+            let planned = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(ranks,
+                PrefillLimits { max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES },
+                    ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
+                PrefillOverrides::default())?;
+            assert_eq!(shape, planned);
+            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
+                if ranks == 0 { (4096, 1, 4096) } else { (2752, 3, 8256) });
+            args.prefill_rows = Some(2048);
+            args.prefill_waves = Some(3);
+            if ranks == 0 {
+                assert!(matches!(args.prefill_shape(4096, Some(6144)),
+                    Err(PrefillError::ExecutorCapacity { max_waves: 1, .. })));
+            } else {
+                assert_eq!((args.prefill_shape(4096, Some(6144))?.unit_rows,
+                    args.prefill_shape(4096, Some(6144))?.waves), (2048, 3));
+            }
+        }
+        let mut args = base;
+        args.peers = (0..6).map(|rank| format!("127.0.0.1:{}", 19000 + rank)).collect::<Vec<_>>().join(",");
+        args.skip_routed_experts = false;
+        args.prefill_rows = Some(4096);
+        args.prefill_waves = Some(3);
+        assert!(matches!(args.prefill_shape(4096, None), Err(PrefillError::ReserveExceeded { .. })));
+        args.prefill_rows = Some(2048);
+        args.prefill_waves = Some(4);
+        assert_eq!(args.prefill_shape(4096, None)?.waves, 4);
+        args.prefill_rows = Some(2752);
+        args.prefill_waves = Some(3);
+        assert!(matches!(args.prefill_shape(4096, Some(8192)), Err(PrefillError::IntakeSpan { .. })));
+        assert!(matches!(args.prefill_shape(2048, None), Err(PrefillError::ExecutorCapacity { .. })));
+        Ok(())
+    }
+}
+
 impl EngineArgs {
+    fn prefill_shape(&self, compiled_rows: u64, span_rows: Option<u64>)
+        -> std::result::Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
+            cuteafd_loader::serving_capacity::prefill_waves::PrefillError> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        let ranks = if self.skip_routed_experts { 0 } else {
+            self.peers.split(',').filter(|peer| !peer.is_empty()).count()
+        };
+        prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
+            max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
+            PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
+                waves: self.prefill_waves.map(|waves| waves as u64), span_rows })
+    }
+
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
     /// Pool first uniformly unless an explicit onboard policy is selected.
     pub(crate) fn onboard(&self) -> Result<cuteafd_loader::placement::Onboard> {
@@ -350,10 +418,10 @@ pub(crate) fn with_engine<T>(
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_kernel_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
-    let prefill_rows = args.prefill_rows.unwrap_or(prefill_kernel_rows.min(4096));
-    ensure!(matches!(prefill_rows, 512 | 1024 | 2048 | 4096)
-        && prefill_rows <= caps["prefill_rows"].as_u64().context("prefill_rows")? as usize
-        && (1..=3).contains(&args.prefill_waves), "V4 prefill needs page-aligned rows within the export capacity and 1..=3 waves");
+    let span_rows = std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok()
+        .map(|value| value.parse::<u64>().context("CUTEAFD_PREFILL_SPAN_ROWS must be an integer")).transpose()?;
+    let prefill = args.prefill_shape(prefill_kernel_rows as u64, span_rows)?;
+    let prefill_rows = usize::try_from(prefill.unit_rows)?;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
@@ -438,7 +506,9 @@ pub(crate) fn with_engine<T>(
             };
             crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
-                peers.len(), None, admission::spark_model(decode_rows)?)?.select(&peers)?;
+                peers.len(), None, admission::spark_model(
+                    cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
+                    decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();
@@ -512,7 +582,8 @@ pub(crate) fn with_engine<T>(
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
         prefill_rows,
         prefill_kernel_rows,
-        prefill_waves: args.prefill_waves,
+        prefill_waves: usize::try_from(prefill.waves)?,
+        prefill_span_rows: usize::try_from(prefill.span_rows)?,
         c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,
         stream,
@@ -584,7 +655,7 @@ pub(crate) fn with_engine<T>(
                 TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
                 loaded.cfg.dim * 2)?);
             transports.push(SparkLink::new_waves(&loaded.library,
-                spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
+                spark_world.context("Spark transport needs a declared world")?, &peers, engine.prefill_rows.max(engine.decode_rows) as u32,
                 TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
                 loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
         }

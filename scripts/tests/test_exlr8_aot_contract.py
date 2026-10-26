@@ -113,8 +113,10 @@ def test_native_worker_times_requests_without_adding_waits():
     # Mapped requests queue every chunk back to back (no per-chunk drain):
     # timing brackets the whole request and publishes when it completes.
     mapped = worker.split("    fn execute(&mut self", 1)[1].split("    fn execute_host(", 1)[0]
-    assert mapped.index("timing.record(0,") < mapped.index("library_copy(") < mapped.index("copy_route_records(")
-    assert mapped.index("execution.run(") < mapped.index("timing.record(1,")
+    assert mapped.index("route_staging.pack(stage, request)?") < mapped.index("timing.record(0,")
+    assert mapped.index("timing.record(0,") < mapped.index("library_copy(") < mapped.index("route_staging.upload(")
+    assert mapped.index("route_staging.upload(") < mapped.index("execution.run(") < mapped.index("timing.record(1,")
+    assert "copy_route_records(" not in worker
     assert "timing.publish(" not in mapped
     complete = worker.split("    pub(super) fn complete(&mut self)", 1)[1]
     assert "timing.publish(" in complete

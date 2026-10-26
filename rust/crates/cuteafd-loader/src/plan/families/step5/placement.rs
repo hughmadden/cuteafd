@@ -14,36 +14,6 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 #[error("Step-5 layout is unqualified: {0}; use WIP FP8 on 2 RTX PRO 6000 + 6 Sparks or NVFP4 on 1 RTX PRO 6000 + 4 Sparks")]
 struct Unqualified(&'static str);
 
-/// Prefill units (PLAN "Prefill contract"): 2048 rows with two in flight by
-/// default, stepping down 2048 -> 1024 -> 512 when the larger unit would cost
-/// pool capacity. Explicit --prefill-rows / --prefill-waves are never
-/// changed. Two units in flight everywhere: NVFP4 min's 8K prefill gained
-/// 1.47x at 512 x 2 for a smaller pool (measured 2026-10-23).
-const DEFAULT_ROWS: [usize; 3] = [2048, 1024, 512];
-const DEFAULT_WAVES: usize = 2;
-
-fn default_rows(inputs: &mut RuntimeInputs, waves: usize,
-    mut admit: impl FnMut(&RuntimeInputs) -> Result<admission::Admission>) -> Result<(usize, admission::Admission)> {
-    // The smallest unit's pool is the reference: a larger unit is taken only
-    // when it admits the same pool (its extra rows cost no KV capacity).
-    let smallest = *DEFAULT_ROWS.last().expect("default prefill units");
-    inputs.waves = waves;
-    inputs.rows = smallest * waves;
-    let reference = admit(inputs)?;
-    for unit in DEFAULT_ROWS {
-        if unit == smallest { break; }
-        inputs.rows = unit * waves;
-        if inputs.rows > 4096 { continue; }
-        if let Ok(admitted) = admit(inputs) {
-            if admitted.placement.pool_tokens >= reference.placement.pool_tokens {
-                return Ok((unit, admitted));
-            }
-        }
-    }
-    inputs.rows = smallest * waves;
-    Ok((smallest, reference))
-}
-
 pub(super) fn layout(
     model: &Model,
     input: &PlanInput,
@@ -88,11 +58,10 @@ pub(super) fn layout(
             && opts.local_expert_layers.is_none_or(|n| n == 0),
         Unqualified("coordinator-local routed experts")
     );
-    let explicit_rows = usize::try_from(opts.prefill_rows)?;
-    let mut waves = if opts.prefill_lanes == 0 { DEFAULT_WAVES } else { usize::try_from(opts.prefill_lanes)? };
-    ensure!((1..=4).contains(&waves), "Step-5 prefill waves must be 1..=4");
-    let checked_rows = if explicit_rows == 0 { DEFAULT_ROWS[0] } else { explicit_rows };
-    ensure!(checked_rows * waves <= 4096, "Step-5 prefill span {checked_rows} x {waves} exceeds 4096 rows");
+    let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
+        crate::plan::Family::prefill_limits(&super::STEP5))?;
+    let checked_rows = usize::try_from(shape.unit_rows)?;
+    let waves = usize::try_from(shape.waves)?;
 
     let sequences = usize::try_from(if opts.concurrency == 0 {
         16
@@ -198,10 +167,10 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let mut inputs = RuntimeInputs {
+    let inputs = RuntimeInputs {
                 kv_format: opts.step5_kv,
         inventory,
-        rows: checked_rows * waves,
+        rows: usize::try_from(shape.span_rows)?,
         waves,
         full_prefill_logits: opts.full_prefill_logits,
         sequences,
@@ -217,27 +186,7 @@ pub(super) fn layout(
         pending_code: code,
         startup: vec![],
     };
-    let admitted = if explicit_rows != 0 {
-        admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?
-    } else {
-        // Default waves step down to one when the in-flight span does not admit
-        // (e.g. device-only prefix retention at full context); explicit waves never do.
-        let mut selected = default_rows(&mut inputs, waves, |inputs|
-            admission::forecast_mtp(input.checkpoint(), inputs, opts.native_mtp_layers));
-        if selected.is_err() && opts.prefill_lanes == 0 && waves > 1 {
-            waves = 1;
-            selected = default_rows(&mut inputs, waves, |inputs|
-                admission::forecast_mtp(input.checkpoint(), inputs, opts.native_mtp_layers));
-        }
-        let (unit, admitted) = selected?;
-        report.prefill_selection = Some(format!("Step-5 automatic prefill selected {unit} rows x {waves} waves"));
-        admitted
-    };
-    let rows = inputs.rows;
-    report.prefill_span_rows = Some(rows as u64);
-    report.prefill_transports = Some(1);
-    opts.prefill_unit_rows = Some(inputs.unit_rows() as u64);
-    opts.prefill_waves = waves as u64;
+    let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert(
@@ -293,9 +242,10 @@ pub(super) fn layout(
         spark_ranks,
         prefill_lanes: 1,
     };
+    let capacity = u32::try_from(shape.unit_rows)?;
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,
-            capacity: u32::try_from(rows).unwrap_or(u32::MAX),
+            capacity,
             ingress: cuteafd_core::SparkIngress::Bf16
         })
         .collect::<Vec<_>>();
@@ -366,6 +316,11 @@ pub(super) fn layout(
                 Basis::Formula,
             ));
         }
+        // Unlike the legacy family wave allowances, Step-5 has no first-slot scratch reserve.
+        let backend = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?;
+        let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
+            shape.unit_rows, shape.waves)?;
+        crate::plan::layout::spark_slots::charge_executions(&mut device, input, &working, "step5", &executions)?;
         memory.devices.push(device);
     }
     report.solver_placement = Some(admitted.placement);

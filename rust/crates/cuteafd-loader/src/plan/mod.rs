@@ -16,13 +16,15 @@ pub mod names;
 pub mod rope;
 pub mod spec;
 pub mod spark_range;
+pub mod spark_executions;
 #[doc(hidden)]
 pub mod testing;
 
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
 
 pub use checkpoint::Checkpoint;
 pub use family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
@@ -161,7 +163,8 @@ pub enum PlanError {
 /// Resolve the decode-lane count before layout or CUDA allocation
 /// ([`decode_lanes::resolve`]).
 pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
-    decode_lanes::resolve(family, requested, concurrency)
+    let descriptor = spark_executions::descriptor(family).map_err(PlanError::Checkpoint)?;
+    decode_lanes::resolve(descriptor, requested, concurrency)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +247,12 @@ pub struct PlanReport {
     /// Family-resolved units in flight on each transport.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_waves: Option<u64>,
+    /// The admitted pool's RTX expert layers and the pool the same solve
+    /// admits with none onboarded (bench cards read both beside the pool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboard_layers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pool_tokens_no_onboard: Option<u64>,
     /// Resolved decode views, independent of prefill units in flight.
     pub decode_lanes: u8,
     /// Solver-selected transport count, independent of units in flight.
@@ -441,26 +450,66 @@ fn numerics_deviations(family: &str, modules: &BTreeMap<String, checkpoint::Modu
     } else { Vec::new() }
 }
 
-/// A checkpoint opened once, with the routed-expert catalog parsed from it:
-/// what a plan is built from. Reading every shard header and building the
-/// expert catalog dominate planning and neither changes between layouts, so
-/// a caller that evaluates many plans over one snapshot opens it once and
-/// asks `PlanInput` for each report (`plan_spark_count` walks one per
-/// candidate Spark count; `cuteafd plan --layout` adds more).
+/// Exclusive elapsed phases for one plan, including first-use metadata work.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlanTimings {
+    pub open: Duration,
+    pub catalog: Duration,
+    pub report: Duration,
+    pub layout: Duration,
+    pub admission: Duration,
+}
+
+impl PlanTimings {
+    pub fn total(self) -> Duration { self.open + self.catalog + self.report + self.layout + self.admission }
+}
+
+#[derive(Default)]
+struct PhaseCounters { catalog: AtomicU64, layout: AtomicU64, admission: AtomicU64 }
+impl PhaseCounters {
+    fn snapshot(&self) -> [u64; 3] {
+        [&self.catalog, &self.layout, &self.admission].map(|counter| counter.load(Ordering::Relaxed))
+    }
+}
+
+struct PhaseTimer<'a> { start: Instant, counter: &'a AtomicU64, nested: Vec<(&'a AtomicU64, u64)> }
+impl<'a> PhaseTimer<'a> {
+    fn new(counter: &'a AtomicU64, nested: &[&'a AtomicU64]) -> Self {
+        Self { start: Instant::now(), counter,
+            nested: nested.iter().map(|counter| (*counter, counter.load(Ordering::Relaxed))).collect() }
+    }
+}
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        let nested = self.nested.iter().map(|(counter, before)| counter.load(Ordering::Relaxed).saturating_sub(*before)).sum::<u64>();
+        self.counter.fetch_add((self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64).saturating_sub(nested), Ordering::Relaxed);
+    }
+}
+
+/// A checkpoint opened once, with its routed-expert catalog initialized on first use.
+/// Reuse an input when evaluating multiple layouts over the same snapshot.
 pub struct PlanInput {
     checkpoint: Checkpoint,
+    header_validation: Option<Result<(), String>>,
+    open_time: Duration,
+    open_reported: AtomicBool,
+    phases: PhaseCounters,
     /// The routed-expert catalog, read on first use.
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
 }
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Ok(Self::from_checkpoint(Checkpoint::open(snapshot)?))
+        let start = Instant::now();
+        let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
+        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(),
+            open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default() })
     }
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
-        Self { checkpoint, catalog: OnceLock::new() }
+        Self { checkpoint, header_validation: None, catalog: OnceLock::new(),
+            open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default() }
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {
@@ -471,7 +520,14 @@ impl PlanInput {
     /// kept for the lifetime of the input. Families that stage no routed
     /// experts never ask for it, so no read happens for them.
     pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> {
-        match self.catalog.get_or_init(|| crate::read_expert_catalog(&self.checkpoint.snapshot)) {
+        match self.catalog.get_or_init(|| {
+            let _timer = PhaseTimer::new(&self.phases.catalog, &[]);
+            if let Some(validation) = &self.header_validation {
+                crate::families::deepseek_v41::v41_catalog::expert_catalog_from_checkpoint(&self.checkpoint, validation)
+            } else {
+                crate::read_expert_catalog(&self.checkpoint.snapshot)
+            }
+        }) {
             Ok(catalog) => Ok(catalog),
             Err(error) => Err(anyhow::anyhow!("{error:#}")),
         }
@@ -479,7 +535,46 @@ impl PlanInput {
 
     /// The plan for `options` over this checkpoint.
     pub fn plan(&self, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-        plan_of(self, options)
+        self.plan_with_timings(options).0
+    }
+
+    /// Resolve Spark-count candidates without reopening the CLI's preflight checkpoint.
+    pub fn plan_spark_count(&self, options: &PlanOptions, available: usize,
+        explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+        plan_spark_count_of(self, options, available, explicit)
+    }
+
+    /// Exclusive wall times; first-use checkpoint/catalog work is charged once.
+    pub fn plan_with_timings(&self, options: &PlanOptions) -> (Result<PlanReport, PlanError>, PlanTimings) {
+        self.with_timings(options, || plan_of(self, options))
+    }
+
+    pub fn exlr8_native_plan(&self, selected: &str, options: &PlanOptions,
+        speculator: &str) -> anyhow::Result<exlr8::NativePlan> {
+        self.exlr8_native_plan_with_timings(selected, options, speculator).0
+    }
+
+    pub fn exlr8_native_plan_with_timings(&self, selected: &str, options: &PlanOptions,
+        speculator: &str) -> (anyhow::Result<exlr8::NativePlan>, PlanTimings) {
+        self.with_timings(options, || exlr8::native_plan_of(self, selected, options, speculator))
+    }
+
+    fn with_timings<T>(&self, options: &PlanOptions, operation: impl FnOnce() -> T) -> (T, PlanTimings) {
+        let before = self.phases.snapshot();
+        let start = Instant::now();
+        let result = operation();
+        let elapsed = start.elapsed();
+        let after = self.phases.snapshot();
+        let [catalog, layout, admission] = std::array::from_fn(|i| Duration::from_nanos(after[i].saturating_sub(before[i])));
+        let timings = PlanTimings {
+            open: if self.open_reported.swap(true, Ordering::Relaxed) { Duration::ZERO } else { self.open_time },
+            catalog, layout, admission, report: elapsed.saturating_sub(catalog + layout + admission),
+        };
+        tracing::info!(snapshot = %self.checkpoint.snapshot.display(), ranks = options.placement.spark_ranks(),
+            open_s = timings.open.as_secs_f64(), catalog_s = timings.catalog.as_secs_f64(),
+            report_s = timings.report.as_secs_f64(), layout_s = timings.layout.as_secs_f64(),
+            admission_s = timings.admission.as_secs_f64(), "planner phase durations");
+        (result, timings)
     }
 }
 
@@ -492,6 +587,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
     options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
+    let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
             report.native_serving_admitted = model.native_serving_admission();
@@ -527,6 +623,7 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
 
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     let mut report = plan_unrestricted(input, options)?;
+    let _timer = PhaseTimer::new(&input.phases.admission, &[&input.phases.catalog, &input.phases.layout]);
     match spark_range::admit(input, options, &report) {
         Ok(()) => {},
         Err(PlanError::SparkRange(refusal)) => {
@@ -580,6 +677,8 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         prefill_span_rows: None,
         prefill_unit_rows: None,
         prefill_waves: None,
+        onboard_layers: None,
+        max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
         prefill_transports: None,
         prefill_selection: None,
@@ -733,13 +832,13 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
 
     // Classify every tensor, then group each component's tensors by stem: one
     // operand per logical weight, checked against the family's contract.
-    let mut by_component: BTreeMap<Component, Vec<checkpoint::CheckpointTensor>> = BTreeMap::new();
-    let mut roles: BTreeMap<String, TensorRole> = BTreeMap::new();
+    let mut by_component: BTreeMap<Component, Vec<&checkpoint::CheckpointTensor>> = BTreeMap::new();
+    let mut roles: std::collections::HashMap<&str, TensorRole> = std::collections::HashMap::new();
     for tensor in &checkpoint.tensors {
         match family.classify(spec, &tensor.meta.name) {
             Some(role) => {
-                roles.insert(format::split_stem(&tensor.meta.name).0.to_owned(), role.clone());
-                by_component.entry(role.component).or_default().push(tensor.clone());
+                roles.insert(format::split_stem(&tensor.meta.name).0, role.clone());
+                by_component.entry(role.component).or_default().push(tensor);
             }
             None => report.unclassified.push(tensor.meta.name.clone()),
         }
@@ -779,12 +878,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     // Routed-expert operands by label, for the placement contract.
     let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
     for (component, tensors) in &by_component {
-        let groups = format::group_by_stem(tensors);
+        let groups = format::group_tensor_refs(tensors.iter().copied());
         let mut formats: BTreeMap<String, usize> = BTreeMap::new();
         let mut rejected = 0usize;
         let mut rejections = Vec::new();
         for (stem, members) in &groups {
-            let role = roles.get(stem).cloned().unwrap_or_else(|| TensorRole::new(*component));
+            let role = roles.get(stem.as_str()).cloned().unwrap_or_else(|| TensorRole::new(*component));
             let verdict = match format::detect(members) {
                 Ok(mut operand) => {
                     let declared = modelopt.as_ref().map_or(Ok(()), |m| m.check(stem, &operand));
@@ -863,6 +962,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
+        if let Some(placement) = &report.solver_placement {
+            report.onboard_layers = Some(placement.onboard_layers);
+            report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+        }
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -1204,6 +1307,18 @@ pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
+    match report.family.as_deref() {
+        Some("deepseek_v41") => {
+            let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #744)");
+        }
+        Some("mimo_v2") => {
+            let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #671 / #709)");
+        }
+        _ => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
+            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows; intake {} rows; {} Spark transport(s)",
+                report.prefill_span_rows.unwrap_or(unit * waves), report.prefill_transports.unwrap_or(0));
+        },
+    }
     if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
         let p = &report.mapped_placement;
         let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
@@ -1215,6 +1330,10 @@ pub fn render(report: &PlanReport) -> String {
         for item in &host.items {
             let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
         }
+    }
+    if let (Some(layers), Some(maximum)) = (report.onboard_layers, report.max_pool_tokens_no_onboard) {
+        let pool = report.memory_layout.as_ref().map_or(0, |memory| memory.pool_tokens);
+        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
     }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }

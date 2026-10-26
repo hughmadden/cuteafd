@@ -97,10 +97,10 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
     SparkAdmission::plan_manifest(&snapshot, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
             spark_ranks: world, prefill_lanes: 1 }, world, None,
-        ModelAdmission { capacity: MAX_ROWS as u32, compiled_capacity: 4096,
-            endpoints: vec![SparkEndpoint { ring_depth: None, capacity: MAX_ROWS as u32,
+        ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: MAX_ROWS as u32,
                 ingress: SparkIngress::Fp8K32 }],
-            rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1 }, Some(&manifest))?.select(&peers)?;
+            spark_rings(config.max_frame_bytes)?, super::tp_gate::gate_executions(&catalog, MAX_ROWS as u32)?)?,
+        Some(&manifest))?.select(&peers)?;
     let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;
     let output = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;

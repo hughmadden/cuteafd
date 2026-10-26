@@ -4,7 +4,7 @@
 //! pages owned by logical-page parity, a q/candidate/partial exchange per
 //! layer), or explicit `layers` (whole attention and owner-local KV, with
 //! split FFNs). `context` remains the default where its programs exist
-//! ([`GlmContext`]); owned attention admits at most two ordered prefill lanes.
+//! ([`GlmContext`]); owned attention follows the shared prefill wave policy.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
 use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
@@ -14,11 +14,6 @@ pub const PAGE_ROWS: u64 = 64;
 pub const DECODE_ROWS: u64 = 64;
 pub const DEFAULT_PREFILL_LANES: u64 = 3;
 pub const SKIP_RANKS: usize = 4;
-
-/// Only Spark prefill pipelines execute multiple lanes; local/diagnostic runs are serial.
-pub fn prefill_lanes(spark_ranks: usize, configured: u64) -> u64 {
-    if spark_ranks == 0 { 1 } else { configured.clamp(1, 4) }
-}
 
 const FLOOR: u64 = 256;
 const GIB: u64 = 1 << 30;
@@ -417,7 +412,7 @@ fn configure_attention(req: &mut PlacementRequest, attention: Option<AttentionPl
                 LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }]);
         }
         validate_layer_pipeline_lanes(req.hops.lanes, req.hops.lanes as usize)
-            .map_err(|_| PlacementError::Inventory("GLM layers requires one or two prefill lanes"))?;
+            .map_err(|_| PlacementError::Inventory("GLM layers requires matching shared-policy prefill lanes"))?;
         req.owner_local_kv_scratch("padded decode scratch page", FLOOR)?;
     }
     Ok(())
@@ -508,7 +503,9 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     if inputs.spark_ranks == 0 || routed == 0 {
         let mut branch = inputs.clone();
         branch.spark_ranks = 0;
-        branch.prefill_lanes = 1;
+        if branch.prefill_lanes != 1 {
+            return Err(PlacementError::Inventory("Spark-free GLM executor requires one admitted prefill wave"));
+        }
         branch.tp2_workspace = serial_tp2_workspace;
         return run(&branch, None, None);
     }
@@ -526,8 +523,15 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
         let mut branch = inputs.clone();
         branch.onboard = Onboard::Layers(n);
         if n == routed {
+            if branch.prefill_lanes > 1 {
+                tracing::info!(waves = branch.prefill_lanes,
+                    "keeping a Spark-using candidate: all-local shape transition awaits shared planner #776");
+                if refusal.is_none() {
+                    refusal = Some(PlacementError::Inventory("all-local GLM candidate requires a one-wave deployment; shared shape transition pending #776"));
+                }
+                continue;
+            }
             branch.spark_ranks = 0;
-            branch.prefill_lanes = 1;
             branch.tp2_workspace = serial_tp2_workspace;
         }
         let floor = match inputs.onboard {
@@ -845,16 +849,21 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
             shape.topk as u64, rows, lanes, false) })
 }
 
-/// Exact checkpoint-native TP2 costs. Rotated unit ownership changes by
-/// expert and layer; neither a proportional half nor EXL3 storage is valid.
+#[cfg(test)]
 fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, layers: usize,
     router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
-    use crate::plan::exlr8::residency::{ExpertSet, Residency};
+    exlr8_expert_costs_of(&crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?, first, layers, router)
+}
+
+/// Exact checkpoint-native TP2 costs; rotated ownership forbids proportional halves.
+fn exlr8_expert_costs_of(input: &crate::plan::exlr8::residency::MetadataInput, first: usize, layers: usize,
+    router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
+    use crate::plan::exlr8::residency::ExpertSet;
     (first..layers).map(|layer| {
-        let whole = Residency::plan(snapshot, selected, layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
+        let whole = input.plan(layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
         let mut half = [Bytes2::default(); 2];
         for (rank, cost) in half.iter_mut().enumerate() {
-            cost.resident = Residency::plan(snapshot, selected, layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
+            cost.resident = input.plan(layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
         }
         for record in router.iter().filter(|record| record.tensor.starts_with(&format!("model.layers.{layer}.mlp.gate."))) {
             for component in &record.components {
@@ -870,6 +879,14 @@ fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, 
 pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
+    let input = crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?;
+    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, rows, lanes, exchange_f32, activations, &input)
+}
+
+pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    activations: crate::plan::exlr8::PrefillActivations, input: &crate::plan::exlr8::residency::MetadataInput)
+    -> anyhow::Result<LocalInventory> {
     anyhow::ensure!(!exchange_f32, "GLM EXLR8 TP2 emits BF16 routed partials; use BF16 exchange");
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     let cfg = GlmDsaConfig::from_hf(&config)?;
@@ -885,7 +902,7 @@ pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &st
             anyhow::ensure!(records.iter().any(|record| record.tensor == name), "EXLR8 missing local router {name}");
         }
     }
-    let experts = exlr8_expert_costs(snapshot, selected, cfg.first_moe_layer, selected_layers, &records)?;
+    let experts = exlr8_expert_costs_of(input, cfg.first_moe_layer, selected_layers, &records)?;
     Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
         extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
 }
@@ -1094,6 +1111,9 @@ mod tests {
             expert.whole.resident = 2 << 20;
             for half in &mut expert.half { half.resident = 1 << 20; }
         }
+        assert!(solve_working_set(&native, native.tp2_workspace, HEADS).is_err(),
+            "all-local admission must not silently shrink the requested three-wave shape");
+        native.prefill_lanes = 1;
         let (all, working) = run(&native);
         assert_eq!(all.onboard_layers, cfg.layers - cfg.first_moe_layer);
         assert!(working.spark.spark_layers.is_empty());
@@ -1151,7 +1171,7 @@ mod tests {
         for cards in [vec![96 * GIB], vec![96 * GIB; 2]] {
             let mut i = inputs(&cfg, &cards);
             i.spark_ranks = 0;
-            i.prefill_lanes = prefill_lanes(0, 3);
+            i.prefill_lanes = 1;
             i.experts.clear();
             i.expert_workspace = 0;
             i.tp2_workspace = [0; 2];
@@ -1173,10 +1193,6 @@ mod tests {
             i.prefill_lanes = 3;
             assert!(super::request(&i).is_err(), "skip diagnostics must retain serial admission");
         }
-        for configured in 1..=4 {
-            assert_eq!(prefill_lanes(0, configured), 1);
-            assert_eq!(prefill_lanes(4, configured), configured);
-        }
     }
 
     #[test]
@@ -1187,6 +1203,7 @@ mod tests {
             Onboard::ExpertsFirst { pool_floor: 262144 }] {
             let mut planned = inputs(&cfg, &[96 * GIB; 2]);
             planned.onboard = onboard;
+            planned.prefill_lanes = 1;
             planned.max_context = 65536;
             planned.requested_pool = Some(65536);
             for cost in &mut planned.experts {
@@ -1253,6 +1270,7 @@ mod tests {
             "unselected RTX rows must never affect admission");
 
         input.onboard = Onboard::Layers(cfg.layers - cfg.first_moe_layer);
+        input.prefill_lanes = 1;
         input.expert_workspace = 0;
         input.tp2_workspace = [128 << 20; 2];
         for cost in &mut input.experts { cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2]; }
@@ -1276,6 +1294,7 @@ mod tests {
     fn pool_first_evaluates_serial_all_local_candidate_and_empty_routed_set() {
         let cfg = config();
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
+        input.prefill_lanes = 1;
         for cost in &mut input.experts { cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2]; }
         let serial = [64 << 20; 2];
         let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
@@ -1291,13 +1310,57 @@ mod tests {
         input.layers = cfg.first_moe_layer;
         input.experts.clear();
         input.spark_ranks = 4;
-        input.prefill_lanes = 3;
+        input.prefill_lanes = 1;
         let (dense, working) = solve_working_set(&input, serial, HEADS).unwrap();
         assert!(working.spark.rtx_layers.is_empty() && working.spark.spark_layers.is_empty());
         assert_eq!(working.spark.spark_ranks, 0);
         assert_eq!(working.spark.prefill_lanes, 1);
         assert_eq!(working.tp2_workspace, [0; 2]);
         assert_eq!(dense.pool_tokens, 2 << 20);
+    }
+
+    #[test]
+    fn automatic_multiwave_skips_all_local_without_rewriting_the_shape() {
+        let mut cfg = config();
+        cfg.layers = 6;
+        cfg.indexers.truncate(cfg.layers);
+        let routed = cfg.layers - cfg.first_moe_layer;
+        for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 262144 }] {
+            for waves in [2, 3, 4] {
+                let mut input = inputs(&cfg, &[96 * GIB; 2]);
+                input.onboard = onboard;
+                input.prefill_lanes = waves;
+                input.prefill_rows = crate::serving_capacity::prefill_waves::unit_rows(waves);
+                input.max_context = 65536;
+                input.requested_pool = Some(65536);
+                for cost in &mut input.experts {
+                    cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2];
+                }
+                let serial = [64 << 20; 2];
+                let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
+                assert!(placed.onboard_layers < routed, "{onboard:?}: all-local needs a new deployment shape");
+                assert!(!working.spark.spark_layers.is_empty());
+                assert_eq!((working.spark.spark_ranks, working.spark.prefill_lanes), (4, waves));
+                assert_eq!(input.prefill_lanes, waves);
+                // Auto must still select the best executable Spark candidate.
+                let explicit = (0..routed).map(|n| {
+                    let branch = GlmInputs { onboard: Onboard::Layers(n), ..input.clone() };
+                    solve_working_set(&branch, serial, HEADS).unwrap().0
+                });
+                let score = |p: &Placement| match onboard {
+                    Onboard::ExpertsFirst { .. } => (p.onboard_layers as u64, p.pool_tokens),
+                    _ => (p.pool_tokens, p.onboard_layers as u64),
+                };
+                assert_eq!(score(&placed), explicit.map(|p| score(&p)).max().unwrap());
+                input.onboard = Onboard::Layers(routed);
+                let error = solve_working_set(&input, serial, HEADS).unwrap_err();
+                assert!(error.to_string().contains("#776"), "{error}");
+                input.spark_ranks = 0;
+                assert!(solve_working_set(&input, serial, HEADS).is_err(), "no-Spark input must not clamp waves");
+                input.prefill_lanes = 1;
+                assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, routed);
+            }
+        }
     }
 
     #[test]
@@ -1354,6 +1417,7 @@ mod tests {
         input.requested_pool = Some(2 << 20);
         assert!(matches!(solve_working_set(&input, serial, HEADS), Err(PlacementError::PoolDoesNotFit { .. })));
         input.experts.clear();
+        input.prefill_lanes = 1;
         input.max_context = 65536;
         input.requested_pool = Some(65536);
         assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, 0);
@@ -1443,7 +1507,7 @@ mod tests {
         for onboard in [Onboard::Auto, Onboard::Layers(1)] {
             let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().unwrap();
-            let planned = GlmInputs { prefill_rows: 64, experts: local.experts.clone(),
+            let planned = GlmInputs { prefill_rows: 64, prefill_lanes: 1, experts: local.experts.clone(),
                 expert_workspace: 0, tp2_workspace: local.workspace(), drafter_bytes: 0,
                 max_context: 65536, requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
             let mut runtime = planned.clone();
@@ -1757,7 +1821,8 @@ mod tests {
                 let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
                 let serial = local.workspace_for(&cfg, rows, 1, false);
                 for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(1), Onboard::Fraction(1.0)] {
-                    let planned = GlmInputs { prefill_rows: rows, experts: local.experts.clone(),
+                    let lanes = if onboard == Onboard::Layers(0) { 3 } else { 1 };
+                    let planned = GlmInputs { prefill_rows: rows, prefill_lanes: lanes, experts: local.experts.clone(),
                         expert_workspace: 0, tp2_workspace: local.workspace(),
                         drafter_bytes: 0, max_context: 65536, requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
                     let mut runtime = planned.clone();
@@ -1889,7 +1954,13 @@ mod tests {
         assert_eq!(req.layers.iter().map(|layer| layer.fixed_bytes.whole).sum::<u64>(),
             glm_cache_geometry(&cfg, cfg.layers, 1).unwrap().ranks[0].persistent_unit_bytes - cfg.layers as u64 * FLOOR);
         assert_eq!(placed.hops.iter().filter(|hop| matches!(hop.at, HopPoint::AfterAttention(_))).count(), cfg.layers);
-        i.prefill_lanes = 3;
+        for lanes in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
+            i.prefill_lanes = lanes;
+            let (placed, working) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
+            assert_eq!(working.spark.prefill_lanes, lanes);
+            assert_eq!(placed.pool_tokens, 2 << 20);
+        }
+        i.prefill_lanes = crate::serving_capacity::prefill_waves::MAX_WAVES + 1;
         assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).is_err());
         let mut one = inputs(&cfg, &[96 * GIB]);
         one.prefill_lanes = 1;

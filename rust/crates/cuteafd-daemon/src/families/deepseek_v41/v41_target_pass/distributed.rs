@@ -1171,7 +1171,7 @@ mod tests {
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                 timeout: Duration::from_secs(120),
                 max_frame_bytes: 2 << 20,
-            })?;
+            }, 0)?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
@@ -1360,7 +1360,7 @@ mod tests {
                 SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                         timeout: Duration::from_secs(120),
                         max_frame_bytes: 2 << 20,
-                    })?,
+                    }, 0)?,
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;

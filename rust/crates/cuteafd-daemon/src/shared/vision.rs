@@ -31,7 +31,7 @@ pub enum VisionError {
     #[error("vision I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("vision config: {0}")]
-    Json(#[from] serde_json::Error),
+    JsonFile(#[from] cuteafd_loader::JsonFileError),
     #[error("vision native: {0}")]
     Native(#[from] cuteafd_ffi::vision::VisionError),
     #[error("audio tower: {0}")]
@@ -141,7 +141,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
     let mut files = BTreeSet::new();
     let index_path = snapshot.join("model.safetensors.index.json");
     if index_path.exists() {
-        let index: serde_json::Value = serde_json::from_reader(File::open(index_path)?)?;
+        let index: serde_json::Value = cuteafd_loader::read_json_file(&index_path)?;
         let map = index["weight_map"]
         .as_object()
         .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
@@ -192,7 +192,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
 
 impl TowerSpec {
     pub fn from_snapshot(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let cfg: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         match cfg["model_type"].as_str() {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
@@ -209,7 +209,7 @@ impl TowerSpec {
         }
     }
     pub fn mimo(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let cfg: MimoConfig = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let cfg: MimoConfig = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         cfg.validate(max_tokens)?;
         let tensors = tower_catalog(snapshot, "visual.")?;
         for bias in [
@@ -875,7 +875,7 @@ mod tests {
             }
             let config = snapshot.path().join("config.json");
             let mut cfg: serde_json::Value =
-                serde_json::from_reader(File::open(&config).unwrap()).unwrap();
+                cuteafd_loader::read_json_file(&config).unwrap();
             cfg["vision_config"]["patch_size"] = serde_json::json!(14);
             std::fs::write(config, serde_json::to_vec(&cfg).unwrap()).unwrap();
             assert!(TowerSpec::mimo(snapshot.path(), 4096)
