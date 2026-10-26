@@ -303,8 +303,10 @@ const IDLE_CLOCK: u32 = 64;
 const SLEEP: Duration = Duration::from_micros(20);
 /// A wave sleeps only through this share of its expected duration (the
 /// running mean of the last waves), then spins: completion stays within a
-/// spin of the event, while the long middle of every Spark round trip and
-/// every GPU stage costs no CPU.
+/// spin of the event, while the long middle of a long Spark round trip or GPU
+/// stage costs no CPU. A wait first spins through the hybrid window
+/// ([`BLOCK_SPIN`](cuteafd_transport::wait_policy::BLOCK_SPIN), 10 ms), so a
+/// decode wave (a per-layer round well under that) never sleeps.
 const SLEEP_SHARE: f64 = 0.7;
 /// Weight of the newest wave in the running means.
 const MEAN_WEIGHT: f64 = 0.125;
@@ -321,8 +323,12 @@ impl Pace {
         *mean = Some(mean.map_or(sample, |mean| mean + MEAN_WEIGHT * (sample - mean)));
     }
     /// Whether a wait that has lasted `age` seconds, of a kind whose mean is
-    /// `mean`, is still early enough to sleep through.
-    fn early(mean: Option<f64>, age: f64) -> bool { mean.is_some_and(|mean| age < SLEEP_SHARE * mean) }
+    /// `mean`, may sleep: past the hybrid spin window and still early in its
+    /// expected duration.
+    fn early(mean: Option<f64>, age: f64) -> bool {
+        !cuteafd_transport::wait_policy::block_spins(Duration::from_secs_f64(age))
+            && mean.is_some_and(|mean| age < SLEEP_SHARE * mean)
+    }
 }
 
 /// The worker's loop until its channel closes or a transport error. It never
@@ -339,8 +345,9 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     let mut idle_since: Option<Instant> = None;
     let mut idle_passes = 0u32;
     let mut pace = Pace::default();
-    // `--host-wait block` paces the polling between a wave's post and its
-    // completion; `spin` polls throughout (lowest latency).
+    // `--host-wait block` spins through the first `BLOCK_SPIN` of a wave's
+    // wait, then paces the polling to its completion; `spin` polls throughout
+    // (lowest latency).
     let paced = cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Block;
     // Whether the current wait is early enough to sleep through, and whether
     // the last pass slept (the next one re-decides).

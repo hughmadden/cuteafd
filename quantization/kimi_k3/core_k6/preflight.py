@@ -20,8 +20,8 @@ def main():
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-    if socket.gethostname().lower() != "oliver":
-        raise RuntimeError("this recipe's production placement is Oliver only")
+    if socket.gethostname().lower() != "maxq":
+        raise RuntimeError("this recipe's production placement is maxq only")
     for relative in (".venv/bin/python",):
         if not (REPO / relative).is_file():
             raise FileNotFoundError(relative)
@@ -49,7 +49,7 @@ def main():
         raise RuntimeError("expected one local 96GB RTX PRO 6000")
     subprocess.run([str(REPO / ".venv/bin/python"), str(Path(__file__).with_name("run.py")),
                     *arguments, "--preflight"], check=True, timeout=240)
-    print(json.dumps(dict(admission="passed", host="oliver", image=IMAGE)), flush=True)
+    print(json.dumps(dict(admission="passed", host="maxq", image=IMAGE)), flush=True)
 
 
 if __name__ == "__main__":

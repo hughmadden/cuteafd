@@ -134,7 +134,7 @@ def test_cuda_objects_are_seeded_per_translation_unit():
 
 def test_export_manifests_never_iterate_directories_unsorted():
     # Directory order is filesystem-specific: an unsorted iterdir/glob into a
-    # manifest dict made raptor's and oliver's identical exports differ (#127).
+    # manifest dict made identical exports differ between hosts (#127).
     import re
     for path in sorted((ROOT / 'python/tools/aot').glob('export_*.py')):
         for number, line in enumerate(path.read_text().splitlines(), 1):

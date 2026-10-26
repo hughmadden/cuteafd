@@ -628,9 +628,9 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 # coordinator GPU). Spark workers and the coordinator both read it.
 # ATTENTION_PLACEMENT (validated per family before this) reaches the server too.
 # HOST_WAIT (block, default; or spin) is how serving's host threads wait:
-# block spins 250 us in each critical-path wait, then sleeps (the Spark exchange
-# worker paces its polling): a less loaded machine; spin spins throughout, one
-# busy core per waiting thread. IDLE_PARK_SECONDS
+# block spins 10 ms in each critical-path wait, then sleeps (the Spark exchange
+# worker spins as long, then paces its polling): a less loaded machine; spin
+# spins throughout, one busy core per waiting thread. IDLE_PARK_SECONDS
 # (default 30): with no active request for that long every polling thread
 # parks. Coordinator and Spark workers both read them.
 shared_coordinator_env_args() {

@@ -417,10 +417,17 @@ def test_wip_seed_lease_balances_only_automatic_lan_seeds():
     assert 'kakapo' not in early
 
 
-def test_remote_export_route_keeps_the_host_ssh_configuration():
+def test_remote_exports_connect_by_ssh_hostname():
     text = (ROOT / 'scripts/build/export-remote.sh').read_text()
-    # The host's own Host block (identity agent, user) must apply: connect by name, route by address.
-    assert 'ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o "HostName=$fqdn" -o "HostKeyAlias=$host" "$host")' in text
+    assert 'ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host")' in text
+    images = (ROOT / 'scripts/build/build-dev-images.sh').read_text()
+    export_ssh = images[images.index('export_ssh() {'):images.index('\nif [[ "$role" != coordinator ]]')]
+    assert 'release_ssh -o ConnectTimeout=10 "$host" "$@"' in export_ssh
+    for script in (text, export_ssh):
+        assert 'HostKeyAlias' not in script and 'HostName=' not in script
+    assert 'CUTEAFD_EXPORT_HOST_ADDR' not in text + images + WIP
+    config = (ROOT / 'cuteafd.config').read_text()
+    assert '\nCUTEAFD_EXPORT_HOST=maxq\n' in config
 
 
 def test_dev_images_refresh_export_hosts_and_distribute_only_never_builds(tmp_path):
