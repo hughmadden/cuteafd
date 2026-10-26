@@ -92,6 +92,10 @@ pub struct WaveReceipt {
     /// Bit r: rank r's whole plane landed in its device range (GPU landing);
     /// the sink saw none of its rows. Other ranks' rows all went to the sink.
     pub landed: u8,
+    /// Per rank: the worker's measured (busy µs, idle µs) for this unit on
+    /// its prefill owner, from the reply header (#762); None for decode
+    /// owners and for workers that report none.
+    pub pace: [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD],
 }
 
 impl SparkExperts {
@@ -419,7 +423,14 @@ impl SparkExperts {
                 let rank = wave.receiver.push_landed(&chunk)?;
                 ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
                 receipt.landed |= 1 << rank;
+                receipt.pace[rank] = chunk.header.pace;
                 return Ok(());
+            }
+            if let Some(pace) = chunk.header.pace {
+                // Every chunk of a unit's reply follows its fence; keep the last.
+                let rank = chunk.stream_id;
+                ensure!(rank < receipt.pace.len(), "Spark reply rank {rank} outside the world");
+                receipt.pace[rank] = Some(pace);
             }
             let mut location = None;
             wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
@@ -944,6 +955,37 @@ mod tests {
         }
         assert!(receiver.complete());
         assert_eq!(receipt.landed, u8::MAX);
+        Ok(())
+    }
+
+    /// #762: a worker's paced reply passes the coordinator's whole-plane and
+    /// chunk receivers unchanged and its pace reaches the header both ways.
+    #[test]
+    fn paced_replies_keep_their_receivers_and_carry_the_pace() -> Result<()> {
+        let request = super::super::tests::request(2);
+        let frame = request.encode()?;
+        let native = BackboneRequest::parse(&frame, 2)?;
+        let plane = vec![7u8; native.plane_bytes()?];
+        let mut landed = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        let mut host = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        for rank in 0..4 {
+            let encoded = native.response(rank as u64 + 1, &plane)?.to_owned()?
+                .with_pace(Some((1_000 + rank, rank))).encode()?;
+            let header = crate::ExpertProtocolV2ResponseView::parse_landed_header(
+                &encoded[..crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?;
+            assert_eq!(header.pace, Some((1_000 + rank, rank)));
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank as usize, header: header.clone(),
+                row_indices: None, partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(Vec::new()),
+                wire_bytes: encoded.len(), landed: true };
+            assert_eq!(landed.push_landed(&chunk)?, rank as usize);
+            let view = crate::ExpertProtocolV2ResponseView::parse(&encoded)?;
+            assert_eq!(view.header.pace, Some((1_000 + rank, rank)));
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank as usize, header: view.header.clone(),
+                row_indices: None, partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(
+                    view.partial_output_payload().to_vec()), wire_bytes: encoded.len(), landed: false };
+            host.push_rdma(&chunk, |_, _, _| Ok(()))?;
+        }
+        assert!(landed.complete() && host.complete());
         Ok(())
     }
 
