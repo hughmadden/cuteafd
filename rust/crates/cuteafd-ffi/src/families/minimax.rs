@@ -39,6 +39,8 @@ pub fn load_library(path: &Path) -> Result<NativeLibrary> {
 }
 
 const INDEX_STAGE: &str = "cuteafd_minimax_index_stage_async";
+/// `minimax_index_stage.cu`'s C ABI: cache, page ids, page count, keys, scales, stream.
+type Stage = unsafe extern "C" fn(*const c_void, *const i32, u32, *mut c_void, *mut c_void, *mut c_void) -> i32;
 
 pub fn definitions() -> Vec<(&'static str, &'static [&'static str])> {
     let norm: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "out"];
@@ -180,6 +182,8 @@ pub struct MiniMaxPrograms<'a> {
     library: &'a NativeLibrary,
     device: i32,
     programs: BTreeMap<&'static str, Program<'a>>,
+    /// The index stage entry point, resolved once (valid while `library` is loaded).
+    stage: Stage,
 }
 
 impl<'a> MiniMaxPrograms<'a> {
@@ -193,7 +197,12 @@ impl<'a> MiniMaxPrograms<'a> {
             validate_geometry(spec)?;
             Ok((name, native(name,programs.program(name, pointers))?))
         }).collect::<Result<_>>()?;
-        Ok(Self { library: programs.library(), device, programs: loaded })
+        let library = programs.library();
+        // SAFETY: the symbol's C ABI is fixed by minimax_index_stage.cu (load_library required it);
+        // the copied entry point stays valid while `library`, which outlives this table, is loaded.
+        let stage = *unsafe { library.lib.get::<Stage>(INDEX_STAGE.as_bytes()) }
+            .map_err(|_| MiniMaxNativeError::Program { program: INDEX_STAGE.into(), reason: "missing shared execution export" })?;
+        Ok(Self { library, device, programs: loaded, stage })
     }
     pub fn library(&self) -> &'a NativeLibrary { self.library }
     pub fn device(&self) -> i32 { self.device }
@@ -304,13 +313,9 @@ impl<'a> MiniMaxPrograms<'a> {
         ensure!([cache, pages, keys, scales].iter().all(|b| b.ptr as usize % 16 == 0),
             MiniMaxNativeError::Operand("program operand is not 16-byte aligned"));
         self.check_device(&[cache, pages, keys, scales])?;
-        type Stage = unsafe extern "C" fn(*const c_void, *const i32, u32, *mut c_void, *mut c_void, *mut c_void) -> i32;
-        // SAFETY: the symbol's C ABI is fixed by minimax_index_stage.cu; load_library required it.
-        let stage = unsafe { self.library.lib.get::<Stage>(INDEX_STAGE.as_bytes()) }
-            .map_err(|_| MiniMaxNativeError::Program { program: INDEX_STAGE.into(), reason: "missing shared execution export" })?;
         // SAFETY: checked extents and alignment; the page ids are the batch's
         // validated pool pages, and the caller keeps every operand live.
-        let status = unsafe { stage(cache.ptr, pages.ptr.cast(), count as u32, keys.ptr, scales.ptr, stream) };
+        let status = unsafe { (self.stage)(cache.ptr, pages.ptr.cast(), count as u32, keys.ptr, scales.ptr, stream) };
         ensure!(status == 0, MiniMaxNativeError::Runtime { operation: "index stage".into(),
             source: anyhow::anyhow!("CUDA status {status}") });
         Ok(())
@@ -326,6 +331,17 @@ pub fn linear_shape(name: &str) -> Option<(usize,usize)> { Some(match name {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index stage runs once per prefill launch tile: its entry point is resolved when the
+    /// table loads, not looked up on every call.
+    #[test]
+    fn minimax_index_stage_entry_point_is_resolved_once_at_load() {
+        let source = include_str!("minimax.rs").split("#[cfg(test)]").next().unwrap();
+        let call = source.split("pub unsafe fn index_stage").nth(1).unwrap().split("pub fn linear_shape").next().unwrap();
+        assert!(!call.contains("lib.get") && call.contains("(self.stage)("));
+        let load = source.split("pub fn load(programs").nth(1).unwrap().split("pub fn library").next().unwrap();
+        assert!(load.contains("lib.get::<Stage>(INDEX_STAGE.as_bytes())"));
+    }
     fn spec(name:&str,pointers:&[&str])->ProgramSpec {
         let capacity=if name.ends_with("_decode") {64} else if matches!(name,"minimax_index_prefill"|"minimax_attention_extend") {1024} else {4096};
         let mut spec=ProgramSpec {name:name.into(),pointers:pointers.iter().map(|s|s.to_string()).collect(),

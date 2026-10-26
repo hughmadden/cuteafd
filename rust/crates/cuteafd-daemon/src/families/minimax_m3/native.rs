@@ -3,20 +3,22 @@
 //! execution's own allocations (weights, scratch, KV cache, step input),
 //! which outlive the stream's work: every entry point drains before it
 //! returns, and the stream drains before any owner is released.
-use crate::shared::{memory::device::{CancellationDrain, Device, Stream}, prefix::view};
+use crate::shared::{memory::{BlockingWait, device::{CancellationDrain, Device, Stream}}, prefix::view};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{minimax::MiniMaxPrograms, programs::{Programs, Scalar}, CuteafdDeviceBuffer, NativeLibrary};
-use std::ffi::c_void;
+use std::{cell::RefCell, ffi::c_void};
 
 pub(super) struct Native<'a> {
     stream: Stream<'a>,
     programs: MiniMaxPrograms<'a>,
+    /// The per-step host wait under `--host-wait`.
+    round: RefCell<BlockingWait<'a>>,
 }
 
 impl<'a> Native<'a> {
     pub fn new(device: Device<'a>, programs: &'a Programs<'a>) -> Result<Self> {
         let programs = device.run(|| MiniMaxPrograms::load(programs, device.id))?;
-        Ok(Self { stream: Stream::new(device)?, programs })
+        Ok(Self { stream: Stream::new(device)?, programs, round: RefCell::new(BlockingWait::new(device.library)) })
     }
     pub fn device(&self) -> Device<'a> { self.stream.device }
     pub fn library(&self) -> &'a NativeLibrary { self.stream.device.library }
@@ -27,6 +29,17 @@ impl<'a> Native<'a> {
         let drained = self.stream.drain();
         if drained.is_err() { self.library().quarantine_module_after_failed_drain(); }
         drained
+    }
+    /// A step's host wait for its queued work, as the process `--host-wait` policy asks (block:
+    /// poll a blocking-sync event, then sleep on it; spin: a stream synchronize). A failed wait
+    /// drains instead, so the stream is drained or the module quarantined either way.
+    pub fn wait(&self) -> Result<()> {
+        // SAFETY: the stream is this execution's own, waited on its device.
+        let waited = self.device().run(|| unsafe { self.round.borrow_mut().wait(self.stream.raw) });
+        match waited {
+            Ok(()) => Ok(()),
+            Err(error) => self.drain().and(Err(error)),
+        }
     }
     /// Drains (or aborts) on unwind unless completed: an entry point's
     /// borrowed operands outlive the work it queued.
@@ -57,11 +70,22 @@ impl<'a> Native<'a> {
         // SAFETY: the whole view belongs to a live owner.
         unsafe { self.library().cuda_zero_bytes_async(buffer, buffer.bytes, self.stream.raw) }
     }
+    /// Uploads `bytes` to the start of `buffer` after the stream's queued work. `buffer` is the
+    /// whole admitted destination (or its tail from a fixed offset), never a view narrowed to
+    /// `bytes`: the first ordered upload into a destination sizes its pinned staging, which a
+    /// later, longer upload must fit ([`Self::reserve`] creates it before readiness).
     pub fn upload(&self, buffer: CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= buffer.bytes, "MiniMax ordered upload extent");
         self.check_device(&[buffer])?;
         // SAFETY: the ordered upload owns its host staging; the destination's owner is live.
-        unsafe { self.library().copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer }, bytes, self.stream.raw) }
+        unsafe { self.library().copy_h2d_ordered(buffer, bytes, self.stream.raw) }
+    }
+    /// Creates `buffer`'s ordered-upload staging, sized to its whole extent, with no copy: before
+    /// readiness, so no upload allocates pinned memory (which can synchronize the device) later.
+    pub fn reserve(&self, buffer: CuteafdDeviceBuffer) -> Result<()> {
+        self.check_device(&[buffer])?;
+        // SAFETY: as `upload`; nothing is copied.
+        unsafe { self.library().reserve_h2d_ordered(buffer, self.stream.raw) }
     }
     /// `destination[..count]` (F32) = `source[..count]` (BF16).
     pub fn widen(&self, source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffer, count: usize) -> Result<()> {

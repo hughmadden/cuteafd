@@ -1,11 +1,11 @@
 //! MiniMax adapter to shared sliding attention and Markov heads.
 //! Semantics: vllm PR 63232 at 306db61dc16a2c7d2655e4d2b29f7d6a6c4409d6.
 use super::{ffn, head::TargetHeadOwner, native::Native, scratch::Scratch, weights::Weights, MiniMaxError};
-use crate::shared::{memory::device::Allocation, prefix::view, qwen::scheduler,
+use crate::shared::{memory::{BlockingWait, HostAllocation, device::Allocation}, prefix::view, qwen::scheduler,
     speculation::{block_dspark, dflash::{ContextRow, Draft, DraftSeq}}, token_io::TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{block_dspark::{check_operand as check, disjoint, extent, DraftHeads}, programs::Scalar,
-    CuteafdDeviceBuffer, NativeLibrary};
+    CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::{families::minimax_m3::dspark::{DraftMemory, DsparkContract, PREFIX, TARGET_LAYERS},
     plan::checkpoint::Checkpoint};
 use std::collections::BTreeMap;
@@ -86,6 +86,10 @@ pub(super) struct Dspark<'a> {
     buffers: BTreeMap<&'static str, Allocation<'a>>,
     caches: Vec<(Allocation<'a>,Allocation<'a>)>,
     pub layout: Layout,
+    /// Pinned landing of a round's tokens then confidence: both download behind its one host wait.
+    landing: HostAllocation<'a>,
+    /// The draft round's host wait (`--host-wait`).
+    round: std::cell::RefCell<BlockingWait<'a>>,
 }
 impl<'a> Dspark<'a> {
     pub fn load(native: &Native<'a>, contract: &DsparkContract, layout: Layout) -> Result<Self> {
@@ -96,7 +100,13 @@ impl<'a> Dspark<'a> {
             .collect::<Result<_>>()?;
         let caches=(0..5).map(|_|Ok((Allocation::new(device,layout.ring_plane_bytes)?,
             Allocation::new(device,layout.ring_plane_bytes)?))).collect::<Result<_>>()?;
-        let draft=Self {weights,buffers,caches,layout};
+        // Pinned memory is allocated before readiness: its allocation can synchronize the device.
+        let landing=HostAllocation::named(native.library(),landing_bytes(layout.sequences)?,"minimax-dspark-landing")?;
+        let round=std::cell::RefCell::new(BlockingWait::new(native.library()));
+        let draft=Self {weights,buffers,caches,layout,landing,round};
+        // The draft metadata's ordered uploads (positions is the target's step scratch, reserved
+        // with it) get their whole-extent staging now.
+        for name in DRAFT_UPLOADS { native.reserve(draft.get(name)?)?; }
         let (w2,norms)=(draft.weight("markov_head.markov_w2.weight")?,draft.get("markov_norms")?);
         native.check_device(&[w2,norms])?;
         // SAFETY: the drafter owns both buffers; the drain below completes the kernel.
@@ -216,8 +226,20 @@ impl<'a> Dspark<'a> {
             bias:self.weight("confidence_head.proj.bias")? };
         draft_heads(n,&heads,s.get("logits")?,s.get("norm")?,(self.get("anchors")?,&anchors),self.get("tokens")?,
             self.get("markov_workspace")?,self.get("confidence")?,count)?;
-        let tokens=download(n,self.get("tokens")?,rows*4)?;
-        let confidence=download(n,self.get("confidence")?,rows*4)?;
+        // The round's results download on its stream; one host wait then covers the round and
+        // both copies.
+        let (tokens,confidence)=(self.get("tokens")?,self.get("confidence")?);
+        let [token_landing,confidence_landing]=landing_halves(self.landing.buffer,rows)?;
+        check(tokens,rows*4,4)?; check(confidence,rows*4,4)?;
+        n.check_device(&[tokens,confidence])?;
+        // SAFETY: the device buffers hold `rows` words and the drafter's pinned landing both
+        // halves; the landing is read only after the wait, which covers both copies.
+        unsafe {
+            n.library().copy_d2h_host_buffer_async(token_landing,tokens,rows*4,n.raw())?;
+            n.library().copy_d2h_host_buffer_async(confidence_landing,confidence,rows*4,n.raw())?;
+            self.round.borrow_mut().wait(n.raw())?;
+        }
+        let (tokens,confidence)=self.landing.bytes()[..rows*8].split_at(rows*4);
         let tokens=tokens.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
         let confidence=confidence.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
         ensure!(tokens.iter().all(|&t|t<VOCAB as u32),MiniMaxError::Invalid("draft token outside vocabulary"));
@@ -353,12 +375,18 @@ fn draft_heads(n: &Native<'_>, heads: &DraftHeads, logits: CuteafdDeviceBuffer, 
         sequences,BLOCK,VOCAB,H,n.raw()) }
 }
 
-fn download(n: &Native<'_>, buffer: CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
-    check(buffer,bytes,1)?;
-    n.check_device(&[buffer])?; n.drain()?;
-    let mut output=vec![0;bytes];
-    if bytes > 0 { n.library().copy_d2h(&mut output,CuteafdDeviceBuffer{bytes,..buffer})?; }
-    Ok(output)
+/// The draft buffers a round uploads into (besides the target's `positions`).
+const DRAFT_UPLOADS: [&str; 2] = ["tables","anchors"];
+
+/// Pinned landing bytes for `sequences` draft blocks: tokens (u32) then confidence (f32).
+fn landing_bytes(sequences: usize) -> Result<usize> { extent(&[draft_rows(sequences,BLOCK,VOCAB)?,8]) }
+
+/// A round of `rows` draft rows lands its tokens in the landing's first `rows` words and its
+/// confidence in the next `rows`.
+fn landing_halves(landing: CuteafdHostBuffer, rows: usize) -> Result<[CuteafdHostBuffer; 2]> {
+    let half=extent(&[rows,4])?;
+    ensure!(rows>0 && !landing.ptr.is_null() && landing.bytes>=2*half, MiniMaxError::Invalid("draft landing extent"));
+    Ok([0,half].map(|offset|CuteafdHostBuffer { ptr:landing.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes:half, ..landing }))
 }
 
 #[cfg(test)]
@@ -405,6 +433,24 @@ mod tests {
         assert!(attention_tables(&[0,4096,8192],1,7,1,4096,4102).is_err());
         assert!(attention_tables(&[0,1,1],1,7,1,4097,4104).is_err());
         assert!(attention_tables(&[0,1],1,7,1,4096,4103).is_err());
+        Ok(())
+    }
+
+    /// A round's tokens and confidence land in the two halves of one pinned landing, sized at
+    /// load for the widest draft batch; the uploads it queues go to reserved draft buffers.
+    #[test] fn minimax_draft_round_lands_in_pinned_halves() -> Result<()> {
+        assert_eq!(landing_bytes(32)?,32*BLOCK*8);
+        assert!(landing_bytes(33).is_err());
+        let landing=CuteafdHostBuffer{ptr:0x4000usize as *mut std::ffi::c_void,bytes:landing_bytes(32)?,flags:3};
+        let [tokens,confidence]=landing_halves(landing,2*BLOCK)?;
+        assert_eq!((tokens.ptr as usize,tokens.bytes,tokens.flags),(0x4000,56,3));
+        assert_eq!((confidence.ptr as usize,confidence.bytes),(0x4000+56,56));
+        assert!(landing_halves(landing,32*BLOCK+1).is_err() && landing_halves(landing,0).is_err());
+        let source=include_str!("dspark.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("for name in DRAFT_UPLOADS { native.reserve(draft.get(name)?)?; }"));
+        for upload in ["n.upload(tables.0,","n.upload(anchors.0,"] { assert!(source.contains(upload)); }
+        assert!(source.contains("(self.get(\"tables\")?,&tables)") && source.contains("(self.get(\"anchors\")?,&anchors)"));
+        assert!(!source.contains(&["copy_", "d2h(&mut"].concat()),"no synchronous readback");
         Ok(())
     }
 

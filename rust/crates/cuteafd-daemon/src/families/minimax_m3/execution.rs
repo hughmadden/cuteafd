@@ -97,6 +97,19 @@ fn extend_tables(batch:&BatchView,tile:usize,stride:usize,cuts:&[usize])->Result
 
 fn le_bytes(values:&[i32])->Vec<u8> { values.iter().flat_map(|v|v.to_le_bytes()).collect() }
 
+/// The step scratch every step uploads into ([`Execution::step`], `plan_attention`; DSpark's
+/// updates and drafts upload `positions` too), besides the extend bounds' tail
+/// ([`extend_bounds`]): their ordered-upload staging is reserved before readiness, at each
+/// destination's whole extent.
+const STEP_UPLOADS: [&str; 5] = ["positions","slots","page_table","cache_lengths","cu_seqlens_q"];
+
+/// The extend launches' causal key ends: `index_bounds` after the `tile` leading zero key
+/// starts, to the buffer's end (one ordered-upload destination for every step).
+fn extend_bounds(bounds:CuteafdDeviceBuffer,tile:usize)->Result<CuteafdDeviceBuffer> {
+    let start=tile.checked_mul(4).context("MiniMax extend bounds offset")?;
+    view(bounds,start,bounds.bytes.checked_sub(start).context("MiniMax extend bounds admission")?)
+}
+
 /// The lane cuts (batch rows) of a step of `rows` rows in up to `lanes` lanes
 /// of `lane_rows`: one lane takes at most a program launch's `program_rows`.
 fn step_cuts(rows:usize,lanes:usize,lane_rows:usize,program_rows:usize,diagnostic:bool)->Result<Vec<usize>> {
@@ -274,6 +287,8 @@ impl<'a> Execution<'a> {
             native.upload(scratch.get("batch_ids")?,&vec![0;rows*4])?;
             // Extend launches read their key starts (all zero) from here.
             native.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
+            for name in STEP_UPLOADS { native.reserve(scratch.get(name)?)?; }
+            native.reserve(extend_bounds(scratch.get("index_bounds")?,extend_rows)?)?;
             native.drain()?;
             Ok((weights,TargetHeadOwner::new(&native,&scratch,logit_rows,cfg.vocab_size)?))
         })?;
@@ -329,7 +344,7 @@ impl<'a> Execution<'a> {
                 guard.complete=true;
                 drained?;
             }
-            // A proposal's readback drained the stream.
+            // A proposal's readback waited for everything it queued.
             guard.complete=true;
             result
         })
@@ -385,8 +400,9 @@ impl<'a> Execution<'a> {
         // A failed step's stream may hold Spark exchange waits that only the link's worker
         // releases: stop the exchange (releasing them) before the drain.
         if result.is_err() { experts.abort(); }
-        // All device/cache/expert borrows end only after queued work retires.
-        let drained=self.native.drain();
+        // All device/cache/expert borrows end only after queued work retires: the step's host
+        // wait (`--host-wait`), or a plain drain after a failure.
+        let drained=if result.is_ok() { self.native.wait() } else { self.native.drain() };
         guard.complete=true;
         let completed=drained.is_ok();
         let result=result.and_then(|logits|{drained?;experts.finish()?;Ok(logits)});
@@ -526,7 +542,7 @@ impl<'a> Execution<'a> {
         self.native.upload(s.get("page_table")?,&le_bytes(&tables))?;
         self.native.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
         self.native.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
-        self.native.upload(view(s.get("index_bounds")?,self.extend_rows*4,bounds.len()*4)?,&le_bytes(&bounds))?;
+        self.native.upload(extend_bounds(s.get("index_bounds")?,self.extend_rows)?,&le_bytes(&bounds))?;
         Ok(AttentionPlan::Extend{launches})
     }
     /// One lane's attention for a layer: its rows (`s` views them) and its
@@ -755,6 +771,38 @@ mod tests {
     /// Decode runs eagerly (no whole-step recording can hold the exchange's stream memory
     /// operations), and a failed step quiesces the Spark link before its drain, then releases
     /// the link's owners only after a completed drain.
+    /// Every ordered upload of a step goes to a whole admitted destination that load reserved
+    /// (or the extend bounds' tail, reserved too), never to a view narrowed to its bytes: the
+    /// first upload sizes a destination's pinned staging, and no step allocates any.
+    #[test] fn minimax_step_uploads_go_to_reserved_whole_destinations() {
+        let source=include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let (head,rest)=source.split_at(source.find("    pub fn load(").unwrap());
+        let (load,steps)=rest.split_at(rest.find("    pub fn load_draft(").unwrap());
+        assert!(!head.contains(".upload(") && load.contains("for name in STEP_UPLOADS { native.reserve(scratch.get(name)?)?; }")
+            && load.contains("native.reserve(extend_bounds(scratch.get(\"index_bounds\")?,extend_rows)?)?;"));
+        let mut uploads=0;
+        for (at,_) in steps.match_indices(".upload(") {
+            let destination=&steps[at+".upload(".len()..];
+            let destination=&destination[..destination.find(")?,").unwrap()+2];
+            let name=destination.split("get(\"").nth(1).and_then(|n|n.split('"').next()).unwrap_or_default();
+            assert!(destination=="extend_bounds(s.get(\"index_bounds\")?"
+                || (STEP_UPLOADS.contains(&name) && destination.ends_with(&format!("get(\"{name}\")?"))),
+                "unreserved or narrowed upload destination {destination}");
+            uploads+=1;
+        }
+        assert_eq!(uploads,9,"every step upload is checked");
+        let native=include_str!("native.rs");
+        assert!(native.contains("copy_h2d_ordered(buffer, bytes, self.stream.raw)") && !native.contains("bytes: bytes.len()"));
+    }
+
+    #[test] fn minimax_extend_bounds_are_the_index_bounds_tail() -> Result<()> {
+        let bounds=CuteafdDeviceBuffer{ptr:0x1000usize as *mut std::ffi::c_void,bytes:4096,device_id:0,flags:0};
+        let tail=extend_bounds(bounds,256)?;
+        assert_eq!((tail.ptr as usize,tail.bytes),(0x1000+1024,4096-1024));
+        assert!(extend_bounds(bounds,1025).is_err(),"key starts past the admitted bounds");
+        Ok(())
+    }
+
     #[test] fn minimax_step_is_eager_and_quiesces_the_exchange_before_draining() {
         let source=include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
         for banned in [["cuda_graph_", "begin_capture"].concat(), ["Graph", "Bank"].concat(),
@@ -762,7 +810,7 @@ mod tests {
             assert!(!source.contains(&banned),"{banned}");
         }
         let step=source.split("fn step(").nth(1).unwrap().split("fn layers(").next().unwrap();
-        let order=["if result.is_err() { experts.abort(); }","let drained=self.native.drain();",
+        let order=["if result.is_err() { experts.abort(); }","let drained=if result.is_ok() { self.native.wait() } else { self.native.drain() };",
             "experts.finish()?","if completed { experts.release(); }"]
             .map(|needle|step.find(needle).unwrap_or_else(||panic!("{needle}")));
         assert!(order.windows(2).all(|w|w[0]<w[1]),"{order:?}");
