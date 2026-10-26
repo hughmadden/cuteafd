@@ -497,7 +497,11 @@ mod selected_spark_io_tests {
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
             assert_eq!(spark_slot_bytes("kimi_k3", unit), slot);
             let reserve = crate::families::kimi_k3::spark_reserve_bytes(waves, unit).unwrap();
-            assert_eq!(reserve, slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+            // One prefill owner (the census slot), the m80 decode owner and
+            // per-unit route staging over the waves; never a slot per wave.
+            let decode = 51 * (1 << 20) + 64 * (3584 + 3584 / 32 + 8 * 16) + 64 * 16 * 8;
+            assert_eq!(reserve, slot + decode + unit * waves * 16 * 8
+                + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
             let rings = spark_ring_geometry(1);
@@ -509,8 +513,8 @@ mod selected_spark_io_tests {
             for _ in 0..2 {
                 charge_spark_io(&mut device, &working, ExpertGeometry::KIMI_K3, unit as u32,
                     false, rings, 0).unwrap();
-                let slots = spark_execution_slots("kimi_k3", waves, 1).unwrap();
-                charge_spark_slots(&mut device, &working, "kimi_k3", slots, unit);
+                spark_slots::charge_owners(&mut device, &crate::families::kimi_k3::spark_executions(waves, unit).unwrap(),
+                    crate::families::kimi_k3::spark_owner_bytes).unwrap();
                 assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), expected,
                     "pre-solver Spark overhead and the final ledger must count each owner once");
             }

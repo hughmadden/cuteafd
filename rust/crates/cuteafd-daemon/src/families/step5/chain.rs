@@ -568,7 +568,7 @@ mod tests {
                 && tp4["tp"] == peers.len(),
             "sealed Step-5 expert geometry"
         );
-        let exports = super::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
+        let exports = crate::families::step5::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
         SparkAdmission::plan(
             snapshot,
             ExpertGeometry::STEP5,
@@ -581,7 +581,7 @@ mod tests {
             },
             peers.len(),
             None,
-            super::serve::spark_model(&exports,
+            crate::families::step5::serve::spark_model(&exports,
                 SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16 },
                 1, 1, config.max_frame_bytes)?,
         )?

@@ -801,22 +801,29 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
 }
 
 #[test]
-fn native_slot_charge_sums_quant_and_bf16_tail_groups() -> anyhow::Result<()> {
-    use crate::plan::layout::spark_slots::native_slot_bytes;
+fn native_owner_shares_scratch_and_sums_quant_and_bf16_tail_io() -> anyhow::Result<()> {
+    use crate::plan::layout::spark_slots::owner_bytes;
     use crate::placement::SparkWorkingSet;
+    let prefill = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+        capacity: 4096, compiled: 4096, staging_rows: 2752, buffered_units: 3 };
     for (format, ranks, quant_scratch) in [("fp8", 6, 538_279_936), ("nvfp4", 4, 464_821_248)] {
         let dir = snapshot(format);
         let input = PlanInput::open(dir.path())?;
         let mut working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: ranks,
             prefill_lanes: 2, ..Default::default() };
-        let quant = native_slot_bytes(&input, "step5", &working, 0, 4096)?.unwrap();
+        let quant = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
         working.spark_layers = vec![88];
-        let tail = native_slot_bytes(&input, "step5", &working, 0, 4096)?.unwrap();
+        let tail = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
         working.spark_layers = vec![3, 88];
-        let mixed = native_slot_bytes(&input, "step5", &working, 0, 4096)?.unwrap();
-        assert_eq!(mixed, quant + tail, "one BF16 tail layer retains its own worker");
+        let mixed = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
+        // One BF16 tail layer adds its own I/O planes; the owner's scratch is
+        // the larger group package, shared on one stream.
         let tail_scratch = if ranks == 4 { 580_747_264 } else { 538_279_936 };
-        assert!(mixed >= quant_scratch + tail_scratch + 2 * 67_371_008);
+        assert_eq!(quant.scratch, quant_scratch);
+        assert_eq!(mixed.scratch, quant.scratch.max(tail.scratch));
+        assert_eq!(mixed.scratch, tail_scratch.max(quant_scratch));
+        assert_eq!(mixed.io, quant.io + tail.io);
+        assert_eq!(mixed.pinned_staging, 0);
     }
     Ok(())
 }

@@ -103,7 +103,7 @@ impl ServeArgs {
 
 /// The sealed package's exports, which the shared Spark admission covers. All
 /// layouts must agree; worker admission independently validates loaded exports.
-pub(super) fn package_exports(manifest: &serde_json::Value) -> Result<Vec<u32>> {
+pub(crate) fn package_exports(manifest: &serde_json::Value) -> Result<Vec<u32>> {
     let layouts = manifest["layouts"].as_object().context("Step-5 package layouts missing")?;
     let mut exports = None;
     for layout in layouts.values() {
@@ -123,7 +123,7 @@ pub(super) fn package_exports(manifest: &serde_json::Value) -> Result<Vec<u32>> 
 
 /// The one Step-5 Spark admission for serve and golden: the endpoint's unit,
 /// typed owners over the sealed package's exports.
-pub(super) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, clients: usize,
+pub(crate) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, clients: usize,
     max_frame_bytes: usize) -> Result<ModelAdmission> {
     let executions = cuteafd_loader::plan::spark_executions::admit_ladder("step5", exports, None,
         u64::from(endpoint.capacity), waves)?;

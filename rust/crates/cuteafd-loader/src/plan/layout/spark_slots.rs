@@ -181,10 +181,14 @@ pub(crate) fn charge_owners(device: &mut DeviceLayout, executions: &cuteafd_core
 mod tests {
     use super::*;
 
+    fn extent(capacity: u32, compiled: u32) -> cuteafd_core::OwnerExtent {
+        cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity, compiled,
+            staging_rows: capacity, buffered_units: 1 }
+    }
+
     #[test]
-    fn planner_bounds_every_shipped_native_package_census() {
+    fn planner_charges_every_shipped_native_package_census_at_its_export() {
         let census: serde_json::Value = serde_json::from_str(include_str!("spark_slot_census.json")).unwrap();
-        let capacities = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
         for row in census.as_array().unwrap() {
             let package = row["package"].as_str().unwrap();
             let family = row["family"].as_str().unwrap();
@@ -197,21 +201,27 @@ mod tests {
             let input = if row["bf16"].as_bool().unwrap() { 2 * hidden } else { hidden + hidden / 32 };
             let geometry = cuteafd_core::ExpertGeometry { hidden: hidden as u32, topk: topk as u32,
                 experts: 1, intermediate: 1, layers: 1 };
-            for (index, rows) in capacities.into_iter().enumerate() {
+            for (index, compiled) in CENSUS_CAPACITIES.into_iter().enumerate() {
+                let rows = u64::from(compiled);
                 let exact = row["scratch"][index].as_u64().unwrap() + rows * (input + 8 * topk + 2 * hidden);
-                let bound = group_slot_bytes(family, format, geometry, rows).unwrap();
-                assert!(bound >= exact, "{package} capacity {rows}: planner {bound} < census {exact}");
+                let owner = fp8_owner_bytes(family, geometry, &[format], extent(compiled, compiled)).unwrap();
+                assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
+                assert_eq!(owner.pinned_staging, 0, "FP8 reads retained ring frames");
             }
         }
     }
 
     #[test]
-    fn compiled_scratch_is_not_scaled_by_live_unit_rows() {
+    fn decode_owner_scratch_is_its_own_export_not_the_prefill_maximum() {
         let geometry = cuteafd_core::ExpertGeometry::GLM5;
-        let full = group_slot_bytes("glm5", ExpertFormat::Nvfp4, geometry, 4096).unwrap();
-        let partial = group_slot_bytes("glm5", ExpertFormat::Nvfp4, geometry, 2752).unwrap();
-        assert!(partial > full * 2752 / 4096);
-        assert_eq!(full - partial, (4096 - 2752) * (4 * 6144 + 8 * 8));
+        let decode = fp8_owner_bytes("glm5", geometry, &[ExpertFormat::Nvfp4], extent(64, 80)).unwrap();
+        let prefill = fp8_owner_bytes("glm5", geometry, &[ExpertFormat::Nvfp4], extent(4096, 4096)).unwrap();
+        assert_eq!((decode.scratch, prefill.scratch), (142_576_640, 667_162_624));
+        // Live rows below the export never shrink compiled scratch, only I/O.
+        let partial = fp8_owner_bytes("glm5", geometry, &[ExpertFormat::Nvfp4], extent(2752, 4096)).unwrap();
+        assert_eq!(partial.scratch, prefill.scratch);
+        assert_eq!(prefill.io - partial.io, (4096 - 2752) * (4 * 6144 + 8 * 8));
+        assert!(group_scratch("glm5", ExpertFormat::Nvfp4, 64).is_err());
     }
 
     #[test]
@@ -233,12 +243,14 @@ mod tests {
         let input = crate::plan::PlanInput::open(root.path())?;
         let mut working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
             prefill_lanes: 2, ..Default::default() };
-        let one = native_slot_bytes(&input, "mimo_v2", &working, 0, 4096)?.unwrap();
+        let prefill = extent(4096, 4096);
+        let one = owner_bytes(&input, &working, "mimo_v2", 0)?(prefill)?;
         working.spark_layers = (1..7).collect();
-        let two = native_slot_bytes(&input, "mimo_v2", &working, 0, 4096)?.unwrap();
-        assert_eq!(two, one * 2, "w352 and w320 retain distinct workers, not six layers");
-        let exact = 472_126_464 + 465_835_008 + 2 * 76_546_048;
-        assert!(two >= exact);
+        let two = owner_bytes(&input, &working, "mimo_v2", 0)?(prefill)?;
+        // w352 and w320 retain distinct groups (not six layers): one shared
+        // scratch at the larger group's package, each group's own I/O planes.
+        assert_eq!((two.scratch, two.io), (one.scratch, 2 * one.io));
+        assert!(two.scratch >= 472_126_464 && two.io >= 2 * 76_546_048);
         Ok(())
     }
 
@@ -277,14 +289,24 @@ mod tests {
             let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
             let wire_routes = 4096 * (hidden + hidden / 32 + 8 * topk);
             assert_eq!(retained + wire_routes, expected, "{family}");
-            for rows in [64, 2048, 2752, 4096] {
-                assert!(exl3_slot_bytes(family, rows) >= expected, "{family} rows {rows}");
-            }
+            let geometry = cuteafd_core::ExpertGeometry { hidden: hidden as u32, topk: topk as u32,
+                experts: 1, intermediate: 1, layers: 1 };
+            let owner = exl3_owner_bytes(family, geometry, extent(4096, 4096)).unwrap();
+            assert!(owner.scratch + owner.io >= expected, "{family}");
         }
     }
 
     #[test]
-    fn selected_catalog_uses_exl3_floor_without_changing_native_v4() -> anyhow::Result<()> {
+    fn exl3_decode_owner_covers_every_installed_narrow_export_set() {
+        // Largest retained m1/m16/m80 set among installed SM121 exports.
+        let geometry = cuteafd_core::ExpertGeometry::GLM5;
+        let decode = exl3_owner_bytes("glm5_flash", geometry, extent(64, 80)).unwrap();
+        assert!(decode.scratch >= 50_445_548);
+        assert_eq!(decode.pinned_staging, 64 * 8 * 8);
+    }
+
+    #[test]
+    fn exl3_catalog_charges_one_prefill_owner_and_two_v41_decode_owners() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         crate::plan::testing::write_v41_exl3_snapshot(root.path(), 3);
         let input = crate::plan::PlanInput::open(root.path())?;
@@ -292,23 +314,36 @@ mod tests {
             prefill_lanes: 2, ..Default::default() };
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
             items: vec![], kv_tokens: 0 };
-        charge_selected_slots(&mut device, &input, &working, "deepseek_v41", 3, 2752)?;
-        assert_eq!(device.items[0].bytes, 3 * 810 * (1 << 20));
-        assert_eq!(spark_slot_bytes("deepseek_v41", 2752), 208 * (1 << 20));
-        assert_eq!(spark_slot_bytes("deepseek_v4", 2752), 208 * (1 << 20));
+        let mut charged = Vec::new();
+        for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+            let executions = crate::plan::spark_executions::admit_ladder("deepseek_v41",
+                &crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports(),
+                None, unit, waves)?;
+            charge_executions(&mut device, &input, &working, "deepseek_v41", &executions)?;
+            let owners = device.items.iter().find(|item| item.group == "execution owners").unwrap().bytes;
+            let staging = device.items.iter().find(|item| item.group == "execution staging").unwrap().bytes;
+            let hidden = 4096u64 * (5120 + 5120 / 32 + 6 * 8);
+            assert_eq!(owners, 810 * (1 << 20) + hidden + 2 * (51 * (1 << 20) + 64 * (5120 + 5120 / 32 + 6 * 8)));
+            assert_eq!(staging, 2 * 64 * 6 * 8 + unit * waves * 6 * 8);
+            charged.push(owners);
+        }
+        // The reserve is divided into k units, never multiplied by k.
+        assert!(charged.windows(2).all(|pair| pair[0] == pair[1]));
         Ok(())
     }
 
     #[test]
-    fn native_slots_credit_only_the_existing_first_slot_residual() {
+    fn owners_credit_only_the_existing_prefill_residual() {
+        let executions = cuteafd_core::SparkExecutions::admit(&[64], 4096, 2048, 4, &cuteafd_core::EXL3_CAPACITIES).unwrap();
+        let bytes = |extent: cuteafd_core::OwnerExtent| Ok(cuteafd_core::OwnerBytes {
+            scratch: if extent.compiled == 4096 { 200 } else { 50 }, io: 0, pinned_staging: 1 });
         for residual in [0, 100, 1000] {
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: GIB,
                 kv_tokens: 0, items: vec![Item::new(Category::Workspace, "expert waves", "", residual, Basis::Calibrated)] };
-            charge_native_slots(&mut device, 3, 200);
-            let charged = device.items.iter().filter(|item| item.group == "execution slots")
-                .map(|item| item.bytes).sum::<u64>();
-            assert_eq!(charged, 600 - residual.min(200));
-            assert!(charged + residual >= 600);
+            charge_owners(&mut device, &executions, bytes).unwrap();
+            let charged = device.items.iter().find(|item| item.group == "execution owners").unwrap().bytes;
+            assert_eq!(charged, 250 - residual.min(200));
+            assert_eq!(device.items.iter().find(|item| item.group == "execution staging").unwrap().bytes, 1 + 4);
         }
     }
 }

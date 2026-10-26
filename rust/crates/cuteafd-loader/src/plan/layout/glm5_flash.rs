@@ -1,5 +1,6 @@
 //! GLM Flash plan adapter. All coordinator admission is the runtime's shared request.
 use super::*;
+use crate::plan::spark_executions::SparkBackend;
 use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
@@ -261,16 +262,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 report.placement_supported = false;
                 notes.push(format!("Spark rank {rank} I/O admission: {error}"));
             }
-            match spark_execution_slots("glm5_flash", prefill.waves, options.decode_lanes) {
-                Ok(slots) => if let Err(error) = spark_slots::charge_selected_slots(&mut device, input,
-                    &working, "glm5_flash", slots, prefill.unit_rows) {
-                    report.placement_supported = false;
-                    notes.push(format!("Spark rank {rank} execution slots: {error:#}"));
-                },
-                Err(error) => {
-                    report.placement_supported = false;
-                    notes.push(format!("Spark rank {rank} execution slots: {error}"));
-                }
+            let charged = input.expert_catalog().and_then(SparkBackend::for_catalog).and_then(|backend|
+                Ok(crate::plan::spark_executions::admit_ladder("glm5_flash", &backend.exports(),
+                    Some(u32::try_from(options.glmf_decode_rows)?), prefill.unit_rows, prefill.waves)?))
+                .and_then(|executions| spark_slots::charge_executions(&mut device, input, &working, "glm5_flash", &executions));
+            if let Err(error) = charged {
+                report.placement_supported = false;
+                notes.push(format!("Spark rank {rank} execution owners: {error:#}"));
             }
             devices.push(device);
         }

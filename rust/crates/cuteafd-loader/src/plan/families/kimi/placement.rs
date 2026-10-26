@@ -370,15 +370,19 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
             unit as u32, false, rings, 0) {
             refusal(report, format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
-        match crate::plan::layout::spark_execution_slots("kimi_k3", shape.waves, 1) {
-            Ok(slots) => crate::plan::layout::charge_spark_slots(&mut device, &working, "kimi_k3", slots, shape.unit_rows),
-            Err(error) => refusal(report, format!("Kimi Spark slots: {error}"), "Use a supported wave count."),
+        if let Err(error) = kimi_owners(&mut device, &working, shape.unit_rows, shape.waves) {
+            refusal(report, format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
         memory.devices.push(device);
     }
-    if let Ok(slots) = crate::plan::layout::spark_execution_slots("kimi_k3", shape.waves, 1) {
-        memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and {} execution slots at {} B each",
-            spark_budget.budget, slots, crate::plan::layout::spark_slot_bytes("kimi_k3", shape.unit_rows)));
-    }
+    memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",
+        spark_budget.budget, shape.waves, shape.unit_rows));
     memory
+}
+
+/// Kimi's typed owners, the same sum its pre-placement reserve charges.
+fn kimi_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
+    if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
+    crate::plan::layout::spark_slots::charge_owners(device,
+        &crate::families::kimi_k3::spark_executions(waves, unit_rows)?, crate::families::kimi_k3::spark_owner_bytes)
 }
