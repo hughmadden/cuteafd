@@ -376,7 +376,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
         }
         memory.devices.push(device);
     }
-    memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and {} execution slots at {} B each",
-        spark_budget.budget, shape.waves, crate::plan::layout::spark_slot_bytes("kimi_k3", shape.unit_rows)));
+    if let Ok(slots) = crate::plan::layout::spark_execution_slots("kimi_k3", shape.waves, 1) {
+        memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and {} execution slots at {} B each",
+            spark_budget.budget, slots, crate::plan::layout::spark_slot_bytes("kimi_k3", shape.unit_rows)));
+    }
     memory
 }

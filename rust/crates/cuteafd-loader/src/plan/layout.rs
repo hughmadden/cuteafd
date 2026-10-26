@@ -544,7 +544,7 @@ mod selected_spark_io_tests {
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
             assert_eq!(spark_slot_bytes("kimi_k3", unit), slot);
             let reserve = crate::families::kimi_k3::spark_reserve_bytes(waves, unit).unwrap();
-            assert_eq!(reserve, waves * slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+            assert_eq!(reserve, slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
             let rings = spark_ring_geometry(1);

@@ -3520,7 +3520,7 @@ fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
 }
 
 #[test]
-fn qwen_small_card_one_spark_admits_both_auto_slots_before_pool() {
+fn qwen_small_card_one_spark_admits_both_auto_waves_with_one_compute_slot() {
     use cuteafd_core::memory_layout::DeviceKind;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
@@ -3534,10 +3534,9 @@ fn qwen_small_card_one_spark_admits_both_auto_slots_before_pool() {
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262_144);
     let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
-    let slot_bytes = spark.items.iter().filter(|item|
-        matches!(item.group.as_str(), "execution slots" | "expert waves"))
+    let slot_bytes = spark.items.iter().filter(|item| item.group == "execution slots")
         .map(|item| item.bytes).sum::<u64>();
-    assert!(slot_bytes >= 2 * layout::spark_slot_bytes("qwen4", 4096));
+    assert_eq!(slot_bytes, layout::spark_slot_bytes("qwen4", 4096));
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "{}", memory.render());
 }
 
