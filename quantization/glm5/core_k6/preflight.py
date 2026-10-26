@@ -16,6 +16,21 @@ from kimi_k3.uniform_k2.storage import atomic_json,sha256_file,verify_receipt
 from kimi_k3.core_k6.container import IMAGE
 
 
+def quantization_host():
+    # Oliver was rebuilt as MaxQ after the storage failure. Both names refer
+    # to the authorized single-RTX quantization host; cluster GPUs stay excluded.
+    host=socket.gethostname().lower()
+    if host not in ("oliver","maxq"):
+        raise ValueError("GLM production placement is Oliver/MaxQ only")
+    return host
+
+
+def require_local_source(host):
+    where=subprocess.check_output(["nest","where","hf:zai-org/GLM-5.3-BF16"],text=True,timeout=60)
+    if not any(line.split()==[host,"ready"] for line in where.splitlines()):
+        raise ValueError(f"the complete BF16 source must be sealed locally on {host}")
+
+
 def qualified(fork_commit,*,audit=False):
     root=Path.home()/".cache/cuteafd/builds/glm53-core-k6"
     report=json.loads((root/"native-probe.json").read_text())
@@ -69,13 +84,15 @@ def qualified(fork_commit,*,audit=False):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--publication-only",action="store_true")
-    parser.add_argument("--audit-native",action="store_true")
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument("--publication-only",action="store_true")
+    mode.add_argument("--audit-native",action="store_true")
+    mode.add_argument("--qualification-only",action="store_true",
+        help="admit a fresh numerical qualification without requiring its future report")
     parser.add_argument("arguments",nargs=argparse.REMAINDER)
     args=parser.parse_args()
     arguments=args.arguments[1:] if args.arguments[:1]==["--"] else args.arguments
-    if socket.gethostname().lower()!="oliver":
-        raise ValueError("GLM production placement is Oliver only")
+    host=quantization_host()
     for directory,paths in ((REPO,["quantization/glm5","quantization/kimi_k3/prepare_corpus.py"]),
                             (REPO/"third_party/gptqmodel",[])):
         if subprocess.check_output(["git","-C",str(directory),"status","--porcelain","--",*paths],text=True).strip():
@@ -86,14 +103,13 @@ def main():
     digest=runpy.run_path(str(REPO/"scripts/build/verify-sparkinfer-source.py"))["source_tree_sha256"](fork)
     if actual!=lock["revision"] or digest!=lock["source_tree_sha256"]:
         raise ValueError("GPTQModel pin or source lock differs")
-    qualified(actual,audit=args.audit_native)
+    if not args.qualification_only:
+        qualified(actual,audit=args.audit_native)
     if args.audit_native:
         print(json.dumps(dict(native_audit="passed",fork_commit=actual)),flush=True)
         return
     if not args.publication_only:
-        where=subprocess.check_output(["nest","where","hf:zai-org/GLM-5.3-BF16"],text=True,timeout=60)
-        if not any(line.split()==["oliver","ready"] for line in where.splitlines()):
-            raise ValueError("the complete BF16 source must be sealed locally on Oliver")
+        require_local_source(host)
         devices=subprocess.check_output(["nvidia-smi","--query-gpu=name,memory.total",
             "--format=csv,noheader,nounits"],text=True,timeout=30).strip().splitlines()
         if len(devices)!=1 or "RTX PRO 6000" not in devices[0] or int(devices[0].rsplit(",",1)[1].strip())<96000:
@@ -101,7 +117,7 @@ def main():
         subprocess.run(["docker","image","inspect",IMAGE],check=True,stdout=subprocess.DEVNULL,timeout=30)
     subprocess.run([str(REPO/".venv/bin/python"),str(Path(__file__).with_name("run.py")),
                     *arguments,"--preflight"],check=True,timeout=240)
-    print(json.dumps(dict(admission="passed",host="oliver",fork_commit=actual,image=IMAGE)),flush=True)
+    print(json.dumps(dict(admission="passed",host=host,fork_commit=actual,image=IMAGE)),flush=True)
 
 
 if __name__=="__main__":

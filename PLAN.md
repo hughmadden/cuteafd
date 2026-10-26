@@ -5962,3 +5962,28 @@ production plan binds numerical code and packages. Documentation, status
 and a future publication-only compatibility fix are separate from that
 numerical identity. CPU-only publication requires the matching durable
 completion marker, exact 80-shard inventory and remote checksum audit.
+
+Recovery on 2026-10-26: the old WSL filesystem failed and its production
+quantization was lost. The rebuilt host is named `maxq`; persistent `/home`
+and Docker's `/srv` now use the native NVMe filesystem rather than the small
+WSL root volume. A 256 MiB write/fsync/read checksum check passed. Rebuilt
+the task worktree's corrupt Git index after verifying its working files;
+the original index is retained in the readiness cache. Git object checks
+pass, and every tracked GPTQModel file matches the existing pinned commit.
+Recovered only the three attested tokenized panel splits from the read-only
+old filesystem: their manifest SHA-256 is unchanged
+(`672455f149d27ff640441e2409d1dc9b1341067bd58f0fdd7136ee503f10add8`).
+New production starts from layer zero, with the same numerical producer.
+
+Restored `cuteafd-coordinator-dev:tc-aa74e55ca2130070` from Raptor using
+compressed Docker save/load; all 86 layers and the toolchain label match,
+as does image ID `fc14e74c6890556cd7d2770d8afe50230a5cdac9342024428bb98cb03060b51c`.
+The preflight accepts only the authorized `oliver`/`maxq` host names and
+requires the complete BF16 source on the current host, never merely on the
+old host name or archive. Explicit `--qualification-only` admits a fresh
+GPU proof without requiring its future report; normal production continues
+to require the completed proof and audit. Launcher/corpus/producer/export
+CPU checks pass 89 cases. Fresh CUDA proof and full local-source integrity
+are required before restarting. This agent session predates the host's FUSE
+mount, so host-side admission runs through a fresh local SSH session that
+sees the mounted source; containers also see the host mount normally.
