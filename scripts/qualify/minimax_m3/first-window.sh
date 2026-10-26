@@ -10,12 +10,13 @@ python="${MINIMAX_PYTHON:-$root/.venv/bin/python}"
 run=0 card=all internal='' stage_config=''
 usage() {
   cat <<'EOF'
-Usage: first-window.sh [--run] [--card all|pro6000|5090]
+Usage: first-window.sh [--run] [--card all|pro6000]
 
 Default: print the ordered schedule, then check local files only. No Docker,
 SSH, CUDA, device probes, engine launches or hardware locks are invoked.
 --run requires CUTEAFD_MINIMAX_HARDWARE_WINDOW=authorized in this shell.
-Use --card to qualify the physically available card; other cards stay unverified.
+MiniMax qualifies on the RTX PRO 6000; MiniMax on an RTX 5090 is not supported on this
+engine yet (--card 5090 is refused).
 Every command and numerical gate must pass before the next step starts.
 
 Required environment:
@@ -23,13 +24,12 @@ Required environment:
   MINIMAX_GOLDEN        Complete Python --activation served-cache --layers 3 5 output.
                        Every window needs >=66 tokens for 63/64/65 prefix checks;
                        one needs >=2177 tokens to exercise MSA pruning.
-  MINIMAX_CONFIG_DIR    Private complete copies of the six example configurations.
-                       Use explicit rank HOST/LANE_A entries and EXPERT_PORT;
-                       TP2/3 prefix TP4. --card all uses the same rank pool.
+  MINIMAX_CONFIG_DIR    Private complete copies of the RTX PRO 6000 TP2, TP3 and TP4 example
+                       configurations. Use explicit rank HOST/LANE_A entries and
+                       EXPERT_PORT; TP2/3 prefix TP4.
   MINIMAX_PLAN_BIN      Existing CPU-capable cuteafd executable for plan admission.
   MINIMAX_RUN_ID        Fresh identifier (1..20 letters, digits, dot, dash, underscore).
-  MINIMAX_GPU_PRO6000   Explicit local device index 0 or 1, when selected.
-  MINIMAX_GPU_5090      Explicit local device index 0 or 1, when selected.
+  MINIMAX_GPU_PRO6000   Explicit local device index 0 or 1.
 Run-only environment:
   MINIMAX_BUILD_SEED    Explicit member of the selected TP4 rank list.
   MINIMAX_URL           API URL matching MINIMAX_ADDR; use an unused local port.
@@ -55,7 +55,11 @@ while (($#)); do
     *) echo "first-window: unknown argument $1" >&2; exit 2 ;;
   esac
 done
-case "$card" in all|pro6000|5090) ;; *) echo 'first-window: invalid card' >&2; exit 2 ;; esac
+case "$card" in
+  all|pro6000) ;;
+  5090) echo 'first-window: MiniMax on an RTX 5090 is not supported on this engine yet; qualify the RTX PRO 6000 (--card pro6000)' >&2; exit 2 ;;
+  *) echo 'first-window: invalid card' >&2; exit 2 ;;
+esac
 if ((run)) || [[ -n "$internal" ]]; then
   [[ "${CUTEAFD_MINIMAX_HARDWARE_WINDOW:-}" == authorized ]] || {
     echo 'first-window: --run requires CUTEAFD_MINIMAX_HARDWARE_WINDOW=authorized' >&2; exit 2;
@@ -66,7 +70,7 @@ show() { printf '  '; printf '%q ' "$@"; printf '\n'; }
 step() { printf '\n%s\n  PASS: %s\n' "$1" "$2"; }
 schedule() {
   local selected tp
-  for selected in pro6000 5090; do
+  for selected in pro6000; do
     [[ "$card" == all || "$card" == "$selected" ]] || continue
     step "$selected: 1. Plan all configurations" 'placement supported; all memory budgets fit'
     show run.sh --config "CONFIG_DIR/minimax-m31-flash-nvfp4-$selected-tp4.config" --dry-run
@@ -182,7 +186,7 @@ golden() {
 
 printf -v preflight '%q %q preflight %q' "$python" "$checks" "$card"
 diagnostic_window="$("$python" "$checks" window "$MINIMAX_GOLDEN")"
-for selected in pro6000 5090; do
+for selected in pro6000; do
   [[ "$card" == all || "$card" == "$selected" ]] || continue
   gpu_key="MINIMAX_GPU_${selected^^}"; gpu="${!gpu_key}"
   for tp in 4 2 3; do
@@ -195,7 +199,7 @@ for selected in pro6000 5090; do
     "$root/run.sh" --wip qualification --config "$cfg" --dry-run | tail -n 1 >"$output/$selected-tp$tp-plan.json"
   done
   device="$(nvidia-smi --id="$gpu" --query-gpu=name --format=csv,noheader)"
-  if [[ "$selected" == 5090 && "$device" != *5090* ]] || [[ "$selected" == pro6000 && "$device" != *PRO*6000* ]]; then
+  if [[ "$selected" == pro6000 && "$device" != *PRO*6000* ]]; then
     echo 'first-window: selected physical GPU does not match the requested card' >&2; exit 2
   fi
   cfg="$output/$selected-tp4.config"

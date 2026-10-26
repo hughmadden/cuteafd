@@ -128,7 +128,9 @@ def preflight(card):
         raise ValueError("MINIMAX_PLAN_BIN must be an existing executable")
     checkpoint(Path(os.environ["MINIMAX_SNAPSHOT"]))
     reference(Path(os.environ["MINIMAX_GOLDEN"]))
-    cards = ("pro6000", "5090") if card == "all" else (card,)
+    if card not in ("all", "pro6000"):
+        raise ValueError("MiniMax on an RTX 5090 is not supported on this engine yet" if card == "5090" else "invalid card")
+    cards = ("pro6000",)
     all_hosts = None
     for current in cards:
         expected_hosts = None
@@ -141,7 +143,7 @@ def preflight(card):
             launched = {**LAUNCHER_DEFAULTS, **values}
             required_values = {"SPARK_COUNT": {str(tp)}, "RTX_GPUS": {"auto", "1"}, "KV_CACHE": {"fp8"},
                                "SPECULATOR": {"off"}, "COORDINATOR_GPU": {gpu},
-                               "COORDINATOR_GPU_BUDGET_GIB": {"31.8"} if current == "5090" else {None, "95.5"}}
+                               "COORDINATOR_GPU_BUDGET_GIB": {None, "95.5"}}
             for key, wanted in required_values.items():
                 if launched.get(key) not in wanted:
                     raise ValueError(f"{current} TP{tp}: {key} must be {' or '.join(sorted(w or 'unset' for w in wanted))}")

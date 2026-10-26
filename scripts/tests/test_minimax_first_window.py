@@ -43,7 +43,7 @@ def ready(tmp_path):
         "windows": [{"id": "sample", "path": "windows/sample"}]}))
     configs = tmp_path / "configs"
     configs.mkdir()
-    for card in ("pro6000", "5090"):
+    for card in ("pro6000",):
         for tp in (2, 3, 4):
             text = (ROOT / "examples/configs" / f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config").read_text()
             # Documentation-only synthetic addresses; no process may use them.
@@ -62,7 +62,7 @@ def ready(tmp_path):
            if not key.startswith("MINIMAX_") and key != "CUTEAFD_MINIMAX_HARDWARE_WINDOW"}
     env.update(MINIMAX_SNAPSHOT=str(snapshot), MINIMAX_GOLDEN=str(golden), MINIMAX_CONFIG_DIR=str(configs),
                MINIMAX_PLAN_BIN=str(tools / "cuteafd"), MINIMAX_RUN_ID="synthetic",
-               MINIMAX_GPU_PRO6000="0", MINIMAX_GPU_5090="0", MINIMAX_PYTHON=sys.executable,
+               MINIMAX_GPU_PRO6000="0", MINIMAX_PYTHON=sys.executable,
                PATH=f"{tools}:{os.environ['PATH']}", FORBIDDEN_CALLS=str(calls))
     return env, calls
 
@@ -79,17 +79,17 @@ def test_default_prints_ordered_schedule_and_checks_only_local_files(ready):
     assert result.returncode == 0, result.stderr
     stages = ["1. Plan", "2. Build", "3. Single-layer", "4. Golden", "Spark TP4", "TP4 serve", "Spark TP2", "Spark TP3"]
     assert [result.stdout.index(stage) for stage in stages] == sorted(result.stdout.index(stage) for stage in stages)
-    assert result.stdout.index("5090: 1.") > result.stdout.index("pro6000: TP3 serve")
+    assert "5090" not in result.stdout
     for text in ("top-1 >=94%", "KL <=0.03 nat", "byte-exact prefix restore", "MSA selection", "remain unverified"):
         assert text in result.stdout
 
 
-def test_card_segment_does_not_claim_other_card(ready):
+def test_an_rtx_5090_card_is_refused_by_name(ready):
     result = invoke(ready, "--card", "5090")
-    assert result.returncode == 0, result.stderr
-    assert "5090: 1." in result.stdout
-    assert "pro6000:" not in result.stdout
-    assert "Selected configurations passed" not in result.stdout
+    assert result.returncode == 2
+    assert "MiniMax on an RTX 5090 is not supported on this engine yet" in result.stderr
+    assert "5090: 1." not in result.stdout
+    assert invoke(ready, "--card", "pro6000").returncode == 0
 
 
 @pytest.mark.parametrize("ack", [None, "1", "yes", "authorized "])
