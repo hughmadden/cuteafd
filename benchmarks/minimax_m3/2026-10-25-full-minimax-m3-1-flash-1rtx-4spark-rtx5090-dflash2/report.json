@@ -194,7 +194,7 @@
     },
     "configuration": {
       "supports_thinking_off": true,
-      "snapshot": "/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
+      "snapshot": "MiniMaxAI/MiniMax-M3.1-Flash@54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
       "quant": [
         {
           "group": "embedding",
@@ -265,7 +265,7 @@
       "settings": [
         {
           "name": "snapshot",
-          "value": "/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
+          "value": "MiniMaxAI/MiniMax-M3.1-Flash@54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
           "default": null,
           "source": "cli"
         },
@@ -331,7 +331,7 @@
         },
         {
           "name": "draft",
-          "value": "/mnt/sparknest/hf-home/hub/models--RadixArk--Minimax-M3.1-Flash-Dflash2/snapshots/923bf1d4b567d5ccb71b0488c6e61b5e4794e92a",
+          "value": "RadixArk/Minimax-M3.1-Flash-Dflash2@923bf1d4b567d5ccb71b0488c6e61b5e4794e92a",
           "default": null,
           "source": "cli"
         },
@@ -22121,7 +22121,7 @@
           "revision": "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
           "configuration": {
             "supports_thinking_off": true,
-            "snapshot": "/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
+            "snapshot": "MiniMaxAI/MiniMax-M3.1-Flash@54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
             "quant": [
               {
                 "group": "embedding",
@@ -22192,7 +22192,7 @@
             "settings": [
               {
                 "name": "snapshot",
-                "value": "/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
+                "value": "MiniMaxAI/MiniMax-M3.1-Flash@54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
                 "default": null,
                 "source": "cli"
               },
@@ -22258,7 +22258,7 @@
               },
               {
                 "name": "draft",
-                "value": "/mnt/sparknest/hf-home/hub/models--RadixArk--Minimax-M3.1-Flash-Dflash2/snapshots/923bf1d4b567d5ccb71b0488c6e61b5e4794e92a",
+                "value": "RadixArk/Minimax-M3.1-Flash-Dflash2@923bf1d4b567d5ccb71b0488c6e61b5e4794e92a",
                 "default": null,
                 "source": "cli"
               },

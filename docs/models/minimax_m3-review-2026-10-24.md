@@ -2,8 +2,8 @@
 
 Branch `hugh/minimax-m3` at `51f79cf68` (46 commits over upstream `work/p0` `f7bb2da19`,
 185 files, +17,184 / −258), kernel fork `hughmadden/sparkinfer-glmrt` at `012972f7`
-(7 commits over the base pin `56ec22d0`). Reviewed 2026-10-24 by the Claude agent within
-Turq, from the code on the branch plus the bring-up's raw run logs. No plan, hand-off or report
+(7 commits over the base pin `56ec22d0`). Reviewed 2026-10-24 by an independent Claude agent,
+from the code on the branch plus the bring-up's raw run logs. No plan, hand-off or report
 written by another agent was used.
 
 ## Verdict
