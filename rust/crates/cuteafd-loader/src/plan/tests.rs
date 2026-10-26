@@ -1,10 +1,27 @@
 use super::testing::*;
+use super::testing::plan;
 use super::*;
 use crate::formats::exl3_storage::Exl3StorageSource;
 use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
 use crate::placement::AttentionPlacement;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+
+#[test]
+fn planner_timings_charge_metadata_once_and_preserve_reports() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let options = PlanOptions::default();
+    let (first, cold) = input.plan_with_timings(&options);
+    let (second, warm) = input.plan_with_timings(&options);
+    assert_eq!(serde_json::to_value(first.unwrap()).unwrap(), serde_json::to_value(second.unwrap()).unwrap());
+    assert!(cold.open > std::time::Duration::ZERO);
+    assert!(cold.catalog > std::time::Duration::ZERO);
+    assert_eq!(warm.open, std::time::Duration::ZERO);
+    assert_eq!(warm.catalog, std::time::Duration::ZERO);
+    assert!(cold.total() >= cold.open + cold.catalog);
+    assert!(warm.report > std::time::Duration::ZERO);
+}
 
 #[test]
 fn planner_rejects_unsupported_decode_views_before_family_layout() {

@@ -220,7 +220,7 @@ mod tests {
             testing, ExpertPlacement, PlanOptions}};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
-        let plan_input = cuteafd_loader::plan::PlanInput::open(snapshot.path())?;
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         for (extra, expected) in [
             (vec![], (2752, 3, 8256)),

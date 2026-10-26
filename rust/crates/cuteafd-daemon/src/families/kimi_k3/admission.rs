@@ -1140,7 +1140,7 @@ pub(super) mod tests {
         use cuteafd_core::memory_layout::DeviceKind;
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
-        let plan_input = cuteafd_loader::plan::PlanInput::open(snapshot.path())?;
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let package_root = tempfile::tempdir()?;
         let manifest_path = testing::write_kimi_installed_inventory(package_root.path(), false);
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
@@ -1286,7 +1286,7 @@ pub(super) mod tests {
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
-        let plan_input = cuteafd_loader::plan::PlanInput::open(snapshot.path())?;
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut lane_bytes = Vec::new();
@@ -1359,7 +1359,7 @@ pub(super) mod tests {
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
-        let plan_input = cuteafd_loader::plan::PlanInput::open(snapshot.path())?;
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut i = inputs(&cfg);

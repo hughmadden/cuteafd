@@ -8,6 +8,38 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+/// Shared full-plan wall budget, including first-use metadata rather than only a warm report.
+pub struct BudgetedPlanInput { input: super::PlanInput }
+
+impl BudgetedPlanInput {
+    pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
+        Ok(Self { input: super::PlanInput::open(snapshot)? })
+    }
+
+    pub fn from_checkpoint(checkpoint: super::Checkpoint) -> Self {
+        Self { input: super::PlanInput::from_checkpoint(checkpoint) }
+    }
+
+    pub fn checkpoint(&self) -> &super::Checkpoint { self.input.checkpoint() }
+
+    pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> { self.input.expert_catalog() }
+
+    #[track_caller]
+    pub fn plan(&self, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
+        let (result, phases) = self.input.plan_with_timings(options);
+        eprintln!("full-plan {:?} ranks={} phases={phases:?}", self.checkpoint().snapshot, options.placement.spark_ranks());
+        assert!(phases.total() < std::time::Duration::from_secs(30),
+            "full plan exceeded 30s: snapshot={} ranks={} phases={phases:?} options={options:?}",
+            self.checkpoint().snapshot.display(), options.placement.spark_ranks());
+        result
+    }
+}
+
+#[track_caller]
+pub fn plan(snapshot: &Path, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
+    BudgetedPlanInput::open(snapshot)?.plan(options)
+}
+
 /// Tiny native TikToken snapshot, deliberately without tokenizer.json.
 pub fn write_kimi_tokenizer(snapshot: &Path) {
     use base64::Engine;
