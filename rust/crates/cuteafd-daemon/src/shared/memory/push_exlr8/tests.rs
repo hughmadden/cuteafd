@@ -124,7 +124,7 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
         for (layers, gpu) in [(vec![], 0), (vec![7, 5], 0), (vec![5, 5], 0), (vec![5, 7], 2)] {
             assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &layers, gpu, usize::MAX).is_err());
         }
-        for sparks in [4, 6] {
+        for sparks in [0, 4, 6] {
             let mut assignments = Vec::new();
             let mut offers = Vec::new();
             let mut spark_entries = Vec::new();

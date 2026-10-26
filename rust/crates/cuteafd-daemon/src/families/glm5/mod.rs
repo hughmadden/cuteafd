@@ -765,6 +765,16 @@ impl Opened {
                 .collect(), push: None };
         let mut coordinator_push = None;
         let mut native_push = None;
+        let native_push_experts = || -> Result<_> {
+            tp2_range.as_ref().map(|range| -> Result<_> {
+                let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
+                    &programs, max_rows, args.exlr8_prefill_activations)?;
+                let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
+                Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
+                    manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
+                    layers: range.clone().collect(), budgets: budgets.to_vec() })
+            }).transpose()
+        };
         let admission = if let Some(peers) = args.peers.as_deref() {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
@@ -807,14 +817,7 @@ impl Opened {
             // coordinator rank. Onboarded experts have no post-push mount loader.
             let ranks = match (ranks, &native_records) {
                 (None, Some(_)) if admission.coordinator_pushes() => {
-                    let experts = tp2_range.as_ref().map(|range| -> Result<_> {
-                        let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                            &programs, max_rows, args.exlr8_prefill_activations)?;
-                        let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                        Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
-                            manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
-                            layers: range.clone().collect(), budgets: budgets.to_vec() })
-                    }).transpose()?;
+                    let experts = native_push_experts()?;
                     let (push, streams, ranks) = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
                         &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
                     native_push = Some((push, peers.len()));
@@ -824,6 +827,13 @@ impl Opened {
             };
             Some(admission.start_with(&peers, ranks)?)
         } else { None };
+        // All selected routed layers may be onboarded in a partial model.
+        // Idle Spark peers acknowledge identity while these destinations push alone.
+        if native_records.is_some() && native_push.is_none() {
+            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
+                &self.snapshot, Some(&self.catalog), devices.len(), native_push_experts()?)?;
+            native_push = Some((push, 0));
+        }
         let started = Instant::now();
         // The admitted TP2 expert halves are charged before the serving pool;
         // their bytes land inside the Spark admission window (pushed, or through
