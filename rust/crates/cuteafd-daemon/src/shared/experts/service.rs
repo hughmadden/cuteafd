@@ -358,6 +358,15 @@ fn selected_spark_io(config: &NativeExpertServiceConfig, geometry: cuteafd_core:
     Ok(working.rank_endpoints_io(config.rank, geometry, &model.endpoints, model.rings)?)
 }
 
+/// The fallback exchange is shared across endpoints, not sized from the
+/// prefill owner's larger scratch/export extent.
+fn worker_host_exchange(config: &NativeExpertServiceConfig) -> Result<(HostExpertExchange, Vec<u32>)> {
+    let model = config.model_admission.as_ref().context("Spark exchange requires coordinator model admission")?;
+    let rows = model.endpoints.iter().map(|endpoint| endpoint.capacity).max()
+        .context("Spark exchange requires an admitted endpoint")?;
+    Ok((HostExpertExchange::new(rows)?, vec![0; rows as usize]))
+}
+
 fn worker_ring_geometry(config: &NativeExpertServiceConfig)
     -> Result<cuteafd_loader::placement::SparkRingGeometry> {
     let model = config.model_admission.as_ref().context("Spark rings require coordinator model admission")?;
@@ -421,9 +430,7 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     geometry: cuteafd_core::ExpertGeometry, resident: usize, staging: usize,
     pinned_host: usize, read_scratch: usize, workspace: usize) -> Result<SparkAdmissionBudget> {
     let io = selected_spark_io(config, geometry, worker_ring_geometry(config)?)?;
-    let (exchange, row_indices) = if config.bf16_ingress || config.exlr8_manifest.is_some() {
-        (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?)
-    } else { (HostExpertExchange::bytes_for(config.capacity)?, config.capacity as usize * 4) };
+    let (exchange, row_indices) = (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?);
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
@@ -1046,6 +1053,49 @@ mod tests {
                 capacity as usize * 6 * 8 + capacity as usize * 10240
             );
         }
+    }
+
+    #[test]
+    fn narrow_prefill_units_allocate_the_planned_host_exchange() -> Result<()> {
+        use cuteafd_core::{SparkEndpoint, SparkIngress};
+        use cuteafd_loader::placement::SparkWorkingSet;
+        let geometry = cuteafd_core::expert_geometry();
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+            prefill_lanes: 1, ..Default::default() };
+        for (unit_rows, waves) in [(256, 3), (2752, 3), (2048, 4)] {
+            for bf16 in [false, true] {
+                let mut config = config(6, 0, None);
+                config.capacity = 4096;
+                config.bf16_ingress = bf16;
+                let model = config.model_admission.as_mut().unwrap();
+                model.executions = cuteafd_core::SparkExecutions::admit(&[80, 80], 4096,
+                    unit_rows, waves, &[80, 4096])?;
+                let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+                model.endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 80, ingress },
+                    SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }];
+                model.validate(geometry)?;
+                let planned = working.rank_endpoints_io(0, geometry, &model.endpoints, model.rings)?;
+                let (exchange, indices) = worker_host_exchange(&config)?;
+                let actual = exchange.ids.capacity() * std::mem::size_of::<i32>()
+                    + exchange.routing.capacity() * std::mem::size_of::<f32>()
+                    + exchange.partials.capacity();
+                assert_eq!(actual as u64, planned.host_exchange);
+                assert_eq!((indices.capacity() * std::mem::size_of::<u32>()) as u64, planned.row_indices);
+                assert_eq!(indices.len(), unit_rows as usize);
+                assert!(actual < HostExpertExchange::bytes_for(config.capacity)?);
+                let budget = spark_admission_budget(&config, 10, 1, 2, 3, 4)?;
+                assert_eq!(budget.exchange, actual);
+                assert_eq!(budget.row_indices, indices.capacity() * std::mem::size_of::<u32>());
+                let mut extents = Vec::new();
+                spark_execution_workspace(&config, |live, compiled, staging| {
+                    extents.push((live, compiled, staging));
+                    Ok((compiled as usize, live as usize, staging as usize))
+                })?;
+                assert_eq!(extents.last(), Some(&(4096, 4096, unit_rows)),
+                    "narrow exchange must not shrink the scratch owner");
+            }
+        }
+        Ok(())
     }
 
     #[test]

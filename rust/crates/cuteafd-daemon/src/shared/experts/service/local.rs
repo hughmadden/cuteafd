@@ -358,8 +358,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
     };
     census.sample("after_retained_arenas", Some(&library))?;
-    let mut exchange = HostExpertExchange::new(config.capacity)?;
-    let mut row_indices = vec![0; config.capacity as usize];
+    let (mut exchange, mut row_indices) = worker_host_exchange(&config)?;
     // Transport benchmarks only: answer each request with its response slot
     // as it is, without running the experts.
     let skip_compute = std::env::var("CUTEAFD_EXPERTD_SKIP_COMPUTE").is_ok_and(|v| v == "1");
