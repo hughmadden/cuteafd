@@ -952,3 +952,15 @@ def test_discrete_context_hook_preserves_existing_lazy_initialization(tmp_path, 
     cuda._lazy_init()
     assert events == ['admit', 'gpu', 'torch']
     assert not (tmp_path / 'context-init.lock').exists()
+
+
+def test_standalone_gb10_installs_host_default_pool(tmp_path, monkeypatch):
+    import types
+    monkeypatch.delenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', raising=False)
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    cuda = types.SimpleNamespace(_lazy_init=lambda: None)
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=cuda))
+    export.install_context_admission()
+    assert os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'] == str(tmp_path / '.cache/cuteafd/export-workers')
+    assert getattr(cuda._lazy_init, '_cuteafd_context_admission')
