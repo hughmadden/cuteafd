@@ -435,8 +435,10 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
         let row_count = read_u32(bytes, 36, "row_count")?;
         let output_payload_bytes = read_u64(bytes, 44, "output_payload_bytes")?;
         let wire_bytes = read_u64(bytes, 60, "wire_bytes")? as usize;
-        let flags = read_u32(bytes, 68, "flags")?;
-        validate_flags(flags, "response")?;
+        let wire_flags = read_u32(bytes, 68, "flags")?;
+        validate_flags(wire_flags, "response")?;
+        let pace = super::read_response_pace(bytes, wire_flags)?;
+        let flags = wire_flags & !super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE;
         validate_header_len(header_len, response_header_len_from_flags(flags))?;
         if bytes.len() < header_len {
             bail!(
@@ -483,6 +485,7 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 output_payload_bytes,
                 flags,
                 executor_id: read_u64(bytes, RESPONSE_EXECUTOR_ID_OFFSET, "executor_id")?,
+                pace,
             },
             row_index_bytes: response_row_indices_enabled(flags)
                 .then_some(&bytes[header_len..payload_start]),
@@ -517,8 +520,10 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
         let row_count = read_u32(bytes, 36, "row_count")?;
         let output_payload_bytes = read_u64(bytes, 44, "output_payload_bytes")?;
         let wire_bytes = read_u64(bytes, 60, "wire_bytes")?;
-        let flags = read_u32(bytes, 68, "flags")?;
-        validate_flags(flags, "response")?;
+        let wire_flags = read_u32(bytes, 68, "flags")?;
+        validate_flags(wire_flags, "response")?;
+        let pace = super::read_response_pace(bytes, wire_flags)?;
+        let flags = wire_flags & !super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE;
         validate_header_len(header_len, response_header_len_from_flags(flags))?;
         if header_len != EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
             || response_row_indices_enabled(flags)
@@ -538,6 +543,7 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
             output_payload_bytes,
             flags,
             executor_id: read_u64(bytes, RESPONSE_EXECUTOR_ID_OFFSET, "executor_id")?,
+                pace,
         };
         header.validate_row_capacity_error()?;
         if header.output_dim == 0 {

@@ -62,6 +62,7 @@ impl ExpertProtocolV2Response {
             status,
             flags: 0,
             executor_id: 0,
+            pace: None,
         };
         let response = Self {
             header,
@@ -74,6 +75,14 @@ impl ExpertProtocolV2Response {
 
     pub fn with_debug_checksum(mut self) -> Self {
         self.header.flags |= EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
+        // The checksum occupies the pace bytes: a checksummed frame has no pace.
+        self.header.pace = None;
+        self
+    }
+
+    /// The worker's unit pace (busy µs, idle µs); dropped beside a checksum.
+    pub fn with_pace(mut self, pace: Option<(u32, u32)>) -> Self {
+        self.header.pace = pace.filter(|_| self.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM == 0);
         self
     }
 
@@ -158,10 +167,11 @@ impl ExpertProtocolV2Response {
         push_u64(out, self.header.output_payload_bytes);
         push_u64(out, self.wire_stats().logical_payload_bytes as u64);
         push_u64(out, wire_bytes as u64);
-        push_u32(out, self.header.flags);
+        push_u32(out, self.header.wire_flags());
         push_u32(out, self.header.output_dim);
         push_u32(out, self.header.output_row_stride_bytes);
         push_u64(out, self.header.executor_id);
+        super::push_response_pace(out, &self.header);
         if self.debug_checksum_enabled() {
             out.extend_from_slice(&self.frame_content_checksum());
         }
@@ -190,8 +200,10 @@ impl ExpertProtocolV2Response {
         let output_row_stride_bytes = read_u32(bytes, 76, "output_row_stride_bytes")?;
         let executor_id = read_u64(bytes, RESPONSE_EXECUTOR_ID_OFFSET, "executor_id")?;
         let wire_bytes = read_u64(bytes, 60, "wire_bytes")? as usize;
-        let flags = read_u32(bytes, 68, "flags")?;
-        validate_flags(flags, "response")?;
+        let wire_flags = read_u32(bytes, 68, "flags")?;
+        validate_flags(wire_flags, "response")?;
+        let pace = super::read_response_pace(bytes, wire_flags)?;
+        let flags = wire_flags & !super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE;
         validate_header_len(header_len, response_header_len_from_flags(flags))?;
         if bytes.len() < header_len {
             bail!(
@@ -256,6 +268,7 @@ impl ExpertProtocolV2Response {
                 status,
                 flags,
                 executor_id,
+                pace,
             },
             row_indices,
             partial_output_payload,
@@ -305,6 +318,14 @@ impl ExpertProtocolV2Response {
 }
 
 impl ExpertProtocolV2ResponseHeader {
+    /// Flags as framed: the pace bit follows `pace` (dropped beside a checksum).
+    pub(super) fn wire_flags(&self) -> u32 {
+        let flags = self.flags & !super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE;
+        if self.pace.is_some() && flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM == 0 {
+            flags | super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE
+        } else { flags }
+    }
+
     pub(super) fn validate_row_capacity_error(&self) -> Result<()> {
         if self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR != 0 {
             let allowed = super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
@@ -397,6 +418,7 @@ impl<'a> ExpertProtocolV2ResponseRef<'a> {
                 status,
                 flags: 0,
                 executor_id: 0,
+                pace: None,
             },
             row_indices: None,
             partial_output_payload,
@@ -407,6 +429,14 @@ impl<'a> ExpertProtocolV2ResponseRef<'a> {
 
     pub fn with_debug_checksum(mut self) -> Self {
         self.header.flags |= EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
+        // The checksum occupies the pace bytes: a checksummed frame has no pace.
+        self.header.pace = None;
+        self
+    }
+
+    /// The worker's unit pace (busy µs, idle µs); dropped beside a checksum.
+    pub fn with_pace(mut self, pace: Option<(u32, u32)>) -> Self {
+        self.header.pace = pace.filter(|_| self.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM == 0);
         self
     }
 
@@ -487,10 +517,11 @@ impl<'a> ExpertProtocolV2ResponseRef<'a> {
         push_u64(out, self.header.output_payload_bytes);
         push_u64(out, self.wire_stats().logical_payload_bytes as u64);
         push_u64(out, wire_bytes as u64);
-        push_u32(out, self.header.flags);
+        push_u32(out, self.header.wire_flags());
         push_u32(out, self.header.output_dim);
         push_u32(out, self.header.output_row_stride_bytes);
         push_u64(out, self.header.executor_id);
+        super::push_response_pace(out, &self.header);
         if self.debug_checksum_enabled() {
             out.extend_from_slice(
                 frame_content_checksum(self.row_indices, self.partial_output_payload).as_slice(),
@@ -541,12 +572,19 @@ impl<'a> ExpertProtocolV2DeviceResponseRef<'a> {
                 status,
                 flags: 0,
                 executor_id: 0,
+                pace: None,
             },
             row_indices: None,
             partial_output_payload,
         };
         response.validate()?;
         Ok(response)
+    }
+
+    /// The worker's unit pace (busy µs, idle µs). Device responses never carry checksums.
+    pub fn with_pace(mut self, pace: Option<(u32, u32)>) -> Self {
+        self.header.pace = pace;
+        self
     }
 
     pub fn with_executor_id(mut self, executor_id: u64) -> Self {
@@ -628,10 +666,11 @@ impl<'a> ExpertProtocolV2DeviceResponseRef<'a> {
         push_u64(out, self.header.output_payload_bytes);
         push_u64(out, self.wire_stats().logical_payload_bytes as u64);
         push_u64(out, wire_bytes as u64);
-        push_u32(out, self.header.flags);
+        push_u32(out, self.header.wire_flags());
         push_u32(out, self.header.output_dim);
         push_u32(out, self.header.output_row_stride_bytes);
         push_u64(out, self.header.executor_id);
+        super::push_response_pace(out, &self.header);
         out.resize(header_len, 0);
         if let Some(row_indices) = self.row_indices {
             for row_index in row_indices {

@@ -82,6 +82,7 @@ impl BackboneRequest<'_> {
                         0
                     },
                 executor_id,
+                pace: None,
             },
             row_indices: Some(&row_indices[..rows as usize]),
             partial_output_payload: partials,
