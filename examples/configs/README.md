@@ -88,7 +88,7 @@ The 5090 examples turn vision off, which frees the coordinator for KV: the
 bundled tower costs about 37,000 pool tokens there (with DFlash2 the served pool
 was 78,784 tokens with the tower and 115,840 without, at a 31 GiB budget). The
 RTX PRO 6000 examples keep the launcher's `VISION=auto` and serve the tower, on
-the GPU at TP2 and on a Spark rank at TP3 and TP4. Every example prefills in two
+the GPU at TP2 and on a Spark rank at TP3, TP4 and TP6. Every example prefills in two
 4096-row lanes. Speculation is DFlash2 by default, with the
 RadixArk/Minimax-M3.1-Flash-Dflash2 draft on the shared drafter, which cuteafd does
 not distribute: download it beside the release. `SPECULATOR=dspark` runs the
