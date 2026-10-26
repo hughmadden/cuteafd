@@ -849,13 +849,13 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
             shape.topk as u64, rows, lanes, false) })
 }
 
-/// Exact checkpoint-native TP2 costs. Rotated unit ownership changes by
-/// expert and layer; neither a proportional half nor EXL3 storage is valid.
+#[cfg(test)]
 fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, layers: usize,
     router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
     exlr8_expert_costs_of(&crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?, first, layers, router)
 }
 
+/// Exact checkpoint-native TP2 costs; rotated ownership forbids proportional halves.
 fn exlr8_expert_costs_of(input: &crate::plan::exlr8::residency::MetadataInput, first: usize, layers: usize,
     router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
     use crate::plan::exlr8::residency::ExpertSet;

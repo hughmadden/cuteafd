@@ -24,6 +24,29 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn spark_count_resolution_reuses_the_preflight_checkpoint() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let options = PlanOptions::default();
+    let normalize = |report| {
+        let mut value = serde_json::to_value(report).unwrap();
+        if let Some(host) = value.get_mut("host_ledger").and_then(Value::as_object_mut) {
+            host.remove("available_bytes");
+            host.remove("headroom_bytes");
+        }
+        value
+    };
+    for explicit in [None, Some(0), Some(4), Some(7)] {
+        let expected = normalize(plan_spark_count(dir.path(), &options, 6, explicit).unwrap());
+        let actual = normalize(input.plan_spark_count(&options, 6, explicit).unwrap());
+        assert_eq!(actual, expected, "{explicit:?}");
+    }
+    std::fs::remove_file(dir.path().join("config.json")).unwrap();
+    assert!(input.plan_spark_count(&options, 6, Some(4)).is_ok());
+    assert!(plan_spark_count(dir.path(), &options, 6, Some(4)).is_err());
+}
+
+#[test]
 fn planner_rejects_unsupported_decode_views_before_family_layout() {
     let glm = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let v41 = tempfile::tempdir().unwrap();

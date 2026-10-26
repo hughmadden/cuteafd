@@ -538,6 +538,12 @@ impl PlanInput {
         self.plan_with_timings(options).0
     }
 
+    /// Resolve Spark-count candidates without reopening the CLI's preflight checkpoint.
+    pub fn plan_spark_count(&self, options: &PlanOptions, available: usize,
+        explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+        plan_spark_count_of(self, options, available, explicit)
+    }
+
     /// Exclusive wall times; first-use checkpoint/catalog work is charged once.
     pub fn plan_with_timings(&self, options: &PlanOptions) -> (Result<PlanReport, PlanError>, PlanTimings) {
         self.with_timings(options, || plan_of(self, options))
