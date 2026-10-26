@@ -220,8 +220,8 @@ pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Result<Vec<Hop>, LayerP
     Ok(hops)
 }
 
-/// The shared layer pipeline owns at most two simultaneously active lanes.
-pub const LAYER_PIPELINE_MAX_LANES: u64 = 2;
+/// Layer pipeline slots follow the shared adaptive prefill wave policy.
+pub const LAYER_PIPELINE_MAX_LANES: u64 = crate::serving_capacity::prefill_waves::MAX_WAVES;
 
 /// Validate the configured runtime lane inventory, not the active lanes of a
 /// short final chunk. Admission chooses the count; execution never clamps it.
@@ -237,7 +237,7 @@ pub fn validate_layer_pipeline_lanes(admitted: u64, runtime: usize) -> Result<()
 pub enum LayerPlanError {
     #[error("layer execution needs a nonempty stack and logical GPUs 0/1")]
     Geometry,
-    #[error("layer pipeline needs matching admitted/runtime lanes in 1..=2, got {admitted}/{runtime}")]
+    #[error("layer pipeline needs matching admitted/runtime lanes in 1..={LAYER_PIPELINE_MAX_LANES}, got {admitted}/{runtime}")]
     Lanes { admitted: u64, runtime: usize },
     #[error("layer {layer} has invalid owner {gpu}")]
     Owner { layer: usize, gpu: u8 },
@@ -372,10 +372,11 @@ mod pipeline_lane_tests {
 
     #[test]
     fn admitted_pipeline_lanes_are_exact_and_never_silently_capped() {
-        for lanes in 1..=2 {
+        for lanes in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
             assert_eq!(validate_layer_pipeline_lanes(lanes, lanes as usize), Ok(()));
         }
-        for (admitted, runtime) in [(0, 0), (1, 2), (2, 1), (3, 3), (4, 4), (4, 2), (u64::MAX, 2)] {
+        for (admitted, runtime) in [(0, 0), (1, 2), (2, 1), (3, 1), (4, 2),
+            (LAYER_PIPELINE_MAX_LANES + 1, (LAYER_PIPELINE_MAX_LANES + 1) as usize), (u64::MAX, 2)] {
             assert_eq!(validate_layer_pipeline_lanes(admitted, runtime),
                 Err(LayerPlanError::Lanes { admitted, runtime }));
         }

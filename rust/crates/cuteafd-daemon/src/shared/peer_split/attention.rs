@@ -554,7 +554,7 @@ fn layer_stack_with(placement: &Placement, exchange: &impl LayerProtocol,
     Ok(())
 }
 
-/// Shared two-lane serving executor. Binding happens before any capture or
+/// Shared admitted-lane serving executor. Binding happens before any capture or
 /// enqueue, and requires hop/FFN waits to share one terminal owner. A family
 /// supplies only attention/FFN kernels and residual packing, not peer order.
 pub(crate) fn layer_pipeline<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
@@ -644,7 +644,7 @@ fn validate_pipeline_selection(plan: &LayerExecutionPlan, lanes: &[usize], rows:
     cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes,
         usize::try_from(plan.spec().lanes)?)?;
     ensure!(!lanes.is_empty() && lanes.len() == count && lanes.len() == rows.len()
-        && lanes.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+        && lanes.len() as u64 <= plan.spec().lanes, "layer pipeline needs a nonempty subset of admitted lanes");
     ensure!(lanes.iter().enumerate().all(|(index, &lane)| (lane as u64) < plan.spec().lanes
         && !lanes[..index].contains(&lane)), "layer pipeline duplicate or unadmitted lane");
     ensure!(rows.iter().all(|&rows| rows > 0 && rows as u64 <= plan.spec().rows),
@@ -1142,8 +1142,12 @@ mod tests {
     }
 
     fn execution_plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPlan {
+        execution_plan_shape(modes, entry, head, 6, 2)
+    }
+
+    fn execution_plan_shape(modes: &[LayerMode], entry: u8, head: u8, rows: u64, lanes: u64) -> LayerExecutionPlan {
         use cuteafd_loader::placement::{plan_hops, HopSpec, ResidualHome};
-        let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows: 6, lanes: 2, entry_gpu: entry, head_gpu: head, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } };
+        let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows, lanes, entry_gpu: entry, head_gpu: head, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } };
         let mut p = placement(modes);
         p.hops = plan_hops(modes, &spec).unwrap();
         p.residual = vec![ResidualHome::Owned(entry)];
@@ -1457,6 +1461,37 @@ mod tests {
                         ["owned", "begin", "finish"].map(|call| (lane, layer, call))).collect();
                     assert_eq!(*trace.calls.borrow(), expected);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn short_prompt_runs_one_active_lane_at_every_admitted_wave_count() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        use cuteafd_loader::serving_capacity::prefill_waves::{unit_rows, MAX_WAVES};
+        let modes = [LayerMode::HeadSplit, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split },
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }];
+        for waves in 1..=MAX_WAVES {
+            let unit = unit_rows(waves);
+            let plan = execution_plan_shape(&modes, 0, 0, unit, waves);
+            let chunks = crate::shared::prefill_pipeline::prefill_units(335, unit as usize, waves as usize, 64).unwrap();
+            assert_eq!(chunks, vec![0..335]);
+            for lane in 0..waves as usize {
+                let trace = PipelineTrace::new(&plan);
+                let mut kernels = [PipelineRecorder { shared: &trace, lane }];
+                submit_scoped(|| Ok(()), || Ok(()), |scope|
+                    layer_pipeline_selected_instances(scope, &plan, &[&trace], &[lane],
+                        LaneOrder::Independent, &[335], &mut kernels)).unwrap();
+                assert_eq!(trace.calls.borrow().len(), modes.len() * 3);
+                assert!(trace.calls.borrow().iter().all(|&(actual, _, _)| actual == lane));
+                let transfers = trace.transfers.borrow();
+                for index in 0..plan.hops().len() {
+                    for pushed in [true, false] {
+                        assert_eq!(transfers.iter().filter(|&&event| event == (lane, index, pushed)).count(), 1);
+                    }
+                }
+                trace.schedule.borrow_mut().end_request();
+                super::super::order::check(&trace.schedule.borrow()).unwrap();
             }
         }
     }

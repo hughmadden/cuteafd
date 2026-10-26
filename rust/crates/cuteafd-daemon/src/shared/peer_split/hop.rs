@@ -314,7 +314,7 @@ mod cuda_tests {
     fn private_hop_instances_charge_one_lane_and_sum_to_the_admitted_forecast() -> Result<()> {
         let (w0, w1) = (LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
             LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner });
-        for lanes in [1, 2] {
+        for lanes in 1..=cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES {
             for modes in [vec![w0, w0], vec![w0, w1], vec![w0, w1, w0, w1, w0, w1]] {
                 let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: 16384,
                     rows: 640, lanes, entry_gpu: 0, head_gpu: 0,
@@ -331,7 +331,7 @@ mod cuda_tests {
                     assert_eq!(physical_lane(spec, Some(lane), lane)?, 0);
                     assert_eq!(physical_lane(spec, None, lane)?, lane);
                     for rank in 0..2 { total[rank] += bytes[rank]; }
-                    assert!(physical_lane(spec, Some(lane), 1 - lane).is_err());
+                    assert!(physical_lane(spec, Some(lane), (lane + 1) % lanes.max(2) as usize).is_err());
                 }
                 assert_eq!(total.as_slice(), admitted);
                 assert!(private_lane_spec(spec, lanes as usize).is_err());

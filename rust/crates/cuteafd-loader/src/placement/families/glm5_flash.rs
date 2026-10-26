@@ -23,14 +23,10 @@ pub const CONTEXT_PROGRAMS: [&str; 6] = ["glmf_scored_index_topk_decode_m64", "g
     "glmf_lse_combine2", "glmf_paged_staging_gather_kv", "glmf_paged_staging_gather_index",
     "glmf_index_expand_owned"];
 
-/// Whole-owned MLA layers use the shared mixed executor's bounded hop slots.
-pub fn admitted_prefill_waves(mode: AttentionPlacement, requested: u64) -> Result<u64, PlacementError> {
-    if !(1..=4).contains(&requested) {
-        return Err(PlacementError::Inventory("GLM Flash executor needs one to four admitted prefill units"));
-    }
-    if mode == AttentionPlacement::Layers && requested > LAYER_PIPELINE_MAX_LANES {
-        return Err(PlacementError::Inventory("layer-owned prefill supports at most two waves"));
-    }
+/// Every attention mode uses the shared executor's admitted wave policy.
+pub fn admitted_prefill_waves(_mode: AttentionPlacement, requested: u64) -> Result<u64, PlacementError> {
+    validate_layer_pipeline_lanes(requested, requested as usize)
+        .map_err(|_| PlacementError::Inventory("GLM Flash executor needs shared-policy prefill units"))?;
     Ok(requested)
 }
 
@@ -1552,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_admission_rejects_unsupported_mixed_hops_without_clamping() {
+    fn unit_admission_keeps_every_shared_policy_wave_without_clamping() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.prefill_lanes = 4;
@@ -1561,17 +1557,13 @@ mod tests {
             assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 4);
         }
         input.attention.mode = AttentionPlacement::Layers;
-        assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
-        for lanes in [1, 2] {
+        for lanes in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
             input.prefill_lanes = lanes;
-            let working = GlmfWorkingSet::candidate(&input, 0).unwrap();
-            assert_eq!(working.prefill_lanes, lanes);
-            validate_layer_pipeline_lanes(working.prefill_lanes, working.prefill_lanes as usize).unwrap();
-        }
-        for lanes in [3, 4] {
-            input.prefill_lanes = lanes;
-            assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
-            assert!(GlmfWorkingSet::candidate(&input, input.experts.len()).is_err());
+            for onboard in [0, input.experts.len()] {
+                let working = GlmfWorkingSet::candidate(&input, onboard).unwrap();
+                assert_eq!(working.prefill_lanes, lanes);
+                validate_layer_pipeline_lanes(working.prefill_lanes, working.prefill_lanes as usize).unwrap();
+            }
         }
         for lanes in [0, 5] {
             input.prefill_lanes = lanes;

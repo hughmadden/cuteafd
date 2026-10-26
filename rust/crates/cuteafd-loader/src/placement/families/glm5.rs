@@ -4,7 +4,7 @@
 //! pages owned by logical-page parity, a q/candidate/partial exchange per
 //! layer), or explicit `layers` (whole attention and owner-local KV, with
 //! split FFNs). `context` remains the default where its programs exist
-//! ([`GlmContext`]); owned attention admits at most two ordered prefill lanes.
+//! ([`GlmContext`]); owned attention follows the shared prefill wave policy.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
 use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
@@ -412,7 +412,7 @@ fn configure_attention(req: &mut PlacementRequest, attention: Option<AttentionPl
                 LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }]);
         }
         validate_layer_pipeline_lanes(req.hops.lanes, req.hops.lanes as usize)
-            .map_err(|_| PlacementError::Inventory("GLM layers requires one or two prefill lanes"))?;
+            .map_err(|_| PlacementError::Inventory("GLM layers requires matching shared-policy prefill lanes"))?;
         req.owner_local_kv_scratch("padded decode scratch page", FLOOR)?;
     }
     Ok(())
@@ -1941,7 +1941,13 @@ mod tests {
         assert_eq!(req.layers.iter().map(|layer| layer.fixed_bytes.whole).sum::<u64>(),
             glm_cache_geometry(&cfg, cfg.layers, 1).unwrap().ranks[0].persistent_unit_bytes - cfg.layers as u64 * FLOOR);
         assert_eq!(placed.hops.iter().filter(|hop| matches!(hop.at, HopPoint::AfterAttention(_))).count(), cfg.layers);
-        i.prefill_lanes = 3;
+        for lanes in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
+            i.prefill_lanes = lanes;
+            let (placed, working) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
+            assert_eq!(working.spark.prefill_lanes, lanes);
+            assert_eq!(placed.pool_tokens, 2 << 20);
+        }
+        i.prefill_lanes = crate::serving_capacity::prefill_waves::MAX_WAVES + 1;
         assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).is_err());
         let mut one = inputs(&cfg, &[96 * GIB]);
         one.prefill_lanes = 1;
