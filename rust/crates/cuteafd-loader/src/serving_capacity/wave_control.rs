@@ -10,15 +10,21 @@
 
 use super::prefill_waves::{unit_rows, MAX_WAVES};
 
-/// Idle share above which the Sparks starve: one more, narrower wave is tried.
-pub const IDLE_ADD: f64 = 0.05;
-/// Idle share below which the Sparks never starve.
-pub const IDLE_DROP: f64 = 0.01;
-/// Consecutive non-starving full-depth prefills before one fewer, wider wave is tried.
-pub const HOLD: u32 = 3;
-/// A trial keeps its new depth unless its period per row exceeds the old
-/// depth's by this factor.
-pub const KEEP: f64 = 1.02;
+/// Idle share above which the Sparks wait between units ("gaps above zero",
+/// above the timing noise floor): one more, narrower wave is tried.
+pub const IDLE_ADD: f64 = 0.01;
+/// Idle share below which the Sparks never wait ("gaps zero").
+pub const IDLE_DROP: f64 = 0.0025;
+/// Consecutive full-depth prefills with gaps before one more wave is tried.
+pub const ADD_HOLD: u32 = 2;
+/// Consecutive full-depth prefills without gaps before one fewer, wider wave is tried.
+pub const HOLD: u32 = 8;
+/// A trial keeps its new depth only if its period per row beats the old
+/// depth's at a comparable prompt length by this factor; ties keep the old.
+pub const KEEP: f64 = 0.99;
+/// Trial calls without a comparable-length sample of the old depth before
+/// the trial gives up (reverting without a cooldown).
+pub const TRIAL_CALLS: u32 = 3;
 /// Full-depth prefills a rejected depth sits out before it may be retried.
 pub const COOLDOWN: u32 = 64;
 /// Weight of the newest call in each depth's running means.
@@ -65,14 +71,19 @@ pub fn candidates(slots: u64, unit_cap: u64) -> Vec<u64> {
     (1..=max).filter(|&k| k == max || unit_for(k + 1, unit_cap) != unit_for(k, unit_cap)).collect()
 }
 
+/// Prompt-length buckets: periods compare only within one (coordinator
+/// turnaround per row grows with context). Power-of-two rows, 1K..=1M.
+const BUCKETS: usize = 11;
+fn bucket(rows: u64) -> usize { (rows.max(1).ilog2() as usize).saturating_sub(10).min(BUCKETS - 1) }
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Depth { period: Option<f64>, cooldown: u32 }
+struct Depth { period: [Option<f64>; BUCKETS], cooldown: u32 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    Steady { quiet: u32 },
-    /// Running candidate `k` after `from`; decided by `k`'s next full-depth call.
-    Trial { from: u64 },
+    Steady { gaps: u32, quiet: u32 },
+    /// Running candidate `k` after `from` for `calls` calls so far.
+    Trial { from: u64, calls: u32 },
 }
 
 /// One boundary's decision (logged by the executor).
@@ -112,7 +123,7 @@ impl WaveControl {
         let k = if pinned { initial } else {
             *candidates.iter().find(|&&k| k >= initial).expect("max is a candidate")
         };
-        Self { k, unit_cap, pinned, candidates, phase: Phase::Steady { quiet: 0 }, depths: Default::default() }
+        Self { k, unit_cap, pinned, candidates, phase: Phase::Steady { gaps: 0, quiet: 0 }, depths: Default::default() }
     }
     /// The wave count of the next prefill.
     pub fn waves(&self) -> u64 { self.k }
@@ -129,42 +140,54 @@ impl WaveControl {
     fn ready(&self, k: u64) -> bool { self.depths[(k - 1) as usize].cooldown == 0 }
 
     /// One finished prefill that ran `waves` deep (fewer when the prompt was
-    /// short) reports its Spark pace; only calls at the chosen depth count.
-    /// Returns the next prefill's depth.
+    /// short) over `pace.rows` counted rows reports its Spark pace; only calls
+    /// at the chosen depth count. Returns the next prefill's depth.
     pub fn observe(&mut self, waves: u64, pace: &PrefillPace) -> Decision {
         let (period, idle) = match pace.summary() {
             Some(sample) if !self.pinned && waves == self.k => sample,
             _ => return self.decision(None, None, if self.pinned { "pinned" } else { "not full depth" }),
         };
         for depth in self.depths.iter_mut() { depth.cooldown = depth.cooldown.saturating_sub(1); }
-        let k = self.k;
+        let (k, b) = (self.k, bucket(pace.rows));
         let trial = matches!(self.phase, Phase::Trial { .. });
-        let entry = &mut self.depths[(k - 1) as usize];
-        // A trial's first sample replaces any older mean of its depth.
-        entry.period = Some(match entry.period { Some(old) if !trial => old + WEIGHT * (period - old), _ => period });
+        let cell = &mut self.depths[(k - 1) as usize].period[b];
+        // A trial's first sample in a bucket replaces any older mean there.
+        *cell = Some(match *cell { Some(old) if !trial => old + WEIGHT * (period - old), _ => period });
         let reason = match self.phase {
-            Phase::Trial { from } => {
-                self.phase = Phase::Steady { quiet: 0 };
-                if self.depths[(from - 1) as usize].period.is_some_and(|old| period > KEEP * old) {
-                    self.depths[(k - 1) as usize].cooldown = COOLDOWN;
+            Phase::Trial { from, calls } => match self.depths[(from - 1) as usize].period[b] {
+                Some(old) => {
+                    self.phase = Phase::Steady { gaps: 0, quiet: 0 };
+                    if period < KEEP * old { "trial kept" } else {
+                        self.depths[(k - 1) as usize].cooldown = COOLDOWN;
+                        self.k = from;
+                        "trial no better: revert"
+                    }
+                }
+                None if calls + 1 >= TRIAL_CALLS => {
+                    self.phase = Phase::Steady { gaps: 0, quiet: 0 };
                     self.k = from;
-                    "trial regressed: revert"
-                } else { "trial kept" }
-            }
-            Phase::Steady { quiet } => {
+                    "trial without a comparable call: revert"
+                }
+                None => {
+                    self.phase = Phase::Trial { from, calls: calls + 1 };
+                    "trial: no comparable call yet"
+                }
+            },
+            Phase::Steady { gaps, quiet } => {
+                let gaps = if idle > IDLE_ADD { gaps + 1 } else { 0 };
                 let quiet = if idle < IDLE_DROP { quiet + 1 } else { 0 };
-                let deeper = self.neighbour(k, true).filter(|&d| idle > IDLE_ADD && self.ready(d));
+                let deeper = self.neighbour(k, true).filter(|&d| gaps >= ADD_HOLD && self.ready(d));
                 let wider = self.neighbour(k, false).filter(|&w| quiet >= HOLD && self.ready(w));
                 if let Some(d) = deeper {
-                    self.phase = Phase::Trial { from: k };
+                    self.phase = Phase::Trial { from: k, calls: 0 };
                     self.k = d;
-                    "Sparks starve: one more, narrower wave"
+                    "Sparks wait between units: one more, narrower wave"
                 } else if let Some(w) = wider {
-                    self.phase = Phase::Trial { from: k };
+                    self.phase = Phase::Trial { from: k, calls: 0 };
                     self.k = w;
-                    "no Spark idle: one fewer, wider wave"
+                    "no Spark gaps: one fewer, wider wave"
                 } else {
-                    self.phase = Phase::Steady { quiet };
+                    self.phase = Phase::Steady { gaps, quiet };
                     "hold"
                 }
             }
@@ -224,8 +247,8 @@ mod tests {
         // above the add threshold; the narrower trial is far cheaper per row.
         let mut control = WaveControl::new(3, 4, 2752, false);
         let trace = run(&mut control, 20, step_s, STEP_T, 1_500.0);
-        assert_eq!(trace[0], 4, "{trace:?}");
-        assert!(trace.iter().all(|&k| k == 4), "{trace:?}");
+        assert_eq!(&trace[..2], [3, 4], "{trace:?}");
+        assert!(trace[1..].iter().all(|&k| k == 4), "{trace:?}");
     }
 
     #[test]
@@ -241,8 +264,8 @@ mod tests {
         let steep = |unit: u64| if unit == 2048 { 1.5 * 13_000.0 * 2048.0 / 2752.0 } else { 13_000.0 * unit as f64 / 2752.0 };
         let mut control = WaveControl::new(3, 4, 2752, false);
         let trace = run(&mut control, 10, steep, 30_000.0, 0.0);
-        assert_eq!(&trace[..2], [4, 3], "{trace:?}");
-        assert!(trace[2..].iter().all(|&k| k == 3), "{trace:?}");
+        assert_eq!(&trace[..3], [3, 4, 3], "{trace:?}");
+        assert!(trace[3..].iter().all(|&k| k == 3), "{trace:?}");
     }
 
     #[test]
@@ -250,8 +273,23 @@ mod tests {
         // Smooth curve (per-row cost falls with width) and T hidden at 2×4096.
         let s = |unit: u64| 1_000.0 + 3.0 * unit as f64;
         let mut control = WaveControl::new(4, 4, 4096, false);
-        let trace = run(&mut control, 12, s, 5_000.0, 0.0);
+        let trace = run(&mut control, 30, s, 5_000.0, 0.0);
         assert_eq!(control.waves(), 2, "{trace:?}");
+    }
+
+    #[test]
+    fn trials_compare_only_like_prompt_lengths() {
+        // Old depth measured at 64K only; the trial's 8K calls are not
+        // comparable, so it gives up after TRIAL_CALLS without a cooldown.
+        let mut control = WaveControl::new(3, 4, 2752, false);
+        let wait = |rows| PrefillPace { rows, ranks: vec![(1_000_000, 100_000); 6] };
+        control.observe(3, &wait(60_000));
+        assert_eq!(control.observe(3, &wait(60_000)).waves, 4);
+        for _ in 1..TRIAL_CALLS { assert_eq!(control.observe(4, &wait(7_000)).waves, 4); }
+        let d = control.observe(4, &wait(7_000));
+        assert_eq!((d.waves, d.reason), (3, "trial without a comparable call: revert"));
+        // A single noisy call never moves a steady depth.
+        assert_eq!(control.observe(3, &wait(60_000)).waves, 3);
     }
 
     #[test]
