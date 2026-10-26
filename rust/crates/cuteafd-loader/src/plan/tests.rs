@@ -229,8 +229,10 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let (unit, waves) = (expected.unit_rows, expected.waves);
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
-            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(unit), Some(waves), Some(unit * waves)), "{family} ranks={ranks}: {}", render(&report));
+            // An adaptive family admits its slots inside one reserve (#762).
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_slots),
+                (Some(unit), Some(waves), Some(expected.span_rows), Some(expected.slots)),
+                "{family} ranks={ranks}: {}", render(&report));
             for (unit, waves) in [(1024, 1), (2048, 2), (2752, 3), (2048, 4)] {
                 let layout = options.layout.as_mut().unwrap();
                 layout.prefill_rows = unit;
