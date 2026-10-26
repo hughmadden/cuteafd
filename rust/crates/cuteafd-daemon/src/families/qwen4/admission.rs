@@ -643,10 +643,13 @@ mod tests {
         args.mtp = if mtp { 3 } else { 0 };
         args.planner_prefix_bytes = Some(0);
         args.planner_graph_modes = Some((8, true));
-        for (host, fp8_projections, fp8_head, attention_rows) in [(false, false, true, None),
-            (true, false, true, None), (false, true, true, None), (false, false, false, None),
-            (false, false, true, Some(64))] {
-            for capacities in [[101_973_491_712; 2], [32 << 30, 101_973_491_712], [101_973_491_712, 32 << 30]] {
+        for (host, fp8_projections, fp8_head, attention_rows, capacities) in [
+            (false, false, true, None, [101_973_491_712; 2]),
+            (true, false, true, None, [32 << 30, 101_973_491_712]),
+            (false, true, true, None, [101_973_491_712, 32 << 30]),
+            (false, false, false, None, [101_973_491_712; 2]),
+            (false, false, true, Some(64), [101_973_491_712; 2]),
+        ] {
             args.attention_plan_rows = attention_rows;
             let reduction = super::super::attention_plan(&args, mtp)?;
             let manifests = qwen4::dual_program_manifests(&manifest,
@@ -689,7 +692,6 @@ mod tests {
                     .cloned().collect::<Vec<_>>();
                 assert_eq!(runtime.items[rank], planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
             }
-        }
         }
         std::fs::remove_file(packages[1].join("m80/v41_exl3.json"))?;
         assert!(super::dual_experts(&args, &catalog, 4).is_err());

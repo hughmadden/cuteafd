@@ -160,8 +160,13 @@ before → after tables with conditions.
   (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
   nextest when present on PATH or in the persistent architecture Cargo home,
   with cargo test as fallback. Install without root:
-  `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`. Release cuts also run `cpu-gate --slow` for the explicit slow CPU
-  tier, not arbitrary ignored GPU/network tests. Add no failing ids.
+  `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`.
+  Default is the iteration tier: it excludes the 14 measured full-plan/cache
+  IDs recorded in `cpu-gate`; receipts list those exclusions and are not
+  merge/release gates. Use `cpu-gate --full` for work/p0 merges and releases
+  to restore every nonignored test. Release cuts also add `--slow` for the
+  explicit ignored CPU soaks, not arbitrary ignored GPU/network tests.
+  The nextest and cargo-test fallback selections agree. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
   (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
