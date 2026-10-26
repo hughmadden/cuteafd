@@ -220,6 +220,7 @@ mod tests {
             testing, ExpertPlacement, PlanOptions}};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         for (extra, expected) in [
             (vec![], (2752, 3, 8256)),
@@ -243,7 +244,7 @@ mod tests {
                     host_cache_bytes: Some(0), prefill_rows: args.prefill_rows.unwrap_or(0) as u64,
                     prefill_lanes: args.prefill_waves.map_or(0, u64::from), ..Default::default() }),
                 ..Default::default() };
-            let report = plan::plan(snapshot.path(), &options)?;
+            let report = plan_input.plan(&options)?;
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
                 (Some(shape.unit_rows), Some(shape.waves), Some(shape.span_rows)));
         }

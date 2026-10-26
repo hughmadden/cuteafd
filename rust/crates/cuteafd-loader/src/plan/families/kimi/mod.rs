@@ -371,9 +371,9 @@ impl FamilyModel for Model {
             local: Err("Kimi K3 routed experts (637 GiB) cannot all be resident on the coordinators".into()),
         })
     }
-    fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        Some(Ok(placement::layout(self, report, options, requested)))
+        Some(Ok(placement::layout(self, input, report, options, requested)))
     }
 }

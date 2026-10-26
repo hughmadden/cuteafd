@@ -489,14 +489,33 @@ fn parse_safetensors_header(path: &Path) -> Result<BTreeMap<String, SafetensorsT
     );
     let mut header_bytes = vec![0_u8; header_len_usize];
     file.read_exact(&mut header_bytes)?;
-    let raw: BTreeMap<String, Value> = serde_json::from_slice(&header_bytes)?;
-    let mut entries = BTreeMap::new();
-    for (name, value) in raw {
-        if name == "__metadata__" {
-            continue;
+    // Decode tensor entries directly, without a second million-node Value tree.
+    struct HeaderMap;
+    impl<'de> serde::de::Visitor<'de> for HeaderMap {
+        type Value = BTreeMap<String, SafetensorsTensorHeader>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("safetensors header object")
         }
-        let mut header: SafetensorsTensorHeader = serde_json::from_value(value)
-            .with_context(|| format!("parsing header entry {name} in {}", path.display()))?;
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            use serde::de::Error;
+            let mut entries = BTreeMap::new();
+            while let Some(name) = map.next_key::<String>()? {
+                if name == "__metadata__" {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                } else {
+                    let header = map.next_value::<SafetensorsTensorHeader>()
+                        .map_err(|error| M::Error::custom(format!("parsing header entry {name}: {error}")))?;
+                    entries.insert(name, header);
+                }
+            }
+            Ok(entries)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(&header_bytes);
+    let mut entries = serde::Deserializer::deserialize_map(&mut de, HeaderMap)
+        .with_context(|| format!("parsing header in {}", path.display()))?;
+    de.end()?;
+    for (name, header) in &mut entries {
         // Hardening bound ported from upstream llama.cpp gguf-py
         // test_gguf_reader_validation.py: reject absurd tensor rank before any
         // downstream allocation/arithmetic on the dims vector.
@@ -524,7 +543,6 @@ fn parse_safetensors_header(path: &Path) -> Result<BTreeMap<String, SafetensorsT
             path.display(),
             header.data_offsets[1]
         );
-        entries.insert(name, header);
     }
     Ok(entries)
 }

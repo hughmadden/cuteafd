@@ -1140,6 +1140,7 @@ pub(super) mod tests {
         use cuteafd_core::memory_layout::DeviceKind;
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let package_root = tempfile::tempdir()?;
         let manifest_path = testing::write_kimi_installed_inventory(package_root.path(), false);
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
@@ -1148,7 +1149,7 @@ pub(super) mod tests {
         let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
-        let automatic = plan::plan(snapshot.path(), &PlanOptions {
+        let automatic = plan_input.plan(&PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![capacity; 2], concurrency: 16,
@@ -1188,10 +1189,10 @@ pub(super) mod tests {
                     context_tokens: context as u64, pool_tokens: requested_pool, host_cache_bytes, mla_kv: format,
                     workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
                     spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
-            let report = plan::plan(snapshot.path(), &options)?;
+            let report = plan_input.plan(&options)?;
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
                 (Some(unit as u64), Some(waves as u64), Some(rows as u64)));
-            let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
+            let catalog = plan_input.expert_catalog()?;
             let package = allocation::expert_package(&manifest_path)?;
             // Startup charges hook-local owners (TP2 workspace, Spark endpoint,
             // peer exchange, graphs) at the unit; row planes at the lane.
@@ -1285,6 +1286,7 @@ pub(super) mod tests {
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut lane_bytes = Vec::new();
@@ -1323,7 +1325,7 @@ pub(super) mod tests {
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
                         host_cache_bytes: Some(0), onboard: Some(Onboard::Auto), ..Default::default() }),
                     ..Default::default() };
-                let report = plan::plan(snapshot.path(), &options)?;
+                let report = plan_input.plan(&options)?;
                 ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
                 let memory = report.memory_layout.context("Kimi planned layout")?;
                 assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
@@ -1340,7 +1342,7 @@ pub(super) mod tests {
                 }
                 cache_bytes.push(total);
                 options.layout.as_mut().unwrap().pool_tokens = Some(context - 64);
-                let refused = plan::plan(snapshot.path(), &options)?;
+                let refused = plan_input.plan(&options)?;
                 assert!(!refused.fits, "planner must not shrink the explicit context floor");
             }
             assert_eq!(lane_bytes[1] - lane_bytes[0], 1 << 20);
@@ -1357,6 +1359,7 @@ pub(super) mod tests {
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
+        let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut i = inputs(&cfg);
@@ -1368,7 +1371,7 @@ pub(super) mod tests {
             assert_eq!(request.pool.compiled_context, DEFAULT_CONTEXT as u64);
             assert!(request.pool.target > request.pool.floor);
             assert!(solve(&request)?.pool_tokens > request.pool.floor);
-            let report = plan::plan(snapshot.path(), &PlanOptions {
+            let report = plan_input.plan(&PlanOptions {
                 placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),

@@ -12,7 +12,7 @@ const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
 const LANES: u64 = 1;
 
-pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
+pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
     let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), limits) {
@@ -177,7 +177,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
         return memory;
     }
     let inventory = (|| -> anyhow::Result<_> {
-        let catalog = crate::read_expert_catalog(&model.snapshot)?;
+        let catalog = input.expert_catalog()?;
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);

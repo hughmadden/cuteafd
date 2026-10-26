@@ -504,12 +504,22 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
 /// `config.json` block alone).
 fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap) -> Result<Exl3StorageSource> {
     let compact = config.get("quantization_config").context("config.json has no quantization_config")?;
+    use sha2::{Digest, Sha256};
     let mut source = None;
-    for file in ["quantize_config.json", "quantization_config.json"] {
-        let path = snapshot.join(file);
-        if !path.is_file() { continue; }
-        let mut manifest = crate::formats::exl3_storage::read_storage_metadata(
-            &path, MAX_MANIFEST_BYTES, Some(derived))?;
+    let paths = ["quantize_config.json", "quantization_config.json"].map(|file| snapshot.join(file));
+    let present = paths.iter().filter(|path| path.is_file()).collect::<Vec<_>>();
+    let first = present.first().map(|path| read_bytes(path, MAX_MANIFEST_BYTES)).transpose()?;
+    if let [left, right] = present.as_slice() {
+        ensure!(left.metadata()?.len() == right.metadata()?.len(),
+            "quantize_config.json and quantization_config.json differ in size");
+        let other = read_bytes(right, MAX_MANIFEST_BYTES)?;
+        ensure!(Sha256::digest(first.as_ref().unwrap()) == Sha256::digest(&other),
+            "quantize_config.json and quantization_config.json differ in SHA256");
+    }
+    if let Some(path) = present.first() {
+        let file = path.file_name().unwrap().to_string_lossy();
+        let mut manifest = crate::formats::exl3_storage::parse_storage_metadata(
+            path, first.as_ref().unwrap(), Some(derived))?;
         normalize_legacy_names(&mut manifest);
         let flavor = if manifest.get("checkpoint_format").is_some() {
             check_gptqmodel_manifest(compact, &manifest, derived).with_context(|| format!("checking {file}"))?;
@@ -1026,6 +1036,19 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_side_maps_match_bytes_before_one_parse() -> Result<()> {
+        let (config, manifest, shape, headers) = deepseek_v4_publication();
+        read_publication(&config, &[("quantize_config.json", &manifest),
+            ("quantization_config.json", &manifest)], shape, &headers, &[])?;
+        let mut different = manifest.clone();
+        different["unused"] = serde_json::json!(1);
+        let error = read_publication(&config, &[("quantize_config.json", &manifest),
+            ("quantization_config.json", &different)], shape, &headers, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("differ in size"));
+        Ok(())
+    }
+
+    #[test]
     fn publication_manifest_over_64_mib_remains_bounded() -> Result<()> {
         use std::io::Write;
 
@@ -1308,7 +1331,7 @@ mod tests {
         let error = format!("{:#}", read_publication(&config,
             &[("quantize_config.json", &manifest), ("quantization_config.json", &copy)], shape, &headers, &[])
             .unwrap_err());
-        assert!(error.contains("quantization_config.json") && error.contains("bits_per_weight 3"), "{error}");
+        assert!(error.contains("quantize_config.json and quantization_config.json differ in SHA256"), "{error}");
     }
 
     #[test]
