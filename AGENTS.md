@@ -6,6 +6,8 @@ model does what, how to brief, launch and review agents), one README
 and the `benchmarks/` index; measurements go in commit messages as short
 before → after tables with conditions.
 
+Porting a family or changing shared serve, prefill, exchange or admission code: read [docs/architecture/shared-engine.md](docs/architecture/shared-engine.md) first.
+
 ## Working method
 
 - Disk: builds live on raptor's root NVMe and fill it fast (1.4 TB of
