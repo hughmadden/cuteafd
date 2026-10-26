@@ -498,7 +498,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         None,
         ModelAdmission::for_units(ExpertGeometry::STEP5,
             SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Bf16 },
-            unit as u32, compiled as u32, spark_rings(config.max_frame_bytes)?, 1, args.prefill_waves)?,
+            unit as u32, compiled as u32, spark_rings(config.max_frame_bytes)?, 1,
+            cuteafd_loader::plan::layout::spark_execution_slots("step5", u64::from(args.prefill_waves), 1)?)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
