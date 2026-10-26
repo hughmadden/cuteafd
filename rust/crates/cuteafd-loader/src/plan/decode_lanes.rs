@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn one_lane_families_record_their_reason() {
-        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2"] {
+        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2", "glm5"] {
             let family = crate::plan::spark_executions::descriptor(id).unwrap();
             let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
             assert!(reason != UNPORTED && reason.contains("#744"), "{id}: {reason}");
