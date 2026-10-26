@@ -32,7 +32,7 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
-    /// Independent decode views. Only one is supported until second-view admission lands.
+    /// Decode lanes; MiMo runs one (`LaneSupport::One`; the planner reports why).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
     /// Shared GQA drafter-ring storage (independent of weight precision).

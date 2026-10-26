@@ -99,8 +99,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_scheduler_families_run_one_lane_with_a_recorded_reason() {
-        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5"] {
+    fn one_lane_families_record_their_reason() {
+        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2"] {
             let family = crate::plan::spark_executions::descriptor(id).unwrap();
             let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
             assert!(reason != UNPORTED && reason.contains("#744"), "{id}: {reason}");
