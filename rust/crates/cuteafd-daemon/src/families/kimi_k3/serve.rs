@@ -59,8 +59,8 @@ impl ServeArgs {
     }
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
-        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-        Ok(prefill_shape(6, PrefillLimits::for_family("kimi_k3"), PrefillOverrides {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        Ok(prefill_shape(6, cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None,
         })?)

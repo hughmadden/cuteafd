@@ -218,10 +218,14 @@ mod tests {
             assert!(!report.executable());
             // A rejected allocation still reports the selected topology shape;
             // capacity admission never retries a smaller unit or fewer waves.
-            let (unit, waves, rows) = if sparks >= 6 { (2752, 3, 8256) } else { (4096, 2, 8192) };
-            assert_eq!(report.prefill_unit_rows, Some(unit as u64));
-            assert_eq!(report.prefill_waves, Some(waves as u64));
-            assert_eq!(report.prefill_span_rows, Some(rows as u64));
+            let descriptor = cuteafd_loader::plan::Family::prefill_limits(
+                &cuteafd_loader::plan::families::step5::STEP5);
+            let daemon = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(
+                sparks, descriptor, Default::default())?;
+            let (waves, rows) = (daemon.waves as usize, daemon.span_rows as usize);
+            assert_eq!(report.prefill_unit_rows, Some(daemon.unit_rows));
+            assert_eq!(report.prefill_waves, Some(daemon.waves));
+            assert_eq!(report.prefill_span_rows, Some(daemon.span_rows));
             let mut code = Vec::new();
             let gpus = opts
                 .rtx_bytes

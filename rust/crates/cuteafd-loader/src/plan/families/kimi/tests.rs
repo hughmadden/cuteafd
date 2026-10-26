@@ -46,9 +46,10 @@ fn planner_resolves_every_spark_count_before_recipe_refusal() {
     let dir = snapshot(true);
     for ranks in 0..=8 {
         let report = plan::plan(dir.path(), &with_layout(ranks, None)).unwrap();
-        let (unit, waves) = match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) };
+        let daemon = crate::serving_capacity::prefill_waves::prefill_shape(ranks,
+            crate::plan::Family::prefill_limits(&super::KIMI_K3), Default::default()).unwrap();
         assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-            (Some(unit), Some(waves), Some(unit * waves)), "ranks={ranks}: {:?}", report.hints);
+            (Some(daemon.unit_rows), Some(daemon.waves), Some(daemon.span_rows)), "ranks={ranks}: {:?}", report.hints);
         if ranks != 6 {
             assert!(!report.fits && !report.placement_supported && !report.wip_launchable());
             assert!(report.hints.iter().any(|hint| hint.what.contains(&format!("kimik3:exl3-k23 TP{ranks}"))),

@@ -337,6 +337,11 @@ impl Model {
 }
 
 impl Family for Step5 {
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        use crate::serving_capacity::prefill_waves::{PrefillAutomatic, PrefillLimits};
+        PrefillLimits { automatic: PrefillAutomatic { max_unit_rows: 2048, ..Default::default() },
+            ..Default::default() }
+    }
     fn id(&self) -> &'static str { "step5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

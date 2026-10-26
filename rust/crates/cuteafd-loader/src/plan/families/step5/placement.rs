@@ -59,7 +59,7 @@ pub(super) fn layout(
         Unqualified("coordinator-local routed experts")
     );
     let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
-        crate::serving_capacity::prefill_waves::PrefillLimits::default())?;
+        crate::plan::Family::prefill_limits(&super::STEP5))?;
     let checked_rows = usize::try_from(shape.unit_rows)?;
     let waves = usize::try_from(shape.waves)?;
 

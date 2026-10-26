@@ -112,6 +112,12 @@ impl FamilyModel for Described {
 
 pub trait Family: Sync {
     fn id(&self) -> &'static str;
+    /// Automatic scheduling preferences supplied by the family, consumed unchanged
+    /// by shared planning, serving and golden admission. Explicit pins still obey
+    /// the separate hard executor limits.
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        Default::default()
+    }
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
     /// Parses the checkpoint's configuration into the family's canonical model

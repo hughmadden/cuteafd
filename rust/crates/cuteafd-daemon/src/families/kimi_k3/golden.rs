@@ -415,8 +415,8 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-    let prefill = prefill_shape(args.peers.len(), PrefillLimits::for_family("kimi_k3"), PrefillOverrides {
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+    let prefill = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
         unit_rows: args.prefill_rows.map(|rows| rows as u64),
         waves: Some(u64::from(args.prefill_waves)), span_rows: None,
     })?;

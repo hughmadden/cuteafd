@@ -14,8 +14,8 @@ const LANES: u64 = 1;
 
 pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
-    use crate::serving_capacity::prefill_waves::PrefillLimits;
-    let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), PrefillLimits::default()) {
+    let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
+    let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), limits) {
         Ok(prefill) => prefill,
         Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
     };

@@ -705,8 +705,7 @@ pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error)
 pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     spark_ranks: usize, mut limits: crate::serving_capacity::prefill_waves::PrefillLimits)
     -> anyhow::Result<crate::serving_capacity::prefill_waves::PrefillPlan> {
-    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillAutomatic, PrefillOverrides};
-    limits.automatic = PrefillAutomatic::for_family(report.family.as_deref().unwrap_or_default());
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
     let manifest_path = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     if manifest_path.is_file() {

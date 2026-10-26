@@ -38,13 +38,9 @@ pub struct PrefillAutomatic {
     pub max_waves: u64,
 }
 
-impl PrefillAutomatic {
-    pub fn for_family(family: &str) -> Self {
-        Self { max_unit_rows: match family {
-            "step5" => 2048,
-            "kimi_k3" => 2752,
-            _ => 4096,
-        }, max_waves: MAX_WAVES }
+impl Default for PrefillAutomatic {
+    fn default() -> Self {
+        Self { max_unit_rows: 4096, max_waves: MAX_WAVES }
     }
 }
 
@@ -58,16 +54,10 @@ pub struct PrefillLimits {
     pub automatic: PrefillAutomatic,
 }
 
-impl PrefillLimits {
-    pub fn for_family(family: &str) -> Self {
-        Self { automatic: PrefillAutomatic::for_family(family), ..Default::default() }
-    }
-}
-
 impl Default for PrefillLimits {
     fn default() -> Self {
         Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES,
-            automatic: PrefillAutomatic::for_family("") }
+            automatic: PrefillAutomatic::default() }
     }
 }
 
@@ -185,31 +175,31 @@ mod tests {
     }
 
     #[test]
-    fn automatic_units_use_the_family_measurement_without_changing_topology() {
-        for (family, ceiling) in [("step5", 2048), ("kimi_k3", 2752), ("glm5", 4096),
-            ("glm5_flash", 4096), ("qwen4", 4096), ("qwen3_5", 4096),
-            ("deepseek_v4", 4096), ("mimo_v2", 4096), ("deepseek_v41", 4096)] {
-            let limits = PrefillLimits::for_family(family);
+    fn automatic_units_consume_supplied_constraints_without_changing_topology() {
+        for ceiling in [1024, 2048, 2752, 4096] {
+            let limits = PrefillLimits { automatic: PrefillAutomatic {
+                max_unit_rows: ceiling, ..Default::default() }, ..Default::default() };
             for ranks in 0..=8 {
                 let shape = prefill_shape(ranks, limits, PrefillOverrides::default()).unwrap();
                 let waves = planned_waves(ranks);
                 let rows = unit_rows(waves).min(ceiling);
                 assert_eq!(shape, PrefillPlan { unit_rows: rows, waves, span_rows: rows * waves },
-                    "{family} ranks={ranks}");
+                    "ceiling={ceiling} ranks={ranks}");
             }
             for waves in 1..=MAX_WAVES {
                 let shape = prefill_shape(6, limits, PrefillOverrides {
                     waves: Some(waves), ..Default::default()
                 }).unwrap();
-                assert_eq!(shape.unit_rows, unit_rows(waves).min(ceiling), "{family} waves={waves}");
+                assert_eq!(shape.unit_rows, unit_rows(waves).min(ceiling), "ceiling={ceiling} waves={waves}");
             }
         }
     }
 
     #[test]
     fn measured_ceilings_do_not_rewrite_explicit_pins_or_hard_refusals() {
-        for family in ["step5", "kimi_k3"] {
-            let limits = PrefillLimits::for_family(family);
+        for ceiling in [2048, 2752] {
+            let limits = PrefillLimits { automatic: PrefillAutomatic {
+                max_unit_rows: ceiling, ..Default::default() }, ..Default::default() };
             for (waves, rows) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
                 let shape = prefill_shape(6, limits, PrefillOverrides {
                     unit_rows: Some(rows), waves: Some(waves), ..Default::default()
@@ -223,7 +213,7 @@ mod tests {
                 unit_rows: Some(2048), waves: Some(2), ..Default::default()
             }).unwrap_err();
             assert!(matches!(error, PrefillError::ExecutorCapacity { unit_rows: 2048, .. }), "{error}");
-            let error = prefill_shape(6, PrefillLimits::for_family(family), PrefillOverrides {
+            let error = prefill_shape(6, PrefillLimits { max_unit_rows: 4096, ..limits }, PrefillOverrides {
                 unit_rows: Some(4096), waves: Some(3), ..Default::default()
             }).unwrap_err();
             assert!(matches!(error, PrefillError::ReserveExceeded { .. }), "{error}");

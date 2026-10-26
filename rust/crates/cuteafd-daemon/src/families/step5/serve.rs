@@ -73,8 +73,8 @@ impl ServeArgs {
     }
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
-        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), PrefillLimits::for_family("step5"), PrefillOverrides {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
             span_rows: None,
