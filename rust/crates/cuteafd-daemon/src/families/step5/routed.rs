@@ -238,6 +238,10 @@ impl RoutedPlan {
                 "Step-5 routed projection geometry: {name}"
             );
         }
+        let quant = &programs.spec("step5_expert_input_quant")?.geometry;
+        ensure!(quant["hidden"] == H && quant["row_bytes"] == H + H / 32
+            && quant["expected_m"] == 80 && quant["amax_floor"].as_f64() == Some(1e-4),
+            "Step-5 routed input quantizer geometry");
         let route = &programs.spec("step5_route_weights")?.geometry;
         let post = &programs.spec(&activation)?.geometry;
         ensure!(
