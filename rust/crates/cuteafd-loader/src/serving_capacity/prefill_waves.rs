@@ -56,6 +56,8 @@ impl PrefillEstimate {
 /// Memory admission supplies the available arena extent, not a scheduling row cap.
 #[derive(Debug, Clone, Copy)]
 pub struct PrefillLimits {
+    /// Measured starting unit for automatic selection; explicit unit pins bypass it.
+    pub initial_unit_rows: Option<u64>,
     pub max_unit_rows: u64,
     pub max_span_rows: u64,
     pub max_waves: u64,
@@ -65,8 +67,9 @@ pub struct PrefillLimits {
 
 impl Default for PrefillLimits {
     fn default() -> Self {
-        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES,
-            capacities: &cuteafd_core::EXL3_CAPACITIES, estimate: PrefillEstimate::Unmeasured }
+        Self { initial_unit_rows: None, max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64,
+            max_waves: MAX_WAVES, capacities: &cuteafd_core::EXL3_CAPACITIES,
+            estimate: PrefillEstimate::Unmeasured }
     }
 }
 
@@ -109,8 +112,9 @@ pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
     loop {
         let budget = unit_rows(waves).min(limits.max_unit_rows)
             .min(limits.max_span_rows.min(RESERVE_ROWS + 64) / waves.max(1));
+        let automatic_budget = budget.min(limits.initial_unit_rows.unwrap_or(budget));
         let rows = explicit.unit_rows.unwrap_or_else(|| limits.capacities.iter().copied()
-            .map(u64::from).filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= budget)
+            .map(u64::from).filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= automatic_budget)
             .max().unwrap_or(0));
         let shape = validate_shape(rows, waves, limits, None);
         if shape.is_ok() { return validate_shape(rows, waves, limits, explicit.span_rows); }
@@ -212,6 +216,44 @@ mod tests {
         assert_eq!(shape, PrefillPlan { unit_rows: 1024, waves: 2, span_rows: 2048 });
         let limits = PrefillLimits { max_span_rows: 128, capacities: &[256, 1024, 4096], ..measured(4) };
         assert!(prefill_shape(6, limits, Default::default()).is_err());
+    }
+
+    #[test]
+    fn initial_unit_preference_only_changes_automatic_rows() {
+        let limits = PrefillLimits { initial_unit_rows: Some(2048), ..measured(3) };
+        assert_eq!(prefill_shape(6, measured(3), Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
+        assert_eq!(prefill_shape(6, limits, Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 2048, waves: 3, span_rows: 6144 });
+        for (rows, waves) in [(256, 3), (2752, 3), (4096, 2)] {
+            assert_eq!(prefill_shape(6, limits, PrefillOverrides {
+                unit_rows: Some(rows), waves: Some(waves), ..Default::default()
+            }).unwrap(), PrefillPlan { unit_rows: rows, waves, span_rows: rows * waves });
+        }
+        assert!(matches!(prefill_shape(6, limits, PrefillOverrides {
+            unit_rows: Some(4096), waves: Some(3), ..Default::default()
+        }), Err(PrefillError::ReserveExceeded { .. })));
+        let capped = PrefillLimits { max_unit_rows: 1024, ..limits };
+        assert_eq!(prefill_shape(6, capped, Default::default()).unwrap().unit_rows, 1024);
+        assert!(matches!(prefill_shape(6, capped, PrefillOverrides {
+            unit_rows: Some(2048), waves: Some(3), ..Default::default()
+        }), Err(PrefillError::ExecutorCapacity { .. })));
+        let shallow = PrefillLimits { max_waves: 2, ..limits };
+        assert_eq!(prefill_shape(6, shallow, Default::default()).unwrap().waves, 2);
+        assert!(matches!(prefill_shape(6, shallow, PrefillOverrides {
+            waves: Some(3), ..Default::default()
+        }), Err(PrefillError::ExecutorCapacity { .. })));
+    }
+
+    #[test]
+    fn initial_unit_preference_still_obeys_memory_and_export_limits() {
+        let limits = PrefillLimits { initial_unit_rows: Some(2048), max_span_rows: 2048,
+            ..measured(3) };
+        assert_eq!(prefill_shape(6, limits, Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 256, waves: 3, span_rows: 768 });
+        let limits = PrefillLimits { initial_unit_rows: Some(2048),
+            capacities: &[256, 4096], ..measured(3) };
+        assert_eq!(prefill_shape(6, limits, Default::default()).unwrap().unit_rows, 256);
     }
 
     #[test]

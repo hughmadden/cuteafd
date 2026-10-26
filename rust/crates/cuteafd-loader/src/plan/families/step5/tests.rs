@@ -717,6 +717,8 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let dir = snapshot("fp8");
     let r = report_context(dir.path(), 2, 96, 6, Some(262_144), 262_144);
     assert!(r.wip_launchable(), "{:?}", r.hints);
+    assert_eq!((r.prefill_unit_rows, r.prefill_waves, r.prefill_span_rows),
+        (Some(2048), Some(3), Some(6144)));
     assert!(!r.executable());
     assert!(r.native_serving_admitted);
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
@@ -774,9 +776,9 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint's frames hold one unit; the intake holds all live waves.
-        // The descriptor's measured best k3 (#785) on the 8192-row ladder.
+        // The measured k3/2048 preference leaves unused reserve, not smaller hard caps.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
-        assert_eq!(rows, 2752);
+        assert_eq!(rows, 2048);
         assert_eq!(result.prefill_waves, Some(3));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
@@ -1268,6 +1270,26 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
             assert!(result.hints.iter().any(|hint| hint.what.contains("coordinator/Spark count")),
                 "{kind} ranks={ranks}: {:?}", result.hints);
             assert!(result.memory_layout.unwrap().devices.is_empty());
+        }
+    }
+}
+
+#[test]
+fn measured_initial_unit_is_step_only_and_preserves_explicit_shapes() {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides, PrefillPlan};
+    for family in crate::plan::family::registry() {
+        assert_eq!(family.prefill_limits().initial_unit_rows,
+            (family.id() == "step5").then_some(2048), "{}", family.id());
+    }
+    let limits = crate::plan::Family::prefill_limits(&super::STEP5);
+    assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows), (4096, 4, 8256));
+    for ranks in [4, 6] {
+        assert_eq!(prefill_shape(ranks, limits, Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 2048, waves: 3, span_rows: 6144 });
+        for (unit, waves) in [(256, 3), (2752, 3), (4096, 2)] {
+            assert_eq!(prefill_shape(ranks, limits, PrefillOverrides {
+                unit_rows: Some(unit), waves: Some(waves), span_rows: None,
+            }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves });
         }
     }
 }
