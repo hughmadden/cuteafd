@@ -55,15 +55,7 @@ impl<'a> Exlr8Weights<'a> {
     }
 
     pub(crate) fn plan(layout: &Residency) -> Result<ExpertLoadBudget> {
-        let descriptor_bytes = layout
-            .experts
-            .checked_mul(layout.units)
-            .and_then(|n| n.checked_mul(3 * (3 * 8 + 4) * 2))
-            .context("EXLR8 descriptor staging overflow")?;
-        let compact_bytes = if layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed {
-            layout.experts.checked_mul(layout.units.checked_add(1).context("compact unit overflow")?)
-                .and_then(|n| n.checked_mul(8)).context("compact descriptor overflow")?
-        } else { 0 };
+        let descriptor_bytes = layout.descriptor_host_bytes()?;
         let descriptor_upload = layout.experts.checked_mul(layout.units)
             .and_then(|n| n.checked_mul(3 * 3 * 8))
             .context("EXLR8 descriptor upload overflow")?;
@@ -77,8 +69,7 @@ impl<'a> Exlr8Weights<'a> {
             resident_bytes: layout.resident_bytes,
             device_staging_bytes: 0,
             pinned_host_bytes: bank_bytes,
-            read_scratch_bytes: descriptor_bytes.checked_add(compact_bytes)
-                .and_then(|n| n.checked_add(layout.host_bytes()))
+            read_scratch_bytes: descriptor_bytes.checked_add(layout.host_bytes())
                 .context("EXLR8 host residency overflow")?,
         })
     }

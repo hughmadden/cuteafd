@@ -11,10 +11,11 @@ use cuteafd_loader::{push_load::builder::{Builder, CheckedPlan, Destination}, Of
 
 /// One coordinator GPU's admitted expert layers, laid out as today's mount
 /// arenas, one region per layer: EXL3 residencies of TP2 halves or of whole
-/// (world 1) layers and draft stages, or native MXFP4 TP2 planes (the Spark
-/// native images at world 2, packed after Done like a Spark rank's).
+/// (world 1) layers and draft stages, native EXLR8 TP2 unit arenas, or native
+/// MXFP4 TP2 planes (the Spark native images at world 2, packed after Done).
 pub(crate) struct CoordinatorExpertPlan {
     pub residencies: Vec<V41Exl3Residency>,
+    pub exlr8: Vec<cuteafd_loader::plan::exlr8::residency::Residency>,
     /// Native planes per layer (empty for EXL3).
     pub native: Vec<cuteafd_loader::push_load::native::NativePlanes>,
     pub layers: Vec<usize>,
@@ -32,6 +33,16 @@ impl CoordinatorExpertPlan {
         let residencies = layers.iter().map(|&layer| manifest.residency(V41Exl3Layer::Backbone(layer), 2, gpu))
             .collect::<Result<Vec<_>>>()?;
         Self::exl3(residencies, layers.to_vec(), gpu, admitted)
+    }
+
+    pub fn exlr8(catalog: &OfficialV41Catalog, manifest: &str, layers: &[usize], gpu: usize,
+        admitted: usize) -> Result<Self> {
+        ensure!(gpu < 2 && !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1]),
+            "EXLR8 TP2 needs ordered layers on two GPUs");
+        let plan = super::push_exlr8::RankPlan::new(catalog.snapshot(), manifest, layers, 2, gpu, admitted)?;
+        let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
+        Ok(Self { residencies: Vec::new(), exlr8: plan.residencies, native: Vec::new(),
+            layers: layers.to_vec(), gpu, layout: plan.layout, validation, scales: Default::default() })
     }
 
     /// Whole (world 1) EXL3 residencies on one coordinator GPU, backbone
@@ -52,7 +63,7 @@ impl CoordinatorExpertPlan {
         let layout = ArenaLayout::new(sizes, admitted)?;
         let validation = ValidationLayout::exl3(&residencies, layout.bytes() as u64, usize::MAX)?;
         let layout = layout.with_validation(validation.bytes(), validation.bytes())?;
-        Ok(Self { residencies, native: Vec::new(), layers, gpu, layout, validation, scales: Default::default() })
+        Ok(Self { residencies, exlr8: Vec::new(), native: Vec::new(), layers, gpu, layout, validation, scales: Default::default() })
     }
 
     /// Native MXFP4 halves: each layer's four planes for intermediate half
@@ -77,7 +88,36 @@ impl CoordinatorExpertPlan {
         }
         let layout = layout.with_generated(generated)?;
         let scales = super::push_native::ScalePlan::new(catalog, scale_layers, 2, gpu)?;
-        Ok(Self { residencies: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation, scales })
+        Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation, scales })
+    }
+
+    /// EXLR8 keeps its source/index metadata through serving and constructs one
+    /// layer's relocated descriptors at a time after Done. Mount upload banks
+    /// are not used by push; its receive rings are admitted separately below.
+    pub fn exlr8_host_bytes(&self) -> Result<usize> {
+        let mut retained = 0usize;
+        let mut scratch = 0usize;
+        for residency in &self.exlr8 {
+            let host = residency.host_bytes();
+            retained = retained.checked_add(host).context("EXLR8 retained host overflow")?;
+            scratch = scratch.max(residency.descriptor_host_bytes()?);
+        }
+        retained.checked_add(scratch).context("EXLR8 host admission overflow")
+    }
+
+    /// Both coordinator ranks receive concurrently, so every format pays for
+    /// every pinned ring. EXLR8 additionally pays for retained metadata and its
+    /// per-rank post-Done descriptor scratch, not the deleted mount staging.
+    pub fn admit_host(plans: &[Option<Self>], slots: usize, slot_bytes: usize, available: u64) -> Result<usize> {
+        let rings = slots.checked_mul(slot_bytes).and_then(|bytes| bytes.checked_mul(plans.len()))
+            .context("coordinator push ring host overflow")?;
+        let peak = plans.iter().try_fold(rings, |bytes, plan| {
+            let extra = plan.as_ref().map_or(Ok(0), Self::exlr8_host_bytes)?;
+            bytes.checked_add(extra).context("coordinator push host admission overflow")
+        })?;
+        ensure!(u64::try_from(peak)? <= available,
+            "coordinator push retained metadata, descriptors and receive rings need {peak} host bytes, available {available}");
+        Ok(peak)
     }
 
     /// Device scratch the post-Done native plane transform needs (0 for EXL3).
@@ -92,6 +132,14 @@ impl CoordinatorExpertPlan {
     /// As `append`, with this plan's logical space starting at `base` of the
     /// rank's (the coordinator's dense operands come first).
     pub fn append_at(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32, base: u64) -> Result<()> {
+        if !self.exlr8.is_empty() {
+            for (index, residency) in self.exlr8.iter().enumerate() {
+                let range = self.layout.region(index)?;
+                builder.exlr8(catalog.snapshot(), residency, Destination {
+                    rank, offset: base + range.start as u64, bytes: range.len() as u64 })?;
+            }
+            return Ok(());
+        }
         if !self.native.is_empty() {
             for (index, (planes, &layer)) in self.native.iter().zip(&self.layers).enumerate() {
                 let range = self.layout.region(index)?;

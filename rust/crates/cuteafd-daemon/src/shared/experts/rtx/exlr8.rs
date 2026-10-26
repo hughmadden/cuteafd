@@ -5,8 +5,8 @@ use crate::shared::experts::exlr8::{grouped_decode_from_row, view, Exlr8Executio
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer};
-use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
-use std::{ffi::c_void, path::Path, rc::Rc};
+use cuteafd_loader::plan::exlr8::residency::ExpertSet;
+use std::{ffi::c_void, rc::Rc};
 
 const DECODE_ROWS: usize = 64;
 const TP2_UNITS: usize = 8;
@@ -44,34 +44,24 @@ impl<'a> Exlr8Tp2Weights<'a> {
             .context("EXLR8 RTX workspace overflow")
     }
 
-    pub(crate) fn load_pair(devices: [Device<'a>; 2], snapshot: &Path, selected: &str,
-        programs: &'a Programs<'a>, layers: Vec<usize>, max_rows: usize,
-        budgets: [usize; 2], activations: Exlr8PrefillActivations) -> Result<[Self; 2]> {
+    pub(crate) fn pushed_pair(devices: [Device<'a>; 2], programs: &'a Programs<'a>,
+        layers: Vec<usize>, max_rows: usize, budgets: [usize; 2],
+        activations: Exlr8PrefillActivations, pushed: [Vec<Exlr8Weights<'a>>; 2]) -> Result<[Self; 2]> {
         ensure!(!layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1]),
             "EXLR8 RTX needs ordered resident layer IDs");
         let workspace_bytes = Self::workspace_bytes(programs, max_rows, activations)?;
         let mut ranks = Vec::new();
-        for (rank, device) in devices.into_iter().enumerate() {
-            let plans = layers.iter().map(|&layer| Residency::plan(snapshot, selected, layer,
-                2, rank, ExpertSet::Routed)).collect::<std::result::Result<Vec<_>, _>>()?;
-            let resident = plans.iter().try_fold(0usize, |sum, plan| sum.checked_add(plan.resident_bytes)
-                .context("EXLR8 RTX residency overflow"))?;
+        for (rank, (device, weights)) in devices.into_iter().zip(pushed).enumerate() {
+            ensure!(weights.len() == layers.len(), "EXLR8 pushed layer count differs from admission");
+            let resident = weights.iter().zip(&layers).try_fold(0usize, |sum, (weight, &layer)| {
+                ensure!(weight.layout.layer == layer && weight.layout.world == 2 && weight.layout.rank == rank
+                    && weight.layout.set == ExpertSet::Routed && weight.layout.compact_unit_limit() <= TP2_UNITS,
+                    "EXLR8 pushed TP2 selection differs from admission");
+                sum.checked_add(weight.budget.resident_bytes).context("EXLR8 RTX residency overflow")
+            })?;
             ensure!(resident.checked_add(workspace_bytes).is_some_and(|bytes| bytes <= budgets[rank]),
                 "EXLR8 RTX weights and execution exceed admitted peak");
-            let retained_host = plans.iter().try_fold(0usize, |bytes, plan| bytes.checked_add(plan.host_bytes())
-                .context("EXLR8 RTX host residency overflow"))?;
-            let transient_host = plans.iter().map(|plan| {
-                let budget = Exlr8Weights::plan(plan)?;
-                budget.pinned_host_bytes.checked_add(budget.read_scratch_bytes.saturating_sub(plan.host_bytes()))
-                    .context("EXLR8 RTX host staging overflow")
-            }).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-            let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-            ensure!(retained_host.checked_add(transient_host).is_some_and(|bytes| bytes as u64 <= available),
-                "EXLR8 RTX host residency and pinned load staging exceed available memory");
-            let weights = device.own(|| plans.into_iter().map(|plan| {
-                ensure!(plan.compact_unit_limit() <= TP2_UNITS, "EXLR8 TP2 unit ownership exceeds admission");
-                Exlr8Weights::load(device.library, plan, resident)
-            }).collect::<Result<Vec<_>>>())?;
+            let weights = device.own(|| Ok(weights))?;
             ranks.push(Self { device, rank: rank as u8, layers: layers.clone(), programs,
                 max_rows, activations, workspace_bytes, weights: Rc::new(weights) });
         }
