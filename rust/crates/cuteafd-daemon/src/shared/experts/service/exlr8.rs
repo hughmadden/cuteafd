@@ -64,6 +64,7 @@ pub(super) struct Worker<'w, 'a> {
     deferred: bool,
     /// The queued mapped request's identity, for its timing at completion.
     pending: super::super::execution::timing::PendingUnits<'a>,
+    route_staging: super::routes::RouteStaging<'a>,
 }
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
@@ -85,9 +86,10 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
     let info = library.cuda_device_info(library.cuda_get_device()?)?;
     let capability = (info.compute_capability_major, info.compute_capability_minor);
-    let owners = spark_execution_workspace(config, |capacity, _, _| {
+    let owners = spark_execution_workspace(config, |capacity, _, staging_rows| {
         Ok((execution_bytes(programs, capacity as usize, unit_limit, capability,
-            config.exlr8_prefill_activations)?, 0, 0))
+            config.exlr8_prefill_activations)?, 0,
+            staging_rows as usize * catalog.routed_experts().geometry()?.topk as usize * 8))
     })?;
     let k1_workspace_bytes = usize::try_from(owners.total().context("EXLR8 owner workspace overflow")?)?;
     // Blocking fallback uploads share the native library's one pinned cache;
@@ -170,7 +172,8 @@ impl<'w, 'a> Worker<'w, 'a> {
         Ok(Self { stream, execution, grouped_decode, grouped_from_row, prefill, weights, library,
             selected: 0, capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing,
-            deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)? })
+            deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
+            route_staging: super::routes::RouteStaging::new(library, 1, capacity)? })
     }
     pub(super) fn bind_layer(&mut self, index: usize) -> Result<()> {
         ensure!(index < self.weights.len(), "EXLR8 requested layer is not resident");
@@ -200,18 +203,19 @@ impl<'w, 'a> Worker<'w, 'a> {
         let output_stride = geometry.hidden as usize * 2;
         let topk = geometry.topk as usize;
         let rows = request.rows() as usize;
-        self.pending.next_slot()?;
+        let stage = self.pending.next_slot()?;
         let identity = (request.request_id(), request.layer(), rows as u32, executor_id);
         let Some(mapped) = mapped else {
             // Host path: blocking uploads and downloads, drained per chunk.
             return self.execute_host(request, exchange, input_stride, output_stride, topk, identity);
         };
+        self.route_staging.pack(stage, request)?;
         let execution = self.arena(rows)?;
         // Mapped path: every chunk queues on the one stream with no host wait.
         // Each chunk reads its own input rows and writes its own output range;
         // the arenas a chunk reuses are ordered after the previous chunk's
         // readers by the stream itself, because every copy here is a stream
-        // copy (`library_copy`, `copy_route_records`).
+        // copy (`library_copy`, packed pinned route uploads).
         let work = (|| -> Result<()> {
             if let Some(timing) = &self.timing {
                 // SAFETY: the event is retained until this request completes.
@@ -220,14 +224,13 @@ impl<'w, 'a> Worker<'w, 'a> {
             for (first, rows) in chunks(rows) {
                 let routes = rows * topk;
                 let hidden = super::super::exlr8::view(mapped.hidden_payload, first * input_stride, rows * input_stride)?;
-                let records = super::super::exlr8::view(mapped.routes, first * topk * 12, routes * 12)?;
                 // SAFETY: the validated mapped request and the exclusive arena
                 // stay live until this request's stream work completes
                 // (`complete`, or the drain on failure below).
                 unsafe {
                     library_copy(self.library, execution.input()?, hidden, hidden.bytes, self.stream.raw)?;
-                    super::routes::copy_route_records(self.library, records,
-                        execution.ids()?, execution.route_weights()?, routes, self.stream.raw)?;
+                    self.route_staging.upload(stage, first * topk, routes,
+                        execution.ids()?, execution.route_weights()?, self.stream.raw)?;
                     execution.run(&self.weights[self.selected], rows, self.stream.raw)?;
                 }
                 let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
@@ -316,9 +319,11 @@ impl<'w, 'a> Worker<'w, 'a> {
     /// Lane-owned mode (#708): a mapped request returns with its work queued;
     /// the owner emits it once [`Self::stream_idle`] holds, then calls
     /// [`Self::complete`].
-    pub(super) fn defer(&mut self, units: usize) -> Result<()> {
+    pub(super) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active EXLR8 queue");
+        ensure!(staging_rows > 0 && staging_rows <= self.capacity, "EXLR8 staging exceeds owner rows");
         self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.route_staging.resize(self.library, units, staging_rows)?;
         self.deferred = true;
         Ok(())
     }
@@ -448,7 +453,7 @@ mod tests {
         let bind = &source[source.find("fn bind_layer(").unwrap()..source.find("fn grouping(").unwrap()];
         assert!(!bind.contains("require_complete") && !bind.contains("synchronize"));
         let backend = include_str!("backend.rs");
-        assert!(backend.contains("Self::Exlr8(execution) => execution.defer(units)?,"));
+        assert!(backend.contains("Self::Exlr8(execution) => execution.defer(units, staging_rows)?,"));
         assert!(backend.contains("Self::Exlr8(execution) => execution.stream_idle(),"));
         assert!(backend.contains("Self::Exlr8(execution) => execution.complete(),"));
     }

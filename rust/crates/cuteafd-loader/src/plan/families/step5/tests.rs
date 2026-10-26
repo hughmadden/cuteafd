@@ -827,7 +827,8 @@ fn native_owner_shares_scratch_and_sums_quant_and_bf16_tail_io() -> anyhow::Resu
         assert_eq!(mixed.scratch, quant.scratch.max(tail.scratch));
         assert_eq!(mixed.scratch, tail_scratch.max(quant_scratch));
         assert_eq!(mixed.io, quant.io + tail.io);
-        assert_eq!(mixed.pinned_staging, 0);
+        assert_eq!(mixed.pinned_staging, quant.pinned_staging + tail.pinned_staging);
+        assert_eq!(mixed.pinned_staging, 2 * u64::from(prefill.staging_rows) * u64::from(input.expert_catalog()?.routed_experts().geometry()?.topk) * 8);
     }
     Ok(())
 }

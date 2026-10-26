@@ -93,7 +93,8 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
         scratch = scratch.max(group_scratch(family, format, extent.compiled)?);
         io += group_io_bytes(family, format, geometry, extent.capacity);
     }
-    Ok(cuteafd_core::OwnerBytes { scratch, io, pinned_staging: 0 })
+    Ok(cuteafd_core::OwnerBytes { scratch, io,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 * formats.len() as u64 })
 }
 
 /// EXL3 owner bytes. Prefill-scale exports charge the calibrated retained
@@ -101,7 +102,7 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
 /// 4096 rows of K32 wire/routes; those rows are re-charged as the owner's I/O
 /// at its own capacity). Decode exports (m80 and below) charge the m1/m16/m80
 /// retained set (installed SM121 exports, 2026-10-24: largest GLM tp1
-/// 50,445,548 B). Ownership-tagged routes stage per queued unit.
+/// 50,445,548 B). Packed routes stage per queued unit.
 pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent)
     -> anyhow::Result<cuteafd_core::OwnerBytes> {
     const DECODE_SET: u64 = 51 * (1 << 20);
@@ -124,11 +125,11 @@ pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeome
 
 /// Legacy calibrated slot bound (stream, scratch, inputs and staging at
 /// the compiled 4096-row export) for backends without a census.
-fn legacy_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent,
-    staged: bool) -> cuteafd_core::OwnerBytes {
+fn legacy_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry,
+    extent: cuteafd_core::OwnerExtent) -> cuteafd_core::OwnerBytes {
     let at_4096 = spark_slot_bytes(family, 4096);
     cuteafd_core::OwnerBytes { scratch: at_4096 * u64::from(extent.compiled.max(80)) / 4096, io: 0,
-        pinned_staging: if staged { u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 } else { 0 } }
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 }
 }
 
 /// One owner's bytes on this rank's installed backend.
@@ -143,8 +144,8 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
     Ok(move |extent| match (&groups, backend) {
         (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
         (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
-        (_, SparkBackend::Native) => Ok(legacy_owner_bytes(&family, geometry, extent, true)),
-        (_, SparkBackend::Exlr8 | SparkBackend::Fp8) => Ok(legacy_owner_bytes(&family, geometry, extent, false)),
+        (_, SparkBackend::Native | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
+            Ok(legacy_owner_bytes(&family, geometry, extent)),
     })
 }
 
@@ -210,7 +211,7 @@ mod tests {
                 let exact = row["scratch"][index].as_u64().unwrap() + rows * (input + 8 * topk + 2 * hidden);
                 let owner = fp8_owner_bytes(family, geometry, &[format], extent(compiled, compiled)).unwrap();
                 assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
-                assert_eq!(owner.pinned_staging, 0, "FP8 reads retained ring frames");
+                assert_eq!(owner.pinned_staging, rows * topk * 8, "each unit retains packed route planes");
             }
         }
     }

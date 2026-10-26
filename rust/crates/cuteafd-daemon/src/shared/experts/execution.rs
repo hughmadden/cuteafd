@@ -678,7 +678,7 @@ impl ExpertExecution<'_, '_> {
         };
         // Validate the destination descriptor before launching any GPU work.
         let response = request.response_device(executor_id, output)?;
-        self.execute_request_output(request, executor_id, exchange, Some(output), hidden, None)?;
+        self.execute_request_output(request, executor_id, exchange, Some(output), hidden)?;
         Ok(Some(response))
     }
 
@@ -695,7 +695,7 @@ impl ExpertExecution<'_, '_> {
         // SAFETY: validated output range is inside the exclusively retained frame.
         let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
         let response = request.response_device(executor_id, output)?;
-        self.execute_request_output(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload), Some(mapped.routes))?;
+        self.execute_request_output(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload))?;
         Ok(Some(response))
     }
 
@@ -707,14 +707,14 @@ impl ExpertExecution<'_, '_> {
         executor_id: u64,
         exchange: &'a mut HostExpertExchange,
     ) -> Result<cuteafd_transport::ExpertProtocolV2ResponseRef<'a>> {
-        self.execute_request_output(request, executor_id, exchange, None, None, None)?;
+        self.execute_request_output(request, executor_id, exchange, None, None)?;
         request.response(executor_id, &exchange.partials[..request.plane_bytes()?])
     }
 
     fn execute_request_output(&mut self,
         request: &cuteafd_transport::expert::BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, destination: Option<CuteafdDeviceBuffer>,
-        hidden_view: Option<CuteafdDeviceBuffer>, routes_view: Option<CuteafdDeviceBuffer>,
+        hidden_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
         let layer = match self._weights.layer {
             ExpertLayer::Backbone { layer, .. }
@@ -779,17 +779,12 @@ impl ExpertExecution<'_, '_> {
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
                 None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
             }
-            if let Some(source) = routes_view.filter(|_| !request.is_native_group()) {
-                // SAFETY: transport retains this unit's mapped canonical route records.
-                super::service::routes::copy_mapped_routes(self.library, request, source,
-                    self.ids.buffer, self.routing.buffer, self.stream.raw)?;
-            } else {
-                let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
-                self.library.copy_host_buffer_h2d_async(self.ids.buffer, ids, routes * 4, self.stream.raw)?;
-                let mut weights = self.route_staging[stage].buffer;
-                weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
-                self.library.copy_host_buffer_h2d_async(self.routing.buffer, weights, routes * 4, self.stream.raw)?;
-            }
+            let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
+            let mut weights = self.route_staging[stage].buffer;
+            weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
+            self.library.copy_host_buffers_h2d_batch_async(
+                &[self.ids.buffer, self.routing.buffer], &[ids, weights],
+                &[routes * 4, routes * 4], self.stream.raw)?;
             Ok(())
         } })();
         if let Err(error) = uploaded { self.synchronize()?; return Err(error); }
