@@ -1006,8 +1006,11 @@ gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3"}
 glm = family == "glm5"
-unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
-waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
+minimax = family == "minimax_m3"
+# MiniMax plans #762's shape: 2 x 4096 below six Sparks, 3 x 2752 at six; pinned waves set the unit.
+waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or ((3 if ranks >= 6 else 2) if minimax
+    else 2 if shared or glm or family == "deepseek_v4" else 1)
+unit = int(value("--prefill-rows", "0")) or (2048 if shared else {3: 2752, 4: 2048}.get(waves, 4096) if minimax else 4096)
 span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
 decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
 if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41" and decode_lanes != 1):
@@ -1081,6 +1084,8 @@ print(json.dumps(deployment))
       "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
      "test/Qwen4", "PREFILL_ROWS", 1, 4),
     ({"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/V4", "PREFILL_ROWS", 1, 4),
+    ({"model_type": "minimax_m3_vl", "text_config": {"model_type": "minimax_m3", "num_hidden_layers": 60,
+      "moe_layer_freq": [0] * 3 + [1] * 57}}, "test/MiniMax-M3.1-Flash", "PREFILL_ROWS", 1, 4),
 ])
 @pytest.mark.parametrize("explicit", [False, True])
 def test_shared_prefill_launcher_forwards_resolved_units_without_span(
@@ -1092,7 +1097,7 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
                     for rank in range(1, ranks))
     if explicit:
         keys += f"{row_key}=1024\nPREFILL_WAVES=2\n"
-    unit, waves = (1024, 2) if explicit else (4096 if family_config["model_type"] == "deepseek_v4" else 2048, 2)
+    unit, waves = (1024, 2) if explicit else (4096 if family_config["model_type"] in ("deepseek_v4", "minimax_m3_vl") else 2048, 2)
     result = _family_launch_result(tmp_path, family_config, model, keys,
         extra_args=("--wip", "prefill-shape"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30},
@@ -1105,8 +1110,8 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
         assert plan[plan.index("--prefill-rows") + 1] == str(unit)
         assert plan[plan.index("--prefill-waves") + 1] == str(waves)
     assert "--prefill-lanes" not in plan
-    command_name = {"kimi_k3": "serve-kimi", "qwen4_exp": "serve-qwen4", "deepseek_v4": "serve-dsv4"}.get(
-        family_config["model_type"], "serve-step5")
+    command_name = {"kimi_k3": "serve-kimi", "qwen4_exp": "serve-qwen4", "deepseek_v4": "serve-dsv4",
+                    "minimax_m3_vl": "serve-minimax"}.get(family_config["model_type"], "serve-step5")
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and command_name in line)
     assert serve.count("--prefill-rows") == serve.count("--prefill-waves") == 1

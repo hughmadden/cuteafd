@@ -71,25 +71,23 @@ attention placement.
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
 
-MiniMax-M3.1-Flash uses one coordinator with native NVFP4 W4A4 experts and
-MXFP8 linears. It is under qualification too: serve it from a `./wip.sh` slot
+MiniMax-M3.1-Flash uses one RTX PRO 6000 coordinator with native NVFP4 W4A4 experts
+and MXFP8 linears. It is under qualification too: serve it from a `./wip.sh` slot
 whose binary has `serve-minimax` (`--wip SLOT`; `--dry-run` plans the launch
 without starting it). Each file states only what differs from the launcher's
-defaults: the Spark world, on the 5090 its GPU budget and `VISION=off`, and at
-TP3, TP4 and TP6 no routed layers on the RTX. The TP6 example is planned
-offline and has not run on hardware yet.
+defaults: the Spark world, and at TP3, TP4 and TP6 no routed layers on the RTX.
+The TP6 example is planned offline and has not run on hardware yet. MiniMax on an
+RTX 5090 is not supported on this engine yet: `cuteafd plan` refuses an RTX
+5090-class coordinator budget by name.
 
 | Coordinator | Spark TP2 | Spark TP3 | Spark TP4 | Spark TP6 |
 | --- | --- | --- | --- | --- |
-| RTX 5090 | [TP2](minimax-m31-flash-nvfp4-5090-tp2.config) | [TP3](minimax-m31-flash-nvfp4-5090-tp3.config) | [TP4](minimax-m31-flash-nvfp4-5090-tp4.config) | |
 | RTX PRO 6000 | [TP2](minimax-m31-flash-nvfp4-pro6000-tp2.config) | [TP3](minimax-m31-flash-nvfp4-pro6000-tp3.config) | [TP4](minimax-m31-flash-nvfp4-pro6000-tp4.config) | [TP6](minimax-m31-flash-nvfp4-pro6000-tp6.config) |
 
-The 5090 examples turn vision off, which frees the coordinator for KV: the
-bundled tower costs about 37,000 pool tokens there (with DFlash2 the served pool
-was 78,784 tokens with the tower and 115,840 without, at a 31 GiB budget). The
-RTX PRO 6000 examples keep the launcher's `VISION=auto` and serve the tower, on
-the GPU at TP2 and on a Spark rank at TP3, TP4 and TP6. Every example prefills in two
-4096-row lanes. Speculation is DFlash2 by default, with the
+The examples keep the launcher's `VISION=auto` and serve the tower, on the GPU at
+TP2 and on a Spark rank at TP3, TP4 and TP6. Prefill runs in the plan's units on
+one Spark link: two waves of 4096 rows, three of 2752 at TP6 (`PREFILL_ROWS` and
+`PREFILL_WAVES` pin them). Speculation is DFlash2 by default, with the
 RadixArk/Minimax-M3.1-Flash-Dflash2 draft on the shared drafter, which cuteafd does
 not distribute: download it beside the release. `SPECULATOR=dspark` runs the
 release's bundled drafter and `SPECULATOR=off` none. Expert loading uses mounted

@@ -43,8 +43,12 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--spark-budget-bytes") == str(108 << 30)
     assert _flag(serve, "--max-sequences") == _flag(plan, "--concurrency") == "64"
-    assert _flag(serve, "--prefill-batch-tokens") == _flag(plan, "--prefill-rows") == "4096"
-    assert _flag(serve, "--prefill-lanes") == _flag(plan, "--prefill-waves") == "2"
+    # Prefill units: the plan resolves #762's shape (no key pins it) and serve runs what it resolved.
+    unit, waves = ("2752", "3") if ranks == 6 else ("4096", "2")
+    assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == (unit, waves)
+    assert _flag(plan, "--prefill-rows") is None and _flag(plan, "--prefill-waves") is None
+    assert not any(flag in serve + plan for flag in ("--prefill-lanes", "--prefill-batch-tokens", "--prefill-span-rows"))
+    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves}" in result.stdout
     assert _flag(plan, "--spark-ranks") == str(ranks)
     assert "--mtp" not in serve and "--split-device" not in serve
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -86,9 +90,9 @@ def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, k
     ("HOST_CACHE_STORE=always\n", "HOST_CACHE_STORE must be on-evict or on-retain"),
     ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "MiniMax requires Spark experts"),
     ("CONCURRENCY=65\n", "CONCURRENCY must be 1..64"),
-    ("PREFILL_BATCH_TOKENS=4097\n", "PREFILL_BATCH_TOKENS must be 1..4096"),
-    ("CONCURRENCY=16\nPREFILL_BATCH_TOKENS=8\n", "CONCURRENCY must not exceed PREFILL_BATCH_TOKENS"),
-    ("PREFILL_LANES=5\n", "PREFILL_LANES must be 1 to 4"),
+    # The lane grammar is gone: prefill units are PREFILL_ROWS and PREFILL_WAVES.
+    ("PREFILL_LANES=2\n", "unknown configuration key: PREFILL_LANES"),
+    ("PREFILL_BATCH_TOKENS=4096\n", "unused configuration key: PREFILL_BATCH_TOKENS"),
     ("MAX_CONTEXT_TOKENS=1048577\n", "MAX_CONTEXT_TOKENS must be 0 (automatic) or 1..1048576"),
     ("ATTENTION_PLACEMENT=heads\n", "supports only ATTENTION_PLACEMENT=auto"),
     ("EMBEDDING=host\n", "requires EMBEDDING=gpu"),
@@ -99,6 +103,20 @@ def test_minimax_refuses_unsupported_launch(tmp_path, keys, diagnostic):
     assert result.returncode != 0
     assert diagnostic in result.stderr
     assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("keys,pinned,resolved", [
+    ("PREFILL_ROWS=2048\nPREFILL_WAVES=4\n", ("2048", "4"), (2048, 4)),
+    ("PREFILL_WAVES=3\n", (None, "3"), (2752, 3)),
+    ("PREFILL_ROWS=1024\n", ("1024", None), (1024, 2)),
+])
+def test_minimax_pins_prefill_units_through_the_plan(tmp_path, keys, pinned, resolved):
+    # Set keys reach the plan, as for Kimi K3; serve takes the shape the plan resolved.
+    result = _launch(tmp_path, keys, deployment_overrides={"prefill_unit_rows": resolved[0], "prefill_waves": resolved[1]})
+    serve, plan = _line(result, "serve-minimax --snapshot"), _line(result, "cuteafd plan")
+    assert (_flag(plan, "--prefill-rows"), _flag(plan, "--prefill-waves")) == pinned
+    assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == tuple(map(str, resolved))
+    assert "--prefill-lanes" not in plan + serve
 
 
 def test_minimax_spark_counts_come_from_the_plan(tmp_path):
@@ -112,59 +130,16 @@ def test_minimax_spark_counts_come_from_the_plan(tmp_path):
     assert "docker run -d" not in result.stderr
 
 
-def test_minimax_polls_a_lan_bound_api_where_it_listens(tmp_path):
-    # A server bound to one LAN address never answers on loopback: readiness polls that address.
-    result = _launch(tmp_path, "ADDR=10.0.0.9:8123\n")
-    assert result.returncode == 0, result.stderr
-    assert _flag(_line(result, "serve-minimax --snapshot"), "--listen") == "10.0.0.9:8123"
-    assert "API ready at http://10.0.0.9:8123/v1/" in result.stdout
-
-
-def _after(result, needle):
-    """Stderr from the first line containing NEEDLE on."""
-    lines = result.stderr.splitlines()
-    return "\n".join(lines[next(index for index, line in enumerate(lines) if needle in line):])
-
-
-def test_minimax_failed_launch_removes_what_it_started(tmp_path):
-    # The coordinator never answers: the launch removes it and every worker it started.
-    result = _launch(tmp_path, extra_env={"STUB_CURL_FAIL": "1"})
-    assert result.returncode == 1 and "coordinator exited" in result.stderr
-    cleanup = _after(result, "serve-minimax --snapshot")
-    assert "docker rm -f cuteafd-coordinator " in cleanup
-    for rank in range(4):
-        assert f"docker rm -f cuteafd-spark-expert-h{rank}-19441 " in cleanup
-    assert "API ready" not in result.stdout
-
-
-def test_minimax_worker_start_failure_stops_the_launch_and_its_started_workers(tmp_path):
-    # One worker's `docker run` fails (its name is taken): the launch stops before the
-    # coordinator, removes the workers it did start and leaves the failed host's container alone.
-    result = _launch(tmp_path, extra_env={"STUB_SSH_FAIL": "docker run -d --name cuteafd-spark-expert-h2-"})
-    assert result.returncode == 1 and "h2: the expert worker did not start" in result.stderr
-    assert "serve-minimax --snapshot" not in result.stderr
-    cleanup = _after(result, "the expert worker did not start")
-    assert [rank for rank in range(4) if f"docker rm -f cuteafd-spark-expert-h{rank}-19441 " in cleanup] == [0, 1, 3]
-    assert "docker rm -f cuteafd-coordinator" not in cleanup
-
-
-@pytest.mark.parametrize("env,diagnostic", [
-    ({"STUB_SSH_FAIL": "release_wip_spark_slot_revision"}, "h0: WIP slot slot1 or the image cuteafd-spark-expert-dev"),
-    ({"STUB_SLOT_SPARKINFER_h3": "f" * 40}, f"carries SparkInfer test-pin on h2 but {'f' * 40} on h3"),
-])
-def test_minimax_wip_slot_is_checked_on_every_spark_before_restart_stops_anything(tmp_path, env, diagnostic):
-    result = _launch(tmp_path, restart=True, extra_args=("--wip", "slot1"), extra_env=env)
-    assert result.returncode == 2 and diagnostic in result.stderr, result.stderr
-    # Nothing was torn down, staged or started.
-    assert "docker rm -f" not in result.stderr and "docker run -d" not in result.stderr
-    assert "ssh h0 bash -s -- slot1" not in result.stderr
-
-
-def test_minimax_wip_slot_from_another_pin_is_a_warning(tmp_path):
-    result = _launch(tmp_path, extra_args=("--wip", "slot1"), extra_env={"STUB_SLOT_SPARKINFER": "e" * 40})
-    assert result.returncode == 0, result.stderr
-    assert f"warning: WIP slot slot1 carries SparkInfer {'e' * 40}; this checkout pins test-pin" in result.stderr
-    assert sum(f"docker run -d --name cuteafd-spark-expert-h{rank}-19441" in result.stderr for rank in range(4)) == 4
+def test_minimax_on_an_rtx_5090_stops_on_the_plans_refusal(tmp_path):
+    # The plan refuses an RTX 5090-class coordinator budget by name; the launch passes the
+    # budget through and stops on the deployment guard.
+    refusal = "native placement refused: MiniMax on an RTX 5090 is not supported on this engine yet"
+    result = _launch(tmp_path, "COORDINATOR_GPU_BUDGET_GIB=31.8\n", gpu_total_mib=32607, gpu_free_mib=32107,
+                     encoder_plan={**PLANNED, "placement_supported": False, "hints": [{"what": refusal, "how": ""}]})
+    assert result.returncode != 0 and refusal in result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert _flag(plan, "--coordinator-gpu-budget-gib") == "31.8"
+    assert "docker run -d" not in result.stderr
 
 
 def test_minimax_refuses_push_loading(tmp_path):
@@ -175,26 +150,20 @@ def test_minimax_refuses_push_loading(tmp_path):
 
 
 def test_minimax_dry_run_takes_the_shared_deployment_plan(tmp_path):
-    # A live server of the same slot and instance mounts this staged layout.
-    live = tmp_path / "home/.cache/cuteafd/wip-run/qualification/serve-default"
-    (live / "bin").mkdir(parents=True)
-    (live / "bin" / "cuteafd").write_text("live")
     result = _launch(tmp_path, extra_args=("--wip", "qualification", "--dry-run"))
     assert result.returncode == 0, result.stderr
-    # Stdout is the deployment the launch would take and nothing else (notes go to stderr).
-    deployment = json.loads(result.stdout)
+    # The deployment the launch would take is stdout's last line, after the resolved prefill units.
+    deployment = json.loads(result.stdout.splitlines()[-1])
     assert deployment["family"] == "minimax_m3" and deployment["wip_launchable"]
+    assert (deployment["prefill_unit_rows"], deployment["prefill_waves"]) == (4096, 2)
+    assert "Resolved prefill: PREFILL_ROWS=4096 PREFILL_WAVES=2" in result.stdout
     plan = _line(result, "cuteafd plan")
     assert _flag(plan, "--spark-ranks") == "4" and "--deployment" in plan
     assert "docker run -d" not in result.stderr and "serve-minimax --snapshot" not in result.stderr
-    # It planned from a private copy of the slot, which it removed; the live layout is untouched.
-    assert "/wip-run/.dry-run." in plan
-    assert (live / "bin" / "cuteafd").read_text() == "live"
-    assert [path.name for path in live.parents[1].iterdir()] == ["qualification"]
 
 
-# The examples' cards, as CUDA reports them: an RTX 5090 and a PRO 6000 (PRO_TOTAL_BYTES).
-CARD_MIB = {"5090": 32607, "pro6000": 101_973_491_712 >> 20}
+# The examples' card, as CUDA reports it: an RTX PRO 6000 (PRO_TOTAL_BYTES).
+CARD_MIB = {"pro6000": 101_973_491_712 >> 20}
 
 
 def _example_launch(tmp_path, pairs, card, tp):
@@ -207,7 +176,7 @@ def _example_launch(tmp_path, pairs, card, tp):
     return result.returncode, sorted(commands)
 
 
-@pytest.mark.parametrize("card,tp", [(card, tp) for card in ("5090", "pro6000") for tp in (2, 3, 4)] + [("pro6000", 6)])
+@pytest.mark.parametrize("card,tp", [("pro6000", tp) for tp in (2, 3, 4, 6)])
 def test_minimax_examples_state_only_what_differs_from_the_launcher(tmp_path, card, tp):
     example = ROOT / "examples/configs" / f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config"
     text = example.read_text()
@@ -328,3 +297,75 @@ def test_minimax_dflash2_serves_and_plans_the_radixark_drafter_on_the_shared_dra
     assert ("--minimax-draft-bf16" in plan) == (fp8 == "false")
     assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == kv
     assert _flag(serve, "--draft-fixed") == "5"
+
+
+# The tests below pin the fork's shared launcher fixes on a MiniMax launch (failed-launch cleanup
+# and the WIP slot check before --restart, 6f62023ce; the bound-address readiness poll, 846d0462a;
+# the private dry-run layout, 77869c571), not the MiniMax arm: they leave with those fixes.
+
+def test_minimax_dry_run_stages_a_private_layout(tmp_path):
+    # A live server of the same slot and instance mounts this staged layout.
+    live = tmp_path / "home/.cache/cuteafd/wip-run/qualification/serve-default"
+    (live / "bin").mkdir(parents=True)
+    (live / "bin" / "cuteafd").write_text("live")
+    result = _launch(tmp_path, extra_args=("--wip", "qualification", "--dry-run"))
+    assert result.returncode == 0, result.stderr
+    # It planned from a private copy of the slot, which it removed; the live layout is untouched.
+    assert "/wip-run/.dry-run." in _line(result, "cuteafd plan")
+    assert (live / "bin" / "cuteafd").read_text() == "live"
+    assert [path.name for path in live.parents[1].iterdir()] == ["qualification"]
+
+
+def test_minimax_polls_a_lan_bound_api_where_it_listens(tmp_path):
+    # A server bound to one LAN address never answers on loopback: readiness polls that address.
+    result = _launch(tmp_path, "ADDR=10.0.0.9:8123\n")
+    assert result.returncode == 0, result.stderr
+    assert _flag(_line(result, "serve-minimax --snapshot"), "--listen") == "10.0.0.9:8123"
+    assert "API ready at http://10.0.0.9:8123/v1/" in result.stdout
+
+
+def _after(result, needle):
+    """Stderr from the first line containing NEEDLE on."""
+    lines = result.stderr.splitlines()
+    return "\n".join(lines[next(index for index, line in enumerate(lines) if needle in line):])
+
+
+def test_minimax_failed_launch_removes_what_it_started(tmp_path):
+    # The coordinator never answers: the launch removes it and every worker it started.
+    result = _launch(tmp_path, extra_env={"STUB_CURL_FAIL": "1"})
+    assert result.returncode == 1 and "coordinator exited" in result.stderr
+    cleanup = _after(result, "serve-minimax --snapshot")
+    assert "docker rm -f cuteafd-coordinator " in cleanup
+    for rank in range(4):
+        assert f"docker rm -f cuteafd-spark-expert-h{rank}-19441 " in cleanup
+    assert "API ready" not in result.stdout
+
+
+def test_minimax_worker_start_failure_stops_the_launch_and_its_started_workers(tmp_path):
+    # One worker's `docker run` fails (its name is taken): the launch stops before the
+    # coordinator, removes the workers it did start and leaves the failed host's container alone.
+    result = _launch(tmp_path, extra_env={"STUB_SSH_FAIL": "docker run -d --name cuteafd-spark-expert-h2-"})
+    assert result.returncode == 1 and "h2: the expert worker did not start" in result.stderr
+    assert "serve-minimax --snapshot" not in result.stderr
+    cleanup = _after(result, "the expert worker did not start")
+    assert [rank for rank in range(4) if f"docker rm -f cuteafd-spark-expert-h{rank}-19441 " in cleanup] == [0, 1, 3]
+    assert "docker rm -f cuteafd-coordinator" not in cleanup
+
+
+@pytest.mark.parametrize("env,diagnostic", [
+    ({"STUB_SSH_FAIL": "release_wip_spark_slot_revision"}, "h0: WIP slot slot1 or the image cuteafd-spark-expert-dev"),
+    ({"STUB_SLOT_SPARKINFER_h3": "f" * 40}, f"carries SparkInfer test-pin on h2 but {'f' * 40} on h3"),
+])
+def test_minimax_wip_slot_is_checked_on_every_spark_before_restart_stops_anything(tmp_path, env, diagnostic):
+    result = _launch(tmp_path, restart=True, extra_args=("--wip", "slot1"), extra_env=env)
+    assert result.returncode == 2 and diagnostic in result.stderr, result.stderr
+    # Nothing was torn down, staged or started.
+    assert "docker rm -f" not in result.stderr and "docker run -d" not in result.stderr
+    assert "ssh h0 bash -s -- slot1" not in result.stderr
+
+
+def test_minimax_wip_slot_from_another_pin_is_a_warning(tmp_path):
+    result = _launch(tmp_path, extra_args=("--wip", "slot1"), extra_env={"STUB_SLOT_SPARKINFER": "e" * 40})
+    assert result.returncode == 0, result.stderr
+    assert f"warning: WIP slot slot1 carries SparkInfer {'e' * 40}; this checkout pins test-pin" in result.stderr
+    assert sum(f"docker run -d --name cuteafd-spark-expert-h{rank}-19441" in result.stderr for rank in range(4)) == 4
