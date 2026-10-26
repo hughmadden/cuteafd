@@ -142,7 +142,7 @@ mod tests {
         if grouped { pointers.extend(["unit_count", "unit_map"]); }
         let mut value = json!({"name":variant.program(activations), "capacity_rows":rows,
             "pointers":pointers.iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
-            "scalars":(0..if grouped {3} else {2}).map(|_| json!({"type":"int32"})).collect::<Vec<_>>(),
+            "scalars":(0..if grouped {4} else {2}).map(|_| json!({"type":"int32"})).collect::<Vec<_>>(),
             "geometry":{"abi_version":3,"hidden":6144,"units":16,"top_k":8,
                 "max_groups":groups,"max_rows":rows,"group_rows":16,"split_k_blocks":8,
                 "fc1_splits":6,"ctas_per_sm":4},

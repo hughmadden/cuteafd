@@ -17,6 +17,7 @@ fn chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
 }
 
 fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize,
+    capability: (i32, i32),
     activations: crate::shared::experts::exlr8::Exlr8PrefillActivations) -> Result<usize> {
     ensure!((1..=PREFILL_ROWS).contains(&capacity), "EXLR8 capacity must be 1..4096");
     let decode_rows = capacity.min(K1_ROWS);
@@ -24,7 +25,7 @@ fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize,
     // threshold and the 64-row grouped instance above it.
     let mut decode =
         Exlr8Execution::decode_compact_workspace_bytes(programs, decode_rows, unit_limit)?;
-    if grouped_decode_from_row(unit_limit) <= decode_rows {
+    if grouped_decode_from_row(unit_limit, capability) <= decode_rows {
         decode = decode.checked_add(
             Exlr8Execution::decode_grouped_workspace_bytes(programs, decode_rows, unit_limit)?)
             .context("EXLR8 decode workspace overflow")?;
@@ -82,7 +83,9 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             config.rank, ExpertSet::Routed).map_err(anyhow::Error::from))
         .collect::<Result<Vec<_>>>()?;
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
-    let k1_workspace_bytes = execution_bytes(programs, rows, unit_limit, config.exlr8_prefill_activations)?;
+    let info = library.cuda_device_info(library.cuda_get_device()?)?;
+    let capability = (info.compute_capability_major, info.compute_capability_minor);
+    let k1_workspace_bytes = execution_bytes(programs, rows, unit_limit, capability, config.exlr8_prefill_activations)?;
     let workspace = k1_workspace_bytes.checked_add(fallback_staging)
         .context("EXLR8 workspace admission overflow")?;
     let budgets = plans.iter().map(Exlr8Weights::plan).collect::<Result<Vec<_>>>()?;
@@ -128,10 +131,12 @@ impl<'w, 'a> Worker<'w, 'a> {
         let capacity = config.capacity as usize;
         let unit_limit = weights.iter().map(|weight| weight.layout.compact_unit_limit()).max()
             .context("EXLR8 has no resident layers")?;
-        let workspace = execution_bytes(programs, capacity, unit_limit, config.exlr8_prefill_activations)?;
+        let info = library.cuda_device_info(library.cuda_get_device()?)?;
+        let capability = (info.compute_capability_major, info.compute_capability_minor);
+        let workspace = execution_bytes(programs, capacity, unit_limit, capability, config.exlr8_prefill_activations)?;
         ensure!(workspace <= remaining, "EXLR8 retained arenas exceed admitted bytes");
         let decode_rows = capacity.min(K1_ROWS);
-        let grouped_from_row = grouped_decode_from_row(unit_limit);
+        let grouped_from_row = grouped_decode_from_row(unit_limit, capability);
         let grouped_decode = grouped_from_row <= decode_rows;
         // Admission above charged exactly the instances built here, before any
         // device storage is allocated.

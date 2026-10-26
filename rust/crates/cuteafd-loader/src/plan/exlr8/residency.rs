@@ -524,6 +524,18 @@ impl Residency {
         self.units.div_ceil(self.world).max(1)
     }
 
+    /// Peak temporary host images while relocating ordinary and compact descriptors.
+    pub fn descriptor_host_bytes(&self) -> anyhow::Result<usize> {
+        let descriptors = self.experts.checked_mul(self.units)
+            .and_then(|n| n.checked_mul(3 * (3 * 8 + 4) * 2))
+            .context("EXLR8 descriptor staging overflow")?;
+        let compact = if self.set == ExpertSet::Routed {
+            self.experts.checked_mul(self.units.checked_add(1).context("compact unit overflow")?)
+                .and_then(|n| n.checked_mul(8)).context("compact descriptor overflow")?
+        } else { 0 };
+        descriptors.checked_add(compact).context("EXLR8 descriptor host overflow")
+    }
+
     /// Host payload retained by this plan, excluding allocator bookkeeping.
     pub fn host_bytes(&self) -> usize {
         let sources = self.loads.iter().flat_map(|unit| &unit.source);

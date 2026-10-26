@@ -7,6 +7,18 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
     push_load::{proto::{Event, Request}, slot, Listener, PushClient}};
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
+#[test]
+fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
+    for gpus in [1, 2] {
+        let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();
+        let peak = gpus * 128 * (1 << 20);
+        assert_eq!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64 - 1).is_err());
+        assert!(CoordinatorExpertPlan::admit_host(&plans, usize::MAX, 2, u64::MAX).is_err());
+    }
+    Ok(())
+}
+
 fn control_pair() -> Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let client = TcpStream::connect(listener.local_addr()?)?;
@@ -1062,6 +1074,109 @@ fn coordinator_exl3_layers_push_byte_exact_at_world_one_and_two() -> Result<()> 
                     Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h(&mut actual, view))?;
                     assert_eq!(actual, expected, "world {world} {}", load.tensor);
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()> {
+    use crate::shared::{experts::exlr8::{Exlr8Weights, view}, memory::push_exlr8::tests::fixture_catalog};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 64 << 30)?; }
+    std::fs::write(fixture.directory().join("events"), b"")?;
+    for padded in [false, true] {
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        cuteafd_loader::plan::testing::exlr8::fixture(root.path(), padded);
+        let catalog = fixture_catalog(root.path())?;
+        for gpu in 0..2 {
+            for fail in [false, true] {
+                let device = Device { library: &library, id: gpu as i32 };
+                let (rank, world, base) = (6 + gpu, 8, 256u64);
+                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[3], gpu, usize::MAX)?;
+                let checked_tp2 = plan.checked(&catalog, root.path(), world, rank)?;
+                let mut arenas = vec![0; world];
+                arenas[rank] = base + plan.logical_bytes();
+                let mut builder = Builder::new(root.path(), arenas);
+                let dense_source = root.path().join("dense/exlr8-dense-000.safetensors");
+                let dense_bytes = std::fs::read(&dense_source)?[..32].to_vec();
+                builder.contiguous(&cuteafd_loader::push_load::builder::Source {
+                    path: dense_source, offset: 0, bytes: dense_bytes.len() as u64 }, 0, dense_bytes.len() as u64,
+                    cuteafd_loader::push_load::builder::Destination { rank: rank as u32, offset: 0,
+                        bytes: dense_bytes.len() as u64 })?;
+                plan.append_at(&mut builder, &catalog, rank as u32, base)?;
+                let combined = builder.finish()?;
+                let packed = pack(&combined, root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
+                let socket = root.path().join("c.sock").to_string_lossy().into_owned();
+                let listener = Listener::bind(&socket)?;
+                let (mut coordinator, mut worker) = control_pair()?;
+                let events_path = fixture.directory().join("events");
+                let before = fixture.events()?.len();
+                let server_socket = socket.clone();
+                let server = std::thread::spawn(move || -> Result<()> {
+                    let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket,
+                        Duration::from_secs(120))?;
+                    conn.set_timeout(Some(Duration::from_secs(10)))?;
+                    let (request, fd) = conn.next_request()?.context("EXLR8 rank did not join")?;
+                    assert!(matches!(request, Request::Join { rank: r, .. } if r == rank as u32));
+                    let file = File::from(fd.context("EXLR8 ring fd absent")?);
+                    conn.send_event(&Event::Joined)?;
+                    assert_eq!(read_control(&coordinator)?["message"], "joined");
+                    for (index, bytes) in packed.into_iter().enumerate() {
+                        let slot = index % 8;
+                        file.write_all_at(&bytes, slot as u64 * DEFAULT_SLOT_BYTES as u64)?;
+                        conn.send_event(&Event::Filled { slot: slot as u32, len: bytes.len() as u32 })?;
+                        assert!(matches!(conn.next_request()?.context("missing release")?.0,
+                            Request::Release { slot: s } if s == slot as u32));
+                    }
+                    conn.send_event(&Event::Done)?;
+                    assert_eq!(read_control(&coordinator)?["success"], true);
+                    write_control(&mut coordinator, &serde_json::json!({"message":"commit", "success":!fail}))?;
+                    if fail {
+                        assert_eq!(read_control(&coordinator)?["message"], "drained");
+                        assert_eq!(std::fs::read_to_string(events_path)?[before..].matches('d').count(), 1,
+                            "EXLR8 arena retained at drained barrier");
+                        write_control(&mut coordinator, &serde_json::json!({"message":"mount"}))?;
+                    }
+                    Ok(())
+                });
+                let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let dense = HostDense { image: vec![0; 32], planned: vec![(0, 32)], delivered: delivered.clone(),
+                    device: gpu as i32 };
+                let client = PushClient::at(socket, Duration::from_secs(10))?;
+                let weights = receive_rank(device, Some((&catalog, plan, &checked_tp2)),
+                    Some(DenseRank { destination: dense, base }), rank, &client, &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES)?;
+                server.join().map_err(|_| anyhow::anyhow!("EXLR8 fake source panicked"))??;
+                if fail { assert!(weights.is_none()); continue; }
+                assert_eq!(*delivered.lock().unwrap(), dense_bytes);
+                let weights = weights.context("EXLR8 push fell back")?.exlr8()?;
+                assert_eq!(weights.len(), 1);
+                device.run(|| {
+                    let pushed = &weights[0];
+                    let mount = Exlr8Weights::load(&library, pushed.layout.clone(), usize::MAX)?;
+                    let mut actual = vec![0; pushed.image().bytes];
+                    let mut expected = vec![0; mount.image().bytes];
+                    library.copy_d2h(&mut actual, pushed.image())?;
+                    library.copy_d2h(&mut expected, mount.image())?;
+                    // Only absolute descriptor addresses relocate with the arena.
+                    let (pointers, _) = pushed.layout.descriptors(pushed.image().ptr as u64)?;
+                    let pointer_image = pointers.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+                    let at = pushed.layout.pointers_offset;
+                    expected[at..at + pointer_image.len()].copy_from_slice(&pointer_image);
+                    // All bytes, including signs, compact maps and padding, must agree.
+                    assert_eq!(actual, expected);
+                    for (offset, bytes) in [(pushed.layout.bits_offset, pushed.bits()?.bytes),
+                        (pushed.layout.signs_offsets[0], pushed.layout.hidden)] {
+                        let mut image = vec![0; bytes];
+                        library.copy_d2h(&mut image, view(pushed.image(), offset, bytes)?)?;
+                        assert_eq!(image, expected[offset..offset + bytes]);
+                    }
+                    Ok(())
+                })?;
+                device.run(|| { drop(weights); Ok(()) })?;
             }
         }
     }

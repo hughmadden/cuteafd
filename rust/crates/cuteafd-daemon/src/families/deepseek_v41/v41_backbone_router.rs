@@ -99,6 +99,7 @@ impl<'a> BackboneRouterWeights<'a> {
             full_request: true,
             ready: None,
             origin: None,
+            wait: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(self.library)),
         })
     }
 }
@@ -362,6 +363,8 @@ pub(crate) struct BackboneRouterWave<'w, 'a> {
     full_request: bool,
     ready: Option<u32>,
     origin: Option<QueryBinding>,
+    /// The per-layer host wait (`--host-wait`: block spins briefly, then sleeps).
+    wait: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
 }
 impl<'w, 'a> BackboneRouterWave<'w, 'a> {
     pub fn rebind(&mut self, weights: &'w BackboneRouterWeights<'a>) -> Result<()> {
@@ -441,7 +444,8 @@ impl BackboneRouterWave<'_, '_> {
         [self.b(0), self.b(1)]
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        // SAFETY: the router's live stream, on the current device.
+        unsafe { self.wait.borrow_mut().wait(self.stream.raw) }
     }
     fn invalidate(&mut self) {
         self.ready = None;

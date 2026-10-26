@@ -7,9 +7,11 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 use std::ffi::c_void;
 
+const DECODE_CAPACITY: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
+
 /// Measured first decode row at which the 64-row grouped instance beats the
-/// compact-unit routed serving core, keyed on this rank's owned units per
-/// expert and never on the SM count.
+/// compact-unit routed serving core, keyed on runtime compute capability and
+/// this rank's owned units per expert, never on the SM count.
 ///
 /// Anchors on GB10, one interleaved session per width (rank 0, random and
 /// realistic routes, medians of three): TP6 (three owned units) keeps the
@@ -22,8 +24,12 @@ use std::ffi::c_void;
 /// units take the three-unit threshold and five or more take the four-unit
 /// threshold. A narrow rank wastes more of a fixed grid, which argues for a
 /// later switch below four units, so the nearest anchor stays conservative.
-pub(crate) fn grouped_decode_from_row(unit_limit: usize) -> usize {
-    if unit_limit <= 3 { 16 } else { 8 }
+/// SM120 TP2 (eight owned units): the routed core wins at every measured row
+/// from 8 through 64 (1.042-1.303x); all live rows 1..64 are bit-exact. Keep
+/// the grouped switch outside decode capacity. Other widths retain GB10 policy.
+pub(crate) fn grouped_decode_from_row(unit_limit: usize, capability: (i32, i32)) -> usize {
+    if capability == (12, 0) && unit_limit == 8 { DECODE_CAPACITY + 1 }
+    else if unit_limit <= 3 { 16 } else { 8 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +179,7 @@ pub(crate) struct Exlr8Execution<'a> {
     intermediate_bytes: usize,
     cta_limit: i32,
     group_cta_limit: i32,
+    l2_bytes: i32,
     set: ExpertSet,
 }
 impl<'a> Exlr8Execution<'a> {
@@ -326,6 +333,8 @@ impl<'a> Exlr8Execution<'a> {
         };
         let cta_limit = limit(k1.spec())?;
         let group_cta_limit = limit(group.spec())?;
+        let l2_bytes = i32::try_from(library.l2_cache_bytes()?).context("EXLR8 runtime L2 exceeds int32")?;
+        ensure!(l2_bytes > 0, "EXLR8 runtime L2 must be positive");
         let arena = DeviceAllocation::named(library, layout.bytes, "experts/workspace/exlr8")?;
         Ok(Self {
             group,
@@ -336,6 +345,7 @@ impl<'a> Exlr8Execution<'a> {
             intermediate_bytes,
             cta_limit,
             group_cta_limit,
+            l2_bytes,
             set,
         })
     }
@@ -423,7 +433,7 @@ impl<'a> Exlr8Execution<'a> {
                 || weights.layout.compact_unit_limit() <= self.layout.unit_limit,
             "EXLR8 layer ownership exceeds compact arena stride");
         let scalars = [Scalar::I32(rows as i32), Scalar::I32(self.cta_limit),
-            Scalar::I32(self.layout.unit_limit as i32)];
+            Scalar::I32(self.layout.unit_limit as i32), Scalar::I32(self.l2_bytes)];
         let mut operands = [p(10), weights.pointers()?.ptr, weights.bits()?.ptr,
             p(4), p(5), p(6), p(2), p(8), intermediate.ptr, fc2.ptr,
             weights.signs(true)?.ptr, p(3), p(7), std::ptr::null_mut(), std::ptr::null_mut()];
@@ -439,7 +449,7 @@ impl<'a> Exlr8Execution<'a> {
                 stream,
             )?;
             self.k1.launch(&operands[..if self.layout.unit_tables { 15 } else { 13 }],
-                &scalars[..if self.layout.unit_tables { 3 } else { 2 }], stream)?;
+                &scalars[..if self.layout.unit_tables { 4 } else { 2 }], stream)?;
         }
         Ok(())
     }
@@ -496,7 +506,7 @@ mod tests {
             Exlr8PrefillActivations::A16).0.into();
         spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeGrouped)
             .into_iter().map(String::from).collect();
-        spec.scalar_kinds = b"iii".to_vec();
+        spec.scalar_kinds = b"iiii".to_vec();
         spec.geometry.as_object_mut().unwrap().remove("serving_variant");
         spec.geometry["group_rows"] = serde_json::json!(cuteafd_ffi::exlr8::COMPACT_GROUP_ROWS);
         spec.geometry["fc2_partials"] = serde_json::json!("f32");
@@ -506,14 +516,19 @@ mod tests {
 
     #[test]
     fn decode_dispatch_switches_to_grouped_on_the_measured_owned_unit_anchor() {
-        // Measured on GB10: TP6 (three owned units) keeps the routed core
-        // through 8 rows and switches at 16; TP4 (four owned units) switches
-        // at 8. Widths outside the anchors take the nearest one, so no SM
-        // count or card identity enters the decision.
-        assert_eq!(grouped_decode_from_row(1), 16);
-        assert_eq!(grouped_decode_from_row(3), 16);
-        assert_eq!(grouped_decode_from_row(4), 8);
-        assert_eq!(grouped_decode_from_row(8), 8);
+        for capability in [(12, 1), (11, 0), (13, 0)] {
+            assert_eq!(grouped_decode_from_row(1, capability), 16);
+            assert_eq!(grouped_decode_from_row(3, capability), 16);
+            assert_eq!(grouped_decode_from_row(4, capability), 8);
+            assert_eq!(grouped_decode_from_row(8, capability), 8);
+        }
+        for units in 1..=16 {
+            let expected = if units == 8 { DECODE_CAPACITY + 1 } else if units <= 3 { 16 } else { 8 };
+            assert_eq!(grouped_decode_from_row(units, (12, 0)), expected);
+        }
+        for rows in 1..=DECODE_CAPACITY {
+            assert!(rows < grouped_decode_from_row(8, (12, 0)));
+        }
         for variant in [Variant::DecodeCompact, Variant::DecodeGrouped] {
             assert_eq!(program_names(ExpertSet::Routed, variant,
                 Exlr8PrefillActivations::A16).1, "exlr8_group");
@@ -640,8 +655,11 @@ mod tests {
         // router saw a non-finite gate weight.
         let compact = compact_spec();
         let grouped = grouped64_spec();
-        for (world, unit_limit) in [(4usize, 4usize), (6, 3), (6, 2)] {
-            let switch = grouped_decode_from_row(unit_limit);
+        for (world, unit_limit, capability) in [
+            (4usize, 4usize, (12, 1)), (6, 3, (12, 1)), (6, 2, (12, 1)),
+            (2, 8, (12, 0)),
+        ] {
+            let switch = grouped_decode_from_row(unit_limit, capability);
             for rows in 1..=64usize {
                 let variant = if rows >= switch { Variant::DecodeGrouped } else { Variant::DecodeCompact };
                 let spec = if variant == Variant::DecodeGrouped { &grouped } else { &compact };
@@ -669,7 +687,7 @@ mod tests {
         grouped.capacity_rows = 4096;
         grouped.pointers = pointers(ExpertSet::Routed, Variant::Prefill)
             .into_iter().map(String::from).collect();
-        grouped.scalar_kinds = b"iii".to_vec();
+        grouped.scalar_kinds = b"iiii".to_vec();
         grouped.geometry["max_rows"] = serde_json::json!(4096);
         grouped.geometry["group_rows"] = serde_json::json!(64);
         grouped.geometry.as_object_mut().unwrap().remove("serving_variant");
