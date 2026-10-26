@@ -74,7 +74,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             self.response_capacity_wire_bytes.min(config.max_frame_bytes));
         let encode_ms = elapsed_ms_optional(total_started);
         if let Some(slice) = landing {
-            self.post_placed_receive(slice, expected_response)?;
+            self.post_placed_receive(slice, expected_response, request.header.row_count as usize)?;
         }
         // Source slot: the SEND that used it last has completed.
         while self.request_sends.in_flight() >= self.request_ring.depth {
@@ -123,17 +123,26 @@ impl VerbsHostProtocolV2PersistentClientSession {
     }
 }
 
+/// The most payload bytes a GPU-landed reply carries. A landed reply is one
+/// unindexed plane (`parse_landed_header` refuses row indices), so the ring's
+/// conservative bound minus its header and row-index prefix: rows x output
+/// row bytes.
+fn landed_payload_bound(expected_response: usize, rows: usize) -> Result<usize> {
+    let row_indices = rows.checked_mul(std::mem::size_of::<u32>()).context("reply row-index bytes overflow")?;
+    expected_response.checked_sub(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + row_indices)
+        .context("expected reply is shorter than its header")
+}
+
 impl VerbsHostProtocolV2PersistentClientSession {
     /// One receive for the next reply: its header into the next header slot
     /// of the response ring (replies complete in post order on this QP), its
     /// payload into `slice` of the registered landing range. At most a ring of
     /// replies may be outstanding, so header slots are never reused early.
-    fn post_placed_receive(&mut self, slice: LandingSlice, expected_response: usize) -> Result<()> {
+    fn post_placed_receive(&mut self, slice: LandingSlice, expected_response: usize, rows: usize) -> Result<()> {
         let outstanding = self.response_post_sequence.wrapping_sub(self.response_recv_sequence);
         anyhow::ensure!(outstanding < self.response_ring.depth,
             "placed GPU landing has {outstanding} replies outstanding, its header ring holds {}", self.response_ring.depth);
-        let payload = expected_response.checked_sub(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN)
-            .context("expected reply is shorter than its header")?;
+        let payload = landed_payload_bound(expected_response, rows)?;
         anyhow::ensure!(payload <= slice.bytes,
             "a reply of {payload} payload bytes exceeds its {}-byte landing slice", slice.bytes);
         let sequence = self.response_post_sequence;
@@ -155,6 +164,22 @@ impl VerbsHostProtocolV2PersistentClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full-capacity BF16 wave's landed payload is exactly its plane: the
+    /// ring bound's row-index prefix does not count against the slice (the
+    /// 2048-row loopback refused a 25,165,824-byte slice for 8 KiB of indices).
+    #[test]
+    fn landed_payload_bound_is_the_unindexed_plane() -> Result<()> {
+        let (rows, hidden) = (2048usize, 6144u32);
+        let request = ExpertProtocolV2Request::new_bytes(1, 1, 1, hidden, ExpertV2Dtype::Bf16,
+            (0..rows).map(|row| crate::ExpertProtocolV2RowDescriptor { row_id: row as u64,
+                source_kind: crate::ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row as u64,
+                route_offset: 0, route_count: 0 }).collect(), vec![], bytes::Bytes::from(vec![0u8; rows * hidden as usize * 2]))?;
+        let expected = verbs_host_expected_response_wire_bytes(&request)?;
+        assert_eq!(landed_payload_bound(expected, rows)?, rows * hidden as usize * 2);
+        assert!(landed_payload_bound(10, rows).is_err());
+        Ok(())
+    }
 
     #[test]
     fn source_slots_free_in_post_order_one_completion_per_frame() -> Result<()> {
