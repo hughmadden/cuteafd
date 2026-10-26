@@ -43,6 +43,9 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
+        # Serving containers now run under --init (tini forwards SIGTERM to the daemon).
+        if "--init" not in before["options"]:
+            before["options"] = sorted([*before["options"], "--init"])
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
