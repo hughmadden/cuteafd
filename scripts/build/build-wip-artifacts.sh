@@ -11,7 +11,7 @@ phase="${6:-all}"
 # Name the failing line and command: a container exec only reports an exit code.
 trap 'status=$?; echo "build-wip-artifacts.sh: line $LINENO: \"$BASH_COMMAND\" exited $status (role ${2:-?}, phase $phase)" >&2' ERR
 # export: only the native/AOT outputs and their native-store entry, no Cargo and
-# no daemon (an export host such as oliver; the slot's own native phase then
+# no daemon (an export host such as maxq; the slot's own native phase then
 # restores the entry with CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1).
 case "$phase" in all|rust|native|export) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
