@@ -28,13 +28,12 @@ fn dense_pushable(args: &EngineArgs) -> bool {
 }
 
 fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
-    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides, MAX_WAVES};
     let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
-    let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+    cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
     let shape = prefill_shape(if complete { ranks } else { 0 }, PrefillLimits {
-        max_waves: if !complete || ranks == 0 { 1 }
-            else if attention == Some(cuteafd_loader::placement::AttentionPlacement::Layers) { 2 } else { 4 },
+        max_waves: if !complete || ranks == 0 { 1 } else { MAX_WAVES },
         ..Default::default()
     }, PrefillOverrides {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
@@ -128,8 +127,8 @@ pub(crate) struct EngineArgs {
     /// Numerical decode/verify reduction rows, independent of execution capacity.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,
-    /// Maximum live prefill units on one Spark transport (1 to 4; mixed layer ownership caps
-    /// this at 2). Units retain their own operands and share attention temporaries; long
+    /// Maximum live prefill units on one Spark transport (1 to 4).
+    /// Units retain their own operands and share attention temporaries; long
     /// spans reuse slots continuously. --prefill-rows bounds each unit's rows.
     #[arg(long = "prefill-waves", default_value_t = 0,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=engine::MAX_PREFILL_WAVES as u64))]
@@ -897,6 +896,35 @@ mod draft_cli_tests {
         }
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--prefill-waves", "5"]).is_err());
+    }
+
+    #[test]
+    fn layers_prefill_uses_shared_topology_and_pinned_waves() {
+        use cuteafd_loader::serving_capacity::prefill_waves::{planned_waves, unit_rows, PrefillError, MAX_WAVES};
+        for complete in [false, true] {
+            for ranks in 0..=8 {
+                let peers = (0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(",");
+                for requested in std::iter::once(None).chain((1..=MAX_WAVES).map(Some)) {
+                    let wave_flag = requested.map(|waves| waves.to_string());
+                    let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                        "--attention-placement", "layers", "--split-device", "1"];
+                    if ranks > 0 { argv.extend(["--peers", peers.as_str()]); }
+                    if let Some(value) = &wave_flag { argv.extend(["--prefill-waves", value.as_str()]); }
+                    let mut args = Parse::try_parse_from(argv).unwrap().engine;
+                    let waves = requested.unwrap_or_else(|| planned_waves(if complete { ranks } else { 0 }));
+                    let result = resolve_prefill(&mut args, complete);
+                    if (!complete || ranks == 0) && waves > 1 {
+                        assert!(matches!(result.unwrap_err().downcast_ref::<PrefillError>(),
+                            Some(PrefillError::ExecutorCapacity { max_waves: 1, .. })));
+                    } else {
+                        result.unwrap();
+                        let rows = unit_rows(waves);
+                        assert_eq!((args.prefill_rows as u64, args.prefill_waves as u64, args.prefill_span_rows as u64),
+                            (rows, waves, rows * waves), "complete={complete}, ranks={ranks}, requested={requested:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

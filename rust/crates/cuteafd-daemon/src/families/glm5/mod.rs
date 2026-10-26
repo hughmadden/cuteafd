@@ -126,13 +126,12 @@ pub(crate) struct EngineArgs {
 }
 
 fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
-    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides, MAX_WAVES};
     let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
-    let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+    cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
     let shape = prefill_shape(ranks, PrefillLimits {
-        max_waves: if ranks == 0 { 1 }
-            else if attention == Some(cuteafd_loader::placement::AttentionPlacement::Layers) { 2 } else { 4 },
+        max_waves: if ranks == 0 { 1 } else { MAX_WAVES },
         ..Default::default()
     }, PrefillOverrides {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
@@ -232,6 +231,33 @@ mod draft_cli_tests {
         }
         assert!(spark_model(0, 4096, false, false).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn layers_prefill_uses_shared_topology_and_pinned_waves() {
+        use cuteafd_loader::serving_capacity::prefill_waves::{planned_waves, unit_rows, PrefillError, MAX_WAVES};
+        for ranks in 0..=8 {
+            let peers = (0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(",");
+            for requested in std::iter::once(None).chain((1..=MAX_WAVES).map(Some)) {
+                let wave_flag = requested.map(|waves| waves.to_string());
+                let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                    "--attention-placement", "layers", "--split-device", "1"];
+                if ranks > 0 { argv.extend(["--peers", peers.as_str()]); }
+                if let Some(value) = &wave_flag { argv.extend(["--prefill-waves", value.as_str()]); }
+                let mut args = Parse::try_parse_from(argv).unwrap().engine;
+                let waves = requested.unwrap_or_else(|| planned_waves(ranks));
+                let result = resolve_prefill(&mut args);
+                if ranks == 0 && waves > 1 {
+                    assert!(matches!(result.unwrap_err().downcast_ref::<PrefillError>(),
+                        Some(PrefillError::ExecutorCapacity { max_waves: 1, .. })));
+                } else {
+                    result.unwrap();
+                    let rows = unit_rows(waves);
+                    assert_eq!((args.prefill_rows as u64, u64::from(args.prefill_waves), args.prefill_span_rows as u64),
+                        (rows, waves, rows * waves), "ranks={ranks}, requested={requested:?}");
+                }
+            }
+        }
     }
 
     #[test]
