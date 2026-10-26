@@ -1,0 +1,429 @@
+{
+  "source": {
+    "revision": "70a98f00e1bb464bd3784e7307a5681634fc4af2",
+    "sparkinfer_revision": "8e3c6f612741c506fe9da2cbeb49d5af0e077089",
+    "role": "spark",
+    "arch": "sm121",
+    "manifest_sha256": "0a1f650895404164acf2b3e2a24e82e1257ce14fd688c82a80327f25caf964e9"
+  },
+  "programs": [
+    {
+      "name": "exlr8_a16_grouped",
+      "family": "exlr8",
+      "op": "exlr8_a16",
+      "params": {
+        "max_rows": 4096
+      },
+      "geometry": {
+        "abi_version": 3,
+        "hidden": 6144,
+        "units": 16,
+        "top_k": 8,
+        "max_groups": 768,
+        "max_rows": 4096,
+        "split_k_blocks": 8,
+        "fc1_splits": 6,
+        "ctas_per_sm": 2,
+        "group_rows": 64
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "float16",
+          "shape": "[rows,6144]",
+          "role": "in"
+        },
+        {
+          "name": "pointers",
+          "dtype": "int64",
+          "shape": "[E,16,3,3]",
+          "role": "in"
+        },
+        {
+          "name": "bits",
+          "dtype": "int32",
+          "shape": "[E,16,3]",
+          "role": "in"
+        },
+        {
+          "name": "group_expert",
+          "dtype": "int32",
+          "shape": "[768]",
+          "role": "in"
+        },
+        {
+          "name": "route_slots",
+          "dtype": "int32",
+          "shape": "[768,64]",
+          "role": "in"
+        },
+        {
+          "name": "route_group_lane",
+          "dtype": "int32",
+          "shape": "[rows,8]",
+          "role": "in"
+        },
+        {
+          "name": "route_weights",
+          "dtype": "float32",
+          "shape": "[rows,8]",
+          "role": "in"
+        },
+        {
+          "name": "fc1",
+          "dtype": "float32",
+          "shape": "[768,16,2,6,64,128]",
+          "role": "scratch"
+        },
+        {
+          "name": "intermediate",
+          "dtype": "float16",
+          "shape": "[768,16,64,128]",
+          "role": "scratch"
+        },
+        {
+          "name": "fc2",
+          "dtype": "float32",
+          "shape": "[768,64,6144]",
+          "role": "scratch"
+        },
+        {
+          "name": "signs_out",
+          "dtype": "int8",
+          "shape": "[6144]",
+          "role": "in"
+        },
+        {
+          "name": "output",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "out"
+        },
+        {
+          "name": "group_count",
+          "dtype": "int32",
+          "shape": "[1]",
+          "role": "in"
+        },
+        {
+          "name": "unit_count",
+          "dtype": "int32",
+          "shape": "[E]",
+          "role": "in"
+        },
+        {
+          "name": "unit_map",
+          "dtype": "int32",
+          "shape": "[E,16]",
+          "role": "in"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        },
+        {
+          "name": "unit_limit",
+          "type": "int32"
+        },
+        {
+          "name": "l2_bytes",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "fc1": 4831838208,
+        "intermediate": 201326592,
+        "fc2": 1207959552
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_exlr8_a16_grouped__mlir_ciface_cutlass___call___b12xintegrationcuteafdexlr8_Exlr8GroupedServingPointers_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_",
+      "object_sha256": "6a66d328d88dd3564b54bd746d0275506be5eee7aaf75799034905550fc5a85b"
+    },
+    {
+      "name": "exlr8_a8_grouped",
+      "family": "exlr8",
+      "op": "exlr8_a16",
+      "params": {
+        "max_rows": 4096,
+        "activations": "a8"
+      },
+      "geometry": {
+        "abi_version": 3,
+        "hidden": 6144,
+        "units": 16,
+        "top_k": 8,
+        "max_groups": 768,
+        "max_rows": 4096,
+        "split_k_blocks": 8,
+        "fc1_splits": 6,
+        "ctas_per_sm": 2,
+        "group_rows": 64,
+        "activations": "a8"
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "float16",
+          "shape": "[rows,6144]",
+          "role": "in"
+        },
+        {
+          "name": "pointers",
+          "dtype": "int64",
+          "shape": "[E,16,3,3]",
+          "role": "in"
+        },
+        {
+          "name": "bits",
+          "dtype": "int32",
+          "shape": "[E,16,3]",
+          "role": "in"
+        },
+        {
+          "name": "group_expert",
+          "dtype": "int32",
+          "shape": "[768]",
+          "role": "in"
+        },
+        {
+          "name": "route_slots",
+          "dtype": "int32",
+          "shape": "[768,64]",
+          "role": "in"
+        },
+        {
+          "name": "route_group_lane",
+          "dtype": "int32",
+          "shape": "[rows,8]",
+          "role": "in"
+        },
+        {
+          "name": "route_weights",
+          "dtype": "float32",
+          "shape": "[rows,8]",
+          "role": "in"
+        },
+        {
+          "name": "fc1",
+          "dtype": "float32",
+          "shape": "[768,16,2,6,64,128]",
+          "role": "scratch"
+        },
+        {
+          "name": "intermediate",
+          "dtype": "float16",
+          "shape": "[768,16,64,128]",
+          "role": "scratch"
+        },
+        {
+          "name": "fc2",
+          "dtype": "float32",
+          "shape": "[768,64,6144]",
+          "role": "scratch"
+        },
+        {
+          "name": "signs_out",
+          "dtype": "int8",
+          "shape": "[6144]",
+          "role": "in"
+        },
+        {
+          "name": "output",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "out"
+        },
+        {
+          "name": "group_count",
+          "dtype": "int32",
+          "shape": "[1]",
+          "role": "in"
+        },
+        {
+          "name": "unit_count",
+          "dtype": "int32",
+          "shape": "[E]",
+          "role": "in"
+        },
+        {
+          "name": "unit_map",
+          "dtype": "int32",
+          "shape": "[E,16]",
+          "role": "in"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        },
+        {
+          "name": "unit_limit",
+          "type": "int32"
+        },
+        {
+          "name": "l2_bytes",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "fc1": 4831838208,
+        "intermediate": 201326592,
+        "fc2": 1207959552
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_exlr8_a8_grouped__mlir_ciface_cutlass___call___b12xintegrationcuteafdexlr8_Exlr8GroupedServingPointers_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_",
+      "object_sha256": "8438181d59ed2f8301c8bd352c24614efe2006f5cbbed0d32ce946a1b192a12b"
+    },
+    {
+      "name": "exlr8_a16_grouped64",
+      "family": "exlr8",
+      "op": "exlr8_a16",
+      "params": {
+        "max_rows": 64,
+        "fc2_partials": "f32"
+      },
+      "geometry": {
+        "abi_version": 3,
+        "hidden": 6144,
+        "units": 16,
+        "top_k": 8,
+        "max_groups": 512,
+        "max_rows": 64,
+        "split_k_blocks": 8,
+        "fc1_splits": 6,
+        "ctas_per_sm": 2,
+        "group_rows": 16,
+        "fc2_partials": "f32"
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "float16",
+          "shape": "[rows,6144]",
+          "role": "in"
+        },
+        {
+          "name": "pointers",
+          "dtype": "int64",
+          "shape": "[E,16,3,3]",
+          "role": "in"
+        },
+        {
+          "name": "bits",
+          "dtype": "int32",
+          "shape": "[E,16,3]",
+          "role": "in"
+        },
+        {
+          "name": "group_expert",
+          "dtype": "int32",
+          "shape": "[512]",
+          "role": "in"
+        },
+        {
+          "name": "route_slots",
+          "dtype": "int32",
+          "shape": "[512,16]",
+          "role": "in"
+        },
+        {
+          "name": "route_group_lane",
+          "dtype": "int32",
+          "shape": "[rows,8]",
+          "role": "in"
+        },
+        {
+          "name": "route_weights",
+          "dtype": "float32",
+          "shape": "[rows,8]",
+          "role": "in"
+        },
+        {
+          "name": "fc1",
+          "dtype": "float32",
+          "shape": "[512,16,2,6,16,128]",
+          "role": "scratch"
+        },
+        {
+          "name": "intermediate",
+          "dtype": "float16",
+          "shape": "[512,16,16,128]",
+          "role": "scratch"
+        },
+        {
+          "name": "fc2",
+          "dtype": "float32",
+          "shape": "[512,16,6144]",
+          "role": "scratch"
+        },
+        {
+          "name": "signs_out",
+          "dtype": "int8",
+          "shape": "[6144]",
+          "role": "in"
+        },
+        {
+          "name": "output",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "out"
+        },
+        {
+          "name": "group_count",
+          "dtype": "int32",
+          "shape": "[1]",
+          "role": "in"
+        },
+        {
+          "name": "unit_count",
+          "dtype": "int32",
+          "shape": "[E]",
+          "role": "in"
+        },
+        {
+          "name": "unit_map",
+          "dtype": "int32",
+          "shape": "[E,16]",
+          "role": "in"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        },
+        {
+          "name": "unit_limit",
+          "type": "int32"
+        },
+        {
+          "name": "l2_bytes",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "fc1": 805306368,
+        "intermediate": 33554432,
+        "fc2": 201326592
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_exlr8_a16_grouped64__mlir_ciface_cutlass___call___b12xintegrationcuteafdexlr8_Exlr8GroupedServingPointers_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_",
+      "object_sha256": "b5b9489a2c6e0517fb19fc00735ef0a30d6a0793c754d5b8eecd94ae31e8d54c"
+    }
+  ]
+}
