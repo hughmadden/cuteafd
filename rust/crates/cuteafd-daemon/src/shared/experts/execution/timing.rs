@@ -14,6 +14,10 @@ impl<'a> Event<'a> {
             raw: library.cuda_event_create()?,
         })
     }
+
+    fn ordering(library: &'a NativeLibrary) -> Result<Self> {
+        Ok(Self { library, raw: library.cuda_event_create_ordering()? })
+    }
 }
 impl Drop for Event<'_> {
     fn drop(&mut self) {
@@ -23,19 +27,37 @@ impl Drop for Event<'_> {
     }
 }
 
-/// Per-unit fences, independent of whole-stream idleness. The transport retains
-/// each request/reply frame until its own fence completes and the reply is sent.
-/// All events are allocated at startup; hot-path submission never allocates.
+enum Completion<'a> {
+    SingleFlight(*mut c_void),
+    UnitEvents(Vec<Event<'a>>),
+}
+
+/// Decode has one retained unit, so stream idleness is its completion fence.
+/// Prefill retains independent unit fences so an earlier reply need not wait
+/// for later work. All events are allocated before serving.
 pub(crate) struct PendingUnits<'a> {
     library: &'a NativeLibrary,
-    events: Vec<Event<'a>>,
+    completion: Completion<'a>,
     free: std::collections::VecDeque<usize>,
     queued: std::collections::VecDeque<(usize, (u64, u32, u32, u64))>,
 }
 impl<'a> PendingUnits<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, capacity: usize) -> Result<Self> {
+        Self::for_owner(library, capacity, cuteafd_core::ExecutionOwner::Prefill)
+    }
+
+    pub(crate) fn for_owner(library: &'a NativeLibrary, capacity: usize,
+        owner: cuteafd_core::ExecutionOwner) -> Result<Self> {
         anyhow::ensure!((1..=4).contains(&capacity), "invalid expert unit queue capacity");
-        Ok(Self { library, events: (0..capacity).map(|_| Event::new(library)).collect::<Result<_>>()?,
+        let completion = match owner {
+            cuteafd_core::ExecutionOwner::Decode(_) => {
+                anyhow::ensure!(capacity == 1, "decode completion requires a single retained unit");
+                Completion::SingleFlight(std::ptr::null_mut())
+            },
+            cuteafd_core::ExecutionOwner::Prefill => Completion::UnitEvents(
+                (0..capacity).map(|_| Event::ordering(library)).collect::<Result<_>>()?),
+        };
+        Ok(Self { library, completion,
             free: (0..capacity).collect(), queued: std::collections::VecDeque::with_capacity(capacity) })
     }
     pub(crate) fn next_slot(&self) -> Result<usize> {
@@ -47,16 +69,24 @@ impl<'a> PendingUnits<'a> {
     /// The stream and every borrowed request/reply owner remain live until pop.
     pub(crate) unsafe fn record(&mut self, identity: (u64, u32, u32, u64), stream: *mut c_void) -> Result<()> {
         let slot = self.next_slot()?;
-        // SAFETY: this event is exclusively reserved until the unit is popped.
-        unsafe { self.library.cuda_event_record(self.events[slot].raw, stream)?; }
+        match &mut self.completion {
+            Completion::SingleFlight(owner_stream) => *owner_stream = stream,
+            Completion::UnitEvents(events) => {
+                // SAFETY: this event is exclusively reserved until the unit is popped.
+                unsafe { self.library.cuda_event_record(events[slot].raw, stream)?; }
+            },
+        }
         self.free.pop_front();
         self.queued.push_back((slot, identity));
         Ok(())
     }
     pub(crate) fn ready(&self) -> Result<bool> {
         let Some((slot, _)) = self.queued.front() else { return Ok(true) };
-        // SAFETY: the queued unit exclusively retains its recorded live event.
-        unsafe { self.library.cuda_event_query(self.events[*slot].raw) }
+        // SAFETY: the queued unit retains its owner stream or exclusive event.
+        unsafe { match &self.completion {
+            Completion::SingleFlight(stream) => self.library.cuda_stream_query(*stream),
+            Completion::UnitEvents(events) => self.library.cuda_event_query(events[*slot].raw),
+        } }
     }
     pub(crate) fn pop(&mut self) -> Result<Option<(u64, u32, u32, u64)>> {
         anyhow::ensure!(self.ready()?, "expert unit completed before its fence");
@@ -197,6 +227,69 @@ impl<'a> WorkerTiming<'a> {
 
 #[cfg(test)]
 mod worker_tests {
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn decode_stream_completion_preserves_credit_identity_and_timing_without_unit_events() -> anyhow::Result<()> {
+        use super::*;
+        use cuteafd_core::ExecutionOwner;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        library.cuda_set_device(7)?;
+        fixture.configure_memory(&library, 7, 1 << 20)?;
+        fixture.queued_experts(&library)?;
+        let stream = crate::shared::memory::LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1)?;
+        let input = [13u8; 1];
+        let mut pending = PendingUnits::for_owner(&library, 1, ExecutionOwner::Decode(1))?;
+        assert!(matches!(&pending.completion, Completion::SingleFlight(_)));
+        assert!(PendingUnits::for_owner(&library, 2, ExecutionOwner::Decode(0)).is_err());
+        let prefill = PendingUnits::for_owner(&library, 1, ExecutionOwner::Prefill)?;
+        assert!(matches!(&prefill.completion, Completion::UnitEvents(events) if events.len() == 1));
+        let path = fixture.directory().join("decode-timing.jsonl");
+        let output = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        let mut timing = WorkerTiming::new(&library, 0, "fixture".into(), Some(output))?;
+        for request_id in 0..3 {
+            assert!(pending.ready()? && pending.is_empty());
+            // SAFETY: the source, buffers, stream and timing records outlive completion.
+            unsafe {
+                timing.record(0, stream.raw)?;
+                library.copy_h2d_async(allocation.buffer, &input, stream.raw)?;
+                timing.record(1, stream.raw)?;
+                pending.record((request_id, 20, 24, 27), stream.raw)?;
+            }
+            assert_eq!(pending.len(), 1);
+            assert!(pending.next_slot().is_err() && !pending.ready()?);
+            assert!(pending.pop().is_err());
+            fixture.advance_queued_experts(&library, 1)?;
+            assert!(pending.ready()?);
+            let identity = pending.pop()?.unwrap();
+            assert_eq!(identity, (request_id, 20, 24, 27));
+            assert_eq!(pending.next_slot()?, 0);
+            // SAFETY: the exclusive owner stream is idle after both timing records.
+            unsafe { timing.publish(identity.0, identity.1, identity.2, identity.3, "native")?; }
+        }
+        let records = std::fs::read_to_string(path)?.lines().map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 3);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["request_id"], index as u64);
+            assert!((record["compute_us"].as_f64().unwrap() - 1.0).abs() < 0.001);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_owner_selects_completion_for_every_spark_backend() {
+        let local = include_str!("../service/local.rs");
+        assert!(local.contains("extent.staging_rows as usize, extent.owner)?"));
+        for source in [include_str!("../execution.rs"), include_str!("../exl3/worker.rs"),
+            include_str!("../fp8/worker.rs"), include_str!("../service/exlr8.rs")] {
+            assert!(source.contains("PendingUnits::for_owner(self.library, units, owner)?"));
+        }
+    }
+
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn queued_spans_keep_fifo_identities_and_gpu_gaps_across_event_reuse() -> anyhow::Result<()> {

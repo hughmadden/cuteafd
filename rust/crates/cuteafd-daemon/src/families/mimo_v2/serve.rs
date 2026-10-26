@@ -281,11 +281,12 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         engine.check_tp2_routers()?;
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
-        }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select, host_config, &mut media, preparer.as_deref())
+            args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
+                }
+            })
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| (args.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -484,12 +485,12 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
     host_config: Option<cuteafd_hostcache::config::Config>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let mut owners = super::serving_owners::ServingOwners::new(engine);
     let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
     owners.prefix(family, cache);
     owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
-    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer)
+    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer, ready)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,7 +498,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let head_numerics = match engine.head().weight {
@@ -540,6 +541,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     let config = &opened.checkpoint.config;
     let mut failures = FailureRecipients::default();
+    publish(stats, requests, generated_total, 0, 0, cache, media, preparer);
+    // The API may advertise capacity only after every fallible startup owner exists.
+    ready();
     // Keep admitted request owners alive until a fatal cause has reached every
     // affected client, including requests waiting for prefill or KV admission.
     let result = (|| -> Result<()> { loop {

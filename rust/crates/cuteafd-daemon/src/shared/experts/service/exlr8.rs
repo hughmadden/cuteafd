@@ -319,10 +319,10 @@ impl<'w, 'a> Worker<'w, 'a> {
     /// Lane-owned mode (#708): a mapped request returns with its work queued;
     /// the owner emits it once [`Self::stream_idle`] holds, then calls
     /// [`Self::complete`].
-    pub(super) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
+    pub(super) fn defer(&mut self, units: usize, staging_rows: usize, owner: cuteafd_core::ExecutionOwner) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active EXLR8 queue");
         ensure!(staging_rows > 0 && staging_rows <= self.capacity, "EXLR8 staging exceeds owner rows");
-        self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.pending = super::super::execution::timing::PendingUnits::for_owner(self.library, units, owner)?;
         self.route_staging.resize(self.library, units, staging_rows)?;
         self.deferred = true;
         Ok(())
@@ -453,7 +453,7 @@ mod tests {
         let bind = &source[source.find("fn bind_layer(").unwrap()..source.find("fn grouping(").unwrap()];
         assert!(!bind.contains("require_complete") && !bind.contains("synchronize"));
         let backend = include_str!("backend.rs");
-        assert!(backend.contains("Self::Exlr8(execution) => execution.defer(units, staging_rows)?,"));
+        assert!(backend.contains("Self::Exlr8(execution) => execution.defer(units, staging_rows, owner)?,"));
         assert!(backend.contains("Self::Exlr8(execution) => execution.stream_idle(),"));
         assert!(backend.contains("Self::Exlr8(execution) => execution.complete(),"));
     }
