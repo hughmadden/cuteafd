@@ -527,6 +527,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // sample. This is "first success after the admission event", not a proof
     // that the request arrived on the newly added connection.
     let mut pending_steady_log = false;
+    let profile_queue = std::env::var("CUTEAFD_EXPERT_TIMING").is_ok_and(|value| value == "1");
+    let mut prefill_overlap_high_water = 1usize;
     let result = (|| -> Result<()> { loop {
         let mut progressed = false;
         for (owner, execution) in executions.iter_mut().enumerate() {
@@ -603,6 +605,17 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     match launched {
                         Ok(Some((owner, true))) => {
                             holding[index].push_back(queues.record(owner)?);
+                            let queued = queues.pending[owner].len();
+                            // Count overlap only while the oldest GPU fence is
+                            // incomplete, not merely while replies retain storage.
+                            if profile_queue && owner == owners.decode.len()
+                                && queued > prefill_overlap_high_water
+                                && !executions[owner].unit_ready()? {
+                                prefill_overlap_high_water = queued;
+                                tracing::info!(target: "cuteafd::expert_timing", rank = config.rank, owner,
+                                    queued_units = queued, oldest_complete = false,
+                                    "Spark prefill owner overlap");
+                            }
                             Ok(true)
                         }
                         // The host-only path drains its owner before using blocking
