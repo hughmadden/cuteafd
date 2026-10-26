@@ -184,7 +184,9 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let mut options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
-            let (unit, waves) = match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) };
+            let descriptor = family::registry().iter().find(|entry| entry.id() == family).unwrap().prefill_limits();
+            let expected = crate::serving_capacity::prefill_waves::prefill_shape(ranks, descriptor, Default::default()).unwrap();
+            let (unit, waves) = (expected.unit_rows, expected.waves);
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
@@ -195,8 +197,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 layout.prefill_lanes = waves;
                 layout.prefill_span_rows = Some(unit * waves);
                 let report = plan(dir.path(), &options).unwrap();
-                let max_waves = if ranks == 0 { 1 }
-                    else if family == "deepseek_v4" { 3 } else { 4 };
+                let max_waves = if ranks == 0 { 1 } else { descriptor.max_waves };
                 if waves > max_waves {
                     assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
                     assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")),
@@ -271,31 +272,36 @@ fn shared_prefill_public_plan_honors_a_real_manifest_unit_bound() {
 }
 
 #[test]
-fn shared_prefill_measured_caps_match_admission_and_cannot_hide_hard_limits() {
-    use crate::serving_capacity::prefill_waves::{PrefillError, PrefillLimits};
+fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillError, PrefillOverrides};
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let mut report = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
     let manifest = dir.path().join("bounded.json");
     std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":1024}}"#).unwrap();
-    for (family, cap) in [("step5", 2048), ("kimi_k3", 2752), ("glm5", 4096)] {
-        report.family = Some(family.into());
-        for (unit, waves) in [(0, 2), (0, 3), (4096, 2)] {
+    for family in family::registry() {
+        report.family = Some(family.id().into());
+        let limits = family.prefill_limits();
+        for (unit, waves) in [(0, 0), (0, 2), (4096, 2)] {
             let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
             options.prefill_rows = unit;
             options.prefill_lanes = waves;
-            let shape = layout::resolve_prefill(&mut report, &mut options, 6, PrefillLimits::default()).unwrap();
-            let expected = if unit == 0 { crate::serving_capacity::prefill_waves::unit_rows(waves).min(cap) }
-                else { unit };
-            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (expected, waves, expected * waves));
+            let daemon = prefill_shape(6, limits, PrefillOverrides {
+                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+            }).unwrap();
+            let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+            assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());
+            let expected = daemon.unit_rows;
             assert_eq!((options.prefill_rows, options.spark_capacity_rows), (expected, expected));
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(expected), Some(waves), Some(expected * waves)));
+                (Some(expected), Some(daemon.waves), Some(expected * daemon.waves)));
         }
         let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
         options.workspace_manifest = Some(manifest.clone());
-        let error = layout::resolve_prefill(&mut report, &mut options, 6, PrefillLimits::default()).unwrap_err();
+        options.prefill_rows = 2048;
+        options.prefill_lanes = 2;
+        let error = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap_err();
         assert!(matches!(error.downcast_ref::<PrefillError>(),
-            Some(PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. })), "{family}: {error}");
+            Some(PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. })), "{}: {error}", family.id());
     }
 }
 
@@ -3520,7 +3526,7 @@ fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
 }
 
 #[test]
-fn qwen_small_card_one_spark_admits_both_auto_waves_with_one_compute_slot() {
+fn qwen_small_card_one_spark_buffers_two_waves_with_one_compute_slot() {
     use cuteafd_core::memory_layout::DeviceKind;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {

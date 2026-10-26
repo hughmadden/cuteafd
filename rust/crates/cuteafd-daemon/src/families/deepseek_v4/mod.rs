@@ -211,12 +211,12 @@ mod prefill_shape_tests {
             args.skip_routed_experts = ranks == 0;
             let shape = args.prefill_shape(4096, None)?;
             let planned = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(ranks,
-                PrefillLimits { max_waves: if ranks == 0 { 1 } else { 3 }, ..Default::default() },
+                PrefillLimits { max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES },
+                    ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
                 PrefillOverrides::default())?;
             assert_eq!(shape, planned);
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
-                if ranks == 0 { (4096, 1, 4096) } else if ranks < 6 { (4096, 2, 8192) }
-                else { (2752, 3, 8256) });
+                if ranks == 0 { (4096, 1, 4096) } else { (2752, 3, 8256) });
             args.prefill_rows = Some(2048);
             args.prefill_waves = Some(3);
             if ranks == 0 {
@@ -235,7 +235,7 @@ mod prefill_shape_tests {
         assert!(matches!(args.prefill_shape(4096, None), Err(PrefillError::ReserveExceeded { .. })));
         args.prefill_rows = Some(2048);
         args.prefill_waves = Some(4);
-        assert!(matches!(args.prefill_shape(4096, None), Err(PrefillError::ExecutorCapacity { .. })));
+        assert_eq!(args.prefill_shape(4096, None)?.waves, 4);
         args.prefill_rows = Some(2752);
         args.prefill_waves = Some(3);
         assert!(matches!(args.prefill_shape(4096, Some(8192)), Err(PrefillError::IntakeSpan { .. })));
@@ -253,7 +253,7 @@ impl EngineArgs {
             self.peers.split(',').filter(|peer| !peer.is_empty()).count()
         };
         prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
-            max_waves: if ranks == 0 { 1 } else { 3 }, ..Default::default() },
+            max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
                 waves: self.prefill_waves.map(|waves| waves as u64), span_rows })
     }

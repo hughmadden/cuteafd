@@ -340,17 +340,17 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     }
 }
 
-/// Spark compute slots follow decode lanes, not the outstanding prefill
-/// exchanges. Waves retain their own transport rings and return buffers while
-/// a rank serializes unit GEMMs on each admitted compute slot.
-pub fn spark_execution_slots(_family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
-    if !(1..=crate::serving_capacity::prefill_waves::MAX_WAVES).contains(&prefill_waves) {
-        return Err(crate::placement::PlacementError::Inventory("Spark prefill waves exceed executor capability"));
+/// Spark compute concurrency follows decode lanes, not buffered network waves.
+/// The family owns any required lane floor (e.g. simultaneous legacy owners).
+pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
+    let descriptor = crate::plan::family::registry().iter().find(|entry| entry.id() == family)
+        .ok_or(crate::placement::PlacementError::Inventory("Spark execution slots require a family descriptor"))?;
+    let slots = decode_lanes.max(descriptor.spark_decode_lanes());
+    if !(1..=crate::serving_capacity::prefill_waves::MAX_WAVES).contains(&prefill_waves)
+        || decode_lanes == 0 || slots > cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
+        return Err(crate::placement::PlacementError::Inventory("Spark execution slots exceed executor capability"));
     }
-    if !(1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS).contains(&decode_lanes) {
-        return Err(crate::placement::PlacementError::Inventory("Spark decode lanes exceed executor capability"));
-    }
-    Ok(decode_lanes)
+    Ok(slots)
 }
 
 /// Device bytes of one Spark execution slot (stream, scratch, inputs and
@@ -456,21 +456,24 @@ mod selected_spark_io_tests {
     }
 
     #[test]
-    fn execution_slots_follow_decode_lanes_independently_of_prefill_waves() {
-        for family in ["glm5", "glm5_flash", "mimo_v2", "deepseek_v41", "deepseek_v4", "kimi_k3", "qwen4", "step5"] {
+    fn execution_slots_follow_descriptor_decode_lanes_not_prefill_waves() {
+        for descriptor in crate::plan::family::registry() {
             for waves in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
                 for lanes in 1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
-                    assert_eq!(spark_execution_slots(family, waves, lanes).unwrap(), lanes);
+                    assert_eq!(spark_execution_slots(descriptor.id(), waves, lanes).unwrap(),
+                        lanes.max(descriptor.spark_decode_lanes()));
                 }
             }
             for waves in [0, 5, u64::MAX] {
-                assert!(spark_execution_slots(family, waves, 1).is_err());
+                assert!(spark_execution_slots(descriptor.id(), waves, 1).is_err());
             }
             for lanes in [0, 5, u8::MAX] {
-                assert!(spark_execution_slots(family, 1, lanes).is_err());
+                assert!(spark_execution_slots(descriptor.id(), 1, lanes).is_err());
             }
         }
-        assert_eq!(spark_execution_slots("deepseek_v41", 1, 2).unwrap(), 2);
+        assert_eq!(spark_execution_slots("deepseek_v41", 1, 1).unwrap(), 2);
+        assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 1);
+        assert!(spark_execution_slots("unknown", 1, 1).is_err());
     }
 
     #[test]
@@ -585,8 +588,8 @@ mod selected_spark_io_tests {
             charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
             assert!(device.items.is_empty());
         }
-        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::planned_waves(4)), 2);
-        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::planned_waves(0)), 1);
+        assert_eq!(spark_endpoints("glm5", crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(4)), 2);
+        assert_eq!(spark_endpoints("glm5", crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(0)), 1);
     }
 }
 
@@ -709,8 +712,7 @@ pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error)
 pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     spark_ranks: usize, mut limits: crate::serving_capacity::prefill_waves::PrefillLimits)
     -> anyhow::Result<crate::serving_capacity::prefill_waves::PrefillPlan> {
-    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillAutomatic, PrefillOverrides};
-    limits.automatic = PrefillAutomatic::for_family(report.family.as_deref().unwrap_or_default());
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
     let manifest_path = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     if manifest_path.is_file() {

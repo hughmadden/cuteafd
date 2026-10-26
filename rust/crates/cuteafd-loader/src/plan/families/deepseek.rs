@@ -15,17 +15,27 @@ pub struct DeepSeek {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
+    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate,
+    decode_lanes: u8,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
+    // Legacy CED executor: not advertised as an adaptive shared-prefill port.
+    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::Unmeasured,
+    decode_lanes: 2,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
     architecture: "DeepseekV4ForCausalLM",
     runtime: RuntimeStatus::Serving,
+    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
+        waves: 3, reference_ranks: 6, larger_topology_waves: 3,
+        source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; Pro EXL3 six-Spark k3 versus k2, no independent S/T",
+    },
+    decode_lanes: 1,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -37,6 +47,10 @@ fn usize_list(config: &Value, key: &str) -> Vec<usize> {
 }
 
 impl Family for DeepSeek {
+    fn spark_decode_lanes(&self) -> u8 { self.decode_lanes }
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, ..Default::default() }
+    }
     fn id(&self) -> &'static str {
         self.id
     }

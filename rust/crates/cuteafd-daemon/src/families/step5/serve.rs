@@ -73,8 +73,8 @@ impl ServeArgs {
     }
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
-        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), PrefillLimits::for_family("step5"), PrefillOverrides {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
             span_rows: None,
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn topology_shapes_and_explicit_units_match_admission() -> Result<()> {
-        for (sparks, unit, waves, span) in [(4, 2048, 2, 4096), (6, 2048, 3, 6144)] {
+        for (sparks, unit, waves, span) in [(4, 2752, 3, 8256), (6, 2752, 3, 8256)] {
             let mut args = args();
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
@@ -707,7 +707,7 @@ mod tests {
             let slots = cuteafd_loader::plan::layout::spark_execution_slots("step5", waves, 1)?;
             let model = ModelAdmission::for_units(ExpertGeometry::STEP5, args.endpoint(), unit as u32,
                 4096, spark_rings(TcpTransportConfig::default().max_frame_bytes)?, 2, slots)?;
-            assert_eq!(model.execution_slots, slots);
+            assert_eq!(model.execution_slots, 1);
             assert_eq!(model.endpoints[0].capacity, unit as u32);
             assert!(model.endpoints[0].capacity < args.span());
             for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {

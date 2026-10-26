@@ -10,7 +10,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             max_waves: if report.spark_ranks == 0 { 1 }
                 else if report.requested_attention == Some(placement::AttentionPlacement::Layers) {
                 placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
-            ..Default::default()
+            ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5_FLASH)
         }) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),

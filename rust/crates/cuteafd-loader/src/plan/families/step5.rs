@@ -337,6 +337,13 @@ impl Model {
 }
 
 impl Family for Step5 {
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
+        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
+            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
+            source: "https://github.com/tpurtell/cuteafd/pull/785#issuecomment-6407286806; k3 beats k2 at fixed2048, S/T not recorded",
+        }, ..Default::default() }
+    }
     fn id(&self) -> &'static str { "step5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

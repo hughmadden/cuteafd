@@ -107,19 +107,18 @@ async fn run() -> Result<()> {
     let parse = |matches: clap::ArgMatches| {
         match Cli::from_arg_matches(&matches) {
             Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
-                (cuteafd_transport::SparkChunking { request: cli.spark_request_chunk_bytes.0, reply: cli.spark_reply_chunk_bytes.0 },
-                 cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                     idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) })),
+                cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
+                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_chunking) =
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait) =
         parse(Cli::command().get_matches());
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, chunking) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -129,12 +128,8 @@ async fn run() -> Result<()> {
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
-            initial_chunking),
+            initial_wait),
     };
-    let (chunking, wait_policy) = chunking;
-    // TEMPORARY: remove after PFC test (TJ 2026-10-25). Coordinators send
-    // these to every worker; a worker uses only the values it receives.
-    cuteafd_transport::set_spark_chunking(chunking)?;
     // Read by the coordinator and every Spark worker from the same key.
     cuteafd_transport::wait_policy::set_wait_policy(wait_policy)?;
     if let Some((_, options)) = matches.subcommand() {

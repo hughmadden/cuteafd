@@ -125,7 +125,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
         expected.push("group_count");
     }
     if grouped { expected.extend(["unit_count", "unit_map"]); }
-    let scalars: &[u8] = if serving && !grouped { b"ii" } else { b"iii" };
+    let scalars: &[u8] = if grouped { b"iiii" } else if serving { b"ii" } else { b"iii" };
     if !spec.pointers.iter().map(String::as_str).eq(expected) || spec.scalar_kinds != scalars {
         return Err(invalid("pointer order or scalar ABI"));
     }
@@ -528,7 +528,7 @@ mod tests {
             s.geometry["group_rows"] = serde_json::json!(tile);
             s.geometry["ctas_per_sm"] = serde_json::json!(2);
             s.pointers.extend(["group_count", "unit_count", "unit_map"].map(String::from));
-            s.scalar_kinds = b"iii".to_vec();
+            s.scalar_kinds = b"iiii".to_vec();
             for bytes in s.scratch.values_mut() { *bytes *= tile / 16; }
             let mut e = entry();
             e["capacity_rows"] = serde_json::json!(4096);
@@ -553,6 +553,8 @@ mod tests {
             bad_a16.geometry["activations"] = serde_json::json!("a8");
             assert!(validate(&bad_a16).is_err());
             let mut legacy = s.clone();
+            legacy.scalar_kinds = b"iii".to_vec();
+            assert!(validate(&legacy).is_err());
             legacy.scalar_kinds = b"ii".to_vec();
             assert!(validate(&legacy).is_err());
             legacy = s.clone();

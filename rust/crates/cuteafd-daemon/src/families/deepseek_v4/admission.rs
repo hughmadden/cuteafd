@@ -85,7 +85,7 @@ impl PinnedTables {
         let mul = |a: u64, b: u64| a.checked_mul(b).context("V4 pinned table multiplication overflow");
         let add = |a: u64, b: u64| a.checked_add(b).context("V4 pinned table addition overflow");
         ensure!(self.units > 0 && self.prefill_rows > 0 && self.decode_rows > 0
-            && (1..=3).contains(&self.waves) && (1..=2).contains(&self.ranks)
+            && (1..=cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES).contains(&self.waves) && (1..=2).contains(&self.ranks)
             && self.c128_width > 0 && self.hidden > 0 && self.topk > 0,
             "invalid V4 pinned table geometry");
         let mut tables = Vec::new();
