@@ -9,7 +9,7 @@ fn snapshot(vision: bool, draft: bool) -> tempfile::TempDir {
     dir
 }
 
-/// The 5090's usable logical budget (`--coordinator-gpu-budget-gib 31.8`).
+/// An RTX 5090's usable logical budget (`--coordinator-gpu-budget-gib 31.8`): refused by name.
 const RTX_5090: u64 = 34_144_990_003;
 
 fn with_layout(rtx: u64, ranks: usize) -> PlanOptions {
@@ -169,7 +169,7 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
     // Sixteen sequences each hold a context ring (at most 64 decode rows / 2); the taps hold a
-    // two-lane chunk.
+    // two-wave call.
     let draft = DraftMemory::new(&contract, admission::default_draft_rings(16, 64), 2 * 256, 188).unwrap();
     assert_eq!(draft.slots, 16);
     let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
@@ -180,7 +180,7 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let graphs = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
         .filter(|i| ["graphs", crate::placement::inventory::GRAPH_GROWTH].contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
     let sizing = |sequences| admission::RuntimeSizing { rows: 256, decode_rows: 64, sequences, context: 1 << 20,
-        spark_ranks: 3, logit_rows: 64, lanes: crate::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false };
+        spark_ranks: 3, logit_rows: 64, lanes: 2, host_landing: false };
     assert_eq!(graphs(&off_rtx), admission::decode_graphs(sizing(16), 0).unwrap().inventory.bytes(0));
     assert_eq!(graphs(&on_rtx), admission::decode_graphs(sizing(16), draft.slots).unwrap().inventory.bytes(0));
     // A DSpark step projects its sequences' drafts through the target head: sixteen drafting
@@ -206,11 +206,12 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     assert!(smaller.placement_supported, "{:?}", smaller.hints);
     // The SM-sized draft attention arena: 532,480 bytes more per drafting sequence at 188 SMs.
     assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 16 * 532_480);
+    // A unit below a KV page is no prefill shape at all (the drafter's taps would need seven rows).
     options.layout.as_mut().unwrap().prefill_rows = 6;
     options.layout.as_mut().unwrap().concurrency = 1;
     let refused = plan::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported);
-    assert!(refused.hints.iter().any(|h| h.what.contains("7..16384 rows")), "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax prefill shape")), "{:?}", refused.hints);
     options.layout.as_mut().unwrap().prefill_rows = 256;
     options.layout.as_mut().unwrap().concurrency = 16;
     options.layout.as_mut().unwrap().drafter_bytes = 1;
@@ -245,10 +246,10 @@ fn a_missing_native_manifest_is_refused() {
     assert!(report.hints.iter().any(|h| h.what.contains("PROGRAMS.json")));
 }
 
-/// The shipped TP2 5090 shape (1024 prefill rows, 64 sequences) at a 108 GiB Spark budget: 55 Spark
-/// layers fit it while serving but not while loading. On hardware the worker refused them with "load
-/// 116371564032 serve 115379228928 budget 115964116992": its load peak adds the largest pinned upload
-/// and read scratch of a layer to the residents, package scratch and runtime residual.
+/// TP2 with 1024-row units and 64 sequences at a 108 GiB Spark budget: 55 Spark layers fit it while
+/// serving but not while loading. On hardware the worker refused them with "load 116371564032 serve
+/// 115379228928 budget 115964116992": its load peak adds the largest pinned upload and read scratch
+/// of a layer to the residents, package scratch and runtime residual.
 #[test]
 fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
     let dir = snapshot(false, false);
@@ -259,7 +260,8 @@ fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
     let mut package = admission::tests::expert_manifest();
     package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
     std::fs::write(experts.join("manifest.json"), package.to_string()).unwrap();
-    let mut options = with_layout(RTX_5090, 2);
+    let mut options = with_layout(PRO_TOTAL_BYTES, 2);
+    options.vision = crate::plan::MediaMode::Off;
     let layout = options.layout.as_mut().unwrap();
     layout.workspace_manifest = Some(programs);
     layout.native_mtp_layers = 0;
@@ -273,7 +275,8 @@ fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
 }
 
 /// The default Spark budget, measured on headless Sparks, holds every routed layer at TP2 with the
-/// shipped 5090 shape (two lanes of 4096 rows, 64 sequences): nothing onboards onto the RTX.
+/// default shape (two waves of 4096 rows, so two execution slots per rank, 64 sequences): nothing
+/// onboards onto the RTX.
 #[test]
 fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     let dir = snapshot(false, false);
@@ -284,7 +287,8 @@ fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     let mut package = admission::tests::expert_manifest();
     package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
     std::fs::write(experts.join("manifest.json"), package.to_string()).unwrap();
-    let mut options = with_layout(RTX_5090, 2);
+    let mut options = with_layout(PRO_TOTAL_BYTES, 2);
+    options.vision = crate::plan::MediaMode::Off;
     let layout = options.layout.as_mut().unwrap();
     layout.workspace_manifest = Some(programs);
     layout.native_mtp_layers = 0;
@@ -293,8 +297,12 @@ fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     assert!(report.wip_launchable(), "{:?}", report.hints);
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "{:?}", memory.notes);
+    let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
+    assert!(spark.items.iter().any(|i| i.group == "execution slots" && i.format == "1 more"), "{:?}", spark.items);
 }
 
+/// TP2 on the RTX PRO 6000 with automatic vision: the bundled tower stays on the coordinator GPU
+/// beside the routed layers a 108 GiB Spark budget onboards, and text admission keeps its pool.
 #[test]
 fn native_tp2_auto_vision_preserves_text_admission() {
     use crate::plan::{encoder::EncoderKind, MediaMode};
@@ -306,7 +314,7 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     let mut package = admission::tests::expert_manifest();
     package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
     std::fs::write(experts.join("manifest.json"), package.to_string()).unwrap();
-    let mut options = with_layout(RTX_5090, 2);
+    let mut options = with_layout(PRO_TOTAL_BYTES, 2);
     options.vision = MediaMode::Auto;
     let layout = options.layout.as_mut().unwrap();
     layout.workspace_manifest = Some(programs);
@@ -317,14 +325,14 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     layout.spark_allocation_budget_bytes = Some(108 << 30);
     let report = plan::plan(dir.path(), &options).unwrap();
     assert!(report.wip_launchable(), "{:?}", report.hints);
-    assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(memory.pool_tokens >= 64);
     assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
     assert!(memory.notes.iter().any(|n| n.starts_with("3 routed layers on the RTX")), "{:?}", memory.notes);
     assert!(!report.hints.iter().any(|h| h.what.starts_with("routed experts need ")));
-    // Logits cover decode rows, not every prefill row, so a 4096-row prefill chunk fits too
-    // (one lane: two lanes of 4096 rows hold twice the per-row buffers).
+    // Logits cover decode rows, not every prefill row, so one 4096-row unit fits too, and it holds
+    // more per-row buffers than two 1024-row waves.
     options.layout.as_mut().unwrap().prefill_rows = 4096;
     options.layout.as_mut().unwrap().prefill_lanes = 1;
     let wide = plan::plan(dir.path(), &options).unwrap();
@@ -337,47 +345,115 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax allocation needs")));
 }
 
-fn native_5090_options(dir: &std::path::Path, ranks: usize) -> PlanOptions {
+/// An RTX PRO 6000 plan with the image's program and expert package manifests, vision off and the
+/// bundled DSpark.
+fn native_options(dir: &std::path::Path, ranks: usize) -> PlanOptions {
     let programs = dir.join("PROGRAMS.json");
     std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
     let experts = dir.join("fp8/fp8-minimax-nvfp4a4");
     std::fs::create_dir_all(&experts).unwrap();
     std::fs::write(experts.join("manifest.json"), admission::tests::expert_manifest().to_string()).unwrap();
-    let mut options = with_layout(RTX_5090, ranks);
+    let mut options = with_layout(PRO_TOTAL_BYTES, ranks);
     options.vision = crate::plan::MediaMode::Off;
     let layout = options.layout.as_mut().unwrap();
     layout.workspace_manifest = Some(programs);
-    layout.physical_sms = Some(170);
+    layout.physical_sms = Some(188);
     layout.native_mtp_layers = 5;
     options
 }
 
-/// The Spark intake each lane's device link allocates: GPU planes on a card the NIC can land in;
-/// on a GeForce card one GPU row per rank plus pinned host planes. Per rank these are the
-/// runtime's own memory ledger (24 Oct, TP2 on the 5090, one lane of 4096 rows): device
-/// `spark-intake` 24,576 B and pinned `spark-intake` 100,663,296 B for two ranks.
+/// The one Spark link's return slots: a GPU plane of a unit's rows per wave and rank, where the NIC
+/// lands every reply (the shared `prefill_return_bytes`), whatever the shape; host admission charges
+/// the same waves on one transport.
 #[test]
-fn spark_intake_is_charged_where_each_card_lands_it() {
+fn spark_intake_is_every_waves_return_slots_on_the_gpu() {
     let dir = snapshot(false, false);
-    let intake = |report: &crate::plan::PlanReport| {
+    for (ranks, rows, waves) in [(3u64, 4096u64, 1u64), (3, 4096, 2), (2, 2048, 4), (6, 2752, 3), (4, 1024, 3)] {
+        let mut options = native_options(dir.path(), ranks as usize);
+        let layout = options.layout.as_mut().unwrap();
+        (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (rows, waves, 0);
+        (layout.concurrency, layout.context_tokens, layout.pool_tokens) = (16, 65536, Some(65536));
+        let report = plan::plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{:?}", report.hints);
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_transports),
+            (Some(rows), Some(waves), Some(rows * waves), Some(1)));
         let gpu = report.memory_layout.as_ref().unwrap().devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap()
             .items.iter().find(|i| i.group == "MiniMax spark_intake").unwrap().bytes;
+        assert_eq!(gpu, crate::serving_capacity::prefill_return_bytes(waves, rows, ranks, 6144), "TP{ranks} {waves}x{rows}");
         let host = report.host_ledger.as_ref().unwrap().items.iter().find(|i| i.group == "spark-intake").unwrap().bytes;
-        (gpu, host)
-    };
-    let (ranks, gpu_row, host_plane) = (3, 24_576 / 2, 100_663_296 / 2);
-    for lanes in [1u64, 2] {
-        let mut options = native_5090_options(dir.path(), ranks);
-        let layout = options.layout.as_mut().unwrap();
-        (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (4096, lanes, 0);
-        (layout.concurrency, layout.context_tokens, layout.pool_tokens) = (16, 65536, Some(65536));
-        let geforce = plan::plan(dir.path(), &options).unwrap();
-        assert_eq!(intake(&geforce), (lanes * ranks as u64 * gpu_row, lanes * ranks as u64 * host_plane),
-            "{lanes} lanes on the 5090");
+        assert_eq!(host, gpu, "TP{ranks} {waves}x{rows}: host-mode bound of the same slots");
+    }
+}
+
+/// MiniMax on an RTX 5090 is not supported on this engine yet: `cuteafd plan` names it, with a
+/// layout or without.
+#[test]
+fn rtx_5090_is_refused_by_name() {
+    let dir = snapshot(false, false);
+    let named = |report: &crate::plan::PlanReport| report.hints.iter()
+        .any(|h| h.what.contains("MiniMax on an RTX 5090 is not supported on this engine yet"));
+    for ranks in [2, 3, 4, 6] {
+        let mut options = native_options(dir.path(), ranks);
+        (options.layout.as_mut().unwrap().rtx_bytes, options.layout.as_mut().unwrap().native_mtp_layers) = (vec![RTX_5090], 0);
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(!report.placement_supported && !report.wip_launchable() && named(&report), "{:?}", report.hints);
         options.layout.as_mut().unwrap().rtx_bytes = vec![PRO_TOTAL_BYTES];
         let pro = plan::plan(dir.path(), &options).unwrap();
-        assert_eq!(intake(&pro).0, lanes * ranks as u64 * host_plane, "{lanes} lanes on the PRO 6000 land on the GPU");
+        assert!(pro.wip_launchable() && !named(&pro), "{:?}", pro.hints);
+    }
+    let inventory = plan::plan(dir.path(), &PlanOptions { coordinator_budget_bytes: RTX_5090,
+        placement: ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
+    assert!(named(&inventory), "{:?}", inventory.hints);
+}
+
+/// The RTX PRO 6000 cards (the example configs' shapes: 64 sequences, the checkpoint's context, FP8
+/// K/V, DFlash2 with its default rings, automatic vision, the default Spark budget) on the units
+/// contract: #762's shape, one Spark transport, an execution slot per wave on every rank, and every
+/// rank within its budget. The coordinator image's expert package carries its TP1 layout only, so
+/// Spark scratch is the estimate, as on a real launch.
+#[test]
+fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
+    use crate::plan::{encoder::EncoderKind, MediaMode};
+    let dir = snapshot(true, false);
+    let drafter = tempfile::tempdir().unwrap();
+    std::fs::write(drafter.path().join("config.json"), testing::minimax_dflash2_config().to_string()).unwrap();
+    for (ranks, unit, waves) in [(2usize, 4096u64, 2u64), (3, 4096, 2), (4, 4096, 2), (6, 2752, 3)] {
+        let mut options = native_options(dir.path(), ranks);
+        let mut package = admission::tests::expert_manifest();
+        package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
+        std::fs::write(dir.path().join("fp8/fp8-minimax-nvfp4a4/manifest.json"), package.to_string()).unwrap();
+        options.vision = MediaMode::Auto;
+        let layout = options.layout.as_mut().unwrap();
+        (layout.native_mtp_layers, layout.concurrency) = (0, 64);
+        layout.minimax_drafter_snapshot = Some(drafter.path().to_path_buf());
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.wip_launchable(), "TP{ranks}: {:?}", report.hints);
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_transports),
+            (Some(unit), Some(waves), Some(unit * waves), Some(1)), "TP{ranks}");
+        let memory = report.memory_layout.as_ref().unwrap();
+        assert!(memory.pool_tokens > 1_000_000, "TP{ranks}: {} pool tokens", memory.pool_tokens);
+        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes), "TP{ranks}");
+        assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "TP{ranks}: {:?}", memory.notes);
+        let sparks = memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
+        assert_eq!(sparks.len(), ranks);
+        for spark in &sparks {
+            let slots = spark.items.iter().find(|i| i.group == "execution slots").unwrap();
+            assert_eq!(slots.format, format!("{} more", waves - 1), "TP{ranks}");
+            let item = |name: &str| spark.items.iter().find(|i| i.group == name).unwrap().bytes;
+            assert_eq!(slots.bytes, (waves - 1) * (item("expert intake") + item("expert package scratch")), "TP{ranks}");
+        }
+        // One endpoint's rings per rank on the coordinator host.
+        let host = report.host_ledger.as_ref().unwrap();
+        let rings = host.items.iter().find(|i| i.group == "transport/rdma-rings").unwrap().bytes;
+        let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
+        let geometry = cuteafd_core::ExpertGeometry::MINIMAX_M3;
+        let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+        let ring = cuteafd_core::SparkRings { max_frame_bytes: (64 << 20).max(request).max(response), depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        assert_eq!(rings, endpoint.ring_bytes(geometry, ring).unwrap() as u64 * ranks as u64, "TP{ranks}");
+        // The tower: on the GPU at TP2, on Spark rank 0 from TP3 (the ranks have room beside the experts).
+        assert_eq!(report.encoder.as_ref().unwrap().kind,
+            if ranks == 2 { EncoderKind::Rtx { gpu: 0 } } else { EncoderKind::Spark { rank: 0 } }, "TP{ranks}");
     }
 }
 
@@ -385,7 +461,7 @@ fn spark_intake_is_charged_where_each_card_lands_it() {
 fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(false, true);
-    let options = native_5090_options(dir.path(), 4);
+    let options = native_options(dir.path(), 4);
     let baseline = plan::plan(dir.path(), &options).unwrap();
     assert!(baseline.placement_supported, "{:?}", baseline.hints);
     // One sequence of 256-row prefill chunks: what C1 serving needs, DSpark kept.
@@ -410,7 +486,7 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
     assert!(pool(&sized) > pool(&baseline));
     assert!(pool(&host) > pool(&baseline));
     for ranks in [2, 3, 4, 6] {
-        let mut combined = native_5090_options(dir.path(), ranks);
+        let mut combined = native_options(dir.path(), ranks);
         c1(&mut combined);
         combined.layout.as_mut().unwrap().host_embedding = true;
         let report = plan::plan(dir.path(), &combined).unwrap();
@@ -429,7 +505,7 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
 #[test]
 fn minimax_draft_context_slots_honor_explicit_shapes() {
     let dir = snapshot(false, true);
-    let mut options = native_5090_options(dir.path(), 4);
+    let mut options = native_options(dir.path(), 4);
     let layout = options.layout.as_mut().unwrap();
     layout.prefill_rows = 512;
     layout.concurrency = 4;
@@ -461,7 +537,7 @@ fn tp6_holds_every_routed_layer_in_six_equal_slices() {
     use crate::plan::{encoder::EncoderKind, MediaMode};
     let dir = snapshot(true, false);
     let planned = |ranks| {
-        let mut options = native_5090_options(dir.path(), ranks);
+        let mut options = native_options(dir.path(), ranks);
         options.vision = MediaMode::Auto;
         let layout = options.layout.as_mut().unwrap();
         (layout.rtx_bytes, layout.physical_sms, layout.native_mtp_layers) = (vec![PRO_TOTAL_BYTES], Some(188), 0);

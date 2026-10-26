@@ -1,7 +1,7 @@
 //! Allocation recipe shared by native serving and manifest-backed planning.
 use std::collections::BTreeMap;
 use crate::formats::native_dense::RankWeightLayout;
-use crate::serving_capacity::{prefill_lanes::{lane_capacity, MAX_PREFILL_LANES}, spark_intake_bytes};
+use crate::serving_capacity::{prefill_return_bytes, prefill_waves, PrefillShape};
 use crate::families::minimax_m3::{cache::{MiniMaxCacheLayout, PAGE_ROWS}, config::MiniMaxM3Config};
 use crate::families::qwen4::Qwen4KvCache;
 use serde_json::Value;
@@ -30,9 +30,12 @@ fn product(values: &[u64]) -> Result<u64> {
     values.iter().try_fold(1u64, |a, b| a.checked_mul(*b).ok_or(AdmissionError::Overflow("product")))
 }
 
+/// The prefill shape and Spark exchange one coordinator admits (PLAN "Prefill contract"): `lanes`
+/// waves of `rows` rows each in flight on one Spark link, which decode shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeSizing {
-    /// Rows of one prefill lane (and of a serial chunk): the most rows any program launch takes.
+    /// Rows of one prefill unit (`--prefill-rows`), one wave on the Spark link: the most rows any
+    /// program launch takes.
     pub rows: usize,
     pub decode_rows: usize,
     pub sequences: usize,
@@ -42,26 +45,35 @@ pub struct RuntimeSizing {
     /// row when full prefill logits are served. Prefill otherwise projects
     /// only the rows whose logits a request needs.
     pub logit_rows: usize,
-    /// Prefill lanes (`--prefill-lanes`, `serving_capacity::prefill_lanes`): a chunk of up to
-    /// `lanes` x `rows` rows, one Spark endpoint per lane on every rank.
+    /// Prefill waves in flight on the one Spark link (`--prefill-waves`): a call spans up to
+    /// `lanes` units, each wave with its own return slot on every rank. The runtime's lane loop
+    /// runs them as that many lanes until its prefill moves onto the shared executor.
     pub lanes: usize,
-    /// Spark partials land in pinned host planes (a card without dma-buf, as GeForce): each
-    /// lane's GPU intake then holds one row per rank, and its planes are host memory.
+    /// No admission effect: MiniMax serves coordinators whose memory the NIC lands Spark replies
+    /// in (RTX PRO 6000), so every wave's return slots are device planes. Kept until the Spark link
+    /// stops taking it.
     pub host_landing: bool,
 }
 impl RuntimeSizing {
-    /// Rows of the longest prefill chunk, which the per-row buffers hold: lanes cut on KV pages.
-    pub fn chunk_rows(self) -> usize { lane_capacity(self.lanes, self.rows, PAGE_ROWS as usize) }
+    /// The prefill unit shape this sizing admits.
+    pub fn shape(self) -> PrefillShape { PrefillShape { unit_rows: self.rows as u64, waves: self.lanes as u64 } }
+    /// Rows of the longest prefill call, which the per-row buffers hold: one unit per wave in flight.
+    pub fn slot_rows(self) -> usize { self.rows * self.lanes }
+    /// [`Self::slot_rows`], the name the runtime's lane loop reads until it moves onto prefill units.
+    pub fn chunk_rows(self) -> usize { self.slot_rows() }
     /// Head rows for a server: every prefill row with full prefill logits,
     /// otherwise decode rows or the drafter's block rows, whichever is wider.
     pub fn head_rows(rows: usize, full_prefill_logits: bool, draft_rows: usize) -> usize {
         if full_prefill_logits { rows } else { rows.min(64).max(draft_rows).min(rows) }
     }
     pub fn validate(self, cfg: &MiniMaxM3Config) -> Result<()> {
-        if !(1..=4096).contains(&self.rows) || !(1..=64).contains(&self.decode_rows)
-            || !(1..=MAX_PREFILL_LANES).contains(&self.lanes)
+        // One wave may take any rows a launch holds (golden's windows); several cut the call on
+        // whole KV pages, as the shared unit shape requires.
+        let shape = if self.lanes == 1 { (1..=4096).contains(&self.rows) } else {
+            self.shape().validate().is_ok() && self.rows % PAGE_ROWS as usize == 0 };
+        if !shape || !(1..=64).contains(&self.decode_rows)
             || self.sequences == 0 || self.sequences > self.decode_rows || self.sequences > self.rows
-            || self.logit_rows < self.decode_rows || self.logit_rows > self.chunk_rows() {
+            || self.logit_rows < self.decode_rows || self.logit_rows > self.slot_rows() {
             return Err(AdmissionError::Unsupported("row capacity or sequence count"));
         }
         if self.context == 0 || self.context > cfg.max_position as u64 {
@@ -72,6 +84,27 @@ impl RuntimeSizing {
         }
         cfg.release_geometry().map_err(|e| manifest(e.to_string()))
     }
+    /// Execution slots every Spark rank runs (the shared rule, `plan::layout::spark_execution_slots`):
+    /// one per prefill wave in flight; decode keeps one request per rank.
+    pub fn execution_slots(self) -> u8 {
+        crate::plan::layout::spark_execution_slots("minimax_m3", self.lanes as u64, 1)
+    }
+    /// The one Spark endpoint decode and prefill share: a wave of up to a unit's rows, BF16 in.
+    pub fn spark_endpoint(self) -> std::result::Result<cuteafd_core::SparkEndpoint, std::num::TryFromIntError> {
+        Ok(cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(self.rows)?,
+            ingress: cuteafd_core::SparkIngress::Bf16 })
+    }
+}
+
+/// The prefill shape a plan or server admits when it names none, after #762: the 8192-row reserve
+/// split into `planned_waves(spark_ranks)` units of `unit_rows(k)` (2 x 4096 below six Sparks,
+/// 3 x 2752 at six). Explicit waves pin k, and their unit follows k unless the rows are pinned too.
+/// A 2752-row wave runs on the expert package's 4096-row programs, which take any rows up to their
+/// capacity, so six Sparks need no other export.
+pub fn prefill_shape(rows: u64, waves: u64, spark_ranks: usize) -> anyhow::Result<PrefillShape> {
+    let waves = if waves > 0 { waves } else { prefill_waves::planned_waves(spark_ranks) };
+    let unit_rows = if rows > 0 { rows } else { prefill_waves::unit_rows(waves) };
+    PrefillShape { unit_rows, waves }.validate()
 }
 
 pub const PROGRAM_NAMES: &[&str] = &[
@@ -144,7 +177,7 @@ impl ProgramSizes {
 }
 
 /// Buffers with one row per batch row: (name, elements per row, bytes per
-/// element). A prefill lane's view of one starts at its first row.
+/// element). A prefill unit's view of one starts at its first row.
 pub const ROW_BUFFERS: &[(&str, u64, u64)] = &[
     ("residual", 6144, 4), ("embedded", 6144, 2), ("norm", 6144, 2), ("q", 8192, 2), ("q_norm", 8192, 2),
     ("kv", 1024, 2), ("k", 512, 2), ("k_norm", 512, 2), ("v", 512, 2),
@@ -168,7 +201,7 @@ pub struct RuntimeLedger {
 impl RuntimeLedger {
     pub fn new(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, programs: &ProgramSizes) -> Result<Self> {
         sizing.validate(cfg)?;
-        let (r, d, h) = (sizing.chunk_rows() as u64, programs.decode_capacity(), cfg.hidden as u64);
+        let (r, d, h) = (sizing.slot_rows() as u64, programs.decode_capacity(), cfg.hidden as u64);
         if d < sizing.decode_rows as u64 { return Err(manifest("decode capacity changed after validation")); }
         let mut allocations = Vec::new();
         let mut add = |name, dimensions: &[u64]| -> Result<()> {
@@ -200,10 +233,9 @@ impl RuntimeLedger {
         add("scratch", &[programs.workspace_bytes()])?;
         add("sampler", &[cuteafd_core::target_sampler_device_bytes(sizing.decode_rows, cfg.vocab_size) as u64])?;
         add("selector", &[sizing.decode_rows as u64, 12])?;
-        // Every lane's link has a GPU plane per rank: whole lanes with GPU landing, one row with
-        // host landing (its pinned planes are host memory, charged by the host layout).
-        let intake_rows = if sizing.host_landing { 1 } else { sizing.rows as u64 };
-        add("spark_intake", &[spark_intake_bytes(sizing.lanes as u64, sizing.spark_ranks as u64, intake_rows, h)])?;
+        // The Spark link's return slots: one BF16 device plane of a unit's rows per wave and rank,
+        // where the NIC lands every reply.
+        add("spark_intake", &[prefill_return_bytes(sizing.lanes as u64, sizing.rows as u64, sizing.spark_ranks as u64, h)])?;
         let fixed_bytes = sum(allocations.iter().map(|a| a.bytes))?;
         Ok(Self { allocations, fixed_bytes })
     }
@@ -236,9 +268,9 @@ pub fn decode_graphs(sizing: RuntimeSizing, draft_rings: usize) -> Result<crate:
 }
 
 /// Most extend launches one prefill step makes: each request's rows split
-/// into tiles of at most `tile` rows, and at each lane cut.
+/// into tiles of at most `tile` rows, and at each unit cut.
 pub fn extend_launches(sizing: RuntimeSizing, tile: u64) -> u64 {
-    sizing.sequences as u64 + (sizing.chunk_rows() as u64).div_ceil(tile) + sizing.lanes as u64 - 1
+    sizing.sequences as u64 + (sizing.slot_rows() as u64).div_ceil(tile) + sizing.lanes as u64 - 1
 }
 
 /// Source scales are released after preparation completes; the MMA arrangement
@@ -465,11 +497,17 @@ pub struct Recipe {
     pub onboarding: Onboarding,
     /// Decode steps the warm-up records before ready; their bytes are reserved.
     pub graphs: crate::placement::inventory::StartupGraphs<usize>,
-    /// One Spark endpoint per prefill lane.
+    /// The one Spark endpoint decode and every prefill wave share ([`RuntimeSizing::spark_endpoint`]).
     pub endpoints: Vec<cuteafd_core::SparkEndpoint>,
     /// The package scratch on each Spark rank, when the package exports the world's layout.
     pub remote_scratch: Option<u64>,
-    /// Every Spark rank's bytes beside its experts: transport, package scratch and the runtime residual.
+    /// Execution slots every Spark rank runs ([`RuntimeSizing::execution_slots`]).
+    pub execution_slots: u8,
+    /// One execution slot's workspace on a Spark rank, as the worker admits it: the slot's BF16
+    /// inputs, routes and outputs at a unit's rows plus the package scratch (exported, or the estimate).
+    pub slot_workspace: u64,
+    /// Every Spark rank's bytes beside its experts: transport, every execution slot's workspace and
+    /// the runtime residual.
     pub remote_reserved: u64,
     pub reservations: Reservations,
 }
@@ -484,18 +522,19 @@ impl Recipe {
         let programs = ProgramSizes::from_manifest(programs, sizing)?;
         let ledger = RuntimeLedger::new(cfg, sizing, &programs)?;
         let weights = super::coordinator::resident_weights(checkpoint, request.host_embedding)?;
-        let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.rows)?,
-            ingress: cuteafd_core::SparkIngress::Bf16 }; sizing.lanes];
+        let endpoints = vec![sizing.spark_endpoint()?];
         let all_remote = crate::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.moe.iter().enumerate()
-            .filter_map(|(layer, &moe)| moe.then_some(layer)).collect(), spark_ranks: sizing.spark_ranks, prefill_lanes: sizing.lanes as u64 };
+            .filter_map(|(layer, &moe)| moe.then_some(layer)).collect(), spark_ranks: sizing.spark_ranks, prefill_lanes: 1 };
         let io = all_remote.rank_endpoints_io(0, catalog.routed_experts().geometry()?, &endpoints, request.rings)?;
         let world = format!("tp{}", sizing.spark_ranks);
         let remote_scratch = package.filter(|p| p["layouts"][&world].is_object())
             .map(|p| expert_workspace(p, sizing.spark_ranks, sizing.rows)).transpose()?;
         let scratch = remote_scratch.unwrap_or(REMOTE_SCRATCH_ESTIMATE_BYTES);
         let residual = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES;
-        let remote_reserved = sum([io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
-            scratch, residual])?;
+        // The worker sizes every execution slot alike: its I/O (the rank's intake) and the scratch.
+        let (execution_slots, slot_workspace) = (sizing.execution_slots(), sum([io.intake, scratch])?);
+        let remote_reserved = sum([product(&[slot_workspace, u64::from(execution_slots)])?, io.host_exchange,
+            io.row_indices, io.endpoint_staging, io.mapped_rings, residual])?;
         let remote = RemoteReserve { serve: remote_reserved, load: sum([scratch, residual])? };
         let with_vision = RemoteReserve { serve: sum([remote.serve, request.spark_vision_bytes])?,
             load: sum([remote.load, request.spark_vision_bytes])? };
@@ -524,14 +563,15 @@ impl Recipe {
         let reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes)
                 .context("MiniMax drafter reservation overflow")?, local_experts: onboarding.local_bytes,
             expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
-        Ok(Self { request, cache, ledger, programs, weights, onboarding, graphs, endpoints, remote_scratch, remote_reserved, reservations })
+        Ok(Self { request, cache, ledger, programs, weights, onboarding, graphs, endpoints, remote_scratch,
+            execution_slots, slot_workspace, remote_reserved, reservations })
     }
 
-    /// The Spark working set once onboarding chose the coordinator's routed layers.
+    /// The Spark working set once onboarding chose the coordinator's routed layers: one transport.
     pub fn working_set(&self) -> crate::placement::SparkWorkingSet {
         crate::placement::SparkWorkingSet { rtx_layers: self.onboarding.local_layers.clone(),
             spark_layers: self.onboarding.spark_layers.clone(), spark_ranks: self.request.sizing.spark_ranks,
-            prefill_lanes: self.request.sizing.lanes as u64 }
+            prefill_lanes: 1 }
     }
 
     /// Admit the KV pool into `available` bytes beside the reservations. The load peak adds the
@@ -625,21 +665,65 @@ pub(crate) mod tests {
 
     #[test]
     fn minimax_row_buffers_hold_one_row_per_chunk_row() {
-        for lanes in [1, 2, 4] {
+        for lanes in [1, 2, 3, 4] {
             let sizing = RuntimeSizing { lanes, ..sizing() };
             let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
             let ledger = RuntimeLedger::new(&config(), sizing, &programs).unwrap();
-            // Lane views stride these by row: each holds exactly lanes x rows x its row bytes.
-            assert_eq!(sizing.chunk_rows(), lanes * 256);
+            // Unit views stride these by row: each holds exactly waves x unit rows x its row bytes.
+            assert_eq!((sizing.slot_rows(), sizing.chunk_rows()), (lanes * 256, lanes * 256));
+            assert_eq!(sizing.shape().slot_rows(), sizing.slot_rows() as u64);
             for &(name, width, bytes) in ROW_BUFFERS {
-                assert_eq!(ledger.bytes(name), Some((sizing.chunk_rows() as u64 * width * bytes).max(256)), "{name}");
+                assert_eq!(ledger.bytes(name), Some((sizing.slot_rows() as u64 * width * bytes).max(256)), "{name}");
             }
-            // Every lane's link holds one plane of a lane's rows per rank.
+            // The one link's return slots: a unit's rows per wave and rank, as the shared contract charges them.
             assert_eq!(ledger.bytes("spark_intake"), Some(lanes as u64 * 3 * 256 * 6144 * 2));
+            assert_eq!(ledger.bytes("spark_intake"), Some(crate::serving_capacity::prefill_return_bytes(lanes as u64, 256, 3, 6144)));
             assert_eq!(extend_launches(sizing, 1024), 16 + 1 + lanes as u64 - 1);
+            // One execution slot per wave in flight on every rank.
+            assert_eq!(sizing.execution_slots(), lanes as u8);
         }
         assert!(RuntimeSizing { lanes: 0, ..sizing() }.validate(&config()).is_err());
         assert!(RuntimeSizing { lanes: 5, ..sizing() }.validate(&config()).is_err());
+        // Several waves cut on whole KV pages; one wave takes any rows a launch holds.
+        let unaligned = RuntimeSizing { rows: 100, sequences: 1, decode_rows: 64, logit_rows: 64, ..sizing() };
+        assert!(RuntimeSizing { lanes: 2, ..unaligned }.validate(&config()).is_err());
+        assert!(RuntimeSizing { lanes: 1, ..unaligned }.validate(&config()).is_ok());
+        assert!(RuntimeSizing { rows: 4160, lanes: 1, ..sizing() }.validate(&config()).is_err());
+    }
+
+    /// #762 picks the waves for the topology and the unit for the waves; explicit waves or rows pin
+    /// them. Six Sparks run three 2752-row waves, the 8192-row reserve rounded up to whole pages.
+    #[test]
+    fn prefill_shape_follows_the_adaptive_wave_defaults_unless_pinned() {
+        let shape = |rows, waves, ranks| prefill_shape(rows, waves, ranks).map(|s| (s.unit_rows, s.waves, s.slot_rows()));
+        for ranks in [2, 3, 4] { assert_eq!(shape(0, 0, ranks).unwrap(), (4096, 2, 8192)); }
+        assert_eq!(shape(0, 0, 6).unwrap(), (2752, 3, 8256));
+        assert_eq!(shape(0, 0, 0).unwrap(), (4096, 1, 4096));
+        // Pinned waves take their own unit; pinned rows keep theirs.
+        assert_eq!(shape(0, 2, 6).unwrap(), (4096, 2, 8192));
+        assert_eq!(shape(0, 4, 4).unwrap(), (2048, 4, 8192));
+        assert_eq!(shape(2048, 0, 4).unwrap(), (2048, 2, 4096));
+        assert_eq!(shape(1024, 3, 2).unwrap(), (1024, 3, 3072));
+        for (rows, waves) in [(100, 2), (4160, 1), (4096, 5), (32, 1)] { assert!(shape(rows, waves, 4).is_err(), "{rows} x {waves}"); }
+    }
+
+    /// A 2752-row wave needs no 2752-row export: the expert package runs it on the smallest capacity
+    /// that holds it (4096), and the coordinator's programs take any rows up to their capacity.
+    #[test]
+    fn six_spark_units_run_on_the_4096_row_capacities() {
+        assert_eq!(expert_workspace(&expert_manifest(), 6, 2752).unwrap(), 987_654_321);
+        assert_eq!(expert_workspace(&expert_manifest(), 1, 2752).unwrap(), 987_654_321);
+        let sizing = RuntimeSizing { rows: 2752, lanes: 3, spark_ranks: 6, ..sizing() };
+        assert!(ProgramSizes::from_manifest(&programs_manifest(), sizing).is_ok());
+        let ledger = RuntimeLedger::new(&config(), sizing, &ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap()).unwrap();
+        assert_eq!(ledger.bytes("residual"), Some(3 * 2752 * 6144 * 4));
+        assert_eq!(ledger.bytes("spark_intake"), Some(3 * 6 * 2752 * 6144 * 2));
+        assert_eq!(sizing.execution_slots(), 3);
+        // A program exported for fewer rows than a unit is refused.
+        let mut manifest = programs_manifest();
+        manifest["programs"].as_array_mut().unwrap().iter_mut().filter(|p| p["name"] == "minimax_norm")
+            .for_each(|p| p["capacity_rows"] = 2048.into());
+        assert!(ProgramSizes::from_manifest(&manifest, sizing).is_err());
     }
 
     #[test]
@@ -701,6 +785,40 @@ pub(crate) mod tests {
         assert_eq!((r.weights, r.local_experts, r.expert_workspace, r.headroom, r.graphs), (weights.resident_bytes,
             expert_resident_bytes(&catalog, &local, 1, 0)?, expert_workspace(&expert_manifest(), 1, 256)?, 2 << 30, 0));
         assert_eq!(r.media + r.pending_code + r.runtime_baseline + r.startup, 0);
+        Ok(())
+    }
+
+    /// One Spark endpoint carries decode and every wave; each rank runs one execution slot per wave
+    /// in flight, every slot the worker's whole workspace (its BF16 I/O at a unit's rows and the
+    /// package scratch), so a second wave reserves exactly one more.
+    #[test]
+    fn every_wave_in_flight_reserves_one_execution_slot_per_rank() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        testing::write_minimax_m3_snapshot(dir.path(), false, false);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        let catalog = crate::read_expert_catalog(dir.path())?;
+        let ring = crate::plan::layout::spark_ring_geometry(1);
+        let recipe = |lanes, package: Option<&Value>| Recipe::new(&cfg, &checkpoint, &catalog, &programs_manifest(), package, Request {
+            sizing: RuntimeSizing { rows: 4096, lanes, context: 4096, ..sizing() }, kv_format: Qwen4KvCache::Fp8,
+            local_layers: LocalLayers::Bottom(0), spark_budget: u64::MAX, spark_vision_bytes: 0, headroom: 0, draft_bytes: 0,
+            draft_rings: 0, draft_staging: 0, host_embedding: false, startup_graphs: false,
+            rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
+                slot_bytes: ring.slot_bytes, alignment: ring.alignment } });
+        let intake = 4096 * (6144 * 2 + 4 * 8 + 6144 * 2);
+        for package in [None, Some(expert_manifest())] {
+            let scratch = if package.is_some() { 987_654_321 } else { REMOTE_SCRATCH_ESTIMATE_BYTES };
+            let one = recipe(1, package.as_ref())?;
+            assert_eq!(one.endpoints, [RuntimeSizing { rows: 4096, ..sizing() }.spark_endpoint()?]);
+            assert_eq!((one.execution_slots, one.slot_workspace), (1, intake + scratch));
+            for lanes in [2, 3, 4] {
+                let waves = recipe(lanes, package.as_ref())?;
+                assert_eq!(waves.endpoints, one.endpoints, "one link at every wave count");
+                assert_eq!(waves.execution_slots, lanes as u8);
+                assert_eq!(waves.remote_reserved - one.remote_reserved, (lanes as u64 - 1) * (intake + scratch));
+                assert_eq!(waves.working_set().prefill_lanes, 1);
+            }
+        }
         Ok(())
     }
 

@@ -360,8 +360,8 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
         "mimo_v2" => lanes as usize,
-        // MiniMax keeps one transport per prefill lane until it moves onto prefill units.
-        "minimax_m3" => lanes as usize,
+        // Decode and every prefill wave share one link.
+        "minimax_m3" => 1,
         "qwen4" => 1,
         _ => 0,
     }
@@ -375,7 +375,7 @@ pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8)
     let prefill = match family {
         // V4.1's two transports carry both prefill encoder streams at once.
         "deepseek_v41" => 2,
-        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" => prefill_waves.max(1),
+        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" | "minimax_m3" => prefill_waves.max(1),
         _ => 1,
     };
     let decode = u64::from(decode_lanes.max(1));
@@ -489,6 +489,9 @@ mod selected_spark_io_tests {
         assert_eq!(spark_execution_slots("mimo_v2", 1, 2), 2);
         assert_eq!(spark_execution_slots("deepseek_v41", 1, 2), 2);
         assert_eq!(spark_execution_slots("qwen4", 1, 1), 1);
+        // MiniMax keeps every wave of its one link in flight on a slot of its own.
+        assert_eq!((1..=4).map(|waves| spark_execution_slots("minimax_m3", waves, 1)).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(spark_endpoints("minimax_m3", 3), 1);
         assert_eq!(spark_execution_slots("glm5", 9, 1), cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS);
         // A smaller unit with more waves costs more, smaller slots (no hard-wired 4096 x 2).
         assert_eq!(spark_slot_bytes("glm5", 2048) * 2, spark_slot_bytes("glm5", 4096));

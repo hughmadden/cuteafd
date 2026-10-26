@@ -71,7 +71,8 @@ mod tests {
     #[test]
     fn every_family_resolves_its_default_and_refuses_what_it_cannot_run() {
         for (family, default) in [("deepseek_v41", 2), ("mimo_v2", 1), ("glm5", 1), ("glm5_flash", 1),
-            ("deepseek_v4", 1), ("qwen4", 1), ("qwen3_5", 1), ("kimi_k3", 1), ("step5", 1)] {
+            ("deepseek_v4", 1), ("qwen4", 1), ("qwen3_5", 1), ("kimi_k3", 1), ("step5", 1),
+            ("minimax_m3", 1)] {
             assert_eq!(resolve(family, None, 16).unwrap(), default, "{family}");
             for lanes in [1, 2] {
                 let supported = match support(family) {

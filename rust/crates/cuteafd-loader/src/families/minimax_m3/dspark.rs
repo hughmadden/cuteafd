@@ -63,8 +63,8 @@ pub struct DraftMemory {
 
 impl DraftMemory {
     pub fn new(contract: &DsparkContract, slots: usize, rows: usize, sms: usize) -> Result<Self, DsparkError> {
-        // Taps hold a whole prefill chunk: up to the most lanes of 4096 rows.
-        const _: () = assert!(crate::serving_capacity::prefill_lanes::MAX_PREFILL_LANES * 4096 == 16384);
+        // Taps hold a whole prefill call: up to the most waves of 4096-row units.
+        const _: () = assert!(crate::serving_capacity::prefill_waves::MAX_WAVES * 4096 == 16384);
         if !(1..=64).contains(&slots) || !(7..=16384).contains(&rows) || !(1..=(i32::MAX / 2) as usize).contains(&sms) {
             return Err(DsparkError::Memory("requires 1..64 slots, 7..16384 rows and a positive SM count"));
         }

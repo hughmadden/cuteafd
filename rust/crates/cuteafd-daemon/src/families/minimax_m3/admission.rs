@@ -36,9 +36,23 @@ pub(super) fn local_package(native_lib: &Path) -> Result<(PathBuf, Option<serde_
     Ok((directory, manifest))
 }
 
-/// The ring geometry the server's Spark links register.
+/// The ring geometry the server's Spark link registers.
 pub(super) fn spark_rings() -> Result<cuteafd_core::SparkRings> {
     crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)
+}
+
+/// The worker admission serve seals to every Spark rank: the one endpoint decode and every prefill
+/// wave share (a unit's rows, BF16 in), and one execution slot per wave in flight, as the recipe
+/// charges them ([`RuntimeSizing::execution_slots`]). Serve's start-up takes it with the one-link
+/// Spark exchange; until then it opens a refusing link per wave.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn spark_model(sizing: RuntimeSizing) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    let endpoint = sizing.spark_endpoint()?;
+    let mut model = cuteafd_transport::worker_selection::ModelAdmission::for_clients(cuteafd_core::ExpertGeometry::MINIMAX_M3,
+        endpoint, endpoint.capacity, spark_rings()?, 1)?;
+    model.execution_slots = sizing.execution_slots();
+    model.validate(cuteafd_core::ExpertGeometry::MINIMAX_M3)?;
+    Ok(model)
 }
 
 /// Admit `request` into `available` measured free bytes: already capped by the logical device
@@ -95,6 +109,22 @@ mod tests {
         Ok(())
     }
 
+    /// Serve seals one endpoint (decode and every wave) and an execution slot per wave in flight to
+    /// every rank: what the shared recipe charges each rank for.
+    #[test]
+    fn minimax_spark_model_seals_one_endpoint_and_a_slot_per_wave() -> Result<()> {
+        for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+            let sizing = RuntimeSizing { rows, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
+                logit_rows: 64, lanes, host_landing: false };
+            let model = spark_model(sizing)?;
+            assert_eq!(model.endpoints, [sizing.spark_endpoint()?]);
+            assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (rows as u32, rows as u32, lanes as u8));
+            assert_eq!(model.execution_slots, sizing.execution_slots());
+            model.require_clients(sizing.spark_endpoint()?, 1)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn minimax_runtime_and_manifest_plan_share_allocation_bytes() -> Result<()> {
         runtime_and_manifest_plan_share_allocation_bytes(false, None)
@@ -105,10 +135,11 @@ mod tests {
         runtime_and_manifest_plan_share_allocation_bytes(true, None)
     }
 
-    /// An exported Spark scratch large enough to onboard layers moves both ledgers alike.
+    /// An exported Spark scratch large enough to onboard layers (each rank runs two execution slots
+    /// of it, one per wave) moves both ledgers alike.
     #[test]
     fn minimax_exported_remote_scratch_onboards_alike_in_plan_and_server() -> Result<()> {
-        runtime_and_manifest_plan_share_allocation_bytes(false, Some(40 << 30))
+        runtime_and_manifest_plan_share_allocation_bytes(false, Some(20 << 30))
     }
 
     fn runtime_and_manifest_plan_share_allocation_bytes(host_embedding: bool, remote_scratch: Option<u64>) -> Result<()> {
@@ -133,9 +164,12 @@ mod tests {
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
             && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
+        // The plan's #762 waves at TP3, with its 256-row units.
+        let lanes = admission::prefill_shape(256, 0, 3)?.waves as usize;
+        assert_eq!(lanes, 2);
         let request = Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
-                lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
+                lanes, host_landing: false },
             kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
             spark_budget: cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0,
             headroom: 0, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
@@ -163,27 +197,16 @@ mod tests {
         Ok(())
     }
 
-    /// The 5090's shipped 31.8 GiB budget.
-    #[test]
-    fn minimax_5090_auto_vision_plans_the_tower_and_pool_serve_admits() -> Result<()> {
-        auto_vision_plans_the_tower_and_pool_serve_admits(34_144_990_003)
-    }
-
-    #[test]
-    fn minimax_pro6000_auto_vision_plans_the_tower_and_pool_serve_admits() -> Result<()> {
-        auto_vision_plans_the_tower_and_pool_serve_admits(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES)
-    }
-
-    /// Automatic vision at the shipped TP2 shapes (64 sequences, two 4096-row lanes, the checkpoint's
-    /// context, FP8 K/V, an automatic pool, the default Spark budget and 2 GiB headroom), speculator
-    /// off and DFlash2 with its default rings, on a coordinator of `rtx` bytes. The planner keeps the
+    /// Automatic vision at the shipped TP2 shapes (64 sequences, the plan's two 4096-row waves, the
+    /// checkpoint's context, FP8 K/V, an automatic pool, the default Spark budget and 2 GiB headroom),
+    /// speculator off and DFlash2 with its default rings, on an RTX PRO 6000. The planner keeps the
     /// bundled tower on the coordinator GPU, as serve-minimax does, and plans the server's pool: the
     /// text admission, readmitted into what the loaded tower leaves.
-    fn auto_vision_plans_the_tower_and_pool_serve_admits(rtx: u64) -> Result<()> {
-        use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation,
-            minimax_m3::{cache::PAGE_ROWS, dflash::DflashMemory}},
-            placement::inventory::ArchContext, plan::{encoder::EncoderKind, MediaMode},
-            serving_capacity::prefill_lanes::{lane_capacity, DEFAULT_PREFILL_LANES}};
+    #[test]
+    fn minimax_pro6000_auto_vision_plans_the_tower_and_pool_serve_admits() -> Result<()> {
+        use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation, minimax_m3::dflash::DflashMemory},
+            placement::inventory::ArchContext, plan::{encoder::EncoderKind, MediaMode}};
+        let rtx = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         use cuteafd_core::memory_layout::{Category, DeviceKind};
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), true, false);
@@ -196,7 +219,8 @@ mod tests {
         std::fs::write(dir.path().join("fp8/fp8-minimax-nvfp4a4/manifest.json"), package(None).to_string())?;
         let drafter = tempfile::tempdir()?;
         std::fs::write(drafter.path().join("config.json"), testing::minimax_dflash2_config().to_string())?;
-        let (rows, sequences, lanes, headroom) = (4096, 64, DEFAULT_PREFILL_LANES, 2u64 << 30);
+        let shape = admission::prefill_shape(0, 0, 2)?;
+        let (rows, sequences, lanes, headroom) = (shape.unit_rows as usize, 64, shape.waves as usize, 2u64 << 30);
         let rings = admission::default_draft_rings(sequences, admission::DECODE_ROWS);
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let arch = ArchContext::coordinator(rtx, None);
@@ -220,8 +244,7 @@ mod tests {
                 GlmDraftRepresentation::Fp8Only, Qwen4KvCache::Fp8)).transpose()?;
             let sizing = RuntimeSizing { rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences,
                 context: cfg.max_position as u64, spark_ranks: 2,
-                logit_rows: RuntimeSizing::head_rows(lane_capacity(lanes, rows, PAGE_ROWS as usize), false, 0),
-                lanes, host_landing: !arch.gpu_landing };
+                logit_rows: RuntimeSizing::head_rows(shape.slot_rows() as usize, false, 0), lanes, host_landing: false };
             let request = Request { sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
                 spark_budget: admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0, headroom,
                 draft_bytes: draft.map_or(0, |d| d.bytes), draft_rings: draft.map_or(0, |d| d.slots),
