@@ -263,7 +263,7 @@ impl Family for MiniMaxM3 {
             }),
             Component::RoutedExpert => Some(Hint {
                 what: "MiniMax M3 native NVFP4 W4A4 expert execution awaits device qualification".into(),
-                how: "Install fp8-minimax-nvfp4a4 with SwiGLU-OAI activation code 3: Spark TP2/TP3/TP4, and TP1 for onboarded \
+                how: "Install fp8-minimax-nvfp4a4 with SwiGLU-OAI activation code 3: Spark TP2/TP3/TP4/TP6, and TP1 for onboarded \
                     bottom routed layers. Compressed-tensors divisor scales load from mounted checkpoints (push images copy \
                     scales unchanged).".into(),
             }),

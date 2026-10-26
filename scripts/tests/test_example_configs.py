@@ -26,7 +26,7 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
 # test_serve_launch_new_families.py and test_minimax_launch.py.
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config"}
 QUALIFICATION |= {f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config"
-                  for card in ("5090", "pro6000") for tp in (2, 3, 4)}
+                  for card in ("5090", "pro6000") for tp in (2, 3, 4)} | {"minimax-m31-flash-nvfp4-pro6000-tp6.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
 

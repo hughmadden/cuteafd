@@ -89,8 +89,8 @@ impl<'a> Routed<'a> {
                 && info.activation==cuteafd_ffi::fp8_moe::Fp8MoeActivation::SwigluOai && info.swiglu_limit==7.0,
                 MiniMaxError::Unsupported("RTX experts require MiniMax TP1 NVFP4 W4A4"));
         }
-        if let Some(Spark(links))=&spark { ensure!(!links.is_empty() && links.iter().all(|l|matches!(l.world_size(),2|3|4)),
-            MiniMaxError::Unsupported("Spark experts require TP2, TP3 or TP4")); }
+        if let Some(Spark(links))=&spark { ensure!(!links.is_empty() && links.iter().all(|l|matches!(l.world_size(),2|3|4|6)),
+            MiniMaxError::Unsupported("Spark experts require TP2, TP3, TP4 or TP6")); }
         // Local layers run on the stream at collect, in any lane.
         let lanes=spark.as_ref().map_or(MAX_PREFILL_LANES,|Spark(links)|links.len());
         Ok(Self{local,spark,pending:(0..lanes).map(|_|None).collect(),kind:ExpertV2SourceKind::Decode,poisoned:false})

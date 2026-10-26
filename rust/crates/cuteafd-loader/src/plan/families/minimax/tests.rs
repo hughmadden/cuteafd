@@ -408,7 +408,7 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
     let pool = |r: &crate::plan::PlanReport| r.memory_layout.as_ref().unwrap().pool_tokens;
     assert!(pool(&sized) > pool(&baseline));
     assert!(pool(&host) > pool(&baseline));
-    for ranks in [2, 3, 4] {
+    for ranks in [2, 3, 4, 6] {
         let mut combined = native_5090_options(dir.path(), ranks);
         c1(&mut combined);
         combined.layout.as_mut().unwrap().host_embedding = true;
@@ -450,4 +450,37 @@ fn minimax_draft_context_slots_honor_explicit_shapes() {
     options.layout.as_mut().unwrap().draft_context_slots = Some(5);
     let refused = plan::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("draft context slots")));
+}
+
+/// Spark TP6 on the RTX PRO 6000: every routed layer in six equal 512-wide slices, smaller than
+/// a TP4 rank's, each rank charged the package's exported TP6 scratch, and the automatic tower on
+/// Spark rank 0.
+#[test]
+fn tp6_holds_every_routed_layer_in_six_equal_slices() {
+    use crate::plan::{encoder::EncoderKind, MediaMode};
+    let dir = snapshot(true, false);
+    let planned = |ranks| {
+        let mut options = native_5090_options(dir.path(), ranks);
+        options.vision = MediaMode::Auto;
+        let layout = options.layout.as_mut().unwrap();
+        (layout.rtx_bytes, layout.physical_sms, layout.native_mtp_layers) = (vec![PRO_TOTAL_BYTES], Some(188), 0);
+        plan::plan(dir.path(), &options).unwrap()
+    };
+    let (tp4, tp6) = (planned(4), planned(6));
+    assert!(tp6.wip_launchable(), "{:?}", tp6.hints);
+    let memory = tp6.memory_layout.as_ref().unwrap();
+    assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX") && n.ends_with("57 on 6 Sparks")),
+        "{:?}", memory.notes);
+    let sparks = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == DeviceKind::Spark).cloned().collect::<Vec<_>>();
+    let item = |device: &cuteafd_core::memory_layout::DeviceLayout, name: &str|
+        device.items.iter().find(|i| i.group == name).unwrap().bytes;
+    let ranks = sparks(&tp6);
+    assert_eq!(ranks.len(), 6);
+    let experts = item(&ranks[0], "routed expert weights");
+    assert!(ranks.iter().all(|d| item(d, "routed expert weights") == experts));
+    assert!(experts < item(&sparks(&tp4)[1], "routed expert weights"));
+    // The package exports tp6: each rank's scratch is its 4096-row capacity, not the estimate.
+    assert!(ranks.iter().all(|d| item(d, "expert package scratch") == 987_654_321));
+    assert_eq!(tp6.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
 }

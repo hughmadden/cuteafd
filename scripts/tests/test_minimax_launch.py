@@ -30,7 +30,7 @@ def _launch(tmp_path, keys="", *, ranks=4, **kwargs):
         + _hosts(ranks) + keys, encoder_plan=kwargs.pop("encoder_plan", PLANNED), **kwargs)
 
 
-@pytest.mark.parametrize("ranks", [2, 3, 4])
+@pytest.mark.parametrize("ranks", [2, 3, 4, 6])
 @pytest.mark.parametrize("kv", ["fp8", "bf16"])
 def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     result = _launch(tmp_path, f"KV_CACHE={kv}\nRTX_EXPERT_LAYERS=auto\n", ranks=ranks)
@@ -84,8 +84,8 @@ def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, k
     ("RTX_EXPERT_LAYERS=58\n", "checkpoint has 57 routed layers"),
     ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
     ("HOST_CACHE_STORE=always\n", "HOST_CACHE_STORE must be on-evict or on-retain"),
-    ("SPARK_COUNT=6\n", "requires Spark TP2, TP3 or TP4"),
-    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "requires Spark TP2, TP3 or TP4"),
+    ("SPARK_COUNT=5\n", "requires Spark TP2, TP3, TP4 or TP6"),
+    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "requires Spark TP2, TP3, TP4 or TP6"),
     ("CONCURRENCY=65\n", "CONCURRENCY must be 1..64"),
     ("PREFILL_BATCH_TOKENS=4097\n", "PREFILL_BATCH_TOKENS must be 1..4096"),
     ("CONCURRENCY=16\nPREFILL_BATCH_TOKENS=8\n", "CONCURRENCY must not exceed PREFILL_BATCH_TOKENS"),
@@ -190,15 +190,14 @@ CARD_MIB = {"5090": 32607, "pro6000": 101_973_491_712 >> 20}
 def _example_launch(tmp_path, pairs, card, tp):
     """The coordinator, plan and worker commands a WIP launch of these keys would start."""
     keys = "".join(f"{key}={value}\n" for key, value in pairs if key not in ("MODEL_ID", "MODEL_REVISION"))
-    result = _family_launch_result(tmp_path, CONFIG, MODEL, keys + _hosts(4), encoder_plan=PLANNED,
+    result = _family_launch_result(tmp_path, CONFIG, MODEL, keys + _hosts(max(tp, 4)), encoder_plan=PLANNED,
         gpu_total_mib=CARD_MIB[card], gpu_free_mib=CARD_MIB[card] - 500, extra_args=("--wip", "example"))
     commands = [re.sub(r"/tmp/\S*?/(hf|home|repo)/", r"<\1>/", line.strip()) for line in result.stderr.splitlines()
                 if any(name in line for name in ("serve-minimax --snapshot", "cuteafd plan", "cuteafd expertd-native"))]
     return result.returncode, sorted(commands)
 
 
-@pytest.mark.parametrize("card", ["5090", "pro6000"])
-@pytest.mark.parametrize("tp", [2, 3, 4])
+@pytest.mark.parametrize("card,tp", [(card, tp) for card in ("5090", "pro6000") for tp in (2, 3, 4)] + [("pro6000", 6)])
 def test_minimax_examples_state_only_what_differs_from_the_launcher(tmp_path, card, tp):
     example = ROOT / "examples/configs" / f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config"
     text = example.read_text()

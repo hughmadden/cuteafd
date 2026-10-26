@@ -76,12 +76,13 @@ MXFP8 linears. It is under qualification too: serve it from a `./wip.sh` slot
 whose binary has `serve-minimax` (`--wip SLOT`; `--dry-run` plans the launch
 without starting it). Each file states only what differs from the launcher's
 defaults: the Spark world, on the 5090 its GPU budget and `VISION=off`, and at
-TP3/TP4 no routed layers on the RTX.
+TP3, TP4 and TP6 no routed layers on the RTX. The TP6 example is planned
+offline and has not run on hardware yet.
 
-| Coordinator | Spark TP2 | Spark TP3 | Spark TP4 |
-| --- | --- | --- | --- |
-| RTX 5090 | [TP2](minimax-m31-flash-nvfp4-5090-tp2.config) | [TP3](minimax-m31-flash-nvfp4-5090-tp3.config) | [TP4](minimax-m31-flash-nvfp4-5090-tp4.config) |
-| RTX PRO 6000 | [TP2](minimax-m31-flash-nvfp4-pro6000-tp2.config) | [TP3](minimax-m31-flash-nvfp4-pro6000-tp3.config) | [TP4](minimax-m31-flash-nvfp4-pro6000-tp4.config) |
+| Coordinator | Spark TP2 | Spark TP3 | Spark TP4 | Spark TP6 |
+| --- | --- | --- | --- | --- |
+| RTX 5090 | [TP2](minimax-m31-flash-nvfp4-5090-tp2.config) | [TP3](minimax-m31-flash-nvfp4-5090-tp3.config) | [TP4](minimax-m31-flash-nvfp4-5090-tp4.config) | |
+| RTX PRO 6000 | [TP2](minimax-m31-flash-nvfp4-pro6000-tp2.config) | [TP3](minimax-m31-flash-nvfp4-pro6000-tp3.config) | [TP4](minimax-m31-flash-nvfp4-pro6000-tp4.config) | [TP6](minimax-m31-flash-nvfp4-pro6000-tp6.config) |
 
 The 5090 examples turn vision off, which frees the coordinator for KV: the
 bundled tower costs about 37,000 pool tokens there (with DFlash2 the served pool

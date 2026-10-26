@@ -67,8 +67,8 @@ impl RuntimeSizing {
         if self.context == 0 || self.context > cfg.max_position as u64 {
             return Err(AdmissionError::Unsupported("context outside the checkpoint extent"));
         }
-        if !matches!(self.spark_ranks, 0 | 2 | 3 | 4) {
-            return Err(AdmissionError::Unsupported("expert world outside local, TP2, TP3 or TP4"));
+        if !matches!(self.spark_ranks, 0 | 2 | 3 | 4 | 6) {
+            return Err(AdmissionError::Unsupported("expert world outside local, TP2, TP3, TP4 or TP6"));
         }
         cfg.release_geometry().map_err(|e| manifest(e.to_string()))
     }
@@ -301,7 +301,7 @@ pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedge
 
 /// The package manifest is selected explicitly; a missing capacity is refused.
 pub fn expert_workspace(manifest_value: &Value, world: usize, rows: usize) -> Result<u64> {
-    if !matches!(world, 1..=4) { return Err(AdmissionError::Unsupported("expert package TP degree")); }
+    if !matches!(world, 1..=4 | 6) { return Err(AdmissionError::Unsupported("expert package TP degree")); }
     let layout = format!("tp{world}");
     let info = &manifest_value["layouts"][&layout];
     if info["hidden"] != 6144 || info["intermediate"] != 3072 || info["experts"] != 128
@@ -580,7 +580,7 @@ pub(crate) mod tests {
         }).collect::<Vec<_>>()})
     }
     pub(crate) fn expert_manifest() -> Value {
-        let layouts = (1..=4).map(|world| (format!("tp{world}"), serde_json::json!({
+        let layouts = [1, 2, 3, 4, 6].into_iter().map(|world| (format!("tp{world}"), serde_json::json!({
             "hidden":6144,"intermediate":3072,"experts":128,"top_k":4,"tp":world,"slice":3072/world,
             "input":"bf16","weights":"nvfp4","activation":"swigluoai_uninterleave","projection":"bf16",
             "swiglu_limit":7.0,"abi_version":5,"capacities":[
@@ -669,8 +669,11 @@ pub(crate) mod tests {
         let programs = ProgramSizes::from_manifest(&programs_manifest(), local).unwrap();
         let ledger = RuntimeLedger::new(&config(), local, &programs).unwrap();
         assert_eq!(ledger.bytes("spark_intake"), Some(256));
-        for spark_ranks in [1, 5, 6] {
+        for spark_ranks in [1, 5, 7] {
             assert!(RuntimeSizing { spark_ranks, ..local }.validate(&config()).is_err());
+        }
+        for spark_ranks in [2, 3, 4, 6] {
+            assert!(RuntimeSizing { spark_ranks, ..local }.validate(&config()).is_ok());
         }
     }
 
@@ -766,6 +769,9 @@ pub(crate) mod tests {
         assert_eq!(expert_workspace(&manifest, 1, 256).unwrap(), 102_837_248);
         assert_eq!(expert_workspace(&manifest, 3, 257).unwrap(), 987_654_321);
         assert!(expert_workspace(&manifest, 3, 4097).is_err());
+        // Six Sparks run 512-wide slices; five have no package layout.
+        assert_eq!(expert_workspace(&manifest, 6, 256).unwrap(), 102_837_248);
+        assert!(expert_workspace(&manifest, 5, 256).is_err());
         manifest["layouts"]["tp3"]["activation"] = "silu_bf16_product".into();
         assert!(expert_workspace(&manifest, 3, 256).is_err());
     }
