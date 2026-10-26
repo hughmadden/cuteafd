@@ -16,7 +16,8 @@ pub mod step5;
 mod spark_intake;
 pub mod prefill_waves;
 pub use spark_intake::{prefill_return_bytes, select_prefill_shape, spark_intake_bytes, PrefillShape};
-// MiniMax-only until it moves onto prefill units; every other family uses `prefill_waves`.
+// The MiniMax runtime's lane loop only, until its prefill moves onto the shared executor: its
+// planner and admission plan prefill units (`PrefillShape`, `prefill_waves`) like every family.
 pub mod prefill_lanes;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;

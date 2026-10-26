@@ -125,6 +125,26 @@ mod tests {
         Ok(())
     }
 
+    /// The ledger's extend-launch tables cover the shared executor's cuts: a prefill call cut into
+    /// units (`prefill_units`), each unit tiled into extend launches of at most the 1024 rows the
+    /// index-prefill and attention-extend programs take.
+    #[test]
+    fn minimax_extend_launches_cover_every_unit_cut() -> Result<()> {
+        use crate::shared::prefill_pipeline::prefill_units;
+        for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (1024, 2), (256, 2)] {
+            let sizing = RuntimeSizing { rows, decode_rows: 64, sequences: 1, context: 1 << 20, spark_ranks: 4,
+                logit_rows: 64, lanes, host_landing: false };
+            let bound = admission::extend_launches(sizing, 1024);
+            for span in (1..=sizing.slot_rows()).step_by(37).chain([sizing.slot_rows()]) {
+                let units = prefill_units(span, rows, lanes, 256)?;
+                assert!(units.len() <= lanes && units.iter().all(|unit| unit.len() <= rows), "{lanes} x {rows}: span {span}");
+                let tiles: u64 = units.iter().map(|unit| (unit.len() as u64).div_ceil(1024)).sum();
+                assert!(tiles <= bound, "{lanes} x {rows}: span {span} cuts into {tiles} tiles, bound {bound}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn minimax_runtime_and_manifest_plan_share_allocation_bytes() -> Result<()> {
         runtime_and_manifest_plan_share_allocation_bytes(false, None)
