@@ -8,6 +8,39 @@ use serde::{Deserialize, Serialize};
 /// Native EXLR8 workers reuse one device arena across serial request chunks.
 pub const EXLR8_EXECUTION_ROWS: usize = 64;
 
+/// Capacity-specific execution payload from the selected installed packages.
+/// Mapped request/reply rings retain each network unit separately; device I/O
+/// and scratch are reused in stream order by one execution owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparkOwnerWorkspace {
+    pub scratch_bytes: u64,
+    pub io_bytes: u64,
+    pub pinned_staging_bytes: u64,
+    pub buffered_units: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparkWorkspaceBytes {
+    pub device_bytes: u64,
+    pub pinned_bytes: u64,
+}
+impl SparkWorkspaceBytes {
+    pub fn total(self) -> Option<u64> { self.device_bytes.checked_add(self.pinned_bytes) }
+}
+
+/// Shared planner/worker owner census. Unit buffering multiplies only pinned
+/// route staging, never compute scratch or stream-ordered device input planes.
+pub fn spark_owner_workspace_bytes(owners: impl IntoIterator<Item = SparkOwnerWorkspace>)
+    -> Option<SparkWorkspaceBytes> {
+    owners.into_iter().try_fold(SparkWorkspaceBytes::default(), |mut total, owner| {
+        if !(1..=4).contains(&owner.buffered_units) { return None; }
+        total.device_bytes = total.device_bytes.checked_add(owner.scratch_bytes)?.checked_add(owner.io_bytes)?;
+        total.pinned_bytes = total.pinned_bytes.checked_add(owner.pinned_staging_bytes
+            .checked_mul(u64::from(owner.buffered_units))?)?;
+        Some(total)
+    })
+}
+
 /// One persistent coordinator-to-Spark connection, resolved before allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -385,6 +418,24 @@ pub fn expert_geometry() -> ExpertGeometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_workspace_charges_scratch_once_and_retains_every_route_stage() {
+        use super::*;
+        let decode = SparkOwnerWorkspace { scratch_bytes: 7, io_bytes: 11,
+            pinned_staging_bytes: 13, buffered_units: 1 };
+        let prefill = SparkOwnerWorkspace { scratch_bytes: 101, io_bytes: 103,
+            pinned_staging_bytes: 107, buffered_units: 3 };
+        let bytes = spark_owner_workspace_bytes([decode, decode, prefill]).unwrap();
+        assert_eq!(bytes.device_bytes, 2 * (7 + 11) + 101 + 103);
+        assert_eq!(bytes.pinned_bytes, 2 * 13 + 3 * 107);
+        assert_eq!(bytes.total(), Some(bytes.device_bytes + bytes.pinned_bytes));
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { buffered_units: 0, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { buffered_units: 5, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { scratch_bytes: u64::MAX, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { pinned_staging_bytes: u64::MAX,
+            buffered_units: 3, ..decode }]).is_none());
+    }
+
     use super::*;
 
     #[test]
