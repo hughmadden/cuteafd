@@ -306,9 +306,14 @@ pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
     ensure!((1..=crate::serving_capacity::prefill_waves::MAX_WAVES as usize).contains(&waves)
         && (1..=LANE_ROWS_MAX).contains(&rows) && rows >= 64 * waves,
         "Kimi lane row/wave capacity: {rows} rows x {waves} waves");
-    Ok(prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
-        unit_rows: Some(unit.unwrap_or(rows / waves) as u64), waves: Some(waves as u64),
-        span_rows: Some(rows as u64), slots: None,
+    let unit = unit.unwrap_or(rows / waves) as u64;
+    // An adaptive lane's rows are the reserve of four admitted slots (#762).
+    // Only the starting depth's own unit (its estimate's shape) is admitted that way.
+    let slots = (rows as u64 != unit * waves as u64
+        && unit == crate::serving_capacity::prefill_waves::unit_rows(waves as u64))
+        .then_some(crate::serving_capacity::prefill_waves::MAX_WAVES);
+    Ok(prefill_shape(6, PrefillLimits { adaptive: true, ..PrefillLimits::default() }, PrefillOverrides {
+        unit_rows: Some(unit), waves: Some(waves as u64), span_rows: Some(rows as u64), slots,
     })?.units())
 }
 
@@ -445,6 +450,10 @@ mod tests {
         assert!(unit(4096, 2, Some(4096)).is_err(), "the lane holds both units");
         assert!(unit(8192, 2, Some(2048)).is_err(), "the lane cannot exceed the exact live units");
         assert!(unit(4097, 2, None).is_err(), "the lane cannot hide a rounded tail");
+        // An adaptive lane (#762): four admitted slots' reserve from the starting depth's unit.
+        assert_eq!(unit(8256, 2, Some(4096))?, 4096);
+        assert_eq!(unit(8256, 3, Some(2752))?, 2752);
+        assert!(unit(8256, 2, Some(2752)).is_err(), "only the starting depth's own unit");
         Ok(())
     }
 }
