@@ -33,7 +33,7 @@ python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" \
   --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json"
 
 docker_args=(
-  run --rm
+  run --rm --init
   -v "$repo_root:/workspace/cuteafd"
   -v "$hf_home:$hf_home:ro"
   -v "$hf_home:/root/.cache/huggingface:ro"
