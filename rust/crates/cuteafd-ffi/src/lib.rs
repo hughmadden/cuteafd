@@ -35,7 +35,6 @@ pub use shared::v41_experts::{
 };
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 mod cuda_runtime;
-mod pinned;
 pub mod host_isa;
 pub mod memory_ledger;
 pub mod synchronized_load;
@@ -475,7 +474,6 @@ mod allocatable_memory_tests {
 }
 
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
-pub use pinned::{transparent_hugepage_defrag, transparent_hugepage_mode, HugePagePinning, SlowHugepageFaults};
 pub mod nvml;
 #[cfg(feature = "test-support")]
 pub mod test_support;
