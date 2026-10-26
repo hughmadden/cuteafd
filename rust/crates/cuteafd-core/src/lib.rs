@@ -11,7 +11,7 @@ pub mod coordinator_programs;
 pub mod expert_geometry;
 pub mod spark_executions;
 pub use spark_executions::{covering_export, DecodeExecution, ExecutionAdmissionError, ExecutionOwner,
-    PrefillExecution, SparkExecutions, MAX_BUFFERED_PREFILL_UNITS, MAX_SPARK_DECODE_LANES};
+    OwnerBytes, OwnerExtent, PrefillExecution, SparkExecutions, MAX_BUFFERED_PREFILL_UNITS, MAX_SPARK_DECODE_LANES};
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy, EXL3_CAPACITIES,
     ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress, SparkRings, SparkRuntimeInventory, SparkSlice};
 mod draft_policy;

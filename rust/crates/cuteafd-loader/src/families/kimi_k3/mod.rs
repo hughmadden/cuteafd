@@ -25,11 +25,16 @@ pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 /// (#762 census). GlmFlashK64 does not retain the m16 specialization.
 pub const SPARK_SLOT_BYTES: u64 = 844_696_852;
 
-/// Use the same execution-slot reserve before placement and in its ledger.
+/// The Spark execution reserve used before placement and in its ledger: the
+/// runtime residual plus the typed owners (one prefill scratch at the ladder
+/// maximum, the decode owner, per-unit route staging times the waves).
 pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
-    let slots = crate::plan::layout::spark_execution_slots("kimi_k3", waves, 1)?;
-    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES
-        + u64::from(slots) * crate::plan::layout::spark_slot_bytes("kimi_k3", unit_rows))
+    let exports = crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::GlmFlashK64).exports();
+    let executions = crate::plan::spark_executions::admit_ladder("kimi_k3", &exports, None, unit_rows, waves)?;
+    let owners = executions.workspace_bytes(|extent| crate::plan::layout::spark_slots::exl3_owner_bytes(
+        "kimi_k3", cuteafd_core::ExpertGeometry::KIMI_K3, extent))?
+        .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Kimi Spark owner reserve overflow"))?;
+    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
 }
 
 /// Target taps for one prefill call (`rows` lane rows) while the common MLA

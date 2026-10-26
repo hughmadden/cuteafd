@@ -399,9 +399,10 @@ mod tests {
         std::fs::write(root.path().join("model.safetensors.index.json"), b"{}")?;
         SparkAdmission::plan(root.path(), ExpertGeometry::GLM5_FLASH, None,
             &SparkWorkingSet::default(), 2, None,
-            ModelAdmission { capacity: 2048, compiled_capacity: 4096,
-                endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32 }],
-                rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1 })
+            ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32 }],
+                SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                cuteafd_loader::plan::spark_executions::admit_ladder("glm5_flash",
+                    &cuteafd_core::EXL3_CAPACITIES, None, 2048, 4)?)?)
     }
 
     fn idle_report(rank: u32) -> ModelAdmissionResponse {
@@ -414,10 +415,11 @@ mod tests {
     }
 
     fn fixture_model() -> ModelAdmission {
-        ModelAdmission { capacity: 80, compiled_capacity: 80,
+        ModelAdmission { executions: cuteafd_core::SparkExecutions::admit(&[16], 80, 80, 1,
+                &cuteafd_core::EXL3_CAPACITIES).unwrap(),
             endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 },
                 SparkEndpoint { ring_depth: None, capacity: 16, ingress: SparkIngress::Fp8K32 }],
-            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 }, execution_slots: 1 }
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 } }
     }
 
     fn check_reports(plan: &SparkAdmission) -> Result<()> {

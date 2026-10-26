@@ -117,8 +117,10 @@ pub trait Family: Sync {
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         Default::default()
     }
-    /// Concurrent decode executions that cannot share one Spark compute slot.
-    fn spark_decode_lanes(&self) -> u8 { 1 }
+    /// Spark decode compute owners: one per decode lane, each admitting the
+    /// family's decode rows (its covering export comes from the backend ladder).
+    /// `None` for families without Spark experts.
+    fn spark_decode(&self) -> Option<super::spark_executions::SparkDecode> { None }
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
     /// Parses the checkpoint's configuration into the family's canonical model

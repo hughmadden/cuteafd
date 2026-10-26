@@ -368,7 +368,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
-    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
+    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity,
         topology)?;
     // Coordinator ranks join only a pushing group, planned before membership:
     // a planning error leaves them out (the Sparks still push).

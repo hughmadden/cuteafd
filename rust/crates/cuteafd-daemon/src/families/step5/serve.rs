@@ -101,24 +101,33 @@ impl ServeArgs {
     }
 }
 
-/// The sealed package's actual compiled extent, not the live row count. All
+/// The sealed package's exports, which the shared Spark admission covers. All
 /// layouts must agree; worker admission independently validates loaded exports.
-fn compiled_capacity(manifest: &serde_json::Value, rows: u32) -> Result<u32> {
+pub(super) fn package_exports(manifest: &serde_json::Value) -> Result<Vec<u32>> {
     let layouts = manifest["layouts"].as_object().context("Step-5 package layouts missing")?;
-    let mut compiled = None;
+    let mut exports = None;
     for layout in layouts.values() {
         ensure!(layout["hidden"] == 4096 && layout["experts"] == 352
             && layout["top_k"] == 8 && layout["intermediate"] == 1536,
             "Step-5 package geometry differs from checkpoint");
-        let capacity = layout["capacities"].as_array().context("Step-5 package capacities missing")?
-            .iter().map(|v| v["capacity"].as_u64().context("Step-5 package capacity must be integer"))
-            .collect::<Result<Vec<_>>>()?.into_iter().max().context("Step-5 package capacities empty")?;
-        let capacity = u32::try_from(capacity)?;
-        ensure!((rows..=4096).contains(&capacity) && compiled.is_none_or(|n| n == capacity),
-            "Step-5 installed package extents disagree or cannot cover live rows");
-        compiled = Some(capacity);
+        let capacities = layout["capacities"].as_array().context("Step-5 package capacities missing")?
+            .iter().map(|v| v["capacity"].as_u64().context("Step-5 package capacity must be integer")
+                .and_then(|capacity| Ok(u32::try_from(capacity)?)))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!capacities.is_empty() && exports.as_ref().is_none_or(|known| known == &capacities),
+            "Step-5 installed package extents disagree or are empty");
+        exports = Some(capacities);
     }
-    compiled.context("Step-5 installed package has no layouts")
+    exports.context("Step-5 installed package has no layouts")
+}
+
+/// The one Step-5 Spark admission for serve and golden: the endpoint's unit,
+/// typed owners over the sealed package's exports.
+pub(super) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, clients: usize,
+    max_frame_bytes: usize) -> Result<ModelAdmission> {
+    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("step5", exports, None,
+        u64::from(endpoint.capacity), waves)?;
+    ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, spark_rings(max_frame_bytes)?, clients, executions)
 }
 
 fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
@@ -148,7 +157,7 @@ fn with_backend<T>(args: &ServeArgs,
     let package = args.native_lib.parent().context("native library directory")?.join("fp8")
         .join(format.package_name("step5")).join("manifest.json");
     let metadata = cuteafd_loader::plan::checkpoint::read_json(&package)?;
-    let compiled = compiled_capacity(&metadata, args.prefill_rows)?;
+    let exports = package_exports(&metadata)?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.
     let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
     library.cuda_set_device(args.device)?;
@@ -204,9 +213,7 @@ fn with_backend<T>(args: &ServeArgs,
     let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
         rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
-        ModelAdmission::for_units(ExpertGeometry::STEP5, endpoint, args.prefill_rows, compiled,
-            spark_rings(config.max_frame_bytes)?, clients,
-            cuteafd_loader::plan::layout::spark_execution_slots("step5", u64::from(args.prefill_waves), 1)?)?)?;
+        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
@@ -460,7 +467,7 @@ mod tests {
         let package = args.native_lib.parent().context("native package")?.join("fp8")
             .join(format.package_name("step5")).join("manifest.json");
         let metadata = plan::checkpoint::read_json(&package)?;
-        let compiled = compiled_capacity(&metadata, args.prefill_rows)?;
+        let exports = package_exports(&metadata)?;
         let manifest = plan::checkpoint::read_json(&args.manifest)?;
         ensure!(manifest["programs"].as_array().context("native programs")?.iter()
             .all(|program| program.get("card_plans").is_none()),
@@ -496,8 +503,7 @@ mod tests {
             let clients = admitted.ownership.routed_endpoints()?;
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
-                6, None, ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, compiled,
-                    spark_rings(TcpTransportConfig::default().max_frame_bytes)?, clients)?)?;
+                6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?)?;
             super::super::execution::bootstrap_request(inputs.rows, 1)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
@@ -704,10 +710,12 @@ mod tests {
             args.prefill_rows = unit as u32;
             args.prefill_waves = waves as u8;
             assert_eq!(args.span(), span as u32);
-            let slots = cuteafd_loader::plan::layout::spark_execution_slots("step5", waves, 1)?;
-            let model = ModelAdmission::for_units(ExpertGeometry::STEP5, args.endpoint(), unit as u32,
-                4096, spark_rings(TcpTransportConfig::default().max_frame_bytes)?, 2, slots)?;
-            assert_eq!(model.execution_slots, 1);
+            let exports = [1, 16, 80, 256, 1024, 4096];
+            let model = spark_model(&exports, args.endpoint(), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+            // One prefill owner at the ladder maximum; the k units only buffer I/O.
+            assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: 4096,
+                compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });
+            assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution { capacity: 64, compiled_capacity: 80 }]);
             assert_eq!(model.endpoints[0].capacity, unit as u32);
             assert!(model.endpoints[0].capacity < args.span());
             for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
@@ -737,12 +745,16 @@ mod tests {
     fn installed_capacity_is_not_live_rows_or_assumed_fp8_format() -> Result<()> {
         let mut metadata = serde_json::json!({"layouts":{"tp4":{"hidden":4096,"experts":352,
             "top_k":8,"intermediate":1536,"capacities":[{"capacity":1},{"capacity":1024}]}}});
-        assert_eq!(compiled_capacity(&metadata, 256)?, 1024);
-        assert!(compiled_capacity(&metadata, 2048).is_err());
+        assert_eq!(package_exports(&metadata)?, [1, 1024]);
+        // A package whose largest export cannot hold the ladder's largest unit is refused.
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 256, ingress: SparkIngress::Bf16 };
+        let error = spark_model(&package_exports(&metadata)?, endpoint, 1, 1, 64 << 20).unwrap_err();
+        assert!(matches!(error.downcast_ref::<cuteafd_core::ExecutionAdmissionError>(),
+            Some(cuteafd_core::ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 4096, .. })), "{error:#}");
         metadata["layouts"]["tp6"] = metadata["layouts"]["tp4"].clone();
         metadata["layouts"]["tp6"]["capacities"][1]["capacity"] = 4096.into();
-        assert!(compiled_capacity(&metadata, 256).is_err());
-        assert!(compiled_capacity(&serde_json::json!({"layouts":{}}), 1).is_err());
+        assert!(package_exports(&metadata).is_err());
+        assert!(package_exports(&serde_json::json!({"layouts":{}})).is_err());
         Ok(())
     }
 }

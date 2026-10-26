@@ -36,11 +36,14 @@ pub(crate) struct Inputs<'a> {
 mod spark_tests {
     #[test]
     fn v4_spark_endpoints_match_the_decode_and_prefill_links() -> anyhow::Result<()> {
-        for decode_rows in [16, 64, 80] {
-            let model = super::spark_model(decode_rows, 2752, 3)?;
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for (decode_rows, compiled) in [(16, 16), (64, 80), (80, 80)] {
+            let model = super::spark_model(SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest), decode_rows, 2752, 3)?;
             model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
-            assert_eq!((model.capacity, model.compiled_capacity), (2752, 4096));
-            assert_eq!(model.execution_slots, 1);
+            assert_eq!((model.capacity(), model.compiled_capacity()), (4096, 4096));
+            assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
+                capacity: decode_rows as u32, compiled_capacity: compiled }]);
+            assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units), (2752, 3));
             assert_eq!(model.endpoints.len(), 2);
             assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
             assert_eq!(model.endpoints[1].capacity, 2752);
@@ -50,18 +53,18 @@ mod spark_tests {
     }
 }
 
-pub(crate) fn spark_model(decode_rows: usize, unit_rows: usize, waves: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+pub(crate) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
+    decode_rows: usize, unit_rows: usize, waves: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let capacity = u32::try_from(unit_rows.max(decode_rows))?;
+    // The installed coordinator manifest fixes this build's decode rows.
+    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("deepseek_v4", &backend.exports(),
+        Some(u32::try_from(decode_rows)?), unit_rows as u64, waves as u64)?;
     let endpoints = vec![
         SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },
-        SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Fp8K32 },
+        SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows.max(decode_rows))?, ingress: SparkIngress::Fp8K32 },
     ];
-    Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity, compiled_capacity: 4096, endpoints,
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
-        execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("deepseek_v4", waves as u64, 1)?
-    })
+    cuteafd_transport::worker_selection::ModelAdmission::new(endpoints,
+        crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
 
 /// Future pinned owners in the coordinator process, summed across its RTX ranks.

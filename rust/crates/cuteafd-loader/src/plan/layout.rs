@@ -340,19 +340,6 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     }
 }
 
-/// Spark compute concurrency follows decode lanes, not buffered network waves.
-/// The family owns any required lane floor (e.g. simultaneous legacy owners).
-pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
-    let descriptor = crate::plan::family::registry().iter().find(|entry| entry.id() == family)
-        .ok_or(crate::placement::PlacementError::Inventory("Spark execution slots require a family descriptor"))?;
-    let slots = decode_lanes.max(descriptor.spark_decode_lanes());
-    if !(1..=crate::serving_capacity::prefill_waves::MAX_WAVES).contains(&prefill_waves)
-        || decode_lanes == 0 || slots > cuteafd_core::MAX_BUFFERED_PREFILL_UNITS {
-        return Err(crate::placement::PlacementError::Inventory("Spark execution slots exceed executor capability"));
-    }
-    Ok(slots)
-}
-
 /// Device bytes of one Spark execution slot (stream, scratch, inputs and
 /// staging at the family's unit capacity), calibrated against the workers'
 /// `experts/workspace*` ledger on the shipped cards (2026-10-24): MiMo Pro max
@@ -412,14 +399,14 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
     Ok(())
 }
 
-/// Charge the compiled-capacity slot floor for every selected execution slot,
-/// crediting only the bytes retained in the legacy first-slot residual.
-pub(crate) fn charge_spark_slots(device: &mut DeviceLayout, working: &crate::placement::SparkWorkingSet,
-    family: &str, slots: u8, unit_rows: u64) {
-    device.items.retain(|item| item.group != "execution slots");
-    if working.selected_ranks().contains(&(device.index as usize)) {
-        spark_slots::charge_native_slots(device, slots, spark_slot_bytes(family, unit_rows));
-    }
+/// The planner's typed Spark owners for `family` on this checkpoint: the
+/// shared admission over the installed backend's export ladder at the resolved
+/// prefill shape (the same call serve and golden make).
+pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: &LayoutOptions)
+    -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    let backend = super::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?;
+    let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
+    super::spark_executions::admit_ladder(family, &backend.exports(), None, unit, options.prefill_waves)
 }
 
 #[cfg(test)]
@@ -453,43 +440,6 @@ mod selected_spark_io_tests {
             assert_eq!(residual.lifetime, cuteafd_core::memory_layout::ItemLifetime::ReadyResident);
             assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
         }
-    }
-
-    #[test]
-    fn execution_slots_follow_descriptor_decode_lanes_not_prefill_waves() {
-        for descriptor in crate::plan::family::registry() {
-            for waves in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
-                for lanes in 1..=cuteafd_core::MAX_BUFFERED_PREFILL_UNITS {
-                    assert_eq!(spark_execution_slots(descriptor.id(), waves, lanes).unwrap(),
-                        lanes.max(descriptor.spark_decode_lanes()));
-                }
-            }
-            for waves in [0, 5, u64::MAX] {
-                assert!(spark_execution_slots(descriptor.id(), waves, 1).is_err());
-            }
-            for lanes in [0, 5, u8::MAX] {
-                assert!(spark_execution_slots(descriptor.id(), 1, lanes).is_err());
-            }
-        }
-        assert_eq!(spark_execution_slots("deepseek_v41", 1, 1).unwrap(), 2);
-        assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 1);
-        assert!(spark_execution_slots("unknown", 1, 1).is_err());
-    }
-
-    #[test]
-    fn execution_slots_charge_their_unit_size() {
-        // A smaller live unit does not shrink compiled-capacity scratch.
-        assert_eq!(spark_slot_bytes("glm5", 2048), spark_slot_bytes("glm5", 4096));
-        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 2, ..Default::default() };
-        let charged = |slots, rows| {
-            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
-                items: vec![], kv_tokens: 0 };
-            charge_spark_slots(&mut device, &working, "glm5", slots, rows);
-            device.items.iter().filter(|item| item.group == "execution slots").map(|item| item.bytes).sum::<u64>()
-        };
-        assert_eq!(charged(1, 4096), spark_slot_bytes("glm5", 4096));
-        assert_eq!(charged(2, 4096), 2 * spark_slot_bytes("glm5", 4096));
-        assert_eq!(charged(4, 2048), 4 * spark_slot_bytes("glm5", 2048));
     }
 
     #[test]
@@ -985,14 +935,11 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
             notes.push(format!("{}: {error}", what(device)));
         }
         let family = report.family.as_deref().unwrap_or_default();
-        // The native EXLR8 Spark backend serves one execution slot.
-        let slots = if crate::plan::exlr8::recognizes(&checkpoint.snapshot).unwrap_or(false) { Ok(1) }
-            else { spark_execution_slots(family, options.prefill_waves, options.decode_lanes) };
-        match slots {
-            Ok(slots) => if let Err(error) = spark_slots::charge_selected_slots(device, input, working, family, slots, options.spark_capacity_rows) {
-                report.placement_supported = false; notes.push(format!("{}: {error:#}", what(device)));
-            },
-            Err(error) => { report.placement_supported = false; notes.push(format!("{}: {error}", what(device))); }
+        let charged = spark_executions(input, family, options).and_then(|executions|
+            spark_slots::charge_executions(device, input, working, family, &executions));
+        if let Err(error) = charged {
+            report.placement_supported = false;
+            notes.push(format!("{}: {error:#}", what(device)));
         }
     }
 }

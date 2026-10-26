@@ -14,6 +14,10 @@ pub struct Qwen;
 pub static QWEN4: Qwen = Qwen;
 
 impl Family for Qwen {
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        // The Qwen engine's decode programs run 64 rows.
+        Some(crate::plan::spark_executions::SparkDecode { lanes: 1, rows: 64 })
+    }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         // #717: the mapped-PLE ring has two slots; this is not a measured best k.
         crate::serving_capacity::prefill_waves::PrefillLimits { max_waves: 2, ..Default::default() }

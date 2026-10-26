@@ -3,43 +3,50 @@ use super::*;
 use crate::formats::fp8_experts::ExpertFormat;
 use crate::placement::SparkWorkingSet;
 
-/// Compiled 4096-row scratch maxima from the installed-package census in
-/// #778, issuecomment-6401148082. Scratch does not scale with live rows: both
-/// 2048 and 2752 select the 4096-row export. MiMo/Step include BF16-input siblings.
-fn group_scratch(family: &str, format: ExpertFormat) -> anyhow::Result<u64> {
-    use ExpertFormat::*;
-    let bytes = match (family, format) {
-        ("glm5", Fp8Block128) => 604_246_016,
-        ("glm5", Nvfp4) => 667_162_624,
-        ("glm5_flash", Fp8Block128) => 470_028_288,
-        ("glm5_flash", Nvfp4) => 469_243_904,
-        ("mimo_v2", Fp8Block128) => 704_977_920,
-        ("mimo_v2", Mxfp4) => 478_417_920,
-        ("qwen4", Nvfp4) => 401_745_920,
-        ("step5", Fp8Block128) => 538_279_936,
-        ("step5", Nvfp4) => 464_821_248,
-        ("step5", Bf16) => 580_747_264,
-        _ => anyhow::bail!("no calibrated Spark slot scratch for {family}/{format:?}; add the package census or manifest-backed sizing (#776)"),
+/// Installed-package scratch census (#778, issuecomment-6401148082): every
+/// shipped FP8-family package's scratch at each export capacity. A typed owner
+/// is charged its compiled export's maximum over the family/format packages.
+/// MiMo/Step rows include their BF16-input siblings.
+const CENSUS_CAPACITIES: [u32; 8] = cuteafd_core::EXL3_CAPACITIES;
+
+fn group_scratch(family: &str, format: ExpertFormat, compiled: u32) -> anyhow::Result<u64> {
+    use std::sync::OnceLock;
+    static CENSUS: OnceLock<Vec<(String, String, Vec<u64>)>> = OnceLock::new();
+    let census = CENSUS.get_or_init(|| {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))
+            .expect("bundled Spark slot census is valid JSON");
+        rows.into_iter().map(|row| (row["family"].as_str().unwrap_or_default().to_owned(),
+            row["format"].as_str().unwrap_or_default().to_owned(),
+            row["scratch"].as_array().map(|values| values.iter().filter_map(serde_json::Value::as_u64).collect())
+                .unwrap_or_default())).collect()
+    });
+    let format_name = match format {
+        ExpertFormat::Fp8Block128 => "fp8", ExpertFormat::Mxfp4 => "mxfp4",
+        ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "",
     };
-    Ok(bytes)
+    let index = CENSUS_CAPACITIES.iter().position(|&rows| rows == compiled)
+        .ok_or_else(|| anyhow::anyhow!("no Spark scratch census at export m{compiled}"))?;
+    census.iter().filter(|(f, k, _)| f == family && k == format_name)
+        .filter_map(|(.., scratch)| scratch.get(index).copied()).max()
+        .ok_or_else(|| anyhow::anyhow!("no calibrated Spark slot scratch for {family}/{format:?}; add the package census or manifest-backed sizing (#776)"))
 }
 
-fn group_slot_bytes(family: &str, format: ExpertFormat, geometry: cuteafd_core::ExpertGeometry,
-    rows: u64) -> anyhow::Result<u64> {
+/// Stream-ordered device input/route/output planes of one owner at `rows`.
+fn group_io_bytes(family: &str, format: ExpertFormat, geometry: cuteafd_core::ExpertGeometry, rows: u32) -> u64 {
     let hidden = u64::from(geometry.hidden);
     // BF16-input siblings are installed for block-FP8 MiMo/Step; NVFP4 and
     // BF16 weights consume BF16 directly. Other packages use FP8 K32 ingress.
     let bf16 = matches!(format, ExpertFormat::Nvfp4 | ExpertFormat::Bf16)
         || (matches!(family, "mimo_v2" | "step5") && format == ExpertFormat::Fp8Block128);
     let input = if bf16 { 2 * hidden } else { hidden + hidden / 32 };
-    Ok(group_scratch(family, format)?
-        + rows * (input + 8 * u64::from(geometry.topk) + 2 * hidden))
+    u64::from(rows) * (input + 8 * u64::from(geometry.topk) + 2 * hidden)
 }
 
-/// Match the worker's retained groups, not the number of layers. Unequal
-/// rotated widths and mixed weight formats each retain separate workers.
-pub(crate) fn native_slot_bytes(input: &super::super::PlanInput, family: &str,
-    working: &SparkWorkingSet, rank: usize, rows: u64) -> anyhow::Result<Option<u64>> {
+/// The worker's retained FP8-family groups for this rank: unequal rotated
+/// widths and mixed weight formats each retain separate packages; repeated
+/// layers of one group do not.
+fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkWorkingSet, rank: usize)
+    -> anyhow::Result<Option<(cuteafd_core::ExpertGeometry, Vec<ExpertFormat>)>> {
     if !working.selected_ranks().contains(&rank) { return Ok(None); }
     let catalog = input.expert_catalog()?;
     let Some(tensors) = catalog.fp8() else { return Ok(None); };
@@ -48,7 +55,7 @@ pub(crate) fn native_slot_bytes(input: &super::super::PlanInput, family: &str,
         experts: u32::try_from(shape.experts)?, topk: u32::try_from(shape.topk)?,
         intermediate: u32::try_from(shape.intermediate)?, layers: u32::try_from(shape.layers)? };
     let mut groups = Vec::new();
-    let mut total = 0;
+    let mut formats = Vec::new();
     for &layer in &working.spark_layers {
         if !tensors.has_layer(layer) { continue; }
         let view = tensors.for_layer_metadata(layer)?;
@@ -69,43 +76,103 @@ pub(crate) fn native_slot_bytes(input: &super::super::PlanInput, family: &str,
         let key = (format, view.activation(layer), width);
         if !groups.contains(&key) {
             groups.push(key);
-            total += group_slot_bytes(family, format, geometry, rows)?;
+            formats.push(format);
         }
     }
-    anyhow::ensure!(!groups.is_empty(), "native Spark slot has no selected expert groups");
-    Ok(Some(total))
+    anyhow::ensure!(!formats.is_empty(), "native Spark owner has no selected expert groups");
+    Ok(Some((geometry, formats)))
 }
 
-/// Every native slot owns scratch and I/O. Only bytes actually retained in the
-/// old first-slot residual can be credited; extra mixed/rotated groups cannot.
-pub(crate) fn charge_native_slots(device: &mut DeviceLayout, slots: u8, per_slot: u64) {
-    device.items.retain(|item| item.group != "execution slots");
+/// One FP8-family owner: groups share one stream and one scratch arena sized
+/// for the largest group package, while each group keeps its own I/O planes.
+fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats: &[ExpertFormat],
+    extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let mut scratch = 0;
+    let mut io = 0u64;
+    for &format in formats {
+        scratch = scratch.max(group_scratch(family, format, extent.compiled)?);
+        io += group_io_bytes(family, format, geometry, extent.capacity);
+    }
+    Ok(cuteafd_core::OwnerBytes { scratch, io, pinned_staging: 0 })
+}
+
+/// EXL3 retained arena maxima plus private capacity state at the 4096-row
+/// export (#762 census; native V4 stays at its 208 MiB slot), and the m1/m16/m80
+/// decode set's retained bytes (installed SM121 exports, 2026-10-24: largest
+/// GLM tp1 50,445,548 B). Input/route planes at the owner's rows.
+pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    const DECODE_SET: u64 = 51 * (1 << 20);
+    let hidden = u64::from(geometry.hidden);
+    let topk = u64::from(geometry.topk);
+    let scratch = if extent.compiled <= 80 { DECODE_SET } else {
+        match family {
+            "glm5_flash" => 607 * (1 << 20),
+            "deepseek_v4" | "deepseek_v41" => 810 * (1 << 20),
+            "kimi_k3" => crate::families::kimi_k3::SPARK_SLOT_BYTES - 4096 * (3584 + 3584 / 32 + 8 * 16),
+            "qwen4" => 644 * (1 << 20),
+            _ => anyhow::bail!("no calibrated Spark EXL3 scratch for {family}; add the package census (#776)"),
+        }
+    };
+    Ok(cuteafd_core::OwnerBytes { scratch, io: u64::from(extent.capacity) * (hidden + hidden / 32 + 8 * topk),
+        pinned_staging: u64::from(extent.staging_rows) * topk * 8 })
+}
+
+/// Legacy calibrated slot bound (stream, scratch, inputs and staging at
+/// the compiled 4096-row export) for backends without a census.
+fn legacy_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent,
+    staged: bool) -> cuteafd_core::OwnerBytes {
+    let at_4096 = spark_slot_bytes(family, 4096);
+    cuteafd_core::OwnerBytes { scratch: at_4096 * u64::from(extent.compiled.max(80)) / 4096, io: 0,
+        pinned_staging: if staged { u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 } else { 0 } }
+}
+
+/// One owner's bytes on this rank's installed backend.
+pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkingSet, family: &str,
+    rank: usize) -> anyhow::Result<impl Fn(cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes>> {
+    use crate::plan::spark_executions::SparkBackend;
+    let catalog = input.expert_catalog()?;
+    let geometry = catalog.routed_experts().geometry()?;
+    let backend = SparkBackend::for_catalog(catalog)?;
+    let groups = native_groups(input, family, working, rank)?;
+    let family = family.to_owned();
+    Ok(move |extent| match (&groups, backend) {
+        (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
+        (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
+        (_, SparkBackend::Native) => Ok(legacy_owner_bytes(&family, geometry, extent, true)),
+        (_, SparkBackend::Exlr8 | SparkBackend::Fp8) => Ok(legacy_owner_bytes(&family, geometry, extent, false)),
+    })
+}
+
+/// Charge one selected Spark rank's typed execution owners: one prefill
+/// scratch, every decode owner's scratch, and per-unit pinned staging times
+/// the buffered units, through the same owner sum the worker uses.
+pub(crate) fn charge_executions(device: &mut DeviceLayout, input: &super::super::PlanInput,
+    working: &SparkWorkingSet, family: &str, executions: &cuteafd_core::SparkExecutions) -> anyhow::Result<()> {
+    device.items.retain(|item| item.group != "execution owners" && item.group != "execution staging");
+    if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
+    charge_owners(device, executions, owner_bytes(input, working, family, device.index as usize)?)
+}
+
+/// Record the owner sum, crediting only bytes the legacy first-slot residual
+/// already reserves on this device (at most the one prefill owner it modelled).
+pub(crate) fn charge_owners(device: &mut DeviceLayout, executions: &cuteafd_core::SparkExecutions,
+    bytes: impl Fn(cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes>) -> anyhow::Result<()> {
+    device.items.retain(|item| item.group != "execution owners" && item.group != "execution staging");
+    let total = executions.workspace_bytes(&bytes)?
+        .ok_or_else(|| anyhow::anyhow!("Spark execution owner workspace overflow"))?;
+    let prefill = executions.owners().last().map(&bytes).transpose()?.unwrap_or_default();
     let residual = device.items.iter().filter(|item| item.group == "expert waves")
         .map(|item| item.bytes).sum::<u64>();
-    let credit = residual.min(per_slot);
-    device.items.push(Item::new(Category::Workspace, "execution slots", format!("{slots} total; {credit} first-slot bytes already reserved"),
-        per_slot * u64::from(slots) - credit, Basis::Calibrated));
-}
-
-fn exl3_slot_bytes(family: &str, rows: u64) -> u64 {
-    // EXL3 retains the arena maxima plus private state for every capacity.
-    // These bounds include the new 2048/2752 capacities; native V4 stays 208 MiB.
-    let compiled: u64 = match family {
-        "glm5_flash" => 607 * (1 << 20),
-        "deepseek_v4" | "deepseek_v41" => 810 * (1 << 20),
-        _ => return spark_slot_bytes(family, rows),
-    };
-    compiled.saturating_mul(rows.max(4096)).div_ceil(4096)
-}
-
-pub(crate) fn charge_selected_slots(device: &mut DeviceLayout, input: &super::super::PlanInput,
-    working: &SparkWorkingSet, family: &str, slots: u8, rows: u64) -> anyhow::Result<()> {
-    if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
-    match native_slot_bytes(input, family, working, device.index as usize, rows)? {
-        Some(bytes) => charge_native_slots(device, slots, bytes),
-        None if input.expert_catalog()?.exl3().is_some() =>
-            charge_native_slots(device, slots, exl3_slot_bytes(family, rows)),
-        None => charge_spark_slots(device, working, family, slots, rows),
+    let credit = residual.min(prefill.scratch + prefill.io);
+    let shape = executions.prefill;
+    device.items.push(Item::new(Category::Workspace, "execution owners",
+        format!("{} decode + 1 prefill (m{} scratch once; {} x {}-row units); {credit} bytes already reserved",
+            executions.decode.len(), shape.compiled_capacity, shape.buffered_units, shape.unit_rows),
+        total.device_bytes - credit, Basis::Calibrated));
+    if total.pinned_bytes > 0 {
+        device.items.push(Item::new(Category::Workspace, "execution staging",
+            format!("pinned route staging, {} units", shape.buffered_units), total.pinned_bytes, Basis::Formula));
     }
     Ok(())
 }

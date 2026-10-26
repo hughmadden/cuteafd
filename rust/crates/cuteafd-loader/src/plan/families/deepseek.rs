@@ -17,6 +17,8 @@ pub struct DeepSeek {
     runtime: RuntimeStatus,
     prefill: crate::serving_capacity::prefill_waves::PrefillEstimate,
     decode_lanes: u8,
+    /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
+    decode_rows: u32,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
@@ -26,6 +28,7 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     // Legacy CED executor: not advertised as an adaptive shared-prefill port.
     prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::Unmeasured,
     decode_lanes: 2,
+    decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
@@ -36,6 +39,8 @@ pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
         source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; Pro EXL3 six-Spark k3 versus k2, no independent S/T",
     },
     decode_lanes: 1,
+    // Installed V4 coordinator manifests fix `decode_rows`; serve passes it.
+    decode_rows: 64,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -47,7 +52,9 @@ fn usize_list(config: &Value, key: &str) -> Vec<usize> {
 }
 
 impl Family for DeepSeek {
-    fn spark_decode_lanes(&self) -> u8 { self.decode_lanes }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        Some(crate::plan::spark_executions::SparkDecode { lanes: self.decode_lanes, rows: self.decode_rows })
+    }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, ..Default::default() }
     }

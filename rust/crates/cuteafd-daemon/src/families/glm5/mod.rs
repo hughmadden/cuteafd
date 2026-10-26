@@ -178,22 +178,25 @@ fn native_dense_charge(cfg: &GlmDsaConfig, gpus: usize, args: &EngineArgs) -> u6
         args.exlr8_prefill_activations == Exlr8PrefillActivations::A8) as u64
 }
 
-fn spark_model(lanes: usize, unit_rows: u32, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
-    ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
+use cuteafd_loader::plan::spark_executions::SparkBackend;
+
+/// The decode link plus one prefill link carrying every wave in flight, over
+/// typed owners from the shared admission (one prefill scratch at the ladder
+/// maximum, waves only buffer per-unit I/O).
+fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
+    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    ensure!(waves > 0, "GLM Spark admission requires at least one prefill wave");
+    let native = backend == SparkBackend::Exlr8;
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
-    // The decode link, plus one prefill link carrying `lanes` waves in flight.
-    let endpoints = 1 + usize::from(lanes > 1);
-    Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity: unit_rows, compiled_capacity: 4096,
-        endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }; endpoints],
-        rings: crate::shared::placement::spark_rings(if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 })?,
-        // One execution slot per prefill wave in flight; decode runs alone
-        // (prefill and decode never share a rank at once). The native EXLR8
-        // Spark backend serves one request at a time.
-        execution_slots: if native { 1 } else {
-            cuteafd_loader::plan::layout::spark_execution_slots("glm5", lanes as u64, 1)? }
-    })
+    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("glm5", &backend.exports(), None,
+        u64::from(unit_rows), waves as u64)?;
+    let endpoints = 1 + usize::from(waves > 1);
+    let rings = crate::shared::placement::spark_rings(if native {
+        cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
+    } else { 64 << 20 })?;
+    cuteafd_transport::worker_selection::ModelAdmission::new(
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }; endpoints], rings, executions)
 }
 
 #[cfg(test)]
@@ -209,27 +212,34 @@ mod draft_cli_tests {
 
     #[test]
     fn spark_contract_matches_decode_link_and_parallel_prefill_lanes() -> Result<()> {
-        for lanes in [1, 2, 3, 4] {
+        for (waves, unit) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
             for bf16 in [false, true] {
-                let model = spark_model(lanes, 4096, bf16, false)?;
+                let model = spark_model(SparkBackend::Fp8, waves, unit, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
                 // The decode link and one prefill link carrying every wave in flight.
-                assert_eq!(model.endpoints.len(), if lanes == 1 { 1 } else { 2 });
-                assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == 4096
+                assert_eq!(model.endpoints.len(), if waves == 1 { 1 } else { 2 });
+                assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == unit
                     && endpoint.ingress == if bf16 { cuteafd_core::SparkIngress::Bf16 }
                         else { cuteafd_core::SparkIngress::Fp8K32 }));
+                // One prefill owner at the ladder maximum; k only buffers units.
+                assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: 4096,
+                    compiled_capacity: 4096, unit_rows: unit, buffered_units: waves as u8 });
+                assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
+                    capacity: engine::DECODE_ROWS as u32, compiled_capacity: 80 }]);
             }
         }
-        for lanes in 1..=4 {
-            let native = spark_model(lanes, 4096, false, true)?;
+        for waves in 1..=4 {
+            let native = spark_model(SparkBackend::Exlr8, waves, 4096, false)?;
             native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
-            assert_eq!(native.endpoints.len(), if lanes == 1 { 1 } else { 2 });
+            assert_eq!(native.endpoints.len(), if waves == 1 { 1 } else { 2 });
             assert!(native.endpoints.iter().all(|endpoint|
                 endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            assert_eq!(native.executions.decode[0].compiled_capacity,
+                cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS as u32);
             assert_eq!(native.rings.max_frame_bytes,
-                cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity)?);
+                cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity())?);
         }
-        assert!(spark_model(0, 4096, false, false).is_err());
+        assert!(spark_model(SparkBackend::Fp8, 0, 4096, false).is_err());
         Ok(())
     }
 
@@ -827,7 +837,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, spark_model(prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16, native)?,
+                peers.len(), None, spark_model(SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
             // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
             // two more ranks; planning failure leaves them on the mount.

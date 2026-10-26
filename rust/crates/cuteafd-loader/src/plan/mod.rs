@@ -16,6 +16,7 @@ pub mod names;
 pub mod rope;
 pub mod spec;
 pub mod spark_range;
+pub mod spark_executions;
 #[doc(hidden)]
 pub mod testing;
 

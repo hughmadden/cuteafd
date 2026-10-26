@@ -8,17 +8,16 @@ use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 use cuteafd_loader::placement::{families::qwen4, Baseline};
 
-pub(super) fn spark_model(rows: usize, waves: u64, bf16: bool)
-    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
+    rows: usize, waves: u64, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let capacity = u32::try_from(rows)?;
     let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 }
         else { cuteafd_core::SparkIngress::Fp8K32 };
-    Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity, compiled_capacity: 4096,
-        endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
-        execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("qwen4", waves, 1)?
-    })
+    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("qwen4", &backend.exports(), None,
+        rows as u64, waves)?;
+    cuteafd_transport::worker_selection::ModelAdmission::new(
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
+        crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
 
 /// The shared admission inputs (`serving_capacity::qwen_graphs::qwen_admission`) at serve's arguments.
@@ -317,11 +316,14 @@ mod tests {
 
     #[test]
     fn spark_contract_matches_single_link_capacity_and_checkpoint_ingress() -> anyhow::Result<()> {
-        for rows in [64, 2048, 2752, 4096] {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for (rows, waves) in [(64, 1), (2048, 2), (4096, 2)] {
             for bf16 in [false, true] {
-                let model = super::spark_model(rows, 1, bf16)?;
+                let model = super::spark_model(SparkBackend::Fp8, rows, waves, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::QWEN4)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (rows as u32, 4096));
+                assert_eq!((model.capacity(), model.compiled_capacity()), (4096, 4096));
+                assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units),
+                    (rows as u32, waves as u8));
                 assert_eq!(model.endpoints.len(), 1);
                 assert_eq!(model.endpoints[0].capacity, rows as u32);
                 assert_eq!(model.endpoints[0].ingress, if bf16 { cuteafd_core::SparkIngress::Bf16 }

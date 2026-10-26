@@ -506,7 +506,9 @@ pub(crate) fn with_engine<T>(
             };
             crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
-                peers.len(), None, admission::spark_model(decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
+                peers.len(), None, admission::spark_model(
+                    cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
+                    decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();

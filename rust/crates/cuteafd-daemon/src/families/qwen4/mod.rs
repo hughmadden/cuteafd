@@ -387,8 +387,9 @@ mod weight_representation_tests {
         parsed.prefill_units = Some(shape.unit_rows as usize);
         assert_eq!(parsed.prefill_shape()?, Some(shape));
         assert_eq!(parsed.prefill_wave_rows(), 4096);
-        let worker = admission::spark_model(parsed.prefill_wave_rows(), shape.waves, false)?;
-        assert_eq!((worker.capacity, worker.compiled_capacity), (4096, 4096));
+        let worker = admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::Fp8,
+            parsed.prefill_wave_rows(), shape.waves, false)?;
+        assert_eq!((worker.capacity(), worker.compiled_capacity()), (4096, 4096));
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
         let admission = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
         assert_eq!(admission.prefill_rows, 8192);
@@ -599,7 +600,9 @@ impl Opened {
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(), None,
-                admission::spark_model(args.prefill_wave_rows(), args.resolved_prefill()?.waves, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+                admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(
+                    self.experts.as_ref().context("Qwen Spark admission requires routed expert headers")?)?,
+                    args.prefill_wave_rows(), args.resolved_prefill()?.waves, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());

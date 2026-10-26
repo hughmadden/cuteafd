@@ -469,20 +469,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
             && layout["tp"] == args.peers.len(),
         "sealed Step-5 FP8 TP geometry"
     );
-    let compiled = layout["capacities"]
-        .as_array()
-        .context("FP8 capacities")?
-        .iter()
-        .map(|c| c["capacity"].as_u64().context("FP8 capacity integer"))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .context("empty FP8 capacities")?;
+    let exports = super::serve::package_exports(&serde_json::json!({"layouts": {"tp": layout.clone()}}))?;
     let unit = args.prefill_units.unwrap_or(rows);
-    ensure!(
-        compiled >= unit as u64 && compiled <= 4096,
-        "FP8 package row capacity"
-    );
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(
         &args.snapshot,
@@ -496,10 +484,9 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         },
         args.peers.len(),
         None,
-        ModelAdmission::for_units(ExpertGeometry::STEP5,
-            SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Bf16 },
-            unit as u32, compiled as u32, spark_rings(config.max_frame_bytes)?, 1,
-            cuteafd_loader::plan::layout::spark_execution_slots("step5", u64::from(args.prefill_waves), 1)?)?,
+        super::serve::spark_model(&exports,
+            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: SparkIngress::Bf16 },
+            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,

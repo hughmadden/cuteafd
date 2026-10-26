@@ -51,6 +51,28 @@ pub struct SparkExecutions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionOwner { Decode(usize), Prefill }
 
+/// One owner's extents for workspace accounting: scratch at `compiled`,
+/// stream-ordered device I/O at `capacity`, and pinned route staging of
+/// `staging_rows` retained for each of `buffered_units` queued units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerExtent {
+    pub owner: ExecutionOwner,
+    pub capacity: u32,
+    pub compiled: u32,
+    pub staging_rows: u32,
+    pub buffered_units: u8,
+}
+
+/// Bytes one owner holds at its extents, from the planner's census or the
+/// worker's installed artifacts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerBytes {
+    pub scratch: u64,
+    pub io: u64,
+    /// Per queued unit; multiplied by `buffered_units` only.
+    pub pinned_staging: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutionAdmissionError {
     #[error("Spark decode lane count {lanes} must be 1..={maximum}")]
@@ -112,6 +134,27 @@ impl SparkExecutions {
                 maximum: MAX_BUFFERED_PREFILL_UNITS });
         }
         Ok(())
+    }
+
+    /// Every owner's extents: each decode owner holds one unit of its own
+    /// capacity; the prefill owner holds `buffered_units` units of `unit_rows`.
+    pub fn owners(&self) -> impl Iterator<Item = OwnerExtent> + '_ {
+        self.decode.iter().enumerate().map(|(lane, owner)| OwnerExtent { owner: ExecutionOwner::Decode(lane),
+            capacity: owner.capacity, compiled: owner.compiled_capacity, staging_rows: owner.capacity, buffered_units: 1 })
+            .chain(std::iter::once(OwnerExtent { owner: ExecutionOwner::Prefill, capacity: self.prefill.capacity,
+                compiled: self.prefill.compiled_capacity, staging_rows: self.prefill.unit_rows,
+                buffered_units: self.prefill.buffered_units }))
+    }
+
+    /// The one workspace sum shared by planner and worker: scratch and device
+    /// I/O once per owner, pinned staging times its queued units. `None` on
+    /// overflow; `bytes` errors propagate.
+    pub fn workspace_bytes<E>(&self, mut bytes: impl FnMut(OwnerExtent) -> Result<OwnerBytes, E>)
+        -> Result<Option<crate::expert_geometry::SparkWorkspaceBytes>, E> {
+        let owners = self.owners().map(|extent| bytes(extent).map(|owner| crate::expert_geometry::SparkOwnerWorkspace {
+            scratch_bytes: owner.scratch, io_bytes: owner.io, pinned_staging_bytes: owner.pinned_staging,
+            buffered_units: extent.buffered_units })).collect::<Result<Vec<_>, E>>()?;
+        Ok(crate::expert_geometry::spark_owner_workspace_bytes(owners))
     }
 
     /// Largest live rows any owner admits.
@@ -184,6 +227,23 @@ mod tests {
         }
         assert_eq!(SparkExecutions::admit(&[64], 2048, 2752, 3, &LADDER).unwrap_err(),
             ExecutionAdmissionError::UnitRows { unit_rows: 2752, capacity: 2048 });
+    }
+
+    #[test]
+    fn workspace_charges_one_prefill_scratch_and_divides_the_reserve_into_units() {
+        let bytes = |plan: &SparkExecutions| plan.workspace_bytes(|extent| Ok::<_, ()>(OwnerBytes {
+            scratch: u64::from(extent.compiled) * 1000, io: u64::from(extent.capacity) * 10,
+            pinned_staging: u64::from(extent.staging_rows) })).unwrap().unwrap();
+        let mut totals = Vec::new();
+        for (unit, units) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+            let plan = SparkExecutions::admit(&[64, 64], 4096, unit, units, &LADDER).unwrap();
+            let total = bytes(&plan);
+            assert_eq!(total.device_bytes, 2 * (80_000 + 640) + 4_096_000 + 40_960);
+            assert_eq!(total.pinned_bytes, 2 * 64 + u64::from(unit) * u64::from(units));
+            totals.push(total.device_bytes);
+        }
+        // More waves never add scratch: the reserve is divided, not multiplied.
+        assert!(totals.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]

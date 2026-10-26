@@ -1923,14 +1923,13 @@ impl Opened {
             let capacity = u32::try_from(args.expert_rows())?;
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
-            let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity, compiled_capacity: 4096,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
-                rings: crate::shared::placement::spark_rings(64 << 20)?,
-                // One execution slot per prefill wave the link keeps in flight.
-                execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("glm5_flash",
-                    args.prefill_waves as u64, 1)?
-            };
+            let catalog = self.experts.as_ref().context("GLM Flash Spark admission requires routed expert headers")?;
+            let executions = cuteafd_loader::plan::spark_executions::admit_ladder("glm5_flash",
+                &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(),
+                Some(u32::try_from(args.decode_rows)?), args.prefill_rows as u64, args.prefill_waves as u64)?;
+            let model = cuteafd_transport::worker_selection::ModelAdmission::new(
+                vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
+                crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;
             let ranks = if admission.coordinator_pushes() && dense_pushable(&args) {
