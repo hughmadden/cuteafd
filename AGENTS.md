@@ -161,10 +161,16 @@ before → after tables with conditions.
   nextest when present on PATH or in the persistent architecture Cargo home,
   with cargo test as fallback. Install without root:
   `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`.
-  Default is for iteration and feature merges: it excludes the 14 measured
+  Default is for iteration and feature merges: it excludes the 15 measured
   full-plan/cache IDs in `scripts/dev/cpu-gate`'s `FULL_TESTS`; receipts list
   every exclusion. Use `cpu-gate --full` before merging into work/p0 and for
-  releases to restore every nonignored test. Release cuts also add `--slow`
+  releases to restore every nonignored test, including installed example
+  plans through the launcher's `release_prefill_shape`. That sweep uses
+  `HF_HOME` (or `~/.cache/huggingface`); override with
+  `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
+  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports. Missing
+  checkpoints/revisions skip explicitly; installed planner failures still fail.
+  Release cuts also add `--slow`
   for explicit ignored CPU soaks, not arbitrary ignored GPU/network tests.
   Full-plan tests use `plan::testing::BudgetedPlanInput`'s strict 30 s per-plan
   budget with phase diagnostics; multi-shape tests may take longer in total.
