@@ -13,7 +13,19 @@ const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
+        max_waves: if spark_ranks == 0 { 1 }
+            else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
+                crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
+        ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
+    };
+    let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
     let mut shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    report.prefill_span_rows = Some(prefill.span_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };
@@ -53,18 +65,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
     }
-    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
-        max_waves: if spark_ranks == 0 { 1 }
-            else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
-                crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
-        ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
-    };
-    let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
-        Ok(shape) => shape,
-        Err(error) => return unsupported_prefill(report, error),
-    };
-    shape.prefill_rows = prefill.unit_rows;
     let lanes = prefill.waves;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
