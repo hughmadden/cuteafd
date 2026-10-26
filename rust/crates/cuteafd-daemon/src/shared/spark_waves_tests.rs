@@ -41,8 +41,8 @@ impl Backend for Fake {
         if self.world.fail_post == Some(job.sequence) { anyhow::bail!("injected post failure"); }
         let mut occupied = self.world.occupied.lock().unwrap();
         assert!(occupied[job.slot].is_none(), "slot {} reposted before its wave landed", job.slot);
-        // The planes are free: the slot's previous reduce was consumed.
-        assert!(reached(self.world.load(Counter::Consumed(job.slot)), job.consumed));
+        // The planes are free: every fenced slot's previous reduce was consumed.
+        assert!(job.consumed.iter().all(|&(slot, uses)| reached(self.world.load(Counter::Consumed(slot)), uses)));
         if let Source::Staged { .. } = job.source {
             assert!(reached(self.world.load(Counter::Staged(job.slot)), job.sequence), "posted before staged");
         }
@@ -52,8 +52,8 @@ impl Backend for Fake {
         occupied[job.slot] = Some(job.sequence);
         Ok(FakeWave { sequence: job.sequence, slot: job.slot, polls: 0 })
     }
-    fn poll(&mut self, wave: &mut FakeWave, slot: usize, _rows: usize) -> Result<Option<RankPace>> {
-        assert_eq!(slot, wave.slot);
+    fn poll(&mut self, wave: &mut FakeWave, _slice: (usize, usize), _rows: usize) -> Result<Option<RankPace>> {
+        let slot = wave.slot;
         self.world.polls.fetch_add(1, Ordering::Relaxed);
         wave.polls += 1;
         if self.world.fail_poll == Some(wave.sequence) && wave.polls == 2 { anyhow::bail!("injected receive failure"); }
@@ -68,7 +68,7 @@ impl Backend for Fake {
 }
 
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
-    Job { sequence, slot, rows: 1, prefill: false, consumed, sent: Instant::now(),
+    Job { sequence, slot, rows: 1, prefill: false, consumed: vec![(slot, consumed)], slice: (slot * 64, 64), sent: Instant::now(),
         source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
             build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
 }
@@ -160,6 +160,44 @@ fn a_wave_waits_for_its_staged_copies_and_its_slots_previous_reduce() {
         assert_eq!(world.posted.lock().unwrap().len(), 1, "posted into planes a pending reduce still reads");
         world.store(Counter::Consumed(0), 1);
         wait(&world, Counter::Landed, 2).unwrap();
+        drop(jobs);
+        let (result, _) = worker.join().unwrap();
+        result.unwrap();
+    });
+}
+
+/// #762: the first wave after a re-cut waits for every old slot's reduce,
+/// not only its own slot's: the new slot overlaps the old ones' planes.
+#[test]
+fn the_first_wave_after_a_re_cut_waits_for_every_old_slots_reduce() {
+    let world = World::new(4);
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
+        let mut geometry = SlotGeometry::new(4, 4096, 8256, 2, 4096).unwrap();
+        let mut uses = [0u32; 4];
+        for (sequence, slot) in [(1u32, 0usize), (2, 1)] {
+            world.store(Counter::Staged(slot), sequence);
+            let mut job = job(sequence, slot, 0);
+            job.consumed = geometry.fences(slot, &uses);
+            jobs.send(Command::Wave(job)).unwrap();
+        }
+        wait(&world, Counter::Landed, 2).unwrap();
+        // Slot 0's reduce is done, slot 1's is still queued on the stream.
+        uses[0] = 1;
+        world.store(Counter::Consumed(0), 1);
+        uses[1] = 1;
+        geometry.set(4, 2048).unwrap();
+        world.store(Counter::Staged(0), 3);
+        let mut job = job(3, 0, 0);
+        job.consumed = geometry.fences(0, &uses);
+        assert_eq!(job.consumed, [(0, 1), (1, 1), (2, 0), (3, 0)]);
+        jobs.send(Command::Wave(job)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(world.posted.lock().unwrap().len(), 2, "posted into planes old slot 1's reduce still reads");
+        world.store(Counter::Consumed(1), 1);
+        wait(&world, Counter::Landed, 3).unwrap();
         drop(jobs);
         let (result, _) = worker.join().unwrap();
         result.unwrap();
@@ -308,9 +346,8 @@ struct EchoWorld {
     ranks: usize,
     row_bytes: usize,
     landing: u8,
-    /// Device plane addresses per slot and rank (integers: they cross to the worker).
-    planes: Vec<Vec<(usize, usize)>>,
-    next_slot: usize,
+    /// Each rank's reserve range base (an integer: it crosses to the worker).
+    ranges: Vec<usize>,
     /// Each layer's input rows: a request must carry exactly its layer's.
     inputs: Vec<Vec<u8>>,
     /// The exchange's counters, set once it started (diagnosis).
@@ -321,7 +358,7 @@ struct EchoWorld {
     cpu: Option<(f64, Instant)>,
     spent: Option<(f64, f64)>,
 }
-struct EchoWave { slot: usize, rows: Vec<Vec<u8>>, polls: usize, posted: Instant }
+struct EchoWave { offset: usize, rows: Vec<Vec<u8>>, polls: usize, posted: Instant }
 
 fn rank_rows(hidden: &[u8], rank: usize) -> Vec<u8> {
     hidden.chunks_exact(2).flat_map(|word| {
@@ -332,9 +369,13 @@ fn rank_rows(hidden: &[u8], rank: usize) -> Vec<u8> {
 
 impl Transport for EchoWorld {
     type Wave = EchoWave;
-    fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<EchoWave> {
-        let slot = self.next_slot;
-        self.next_slot = (slot + 1) % self.planes.len();
+    fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[cuteafd_transport::LandingSlice]>)
+        -> Result<EchoWave> {
+        // A landing link places every wave; a host-receive link names none.
+        ensure!(landing.is_some() == (self.landing != 0), "landing slices: {landing:?}, landing ranks {:#b}", self.landing);
+        let offset = landing.map_or(0, |slices| slices[0].offset);
+        ensure!(landing.is_none_or(|slices| slices.len() == self.ranks && slices.iter().all(|s| s.offset == offset
+            && s.bytes >= request.header.row_count as usize * self.row_bytes)), "landing slices disagree: {landing:?}");
         let hidden = request.hidden_payload.as_ref();
         ensure!(hidden.len() == request.header.row_count as usize * self.row_bytes, "echo rows differ");
         let layer = request.header.layer_id as usize;
@@ -356,7 +397,7 @@ impl Transport for EchoWorld {
             anyhow::bail!("request for layer {layer}: {}", report.join("; "));
         }
         if self.cpu.is_none() { self.cpu = Some((cuteafd_ffi::thread_cpu_seconds()?, Instant::now())); }
-        Ok(EchoWave { slot, rows: (0..self.ranks).map(|rank| rank_rows(hidden, rank)).collect(), polls: 0,
+        Ok(EchoWave { offset, rows: (0..self.ranks).map(|rank| rank_rows(hidden, rank)).collect(), polls: 0,
             posted: Instant::now() })
     }
     fn poll(&mut self, wave: &mut EchoWave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
@@ -365,7 +406,7 @@ impl Transport for EchoWorld {
         if wave.polls < 3 || wave.posted.elapsed() < self.delay { return Ok(None); }
         for (rank, rows) in wave.rows.iter().enumerate() {
             if self.landing & (1 << rank) != 0 {
-                let (ptr, _) = self.planes[wave.slot][rank];
+                let ptr = self.ranges[rank] + wave.offset;
                 self.library.copy_h2d(CuteafdDeviceBuffer { ptr: ptr as *mut c_void, bytes: rows.len(),
                     ..Default::default() }, rows)?;
             } else {
@@ -380,7 +421,7 @@ impl Transport for EchoWorld {
         }
         let mut pace = RankPace::default();
         for (rank, sample) in pace.iter_mut().enumerate().take(self.ranks) {
-            *sample = Some((100 * (rank as u32 + 1), wave.slot as u32));
+            *sample = Some((100 * (rank as u32 + 1), (wave.offset % 997) as u32));
         }
         Ok(Some((self.landing, pace)))
     }
@@ -388,10 +429,12 @@ impl Transport for EchoWorld {
     fn abandon(&mut self) {}
 }
 
-/// GPU gate: a whole decode step (80 layers, one slot) and a prefill run
-/// (3 slots) queued ahead on one stream through the real exchange: counters
-/// in mapped memory, stream waits and writes, staging copies, pinned-rank
-/// uploads behind the wait, and the reduce. The reduced output of every
+/// GPU gate: a whole decode step (80 layers, one slot) and prefill runs
+/// (several slots) queued ahead on one stream through the real exchange:
+/// counters in mapped memory, stream waits and writes, staging copies,
+/// pinned-rank uploads behind the wait, and the reduce. Each case runs its
+/// layers under a sequence of cuts of one reserve (#762: re-cut at rest
+/// between prefills, slices placed per wave); the reduced output of every
 /// layer must equal the host reference byte for byte. Opt in with
 /// `CUTEAFD_PLANE_UPLOAD_LIBRARY` (the built native library).
 #[test]
@@ -408,22 +451,27 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     // staging copy (24-byte route rows are not 16-byte multiples).
     let (hidden, topk) = (5120usize, 6usize);
     let row_bytes = hidden * 2;
-    // The last case models a Spark round trip (800 us per wave) and reports
-    // the worker thread's CPU share over it.
-    for (ranks, landing, waves, layers, rows, delay_us) in [(3usize, 0u8, 1usize, 80u32, 16usize, 0u64),
-        (4, 0b0101, 1, 80, 64, 0), (3, 0b111, 1, 80, 1, 0), (4, 0, 3, 24, 128, 0), (6, 0b100001, 2, 30, 64, 0),
-        (3, 0b111, 1, 80, 1, 800)] {
+    // (ranks, landing ranks, admitted slots, max rows, reserve rows, cuts as
+    // (waves, rows), layers per cut, delay). The last case models a Spark
+    // round trip (800 us per wave) and reports the worker thread's CPU share.
+    // Cut rows scale the shared 4096/2752/2048 reserve down to test size.
+    let recut = vec![(2usize, 128usize), (3, 86), (4, 64), (2, 128), (1, 128), (4, 64)];
+    for (ranks, landing, slots, max_rows, reserve, cuts, layers, delay_us) in [
+        (3usize, 0u8, 1usize, 16usize, 16usize, vec![(1usize, 16usize)], 80u32, 0u64),
+        (4, 0b0101, 1, 64, 64, vec![(1, 64)], 80, 0), (3, 0b111, 1, 1, 1, vec![(1, 1)], 80, 0),
+        (4, 0, 4, 128, 258, recut.clone(), 12, 0), (6, 0b100001, 4, 128, 258, recut.clone(), 12, 0),
+        (4, 0b1111, 4, 128, 258, recut, 12, 0), (3, 0b111, 1, 1, 1, vec![(1, 1)], 80, 800)] {
         let delay = Duration::from_micros(delay_us);
-        let capacity = rows;
-        let planes_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, capacity * row_bytes * waves))
+        let total = layers as usize * cuts.len();
+        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes))
             .collect::<Result<Vec<_>>>()?;
-        let planes: Vec<Vec<CuteafdDeviceBuffer>> = (0..waves).map(|slot| planes_owned.iter().map(|plane|
-            CuteafdDeviceBuffer { ptr: (plane.buffer.ptr as usize + slot * capacity * row_bytes) as *mut c_void,
-                bytes: capacity * row_bytes, ..plane.buffer }).collect()).collect();
-        let layout = RouteStaging::new(rows, topk, row_bytes)?;
-        let arenas = (0..waves).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
+        let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
+        let max_layout = RouteStaging::new(max_rows, topk, row_bytes)?;
+        let arenas = (0..slots).map(|_| StagingArena::new(max_layout.bytes)).collect::<Result<Vec<_>>>()?;
         let words = Arc::new(std::sync::OnceLock::new());
-        let hosts: Vec<Vec<u8>> = (0..layers as usize).map(|layer| (0..rows * hidden).flat_map(|i| {
+        // Each layer's rows at its cut's width (the widest rows the layer may carry).
+        let widths: Vec<usize> = cuts.iter().flat_map(|&(_, rows)| std::iter::repeat_n(rows, layers as usize)).collect();
+        let hosts: Vec<Vec<u8>> = (0..total).map(|layer| (0..widths[layer] * hidden).flat_map(|i| {
             // Multiples of 0.5 in [-2, 2]: every rank partial (x rank + 1) and
             // every sum over up to six ranks is exact in BF16, so the reference
             // does not depend on the reducer's summation order.
@@ -432,22 +480,24 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             let value = if i < 8 { ((layer >> i) & 1) as f32 / 2.0 } else { ((i * 7 + layer * 13) % 9) as f32 / 2.0 - 2.0 };
             ((value.to_bits() >> 16) as u16).to_le_bytes()
         }).collect()).collect();
-        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0, inputs: hosts.clone(), words: words.clone(), delay, cpu: None, spent: None,
-            planes: planes.iter().map(|slot| slot.iter().map(|plane| (plane.ptr as usize, plane.bytes)).collect()).collect() };
-        let intake = Intake { ranks, rows: capacity, row_bytes, waves, planes, landing, next_slot: 0 };
+        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, inputs: hosts.clone(), words: words.clone(), delay, cpu: None, spent: None,
+            ranges: ranges.iter().map(|range| range.ptr as usize).collect() };
+        let (first_waves, first_rows) = cuts[0];
+        let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows, reserve, first_waves, first_rows)?;
+        let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-        let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
-        let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
+        let ids = DeviceAllocation::new(&library, max_rows * topk * 4)?;
+        let weights = DeviceAllocation::new(&library, max_rows * topk * 4)?;
         // One input and one output per layer, all live until the end.
-        let inputs = (0..layers).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
-        let outputs = (0..layers).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+        let inputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes)).collect::<Result<Vec<_>>>()?;
+        let outputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes)).collect::<Result<Vec<_>>>()?;
         let mut expected = Vec::new();
         for (layer, input) in inputs.iter().enumerate() {
             let host = &hosts[layer];
             library.copy_h2d(input.buffer, host)?;
-            let sum: Vec<u8> = (0..rows * hidden).flat_map(|i| {
+            let sum: Vec<u8> = (0..widths[layer] * hidden).flat_map(|i| {
                 let total: f32 = (0..ranks).map(|rank| {
                     let word = rank_rows(&host[2 * i..2 * i + 2], rank);
                     f32::from_bits(u32::from(u16::from_le_bytes([word[0], word[1]])) << 16)
@@ -457,60 +507,61 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             expected.push(sum);
         }
         let reducer = library.v41_compact_reducer()?;
-        // The host queues every layer before the GPU runs the first: send,
-        // land, reduce, consumed, back to back (decode run-ahead), with up
-        // to `waves` waves in flight (prefill units).
         let mut tickets = std::collections::VecDeque::new();
-        for layer in 0..layers as usize {
-            if tickets.len() == waves {
-                let (layer, ticket): (usize, WaveTicket) = tickets.pop_front().unwrap();
-                let slot = ticket.slot();
-                exchange.land(ticket, stream.raw())?;
-                // SAFETY: planes, output and the null shared plane are live.
-                unsafe { reducer.reduce_planes(exchange.planes(slot), ranks as u32, std::ptr::null(),
-                    outputs[layer].buffer.ptr.cast(), rows as u32, stream.raw())?; }
-                exchange.consumed(slot, stream.raw())?;
-            }
-            let (h, l) = (hidden, layer);
-            // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
-            let ticket = unsafe { exchange.send(rows, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
-                stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(l as u64 + 1, 1, l as u32,
-                    h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
-                        cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
-                        source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
-                        token_position: row.into(), route_offset: row * topk as u32, route_count: topk as u32 })
-                        .collect(), routes, wire)))? };
-            tickets.push_back((layer, ticket));
-        }
-        while let Some((layer, ticket)) = tickets.pop_front() {
+        let land = |exchange: &mut Waves<'_>, layer: usize, ticket: WaveTicket| -> Result<()> {
             let slot = ticket.slot();
             exchange.land(ticket, stream.raw())?;
-            // SAFETY: as above.
+            // SAFETY: planes, output and the null shared plane are live.
             unsafe { reducer.reduce_planes(exchange.planes(slot), ranks as u32, std::ptr::null(),
-                outputs[layer].buffer.ptr.cast(), rows as u32, stream.raw())?; }
-            exchange.consumed(slot, stream.raw())?;
+                outputs[layer].buffer.ptr.cast(), widths[layer] as u32, stream.raw())?; }
+            exchange.consumed(slot, stream.raw())
+        };
+        for (index, &(waves, rows)) in cuts.iter().enumerate() {
+            // A re-cut happens at rest: every wave landed and consumed (the
+            // decode→prefill boundary), with the reduces still queued.
+            while let Some((layer, ticket)) = tickets.pop_front() { land(&mut exchange, layer, ticket)?; }
+            exchange.set_geometry(waves, rows)?;
+            assert_eq!(exchange.waves(), waves);
+            let layout = RouteStaging::new(rows, topk, row_bytes)?;
+            // The host queues every layer of this cut before the GPU runs the
+            // first: send, land, reduce, consumed, back to back, with up to
+            // `waves` waves in flight (prefill units).
+            for layer in index * layers as usize..(index + 1) * layers as usize {
+                if tickets.len() == waves {
+                    let (layer, ticket) = tickets.pop_front().unwrap();
+                    land(&mut exchange, layer, ticket)?;
+                }
+                let (h, l) = (hidden, layer);
+                // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
+                let ticket = unsafe { exchange.send(rows, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
+                    stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(l as u64 + 1, 1, l as u32,
+                        h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
+                            cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
+                            source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
+                            token_position: row.into(), route_offset: row * topk as u32, route_count: topk as u32 })
+                            .collect(), routes, wire)))? };
+                tickets.push_back((layer, ticket));
+            }
         }
+        while let Some((layer, ticket)) = tickets.pop_front() { land(&mut exchange, layer, ticket)?; }
         stream.finish()?;
         healthy()?;
         let all = &expected;
-    for (layer, (output, expected)) in outputs.iter().zip(all).enumerate() {
+        for (layer, (output, expected)) in outputs.iter().zip(all).enumerate() {
+            let rows = widths[layer];
             let mut actual = vec![0u8; rows * row_bytes];
             library.copy_d2h(&mut actual, output.buffer)?;
             if actual != *expected {
                 let first = actual.iter().zip(expected.iter()).position(|(a, e)| a != e).unwrap();
                 let bad = actual.chunks(row_bytes).zip(expected.chunks(row_bytes)).filter(|(a, e)| a != e).count();
-                // Which earlier layer's sum does the bad row match (a stale or early plane)?
-                let row = first / row_bytes;
-                let source = all.iter().position(|other| other[row * row_bytes..(row + 1) * row_bytes]
-                    == actual[row * row_bytes..(row + 1) * row_bytes]);
-                panic!("ranks={ranks} landing={landing:#b} waves={waves} layer {layer} differs: first byte {first} \
-                    (row {row}), {bad} of {rows} rows, row matches layer {source:?}");
+                panic!("ranks={ranks} landing={landing:#b} cuts={cuts:?} layer {layer} differs: first byte {first}, \
+                    {bad} of {rows} rows");
             }
         }
         let (echo, _) = exchange.stop::<EchoWorld>()?;
         let share = echo.spent.map(|(cpu, wall)| format!(", worker CPU {:.0}% of {:.1} ms", 100.0 * cpu / wall, wall * 1e3))
             .filter(|_| delay_us > 0).unwrap_or_default();
-        eprintln!("exchange ranks={ranks} landing={landing:#b} waves={waves}: {layers} layers of {rows} rows byte-exact{share}");
+        eprintln!("exchange ranks={ranks} landing={landing:#b} cuts={cuts:?}: {total} layers byte-exact{share}");
     }
     Ok(())
 }
@@ -529,20 +580,19 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize, 4usize, 2usize, 4usize);
     let row_bytes = hidden * 2;
-    let planes_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes * waves))
+    let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes * waves))
         .collect::<Result<Vec<_>>>()?;
-    let planes: Vec<Vec<CuteafdDeviceBuffer>> = (0..waves).map(|slot| planes_owned.iter().map(|plane|
-        CuteafdDeviceBuffer { ptr: (plane.buffer.ptr as usize + slot * rows * row_bytes) as *mut c_void,
-            bytes: rows * row_bytes, ..plane.buffer }).collect()).collect();
+    let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
     let layout = RouteStaging::new(rows, topk, row_bytes)?;
     let arenas = (0..waves).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
     let words = Arc::new(std::sync::OnceLock::new());
     let hosts: Vec<Vec<u8>> = (0..layers).map(|_| vec![0u8; rows * row_bytes]).collect();
     // Replies take a second: every wave is still in flight when teardown closes.
-    let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing: 0, next_slot: 0, inputs: hosts,
+    let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing: 0, inputs: hosts,
         words: words.clone(), delay: Duration::from_secs(1), cpu: None, spent: None,
-        planes: planes.iter().map(|slot| slot.iter().map(|plane| (plane.ptr as usize, plane.bytes)).collect()).collect() };
-    let intake = Intake { ranks, rows, row_bytes, waves, planes, landing: 0, next_slot: 0 };
+        ranges: ranges.iter().map(|range| range.ptr as usize).collect() };
+    let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows, waves * rows, waves, rows)?;
+    let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -676,7 +726,7 @@ fn worker_sums_prefill_wave_pace_before_publishing_landed() -> Result<()> {
         type Wave = (u32, usize);
         fn counter(&self, counter: Counter) -> u32 { self.world.load(counter) }
         fn post(&mut self, job: Job) -> Result<(u32, usize)> { Ok((job.sequence, job.slot)) }
-        fn poll(&mut self, wave: &mut (u32, usize), _slot: usize, _rows: usize) -> Result<Option<RankPace>> {
+        fn poll(&mut self, wave: &mut (u32, usize), _slice: (usize, usize), _rows: usize) -> Result<Option<RankPace>> {
             self.polls += 1;
             let mut pace = RankPace::default();
             pace[0] = Some((1_000 * wave.0, 10 * wave.0));

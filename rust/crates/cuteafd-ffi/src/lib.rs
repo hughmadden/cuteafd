@@ -1529,6 +1529,14 @@ type RdmaRcEndpointPostRecvAtFn = unsafe extern "C" fn(
     bytes: usize,
     wr_id: u64,
 ) -> CuteafdStatus;
+type RdmaRcEndpointPostRecvLandingAtFn = unsafe extern "C" fn(
+    handle: *mut c_void,
+    offset_bytes: usize,
+    bytes: usize,
+    wr_id: u64,
+    landing_offset: usize,
+    landing_bytes: usize,
+) -> CuteafdStatus;
 type RdmaRcEndpointSetRecvLandingFn = unsafe extern "C" fn(
     handle: *mut c_void,
     device_ptr: *mut c_void,
@@ -1777,6 +1785,7 @@ native_symbols! {
     cuteafd_rdma_rc_endpoint_post_recv: RdmaRcEndpointPostRecvFn,
     cuteafd_rdma_rc_endpoint_post_recv_at: RdmaRcEndpointPostRecvAtFn,
     cuteafd_rdma_rc_endpoint_set_recv_landing: RdmaRcEndpointSetRecvLandingFn,
+    cuteafd_rdma_rc_endpoint_post_recv_landing_at: RdmaRcEndpointPostRecvLandingAtFn,
     cuteafd_rdma_gpu_landing_probe: RdmaGpuLandingProbeFn,
     cuteafd_rdma_rc_endpoint_post_send_at: RdmaRcEndpointPostSendAtFn,
     cuteafd_rdma_rc_endpoint_send: RdmaRcEndpointSendFn,
@@ -4697,6 +4706,29 @@ impl NativeLibrary {
         let recv_fn: RdmaRcEndpointPostRecvAtFn = self.cuteafd_rdma_rc_endpoint_post_recv_at()?;
         let status = unsafe { recv_fn(handle, offset_bytes, bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_recv_at", status)
+    }
+
+    /// Posts one receive whose header lands in the host slot at
+    /// `offset_bytes` and whose payload lands in the registered GPU landing
+    /// range at `[landing_offset, landing_offset + landing_bytes)`, outside the
+    /// landing rotation (bounds are checked natively).
+    ///
+    /// # Safety
+    /// `handle` is a live endpoint with a GPU landing range; that slice must
+    /// not be read or rewritten by anything else until this receive completes.
+    pub unsafe fn rdma_rc_endpoint_post_recv_landing_at(
+        &self,
+        handle: *mut c_void,
+        offset_bytes: usize,
+        bytes: usize,
+        wr_id: u64,
+        landing_offset: usize,
+        landing_bytes: usize,
+    ) -> Result<()> {
+        let post: RdmaRcEndpointPostRecvLandingAtFn = self.cuteafd_rdma_rc_endpoint_post_recv_landing_at()?;
+        // SAFETY: the caller guarantees the handle and slice contract above.
+        let status = unsafe { post(handle, offset_bytes, bytes, wr_id, landing_offset, landing_bytes) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_recv_landing_at", status)
     }
 
     /// Scatter each later receive: its first `header_bytes` into the host

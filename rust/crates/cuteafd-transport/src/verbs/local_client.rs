@@ -255,20 +255,27 @@ impl LocalTp4Client {
             }
         }
     }
-    pub(crate) fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+    /// Posts `request` to every rank. `landing` names, per rank, where this
+    /// wave's payload lands in a placed GPU landing (ranks without one ignore
+    /// their entry); it is required when any rank's landing is placed.
+    pub(crate) fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[LandingSlice]>)
+        -> Result<()> {
         crate::health::ensure_available()?;
         anyhow::ensure!(!self.terminal_failed && !self.terminal_quiesced,
             "terminal-owned Spark transport cannot be reused after failure or quiescence");
         anyhow::ensure!(self.waves.len() < self.max_waves,
             "Spark transport already has {} of {} admitted waves pending", self.waves.len(), self.max_waves);
-        let result = self.post(request);
+        if let Some(slices) = landing {
+            anyhow::ensure!(slices.len() == self.peers.len(), "one landing slice per rank");
+        }
+        let result = self.post(request, landing);
         if let Err(error) = &result {
             crate::health::record_failure(format!("expert dispatch failed: {error:#}"));
             self.reset();
         }
         result
     }
-    fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+    fn post(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[LandingSlice]>) -> Result<()> {
         // Any rank still unplaced is measured before this wave's requests go out.
         self.flows.ensure_all(&self.peers)?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -295,8 +302,17 @@ impl LocalTp4Client {
         // Every rank's bootstrap is validated before any request enters a QP;
         // then each rank's request goes out as one SEND.
         let mut timings = Vec::with_capacity(self.peers.len());
-        for session in self.sessions.iter_mut() {
-            timings.push(session.as_mut().unwrap().post_request(request, &self.config)?);
+        for (rank, session) in self.sessions.iter_mut().enumerate() {
+            let session = session.as_mut().unwrap();
+            let slice = if session.placed_landing {
+                let slice = landing.map(|slices| slices[rank])
+                    .context("a placed GPU landing needs the wave's landing slice")?;
+                let range = self.landing[rank].context("placed session without its landing range")?;
+                anyhow::ensure!(range.holds(slice), "rank {rank} landing slice {slice:?} lies outside its {}-byte range",
+                    range.bytes);
+                Some(slice)
+            } else { None };
+            timings.push(session.post_request(request, &self.config, slice)?);
         }
         for (rank, timing) in timings.into_iter().enumerate() {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -470,8 +486,10 @@ fn wait_for_ring_release(stream: &mut TcpStream, timeout: Duration) -> Result<()
 /// dispatch (`egress_slot`), and the exchange lands wave `k` in slot `k % N`.
 /// A multi-slot GPU landing may therefore (re)open only in phase, at wave
 /// slot 0: otherwise its next reply would land in another wave's planes.
+/// A placed landing has no rotation (each request names its slice), so it may
+/// (re)open at any slot.
 fn landing_phase_admits_open(landing: Option<DeviceLanding>, max_waves: usize, next_slot: usize) -> Result<()> {
-    let slots = landing.map_or(1, |landing| landing.bytes / landing.slot_bytes.max(1));
+    let slots = landing.filter(|landing| !landing.placed).map_or(1, |landing| landing.bytes / landing.slot_bytes.max(1));
     anyhow::ensure!(slots <= 1 || next_slot % max_waves.max(1) == 0,
         "a GPU-landing Spark session cannot (re)connect at wave slot {next_slot} of {max_waves}: its landing \
         rotation restarts at slot 0 (reset the link first)");
@@ -538,12 +556,14 @@ mod tests {
 
     #[test]
     fn multi_slot_landing_reconnects_only_in_phase() {
-        let landing = |slots: usize| Some(DeviceLanding { ptr: 4096, bytes: slots * 12288, slot_bytes: 12288 });
+        let landing = |slots: usize| Some(DeviceLanding { ptr: 4096, bytes: slots * 12288, slot_bytes: 12288, placed: false });
+        let placed = Some(DeviceLanding { ptr: 4096, bytes: 4 * 12288, slot_bytes: 4 * 12288, placed: true });
         for waves in 1..=4 {
             for next in 0..2 * waves {
-                // Host receives and a one-slot landing have no phase.
+                // Host receives, a one-slot landing and a placed landing have no phase.
                 assert!(landing_phase_admits_open(None, waves, next).is_ok());
                 assert!(landing_phase_admits_open(landing(1), waves, next).is_ok());
+                assert!(landing_phase_admits_open(placed, waves, next).is_ok());
                 assert_eq!(landing_phase_admits_open(landing(waves), waves, next).is_ok(),
                     waves == 1 || next % waves == 0, "{waves} waves at slot {next}");
             }
@@ -564,7 +584,7 @@ mod tests {
                 source_request_id: 1, token_position: 0, route_offset: 0, route_count: 1 }],
             vec![crate::ExpertProtocolV2RouteEntry { row_index: 0, expert_id: 0, gate_weight: 1.0 }], vec![0; 128])?;
         for waves in 2..=4usize {
-            let landing = DeviceLanding { ptr: 1 << 32, bytes: waves * 12288, slot_bytes: 12288 };
+            let landing = DeviceLanding { ptr: 1 << 32, bytes: waves * 12288, slot_bytes: 12288, placed: false };
             for slot in 0..waves {
                 for gpu in [false, true] {
                     let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig { timing: false,
@@ -725,7 +745,7 @@ mod tests {
         assert!(client.set_max_waves(3).is_err(), "admission changed with waves in flight");
         // A third dispatch is refused before any session or request is touched.
         let request = crate::expert::test_request(1);
-        let error = client.dispatch(&request).unwrap_err().to_string();
+        let error = client.dispatch(&request, None).unwrap_err().to_string();
         assert!(error.contains("2 of 2 admitted waves"), "{error}");
         // The second wave's completion does not complete the first.
         let (first, second) = (senders.remove(0), senders.remove(0));
@@ -808,7 +828,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let library = load_verbs_host_native_library()?;
         let plane_bytes = capacity as usize * hidden as usize * 2;
-        for landing in if gpu { vec![false, true] } else { vec![false] } {
+        // Landing modes: host receives, a rotating N-slot landing, and a placed
+        // landing whose slot width changes every pass (as a prefill link
+        // re-partitions its reserve between prompts) without reconnecting.
+        for (landing, placed) in if gpu { vec![(false, false), (true, false), (true, true)] } else { vec![(false, false)] } {
             for registered in [false, true] {
                 for waves in 1..=4usize {
                     let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
@@ -818,16 +841,23 @@ mod tests {
                     let mut plane = None;
                     if landing {
                         let buffer = library.alloc_device_buffer(plane_bytes * waves)?;
-                        client.set_landing(vec![Some(DeviceLanding::with_slots(buffer, waves)?)])?;
+                        client.set_landing(vec![Some(match placed {
+                            true => DeviceLanding::placed(buffer)?,
+                            false => DeviceLanding::with_slots(buffer, waves)?,
+                        })])?;
                         plane = Some(buffer);
                     }
+                    let row_bytes = hidden as usize * 2;
                     let result = (|| -> Result<()> {
+                        // Placed: the slot width of pass `p` (rows), inside the
+                        // same `waves` x capacity range; rotating: the capacity.
+                        let widths = [2048u32, 1376, 1024];
                         // Full capacity first: it sizes the rings for every later wave.
                         let sizes = [2048u32, 1, 21, 64, 1500, 2048, 7, 2048];
                         let mut sent: VecDeque<(ExpertProtocolV2Request, Vec<u8>, usize)> = VecDeque::new();
                         let mut zero_copy = 0;
                         let check = |client: &mut LocalTp4Client, request: ExpertProtocolV2Request, expected: Vec<u8>,
-                            slot: usize| -> Result<()> {
+                            offset: usize| -> Result<()> {
                             // The request's payload (an egress view) is still intact.
                             anyhow::ensure!(request.hidden_payload.as_ref() == expected.as_slice(),
                                 "request {} payload changed while in flight", request.header.request_id);
@@ -844,21 +874,27 @@ mod tests {
                             if let Some(buffer) = plane.filter(|_| landed) {
                                 // SAFETY: the slot lies inside the allocated plane, whose wave landed.
                                 let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
-                                    .add(slot * plane_bytes) }.cast(), bytes: got.len(), ..buffer };
+                                    .add(offset) }.cast(), bytes: got.len(), ..buffer };
                                 library.copy_d2h(&mut got, view)?;
                             }
                             anyhow::ensure!(landed == plane.is_some(), "request {} landed={landed}", request.header.request_id);
-                            anyhow::ensure!(got == expected, "request {} echo differs (slot {slot})", request.header.request_id);
+                            anyhow::ensure!(got == expected, "request {} echo differs (offset {offset})", request.header.request_id);
                             Ok(())
                         };
                         for (index, &rows) in sizes.iter().cycle().take(sizes.len() * 3).enumerate() {
-                            while client.open_waves() == waves {
-                                let (request, expected, slot) = sent.pop_front().unwrap();
-                                check(&mut client, request, expected, slot)?;
+                            let pass = index / sizes.len();
+                            let width = if placed { widths[pass % widths.len()] } else { capacity };
+                            // A geometry change waits for quiescence, as the exchange's does.
+                            let reshape = placed && index % sizes.len() == 0;
+                            while client.open_waves() == waves || (reshape && client.open_waves() > 0) {
+                                let (request, expected, offset) = sent.pop_front().unwrap();
+                                check(&mut client, request, expected, offset)?;
                             }
+                            let rows = rows.min(width);
                             let expected: Vec<u8> = (0..rows as usize * hidden as usize * 2)
                                 .map(|i| ((i * 7 + index * 13) % 253) as u8).collect();
                             let slot = index % waves;
+                            let offset = slot * width as usize * row_bytes;
                             let payload: bytes::Bytes = match registered && expected.len() >= 1 << 20 {
                                 true => {
                                     // Rewrites this wave's slot while the other waves' requests,
@@ -874,14 +910,15 @@ mod tests {
                                 false => expected.clone().into(),
                             };
                             let request = bf16_request(index as u64 + 1, rows, hidden, payload)?;
-                            client.dispatch(&request)?;
-                            sent.push_back((request, expected, slot));
+                            let slice = [LandingSlice { offset, bytes: width as usize * row_bytes }];
+                            client.dispatch(&request, placed.then_some(&slice[..]))?;
+                            sent.push_back((request, expected, offset));
                         }
-                        while let Some((request, expected, slot)) = sent.pop_front() {
-                            check(&mut client, request, expected, slot)?;
+                        while let Some((request, expected, offset)) = sent.pop_front() {
+                            check(&mut client, request, expected, offset)?;
                         }
                         anyhow::ensure!((zero_copy > 0) == registered, "registered={registered}: {zero_copy} zero-copy waves");
-                        eprintln!("loopback landing={landing} registered={registered} waves={waves}: \
+                        eprintln!("loopback landing={landing} placed={placed} registered={registered} waves={waves}: \
                             {} waves byte-exact, {zero_copy} zero-copy", sizes.len() * 3);
                         Ok(())
                     })();
@@ -940,7 +977,7 @@ mod tests {
                     let wire = request.wire_stats().wire_bytes;
                     anyhow::ensure!(wire > 16 << 20, "request of {wire} bytes is not large");
                     let sent_before = client.sessions[0].as_ref().map_or(0, |s| s.request_sends.in_flight());
-                    client.dispatch(&request)?;
+                    client.dispatch(&request, None)?;
                     let session = client.sessions[0].as_ref().context("session opened by dispatch")?;
                     // Nothing reaps send completions between dispatch and here.
                     anyhow::ensure!(session.request_sends.in_flight() == sent_before + 1,

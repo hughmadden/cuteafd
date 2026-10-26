@@ -36,6 +36,7 @@ pub(crate) mod token_io;
 pub(crate) mod spark_intake;
 pub(crate) mod spark_topology;
 pub(crate) mod spark_waves;
+pub(crate) mod wave_geometry;
 pub(crate) mod target_head;
 pub(crate) mod thermal;
 pub(crate) mod vision;

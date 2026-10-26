@@ -327,7 +327,7 @@ impl SparkExperts {
         ensure!(self.open_waves.is_empty() || self.clients.max_waves() == 1,
             "a borrowed Spark dispatch cannot follow outstanding waves");
         if !self.open_waves.is_empty() { self.open_waves.clear(); self.reset_connections(); }
-        let receiver = self.post(request)?;
+        let receiver = self.post(request, None)?;
         Ok(SparkExpertPending {
             receiver,
             poll_quantum: poll_quantum(&request.rows),
@@ -341,7 +341,16 @@ impl SparkExperts {
     /// keep their own copy of the request, so it need not outlive the wave.
     /// Up to [`Self::max_waves`] may be outstanding; receive them in dispatch order.
     pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<SparkExpertWave> {
-        let receiver = self.post(request)?;
+        self.dispatch_wave_at(request, None)
+    }
+
+    /// [`Self::dispatch_wave`] whose payload lands, on every rank with a
+    /// placed GPU landing ([`DeviceLanding::placed`]), at that rank's
+    /// `landing` slice of its registered range. A transport with a placed
+    /// landing requires the slices; other ranks ignore theirs.
+    pub fn dispatch_wave_at(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[crate::LandingSlice]>)
+        -> Result<SparkExpertWave> {
+        let receiver = self.post(request, landing)?;
         self.wave_sequence += 1;
         self.open_waves.push_back(self.wave_sequence);
         Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows), sequence: self.wave_sequence,
@@ -475,7 +484,8 @@ impl SparkExperts {
         self.clients.egress_arenas()
     }
 
-    fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {
+    fn post(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[crate::LandingSlice]>)
+        -> Result<V41Tp4ChunkReceiver> {
         crate::health::ensure_available()?;
         // A dropped wave is not received; at single-wave admission the next
         // post resets its QPs as before. Past the admitted count, refuse.
@@ -524,7 +534,7 @@ impl SparkExperts {
                 }
             }
         };
-        self.clients.dispatch(request)?;
+        self.clients.dispatch(request, landing)?;
         if let Some(tap) = &mut self.route_tap {
             tap.record(request, self.executors.len());
         }
