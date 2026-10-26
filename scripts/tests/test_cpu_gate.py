@@ -228,7 +228,35 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
             assert command[command.index('--') + 2:-1:2] == list(gate.FULL_TESTS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert ('not a merge/release gate' in gate.render(record)) != full
-    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 14
+    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 15
+    assert 'installed_example_deployments_publish_executable_prefill_shapes' in gate.FULL_TESTS
+
+
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('inventory', ['home', 'hf-home', 'override'])
+def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monkeypatch, full, inventory):
+    (tmp_path / 'logs').mkdir()
+    calls = []
+    def run_logged(cmd, path, env, cwd, timeout):
+        calls.append(dict(env))
+        Path(path).write_text(BUILD_OK if len(calls) == 1 else
+                              'test result: ok. 1 passed; 0 failed; 0 ignored\n')
+        return 0, 1.
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'run_logged', run_logged)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **kwargs: '')
+    env = {'HOME': str(tmp_path)}
+    expected = str(tmp_path / '.cache/huggingface')
+    if inventory in ('hf-home', 'override'):
+        env['HF_HOME'] = expected = str(tmp_path / 'hf-home')
+    if inventory == 'override':
+        env['CUTEAFD_DEPLOYMENT_TEST_HF_HOME'] = expected = str(tmp_path / 'selected-inventory')
+    env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] = str(tmp_path / 'PROGRAMS.json')
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), env)
+    assert result['status'] == 'pass'
+    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == (expected if full or inventory == 'override' else None)
+    assert calls[1]['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS']
+    assert ('CUTEAFD_DEPLOYMENT_TEST_HF_HOME' in env) == (inventory == 'override')
 
 
 def test_full_tier_adds_only_its_missing_profile_for_an_older_base(tmp_path, monkeypatch):
