@@ -85,11 +85,13 @@ def test_quantization_host_rejects_other_cluster_hosts(monkeypatch,host):
 
 
 @pytest.mark.parametrize("qualification",[False,True])
-def test_preflight_bootstrap_still_checks_local_source_gpu_and_producer(tmp_path,monkeypatch,qualification):
+@pytest.mark.parametrize("wsl_path",[False,True])
+def test_preflight_bootstrap_still_checks_local_source_gpu_and_producer(tmp_path,monkeypatch,qualification,wsl_path):
     repo=tmp_path;fork=repo/"third_party/gptqmodel";fork.mkdir(parents=True)
     (fork.parent/"gptqmodel.lock.json").write_text(json.dumps(dict(revision="pinned",source_tree_sha256="tree")))
     monkeypatch.setattr(preflight,"REPO",repo)
     monkeypatch.setattr(preflight.socket,"gethostname",lambda:"maxq")
+    monkeypatch.setattr(preflight.shutil,"which",lambda name:None if wsl_path else "/usr/bin/nvidia-smi")
     monkeypatch.setattr(preflight.runpy,"run_path",lambda path:{"source_tree_sha256":lambda source:"tree"})
     qualified=[];checks=[];runs=[]
     monkeypatch.setattr(preflight,"qualified",lambda *a,**k:qualified.append((a,k)))
@@ -98,7 +100,9 @@ def test_preflight_bootstrap_still_checks_local_source_gpu_and_producer(tmp_path
         if "--porcelain" in command:return ""
         if "rev-parse" in command:return "pinned\n"
         if command[0]=="nest":return "maxq ready\n"
-        if command[0]=="nvidia-smi":return "NVIDIA RTX PRO 6000 Blackwell Max-Q, 97887\n"
+        if Path(command[0]).name=="nvidia-smi":
+            assert command[0]==("/usr/lib/wsl/lib/nvidia-smi" if wsl_path else "/usr/bin/nvidia-smi")
+            return "NVIDIA RTX PRO 6000 Blackwell Max-Q, 97887\n"
         pytest.fail(str(command))
     monkeypatch.setattr(preflight.subprocess,"check_output",output)
     monkeypatch.setattr(preflight.subprocess,"run",lambda command,**kwargs:runs.append(command))
@@ -107,7 +111,7 @@ def test_preflight_bootstrap_still_checks_local_source_gpu_and_producer(tmp_path
     preflight.main()
     assert bool(qualified) is not qualification
     assert any(command[0]=="nest" for command in checks)
-    assert any(command[0]=="nvidia-smi" for command in checks)
+    assert any(Path(command[0]).name=="nvidia-smi" for command in checks)
     assert runs[0]==["docker","image","inspect",preflight.IMAGE]
     assert runs[1][-1]=="--preflight"
 

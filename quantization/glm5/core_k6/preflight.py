@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import runpy
+import shutil
 import socket
 import subprocess
 import sys
@@ -110,7 +111,8 @@ def main():
         return
     if not args.publication_only:
         require_local_source(host)
-        devices=subprocess.check_output(["nvidia-smi","--query-gpu=name,memory.total",
+        nvidia_smi=shutil.which("nvidia-smi") or "/usr/lib/wsl/lib/nvidia-smi"
+        devices=subprocess.check_output([nvidia_smi,"--query-gpu=name,memory.total",
             "--format=csv,noheader,nounits"],text=True,timeout=30).strip().splitlines()
         if len(devices)!=1 or "RTX PRO 6000" not in devices[0] or int(devices[0].rsplit(",",1)[1].strip())<96000:
             raise ValueError("expected one local 96GB RTX PRO 6000")

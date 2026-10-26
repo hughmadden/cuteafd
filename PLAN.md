@@ -6005,3 +6005,6 @@ the HF content SHA-256 names. No destructive fsck resolution was applied.
 Readiness therefore verifies all 282 weights and six source/config/tokenizer
 assets directly against the pinned Hugging Face revision's published hashes;
 the two-thread streaming audit and evidence live in the readiness cache.
+Non-login SSH admission also resolves WSL's `/usr/lib/wsl/lib/nvidia-smi`
+when it is absent from PATH. The final CPU gate passes 96 cases, including
+both normal Linux and minimal-PATH WSL admission.
