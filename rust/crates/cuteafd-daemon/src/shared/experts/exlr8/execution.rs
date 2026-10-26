@@ -179,6 +179,7 @@ pub(crate) struct Exlr8Execution<'a> {
     intermediate_bytes: usize,
     cta_limit: i32,
     group_cta_limit: i32,
+    l2_bytes: i32,
     set: ExpertSet,
 }
 impl<'a> Exlr8Execution<'a> {
@@ -332,6 +333,8 @@ impl<'a> Exlr8Execution<'a> {
         };
         let cta_limit = limit(k1.spec())?;
         let group_cta_limit = limit(group.spec())?;
+        let l2_bytes = i32::try_from(library.l2_cache_bytes()?).context("EXLR8 runtime L2 exceeds int32")?;
+        ensure!(l2_bytes > 0, "EXLR8 runtime L2 must be positive");
         let arena = DeviceAllocation::named(library, layout.bytes, "experts/workspace/exlr8")?;
         Ok(Self {
             group,
@@ -342,6 +345,7 @@ impl<'a> Exlr8Execution<'a> {
             intermediate_bytes,
             cta_limit,
             group_cta_limit,
+            l2_bytes,
             set,
         })
     }
@@ -429,7 +433,7 @@ impl<'a> Exlr8Execution<'a> {
                 || weights.layout.compact_unit_limit() <= self.layout.unit_limit,
             "EXLR8 layer ownership exceeds compact arena stride");
         let scalars = [Scalar::I32(rows as i32), Scalar::I32(self.cta_limit),
-            Scalar::I32(self.layout.unit_limit as i32)];
+            Scalar::I32(self.layout.unit_limit as i32), Scalar::I32(self.l2_bytes)];
         let mut operands = [p(10), weights.pointers()?.ptr, weights.bits()?.ptr,
             p(4), p(5), p(6), p(2), p(8), intermediate.ptr, fc2.ptr,
             weights.signs(true)?.ptr, p(3), p(7), std::ptr::null_mut(), std::ptr::null_mut()];
@@ -445,7 +449,7 @@ impl<'a> Exlr8Execution<'a> {
                 stream,
             )?;
             self.k1.launch(&operands[..if self.layout.unit_tables { 15 } else { 13 }],
-                &scalars[..if self.layout.unit_tables { 3 } else { 2 }], stream)?;
+                &scalars[..if self.layout.unit_tables { 4 } else { 2 }], stream)?;
         }
         Ok(())
     }
@@ -502,7 +506,7 @@ mod tests {
             Exlr8PrefillActivations::A16).0.into();
         spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeGrouped)
             .into_iter().map(String::from).collect();
-        spec.scalar_kinds = b"iii".to_vec();
+        spec.scalar_kinds = b"iiii".to_vec();
         spec.geometry.as_object_mut().unwrap().remove("serving_variant");
         spec.geometry["group_rows"] = serde_json::json!(cuteafd_ffi::exlr8::COMPACT_GROUP_ROWS);
         spec.geometry["fc2_partials"] = serde_json::json!("f32");
@@ -683,7 +687,7 @@ mod tests {
         grouped.capacity_rows = 4096;
         grouped.pointers = pointers(ExpertSet::Routed, Variant::Prefill)
             .into_iter().map(String::from).collect();
-        grouped.scalar_kinds = b"iii".to_vec();
+        grouped.scalar_kinds = b"iiii".to_vec();
         grouped.geometry["max_rows"] = serde_json::json!(4096);
         grouped.geometry["group_rows"] = serde_json::json!(64);
         grouped.geometry.as_object_mut().unwrap().remove("serving_variant");
