@@ -3200,7 +3200,6 @@ fn protocol_v2_request_device_payload(
     Ok(ProtocolV2RequestDevicePayload {
         execution_lane,
         response_slot,
-        routes: mapped(request.route_bytes(), "route records")?,
         hidden_payload: mapped(request.hidden_payload(), "hidden payload")?,
     })
 }
@@ -5398,7 +5397,7 @@ mod persistent_tests {
     }
 
     #[test]
-    fn mapped_request_device_payload_preserves_routes_and_refuses_short_frames() {
+    fn mapped_request_device_payload_preserves_hidden_and_refuses_short_frames() {
         let mut owned = persistent_chunk_request(3);
         owned.routes = (0..3).map(|row| crate::ExpertProtocolV2RouteEntry {
             row_index: row, expert_id: row + 7, gate_weight: 0.125 * (row + 1) as f32,
@@ -5417,10 +5416,11 @@ mod persistent_tests {
             flags: CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST,
         };
         let mapped = protocol_v2_request_device_payload(&frame, &request, buffer, None, 0).unwrap();
-        assert_eq!(mapped.routes.ptr as usize, 0x100000 + offset);
-        assert_eq!(mapped.routes.bytes, 36);
-        assert_eq!(mapped.routes.device_id, 2);
-        assert_eq!(mapped.routes.flags, CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST);
+        let hidden_offset = request.hidden_payload().as_ptr() as usize - frame.as_ptr() as usize;
+        assert_eq!(mapped.hidden_payload.ptr as usize, 0x100000 + hidden_offset);
+        assert_eq!(mapped.hidden_payload.bytes, request.hidden_payload().len());
+        assert_eq!(mapped.hidden_payload.device_id, 2);
+        assert_eq!(mapped.hidden_payload.flags, CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST);
         for bytes in [offset + 35, frame.len() - 1] {
             assert!(protocol_v2_request_device_payload(&frame, &request,
                 CuteafdDeviceBuffer { bytes, ..buffer }, None, 0).is_err());

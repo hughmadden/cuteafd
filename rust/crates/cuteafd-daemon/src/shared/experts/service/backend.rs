@@ -358,9 +358,9 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Fp8(groups) => {
                 ensure!(groups.pending_groups.is_empty(), "cannot resize an active FP8 owner queue");
                 groups.pending_groups = std::collections::VecDeque::with_capacity(units);
-                for worker in &mut groups.workers { worker.defer(units)?; }
+                for worker in &mut groups.workers { worker.defer(units, staging_rows)?; }
             },
-            Self::Exlr8(execution) => execution.defer(units)?,
+            Self::Exlr8(execution) => execution.defer(units, staging_rows)?,
         }
         Ok(())
     }
@@ -598,7 +598,7 @@ pub(super) fn load_fp8<'a>(
         totals.add(resident, 1, group.scratch)?;
         budgets.push(resident);
     }
-    let workspace = spark_execution_workspace(config, |capacity, _, _| {
+    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows| {
         let (mut scratch, mut io) = (0, 0usize);
         for group in &groups {
             let (group_scratch, group_io) = group.modules.as_ref()
@@ -606,7 +606,8 @@ pub(super) fn load_fp8<'a>(
             scratch = scratch.max(group_scratch);
             io = io.checked_add(group_io).context("native owner I/O overflow")?;
         }
-        Ok((scratch, io, 0))
+        let pinned = staging_rows as usize * cuteafd_core::expert_geometry().topk as usize * 8 * groups.len();
+        Ok((scratch, io, pinned))
     })?;
     let workspace = usize::try_from(workspace.total().context("native owner workspace overflow")?)?;
     let peak = spark_admission_budget(config, totals.resident, 0, totals.pinned, totals.host, workspace)?;

@@ -1,10 +1,50 @@
 use super::testing::*;
+use super::testing::plan;
 use super::*;
 use crate::formats::exl3_storage::Exl3StorageSource;
 use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
 use crate::placement::AttentionPlacement;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+
+#[test]
+fn planner_timings_charge_metadata_once_and_preserve_reports() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let options = PlanOptions::default();
+    let (first, cold) = input.plan_with_timings(&options);
+    let (second, warm) = input.plan_with_timings(&options);
+    assert_eq!(serde_json::to_value(first.unwrap()).unwrap(), serde_json::to_value(second.unwrap()).unwrap());
+    assert!(cold.open > std::time::Duration::ZERO);
+    assert!(cold.catalog > std::time::Duration::ZERO);
+    assert_eq!(warm.open, std::time::Duration::ZERO);
+    assert_eq!(warm.catalog, std::time::Duration::ZERO);
+    assert!(cold.total() >= cold.open + cold.catalog);
+    assert!(warm.report > std::time::Duration::ZERO);
+}
+
+#[test]
+fn spark_count_resolution_reuses_the_preflight_checkpoint() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let options = PlanOptions::default();
+    let normalize = |report| {
+        let mut value = serde_json::to_value(report).unwrap();
+        if let Some(host) = value.get_mut("host_ledger").and_then(Value::as_object_mut) {
+            host.remove("available_bytes");
+            host.remove("headroom_bytes");
+        }
+        value
+    };
+    for explicit in [None, Some(0), Some(4), Some(7)] {
+        let expected = normalize(plan_spark_count(dir.path(), &options, 6, explicit).unwrap());
+        let actual = normalize(input.plan_spark_count(&options, 6, explicit).unwrap());
+        assert_eq!(actual, expected, "{explicit:?}");
+    }
+    std::fs::remove_file(dir.path().join("config.json")).unwrap();
+    assert!(input.plan_spark_count(&options, 6, Some(4)).is_ok());
+    assert!(plan_spark_count(dir.path(), &options, 6, Some(4)).is_err());
+}
 
 #[test]
 fn planner_rejects_unsupported_decode_views_before_family_layout() {
@@ -3317,8 +3357,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "runtime growth").unwrap().bytes, 3 << 30);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
-    let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&serde_json::from_reader::<_, Value>(
-        std::fs::File::open(dir.path().join("config.json")).unwrap()).unwrap(), 1).unwrap();
+    let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
     let rank = cache.ranks[0];
     assert_eq!(state, (rank.active_state_per_sequence_bytes - 4 * 4096 * 4) * 16);
     options.layout.as_mut().unwrap().pool_tokens = Some(512);

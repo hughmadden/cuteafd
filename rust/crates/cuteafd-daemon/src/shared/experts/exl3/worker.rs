@@ -463,7 +463,7 @@ impl<'a> Exl3Worker<'a> {
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         destination: Option<CuteafdDeviceBuffer>,
-        hidden_view: Option<CuteafdDeviceBuffer>, routes_view: Option<CuteafdDeviceBuffer>,
+        hidden_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
         Self::validate_layer(&self.layer_ids, self.layer, request.layer() as usize)?;
         ensure!(
@@ -529,11 +529,7 @@ impl<'a> Exl3Worker<'a> {
             bytes: routes * 4,
             ..staged
         };
-        if let Some(source) = routes_view.filter(|_| !request.is_native_group()) {
-            // SAFETY: the mapped route records remain retained for this unit.
-            unsafe { super::super::service::routes::copy_mapped_routes(self.library, request, source,
-                self.inputs[1].buffer, self.inputs[2].buffer, self.stream.raw)?; }
-        } else {
+        // Packed pinned planes avoid a strided mapped-host copy per route.
         match if self.deferred { HostPath::Async } else { self.host_path } {
             // SAFETY: both sources are pinned staging written above and left
             // untouched until this call's stream completes (below); both
@@ -552,7 +548,6 @@ impl<'a> Exl3Worker<'a> {
                 self.library.copy_h2d(self.inputs[2].buffer,
                     std::slice::from_raw_parts(weight_source.ptr.cast::<u8>(), routes * 4))?;
             },
-        }
         }
         let uploaded_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if let Some([start, _]) = &self.timing {
@@ -671,7 +666,7 @@ impl<'a> Exl3Worker<'a> {
             ..slot
         };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output), hidden, None)?;
+        self.execute(request, executor_id, exchange, Some(output), hidden)?;
         Ok(Some(response))
     }
 
@@ -687,7 +682,7 @@ impl<'a> Exl3Worker<'a> {
         // SAFETY: checked output extent stays inside the exclusively retained send frame.
         let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload), Some(mapped.routes))?;
+        self.execute(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload))?;
         Ok(Some(response))
     }
 
@@ -708,7 +703,7 @@ impl<'a> Exl3Worker<'a> {
             row_indices.len() >= chunk_rows as usize,
             "response row-index scratch is too short"
         );
-        self.execute(request, executor_id, exchange, None, None, None)?;
+        self.execute(request, executor_id, exchange, None, None)?;
         let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());

@@ -28,6 +28,7 @@ pub(crate) struct Fp8Worker<'a> {
     pending: super::super::execution::timing::PendingUnits<'a>,
     /// The owner stream's pace clock, shared with every group on that stream.
     clock: super::super::execution::timing::PaceClock<'a>,
+    route_staging: super::super::service::routes::RouteStaging<'a>,
 }
 
 fn validate_worker_layers(layers: &[usize]) -> Result<()> {
@@ -90,6 +91,7 @@ impl<'a> Fp8Worker<'a> {
             deferred: false,
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
             clock: Default::default(),
+            route_staging: super::super::service::routes::RouteStaging::new(library, 1, capacity)?,
         })
     }
 
@@ -107,9 +109,11 @@ impl<'a> Fp8Worker<'a> {
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
-    pub(crate) fn defer(&mut self, units: usize) -> Result<()> {
+    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active FP8 queue");
+        ensure!(staging_rows > 0 && staging_rows <= self.capacity, "FP8 staging exceeds owner rows");
         self.pending = super::super::execution::timing::PendingUnits::with_clock(self.library, units, self.clock.clone())?;
+        self.route_staging.resize(self.library, units, staging_rows)?;
         self.deferred = true;
         Ok(())
     }
@@ -145,8 +149,7 @@ impl<'a> Fp8Worker<'a> {
     }
 
     fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64, exchange: &mut HostExpertExchange,
-        destination: Option<CuteafdDeviceBuffer>, hidden_view: Option<CuteafdDeviceBuffer>,
-        routes_view: Option<CuteafdDeviceBuffer>)
+        destination: Option<CuteafdDeviceBuffer>, hidden_view: Option<CuteafdDeviceBuffer>)
         -> Result<CuteafdDeviceBuffer> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
@@ -165,11 +168,8 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.hidden().len() <= self.inputs[0].buffer.bytes, "FP8 request rows exceed the input buffer");
         let bytes = request.plane_bytes()?;
         let routes = rows * cuteafd_core::expert_geometry().topk as usize;
-        if routes_view.is_none() {
-            ensure!(self.pending.is_empty(), "host routes cannot overwrite queued expert inputs");
-            request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
-        }
-        self.pending.next_slot()?;
+        let stage = self.pending.next_slot()?;
+        self.route_staging.pack(stage, request)?;
         ensure!(cfg!(target_endian = "little"), "native exchange requires little-endian storage");
         // Every copy follows the previous unit's consumers on this owner stream;
         // the transport retains each mapped source independently until its reply.
@@ -186,19 +186,9 @@ impl<'a> Fp8Worker<'a> {
             },
             None => self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?,
         }
-        if let Some(source) = routes_view {
-            // SAFETY: transport retains this unit's mapped records until its fence and send complete.
-            unsafe { super::super::service::routes::copy_mapped_routes(self.library, request, source,
-                self.inputs[1].buffer, self.inputs[2].buffer, self.stream.raw)?; }
-        } else {
-            // SAFETY: the host path has no queued unit and these initialized slices live through each copy.
-            unsafe {
-                self.library.copy_h2d(self.inputs[1].buffer,
-                    std::slice::from_raw_parts(exchange.ids.as_ptr().cast::<u8>(), routes * 4))?;
-                self.library.copy_h2d(self.inputs[2].buffer,
-                    std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4))?;
-            }
-        }
+        // SAFETY: this unit retains its packed slot through the FIFO completion fence.
+        unsafe { self.route_staging.upload(stage, 0, routes, self.inputs[1].buffer,
+            self.inputs[2].buffer, self.stream.raw)?; }
         let output = match destination {
             Some(output) => output,
             None => CuteafdDeviceBuffer { bytes, ..self.output.buffer },
@@ -249,7 +239,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(!slot.ptr.is_null(), "null FP8 response slot");
         let output = CuteafdDeviceBuffer { ptr: slot.ptr.cast::<u8>().add(prefix).cast(), bytes, ..slot };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output), hidden, None)?;
+        self.execute(request, executor_id, exchange, Some(output), hidden)?;
         Ok(Some(response))
     }
 
@@ -265,7 +255,7 @@ impl<'a> Fp8Worker<'a> {
         // SAFETY: checked prefix/plane extent stays in the exclusively retained send slot.
         let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload), Some(mapped.routes))?;
+        self.execute(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload))?;
         Ok(Some(response))
     }
 
@@ -276,7 +266,7 @@ impl<'a> Fp8Worker<'a> {
     {
         let chunk_rows = request.response_chunk_rows(max_frame_bytes)?;
         ensure!(row_indices.len() >= chunk_rows as usize, "response row-index scratch is too short");
-        self.execute(request, executor_id, exchange, None, None, None)?;
+        self.execute(request, executor_id, exchange, None, None)?;
         let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());
@@ -399,7 +389,7 @@ mod tests {
         let weights = Rc::new(Fp8Weights { layers, module, bf16_module: None,
             tp: 2, rank: 0, weight_read_bytes: 256 });
         let mut worker = Fp8Worker::new(&library, weights, 4096)?;
-        worker.defer(3)?;
+        worker.defer(3, 4096)?;
         let mut exchange = HostExpertExchange::new(4096)?;
         let rows = 2u32;
         let hidden = geometry.hidden as usize;
@@ -408,7 +398,7 @@ mod tests {
         let mut frames = Vec::new();
         let mut replies = Vec::new();
         let mut expected = Vec::new();
-        for unit in 0..3usize {
+        for unit in 0..4usize {
             let layer = 3 + unit % 2;
             let input = 7 + unit as u8 * 4;
             let gate = (unit + 1) as f32;
@@ -437,13 +427,20 @@ mod tests {
             frames.push(frame);
             replies.push(reply);
         }
-        for unit in 0..3 {
+        for unit in 0..4 {
+            if unit == 3 {
+                fixture.advance_queued_experts(&library, 1)?;
+                assert!(worker.unit_ready()? && !worker.stream_idle()?);
+                worker.complete()?;
+                assert_eq!(worker.pending.next_slot()?, 0);
+                assert_eq!(&replies[0].bytes()[prefix..prefix + expected[0].len()], expected[0]);
+            }
             let view = ExpertProtocolV2RequestView::parse(frames[unit].bytes())?;
             let request = BackboneRequest::parse(frames[unit].bytes(), 4096)?;
             let alias = library.cuda_host_buffer_device_alias(frames[unit].buffer)?;
             let field = |bytes: &[u8]| CuteafdDeviceBuffer {
                 ptr: bytes.as_ptr().cast_mut().cast(), bytes: bytes.len(), ..alias };
-            let mapped = ProtocolV2RequestDevicePayload { routes: field(view.route_bytes()),
+            let mapped = ProtocolV2RequestDevicePayload {
                 hidden_payload: field(view.hidden_payload()), execution_lane: 0,
                 response_slot: Some(library.cuda_host_buffer_device_alias(replies[unit].buffer)?) };
             worker.bind_layer(unit % 2)?;
@@ -461,10 +458,10 @@ mod tests {
         }
         assert_eq!(worker.pending.len(), 3);
         assert!(!worker.stream_idle()?);
-        for unit in 0..3 {
-            fixture.advance_queued_experts(&library, if unit == 0 { 1 } else { 4 })?;
+        for unit in 1..4 {
+            fixture.advance_queued_experts(&library, 4)?;
             assert!(worker.unit_ready()?);
-            if unit < 2 { assert!(!worker.stream_idle()?); }
+            if unit < 3 { assert!(!worker.stream_idle()?); }
             worker.complete()?;
             assert_eq!(&replies[unit].bytes()[prefix..prefix + expected[unit].len()], expected[unit]);
             assert!(replies[unit].bytes()[..prefix].iter().all(|byte| *byte == 0xa5));

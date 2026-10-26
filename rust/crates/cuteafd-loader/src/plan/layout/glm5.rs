@@ -13,7 +13,19 @@ const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
+        max_waves: if spark_ranks == 0 { 1 }
+            else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
+                crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
+        ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
+    };
+    let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
     let mut shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    report.prefill_span_rows = Some(prefill.span_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };
@@ -53,18 +65,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
     }
-    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
-        max_waves: if spark_ranks == 0 { 1 }
-            else if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
-                crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
-        ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
-    };
-    let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
-        Ok(shape) => shape,
-        Err(error) => return unsupported_prefill(report, error),
-    };
-    shape.prefill_rows = prefill.unit_rows;
     let lanes = prefill.waves;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
@@ -335,6 +335,13 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
 pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
     workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>)
     -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
+    native_layout_with_metadata(checkpoint, options, shared_bytes, workspace, spark_ranks, manifest, selected, None)
+}
+
+pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
+    workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>,
+    metadata: Option<&crate::plan::exlr8::residency::MetadataInput>)
+    -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     let gpu_count = options.rtx_bytes.len();
     anyhow::ensure!((1..=2).contains(&gpu_count) && shared_bytes.len() == gpu_count,
@@ -392,8 +399,15 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
         let manifest_path = options.workspace_manifest.as_deref()
             .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-        glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
-            glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
+        if let Some(metadata) = metadata.filter(|_| gpu_count == 2
+            && onboard.layers(cfg.layers.saturating_sub(catalog.routed_experts().first_layer)) != Some(0)
+            && cfg.layers > catalog.routed_experts().first_layer) {
+            Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers, rows, lanes,
+                glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
+        } else {
+            glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
+                glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
+        }
     } else { None };
     let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));

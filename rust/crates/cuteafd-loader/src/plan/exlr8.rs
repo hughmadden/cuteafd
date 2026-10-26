@@ -108,7 +108,13 @@ pub struct NativePlan {
 /// Full-forward native admission, deliberately narrower than format inventory.
 pub fn native_plan(snapshot: &Path, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
-    use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
+    native_options(selected, options, speculator)?;
+    super::PlanInput::open(snapshot)?.exlr8_native_plan(selected, options, speculator)
+}
+
+fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str)
+    -> Result<(usize, usize, crate::placement::AttentionPlacement, super::layout::LayoutOptions)> {
+    use super::ExpertPlacement;
     ensure!(matches!(selected, "up1" | "bit325"), "EXLR8 native manifest must be up1 or bit325");
     let world = match options.placement {
         ExpertPlacement::Sparks { ranks } if (1..=8).contains(&ranks) => ranks,
@@ -124,35 +130,50 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     ensure!(options.attention_placement.is_none_or(|requested| requested == attention),
         "EXLR8 native deployment with {gpu_count} RTX GPUs requires {attention} attention");
     ensure!(!resolved_layout.host_embedding, "EXLR8 requires GPU embedding");
-    let checkpoint = super::Checkpoint::open(snapshot)?;
-    let mut report = super::empty_report(&checkpoint, options)?;
+    Ok((world, gpu_count, attention, resolved_layout))
+}
+
+pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
+    options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
+    use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
+    let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator)?;
+    let checkpoint = input.checkpoint();
+    let snapshot = &checkpoint.snapshot;
+    let mut report = super::empty_report(checkpoint, options)?;
     super::layout::resolve_prefill(&mut report, &mut resolved_layout, world,
         crate::serving_capacity::prefill_waves::PrefillLimits::default())?;
     let layout = &resolved_layout;
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
-    let (_, set_id) = manifest_identity(snapshot, selected)?;
+    let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
+    let metadata = residency::MetadataInput::open(snapshot, selected)?;
+    let set_id = metadata.identity.clone();
     let mut shared = vec![0u64; gpu_count];
     for layer in cfg.first_moe_layer..cfg.layers {
         for (rank, resident) in shared.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, gpu_count, rank, residency::ExpertSet::Shared)?;
+            let plan = metadata.plan(layer, gpu_count, rank, residency::ExpertSet::Shared)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
         }
     }
     let programs = read_json(layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let workspace = shared_workspace(&programs)?;
-    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, world, &programs, Some(selected))?;
+    drop(catalog_timer);
+    let (memory, placement) = {
+        let _timer = super::PhaseTimer::new(&input.phases.layout, &[]);
+        super::layout::glm5::native_layout_with_metadata(checkpoint, layout, &shared, workspace, world, &programs, Some(selected), Some(&metadata))?
+    };
+    let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let first_spark = cfg.first_moe_layer + placement.onboard_layers;
     let selected_world = if first_spark == cfg.layers { 0 } else { world };
-    let residents = spark_resident_bytes(snapshot, selected, &(first_spark..cfg.layers).collect::<Vec<_>>(), selected_world)?;
+    let residents = spark_resident_bytes_of(&metadata, &(first_spark..cfg.layers).collect::<Vec<_>>(), selected_world)?;
     ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
         "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
     let mut local_routed = 0u64;
     for layer in cfg.first_moe_layer..first_spark {
         for rank in 0..gpu_count {
-            local_routed = local_routed.checked_add(residency::Residency::plan(snapshot, selected,
+            local_routed = local_routed.checked_add(metadata.plan(
                 layer, gpu_count, rank, residency::ExpertSet::Routed)?.resident_bytes as u64)
                 .context("EXLR8 local routed residency overflow")?;
         }
@@ -160,6 +181,7 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     let family = super::family::detect(&checkpoint).context("EXLR8 family is not recognized")?;
     let model = family.open(&checkpoint)?;
     let records = dense::DenseRecord::inventory(snapshot)?;
+    drop(catalog_timer);
     report.family = Some(family.id().into());
     report.exlr8_prefill_activations = Some(layout.exlr8_prefill_activations);
     report.spec = Some(model.spec().clone());
@@ -212,7 +234,10 @@ pub fn native_plan(snapshot: &Path, selected: &str,
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
-    super::layout::charge_host(&mut report, layout, &checkpoint, true)?;
+    {
+        let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
+        super::layout::charge_host(&mut report, layout, checkpoint, true)?;
+    }
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
 }
@@ -223,15 +248,22 @@ pub fn spark_resident_bytes(snapshot: &Path, selected: &str, layers: &[usize], w
         ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
         return Ok(Vec::new());
     }
-    let config = read_json(&snapshot.join("config.json"))?;
-    let config = config.get("text_config").unwrap_or(&config);
+    spark_resident_bytes_of(&residency::MetadataInput::open(snapshot, selected)?, layers, world)
+}
+
+fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    if layers.is_empty() {
+        ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
+        return Ok(Vec::new());
+    }
+    let config = input.config.get("text_config").unwrap_or(&input.config);
     let extent = usize::try_from(config["num_hidden_layers"].as_u64().context("EXLR8 layer extent missing")?)?;
     let first = usize::try_from(config["first_k_dense_replace"].as_u64().context("EXLR8 routed layer start missing")?)?;
     ensure!((1..=8).contains(&world) && layers.first().is_some_and(|&layer| layer >= first)
         && layers.last().copied() == extent.checked_sub(1)
         && layers.windows(2).all(|pair| pair[0] + 1 == pair[1]), "EXLR8 selected Spark suffix/rank geometry");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = residency::Residency::plan(snapshot, selected, layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
+        let bytes = input.plan(layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
         sum.checked_add(bytes).context("EXLR8 Spark suffix residency overflow")
     })).collect()
 }

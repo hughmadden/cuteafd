@@ -56,12 +56,12 @@ fn validate(config: &serde_json::Value, max_tokens: usize) -> Result<()> {
 impl TowerSpec {
     pub fn glm_flash(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let config: serde_json::Value =
-            serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+            cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         validate(&config, max_tokens)?;
         let index = snapshot.join("model.safetensors.index.json");
         let mut files = BTreeSet::new();
         if index.exists() {
-            let index: serde_json::Value = serde_json::from_reader(File::open(index)?)?;
+            let index: serde_json::Value = cuteafd_loader::read_json_file(&index)?;
             let map = index["weight_map"]
                 .as_object()
                 .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;

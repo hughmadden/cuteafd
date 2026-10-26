@@ -756,6 +756,11 @@ impl Shape {
         let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
+        // Legacy one-wave executors still publish a complete launch shape.
+        // Shared-policy families resolve their units before this fallback.
+        if options.prefill_waves == 1 && options.prefill_unit_rows.is_none() {
+            options.prefill_unit_rows = Some(prefill_rows);
+        }
         report.prefill_span_rows = Some(prefill_rows);
         let decode_rows = manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
         let concurrency = if options.concurrency > 0 { options.concurrency }

@@ -87,14 +87,6 @@ impl SparkBackend {
         }
     }
 
-    /// Pinned route staging retained per queued unit of `rows` (ownership-tagged
-    /// native/EXL3 routes); FP8 and EXLR8 read retained ring frames directly.
-    pub fn route_staging_bytes(self, rows: u32, topk: u32) -> u64 {
-        match self {
-            Self::Exl3(_) | Self::Native => u64::from(rows) * u64::from(topk) * 8,
-            Self::Fp8 | Self::Exlr8 => 0,
-        }
-    }
 }
 
 /// Admit the typed owners for `family` over the package's `exports` (an

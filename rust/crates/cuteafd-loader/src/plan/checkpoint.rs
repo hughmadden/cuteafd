@@ -1,16 +1,12 @@
 //! Family-independent view of a Hugging Face checkpoint: configuration JSON,
 //! the safetensors index and every shard header. Nothing here reads tensor data.
-use crate::{read_safetensors_metadata, SafetensorsTensorMetadata};
+use crate::{catalog::MAX_JSON_BYTES, read_safetensors_metadata, SafetensorsTensorMetadata};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-
-/// Bounds a metadata read, not tensor data. Kimi K3 EXL3 K2's index names
-/// 991,812 tensors (~100 MiB) and its GPTQModel storage map is ~141 MiB.
-const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
 
 pub mod identity;
 
@@ -71,18 +67,18 @@ pub struct Checkpoint {
     pub shard_bytes: u64,
 }
 
+pub(crate) fn validate_index_headers(shard: &str, names: &BTreeSet<&str>,
+    headers: &[SafetensorsTensorMetadata]) -> Result<()> {
+    ensure!(headers.len() == names.len(), "index/header tensor count mismatch in {shard}");
+    for tensor in headers {
+        ensure!(names.contains(tensor.name.as_str()),
+            "tensor {} appears in unexpected shard {shard}", tensor.name);
+    }
+    Ok(())
+}
+
 pub fn read_json(path: &Path) -> Result<Value> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(MAX_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_JSON_BYTES,
-        "{} exceeds {MAX_JSON_BYTES} bytes",
-        path.display()
-    );
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+    Ok(crate::read_json_file(path)?)
 }
 
 impl Checkpoint {
@@ -131,7 +127,18 @@ impl Checkpoint {
         Self::open_filtered(snapshot, Some(role), needed)
     }
 
+    pub(crate) fn open_with_header_validation(snapshot: &Path) -> Result<(Self, Result<(), String>)> {
+        let mut validation = Ok(());
+        let checkpoint = Self::open_filtered_validated(snapshot, None, |_| true, Some(&mut validation))?;
+        Ok((checkpoint, validation))
+    }
+
     fn open_filtered(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_filtered_validated(snapshot, role, needed, None)
+    }
+
+    fn open_filtered_validated(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool,
+        mut validation: Option<&mut Result<(), String>>) -> Result<Self> {
         let config = read_json(&snapshot.join("config.json"))?;
         if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
             return super::exlr8::inventory(snapshot, config, needed);
@@ -196,6 +203,9 @@ impl Checkpoint {
                     continue;
                 }
             };
+            if let Some(result) = validation.as_deref_mut().filter(|result| result.is_ok()) {
+                *result = validate_index_headers(shard, &names, &headers).map_err(|error| error.to_string());
+            }
             if let Some(role) = role {
                 let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();
                 for name in &names {
@@ -677,6 +687,8 @@ mod sliced_tests {
         write_safetensors(&dir.path().join("a.safetensors"), &[
             t("a.weight", "BF16", &[2]), t("z.weight", "BF16", &[2]), t("extra.weight", "BF16", &[2])]);
         write_safetensors(&dir.path().join("z.safetensors"), &[t("z.weight", "BF16", &[2])]);
+        let (_, validation) = Checkpoint::open_with_header_validation(dir.path()).unwrap();
+        assert!(validation.unwrap_err().contains("index/header tensor count mismatch"));
         let checkpoint = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap();
         assert_eq!(checkpoint.tensors.iter().map(|tensor| (tensor.meta.name.as_str(), tensor.shard.as_str()))
             .collect::<Vec<_>>(), [("a.weight", "a.safetensors"), ("z.weight", "z.safetensors")]);

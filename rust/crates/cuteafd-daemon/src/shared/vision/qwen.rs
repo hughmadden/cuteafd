@@ -3,7 +3,7 @@ use super::*;
 
 impl TowerSpec {
     pub fn qwen(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let cfg: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         let v = &cfg["vision_config"];
         for (name, want) in [
             ("depth", 27), ("hidden_size", 1152), ("intermediate_size", 4304),
@@ -159,7 +159,7 @@ mod tests {
         assert!(spec.reads.iter().all(|r| r.destination % 256 == 0));
         assert!(TowerSpec::qwen(dir.path(), 4097).is_err());
         let p = dir.path().join("config.json");
-        let mut cfg: serde_json::Value = serde_json::from_reader(File::open(&p).unwrap()).unwrap();
+        let mut cfg: serde_json::Value = cuteafd_loader::read_json_file(&p).unwrap();
         cfg["vision_config"]["intermediate_size"] = 4305.into();
         std::fs::write(&p, serde_json::to_vec(&cfg).unwrap()).unwrap();
         assert!(TowerSpec::qwen(dir.path(), 1024).unwrap_err().to_string().contains("intermediate_size"));
@@ -168,7 +168,7 @@ mod tests {
     fn qwen_rejects_unknown_shards_and_inconsistent_norm_shape() {
         let dir = snapshot();
         let p = dir.path().join("model.safetensors.index.json");
-        let mut index: serde_json::Value = serde_json::from_reader(File::open(&p).unwrap()).unwrap();
+        let mut index: serde_json::Value = cuteafd_loader::read_json_file(&p).unwrap();
         index["weight_map"]["model.visual.extra.weight"] = "../outside.safetensors".into();
         std::fs::write(&p, serde_json::to_vec(&index).unwrap()).unwrap();
         assert!(TowerSpec::qwen(dir.path(), 1).unwrap_err().to_string().contains("shard path"));

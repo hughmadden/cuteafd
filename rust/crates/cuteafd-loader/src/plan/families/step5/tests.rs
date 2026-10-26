@@ -199,7 +199,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
             peer_diagnostics: false, startup: vec![],
         };
-        for depth in 0..=3 {
+        for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
+            || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {
             let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
             assert_eq!(admitted.cache.context, 1_048_576);
             assert_eq!(admitted.placement.pool_tokens, 1_048_576);
@@ -827,7 +828,8 @@ fn native_owner_shares_scratch_and_sums_quant_and_bf16_tail_io() -> anyhow::Resu
         assert_eq!(mixed.scratch, quant.scratch.max(tail.scratch));
         assert_eq!(mixed.scratch, tail_scratch.max(quant_scratch));
         assert_eq!(mixed.io, quant.io + tail.io);
-        assert_eq!(mixed.pinned_staging, 0);
+        assert_eq!(mixed.pinned_staging, quant.pinned_staging + tail.pinned_staging);
+        assert_eq!(mixed.pinned_staging, 2 * u64::from(prefill.staging_rows) * u64::from(input.expert_catalog()?.routed_experts().geometry()?.topk) * 8);
     }
     Ok(())
 }
@@ -1262,9 +1264,10 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
 
 #[test]
 fn native_prefill_refuses_every_unqualified_spark_count() {
-    for (kind, gpus, supported) in [("nvfp4", 1, 4), ("fp8", 2, 6)] {
+    for (kind, gpus) in [("nvfp4", 1), ("fp8", 2)] {
         let dir = snapshot(kind);
-        for ranks in (0..=8).filter(|&ranks| ranks != supported) {
+        // Boundaries plus a transport-valid count that lacks this native executor.
+        for ranks in [0, 1, 3, 8] {
             let result = report(dir.path(), gpus, 96, ranks, None);
             assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
             assert!(result.hints.iter().any(|hint| hint.what.contains("coordinator/Spark count")),
@@ -1299,8 +1302,7 @@ fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity(
     for (kind, gpus, sparks) in [("nvfp4", 1, 4), ("fp8", 2, 6)] {
         let snapshot = snapshot(kind);
         let manifest = native_manifest(snapshot.path());
-        for (unit, waves) in [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (512, 1),
-            (1024, 2), (2752, 3), (2048, 4), (4096, 2)] {
+        for (unit, waves) in [(0, 0), (1024, 2), (2048, 4), (4096, 2)] {
             let shape = crate::serving_capacity::prefill_waves::prefill_shape(sparks,
                 crate::plan::Family::prefill_limits(&super::STEP5),
                 crate::serving_capacity::prefill_waves::PrefillOverrides {

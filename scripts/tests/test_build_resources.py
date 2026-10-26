@@ -956,7 +956,9 @@ def test_discrete_context_hook_preserves_existing_lazy_initialization(tmp_path, 
 
 def test_standalone_gb10_installs_host_default_pool(tmp_path, monkeypatch):
     import types
-    monkeypatch.delenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', raising=False)
+    # Record the key so monkeypatch restores it: the code under test assigns it.
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', '')
+    monkeypatch.delenv('CUTEAFD_EXPORT_HOST_SLOT_DIR')
     monkeypatch.setattr(export, '_gb10_host', lambda: True)
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     cuda = types.SimpleNamespace(_lazy_init=lambda: None)
