@@ -37,8 +37,8 @@ pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cu
 }
 
 /// The Spark execution reserve used before placement and in its ledger: the
-/// runtime residual plus the typed owners (one prefill scratch at the ladder
-/// maximum, the decode owner, per-unit route staging times the waves).
+/// runtime residual plus the typed owners (one prefill scratch at the admitted
+/// unit's export, the decode owner, per-unit route staging times the waves).
 pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
     let owners = spark_executions(waves, unit_rows)?.workspace_bytes(spark_owner_bytes)?
         .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Kimi Spark owner reserve overflow"))?;

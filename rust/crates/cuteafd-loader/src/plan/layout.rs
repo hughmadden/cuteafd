@@ -505,10 +505,12 @@ mod selected_spark_io_tests {
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
             assert_eq!(spark_slot_bytes("kimi_k3", unit), slot);
             let reserve = crate::families::kimi_k3::spark_reserve_bytes(waves, unit).unwrap();
-            // One prefill owner (the census slot), the m80 decode owner and
-            // per-unit route staging over the waves; never a slot per wave.
-            let decode = 51 * (1 << 20) + 64 * (3584 + 3584 / 32 + 8 * 16) + 64 * 16 * 8;
-            assert_eq!(reserve, slot + decode + unit * waves * 16 * 8
+            // The conservative census scratch plus selected-unit device I/O,
+            // the m80 decode owner and per-unit route staging; never a slot per wave.
+            let row_bytes = 3584 + 3584 / 32 + 8 * 16;
+            let prefill = slot - (4096 - unit) * row_bytes;
+            let decode = 51 * (1 << 20) + 64 * row_bytes + 64 * 16 * 8;
+            assert_eq!(reserve, prefill + decode + unit * waves * 16 * 8
                 + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
