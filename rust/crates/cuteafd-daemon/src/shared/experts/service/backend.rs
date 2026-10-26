@@ -351,16 +351,16 @@ impl<'w, 'a> Execution<'w, 'a> {
         }
     }
     /// Mapped requests return queued; each reply waits for its own unit fence.
-    pub(super) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
+    pub(super) fn defer(&mut self, units: usize, staging_rows: usize, owner: cuteafd_core::ExecutionOwner) -> Result<()> {
         match self {
-            Self::Full(execution) => execution.defer(units, staging_rows)?,
-            Self::Exl3(execution) => execution.defer(units, staging_rows)?,
+            Self::Full(execution) => execution.defer(units, staging_rows, owner)?,
+            Self::Exl3(execution) => execution.defer(units, staging_rows, owner)?,
             Self::Fp8(groups) => {
                 ensure!(groups.pending_groups.is_empty(), "cannot resize an active FP8 owner queue");
                 groups.pending_groups = std::collections::VecDeque::with_capacity(units);
-                for worker in &mut groups.workers { worker.defer(units, staging_rows)?; }
+                for worker in &mut groups.workers { worker.defer(units, staging_rows, owner)?; }
             },
-            Self::Exlr8(execution) => execution.defer(units, staging_rows)?,
+            Self::Exlr8(execution) => execution.defer(units, staging_rows, owner)?,
         }
         Ok(())
     }

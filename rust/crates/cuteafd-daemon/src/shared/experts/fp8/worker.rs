@@ -109,10 +109,11 @@ impl<'a> Fp8Worker<'a> {
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
-    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
+    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize, owner: cuteafd_core::ExecutionOwner) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active FP8 queue");
         ensure!(staging_rows > 0 && staging_rows <= self.capacity, "FP8 staging exceeds owner rows");
-        self.pending = super::super::execution::timing::PendingUnits::with_clock(self.library, units, self.clock.clone())?;
+        self.pending = super::super::execution::timing::PendingUnits::with_clock(self.library, units, owner,
+            self.clock.clone())?;
         self.route_staging.resize(self.library, units, staging_rows)?;
         self.deferred = true;
         Ok(())
@@ -389,7 +390,7 @@ mod tests {
         let weights = Rc::new(Fp8Weights { layers, module, bf16_module: None,
             tp: 2, rank: 0, weight_read_bytes: 256 });
         let mut worker = Fp8Worker::new(&library, weights, 4096)?;
-        worker.defer(3, 4096)?;
+        worker.defer(3, 4096, cuteafd_core::ExecutionOwner::Prefill)?;
         let mut exchange = HostExpertExchange::new(4096)?;
         let rows = 2u32;
         let hidden = geometry.hidden as usize;

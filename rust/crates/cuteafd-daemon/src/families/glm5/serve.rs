@@ -173,14 +173,15 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine, transport, runtime| {
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(engine.max_context));
-        }
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
-            ranks, &prefix, args.token_io.token_select)
+            ranks, &prefix, args.token_io.token_select, || {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok(engine.max_context));
+                }
+            })
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -446,7 +447,8 @@ fn draft_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement) -> Result<()> {
+    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement,
+    ready: impl FnOnce()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
         &crate::families::glm5_flash::serve::MESSAGE_STARTS)?;
@@ -483,6 +485,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut trace = Trace::open()?;
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
+    // Prefix capacity and all fallible scheduler initialization precede readiness.
+    ready();
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {

@@ -342,7 +342,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     if index < owners.decode.len() { "experts/workspace/decode" } else { "experts/workspace/prefill" });
                 weights.execution(&library, &owner_config, extent.compiled, budget, &mut modules)?
             };
-            execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize)?;
+            execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize, extent.owner)?;
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
                 .saturating_sub(before);
             budget = budget.checked_sub(used).context("Spark execution owners exceed admitted workspace")?;

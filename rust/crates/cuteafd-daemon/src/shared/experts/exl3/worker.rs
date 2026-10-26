@@ -345,10 +345,10 @@ impl<'a> Exl3Worker<'a> {
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
-    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
+    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize, owner: cuteafd_core::ExecutionOwner) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active EXL3 queue");
         ensure!(staging_rows > 0 && staging_rows <= self.capacity, "EXL3 staging exceeds owner rows");
-        self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.pending = super::super::execution::timing::PendingUnits::for_owner(self.library, units, owner)?;
         self.weights_offset = staging_rows.checked_mul(Self::topk() * 4)
             .context("EXL3 route staging overflow")?;
         self.staging.clear();

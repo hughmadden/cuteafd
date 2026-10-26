@@ -187,11 +187,12 @@ fn serve_loop(
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
             engine.decode_rows)?;
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(engine.max_context));
-        }
         schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats,
-            decode_share, &prefix, host_config, &mut selector, shared)
+            decode_share, &prefix, host_config, &mut selector, shared, || {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok(engine.max_context));
+                }
+            })
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -623,6 +624,7 @@ fn schedule(
     host_config: Option<cuteafd_hostcache::config::Config>,
     selector: &mut TokenSelector<'_>,
     mut shared: Option<SharedPolicy>,
+    ready: impl FnOnce(),
 ) -> Result<()> {
     let (mut observed, mut skipped) = (0u64, 0u64);
     let (family, mut cache) = prefix_cache(engine, prefix, host_config)?;
@@ -635,6 +637,8 @@ fn schedule(
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
+    // Prefix capacity and all fallible scheduler initialization precede readiness.
+    ready();
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
