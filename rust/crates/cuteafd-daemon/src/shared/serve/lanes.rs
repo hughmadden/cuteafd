@@ -48,6 +48,14 @@ impl LaneSet {
             self.lease(1).run(second(self.lease(1)))).await
     }
 
+    /// Run a family's only decode lane (`LaneSupport::One`): lane 0 under the
+    /// same lease, failure stop and host-wait pacing as a pair.
+    pub async fn run_one<'s, T, F>(&'s self, lane: impl FnOnce(LaneLease<'s>) -> F) -> Result<T>
+    where F: Future<Output = Result<T>> {
+        let lease = self.lease(0);
+        paced(std::pin::pin!(lease.run(lane(lease)))).await
+    }
+
     /// Poll two lanes to completion. Neither is cancelled when the other fails;
     /// a failing lane stops its peers at their next boundary ([`LaneLease::run`]).
     /// The first lane's error wins when both fail.
@@ -102,7 +110,7 @@ impl LaneLease<'_> {
     /// Ask every lane of the set to return at its next completed boundary.
     pub fn stop(&self) { self.stop.set(true); }
     /// Run this lane's loop; an error stops the peers.
-    pub async fn run(self, lane: impl Future<Output = Result<()>>) -> Result<()> {
+    pub async fn run<T>(self, lane: impl Future<Output = Result<T>>) -> Result<T> {
         let result = lane.await;
         if result.is_err() { self.stop(); }
         result
@@ -180,6 +188,24 @@ mod tests {
             anyhow::bail!("setup failed")
         }).is_err());
         assert_eq!(attempted, [0]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_lane_runs_as_lane_zero_and_a_failure_stops_the_set() {
+        let set = LaneSet::default();
+        let value = block_on(set.run_one(|lease| async move {
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            Ok((lease.index(), lease.stopping()))
+        })).unwrap();
+        assert_eq!(value, (0, false));
+        assert!(!set.lease(0).stopping());
+        let error = block_on(set.run_one(failing_one)).unwrap_err();
+        assert_eq!(error.to_string(), "single lane failed");
+        assert!(set.lease(0).stopping());
+    }
+    async fn failing_one(lease: LaneLease<'_>) -> Result<()> {
+        anyhow::ensure!(lease.index() != 0, "single lane failed");
         Ok(())
     }
 

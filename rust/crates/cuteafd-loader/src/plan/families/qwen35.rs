@@ -7,6 +7,10 @@ pub struct Qwen35;
 pub static QWEN35: Qwen35 = Qwen35;
 
 impl Family for Qwen35 {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "dense Qwen runs RTX-only: no Spark round trip for a second lane to hide (#744)" }
+    }
     fn id(&self) -> &'static str { "qwen3_5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
