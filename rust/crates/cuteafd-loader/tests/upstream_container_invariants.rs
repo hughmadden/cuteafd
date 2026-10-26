@@ -171,6 +171,22 @@ fn tensor_extent_past_eof_is_rejected_without_overread() {
 }
 
 #[test]
+fn typed_headers_ignore_metadata_and_keep_sorted_tensor_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("typed.safetensors");
+    let header = br#"{"z":{"dtype":"BF16","shape":[1],"data_offsets":[2,4]},"__metadata__":{"format":"pt"},"a":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+    let mut file = File::create(&path).unwrap();
+    file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    file.write_all(header).unwrap();
+    file.write_all(&[0; 4]).unwrap();
+    let tensors = read_safetensors_metadata(&path).unwrap();
+    assert_eq!(tensors.iter().map(|tensor| tensor.name.as_str()).collect::<Vec<_>>(), ["a", "z"]);
+    assert_eq!(tensors[0].byte_offset, 8 + header.len() as u64);
+    assert_eq!(tensors[1].byte_offset, tensors[0].byte_offset + 2);
+    assert!(tensors.iter().all(|tensor| tensor.byte_length == 2));
+}
+
+#[test]
 fn inverted_data_offsets_are_rejected() {
     // data_offsets[0] > data_offsets[1] would underflow byte-length math.
     let tempdir = tempfile::tempdir().unwrap();

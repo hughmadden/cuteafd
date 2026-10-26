@@ -147,10 +147,13 @@ impl Checkpoint {
             #[derive(serde::Deserialize)]
             struct Index { weight_map: BTreeMap<String, String> }
             let file = File::open(&index_path)?;
-            ensure!(file.metadata()?.len() <= MAX_JSON_BYTES, "index exceeds metadata size limit");
-            let mut input = std::io::BufReader::new(file).take(MAX_JSON_BYTES + 1);
-            let index: Index = serde_json::from_reader(&mut input).context("decoding weight_map")?;
-            ensure!(MAX_JSON_BYTES + 1 - input.limit() <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            let size = file.metadata()?.len();
+            ensure!(size <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            // Slice parsing avoids serde_json's per-byte Read adapter on large indexes.
+            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
+            file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            let index: Index = serde_json::from_slice(&bytes).context("decoding weight_map")?;
             index.weight_map
         } else {
             let single = snapshot.join("model.safetensors");
@@ -164,15 +167,17 @@ impl Checkpoint {
                 .map(|meta| (meta.name, "model.safetensors".to_owned()))
                 .collect()
         };
-        let shards: BTreeSet<&String> = weight_map.iter()
-            .filter(|(name, _)| needed(name)).map(|(_, shard)| shard).collect();
+        // Group once instead of scanning the complete index for every shard.
+        let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
+        for (name, shard) in &weight_map {
+            if needed(name) { shards.entry(shard).or_default().insert(name); }
+        }
         let mut tensors = Vec::with_capacity(weight_map.len());
         let mut missing_shards = Vec::new();
         let mut shard_bytes = 0u64;
-        for shard in shards {
+        for (shard, names) in shards {
             let path = snapshot.join(shard);
-            let tensor = weight_map.iter().find(|(name, file)| *file == shard && needed(name))
-                .map(|(name, _)| name.as_str()).context("selected shard has no tensor")?;
+            let tensor = names.first().context("selected shard has no tensor")?;
             let requirement = || format!("role {} needs tensor {tensor} in shard {shard} at snapshot {}",
                 role.unwrap_or("planner"), snapshot.display());
             let metadata = match path.metadata() {
@@ -193,17 +198,15 @@ impl Checkpoint {
             };
             if let Some(role) = role {
                 let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();
-                for (name, file) in &weight_map {
-                    if file == shard && needed(name) {
-                        ensure!(header_names.contains(name.as_str()),
-                            "role {role} needs tensor {name} in shard {shard} at snapshot {}: header is missing",
-                            snapshot.display());
-                    }
+                for name in &names {
+                    ensure!(header_names.contains(name),
+                        "role {role} needs tensor {name} in shard {shard} at snapshot {}: header is missing",
+                        snapshot.display());
                 }
             }
             shard_bytes += metadata.len();
             for meta in headers {
-                if weight_map.get(&meta.name) == Some(shard) && needed(&meta.name) {
+                if names.contains(meta.name.as_str()) {
                     tensors.push(CheckpointTensor {
                         shard: shard.clone(),
                         meta,
@@ -663,6 +666,22 @@ mod sliced_tests {
         std::fs::remove_file(dir.path().join("shard0.safetensors")).unwrap();
         let error = Checkpoint::open_for_role(dir.path(), "coordinator", local).unwrap_err().to_string();
         assert!(error.contains(names[0]) && error.contains("shard0.safetensors"));
+    }
+
+    #[test]
+    fn grouped_shards_ignore_unindexed_and_wrong_shard_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a.weight":"a.safetensors","z.weight":"z.safetensors"}}"#).unwrap();
+        write_safetensors(&dir.path().join("a.safetensors"), &[
+            t("a.weight", "BF16", &[2]), t("z.weight", "BF16", &[2]), t("extra.weight", "BF16", &[2])]);
+        write_safetensors(&dir.path().join("z.safetensors"), &[t("z.weight", "BF16", &[2])]);
+        let checkpoint = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap();
+        assert_eq!(checkpoint.tensors.iter().map(|tensor| (tensor.meta.name.as_str(), tensor.shard.as_str()))
+            .collect::<Vec<_>>(), [("a.weight", "a.safetensors"), ("z.weight", "z.safetensors")]);
+        assert_eq!(Checkpoint::open_for_role(dir.path(), "coordinator", |name| name == "z.weight")
+            .unwrap().tensors.len(), 1);
     }
 
     #[test]
