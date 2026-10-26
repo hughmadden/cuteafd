@@ -5987,3 +5987,21 @@ CPU checks pass 89 cases. Fresh CUDA proof and full local-source integrity
 are required before restarting. This agent session predates the host's FUSE
 mount, so host-side admission runs through a fresh local SSH session that
 sees the mounted source; containers also see the host mount normally.
+
+TJ explicitly requested taking the GPU reservation before the source copy
+finishes, then starting automatically once the original is fully local.
+The local fair-queue `gpu1` lease is held across readiness, qualification and
+production. The launcher supports `--foreground --use-held-lock`: it checks
+the enclosing lease and actual flock, keeps durable attempt records, avoids
+requeueing behind itself and replaces itself with the existing container
+teardown guard. It cannot detach or publish while using that reservation.
+The guard now handles SIGHUP as well as TERM/INT, so SSH hangup cleanup
+precedes reservation release. The expanded CPU gate passes 94 cases.
+
+The source is fully local on MaxQ. `nest fsck --deep` reported corrupt blob
+names, but independently hashing flagged shard 92 matches its published HF
+LFS SHA-256 exactly: Sparknest's global deduplicated blob IDs differ from
+the HF content SHA-256 names. No destructive fsck resolution was applied.
+Readiness therefore verifies all 282 weights and six source/config/tokenizer
+assets directly against the pinned Hugging Face revision's published hashes;
+the two-thread streaming audit and evidence live in the readiness cache.

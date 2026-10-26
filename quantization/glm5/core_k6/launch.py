@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -17,16 +18,36 @@ from kimi_k3.uniform_k2.storage import atomic_json
 from kimi_k3.core_k6.launch import supervise
 
 
+def require_held_gpu_lock():
+    if os.environ.get("CUTEAFD_HW_LOCKS_HELD")!="gpu1":
+        raise ValueError("using a reservation requires the enclosing hwlock gpu1 lease")
+    directory=Path(os.environ.get("CUTEAFD_LOCK_DIR",Path.home()/".cache/cuteafd"))
+    with (directory/"gpu1.lock").open("a") as guard:
+        try:
+            fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        raise ValueError("the claimed gpu1 reservation is not held")
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ("source-snapshot","tokens","root","export"):
         parser.add_argument("--"+name,type=Path,required=True)
     parser.add_argument("--resume",action="store_true")
     parser.add_argument("--publish-only",action="store_true")
+    parser.add_argument("--foreground",action="store_true",
+        help="supervise synchronously so an enclosing hardware reservation outlives the job")
+    parser.add_argument("--use-held-lock",action="store_true",
+        help="use the enclosing hwlock gpu1 reservation; requires --foreground")
     parser.add_argument("--supervise",type=Path,help=argparse.SUPPRESS)
     args=parser.parse_args()
     if args.supervise:
         sys.exit(supervise(args.supervise))
+    if args.use_held_lock:
+        if not args.foreground or args.publish_only:
+            raise ValueError("a held GPU reservation requires foreground quantization")
+        require_held_gpu_lock()
     root=args.root.expanduser().resolve();attempts=root/"attempts";attempts.mkdir(parents=True,exist_ok=True)
     for path in attempts.glob("*-process.json"):
         if path.with_name(path.name.replace("-process.json","-exit.json")).exists():
@@ -60,9 +81,10 @@ def main():
         numerical=[python,str(REPO/"quantization/kimi_k3/core_k6/container.py"),"--name",container,
             "--memory-gib","60","--",runner,*common]
         guarded=[python,str(REPO/"quantization/kimi_k3/core_k6/run_guard.py"),"--container",container,"--",*numerical]
-        command=[python,str(REPO/"scripts/hw/hwlock.py"),"--locks","gpu1","--wait","60",
-            "--preflight",shlex.join(preflight),"--preflight-timeout","300","--",
-            "timeout","--foreground","--signal=TERM","--kill-after=120","30d",*guarded]
+        command=["timeout","--foreground","--signal=TERM","--kill-after=120","30d",*guarded]
+        if not args.use_held_lock:
+            command=[python,str(REPO/"scripts/hw/hwlock.py"),"--locks","gpu1","--wait","60",
+                "--preflight",shlex.join(preflight),"--preflight-timeout","300","--",*command]
     environment={key:os.environ[key] for key in
         ("PATH","HOME","USER","LOGNAME","LANG","LC_ALL","LD_LIBRARY_PATH","HF_HOME") if key in os.environ}
     environment["HF_HUB_CACHE"]=str(Path.home()/".cache/huggingface/cuteafd-local-hub")
@@ -70,7 +92,18 @@ def main():
         environment["CUDA_VISIBLE_DEVICES"]=""
     path=attempts/(stamp+".json")
     atomic_json(path,dict(command=command,environment=environment,container=container,
-        log=str(attempts/(stamp+".log")),publication_only=args.publish_only,resume=args.resume))
+        log=str(attempts/(stamp+".log")),publication_only=args.publish_only,resume=args.resume,
+        foreground=args.foreground,uses_held_lock=args.use_held_lock))
+    if args.foreground:
+        atomic_json(root/"latest-attempt.json",dict(pid=os.getpid(),attempt=stamp,launch=str(path),log=str(attempts/(stamp+".log"))))
+        print(json.dumps(dict(supervisor_pid=os.getpid(),launch=str(path))),flush=True)
+        if args.publish_only:
+            sys.exit(supervise(path))
+        # Replace this process with the existing teardown guard: the enclosing
+        # reservation must wait for container cleanup even on an SSH hangup.
+        os.execv(python,[python,str(REPO/"quantization/kimi_k3/core_k6/run_guard.py"),
+            "--container",container,"--",python,str(Path(__file__).resolve()),
+            *common,"--supervise",str(path)])
     supervisor=[python,str(Path(__file__).resolve()),*common,"--supervise",str(path)]
     with (attempts/(stamp+"-supervisor.log")).open("a") as output:
         process=subprocess.Popen(supervisor,cwd=REPO,stdin=subprocess.DEVNULL,stdout=output,

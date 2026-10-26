@@ -1,7 +1,11 @@
 """GPU ownership and publication separation in detached production launches."""
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -106,3 +110,73 @@ def test_preflight_bootstrap_still_checks_local_source_gpu_and_producer(tmp_path
     assert any(command[0]=="nvidia-smi" for command in checks)
     assert runs[0]==["docker","image","inspect",preflight.IMAGE]
     assert runs[1][-1]=="--preflight"
+
+
+def test_reservation_requires_a_real_held_flock(tmp_path,monkeypatch):
+    monkeypatch.setenv("CUTEAFD_LOCK_DIR",str(tmp_path))
+    monkeypatch.delenv("CUTEAFD_HW_LOCKS_HELD",raising=False)
+    with pytest.raises(ValueError,match="enclosing hwlock"):
+        launch.require_held_gpu_lock()
+    monkeypatch.setenv("CUTEAFD_HW_LOCKS_HELD","gpu1")
+    with pytest.raises(ValueError,match="not held"):
+        launch.require_held_gpu_lock()
+    with (tmp_path/"gpu1.lock").open("a") as guard:
+        launch.fcntl.flock(guard,launch.fcntl.LOCK_EX|launch.fcntl.LOCK_NB)
+        launch.require_held_gpu_lock()
+
+
+@pytest.mark.parametrize("extra",[[],["--foreground","--publish-only"]])
+def test_reservation_cannot_detach_or_publish(tmp_path,monkeypatch,extra):
+    monkeypatch.setattr(sys,"argv",["launch.py","--source-snapshot",str(tmp_path/"source"),
+        "--tokens",str(tmp_path/"tokens"),"--root",str(tmp_path/"state"),
+        "--export",str(tmp_path/"export"),"--use-held-lock",*extra])
+    monkeypatch.setattr(launch.subprocess,"run",lambda *a,**k:pytest.fail("must reject before admission"))
+    with pytest.raises(ValueError,match="foreground quantization"):
+        launch.main()
+
+
+def test_reserved_foreground_job_retains_guard_without_requeueing(tmp_path,monkeypatch):
+    root=tmp_path/"state";checks=[];execs=[]
+    monkeypatch.setattr(sys,"argv",["launch.py","--source-snapshot",str(tmp_path/"source"),
+        "--tokens",str(tmp_path/"tokens"),"--root",str(root),
+        "--export",str(tmp_path/"export"),"--foreground","--use-held-lock"])
+    monkeypatch.setattr(launch,"require_held_gpu_lock",lambda:None)
+    monkeypatch.setattr(launch.subprocess,"run",lambda command,**kwargs:checks.append(command))
+    monkeypatch.setattr(launch.subprocess,"Popen",lambda *a,**k:pytest.fail("must not detach"))
+    class ReplacedProcess(Exception):pass
+    def replace(python,command):
+        execs.append(command);raise ReplacedProcess
+    monkeypatch.setattr(launch.os,"execv",replace)
+    with pytest.raises(ReplacedProcess):launch.main()
+    latest=json.loads((root/"latest-attempt.json").read_text())
+    record=json.loads(Path(latest["launch"]).read_text())
+    assert len(checks)==len(execs)==1
+    assert latest["pid"]==os.getpid()
+    assert record["foreground"] and record["uses_held_lock"]
+    assert not any(arg.endswith("hwlock.py") for arg in record["command"])
+    assert any(arg.endswith("run_guard.py") for arg in record["command"])
+    assert execs[0][1].endswith("run_guard.py")
+    assert execs[0][execs[0].index("--container")+1]==record["container"]
+    assert "--supervise" in execs[0] and str(latest["launch"]) in execs[0]
+
+
+def test_hangup_stops_owned_container_before_guard_returns(tmp_path):
+    started=tmp_path/"child-started";stopped=tmp_path/"container-stopped"
+    docker=tmp_path/"docker"
+    docker.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(stopped)!r}).write_text('stopped')\n")
+    docker.chmod(0o755)
+    guard=Path(launch.__file__).resolve().parents[2]/"kimi_k3/core_k6/run_guard.py"
+    process=subprocess.Popen([sys.executable,str(guard),"--container","test-owned-container","--",
+        sys.executable,"-c",f"from pathlib import Path; import time; Path({str(started)!r}).touch(); time.sleep(60)"],
+        env=dict(os.environ,PATH=str(tmp_path)+os.pathsep+os.environ["PATH"]))
+    try:
+        deadline=time.monotonic()+5
+        while not started.exists():
+            assert process.poll() is None and time.monotonic()<deadline
+            time.sleep(.01)
+        process.send_signal(signal.SIGHUP)
+        process.wait(timeout=5)
+        assert stopped.read_text()=="stopped"
+    finally:
+        if process.poll() is None:
+            process.terminate();process.wait(timeout=5)
