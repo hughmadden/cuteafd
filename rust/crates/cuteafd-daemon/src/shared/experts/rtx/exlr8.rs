@@ -19,6 +19,7 @@ pub(crate) struct Exlr8Tp2Weights<'a> {
     max_rows: usize,
     activations: Exlr8PrefillActivations,
     workspace_bytes: usize,
+    grouped_from_row: usize,
     weights: Rc<DeviceOwner<'a, Vec<Exlr8Weights<'a>>>>,
 }
 
@@ -52,6 +53,9 @@ impl<'a> Exlr8Tp2Weights<'a> {
         let workspace_bytes = Self::workspace_bytes(programs, max_rows, activations)?;
         let mut ranks = Vec::new();
         for (rank, (device, weights)) in devices.into_iter().zip(pushed).enumerate() {
+            let info = device.library.cuda_device_info(device.id)?;
+            let grouped_from_row = grouped_decode_from_row(TP2_UNITS,
+                (info.compute_capability_major, info.compute_capability_minor));
             ensure!(weights.len() == layers.len(), "EXLR8 pushed layer count differs from admission");
             let resident = weights.iter().zip(&layers).try_fold(0usize, |sum, (weight, &layer)| {
                 ensure!(weight.layout.layer == layer && weight.layout.world == 2 && weight.layout.rank == rank
@@ -63,7 +67,7 @@ impl<'a> Exlr8Tp2Weights<'a> {
                 "EXLR8 RTX weights and execution exceed admitted peak");
             let weights = device.own(|| Ok(weights))?;
             ranks.push(Self { device, rank: rank as u8, layers: layers.clone(), programs,
-                max_rows, activations, workspace_bytes, weights: Rc::new(weights) });
+                max_rows, activations, workspace_bytes, grouped_from_row, weights: Rc::new(weights) });
         }
         ranks.try_into().map_err(|_| anyhow::anyhow!("EXLR8 needs two RTX owners"))
     }
@@ -116,7 +120,7 @@ impl RtxExpertLayer for Exlr8Tp2<'_> {
             let ExpertInput::Fp8K32(wire) = input else { bail!("EXLR8 RTX requires FP8 K32 wire input") };
             ensure!(!wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(), "null EXLR8 RTX input");
             let selected = if rows > DECODE_ROWS { 2 }
-                else { usize::from(rows >= grouped_decode_from_row(TP2_UNITS)) };
+                else { usize::from(rows >= self.owner.grouped_from_row) };
             let execution = &self.executions[selected];
             let device = self.owner.device;
             let source = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: device.id, flags: 0 };
