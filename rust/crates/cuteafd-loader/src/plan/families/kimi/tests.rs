@@ -319,7 +319,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert!(memory.notes.iter().any(|note| note.contains("selected RTX expert layers:")
         && note.contains("retained marks:")), "{:?}", memory.notes);
     assert!(memory.notes.iter().any(|note| note.contains("runtime residual")
-        && note.contains("execution slots")), "{:?}", memory.notes);
+        && note.contains("typed execution owners")), "{:?}", memory.notes);
     let sparks = device(memory, DeviceKind::Spark);
     assert_eq!(sparks.len(), 6);
     for spark in &sparks {

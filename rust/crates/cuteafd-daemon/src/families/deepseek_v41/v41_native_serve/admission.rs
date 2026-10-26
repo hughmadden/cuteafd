@@ -3,19 +3,14 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-/// The legacy CED executor's two prefill encoder streams, which queue units on
-/// the one prefill owner (they never add scratch).
-const PREFILL_STREAMS: u8 = 2;
-
 fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    use cuteafd_loader::plan::spark_executions::{admit, PrefillUnits, SparkBackend};
+    use cuteafd_loader::plan::spark_executions::{admit_family, SparkBackend};
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    // The legacy executor's own live chunk is its largest unit.
-    let executions = admit(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V41,
-        &SparkBackend::for_catalog(catalog)?.exports(), None,
-        PrefillUnits { max_unit_rows: capacity, unit_rows: capacity, waves: PREFILL_STREAMS })?;
+    // The descriptor's legacy stream shape queues the live chunk on one owner.
+    let executions = admit_family("deepseek_v41", &SparkBackend::for_catalog(catalog)?.exports(), None,
+        u64::from(capacity), 1)?;
     // One endpoint per link: the decode transport and the prefill transport.
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2],
@@ -71,6 +66,22 @@ mod spark_tests {
     }
 
     #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let backend = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
+        for live in [256u32, 2048, 4096] {
+            // V4.1's layout pins its unit to the live chunk at one wave.
+            let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
+                prefill_waves: 1, ..Default::default() };
+            assert_eq!(spark_model(&catalog, live, false)?.executions,
+                cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_contract_covers_the_decode_and_prefill_links() -> Result<()> {
         let root = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
@@ -83,7 +94,7 @@ mod spark_tests {
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
                     capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
-                    compiled_capacity: compiled, unit_rows: live, buffered_units: PREFILL_STREAMS });
+                    compiled_capacity: compiled, unit_rows: live, buffered_units: 2 });
                 assert_eq!(model.endpoints.len(), 2);
                 assert!(model.endpoints.iter().all(|e| e.capacity == live && e.ingress == if bf16 {
                     cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 }));

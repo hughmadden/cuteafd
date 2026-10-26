@@ -263,8 +263,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 notes.push(format!("Spark rank {rank} I/O admission: {error}"));
             }
             let charged = input.expert_catalog().and_then(SparkBackend::for_catalog).and_then(|backend|
-                Ok(crate::plan::spark_executions::admit_ladder("glm5_flash", &backend.exports(),
-                    Some(u32::try_from(options.glmf_decode_rows)?), prefill.unit_rows, prefill.waves)?))
+                super::planned_spark_executions("glm5_flash", backend,
+                    Some(u32::try_from(options.glmf_decode_rows)?), options))
                 .and_then(|executions| spark_slots::charge_executions(&mut device, input, &working, "glm5_flash", &executions));
             if let Err(error) = charged {
                 report.placement_supported = false;

@@ -189,7 +189,7 @@ fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
     let native = backend == SparkBackend::Exlr8;
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
-    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("glm5", &backend.exports(), None,
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("glm5", &backend.exports(), None,
         u64::from(unit_rows), waves as u64)?;
     let endpoints = 1 + usize::from(waves > 1);
     let rings = crate::shared::placement::spark_rings(if native {
@@ -208,6 +208,26 @@ mod draft_cli_tests {
     struct Parse {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> Result<()> {
+        let k4 = SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest);
+        for backend in [SparkBackend::Fp8, SparkBackend::Exlr8, k4] {
+            for (waves, unit) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
+                assert_eq!(spark_model(backend, waves, unit, false)?.executions,
+                    planned("glm5", backend, None, u64::from(unit), waves as u64), "{backend:?} k{waves}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

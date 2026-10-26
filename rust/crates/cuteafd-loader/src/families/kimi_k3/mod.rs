@@ -28,7 +28,7 @@ pub const SPARK_SLOT_BYTES: u64 = 844_696_852;
 /// Kimi's typed Spark owners on its EXL3 K64 ladder.
 pub fn spark_executions(waves: u64, unit_rows: u64) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let exports = crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::GlmFlashK64).exports();
-    crate::plan::spark_executions::admit_ladder("kimi_k3", &exports, None, unit_rows, waves)
+    crate::plan::spark_executions::admit_family("kimi_k3", &exports, None, unit_rows, waves)
 }
 
 /// One Kimi owner's bytes (the shared EXL3 owner census at latent width).

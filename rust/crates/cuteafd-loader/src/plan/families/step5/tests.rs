@@ -774,9 +774,10 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint's frames hold one unit; the intake holds all live waves.
+        // The descriptor's measured best k3 (#785) on the 8192-row ladder.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
-        assert_eq!(rows, 2048);
-        assert_eq!(result.prefill_waves, Some(2));
+        assert_eq!(rows, 2752);
+        assert_eq!(result.prefill_waves, Some(3));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
         let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
@@ -818,7 +819,8 @@ fn native_owner_shares_scratch_and_sums_quant_and_bf16_tail_io() -> anyhow::Resu
         let mixed = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
         // One BF16 tail layer adds its own I/O planes; the owner's scratch is
         // the larger group package, shared on one stream.
-        let tail_scratch = if ranks == 4 { 580_747_264 } else { 538_279_936 };
+        // The census bound is the maximum over every installed TP package.
+        let tail_scratch = 580_747_264;
         assert_eq!(quant.scratch, quant_scratch);
         assert_eq!(mixed.scratch, quant.scratch.max(tail.scratch));
         assert_eq!(mixed.scratch, tail_scratch.max(quant_scratch));

@@ -125,7 +125,7 @@ pub(crate) fn package_exports(manifest: &serde_json::Value) -> Result<Vec<u32>> 
 /// typed owners over the sealed package's exports.
 pub(crate) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, clients: usize,
     max_frame_bytes: usize) -> Result<ModelAdmission> {
-    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("step5", exports, None,
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("step5", exports, None,
         u64::from(endpoint.capacity), waves)?;
     ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, spark_rings(max_frame_bytes)?, clients, executions)
 }
@@ -737,6 +737,26 @@ mod tests {
             assert!(args.validate().is_err());
             args.prefill_rows = 2753;
             assert!(args.validate().is_err());
+        }
+        Ok(())
+    }
+
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_serve_and_golden_admit_identical_spark_owners() -> Result<()> {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for (waves, unit) in [(1u64, 4096u32), (2, 4096), (3, 2752), (4, 2048), (3, 640)] {
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: unit, ingress: SparkIngress::Bf16 };
+            // Serve and golden share `spark_model`; the planner charges the same owners.
+            assert_eq!(spark_model(&SparkBackend::Fp8.exports(), endpoint, waves, 1, 64 << 20)?.executions,
+                planned("step5", SparkBackend::Fp8, None, u64::from(unit), waves));
         }
         Ok(())
     }

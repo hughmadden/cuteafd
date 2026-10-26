@@ -318,7 +318,7 @@ pub(super) fn layout(
         }
         // Unlike the legacy family wave allowances, Step-5 has no first-slot scratch reserve.
         let backend = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?;
-        let executions = crate::plan::spark_executions::admit_ladder("step5", &backend.exports(), None,
+        let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
             shape.unit_rows, shape.waves)?;
         crate::plan::layout::spark_slots::charge_executions(&mut device, input, &working, "step5", &executions)?;
         memory.devices.push(device);

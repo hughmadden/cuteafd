@@ -401,7 +401,7 @@ mod tests {
             &SparkWorkingSet::default(), 2, None,
             ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32 }],
                 SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
-                cuteafd_loader::plan::spark_executions::admit_ladder("glm5_flash",
+                cuteafd_loader::plan::spark_executions::admit_family("glm5_flash",
                     &cuteafd_core::EXL3_CAPACITIES, None, 2048, 4)?)?)
     }
 

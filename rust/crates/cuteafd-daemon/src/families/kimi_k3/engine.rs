@@ -131,7 +131,7 @@ impl<'a> Engine<'a> {
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32 };
             plan.spec().lanes as usize];
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
-        let executions = cuteafd_loader::plan::spark_executions::admit_ladder("kimi_k3",
+        let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
             &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
             u64::from(rows), admission.waves() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;

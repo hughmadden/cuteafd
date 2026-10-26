@@ -13,7 +13,7 @@ pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::Spark
     let capacity = u32::try_from(rows)?;
     let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 }
         else { cuteafd_core::SparkIngress::Fp8K32 };
-    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("qwen4", &backend.exports(), None,
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("qwen4", &backend.exports(), None,
         rows as u64, waves)?;
     cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
@@ -244,7 +244,8 @@ mod tests {
                     "F8_E4M3", &[100, 160]));
             }
             testing::write_snapshot(dir.path(), &config, &tensors, None);
-            for (rows, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+            // The mapped-PLE ring caps Qwen at two waves (#717).
+            for (rows, waves) in [(4096, 1), (2048, 2), (4096, 2)] {
                 let report = plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks: 4 },
                     layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: rows,
@@ -311,6 +312,26 @@ mod tests {
         assert_eq!(full.logits, 8192 * cfg.vocab_size as u64 * 4);
         assert!(HostWorkspaceBytes::new(&cfg, usize::MAX, false, pages, pools,
             true, true, true, false, 1).is_err());
+        Ok(())
+    }
+
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for backend in [SparkBackend::Fp8, SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
+            for (waves, unit) in [(1u64, 4096usize), (2, 2048), (2, 4096)] {
+                assert_eq!(super::spark_model(backend, unit, waves, false)?.executions,
+                    planned("qwen4", backend, None, unit as u64, waves));
+            }
+        }
         Ok(())
     }
 

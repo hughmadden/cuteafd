@@ -223,7 +223,8 @@ mod tests {
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         for (extra, expected) in [
             (vec![], (2752, 3, 8256)),
-            (vec!["--prefill-waves", "2"], (2752, 2, 5504)),
+            // Units are the 8192-row reserve divided by k.
+            (vec!["--prefill-waves", "2"], (4096, 2, 8192)),
             (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192)),
             (vec!["--prefill-waves", "3"], (2752, 3, 8256)),
             (vec!["--prefill-waves", "4"], (2048, 4, 8192)),

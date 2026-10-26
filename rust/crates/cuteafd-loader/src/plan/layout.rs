@@ -405,8 +405,16 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
 pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: &LayoutOptions)
     -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let backend = super::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?;
+    planned_spark_executions(family, backend, None, options)
+}
+
+/// The planner's admission for a known backend, at the layout's resolved
+/// unit and wave count. Daemons call `admit_family` with the same inputs;
+/// parity tests compare the two per family.
+pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
+    decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
-    super::spark_executions::admit_ladder(family, &backend.exports(), None, unit, options.prefill_waves)
+    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit, options.prefill_waves)
 }
 
 #[cfg(test)]
