@@ -457,18 +457,20 @@ fn numerics_deviations(family: &str, modules: &BTreeMap<String, checkpoint::Modu
 /// candidate Spark count; `cuteafd plan --layout` adds more).
 pub struct PlanInput {
     checkpoint: Checkpoint,
+    header_validation: Option<Result<(), String>>,
     /// The routed-expert catalog, read on first use.
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
 }
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Ok(Self::from_checkpoint(Checkpoint::open(snapshot)?))
+        let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
+        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new() })
     }
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
-        Self { checkpoint, catalog: OnceLock::new() }
+        Self { checkpoint, header_validation: None, catalog: OnceLock::new() }
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {
@@ -479,7 +481,13 @@ impl PlanInput {
     /// kept for the lifetime of the input. Families that stage no routed
     /// experts never ask for it, so no read happens for them.
     pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> {
-        match self.catalog.get_or_init(|| crate::read_expert_catalog(&self.checkpoint.snapshot)) {
+        match self.catalog.get_or_init(|| {
+            if let Some(validation) = &self.header_validation {
+                crate::families::deepseek_v41::v41_catalog::expert_catalog_from_checkpoint(&self.checkpoint, validation)
+            } else {
+                crate::read_expert_catalog(&self.checkpoint.snapshot)
+            }
+        }) {
             Ok(catalog) => Ok(catalog),
             Err(error) => Err(anyhow::anyhow!("{error:#}")),
         }

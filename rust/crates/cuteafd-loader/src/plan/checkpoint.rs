@@ -71,6 +71,16 @@ pub struct Checkpoint {
     pub shard_bytes: u64,
 }
 
+pub(crate) fn validate_index_headers(shard: &str, names: &BTreeSet<&str>,
+    headers: &[SafetensorsTensorMetadata]) -> Result<()> {
+    ensure!(headers.len() == names.len(), "index/header tensor count mismatch in {shard}");
+    for tensor in headers {
+        ensure!(names.contains(tensor.name.as_str()),
+            "tensor {} appears in unexpected shard {shard}", tensor.name);
+    }
+    Ok(())
+}
+
 pub fn read_json(path: &Path) -> Result<Value> {
     let mut bytes = Vec::new();
     File::open(path)
@@ -131,7 +141,18 @@ impl Checkpoint {
         Self::open_filtered(snapshot, Some(role), needed)
     }
 
+    pub(crate) fn open_with_header_validation(snapshot: &Path) -> Result<(Self, Result<(), String>)> {
+        let mut validation = Ok(());
+        let checkpoint = Self::open_filtered_validated(snapshot, None, |_| true, Some(&mut validation))?;
+        Ok((checkpoint, validation))
+    }
+
     fn open_filtered(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_filtered_validated(snapshot, role, needed, None)
+    }
+
+    fn open_filtered_validated(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool,
+        mut validation: Option<&mut Result<(), String>>) -> Result<Self> {
         let config = read_json(&snapshot.join("config.json"))?;
         if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
             return super::exlr8::inventory(snapshot, config, needed);
@@ -196,6 +217,9 @@ impl Checkpoint {
                     continue;
                 }
             };
+            if let Some(result) = validation.as_deref_mut().filter(|result| result.is_ok()) {
+                *result = validate_index_headers(shard, &names, &headers).map_err(|error| error.to_string());
+            }
             if let Some(role) = role {
                 let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();
                 for name in &names {
@@ -677,6 +701,8 @@ mod sliced_tests {
         write_safetensors(&dir.path().join("a.safetensors"), &[
             t("a.weight", "BF16", &[2]), t("z.weight", "BF16", &[2]), t("extra.weight", "BF16", &[2])]);
         write_safetensors(&dir.path().join("z.safetensors"), &[t("z.weight", "BF16", &[2])]);
+        let (_, validation) = Checkpoint::open_with_header_validation(dir.path()).unwrap();
+        assert!(validation.unwrap_err().contains("index/header tensor count mismatch"));
         let checkpoint = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap();
         assert_eq!(checkpoint.tensors.iter().map(|tensor| (tensor.meta.name.as_str(), tensor.shard.as_str()))
             .collect::<Vec<_>>(), [("a.weight", "a.safetensors"), ("z.weight", "z.safetensors")]);
