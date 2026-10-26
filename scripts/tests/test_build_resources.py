@@ -611,8 +611,8 @@ def test_exl3_variant_workers_persist_across_variants(tmp_path):
 
 def test_spark_native_builds_brake_ninja_on_load():
     host_isa = ROOT / 'scripts/build/host-isa.sh'
-    for machine, expected in (('aarch64', ['-l', '14']), ('x86_64', [])):
-        out = subprocess.run(['bash', '-c', f'uname() {{ echo {machine}; }}; source "$1"; cuteafd_native_build_args',
+    for machine, expected in (('aarch64', ['-l', '10']), ('x86_64', [])):
+        out = subprocess.run(['bash', '-c', f'uname() {{ echo {machine}; }}; source "$1"; cuteafd_performance_cores() {{ echo 10; }}; cuteafd_native_build_args',
                               'host-isa', str(host_isa)], capture_output=True, text=True, check=True).stdout
         assert out.split() == expected
     for script, root in (('build-wip-artifacts.sh', 'build_dir'), ('build-release-artifacts.sh', 'build_root')):
@@ -866,3 +866,49 @@ def test_pick_names_the_balanced_seed_without_holding_anything(tmp_path, locks, 
                              '--host', 'kakapo', '--fallback', 'rhea,moa', '--lease-dir', '/nonexistent'],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0 and result.stdout.strip() == 'rhea'
+
+
+def test_gb10_charge_uses_measured_host_footprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_RAM_MIB', '')
+    monkeypatch.setenv('CUTEAFD_EXPORT_CONTEXT_SPACING_S', '0')
+    monkeypatch.setattr(export, 'host_allocatable_memory', lambda: 120000 * 1024**2)
+    (tmp_path / 'context-footprint-mib').write_text('7168')
+    export.context_admission()
+    try:
+        assert (tmp_path / 'context.0.lock').read_text() == '7168'
+    finally:
+        export._context_lease.close()
+        export._context_lease = None
+
+
+def test_context_hook_initializes_stream_under_host_guard(tmp_path, monkeypatch):
+    import types
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    events = []
+    cuda = types.SimpleNamespace(_lazy_init=lambda: events.append('torch'))
+    def stream():
+        cuda._lazy_init()  # torch's recursive lazy-init path must not deadlock
+        assert resource.try_lock(tmp_path / 'context-init.lock') is None
+        events.append('stream')
+        return types.SimpleNamespace(synchronize=lambda: events.append('sync'))
+    cuda.current_stream = stream
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(export, 'context_admission', lambda: events.append('admit'))
+    monkeypatch.setattr(export, 'gpu_admission', lambda: events.append('gpu'))
+    monkeypatch.setattr(export, '_record_footprint', lambda *args: 'measured')
+    callbacks = []
+    monkeypatch.setattr(export.atexit, 'register', lambda callback: callbacks.append(callback))
+    export.install_context_admission()
+    try:
+        cuda._lazy_init()
+        assert events == ['admit', 'gpu', 'torch', 'torch', 'stream', 'sync']
+        assert resource.try_lock(tmp_path / 'context-init.lock') is not None
+        cuda._lazy_init()
+        assert events.count('stream') == 1
+    finally:
+        for callback in callbacks:
+            callback()

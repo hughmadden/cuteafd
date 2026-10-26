@@ -203,6 +203,7 @@ cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
 # coordinator ships a portable x86-64-v2 base plus an x86-64-v4 variant. Each
 # daemon builds into its own target directory; the variants build side by side.
 source "$(dirname "${BASH_SOURCE[0]}")/host-isa.sh"
+cuteafd_build_parallelism
 host_isa_text="$(cuteafd_host_isa_list release "${CUTEAFD_RELEASE_HOST_ISA:-}")"
 mapfile -t host_isas <<<"$host_isa_text"
 host_isa_cmake="${host_isa_text//$'\n'/;}"

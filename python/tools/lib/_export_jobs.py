@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
+import threading
 import shutil
 import subprocess
 import time
@@ -210,7 +212,15 @@ def context_admission():
         return
     root = Path(os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'])
     root.mkdir(parents=True, exist_ok=True)
-    per_worker = int(os.environ.get('CUTEAFD_EXPORT_WORKER_RAM_MIB', '1536'))
+    per_worker = int(os.environ.get('CUTEAFD_EXPORT_WORKER_RAM_MIB') or '1536')
+    if _gb10_host():
+        # Cold builds start conservatively; subsequent admissions use the
+        # measured process + allocator high-water footprint on this host.
+        try:
+            measured = int((root / 'context-footprint-mib').read_text())
+        except (FileNotFoundError, ValueError):
+            measured = 0
+        per_worker = max(per_worker, 4096, measured)
     count = host_context_cap()
     spacing = float(os.environ.get('CUTEAFD_EXPORT_CONTEXT_SPACING_S',
                                    CONTEXT_SPACING_S if _gb10_host() else 0))
@@ -332,16 +342,108 @@ def park_context_lease():
         atexit.register(parked.close)
 
 
+def _record_footprint(torch, root, initial_available):
+    """Keep a host-wide measured high-water charge, including allocator cache.
+
+    RSS covers Python, compiler IR/workspace and mapped driver pages; device
+    allocator reservations can be outside RSS on GB10, so charge them as well.
+    This intentionally overestimates shared library pages instead of trusting
+    nvidia-smi's context-only figure as the entire export footprint.
+    """
+    peak_rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss + 1023) // 1024
+    allocated = torch.cuda.max_memory_allocated() // 1024**2
+    cached = torch.cuda.max_memory_reserved() // 1024**2
+    footprint = peak_rss + cached
+    available = host_allocatable_memory() // 1024**2
+    with (root / 'context-admission.lock').open('a') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        path = root / 'context-footprint-mib'
+        try:
+            previous = int(path.read_text())
+        except (FileNotFoundError, ValueError):
+            previous = 0
+        if footprint > previous:
+            path.write_text(str(footprint))
+        if _context_lease is not None and not _context_lease.closed:
+            _context_lease.seek(0)
+            charge = max(int(_context_lease.read() or 0), footprint)
+            _context_lease.seek(0)
+            _context_lease.truncate()
+            _context_lease.write(str(charge))
+            _context_lease.flush()
+    return (f'pid={os.getpid()} rss_peak={peak_rss} MiB, '
+            f'torch_allocated_peak={allocated} MiB, torch_reserved_peak={cached} MiB, '
+            f'charge={footprint} MiB, available={available} MiB, '
+            f'init_dip={initial_available - available} MiB')
+
+
 def install_context_admission():
     if not os.environ.get('CUTEAFD_EXPORT_HOST_SLOT_DIR'):
-        return
+        if not _gb10_host():
+            return
+        # Standalone GB10 exports share the same host pool as build launchers.
+        os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'] = str(
+            Path.home() / '.cache/cuteafd/export-workers')
     import torch
     original = torch.cuda._lazy_init
     if getattr(original, '_cuteafd_context_admission', False):
         return
+    initializing = threading.local()
+    init_lock = threading.RLock()
+    ready = False
+
     def admitted_init(*args, **kwargs):
-        context_admission()
-        gpu_admission()
-        return original(*args, **kwargs)
+        nonlocal ready
+        # current_stream() below calls _lazy_init again. Let that recursive
+        # call reach torch, without taking another host lock or another lease.
+        if getattr(initializing, 'active', False):
+            return original(*args, **kwargs)
+        with init_lock:
+            if ready or not _gb10_host():
+                context_admission()
+                gpu_admission()
+                return original(*args, **kwargs)
+            root = Path(os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'])
+            root.mkdir(parents=True, exist_ok=True)
+            started = time.monotonic()
+            next_warn = started
+            with (root / 'context-init.lock').open('a') as guard:
+                while True:
+                    try:
+                        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        next_warn = _wait_for_admission(started, next_warn,
+                            'waiting for actual CUDA context initialization', 'initialization')
+                context_admission()
+                gpu_admission()
+                available = host_allocatable_memory() // 1024**2
+                initializing.active = True
+                try:
+                    result = original(*args, **kwargs)
+                    # Torch lazy init alone need not allocate the graphics
+                    # context. This is the exact driver allocation that failed
+                    # in current_cuda_stream AFTER the old admission spacing.
+                    torch.cuda.current_stream().synchronize()
+                    print('AOT context initialized: ' + _record_footprint(torch, root, available), flush=True)
+                    ready = True
+                finally:
+                    initializing.active = False
+            stopped = threading.Event()
+            minimum_available = [available]
+            def sample_memory():
+                while not stopped.wait(1):
+                    _record_footprint(torch, root, available)
+                    minimum_available[0] = min(minimum_available[0],
+                        host_allocatable_memory() // 1024**2)
+            sampler = threading.Thread(target=sample_memory, daemon=True)
+            sampler.start()
+            def finished():
+                stopped.set()
+                sampler.join(timeout=2)
+                print('AOT context finished: ' + _record_footprint(torch, root, available)
+                      + f', sampled_min_available={minimum_available[0]} MiB', flush=True)
+            atexit.register(finished)
+            return result
     admitted_init._cuteafd_context_admission = True
     torch.cuda._lazy_init = admitted_init
