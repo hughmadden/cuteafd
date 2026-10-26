@@ -257,10 +257,11 @@ fn spark_transport(
     capacity: u32,
     timing: bool,
     world: cuteafd_transport::expert::SparkWorld,
+    lane: u32,
 ) -> Result<SparkExperts> {
     let config = TcpTransportConfig { timing, timeout: Duration::from_secs(120), max_frame_bytes: 64 * 1024 * 1024 };
     SparkExperts::new_world(world,
-        peers, capacity, config)
+        peers, capacity, config, lane)
 }
 
 fn worker(
@@ -448,7 +449,9 @@ fn worker(
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
-    let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
+    let lanes = crate::shared::serve::lanes::LaneSet::default();
+    let [roce, prefill_roce] = lanes.try_map(|lane| spark_transport(&args.peers, capacity,
+        protocol_v2_timing, spark_world, u32::try_from(lane.index())?))?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
@@ -466,7 +469,6 @@ fn worker(
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
     admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?;
-    let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;

@@ -2072,11 +2072,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
     #[allow(clippy::too_many_arguments)]
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
-                     request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
+                     request: &ExpertProtocolV2Request, execution_lane: u32, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>,
                      terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>,
                      model_endpoint: Option<u32>) -> Result<Self> {
-        let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(),
+        let mut session = Self::connect_impl(addr, config, request, execution_lane, None, true, landing, egress.is_some(),
             terminal_owner, flow_label, capacity, model_endpoint)?;
         if let Some(buffer) = egress {
             let host = buffer.host();

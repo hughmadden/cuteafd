@@ -995,6 +995,44 @@ mod owner_tests {
     }
 
     #[test]
+    fn lane_set_transports_use_distinct_decode_credits_and_one_prefill_owner() -> Result<()> {
+        use cuteafd_transport::expert::{SparkExperts, SparkWorld};
+        use cuteafd_transport::worker_selection::{execution_owner, ExecutionOwner};
+        use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
+        let mut admitted = owners();
+        admitted.prefill.unit_rows = 2048;
+        admitted.prefill.buffered_units = 2;
+        let mut queues = OwnerQueues::new(&admitted);
+        let set = crate::shared::serve::lanes::LaneSet::default();
+        let peers = ["127.0.0.1:19455".parse()?];
+        let mut transports = set.try_map(|lane| SparkExperts::new_world(SparkWorld::canonical(1)?,
+            &peers, 2048, TcpTransportConfig::default(), u32::try_from(lane.index())?))?;
+        let mut units = Vec::new();
+        for (lane, transport) in transports.iter_mut().enumerate() {
+            assert_eq!(transport.execution_lane(), lane as u32);
+            for source in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
+                assert_eq!(execution_owner(&admitted, source, transport.execution_lane(), 62)?,
+                    ExecutionOwner::Decode(lane));
+            }
+            units.push(queues.record(lane)?);
+            assert!(queues.admit(lane).is_err());
+            assert_eq!(execution_owner(&admitted, ExpertV2SourceKind::Prefill,
+                transport.execution_lane(), 2048)?, ExecutionOwner::Prefill);
+            units.push(queues.record(admitted.decode.len())?);
+            transport.reset_connections();
+            assert_eq!(transport.execution_lane(), lane as u32);
+        }
+        assert_eq!(queues.retained, [1, 1, 2]);
+        assert!(queues.admit(admitted.decode.len()).is_err());
+        for unit in units {
+            queues.publish_oldest(unit.owner)?;
+            queues.release(unit)?;
+        }
+        assert_eq!(queues.retained, [0; 3]);
+        Ok(())
+    }
+
+    #[test]
     fn decode_lanes_never_borrow_prefill_or_other_decode_credit() -> Result<()> {
         let mut queues = OwnerQueues::new(&owners());
         let first = queues.record(0)?;

@@ -32,6 +32,11 @@ impl LaneSet {
         LaneLease { index, stop: &self.stop }
     }
 
+    /// Construct each lane's owners with the same identities used by `run`.
+    pub fn try_map<T>(&self, mut setup: impl FnMut(LaneLease<'_>) -> Result<T>) -> Result<[T; 2]> {
+        Ok([setup(self.lease(0))?, setup(self.lease(1))?])
+    }
+
     /// Run both lane loops with shared failure propagation, without cancelling
     /// an outstanding device or transport operation.
     pub async fn run<'s, F, G>(&'s self,
@@ -155,6 +160,26 @@ mod tests {
     async fn failing(lease: LaneLease<'_>) -> Result<()> {
         for _ in 0..3 { tokio::task::yield_now().await; }
         anyhow::ensure!(lease.index() == 0, "lane failed");
+        Ok(())
+    }
+
+    #[test]
+    fn owner_setup_and_execution_share_lane_identities() -> Result<()> {
+        let set = LaneSet::default();
+        let identities = set.try_map(|lease| Ok(lease.index()))?;
+        let ran = RefCell::new(Vec::new());
+        block_on(set.run(
+            |lease| record(&ran, lease.index(), false),
+            |lease| record(&ran, lease.index(), false),
+        ))?;
+        assert_eq!(identities, [0, 1]);
+        assert_eq!(*ran.borrow(), identities);
+        let mut attempted = Vec::new();
+        assert!(set.try_map::<()>(|lease| {
+            attempted.push(lease.index());
+            anyhow::bail!("setup failed")
+        }).is_err());
+        assert_eq!(attempted, [0]);
         Ok(())
     }
 

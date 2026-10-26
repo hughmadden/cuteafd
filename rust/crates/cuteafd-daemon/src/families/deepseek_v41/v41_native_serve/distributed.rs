@@ -408,10 +408,12 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
-    let mut make_transport = || {
+    let lanes = crate::shared::serve::lanes::LaneSet::default();
+    let [mut transport, mut second_transport] = lanes.try_map(|lane| {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
-            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world)?;
+            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world,
+                u32::try_from(lane.index())?)?;
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
@@ -420,10 +422,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             // link's exchange worker (the first remote layer sizes the rings).
             devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
-        Ok::<_, anyhow::Error>(transport)
-    };
-    let mut transport = make_transport()?;
-    let mut second_transport = make_transport()?;
+        Ok(transport)
+    })?;
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     // Allocation must consume exactly the admitted pages; do not run a second

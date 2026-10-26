@@ -95,17 +95,19 @@ pub struct WaveReceipt {
 }
 
 impl SparkExperts {
-    /// Rank identity and request encoding are declared before connecting.
+    /// Rank identity, request encoding and decode execution lane are fixed
+    /// before connecting. Prefill requests always use the singleton owner.
     pub fn new_world(
         world: SparkWorld,
         peers: &[SocketAddr],
         capacity: u32,
         config: TcpTransportConfig,
+        execution_lane: u32,
     ) -> Result<Self> {
         ensure!(peers.len() == world.topology().world_size(),
             "Spark world requires exactly its physical rank count");
         let executors = world.topology().executor_ids();
-        let clients = LocalTp4Client::new_ranks(peers.to_vec(), config.clone());
+        let clients = LocalTp4Client::new_ranks(peers.to_vec(), config.clone(), execution_lane);
         Self::with_clients(peers, &executors, capacity, &config, clients, world)
     }
 
@@ -160,6 +162,8 @@ impl SparkExperts {
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
+    /// Decode/MTP owner identity, fixed at construction and kept on reconnect.
+    pub fn execution_lane(&self) -> u32 { self.clients.execution_lane() }
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
@@ -595,11 +599,11 @@ mod tests {
         let config = TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000,
         };
-        let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config.clone())?;
+        let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config.clone(), 0)?;
         assert_eq!(client.world_size(), 2);
         client.reset_connections();
         assert_eq!(client.world_size(), 2);
-        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical((&[peers[0]; 2]).len())?, &[peers[0]; 2], 2, config.clone()).is_err());
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical((&[peers[0]; 2]).len())?, &[peers[0]; 2], 2, config.clone(), 0).is_err());
         assert_eq!(client.world().topology().executor_ids(), [5, 6]);
         Ok(())
     }
@@ -611,7 +615,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 };
         let request = super::super::tests::request(2);
         for waves in 1..=4 {
-            let mut client = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config.clone())?;
+            let mut client = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config.clone(), 0)?;
             client.set_max_waves(waves)?;
             let mut unread = Vec::new();
             for sequence in 1..=waves as u64 {
@@ -638,7 +642,7 @@ mod tests {
             client.set_max_waves(waves)?;
             client.reset_drained()?;
         }
-        let mut terminal = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config)?;
+        let mut terminal = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config, 0)?;
         terminal.enable_terminal_ownership()?;
         assert!(terminal.reset_drained().is_err(), "terminal owners must quiesce/release, never reset for reuse");
         assert!(terminal.terminal_ready_for_test());
@@ -796,7 +800,7 @@ mod tests {
             let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, capacity, TcpTransportConfig { timing: false,
                     timeout: std::time::Duration::from_secs(10),
                     max_frame_bytes: 64 * 1024 * 1024,
-                })?;
+                }, 0)?;
             for rows in shapes {
                 let base = super::super::tests::request(rows);
                 let mut payload = Vec::new();

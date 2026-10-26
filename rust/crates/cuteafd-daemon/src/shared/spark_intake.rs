@@ -1476,7 +1476,7 @@ impl<'a> SparkLink<'a> {
         row_bytes: usize, waves: usize, wave_rows: u32) -> Result<Self> {
         ensure!((1..=capacity).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         let timing = config.timing;
-        let mut transport = SparkExperts::new_world(world, peers, capacity, config)?;
+        let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
         transport.set_max_waves(waves)?;
         Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, waves, wave_rows, timing)
     }
@@ -1859,7 +1859,7 @@ mod tests {
             .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         ensure!(peers.len() == 4, "four peers required");
         let mut transport = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 4096, TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(30),
-                max_frame_bytes: 64 << 20 })?;
+                max_frame_bytes: 64 << 20 }, 0)?;
         let intake = SparkIntake::new(&library, IntakeMode::Pinned, 4, 4096, 10240)?;
         // SAFETY: transport drops first and dispatch follows before_dispatch.
         unsafe { intake.attach(&mut transport)? };

@@ -513,7 +513,7 @@ mod tests {
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                 timeout: std::time::Duration::from_secs(1),
                 max_frame_bytes: 2 * 1024 * 1024,
-            })?;
+            }, 0)?;
         let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?)?;
         transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 1, 16, [None, None])?)?;
         let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
