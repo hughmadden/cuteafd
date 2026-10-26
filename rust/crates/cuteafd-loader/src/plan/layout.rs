@@ -340,23 +340,17 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     }
 }
 
-/// Execution slots each Spark rank runs for a family: the most requests the
-/// coordinator keeps in flight to one rank. Prefill waves and decode lanes
-/// never share a rank at once (each family's scheduler stops decode for
-/// admission), so the bound is the larger of the two, not their sum.
-pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
-    let prefill = match family {
-        // V4.1's two transports carry both prefill encoder streams at once.
-        "deepseek_v41" => 2,
-        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" | "deepseek_v4" | "qwen4" | "step5" => prefill_waves,
-        _ => 1,
-    };
-    let decode = u64::from(decode_lanes.max(1));
-    let slots = prefill.max(decode);
-    if prefill == 0 || slots > u64::from(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS) {
-        return Err(crate::placement::PlacementError::Inventory("Spark execution slots exceed executor capability"));
+/// Spark compute slots follow decode lanes, not the outstanding prefill
+/// exchanges. Waves retain their own transport rings and return buffers while
+/// a rank serializes unit GEMMs on each admitted compute slot.
+pub fn spark_execution_slots(_family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
+    if !(1..=crate::serving_capacity::prefill_waves::MAX_WAVES).contains(&prefill_waves) {
+        return Err(crate::placement::PlacementError::Inventory("Spark prefill waves exceed executor capability"));
     }
-    u8::try_from(slots).map_err(|_| crate::placement::PlacementError::Overflow("Spark execution slots"))
+    if !(1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS).contains(&decode_lanes) {
+        return Err(crate::placement::PlacementError::Inventory("Spark decode lanes exceed executor capability"));
+    }
+    Ok(decode_lanes)
 }
 
 /// Device bytes of one Spark execution slot (stream, scratch, inputs and
@@ -462,16 +456,25 @@ mod selected_spark_io_tests {
     }
 
     #[test]
-    fn execution_slots_follow_admitted_waves_and_lanes_and_charge_their_unit_size() {
-        assert_eq!(spark_execution_slots("glm5", 2, 1).unwrap(), 2);
-        assert_eq!(spark_execution_slots("glm5", 4, 1).unwrap(), 4);
-        assert_eq!(spark_execution_slots("mimo_v2", 3, 2).unwrap(), 3);
-        assert_eq!(spark_execution_slots("mimo_v2", 1, 2).unwrap(), 2);
+    fn execution_slots_follow_decode_lanes_independently_of_prefill_waves() {
+        for family in ["glm5", "glm5_flash", "mimo_v2", "deepseek_v41", "deepseek_v4", "kimi_k3", "qwen4", "step5"] {
+            for waves in 1..=crate::serving_capacity::prefill_waves::MAX_WAVES {
+                for lanes in 1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS {
+                    assert_eq!(spark_execution_slots(family, waves, lanes).unwrap(), lanes);
+                }
+            }
+            for waves in [0, 5, u64::MAX] {
+                assert!(spark_execution_slots(family, waves, 1).is_err());
+            }
+            for lanes in [0, 5, u8::MAX] {
+                assert!(spark_execution_slots(family, 1, lanes).is_err());
+            }
+        }
         assert_eq!(spark_execution_slots("deepseek_v41", 1, 2).unwrap(), 2);
-        assert_eq!(spark_execution_slots("qwen4", 1, 1).unwrap(), 1);
-        assert!(spark_execution_slots("glm5", 9, 1).is_err());
-        assert!(spark_execution_slots("qwen4", 0, 1).is_err());
-        assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 3);
+    }
+
+    #[test]
+    fn execution_slots_charge_their_unit_size() {
         // A smaller live unit does not shrink compiled-capacity scratch.
         assert_eq!(spark_slot_bytes("glm5", 2048), spark_slot_bytes("glm5", 4096));
         let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 2, ..Default::default() };

@@ -40,7 +40,7 @@ mod spark_tests {
             let model = super::spark_model(decode_rows, 2752, 3)?;
             model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
             assert_eq!((model.capacity, model.compiled_capacity), (2752, 4096));
-            assert_eq!(model.execution_slots, 3);
+            assert_eq!(model.execution_slots, 1);
             assert_eq!(model.endpoints.len(), 2);
             assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
             assert_eq!(model.endpoints[1].capacity, 2752);
