@@ -431,16 +431,17 @@ fn packaged_schedule_identity_matches_exact_variant_without_a_policy_allowlist()
 
 /// #762: a deferred mapped request (the async exchange's lane-owned slots)
 /// keeps its expert timing pending and publishes it at `complete`, after the
-/// owner saw the stream drain, so per-rank Spark compute stays observable.
+/// owner saw that unit's fence complete, so later units can remain queued.
 #[test]
 fn deferred_exl3_requests_publish_their_timing_at_completion() {
     let source = include_str!("../worker.rs");
     let deferred = &source[source.find("if self.deferred && destination.is_some() {").unwrap()..];
     let early = &deferred[..deferred.find("return Ok(());").unwrap()];
-    assert!(early.contains("self.pending = Some((request.request_id(), request.layer(), request.rows(), executor_id))"));
+    assert!(early.contains("self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?"));
     let complete = &source[source.find("pub(crate) fn complete(&mut self)").unwrap()..];
     let complete = &complete[..complete.find("\n    }\n").unwrap()];
-    assert!(complete.contains("self.pending.take()") && complete.contains("timing.publish("));
+    assert!(complete.contains("self.pending.pop()?") && complete.contains("timing.publish("));
+    assert!(source.contains("pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }"));
     let backend = include_str!("../../service/backend.rs");
     assert!(backend.contains("Self::Exl3(execution) => execution.complete(),"));
 }

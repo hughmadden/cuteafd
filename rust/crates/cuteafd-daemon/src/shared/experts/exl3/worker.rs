@@ -360,13 +360,12 @@ impl<'a> Exl3Worker<'a> {
         Ok(())
     }
 
-    /// The deferred request finished (the owner observed its stream drained):
-    /// publish its expert timing, so per-rank Spark compute (S, #762) stays
-    /// observable under the async exchange.
+    /// Publish the oldest unit's timing after its own fence completes, even
+    /// while later units remain queued on the same stream.
     pub(crate) fn complete(&mut self) -> Result<()> {
         let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
         if let Some(timing) = &mut self.worker_timing {
-            // SAFETY: the caller observed this stream drained after both records.
+            // SAFETY: the unit's completed fence follows both timing records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exl3")?; }
         }
         Ok(())
@@ -590,9 +589,8 @@ impl<'a> Exl3Worker<'a> {
         if let Some(timing) = &self.worker_timing {
             unsafe { timing.record(1, self.stream.raw)?; }
         }
-        // A deferred mapped request completes when the owner observes the
-        // stream idle; the transport holds both slots until then, and its
-        // timing publishes at `complete`.
+        // Retain this mapped request/reply until its unit fence completes;
+        // later units may remain queued when its timing publishes at `complete`.
         if self.deferred && destination.is_some() {
             // SAFETY: all input copies, math and output writes precede this unit fence.
             unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
