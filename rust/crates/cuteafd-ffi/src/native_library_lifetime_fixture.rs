@@ -165,6 +165,26 @@ impl Fixture {
         Ok(())
     }
 
+    /// Queue copies and deterministic route-dependent fake expert reads, rather
+    /// than executing either at submission. Only explicit advance/drain runs work.
+    pub fn queued_experts(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: these exports belong only to the CPU fixture built above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_configure_queued_experts")?;
+            configure();
+        }
+        Ok(())
+    }
+
+    pub fn advance_queued_experts(&self, library: &NativeLibrary, operations: usize) -> Result<()> {
+        // SAFETY: the fixture executes at most this many previously queued operations.
+        unsafe {
+            let advance: Symbol<unsafe extern "C" fn(usize)> = library.lib.get(b"fixture_advance_queued_experts")?;
+            advance(operations);
+        }
+        Ok(())
+    }
+
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {

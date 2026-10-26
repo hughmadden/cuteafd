@@ -17,6 +17,9 @@ static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
+static int queued_experts;
+static int queue_expert(void **ptrs, int rows, void *stream);
+void fixture_configure_queued_experts(void) { queued_experts = 1; }
 
 void fixture_configure_immediate_copies(void) { immediate_copies = 1; }
 
@@ -95,8 +98,9 @@ int cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t *bytes) {
 }
 int cuteafd_fp8moe_create(void **out) { *out = malloc(1); return *out ? 0 : 1; }
 int cuteafd_fp8moe_launch(void *ctx, uint32_t capacity, void **ptrs, int rows, void *stream) {
-    (void)ctx; (void)capacity; (void)ptrs; (void)rows; (void)stream;
-    return 1; /* No CPU stand-in for expert math. */
+    (void)ctx; (void)capacity;
+    if (queued_experts) return queue_expert(ptrs, rows, stream);
+    return 1; /* Ordinary lifetime tests never launch expert math. */
 }
 void cuteafd_fp8moe_destroy(void *ctx) { free(ctx); }
 
@@ -117,6 +121,13 @@ int cuteafd_free_host_buffer(struct host_buffer *buffer) {
 }
 
 struct device_buffer { void *ptr; size_t bytes; int device_id; uint64_t flags; };
+
+int cuteafd_cuda_host_buffer_device_alias(struct host_buffer host, struct device_buffer *out) {
+    if (!host.ptr || !host.bytes || !out) return 1;
+    *out = (struct device_buffer){ .ptr = host.ptr, .bytes = host.bytes,
+        .device_id = current_device, .flags = 2 };
+    return 0;
+}
 
 void fixture_configure_pack(int pack, int drain) {
     pack_status = pack;
@@ -187,7 +198,59 @@ int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
 }
 
 struct upload { void *dst; const void *src; size_t bytes; };
-struct upload_event { struct upload *copies; size_t count; };
+struct upload_event { struct upload *copies; size_t count, fence; };
+
+/* Opt-in stream interpreter: copies and fake expert reads execute only when
+ * explicitly advanced, so tests can submit N+1 while N is still outstanding. */
+struct queued_op {
+    int kind;
+    void *stream, *dst;
+    const void *src;
+    size_t bytes, dst_pitch, src_pitch, rows, hidden, topk;
+    void *ptrs[11];
+};
+static struct queued_op queued_ops[65536];
+static size_t queued_count, queued_done;
+static int enqueue(struct queued_op op) {
+    if (queued_count == 65536) return 1;
+    queued_ops[queued_count++] = op;
+    return 0;
+}
+static int queue_expert(void **ptrs, int rows, void *stream) {
+    struct queued_op op = { .kind = 1, .stream = stream, .rows = (size_t)rows,
+        .hidden = fp8_words[1], .topk = fp8_words[4] };
+    memcpy(op.ptrs, ptrs, sizeof(op.ptrs));
+    return enqueue(op);
+}
+static void advance_queue(size_t until) {
+    while (queued_done < until) {
+        struct queued_op *op = &queued_ops[queued_done++];
+        if (op->kind == 0) {
+            for (size_t row = 0; row < op->rows; ++row)
+                memcpy((char *)op->dst + row * op->dst_pitch,
+                    (const char *)op->src + row * op->src_pitch, op->bytes);
+        } else {
+            const int32_t *ids = op->ptrs[1];
+            const float *gates = op->ptrs[2];
+            uint16_t *out = op->ptrs[9];
+            const uint8_t *input = op->ptrs[0];
+            size_t stride = op->hidden + op->hidden / 32;
+            for (size_t row = 0; row < op->rows; ++row) {
+                uint16_t value = input[row * stride];
+                for (size_t route = 0; route < op->topk; ++route) {
+                    size_t at = row * op->topk + route;
+                    value += (uint16_t)((ids[at] + 1) * (int)gates[at]);
+                }
+                for (size_t col = 0; col < op->hidden; ++col)
+                    out[row * op->hidden + col] = value;
+            }
+        }
+    }
+}
+void fixture_advance_queued_experts(size_t operations) {
+    size_t until = queued_done + operations;
+    advance_queue(until < queued_count ? until : queued_count);
+}
 static struct upload pending_uploads[65536];
 static size_t pending_count;
 static void finish_uploads(struct upload_event *upload) {
@@ -269,6 +332,8 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
                          size_t bytes, void *stream) {
     (void)stream;
     if (bytes > dst.bytes) return 1;
+    if (queued_experts) return enqueue((struct queued_op){ .stream = stream,
+        .dst = dst.ptr, .src = source, .bytes = bytes, .rows = 1 });
     if (immediate_copies) {
         if (dst.device_id != current_device) return 1;
         memcpy(dst.ptr, source, bytes);
@@ -289,6 +354,7 @@ int cuteafd_copy_h2d_batch_async(const struct device_buffer *dsts, const void *c
 int cuteafd_cuda_event_record(void *handle, void *stream) {
     (void)stream;
     struct upload_event *upload = handle;
+    if (queued_experts) { upload->fence = queued_count; return 0; }
     if (upload->count) return 1;
     upload->copies = malloc(pending_count * sizeof(struct upload));
     if (pending_count && !upload->copies) return 1;
@@ -298,7 +364,18 @@ int cuteafd_cuda_event_record(void *handle, void *stream) {
     event('R');
     return 0;
 }
+int cuteafd_cuda_event_query(void *handle, int *ready) {
+    struct upload_event *upload = handle;
+    *ready = queued_experts ? queued_done >= upload->fence : upload->count == 0;
+    return 0;
+}
+int cuteafd_cuda_event_elapsed_ms(void *start, void *end, float *ms) {
+    struct upload_event *first = start, *last = end;
+    *ms = (float)(last->fence - first->fence) * 0.001f;
+    return 0;
+}
 int cuteafd_cuda_event_synchronize(void *handle) {
+    if (queued_experts) { advance_queue(((struct upload_event *)handle)->fence); return 0; }
     event('S');
     int status = ++drain_calls > drain_after ? drain_status : 0;
     if (status) return status;
@@ -321,12 +398,13 @@ int cuteafd_cuda_event_destroy(void *handle) {
 
 int cuteafd_cuda_stream_query(void *stream, int *ready) {
     (void)stream;
-    *ready = immediate_copies;
+    *ready = queued_experts ? queued_done == queued_count : immediate_copies;
     return 0;
 }
 
 int cuteafd_cuda_stream_synchronize(void *stream) {
     (void)stream;
+    if (queued_experts) { advance_queue(queued_count); return 0; }
     event('S');
     int status = ++drain_calls > drain_after ? drain_status : 0;
     if (status) return status;
@@ -412,7 +490,9 @@ int cuteafd_cuda_nvfp4_swizzle_scale_async(struct device_buffer src, struct devi
 int cuteafd_copy_d2d_2d_async(struct device_buffer dst, size_t dst_pitch,
                             struct device_buffer src, size_t src_pitch,
                             size_t width, size_t rows, void *stream) {
-    (void)stream;
+    if (queued_experts) return enqueue((struct queued_op){ .stream = stream,
+        .dst = dst.ptr, .src = src.ptr, .bytes = width,
+        .dst_pitch = dst_pitch, .src_pitch = src_pitch, .rows = rows });
     for (size_t r = 0; r < rows; ++r)
         memcpy((char *)dst.ptr + r * dst_pitch,
                (const char *)src.ptr + r * src_pitch, width);

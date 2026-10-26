@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 pub(crate) struct Fp8Worker<'a> {
     // Drain the stream before dropping the experts or the inputs.
-    stream: LoadStream<'a>,
+    stream: Rc<LoadStream<'a>>,
     experts: Fp8Experts<'a, Rc<Fp8Weights<'a>>>,
     library: &'a NativeLibrary,
     inputs: [DeviceAllocation<'a>; 3],
@@ -22,11 +22,10 @@ pub(crate) struct Fp8Worker<'a> {
     capacity: usize,
     layer: usize,
     executor_id: u64,
-    timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
-    /// Lane-owned execution on a rank serving several execution lanes: a
-    /// mapped request returns with its work queued; the owner emits it once
-    /// [`Self::stream_idle`] reports this stream drained.
+    timing: Option<Rc<std::cell::RefCell<super::super::execution::timing::WorkerTiming<'a>>>>,
+    /// Mapped requests return queued; each reply waits only for its unit fence.
     deferred: bool,
+    pending: super::super::execution::timing::PendingUnits<'a>,
 }
 
 fn validate_worker_layers(layers: &[usize]) -> Result<()> {
@@ -50,6 +49,11 @@ impl<'a> Fp8Worker<'a> {
     }
 
     pub(crate) fn new(library: &'a NativeLibrary, experts: Rc<Fp8Weights<'a>>, capacity: u32) -> Result<Self> {
+        Self::with_scratch(library, experts, capacity, None)
+    }
+
+    pub(crate) fn with_scratch(library: &'a NativeLibrary, experts: Rc<Fp8Weights<'a>>, capacity: u32,
+        scratch: Option<Rc<DeviceAllocation<'a>>>) -> Result<Self> {
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk, capacity) = (geometry.hidden as usize, geometry.topk as usize, capacity as usize);
         validate_worker_layers(&experts.layers.iter().map(|layer| layer.layer).collect::<Vec<_>>())?;
@@ -57,7 +61,10 @@ impl<'a> Fp8Worker<'a> {
         ensure!(experts.wire_input() || matches!(experts.module.info().weights,
             cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 | cuteafd_ffi::fp8_moe::Fp8MoeWeights::Bf16),
             "Spark workers need a wire-input package, or native BF16-input weights");
-        let experts = Fp8Experts::from_shared(library, experts, capacity)?;
+        let experts = match scratch {
+            Some(scratch) => Fp8Experts::from_scratch(experts, capacity, scratch)?,
+            None => Fp8Experts::from_shared(library, experts, capacity)?,
+        };
         let inputs = [
             DeviceAllocation::new(library, capacity * if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
                 else { hidden + hidden / 32 })?,
@@ -66,9 +73,10 @@ impl<'a> Fp8Worker<'a> {
         ];
         let output = DeviceAllocation::new(library, capacity * hidden * 2)?;
         let executor_id = cuteafd_transport::expert::SparkWorld::canonical(experts.tp)?.topology().executor_id(experts.rank)?;
-        let timing = super::super::execution::timing::WorkerTiming::from_env(library, experts.rank)?;
+        let timing = super::super::execution::timing::WorkerTiming::from_env(library, experts.rank)?
+            .map(|timing| Rc::new(std::cell::RefCell::new(timing)));
         Ok(Self {
-            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            stream: Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }),
             experts,
             library,
             inputs,
@@ -78,6 +86,7 @@ impl<'a> Fp8Worker<'a> {
             executor_id,
             timing,
             deferred: false,
+            pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
         })
     }
 
@@ -86,8 +95,38 @@ impl<'a> Fp8Worker<'a> {
         self.experts.installed_grouping(loaded, rank, self.capacity)
     }
 
+    /// All homogeneous groups in one slot run serially; their gap clock must
+    /// follow the slot, not skip compute from a different weight group.
+    pub(crate) fn share_owner(&mut self, other: &Self) {
+        self.stream = other.stream.clone();
+        self.timing = other.timing.clone();
+    }
+
     /// Leave mapped requests queued at return (see `deferred`).
-    pub(crate) fn defer(&mut self) { self.deferred = true; }
+    pub(crate) fn defer(&mut self, units: usize) -> Result<()> {
+        ensure!(self.pending.is_empty(), "cannot resize an active FP8 queue");
+        self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.deferred = true;
+        Ok(())
+    }
+
+    /// Publish deferred diagnostics after the owner's existing completion check.
+    pub(crate) fn complete(&mut self) -> Result<()> {
+        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
+        if let Some(timing) = &mut self.timing {
+            // SAFETY: the caller observed this stream drained after both records.
+            unsafe { timing.borrow_mut().publish(request_id, layer, rows, executor_id, "fp8_moe")?; }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
+
+    pub(crate) fn synchronize(&self) -> Result<()> {
+        // SAFETY: this owner retains its stream and every queued buffer.
+        unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
+        Ok(())
+    }
 
     /// Whether every request queued on this execution's stream has completed.
     pub(crate) fn stream_idle(&self) -> Result<bool> {
@@ -102,7 +141,8 @@ impl<'a> Fp8Worker<'a> {
     }
 
     fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64, exchange: &mut HostExpertExchange,
-        destination: Option<CuteafdDeviceBuffer>, hidden_view: Option<CuteafdDeviceBuffer>)
+        destination: Option<CuteafdDeviceBuffer>, hidden_view: Option<CuteafdDeviceBuffer>,
+        routes_view: Option<CuteafdDeviceBuffer>)
         -> Result<CuteafdDeviceBuffer> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
@@ -121,11 +161,14 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.hidden().len() <= self.inputs[0].buffer.bytes, "FP8 request rows exceed the input buffer");
         let bytes = request.plane_bytes()?;
         let routes = rows * cuteafd_core::expert_geometry().topk as usize;
-        request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
+        if routes_view.is_none() {
+            ensure!(self.pending.is_empty(), "host routes cannot overwrite queued expert inputs");
+            request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
+        }
+        self.pending.next_slot()?;
         ensure!(cfg!(target_endian = "little"), "native exchange requires little-endian storage");
-        // Every previous response completed this stream before returning. The
-        // hidden rows come as a device copy from the mapped request frame when
-        // the transport exposes one, else as a host upload.
+        // Every copy follows the previous unit's consumers on this owner stream;
+        // the transport retains each mapped source independently until its reply.
         let hidden_bytes = request.hidden().len();
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
             // SAFETY: the view is device-visible request storage of at least
@@ -137,12 +180,18 @@ impl<'a> Fp8Worker<'a> {
             },
             None => self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?,
         }
-        // SAFETY: plain i32/f32 slices of `routes` elements viewed as bytes.
-        unsafe {
-            self.library.copy_h2d(self.inputs[1].buffer,
-                std::slice::from_raw_parts(exchange.ids.as_ptr().cast::<u8>(), routes * 4))?;
-            self.library.copy_h2d(self.inputs[2].buffer,
-                std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4))?;
+        if let Some(source) = routes_view {
+            // SAFETY: transport retains this unit's mapped records until its fence and send complete.
+            unsafe { super::super::service::routes::copy_mapped_routes(self.library, request, source,
+                self.inputs[1].buffer, self.inputs[2].buffer, self.stream.raw)?; }
+        } else {
+            // SAFETY: the host path has no queued unit and these initialized slices live through each copy.
+            unsafe {
+                self.library.copy_h2d(self.inputs[1].buffer,
+                    std::slice::from_raw_parts(exchange.ids.as_ptr().cast::<u8>(), routes * 4))?;
+                self.library.copy_h2d(self.inputs[2].buffer,
+                    std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4))?;
+            }
         }
         let output = match destination {
             Some(output) => output,
@@ -152,7 +201,7 @@ impl<'a> Fp8Worker<'a> {
         // SAFETY: inputs, output and the resident layer are live device memory of
         // the documented extents; the stream is synchronized below.
         unsafe {
-            if let Some(timing) = &self.timing { timing.record(0, self.stream.raw)?; }
+            if let Some(timing) = &self.timing { timing.borrow().record(0, self.stream.raw)?; }
             if bf16 {
                 self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
@@ -160,15 +209,18 @@ impl<'a> Fp8Worker<'a> {
                 self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
-            if let Some(timing) = &self.timing { timing.record(1, self.stream.raw)?; }
-            // A deferred mapped request completes when the owner observes the
-            // stream idle; the transport holds both slots until then.
-            if self.deferred && destination.is_some() { return Ok(output); }
+            if let Some(timing) = &self.timing { timing.borrow().record(1, self.stream.raw)?; }
+            // The transport holds both mapped slots until this unit's fence,
+            // independent of later work queued on the owner's stream.
+            if self.deferred && destination.is_some() {
+                self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?;
+                return Ok(output);
+            }
             self.library.cuda_stream_synchronize(self.stream.raw)?;
         }
         if let Some(timing) = &mut self.timing {
             // SAFETY: the existing worker barrier completed both event records.
-            unsafe { timing.publish(request.request_id(), request.layer(), request.rows(), executor_id, "fp8_moe")?; }
+            unsafe { timing.borrow_mut().publish(request.request_id(), request.layer(), request.rows(), executor_id, "fp8_moe")?; }
         }
         if destination.is_none() {
             ensure!(exchange.partials.len() >= bytes, "FP8 host exchange is too small");
@@ -191,7 +243,23 @@ impl<'a> Fp8Worker<'a> {
         ensure!(!slot.ptr.is_null(), "null FP8 response slot");
         let output = CuteafdDeviceBuffer { ptr: slot.ptr.cast::<u8>().add(prefix).cast(), bytes, ..slot };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output), hidden)?;
+        self.execute(request, executor_id, exchange, Some(output), hidden, None)?;
+        Ok(Some(response))
+    }
+
+    /// # Safety
+    /// Transport retains all mapped frames through this unit's completion and send.
+    pub(crate) unsafe fn execute_mapped_payload(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, mapped: cuteafd_transport::ProtocolV2RequestDevicePayload)
+        -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
+        let Some(slot) = mapped.response_slot else { return Ok(None) };
+        let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let bytes = request.plane_bytes()?;
+        if !request.permits_device_response() || slot.bytes < prefix + bytes { return Ok(None); }
+        // SAFETY: checked prefix/plane extent stays in the exclusively retained send slot.
+        let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
+        let response = request.response_device(executor_id, output)?;
+        self.execute(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload), Some(mapped.routes))?;
         Ok(Some(response))
     }
 
@@ -202,7 +270,7 @@ impl<'a> Fp8Worker<'a> {
     {
         let chunk_rows = request.response_chunk_rows(max_frame_bytes)?;
         ensure!(row_indices.len() >= chunk_rows as usize, "response row-index scratch is too short");
-        self.execute(request, executor_id, exchange, None, None)?;
+        self.execute(request, executor_id, exchange, None, None, None)?;
         let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());
@@ -296,6 +364,111 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn three_queued_prefill_units_preserve_distinct_routes_inputs_and_replies() -> Result<()> {
+        use crate::shared::memory::HostAllocation;
+        use cuteafd_ffi::{fp8_moe::Fp8MoeModule, native_library_lifetime_fixture::Fixture};
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RequestView,
+            ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2SourceKind,
+            ProtocolV2RequestDevicePayload, expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        library.cuda_set_device(7)?;
+        fixture.configure_memory(&library, 7, 1 << 30)?;
+        fixture.queued_experts(&library)?;
+        std::fs::hard_link(fixture.directory().join("liblifetime_fixture.so"),
+            fixture.directory().join("libcuteafd_fp8moe.so"))?;
+        let geometry = cuteafd_core::expert_geometry();
+        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
+            128, geometry.experts, geometry.topk, 256, 2, 7, 0,
+            2, 16, 4096, 0, 0, 0, 0];
+        fixture.configure_fp8(&library, &words, &[1024, 4096, 0, 0, 0, 0])?;
+        // SAFETY: this test built the trusted CPU ABI immediately above.
+        let module = unsafe { Fp8MoeModule::load(fixture.directory())? };
+        let layers = [3, 4].into_iter().map(|layer| super::super::Fp8Layer { layer,
+            slice: cuteafd_core::SparkSlice { unit_map: None, layer: layer as u32, first: 0,
+                width: 128, stored_width: 128, tiers: vec![], projection_counts: vec![] },
+            regions: vec![None, None, None, None, None, None] }).collect();
+        let weights = Rc::new(Fp8Weights { layers, module, bf16_module: None,
+            tp: 2, rank: 0, weight_read_bytes: 256 });
+        let mut worker = Fp8Worker::new(&library, weights, 4096)?;
+        worker.defer(3)?;
+        let mut exchange = HostExpertExchange::new(4096)?;
+        let rows = 2u32;
+        let hidden = geometry.hidden as usize;
+        let topk = geometry.topk as usize;
+        let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let mut frames = Vec::new();
+        let mut replies = Vec::new();
+        let mut expected = Vec::new();
+        for unit in 0..3usize {
+            let layer = 3 + unit % 2;
+            let input = 7 + unit as u8 * 4;
+            let gate = (unit + 1) as f32;
+            let ids = (0..rows as usize * topk).map(|route|
+                ((unit * 23 + route * 3) % geometry.experts as usize) as u32).collect::<Vec<_>>();
+            let mut owned = ExpertProtocolV2Request::new(91 + unit as u64, 17, layer as u32, geometry.hidden,
+                ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row as u64,
+                    source_kind: ExpertV2SourceKind::Prefill, source_request_id: unit as u64,
+                    token_position: row as u64, route_offset: row * geometry.topk,
+                    route_count: geometry.topk }).collect(),
+                ids.iter().enumerate().map(|(route, &expert_id)| ExpertProtocolV2RouteEntry {
+                    row_index: (route / topk) as u32, expert_id, gate_weight: gate }).collect(),
+                vec![input; rows as usize * (hidden + hidden / 32)])?;
+            owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            let encoded = owned.encode()?;
+            let mut frame = HostAllocation::new(&library, encoded.len())?;
+            frame.bytes_mut().copy_from_slice(&encoded);
+            let mut reply = HostAllocation::new(&library, prefix + rows as usize * hidden * 2 + 32)?;
+            reply.bytes_mut().fill(0xa5);
+            expected.push((0..rows as usize).flat_map(|row| {
+                let value = input as u16 + ids[row * topk..(row + 1) * topk].iter()
+                    .map(|id| ((id + 1) as usize * (unit + 1)) as u16).sum::<u16>();
+                std::iter::repeat_n(value.to_le_bytes(), hidden).flatten()
+            }).collect::<Vec<_>>());
+            frames.push(frame);
+            replies.push(reply);
+        }
+        for unit in 0..3 {
+            let view = ExpertProtocolV2RequestView::parse(frames[unit].bytes())?;
+            let request = BackboneRequest::parse(frames[unit].bytes(), 4096)?;
+            let alias = library.cuda_host_buffer_device_alias(frames[unit].buffer)?;
+            let field = |bytes: &[u8]| CuteafdDeviceBuffer {
+                ptr: bytes.as_ptr().cast_mut().cast(), bytes: bytes.len(), ..alias };
+            let mapped = ProtocolV2RequestDevicePayload { routes: field(view.route_bytes()),
+                hidden_payload: field(view.hidden_payload()), execution_lane: 0,
+                response_slot: Some(library.cuda_host_buffer_device_alias(replies[unit].buffer)?) };
+            worker.bind_layer(unit % 2)?;
+            // SAFETY: every frame and reply is retained until all queued unit fences complete.
+            let response = unsafe { worker.execute_mapped_payload(&request, worker.executor_id,
+                &mut exchange, mapped)? }.context("mapped queue request rejected")?;
+            assert_eq!(response.header.request_id, 91 + unit as u64);
+            assert!(!worker.unit_ready()?);
+            if unit == 0 {
+                // Input/routes have arrived; the first expert read is still queued.
+                // Submit unit 1's different routes before allowing that read to run.
+                fixture.advance_queued_experts(&library, 3)?;
+                assert!(!worker.unit_ready()?);
+            }
+        }
+        assert_eq!(worker.pending.len(), 3);
+        assert!(!worker.stream_idle()?);
+        for unit in 0..3 {
+            fixture.advance_queued_experts(&library, if unit == 0 { 1 } else { 4 })?;
+            assert!(worker.unit_ready()?);
+            if unit < 2 { assert!(!worker.stream_idle()?); }
+            worker.complete()?;
+            assert_eq!(&replies[unit].bytes()[prefix..prefix + expected[unit].len()], expected[unit]);
+            assert!(replies[unit].bytes()[..prefix].iter().all(|byte| *byte == 0xa5));
+            assert!(replies[unit].bytes()[prefix + expected[unit].len()..].iter().all(|byte| *byte == 0xa5));
+        }
+        assert!(worker.stream_idle()? && worker.pending.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn width_group_accepts_sparse_layers_but_not_empty_or_duplicate_ids() {
         for layers in [&[3][..], &[3, 4, 5][..], &[3, 6, 7, 8, 9, 12][..]] {
             super::validate_worker_layers(layers).unwrap();
@@ -304,4 +477,7 @@ mod tests {
             assert!(super::validate_worker_layers(layers).is_err());
         }
     }
+
+
+
 }

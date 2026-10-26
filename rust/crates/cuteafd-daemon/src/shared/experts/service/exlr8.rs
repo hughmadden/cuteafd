@@ -63,7 +63,7 @@ pub(super) struct Worker<'w, 'a> {
     /// Lane-owned mode: mapped requests return with their work queued.
     deferred: bool,
     /// The queued mapped request's identity, for its timing at completion.
-    pending: Option<(u64, u32, u32, u64)>,
+    pending: super::super::execution::timing::PendingUnits<'a>,
 }
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
@@ -85,7 +85,13 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
     let info = library.cuda_device_info(library.cuda_get_device()?)?;
     let capability = (info.compute_capability_major, info.compute_capability_minor);
-    let k1_workspace_bytes = execution_bytes(programs, rows, unit_limit, capability, config.exlr8_prefill_activations)?;
+    let owners = spark_execution_workspace(config, |capacity, _, _| {
+        Ok((execution_bytes(programs, capacity as usize, unit_limit, capability,
+            config.exlr8_prefill_activations)?, 0, 0))
+    })?;
+    let k1_workspace_bytes = usize::try_from(owners.total().context("EXLR8 owner workspace overflow")?)?;
+    // Blocking fallback uploads share the native library's one pinned cache;
+    // mapped requests borrow their individually retained request-ring payloads.
     let workspace = k1_workspace_bytes.checked_add(fallback_staging)
         .context("EXLR8 workspace admission overflow")?;
     let budgets = plans.iter().map(Exlr8Weights::plan).collect::<Result<Vec<_>>>()?;
@@ -164,12 +170,10 @@ impl<'w, 'a> Worker<'w, 'a> {
         Ok(Self { stream, execution, grouped_decode, grouped_from_row, prefill, weights, library,
             selected: 0, capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing,
-            deferred: false, pending: None })
+            deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)? })
     }
     pub(super) fn bind_layer(&mut self, index: usize) -> Result<()> {
         ensure!(index < self.weights.len(), "EXLR8 requested layer is not resident");
-        self.stream.require_complete()?;
-        ensure!(self.pending.is_none(), "EXLR8 request rebound before its queued request completed");
         self.selected = index;
         Ok(())
     }
@@ -196,6 +200,7 @@ impl<'w, 'a> Worker<'w, 'a> {
         let output_stride = geometry.hidden as usize * 2;
         let topk = geometry.topk as usize;
         let rows = request.rows() as usize;
+        self.pending.next_slot()?;
         let identity = (request.request_id(), request.layer(), rows as u32, executor_id);
         let Some(mapped) = mapped else {
             // Host path: blocking uploads and downloads, drained per chunk.
@@ -246,7 +251,8 @@ impl<'w, 'a> Worker<'w, 'a> {
             if drain.is_err() { crate::shared::decode_graph::fatal_drain(drain, "EXLR8 mapped request"); }
             return work;
         }
-        self.pending = Some(identity);
+        // SAFETY: every mapped copy and output write precedes this unit fence.
+        unsafe { self.pending.record(identity, self.stream.raw)?; }
         if !self.deferred {
             // SAFETY: this worker exclusively owns the stream and every queued view.
             unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
@@ -310,7 +316,20 @@ impl<'w, 'a> Worker<'w, 'a> {
     /// Lane-owned mode (#708): a mapped request returns with its work queued;
     /// the owner emits it once [`Self::stream_idle`] holds, then calls
     /// [`Self::complete`].
-    pub(super) fn defer(&mut self) { self.deferred = true; }
+    pub(super) fn defer(&mut self, units: usize) -> Result<()> {
+        ensure!(self.pending.is_empty(), "cannot resize an active EXLR8 queue");
+        self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.deferred = true;
+        Ok(())
+    }
+
+    pub(super) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
+
+    pub(super) fn synchronize(&self) -> Result<()> {
+        // SAFETY: this owner retains its stream and every queued buffer.
+        unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
+        Ok(())
+    }
 
     /// Whether every request queued on this worker's stream has completed.
     pub(super) fn stream_idle(&self) -> Result<bool> {
@@ -320,7 +339,7 @@ impl<'w, 'a> Worker<'w, 'a> {
 
     /// The queued request finished (its stream drained): publish its timing.
     pub(super) fn complete(&mut self) -> Result<()> {
-        let Some((request_id, layer, rows, executor_id)) = self.pending.take() else { return Ok(()) };
+        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
         if let Some(timing) = &mut self.timing {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exlr8")?; }
@@ -419,17 +438,17 @@ mod tests {
         let chunk_loop = &execute[execute.find("for (first, rows) in chunks(").unwrap()..execute.find("Ok(())").unwrap()];
         assert!(!chunk_loop.contains(&sync), "no drain between mapped chunks");
         assert!(!chunk_loop.contains("copy_h2d(") && !chunk_loop.contains("copy_d2h("), "mapped chunks only queue stream copies");
-        let after = &execute[execute.find("self.pending = Some(identity);").unwrap()..];
+        let after = &execute[execute.find("self.pending.record(identity,").unwrap()..];
         let deferred = after.find("if !self.deferred {").unwrap();
         assert!(after[deferred..].find(&sync).is_some(), "an undeferred request still completes in place");
         assert_eq!(execute.matches(&sync).count(), 2, "only the failure drain and the undeferred completion wait");
         let complete = &source[source.find("fn complete(&mut self)").unwrap()..];
-        assert!(complete.contains("self.pending.take()") && complete.contains("timing.publish("));
-        // A queued request must complete before its arena or layer is reused.
+        assert!(complete.contains("self.pending.pop()?") && complete.contains("timing.publish("));
+        // Layer arguments are snapshotted at launch; stream order protects scratch reuse.
         let bind = &source[source.find("fn bind_layer(").unwrap()..source.find("fn grouping(").unwrap()];
-        assert!(bind.contains("self.pending.is_none()"));
+        assert!(!bind.contains("require_complete") && !bind.contains("synchronize"));
         let backend = include_str!("backend.rs");
-        assert!(backend.contains("Self::Exlr8(execution) => execution.defer(),"));
+        assert!(backend.contains("Self::Exlr8(execution) => execution.defer(units)?,"));
         assert!(backend.contains("Self::Exlr8(execution) => execution.stream_idle(),"));
         assert!(backend.contains("Self::Exlr8(execution) => execution.complete(),"));
     }

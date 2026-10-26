@@ -53,7 +53,7 @@ impl RouteCopies {
 /// The mapped receive frame and exclusive destinations stay live until `stream`
 /// drains. Source arrival must precede this stream's reads. On any launch error,
 /// the caller still drains previously queued copies before releasing the frame.
-pub(super) unsafe fn copy_mapped_routes(library: &NativeLibrary,
+pub(in crate::shared::experts) unsafe fn copy_mapped_routes(library: &NativeLibrary,
     request: &BackboneRequest<'_>, source: CuteafdDeviceBuffer,
     ids: CuteafdDeviceBuffer, weights: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
     ensure!(!request.is_native_group(), "ownership-tagged routes need an ownership-aware device adapter");
