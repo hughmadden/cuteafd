@@ -119,7 +119,9 @@ pub trait Family: Sync {
     }
     /// Decode lanes the executor runs (PLAN "Two decode lanes"); `One` until a
     /// family's port onto the shared lane owners lands with its planner charges.
-    fn decode_lanes(&self) -> super::decode_lanes::LaneSupport { super::decode_lanes::LaneSupport::One }
+    fn decode_lanes(&self) -> super::decode_lanes::LaneSupport {
+        super::decode_lanes::LaneSupport::One { reason: super::decode_lanes::UNPORTED }
+    }
     /// Spark decode compute owners: one per decode lane, each admitting the
     /// family's decode rows (its covering export comes from the backend ladder).
     /// `None` for families without Spark experts.

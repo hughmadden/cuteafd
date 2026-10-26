@@ -337,6 +337,10 @@ impl Model {
 }
 
 impl Family for Step5 {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "a second lane needs its own decode link, separate from the shared prefill link; low priority (#744)" }
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // Step-5 decode/verify steps send at most 64 rows (`rows.min(64)`).
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })

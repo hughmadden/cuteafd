@@ -10,11 +10,15 @@ use super::PlanError;
 /// Most decode lanes one coordinator runs.
 pub const MAX_DECODE_LANES: u8 = 2;
 
+/// The reason of a family whose decode still runs a private loop.
+pub const UNPORTED: &str = "this family's decode is not on the shared lane owners yet (#744)";
+
 /// What a family's executor supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneSupport {
-    /// One decode batch only.
-    One,
+    /// One decode batch only; `reason` records why a second lane is not
+    /// wired (a measurement or the predicted cost), and the planner reports it.
+    One { reason: &'static str },
     /// One or two; `default` until a hardware A/B qualifies another default.
     OneOrTwo { default: u8 },
     /// A fixed pair (the executor has no one-lane path).
@@ -24,7 +28,7 @@ pub enum LaneSupport {
 impl LaneSupport {
     /// Most lanes the executor can run (each owns a Spark decode execution).
     pub fn max_lanes(self) -> u8 {
-        match self { Self::One => 1, Self::OneOrTwo { .. } | Self::FixedTwo => MAX_DECODE_LANES }
+        match self { Self::One { .. } => 1, Self::OneOrTwo { .. } | Self::FixedTwo => MAX_DECODE_LANES }
     }
 }
 
@@ -35,7 +39,7 @@ impl LaneSupport {
 pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
     let support = family.decode_lanes();
     let lanes = requested.unwrap_or(match support {
-        LaneSupport::One => 1,
+        LaneSupport::One { .. } => 1,
         LaneSupport::OneOrTwo { default } => default,
         LaneSupport::FixedTwo => 2,
     });
@@ -44,7 +48,7 @@ pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u
     }
     let refusal = match (support, lanes) {
         (LaneSupport::FixedTwo, 1) => Some("the executor has a fixed pair of decode lanes"),
-        (LaneSupport::One, 2) => Some("this family has no independent second decode lane"),
+        (LaneSupport::One { reason }, 2) => Some(reason),
         _ => None,
     };
     if let Some(reason) = refusal {
@@ -70,11 +74,11 @@ mod tests {
     fn every_family_resolves_its_default_and_refuses_what_it_cannot_run() {
         for family in super::super::family::registry() {
             let default = match family.decode_lanes() {
-                LaneSupport::One => 1, LaneSupport::OneOrTwo { default } => default, LaneSupport::FixedTwo => 2 };
+                LaneSupport::One { .. } => 1, LaneSupport::OneOrTwo { default } => default, LaneSupport::FixedTwo => 2 };
             assert_eq!(resolve(*family, None, 16).unwrap(), default, "{}", family.id());
             for lanes in [1, 2] {
                 let supported = match family.decode_lanes() {
-                    LaneSupport::One => lanes == 1,
+                    LaneSupport::One { .. } => lanes == 1,
                     LaneSupport::OneOrTwo { .. } => true,
                     LaneSupport::FixedTwo => lanes == 2,
                 };
@@ -92,6 +96,17 @@ mod tests {
         let v41 = &crate::plan::families::deepseek::DEEPSEEK_V41;
         assert_eq!(resolve(v41, Some(2), 1).unwrap(), 2);
         assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::FixedTwo);
+    }
+
+    #[test]
+    fn shared_scheduler_families_run_one_lane_with_a_recorded_reason() {
+        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5"] {
+            let family = crate::plan::spark_executions::descriptor(id).unwrap();
+            let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
+            assert!(reason != UNPORTED && reason.contains("#744"), "{id}: {reason}");
+            assert!(matches!(resolve(family, Some(2), 16),
+                Err(PlanError::UnsupportedOption { reason: refused, .. }) if refused == reason), "{id}");
+        }
     }
 
     #[test]

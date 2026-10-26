@@ -150,23 +150,63 @@ fn glm53_max_deployment_starts_at_three_2752_row_waves_in_four_slots() {
     assert_eq!(deployment["prefill_span_rows"], 8256);
 }
 
+fn installed_example_snapshot(model_id: &str, revision: Option<&str>, hf_home: &std::path::Path)
+    -> Option<std::path::PathBuf> {
+    let snapshots = cuteafd_loader::model_cache_dir(hf_home, model_id).join("snapshots");
+    if !snapshots.is_dir() || revision.is_some_and(|revision| !snapshots.join(revision).is_dir()) {
+        return None;
+    }
+    cuteafd_loader::resolve_snapshot_at_revision(model_id, Some(hf_home), revision)
+        .unwrap_or_else(|error| panic!("{model_id}: {error:#}")).snapshot_path
+}
+
+#[test]
+fn installed_example_inventory_skips_only_absent_checkpoints_and_revisions() {
+    let home = tempfile::tempdir().unwrap();
+    let model = "test/installed";
+    assert!(installed_example_snapshot(model, None, home.path()).is_none());
+    assert!(installed_example_snapshot(model, Some("missing"), home.path()).is_none());
+    let cache = cuteafd_loader::model_cache_dir(home.path(), model);
+    let snapshot = cache.join("snapshots/present");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(cache.join("refs")).unwrap();
+    std::fs::write(cache.join("refs/main"), "present\n").unwrap();
+    assert_eq!(installed_example_snapshot(model, None, home.path()), Some(snapshot.clone()));
+    assert_eq!(installed_example_snapshot(model, Some("present"), home.path()), Some(snapshot));
+    assert!(installed_example_snapshot(model, Some("missing"), home.path()).is_none());
+    std::fs::write(cache.join("refs/main"), "missing\n").unwrap();
+    assert!(std::panic::catch_unwind(|| installed_example_snapshot(model, None, home.path())).is_err(),
+        "a broken installed main ref is not an absent-checkpoint skip");
+}
+
 #[test]
 fn installed_example_deployments_publish_executable_prefill_shapes() {
-    // Opt into the complete on-disk checkpoint inventory. Sparse fixtures above
-    // always run; this gate additionally covers every real example and format.
+    // cpu-gate --full enables the installed inventory; sparse fixtures always run.
     let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
+    let hf_home = std::path::PathBuf::from(hf_home);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut examples = std::fs::read_dir(root.join("examples/configs")).unwrap()
         .map(|entry| entry.unwrap().path()).filter(|path|
             path.extension().is_some_and(|extension| extension == "config"))
         .collect::<Vec<_>>();
     examples.sort();
+    assert!(!examples.is_empty(), "no example configs found");
+    let total = examples.len();
+    let mut tested = 0;
+    let mut skipped = 0;
     let mut families = std::collections::BTreeSet::new();
     for example in examples {
         let raw = std::fs::read_to_string(&example).unwrap();
         let config = raw.lines().filter_map(|line| line.split_once('='))
             .collect::<std::collections::BTreeMap<_, _>>();
         let name = example.file_name().unwrap().to_str().unwrap();
+        let revision = config.get("MODEL_REVISION").copied();
+        if installed_example_snapshot(config["MODEL_ID"], revision, &hf_home).is_none() {
+            skipped += 1;
+            eprintln!("{name}: SKIP checkpoint not installed: {}@{}", config["MODEL_ID"],
+                revision.unwrap_or("main"));
+            continue;
+        }
         let mut command = Command::new("timeout");
         command.args(["180", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
             "--deployment", "--config"]).arg(&example)
@@ -188,11 +228,12 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
         let output = command.output().unwrap();
         assert!(output.status.success(), "{name}: {}", String::from_utf8_lossy(&output.stderr));
         let deployment = release_accepts_prefill(&output.stdout);
+        tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());
         eprintln!("{name}: {} unit_rows={} waves={} slots={} span_rows={}", deployment["family"],
             deployment["prefill_unit_rows"], deployment["prefill_waves"], deployment["prefill_slots"],
             deployment["prefill_span_rows"]);
     }
-    assert_eq!(families, ["deepseek_v4", "deepseek_v41", "glm5", "glm5_flash", "kimi_k3",
-        "mimo_v2", "qwen3_5", "qwen4", "step5"].into_iter().map(str::to_owned).collect());
+    assert_eq!(tested + skipped, total);
+    eprintln!("installed example deployments: {tested} tested, {skipped} skipped, {total} configs, families={families:?}");
 }
