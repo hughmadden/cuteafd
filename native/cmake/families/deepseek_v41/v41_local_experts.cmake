@@ -19,7 +19,7 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     --output-dir "${CUTEAFD_V41_LOCAL_EXPERT_DIR}" --role rtx_backbone
-    --rows 1,16,80,256,1024,4096 --width 192 --atomic-min-capacity 256 --standard-names
+    --rows 1,16,80,256,1024,4096 --width 192 --standard-names
   COMMAND "${CMAKE_COMMAND}" -E copy
     "${CUTEAFD_V41_LOCAL_EXPERT_DIR}/v41_expert_variants.h"
     "${CUTEAFD_V41_LOCAL_EXPERT_DIR}/v41_local_expert_variants.h"

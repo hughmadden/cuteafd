@@ -33,8 +33,7 @@ set(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS 1 16 80 256 1024 4096)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096")
-# Decode capacities share the fast width-192, six-K-step reduction recipe;
-# prefill keeps its existing direct-token fold.
+# All capacities share width-192 arithmetic and ordered slice-to-route reduction.
 # Per-role cache strings so a build can select a width map for TP2, TP3 and TP6
 # independently (for example a capacity-80 candidate) without patching this file.
 # Each value is either a
@@ -78,7 +77,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
   # be lost when a width map is overridden.
   set(width_stamp "${CMAKE_CURRENT_BINARY_DIR}/v41_${role}_width.stamp")
   file(GENERATE OUTPUT "${width_stamp}"
-    CONTENT "role=${role}\nwidth=${width_map}\natomic_min_capacity=256\n")
+    CONTENT "role=${role}\nwidth=${width_map}\natomic_min_capacity=none\n")
   set(dir "${CMAKE_CURRENT_BINARY_DIR}/v41_${role}_experts")
   set(objects)
   set(headers)
@@ -97,7 +96,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       --output-dir "${dir}" --role "${role}"
       --rows "${CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG}"
       --width "${width_map}"
-      --atomic-min-capacity 256 --standard-names
+      --standard-names
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS
