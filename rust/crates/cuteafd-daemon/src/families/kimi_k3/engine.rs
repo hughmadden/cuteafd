@@ -33,8 +33,6 @@ pub(crate) struct Engine<'a> {
     prefill: PrefillUnits,
     /// The runtime depth within the admitted slots (#762 stages 2–4).
     depth: crate::shared::prefill_depth::PrefillDepth,
-    /// Units in flight the last unit call actually ran (`waves_used`).
-    last_waves: std::cell::Cell<usize>,
 }
 
 /// The lane holds `waves` units of `unit_rows`; a step of `rows` is cut into
@@ -218,7 +216,7 @@ impl<'a> Engine<'a> {
         let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.slots, prefill.unit_rows,
             prefill.pinned)?;
-        Ok(Self { depth, last_waves: std::cell::Cell::new(0), draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
             hops, peer, exchange_streams, prefill })
     }
@@ -240,7 +238,7 @@ impl<'a> Engine<'a> {
         let layers = self.execution.plan.modes().len();
         let units = crate::shared::prefill_pipeline::prefill_units(rows, depth.unit_rows, depth.waves, 256)?;
         // The pipeline reports the depth it ran (fewer for short prompts).
-        self.last_waves.set(units.len().min(depth.waves));
+        self.depth.ran(units.len());
         // Every unit's rows lie in the lane; a slot is the unit's row range.
         Ok(units.into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit {
             index, sequence: 0, rows, layers: 0..layers, slot: index % depth.waves, barrier: false }).collect())
@@ -400,7 +398,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = if unit_call {
-                let depth = routed[0].start_prefill(&self.depth, &self.last_waves)?;
+                let depth = routed[0].start_prefill(&self.depth, metadata[0].start + rows)?;
                 let units = self.prefill_units(rows, depth)?;
                 let ran = self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &units, depth.waves, &metadata[0], pool,
@@ -599,7 +597,7 @@ impl<'a> Engine<'a> {
             }
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = if unit_call {
-                let depth = routed[0].start_prefill(&self.depth, &self.last_waves)?;
+                let depth = routed[0].start_prefill(&self.depth, sequences[0][0].start + rows[0])?;
                 let units = self.prefill_units(rows[0], depth)?;
                 let ran = self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &units, depth.waves, &sequences[0][0], pool, None);

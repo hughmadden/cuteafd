@@ -406,8 +406,6 @@ pub(crate) struct GlmEngine<'a> {
     prefill_lanes: usize,
     /// The runtime depth inside the admitted slots (#762 stages 2-4).
     depth: crate::shared::prefill_depth::PrefillDepth,
-    /// Units in flight the last pipelined prefill call actually ran.
-    last_waves: Cell<usize>,
     /// Recorded after a unit's route/wire copies to its pinned staging: the
     /// host waits for these copies only, never the whole stream.
     staged: Cell<*mut c_void>,
@@ -537,7 +535,7 @@ impl<'a> GlmEngine<'a> {
         Ok(Self { quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
-            prefill_lanes, depth, last_waves: Cell::new(0),
+            prefill_lanes, depth,
             staged: Cell::new(library.cuda_event_create_ordering()?),
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
@@ -991,7 +989,7 @@ impl<'a> GlmEngine<'a> {
             let link = link.as_mut().context("GLM prefill units need the prefill link")?;
             // The decode->prefill transition (#762): the previous call's pace,
             // this call's depth, the link re-cut to it.
-            let depth = self.start_prefill(link)?;
+            let depth = self.start_prefill(link, start + t)?;
             let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
                 MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
@@ -999,7 +997,7 @@ impl<'a> GlmEngine<'a> {
                 lanes.push(self.prefill_tables(placement, start + rows.start, rows.len())?);
                 chunks.push(&tokens[rows]);
             }
-            self.last_waves.set(lanes.len().min(depth.waves));
+            self.depth.ran(lanes.len());
             let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
             let logits = self.step_lanes(&lanes, &chunks, depth, logit_rows, link, runtime);
             // The call's last wave is sent: later waves are not its.
@@ -1365,9 +1363,9 @@ impl<'a> GlmEngine<'a> {
     /// Spark pace (when its last wave has landed on the host; no wait) to the
     /// depth controller, the next depth, the link re-cut to it at rest, and
     /// this call's waves flagged as the prefill's.
-    fn start_prefill(&self, link: &mut SparkLink<'_>) -> Result<crate::shared::prefill_depth::Depth> {
-        if let Some(pace) = link.exchange()?.take_prefill() { self.depth.finish(self.last_waves.get(), &pace); }
-        let next = self.depth.next();
+    fn start_prefill(&self, link: &mut SparkLink<'_>, context: usize) -> Result<crate::shared::prefill_depth::Depth> {
+        let pace = link.exchange()?.take_prefill();
+        let next = self.depth.begin(pace, context);
         ensure!(next.waves <= link.slots() && next.unit_rows <= self.prefill_rows,
             "prefill depth {next:?} outside the link's {} admitted slots", link.slots());
         link.set_geometry(next.waves, next.unit_rows)?;

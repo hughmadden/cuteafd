@@ -138,10 +138,10 @@ impl<'a> RoutedLane<'a> {
     /// no wait), re-cuts the return slots to the next depth and starts
     /// summing this call's waves. Returns the depth this call runs.
     pub(crate) fn start_prefill(&mut self, depth: &crate::shared::prefill_depth::PrefillDepth,
-        previous_waves: &std::cell::Cell<usize>) -> Result<crate::shared::prefill_depth::Depth> {
+        context: usize) -> Result<crate::shared::prefill_depth::Depth> {
         let exchange = self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?;
-        if let Some(pace) = exchange.take_prefill() { depth.finish(previous_waves.get(), &pace); }
-        let next = depth.next();
+        let pace = exchange.take_prefill();
+        let next = depth.begin(pace, context);
         self.set_depth(next.waves, next.unit_rows)?;
         self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?.begin_prefill()?;
         Ok(next)
