@@ -2,9 +2,9 @@
 //! RadixArk/Minimax-M3.1-Flash-Dflash2: five Gemma-norm layers over a 4096-position ring, fed by
 //! the target's FP32 residual after layers 3, 17, 31, 45 and 59 (the bundled DSpark's taps).
 //!
-//! A step taps the last [`dflash::DflashConfig::tap_rows`] rows of its batch (a prefill chunk's
-//! tail fills the ring; a verify step taps every row) on the target's stream, so the startup
-//! decode recordings carry the taps. The drafter runs on that stream too, borrows the target's
+//! A step taps the last [`dflash::DflashConfig::tap_rows`] rows of its batch on the target's
+//! stream: a prefill call's tail, across its units, fills the ring (GLM 5.3 Flash's unit tail
+//! window); a verify step taps every row. The drafter runs on that stream too, borrows the target's
 //! BF16 head and gathers its block inputs from the target's embedding table. Its block attends
 //! as SGLang serves the release ([`dflash::BlockMask::upstream`]).
 use super::{native::Native, MiniMaxError};
@@ -27,16 +27,17 @@ fn tail(rows: usize, tap_rows: usize) -> (usize, usize) {
     (rows - count, count)
 }
 
-/// Batch rows `[lane_first, lane_first + lane_rows)` of a `rows`-row step that lie in its tapped
-/// tail: `(row within the lane, tap row, count)`, if any.
-fn lane_tail(lane_first: usize, lane_rows: usize, rows: usize, tap_rows: usize) -> Option<(usize, usize, usize)> {
+/// Batch rows `[unit_first, unit_first + unit_rows)` (a prefill unit's, or a whole step's) of a
+/// `rows`-row step that lie in its tapped tail: `(row within the unit, tap row, count)`, if any.
+/// Units tap disjoint tap rows, so the order in which units in flight tap does not matter.
+fn unit_tail(unit_first: usize, unit_rows: usize, rows: usize, tap_rows: usize) -> Option<(usize, usize, usize)> {
     let (first, _) = tail(rows, tap_rows);
-    let from = lane_first.max(first);
-    (from < lane_first + lane_rows).then(|| (from - lane_first, from - first, lane_first + lane_rows - from))
+    let from = unit_first.max(first);
+    (from < unit_first + unit_rows).then(|| (from - unit_first, from - first, unit_first + unit_rows - from))
 }
 
 /// The context rows of a `rows`-row single-request step from `start`: its tapped tail, at its
-/// tap rows, into ring `slot`. Earlier rows of a long chunk would only be overwritten in the ring.
+/// tap rows, into ring `slot`. Earlier rows of a long call would only be overwritten in the ring.
 fn tail_rows(start: usize, rows: usize, slot: usize, tap_rows: usize) -> Vec<ContextRow> {
     let (first, count) = tail(rows, tap_rows);
     (0..count).map(|tap_row| ContextRow { tap_row, slot, position: start + first + tap_row }).collect()
@@ -116,12 +117,12 @@ impl<'a> Dflash<'a> {
     /// Rows of the block a draft runs: the anchor and its drafts.
     pub fn block(&self) -> usize { self.drafter.cfg.block }
 
-    /// Taps target layer `layer`'s FP32 residual of lane rows `[lane_first, lane_first + lane_rows)`
-    /// (`residual`: the lane's view) of a `rows`-row step, where they lie in its tapped tail.
-    pub fn tap(&self, native: &Native<'a>, layer: usize, residual: CuteafdDeviceBuffer, lane_first: usize,
-        lane_rows: usize, rows: usize) -> Result<()> {
+    /// Taps target layer `layer`'s FP32 residual of unit rows `[unit_first, unit_first + unit_rows)`
+    /// (`residual`: the unit's view) of a `rows`-row step, where they lie in its tapped tail.
+    pub fn tap(&self, native: &Native<'a>, layer: usize, residual: CuteafdDeviceBuffer, unit_first: usize,
+        unit_rows: usize, rows: usize) -> Result<()> {
         if self.drafter.tap_index(layer).is_none() { return Ok(()) }
-        let Some((from, to, count)) = lane_tail(lane_first, lane_rows, rows, self.drafter.cfg.tap_rows()) else {
+        let Some((from, to, count)) = unit_tail(unit_first, unit_rows, rows, self.drafter.cfg.tap_rows()) else {
             return Ok(())
         };
         ensure!(residual.bytes >= (from + count) * HIDDEN * 4, MiniMaxError::Invalid("DFlash2 tap residual extent"));
@@ -179,19 +180,23 @@ mod tests {
         assert!(!fine.contains("BF16") && !fine.contains("expected ["), "{fine}");
     }
 
-    /// A long chunk taps its last 4096 rows across its lanes, each at its offset in the tail;
-    /// a short chunk or a verify step taps every row in place.
+    /// A long call taps its last 4096 rows across its units, each at its offset in the tail; a short
+    /// call or a verify step taps every row in place.
     #[test]
-    fn minimax_dflash_taps_the_step_tail_across_lanes() {
-        // Two lanes of 4096 rows: only the second lane's rows are tapped, from tap row 0.
-        assert_eq!(lane_tail(0, 4096, 8192, 4096), None);
-        assert_eq!(lane_tail(4096, 4096, 8192, 4096), Some((0, 0, 4096)));
-        // Page-aligned uneven lanes: the tail starts inside the first lane.
-        assert_eq!(lane_tail(0, 2240, 4412, 4096), Some((316, 0, 1924)));
-        assert_eq!(lane_tail(2240, 2172, 4412, 4096), Some((0, 1924, 2172)));
-        // Verify steps and short chunks keep every row at its own index.
-        assert_eq!(lane_tail(0, 24, 24, 4096), Some((0, 0, 24)));
-        assert_eq!(lane_tail(0, 4096, 4096, 4096), Some((0, 0, 4096)));
+    fn minimax_dflash_taps_the_call_tail_across_units() {
+        // Two units of 4096 rows: only the second unit's rows are tapped, from tap row 0.
+        assert_eq!(unit_tail(0, 4096, 8192, 4096), None);
+        assert_eq!(unit_tail(4096, 4096, 8192, 4096), Some((0, 0, 4096)));
+        // Page-aligned uneven units: the tail starts inside the first unit.
+        assert_eq!(unit_tail(0, 2240, 4412, 4096), Some((316, 0, 1924)));
+        assert_eq!(unit_tail(2240, 2172, 4412, 4096), Some((0, 1924, 2172)));
+        // Three units of 2752 (six Sparks, an 8256-row span): the tail starts inside the second.
+        assert_eq!(unit_tail(0, 2752, 8256, 4096), None);
+        assert_eq!(unit_tail(2752, 2752, 8256, 4096), Some((1408, 0, 1344)));
+        assert_eq!(unit_tail(5504, 2752, 8256, 4096), Some((0, 1344, 2752)));
+        // Verify steps and short calls keep every row at its own index.
+        assert_eq!(unit_tail(0, 24, 24, 4096), Some((0, 0, 24)));
+        assert_eq!(unit_tail(0, 4096, 4096, 4096), Some((0, 0, 4096)));
         // The prefill context rows are the same tail, at its positions.
         let rows = tail_rows(100, 4412, 3, 4096);
         assert_eq!(rows.len(), 4096);
@@ -202,21 +207,24 @@ mod tests {
             (0..5).map(|r| (r, 7 + r)).collect::<Vec<_>>());
     }
 
-    /// Every tapped row of a lane split lands once: the lanes' tail pieces tile the tap rows.
+    /// Every tapped row of a unit call lands once: on the shared executor's cuts for every admitted
+    /// shape, the units' tail pieces tile the tap rows exactly.
     #[test]
-    fn minimax_dflash_lane_tails_tile_the_tap_rows_exactly() {
-        for (rows, cuts) in [(8192, vec![4096]), (4412, vec![2240]), (12000, vec![4096, 8192]), (300, vec![])] {
-            let mut bounds = vec![0];
-            bounds.extend(cuts);
-            bounds.push(rows);
-            let mut covered = Vec::new();
-            for lane in bounds.windows(2) {
-                if let Some((from, to, count)) = lane_tail(lane[0], lane[1] - lane[0], rows, 4096) {
-                    assert!(from + count <= lane[1] - lane[0]);
-                    covered.extend(to..to + count);
+    fn minimax_dflash_unit_tails_tile_the_tap_rows_exactly() -> Result<()> {
+        use crate::shared::prefill_pipeline::prefill_units;
+        for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (1024, 2)] {
+            let span = unit * waves;
+            for rows in (256..=span).step_by(131).chain([span, 4097, 4412]).filter(|&rows| rows <= span) {
+                let mut covered = Vec::new();
+                for piece in prefill_units(rows, unit, waves, 256)? {
+                    if let Some((from, to, count)) = unit_tail(piece.start, piece.len(), rows, 4096) {
+                        assert!(from + count <= piece.len());
+                        covered.extend(to..to + count);
+                    }
                 }
+                assert_eq!(covered, (0..rows.min(4096)).collect::<Vec<_>>(), "{waves} x {unit}, {rows} rows");
             }
-            assert_eq!(covered, (0..rows.min(4096)).collect::<Vec<_>>(), "{rows}");
         }
+        Ok(())
     }
 }

@@ -36,6 +36,14 @@ fn check_captures(startup: u64, current: u64) -> Result<()> {
     Ok(())
 }
 
+/// Rows of the scheduler's prefill chunks: the call span (`RuntimeSizing::slot_rows`, every unit of every wave
+/// in flight), or one unit when every prefill row's logits are served. A call's scored rows stay in one unit
+/// (`retained_logits_units`), so prefill-shaped scoring runs one-unit calls, as GLM 5.3 scores under full
+/// prefill logits; serving asks only for each call's last row.
+fn chunk_rows(span: usize, unit_rows: usize, full_prefill_logits: bool) -> usize {
+    if full_prefill_logits { unit_rows.min(span) } else { span }
+}
+
 fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, State, ()>]) -> Result<()> {
     if verified.iter().any(|v| !step.matches(v.placement.sequence, v.start, v.rows)
         || (v.kept.is_none() && !v.finished)) {
@@ -169,7 +177,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.vocabulary, max_context: self.cache.context,
-            slots: self.cache.sequences, prefill_rows: self.rows,
+            slots: self.cache.sequences,
+            prefill_rows: chunk_rows(self.rows, self.execution.unit_rows(), self.full_prefill_logits),
             decode_rows: self.rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS),
             full_prefill_logits: self.full_prefill_logits }
     }
@@ -313,6 +322,23 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
 mod tests {
     use super::*;
     use scheduler::Placement as _;
+
+    /// The scheduler chunks prompts at the span the planner admits (8192 rows at 2 x 4096 and 4 x 2048, 8256 at
+    /// six Sparks' 3 x 2752, from `slot_rows`), or at one unit when every prefill row's logits are served.
+    #[test]
+    fn minimax_scheduler_prefill_rows_are_the_span_unless_every_row_is_scored() {
+        use cuteafd_loader::plan::families::minimax::admission::RuntimeSizing;
+        for (unit_rows, waves, span) in [(4096, 2, 8192), (2752, 3, 8256), (2048, 4, 8192), (4096, 1, 4096), (128, 1, 128)] {
+            let sizing = RuntimeSizing { unit_rows, decode_rows: 64, sequences: 1, context: 1 << 20, spark_ranks: 6,
+                logit_rows: 64, waves };
+            assert_eq!(sizing.slot_rows(), span);
+            assert_eq!((chunk_rows(span, unit_rows, false), chunk_rows(span, unit_rows, true)), (span, unit_rows));
+        }
+        let serve = include_str!("serve.rs");
+        assert!(serve.contains("let span = sizing.slot_rows();") && serve.contains("rows: span,"));
+        let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(backend.contains("prefill_rows: chunk_rows(self.rows, self.execution.unit_rows(), self.full_prefill_logits),"));
+    }
 
     #[test]
     fn minimax_serving_adds_no_graph_capture_after_ready() {

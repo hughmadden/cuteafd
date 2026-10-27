@@ -16,21 +16,29 @@ impl<'a> Scratch<'a> {
     pub fn get(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
         self.buffers.get(name).map(|a| a.buffer).with_context(||format!("MiniMax unadmitted scratch {name}"))
     }
-    /// The scratch of a prefill lane over batch rows `first..first + rows`:
+    /// The scratch of a prefill unit (or a whole step) over batch rows `first..first + rows`:
     /// every per-row buffer viewed from its row `first`, the rest shared.
     pub fn rows(&self, first: usize, rows: usize) -> Result<Rows<'_>> {
         let buffers = self.buffers.iter().map(|(&name, allocation)| {
-            let Some(&(_, width, bytes)) = ROW_BUFFERS.iter().find(|(row, _, _)| *row == name) else {
-                return Ok((name, allocation.buffer));
-            };
-            let row = usize::try_from(width * bytes)?;
-            Ok((name, view(allocation.buffer, first * row, rows * row)?))
+            Ok((name, match row_extent(name, first, rows)? {
+                Some((offset, bytes)) => view(allocation.buffer, offset, bytes)?,
+                None => allocation.buffer,
+            }))
         }).collect::<Result<_>>()?;
         Ok(Rows { buffers, _scratch: PhantomData })
     }
 }
 
-/// Views of the scratch a lane's rows use, borrowed from [`Scratch`].
+/// The byte extent `(offset, bytes)` of batch rows `first..first + rows` in per-row buffer `name`
+/// ([`ROW_BUFFERS`]); `None` for a buffer that is not per row.
+pub(super) fn row_extent(name: &str, first: usize, rows: usize) -> Result<Option<(usize, usize)>> {
+    let Some(&(_, width, bytes)) = ROW_BUFFERS.iter().find(|(row, _, _)| *row == name) else { return Ok(None) };
+    let row = usize::try_from(width * bytes)?;
+    Ok(Some((first.checked_mul(row).context("MiniMax row view offset")?,
+        rows.checked_mul(row).context("MiniMax row view extent")?)))
+}
+
+/// Views of the scratch a unit's (or a step's) rows use, borrowed from [`Scratch`].
 pub(super) struct Rows<'s> { buffers: BTreeMap<&'static str, CuteafdDeviceBuffer>, _scratch: PhantomData<&'s ()> }
 impl Rows<'_> {
     pub fn get(&self, name: &str) -> Result<CuteafdDeviceBuffer> {

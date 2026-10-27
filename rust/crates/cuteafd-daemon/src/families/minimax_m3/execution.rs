@@ -1,4 +1,7 @@
-//! One device, one append-only paged MSA pipeline, native checkpoint arithmetic.
+//! One device, one append-only paged MSA pipeline, native checkpoint arithmetic. A single-sequence
+//! prefill of more than the decode rows runs as row units on the shared executor ([`units`]); every
+//! other step runs one pass over its rows.
+mod units;
 use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, native::Native,
     scratch::{Rows, Scratch}, weights::Weights};
 use crate::shared::{memory::device::{Allocation, Device}, prefix::view, token_io::DeviceLogits};
@@ -6,8 +9,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::{Programs,Scalar}, CuteafdDeviceBuffer};
 use cuteafd_transport::ExpertV2SourceKind;
 use cuteafd_loader::{families::minimax_m3::{cache::PAGE_ROWS,config::MiniMaxM3Config},
-    plan::{checkpoint::Checkpoint,families::minimax::admission::{RuntimeLedger,RuntimeSizing}},
-    serving_capacity::prefill_lanes as lane_plans};
+    plan::{checkpoint::Checkpoint,families::minimax::admission::{RuntimeLedger,RuntimeSizing}}};
 
 pub(super) struct LayerCache<'a> { pub key: Allocation<'a>, pub value: Allocation<'a>, pub index: Allocation<'a> }
 #[derive(Debug,Clone)]
@@ -67,7 +69,7 @@ fn decode_tables(batch:&BatchView,stride:usize)->Result<(Vec<i32>,Vec<i32>,Vec<i
 }
 
 /// Extend metadata: one launch per request tile of at most `tile` rows, and
-/// no tile across a prefill lane's first row (`cuts`, batch rows). Each
+/// no tile across a prefill unit's first row (`cuts`, batch rows). Each
 /// launch's table row holds its request's pages through the step (padded
 /// with -1 to `stride`), its 16-byte entries hold the cache length after its
 /// rows and its packed offsets [0, rows], and `bounds` its rows' causal key
@@ -110,22 +112,9 @@ fn extend_bounds(bounds:CuteafdDeviceBuffer,tile:usize)->Result<CuteafdDeviceBuf
     view(bounds,start,bounds.bytes.checked_sub(start).context("MiniMax extend bounds admission")?)
 }
 
-/// The lane cuts (batch rows) of a step of `rows` rows in up to `lanes` lanes
-/// of `lane_rows`: one lane takes at most a program launch's `program_rows`.
-fn step_cuts(rows:usize,lanes:usize,lane_rows:usize,program_rows:usize,diagnostic:bool)->Result<Vec<usize>> {
-    if lanes<2 {
-        ensure!(rows<=program_rows,MiniMaxError::Invalid(if diagnostic {"a diagnostic runs one lane: --prefill-lanes 1"}
-            else {"one-lane step rows"}));
-        return Ok(Vec::new());
-    }
-    let sizes=lane_plans::lane_cuts(rows,lanes,lane_rows,PAGE_ROWS as usize)?;
-    Ok(sizes.iter().scan(0,|at,&n|{*at+=n; Some(*at)}).take(sizes.len()-1).collect())
-}
-
 /// Batch rows `first..first + rows` of a step and their extend launches (a
-/// range of the plan's; empty for a decode plan): one prefill lane today, and
-/// one prefill unit or a whole one-pass step once units run on the shared
-/// executor.
+/// range of the plan's; empty for a decode plan): one prefill unit, or a
+/// whole one-pass step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnitTiles { first:usize, rows:usize, launches:std::ops::Range<usize> }
 
@@ -142,41 +131,25 @@ fn unit_tiles(plan:&AttentionPlan,rows:usize,cuts:&[usize])->Vec<UnitTiles> {
     }).collect()
 }
 
-/// What a step queues next, lane by lane ([`Execution::layers`] runs exactly this order).
+/// How a step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Visit {
-    /// A dense layer, whole, on every lane in turn.
-    Dense(usize),
-    /// A lane collects routed layer `layer`'s experts: the shared and routed sums into the
-    /// residual, and the drafter's tap.
-    Collect { layer:usize, lane:usize },
-    /// A lane runs routed layer `layer` through attention, the router, the expert dispatch and
-    /// the shared expert.
-    Dispatch { layer:usize, lane:usize },
+enum StepPath {
+    /// Every layer of every row in order, at most one program launch of rows: decode, verify,
+    /// packed and decode-shaped scoring steps, and diagnostics (which dump whole layers).
+    OnePass,
+    /// Row units on the shared executor ([`units`]): a single-sequence prefill of more than the
+    /// decode rows.
+    Units,
 }
 
-/// A step's visits through `last_layer` on `lanes` lanes. A routed layer's lane collects the
-/// previous routed layer's wave right before dispatching its own, so one lane's exchange is in
-/// flight while another lane's GPU work runs; a dense layer, and the step's end, first collect
-/// every lane's wave. Waves are therefore collected in dispatch order with at most `lanes` in
-/// flight: one exchange link with a return slot per lane carries them.
-fn visits(moe:&[bool],last_layer:usize,lanes:usize)->Vec<Visit> {
-    let mut visits=Vec::new();
-    let mut pending=None;
-    for (layer,&routed) in moe.iter().enumerate().take(last_layer+1) {
-        if !routed {
-            if let Some(previous)=pending.take() { visits.extend((0..lanes).map(|lane|Visit::Collect{layer:previous,lane})); }
-            visits.push(Visit::Dense(layer));
-            continue;
-        }
-        for lane in 0..lanes {
-            if let Some(previous)=pending { visits.push(Visit::Collect{layer:previous,lane}); }
-            visits.push(Visit::Dispatch{layer,lane});
-        }
-        pending=Some(layer);
-    }
-    if let Some(previous)=pending { visits.extend((0..lanes).map(|lane|Visit::Collect{layer:previous,lane})); }
-    visits
+/// The path of a step of `rows` rows over `requests` requests (Kimi K3's unit-call rule; T6's
+/// prefill lanes took the same steps).
+fn step_path(requests:usize,rows:usize,kind:ExpertV2SourceKind,diagnostic:bool,decode_rows:usize,
+    program_rows:usize)->Result<StepPath> {
+    if requests==1 && rows>decode_rows && kind==ExpertV2SourceKind::Prefill && !diagnostic { return Ok(StepPath::Units); }
+    ensure!(rows<=program_rows,MiniMaxError::Invalid(if diagnostic {"a diagnostic dumps one pass: --prefill-waves 1"}
+        else {"one-pass step rows"}));
+    Ok(StepPath::OnePass)
 }
 
 /// The drafter an execution taps and drafts with: the bundled DSpark or a DFlash2 checkpoint
@@ -218,8 +191,9 @@ pub(super) trait ExpertExecutor<'a> {
     /// Before a step's layers: `routed` routed layers, up to `slots` waves in flight (one per slot), none wider
     /// than `rows` rows.
     fn begin(&mut self, _routed:usize, _slots:usize, _rows:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
-    /// Waves that can be in flight at once (the Spark link's return slots).
-    fn slots(&self) -> usize { 1 }
+    /// Whether routed layer `layer`'s experts run on the coordinator: its dispatch and collect complete
+    /// inside one piece of work, never in flight across others.
+    fn local(&self, _layer:usize) -> bool { false }
     /// Sends routed layer `layer`'s wave of `rows` rows from slot `slot`'s rows.
     fn dispatch(&mut self, layer:usize, slot:usize, rows:usize, ids:CuteafdDeviceBuffer, weights:CuteafdDeviceBuffer,
         input:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
@@ -241,10 +215,11 @@ pub(super) struct Execution<'a> {
     weights: Weights<'a>,
     scratch: Scratch<'a>,
     cfg: MiniMaxM3Config,
-    /// Rows of the widest step (a prefill chunk of `lanes` lanes of `lane_rows`).
+    /// Rows of the widest step: the prefill span, `waves` units of `unit_rows` (`RuntimeSizing::slot_rows`).
     rows:usize,
-    lane_rows:usize,
-    lanes:usize,
+    unit_rows:usize,
+    /// Prefill waves in flight on the Spark link (`--prefill-waves`).
+    waves:usize,
     /// The most rows a program launch takes (the export's row capacity).
     program_rows:usize,
     logit_rows:usize,
@@ -253,6 +228,8 @@ pub(super) struct Execution<'a> {
     extend_rows:usize,
     table_stride:usize,
     poisoned:std::cell::Cell<bool>,
+    /// A unit call is on the shared executor: drafter work, which borrows this scratch, waits for its end.
+    in_units:std::cell::Cell<bool>,
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
     draft:Option<Drafter<'a>>,
 }
@@ -276,7 +253,7 @@ impl<'a> Execution<'a> {
         ensure!(extend_rows>0 && extend_rows%4==0 && native.capacity("minimax_attention_extend")?==extend_rows,
             MiniMaxError::Invalid("prefill index/attention capacity stride"));
         let program_rows=native.capacity("minimax_norm")?;
-        ensure!(rows==sizing.slot_rows() && sizing.unit_rows<=program_rows,MiniMaxError::Invalid("prefill lane rows"));
+        ensure!(rows==sizing.slot_rows() && sizing.unit_rows<=program_rows,MiniMaxError::Invalid("prefill unit rows"));
         let scratch=Scratch::new(device,ledger)?;
         let table_stride=usize::try_from(cuteafd_loader::plan::families::minimax::admission::extend_table_stride(context as u64))?;
         ensure!(scratch.get("page_table")?.bytes>=decode_rows*table_stride*4,MiniMaxError::Invalid("page-table admission"));
@@ -296,9 +273,9 @@ impl<'a> Execution<'a> {
             native.drain()?;
             Ok((weights,TargetHeadOwner::new(&native,&scratch,logit_rows,cfg.vocab_size)?))
         })?;
-        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.unit_rows,lanes:sizing.waves,program_rows,
+        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,unit_rows:sizing.unit_rows,waves:sizing.waves,program_rows,
             logit_rows,context,decode_rows,extend_rows,table_stride,
-            poisoned:std::cell::Cell::new(false),diagnostics,draft:None})
+            poisoned:std::cell::Cell::new(false),in_units:std::cell::Cell::new(false),diagnostics,draft:None})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
         layout:super::dspark::Layout)->Result<()> {
@@ -317,6 +294,7 @@ impl<'a> Execution<'a> {
     pub fn draft(&self)->Result<&Drafter<'a>> { self.draft.as_ref().context("MiniMax drafter not admitted") }
     pub fn update_draft(&self,rows:&[crate::shared::speculation::dflash::ContextRow])->Result<()> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
+        units::outside_units(self.in_units.get())?;
         let result=self.native.device().run(|| {
             let mut guard=self.native.cancellation_guard("MiniMax draft update");
             let result=match self.draft()? {
@@ -333,6 +311,7 @@ impl<'a> Execution<'a> {
     pub fn propose(&self,seqs:&[crate::shared::speculation::dflash::DraftSeq],embedding:&crate::shared::token_io::TokenEmbedding<'a>)
         ->Result<Vec<crate::shared::speculation::dflash::Draft>> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
+        units::outside_units(self.in_units.get())?;
         let block=self.draft()?.block();
         ensure!(seqs.iter().all(|s|s.position.checked_add(block).is_some_and(|end|end<=self.context)),
             MiniMaxError::Invalid("draft RoPE extent"));
@@ -354,6 +333,8 @@ impl<'a> Execution<'a> {
         })
     }
     pub fn stream(&self)->*mut std::ffi::c_void { self.native.raw() }
+    /// Rows of one prefill unit (`--prefill-rows`).
+    pub fn unit_rows(&self)->usize { self.unit_rows }
     pub fn drain(&self)->Result<()> { self.native.drain() }
     /// Runs every layer; the head projects only `logits` (batch rows), and an
     /// empty range skips it.
@@ -392,15 +373,23 @@ impl<'a> Execution<'a> {
         // state, never captured, so no whole decode step is recorded.
         let mut guard=self.native.cancellation_guard("MiniMax step");
         let result=(||{
-            let cuts=self.lane_cuts(batch,rows,experts.slots(),diagnostics.is_some())?;
-            let widest=cuts.iter().chain([&rows]).scan(0,|at,&cut|{let piece=cut-*at; *at=cut; Some(piece)}).max().unwrap_or(rows);
-            experts.begin(routed,cuts.len()+1,widest,kind)?;
+            let units=match step_path(batch.requests.len(),rows,kind,diagnostics.is_some(),self.decode_rows,self.program_rows)? {
+                StepPath::Units => Some(self.units(rows,logits.len(),last_layer)?),
+                StepPath::OnePass => None,
+            };
+            let (waves,widest)=units.as_ref().map_or((1,rows),|(units,waves)|
+                (*waves,units.iter().map(|unit|unit.rows.len()).max().unwrap_or(rows)));
+            experts.begin(routed,waves,widest,kind)?;
             self.native.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.native.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-            let plan=self.plan_attention(batch,rows,&cuts)?;
-            let lanes=unit_tiles(&plan,rows,&cuts);
-            self.layers(embedded,batch,batch.pool_pages,caches,experts,&plan,&lanes,rows,last_layer,logits.clone(),
-                &mut diagnostics)
+            let starts=units.as_ref().map_or_else(Vec::new,|(units,_)|units.iter().skip(1).map(|unit|unit.rows.start).collect());
+            // Every unit's attention tiles, uploaded once before the executor: no hook uploads, so nothing
+            // is uploaded while a wave is in flight.
+            let plan=self.plan_attention(batch,rows,&starts)?;
+            match &units {
+                Some((units,waves)) => self.prefill(embedded,batch,caches,experts,&plan,units,*waves,last_layer,logits.clone()),
+                None => self.layers(embedded,batch,caches,experts,&plan,rows,last_layer,logits.clone(),&mut diagnostics),
+            }
         })();
         // A failed step's stream may hold Spark exchange waits that only the link's worker
         // releases: stop the exchange (releasing them) before the drain.
@@ -418,58 +407,31 @@ impl<'a> Execution<'a> {
         }
         result
     }
-    /// The step body over its `lanes`: residual widening, every layer through
-    /// `last_layer` in [`visits`] order, then the head over `logits` (an empty
-    /// range skips it). A lane collects a routed layer's experts only after
-    /// the other lanes dispatched theirs, so one lane's exchange is in flight
-    /// while another's GPU work runs. One lane (every decode step, and a
-    /// diagnostic, which dumps whole layers) is the layer's own order.
+    /// One pass over a step's rows: residual widening, every layer through `last_layer` in
+    /// order (each routed layer's experts collected before the next layer), then the head over
+    /// `logits` (an empty range skips it). Decode, verify, packed and diagnostic steps run here;
+    /// a diagnostic dumps its layer whole.
     #[allow(clippy::too_many_arguments)]
-    fn layers(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, pool_pages:usize, caches:&[LayerCache<'a>],
-        experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, lanes:&[UnitTiles], rows:usize, last_layer:usize,
+    fn layers(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
+        experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, rows:usize, last_layer:usize,
         logits:std::ops::Range<usize>, diagnostics:&mut Option<Diagnostics>) -> Result<Option<DeviceLogits>> {
-        ensure!(diagnostics.is_none() || lanes.len()==1,MiniMaxError::Invalid("a diagnostic dumps one lane"));
-        let views=lanes.iter().map(|lane|self.scratch.rows(lane.first,lane.rows)).collect::<Result<Vec<_>>>()?;
+        let tiles=unit_tiles(plan,rows,&[]).pop().context("MiniMax step tiles")?;
+        let s=self.scratch.rows(0,rows)?;
         let begin=|layer:usize,diagnostics:&Option<Diagnostics>| diagnostics.as_ref().filter(|d|d.layer==layer)
             .map(|d|d.begin(batch)).transpose();
         self.native.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
-        // The dump of the routed layer whose waves are in flight (a diagnostic's one lane).
-        let mut routed:Option<StepDump>=None;
-        for visit in visits(&self.cfg.moe,last_layer,lanes.len()) {
-            match visit {
-                Visit::Dense(layer) => {
-                    let cache=caches.get(layer).context("MiniMax layer cache")?;
-                    let mut dump=begin(layer,diagnostics)?;
-                    for (lane,s) in lanes.iter().zip(&views) {
-                        if let Some(d)=&mut dump { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
-                        self.attention(layer,lane,pool_pages,batch,cache,plan,s,dump.as_mut())?;
-                        self.dense_ffn(layer,lane.first,lane.rows,rows,s,dump.as_mut())?;
-                    }
-                    if let Some(mut d)=dump {
-                        d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
-                        diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
-                    }
-                }
-                Visit::Collect{layer,lane} => {
-                    let (view,s)=(lanes.get(lane).context("MiniMax lane")?,&views[lane]);
-                    self.ffn_back(layer,lane,view.first,view.rows,rows,s,experts)?;
-                    // A routed layer's dump ends once its last lane collected.
-                    if lane+1==lanes.len() { if let Some(mut d)=routed.take() {
-                        d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
-                        diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
-                    } }
-                }
-                Visit::Dispatch{layer,lane} => {
-                    let (view,s)=(lanes.get(lane).context("MiniMax lane")?,&views[lane]);
-                    if lane==0 {
-                        ensure!(routed.is_none(),MiniMaxError::Invalid("diagnostic dump of an uncollected layer"));
-                        routed=begin(layer,diagnostics)?;
-                        if let Some(d)=&mut routed { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
-                    }
-                    let cache=caches.get(layer).context("MiniMax layer cache")?;
-                    self.attention(layer,view,pool_pages,batch,cache,plan,s,routed.as_mut())?;
-                    self.ffn_front(layer,lane,view.rows,s,experts,routed.as_mut())?;
-                }
+        for layer in 0..=last_layer {
+            let cache=caches.get(layer).context("MiniMax layer cache")?;
+            let mut dump=begin(layer,diagnostics)?;
+            if let Some(d)=&mut dump { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
+            self.attention(layer,&tiles,batch.pool_pages,batch,cache,plan,&s,dump.as_mut())?;
+            if self.cfg.moe[layer] {
+                self.ffn_front(layer,0,rows,&s,experts,dump.as_mut())?;
+                self.ffn_back(layer,0,0,rows,rows,&s,experts)?;
+            } else { self.dense_ffn(layer,0,rows,rows,&s,dump.as_mut())?; }
+            if let Some(mut d)=dump {
+                d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
+                diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
             }
         }
         if last_layer+1==self.cfg.layers && !logits.is_empty() {
@@ -523,15 +485,6 @@ impl<'a> Execution<'a> {
         self.residual(s,rows)?;
         self.tap(layer,s,first,rows,span)
     }
-    /// Where a step's lanes after the first start (batch rows): a one-request
-    /// prefill chunk runs in up to `lanes` lanes of `lane_rows` rows (at most
-    /// `links`, one Spark exchange each; `serving_capacity::prefill_lanes`,
-    /// cut on KV pages); decode, verify and packed steps run one lane, as
-    /// does a diagnostic, which dumps whole layers.
-    fn lane_cuts(&self,batch:&BatchView,rows:usize,links:usize,diagnostic:bool)->Result<Vec<usize>> {
-        let one=diagnostic || rows<=self.decode_rows || batch.requests.len()>1;
-        step_cuts(rows,if one {1} else {self.lanes.min(links)},self.lane_rows,self.program_rows,diagnostic)
-    }
     /// The page-table stride of every decode step: wide enough for any live
     /// request (none holds more than the pool's pages or the context's).
     fn decode_stride(&self,batch:&BatchView)->usize { self.table_stride.min(batch.pool_pages) }
@@ -540,8 +493,8 @@ impl<'a> Execution<'a> {
     pub fn attention_route(&self,rows:usize)->&'static str {
         if rows<=self.decode_rows {"causal_paged_decode"} else {"causal_paged_extend"}
     }
-    /// Uploads the step's attention metadata (see [`AttentionPlan`]); extend
-    /// tiles end at the lane `cuts`.
+    /// Uploads the step's attention metadata (see [`AttentionPlan`]): every unit's
+    /// extend tiles, which end at the unit starts `cuts`.
     fn plan_attention(&self,batch:&BatchView,rows:usize,cuts:&[usize])->Result<AttentionPlan> {
         let s=&self.scratch;
         if rows<=self.decode_rows {
@@ -559,12 +512,13 @@ impl<'a> Execution<'a> {
         self.native.upload(extend_bounds(s.get("index_bounds")?,self.extend_rows)?,&le_bytes(&bounds))?;
         Ok(AttentionPlan::Extend{launches})
     }
-    /// One lane's attention for a layer: its rows (`s` views them) and its
-    /// extend launches.
+    /// The attention of the rows `tiles` holds (a unit, or a one-pass step) for a layer: `s`
+    /// views them, and `tiles.launches` are their extend tiles. It writes their K/V and index
+    /// keys for the layer, which later units then attend.
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, layer:usize,lane:&UnitTiles,pool_pages:usize,batch:&BatchView,cache:&LayerCache<'a>,
+    fn attention(&self, layer:usize,tiles:&UnitTiles,pool_pages:usize,batch:&BatchView,cache:&LayerCache<'a>,
         plan:&AttentionPlan,s:&Rows<'_>,mut dump:Option<&mut StepDump>)->Result<()> {
-        let rows=lane.rows;
+        let rows=tiles.rows;
         ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
         if let Some(d)=dump.as_deref_mut() { d.tensor(&self.native,"norm","bf16",&[rows,6144],s.get("norm")?)?; }
         for (projection,stem,out) in [("q","q","q"),("kv","kv","kv"),("index_q","index_q","index_q"),("index_k","index_k","index_k")] {
@@ -607,23 +561,23 @@ impl<'a> Execution<'a> {
                     view(s.get("attention")?,0,rows*16384)?,s.get("lse")?,s.get("scratch")?], &[
                     Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
             }
-            // Each request's index keys through this lane are staged as the
+            // Each request's index keys through this unit are staged as the
             // contiguous rows the prefill scorer reads; its tiles then select
             // blocks and attend over the paged cache like the decode kernels.
-            // A later lane restages a request an earlier one began: no row
+            // A later unit restages a request an earlier one began: no row
             // reads keys past its own causal end.
             AttentionPlan::Extend{launches} => {
                 let (stride,tile)=(self.table_stride,self.extend_rows);
                 let (tables,bounds)=(s.get("page_table")?,s.get("index_bounds")?);
-                for (index,launch) in launches[lane.launches.clone()].iter().enumerate() {
+                for (index,launch) in launches[tiles.launches.clone()].iter().enumerate() {
                     let request=&batch.requests[launch.request];
                     let table=view(tables,launch.slot*stride*4,stride*4)?;
                     if launch.first==0 || index==0 {
-                        let end=(request.row_start+request.rows).min(lane.first+lane.rows)-request.row_start;
+                        let end=(request.row_start+request.rows).min(tiles.first+tiles.rows)-request.row_start;
                         let pages=(request.start_position+end).div_ceil(64);
                         self.native.index_stage(cache.index.buffer,view(table,0,pages*4)?,pages,s.get("index_keys")?,s.get("index_scales")?)?;
                     }
-                    let (row,n)=(launch.row-lane.first,launch.rows);
+                    let (row,n)=(launch.row-tiles.first,launch.rows);
                     self.native.launch("minimax_index_prefill", &[view(s.get("index_q_fp8")?,row*512,n*512)?,
                         view(s.get("index_q_scales")?,row*16,n*16)?,s.get("index_keys")?,s.get("index_scales")?,
                         view(bounds,0,n*4)?,view(bounds,launch.bounds*4,n*4)?,s.get("q2k_extend")?,s.get("scratch")?], &[
@@ -691,100 +645,70 @@ mod tests {
         BatchView{positions,slots:vec![0;rows],requests,pool_pages:1<<20}
     }
 
-    #[test] fn minimax_prefill_lanes_end_extend_tiles_at_their_cuts() -> Result<()> {
-        let lanes=|batch:&BatchView,want:usize,lane_rows:usize|->Result<Vec<(usize,usize,Vec<(usize,usize)>)>> {
-            let rows=batch.positions.len();
-            let cuts=step_cuts(rows,want,lane_rows,4096,false)?;
-            let (launches,..)=extend_tables(batch,1024,1<<12,&cuts)?;
+    /// Unit calls tile each unit's rows with its own extend launches: each unit's pieces start at
+    /// its first row, none crosses a unit start or exceeds the extend tile, and the call's launches
+    /// stay inside the admitted tables (`extend_launches`, which counts the unit cuts). One-pass
+    /// steps keep one piece.
+    #[test] fn minimax_prefill_units_end_extend_tiles_at_their_cuts() -> Result<()> {
+        use cuteafd_loader::plan::families::minimax::admission::extend_launches;
+        let tiles=|batch:&BatchView,units:&[std::ops::Range<usize>]|->Result<Vec<(usize,usize,Vec<(usize,usize)>)>> {
+            let starts=units.iter().skip(1).map(|unit|unit.start).collect::<Vec<_>>();
+            let (launches,..)=extend_tables(batch,1024,1<<12,&starts)?;
             let plan=AttentionPlan::Extend{launches:launches.clone()};
-            Ok(unit_tiles(&plan,rows,&cuts).into_iter().map(|l|(l.first,l.rows,
-                launches[l.launches].iter().map(|t|(t.row,t.rows)).collect())).collect())
+            Ok(unit_tiles(&plan,batch.positions.len(),&starts).into_iter().map(|t|(t.first,t.rows,
+                launches[t.launches].iter().map(|l|(l.row,l.rows)).collect())).collect())
         };
-        // Two lanes of 4096 rows: a full chunk keeps the serial tiles.
-        assert_eq!(lanes(&chunk(8192,&[8192]),2,4096)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)]),
+        let cut=|rows,unit,waves| units::unit_cuts(rows,unit,waves,1,64);
+        // T6's lane cases on the shared cuts: a full 2 x 4096 call keeps the serial tiles in each unit,
+        // and a page-aligned cut ends a tile early, the next unit's first tile starting there.
+        assert_eq!(tiles(&chunk(8192,&[8192]),&cut(8192,4096,2)?)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)]),
             (4096,4096,vec![(4096,1024),(5120,1024),(6144,1024),(7168,1024)])]);
-        // A page-aligned cut ends a tile early and the next lane's first tile starts there.
-        assert_eq!(lanes(&chunk(0,&[4412]),2,4096)?,[(0,2240,vec![(0,1024),(1024,1024),(2048,192)]),
+        assert_eq!(tiles(&chunk(0,&[4412]),&cut(4412,4096,2)?)?,[(0,2240,vec![(0,1024),(1024,1024),(2048,192)]),
             (2240,2172,vec![(2240,1024),(3264,1024),(4288,124)])]);
-        // Short chunks and one lane keep one lane and the serial tiles.
-        assert_eq!(lanes(&chunk(64,&[300]),2,4096)?,[(0,300,vec![(0,300)])]);
-        assert_eq!(lanes(&chunk(0,&[4096]),1,4096)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)])]);
-        assert!(step_cuts(8192,1,4096,4096,false).is_err(),"one lane holds at most a program launch");
-        assert!(step_cuts(4097,2,2048,4096,false).is_err(),"two lanes of 2048 rows hold 4096");
-        assert!(step_cuts(8192,1,4096,4096,true).unwrap_err().to_string().contains("--prefill-lanes 1"));
-        // Decode plans keep one lane.
+        assert_eq!(tiles(&chunk(64,&[300]),&cut(300,4096,2)?)?,[(0,300,vec![(0,300)])]);
+        assert_eq!(tiles(&chunk(0,&[4096]),&cut(4096,4096,1)?)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)])]);
+        for (unit,waves) in [(4096,1),(4096,2),(2752,3),(2048,4),(1024,2),(256,2)] {
+            let sizing=RuntimeSizing{unit_rows:unit,decode_rows:64,sequences:1,context:1<<20,spark_ranks:4,logit_rows:64,waves};
+            let (bound,span)=(usize::try_from(extend_launches(sizing,1024))?,sizing.slot_rows());
+            for rows in (65..=span).step_by(37).chain([unit,span]) {
+                for start in [0,64,100] {
+                    let units=cut(rows,unit,waves)?;
+                    let got=tiles(&chunk(start,&[rows]),&units)?;
+                    ensure!(got.len()==units.len(),"{waves} x {unit}, {rows} rows");
+                    let mut launches=0;
+                    for ((first,n,pieces),u) in got.iter().zip(&units) {
+                        ensure!((*first,*n)==(u.start,u.len()),"{waves} x {unit}, {rows} rows: tiles of {u:?}");
+                        let mut at=u.start;
+                        for &(row,len) in pieces {
+                            ensure!(row==at && (1..=1024).contains(&len),"{waves} x {unit}, {rows} rows at {start}: {pieces:?}");
+                            at+=len;
+                        }
+                        ensure!(at==u.end,"{waves} x {unit}, {rows} rows: {u:?} left untiled");
+                        launches+=pieces.len();
+                    }
+                    ensure!(launches<=bound,"{waves} x {unit}, {rows} rows: {launches} launches, admitted {bound}");
+                }
+            }
+        }
+        // A one-pass (decode) plan keeps one piece over the step.
         assert_eq!(unit_tiles(&AttentionPlan::Decode{stride:4},64,&[]),[UnitTiles{first:0,rows:64,launches:0..0}]);
         Ok(())
     }
 
-    #[test] fn minimax_step_visits_collect_each_routed_layer_before_the_next_dispatch() {
-        use Visit::*;
-        // Dense 0, routed 1-2, dense 3, routed 4; two lanes.
-        let moe=[false,true,true,false,true];
-        assert_eq!(visits(&moe,4,2),[Dense(0),Dispatch{layer:1,lane:0},Dispatch{layer:1,lane:1},
-            Collect{layer:1,lane:0},Dispatch{layer:2,lane:0},Collect{layer:1,lane:1},Dispatch{layer:2,lane:1},
-            Collect{layer:2,lane:0},Collect{layer:2,lane:1},Dense(3),
-            Dispatch{layer:4,lane:0},Dispatch{layer:4,lane:1},Collect{layer:4,lane:0},Collect{layer:4,lane:1}]);
-        // One lane is the layer's own order; a partial step ends after its last layer.
-        assert_eq!(visits(&moe,2,1),[Dense(0),Dispatch{layer:1,lane:0},Collect{layer:1,lane:0},
-            Dispatch{layer:2,lane:0},Collect{layer:2,lane:0}]);
-        assert_eq!(visits(&moe,0,3),[Dense(0)]);
-    }
-
-    /// The one-link mapping: driven through the step's visit order (dense, RTX-local and Spark
-    /// layers in any pattern, 1-4 lanes, any last layer), the routed owner's bookkeeping sends
-    /// at most `lanes` Spark waves and collects each one as the oldest outstanding, so a link
-    /// with one return slot per lane carries every step. Wave k takes slot k % lanes, and the
-    /// slot's previous wave was collected (landed and reduced) before it.
-    #[test] fn minimax_lane_waves_land_in_dispatch_order_on_one_link() -> Result<()> {
-        use super::super::routed::{Wave, WaveOrder};
-        let mut seed=0x2545_f491_4f6c_dd1du64;
-        let mut next=|bound:u64| { seed^=seed<<13; seed^=seed>>7; seed^=seed<<17; seed%bound };
-        for _ in 0..400 {
-            let layers=1+next(60) as usize;
-            let moe=(0..layers).map(|_|next(4)!=0).collect::<Vec<_>>();
-            let local=(0..layers).map(|_|next(5)==0).collect::<Vec<_>>();
-            let lanes=1+next(4) as usize;
-            let last=next(layers as u64) as usize;
-            let mut order=WaveOrder::new(lanes);
-            let mut pending:Vec<Option<(usize,Option<u64>)>>=vec![None;lanes];
-            let (mut sent,mut slots)=(0u64,vec![true;lanes]);
-            for visit in visits(&moe,last,lanes) {
-                match visit {
-                    Visit::Dense(layer) => {
-                        assert!(!moe[layer] && pending.iter().all(Option::is_none) && order.is_empty(),
-                            "a dense layer runs with no wave in flight");
-                    }
-                    Visit::Dispatch{layer,lane} => {
-                        assert!(moe[layer] && pending[lane].is_none(),"one wave per lane");
-                        let spark=(!local[layer]).then(|| {
-                            let slot=(sent%lanes as u64) as usize;
-                            assert!(slots[slot],"wave {sent} reuses slot {slot} before its previous wave landed");
-                            slots[slot]=false;
-                            order.push(Wave{layer,slot:lane,rows:64},sent).unwrap();
-                            sent+=1;
-                            sent-1
-                        });
-                        pending[lane]=Some((layer,spark));
-                    }
-                    Visit::Collect{layer,lane} => {
-                        let (dispatched,spark)=pending[lane].take().expect("collect after dispatch");
-                        assert_eq!(dispatched,layer);
-                        if let Some(wave)=spark {
-                            assert_eq!(order.pop(Wave{layer,slot:lane,rows:64})?,wave,"the oldest wave lands first");
-                            slots[(wave%lanes as u64) as usize]=true;
-                        }
-                    }
-                }
-            }
-            assert!(pending.iter().all(Option::is_none) && order.is_empty(),"the step ends with every wave collected");
+    /// A single-sequence prefill of more than the decode rows runs as units; decode, verify, packed and
+    /// diagnostic steps run one pass, which holds at most one program launch of rows.
+    #[test] fn minimax_single_sequence_prefill_above_decode_rows_runs_units() -> Result<()> {
+        use ExpertV2SourceKind::{Decode, Prefill};
+        for (requests,rows,kind,diagnostic,path) in [(1,65,Prefill,false,StepPath::Units),(1,8256,Prefill,false,StepPath::Units),
+            (1,64,Prefill,false,StepPath::OnePass),(2,128,Prefill,false,StepPath::OnePass),(1,8,Decode,false,StepPath::OnePass),
+            (1,200,Decode,false,StepPath::OnePass),(1,4096,Prefill,true,StepPath::OnePass)] {
+            assert_eq!(step_path(requests,rows,kind,diagnostic,64,4096)?,path,"{requests} requests, {rows} rows, {kind:?}");
         }
+        assert!(step_path(1,4097,Prefill,true,64,4096).unwrap_err().to_string().contains("--prefill-waves 1"));
+        assert!(step_path(2,4097,Prefill,false,64,4096).is_err(),"a packed step holds one program launch");
         Ok(())
     }
 
-    /// Decode runs eagerly (no whole-step recording can hold the exchange's stream memory
-    /// operations), and a failed step quiesces the Spark link before its drain, then releases
-    /// the link's owners only after a completed drain.
     /// Every ordered upload of a step goes to a whole admitted destination that load reserved
     /// (or the extend bounds' tail, reserved too), never to a view narrowed to its bytes: the
     /// first upload sizes a destination's pinned staging, and no step allocates any.
@@ -817,6 +741,9 @@ mod tests {
         Ok(())
     }
 
+    /// Decode runs eagerly (no whole-step recording can hold the exchange's stream memory
+    /// operations), and a failed step, a unit call's included, quiesces the Spark link before its
+    /// drain, then releases the link's owners only after a completed drain.
     #[test] fn minimax_step_is_eager_and_quiesces_the_exchange_before_draining() {
         let source=include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
         for banned in [["cuda_graph_", "begin_capture"].concat(), ["Graph", "Bank"].concat(),
@@ -824,7 +751,7 @@ mod tests {
             assert!(!source.contains(&banned),"{banned}");
         }
         let step=source.split("fn step(").nth(1).unwrap().split("fn layers(").next().unwrap();
-        let order=["if result.is_err() { experts.abort(); }","let drained=if result.is_ok() { self.native.wait() } else { self.native.drain() };",
+        let order=["self.prefill(","if result.is_err() { experts.abort(); }","let drained=if result.is_ok() { self.native.wait() } else { self.native.drain() };",
             "experts.finish()?","if completed { experts.release(); }"]
             .map(|needle|step.find(needle).unwrap_or_else(||panic!("{needle}")));
         assert!(order.windows(2).all(|w|w[0]<w[1]),"{order:?}");

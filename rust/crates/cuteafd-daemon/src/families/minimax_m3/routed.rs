@@ -289,7 +289,7 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
     fn begin(&mut self,routed:usize,slots:usize,rows:usize,kind:ExpertV2SourceKind)->Result<()> {
         ensure!(!self.poisoned,MiniMaxError::Invalid("previous expert failure; restart required"));
         ensure!(self.pending.iter().all(Option::is_none),MiniMaxError::Invalid("pending expert wave at step start"));
-        ensure!((1..=self.slots()).contains(&slots),MiniMaxError::Invalid("expert slots"));
+        ensure!((1..=self.pending.len()).contains(&slots),MiniMaxError::Invalid("expert slots"));
         ensure!(matches!(kind,ExpertV2SourceKind::Decode|ExpertV2SourceKind::Prefill),
             MiniMaxError::Unsupported("expert source kind"));
         self.kind=kind;
@@ -298,7 +298,7 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
         if let Some(spark)=&mut self.spark { spark.idle()?; spark.fits(rows)?; }
         Ok(())
     }
-    fn slots(&self)->usize { self.pending.len() }
+    fn local(&self,layer:usize)->bool { self.local.as_ref().is_some_and(|l|l.index_of(layer).is_ok()) }
     fn dispatch(&mut self,layer:usize,slot:usize,rows:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,
         input:CuteafdDeviceBuffer,native:&Native<'a>)->Result<()> {
         ensure!(self.pending.get(slot).is_some_and(Option::is_none),MiniMaxError::Invalid("overlapping expert waves"));
