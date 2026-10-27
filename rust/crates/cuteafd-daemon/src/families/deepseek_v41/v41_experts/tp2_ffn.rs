@@ -500,9 +500,17 @@ impl<'a> Wave<'a> {
         });
         let drained = stream.complete().await;
         queued.and(drained)?;
+        // The add above read the shared output: release it for the next layer
+        // (it is on the chain head now; no-op outside a chain).
+        self.shared.release_output(local)?;
         let mut result = output;
         result.bytes = rows as usize * 10240;
         Ok(result)
+    }
+    /// The Spark reduce that read the shared output on `destination` finished
+    /// on the unit's chain: the next layer's shared add may overwrite it.
+    pub(crate) fn release_shared_output(&self, destination: usize) -> Result<()> {
+        self.shared.release_output(destination)
     }
 }
 

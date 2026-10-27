@@ -625,6 +625,11 @@ impl<'w> NativePendingFfn<'w, '_> {
         // until the reduce completes instead of synchronizing the thread.
         // SAFETY: the pending owner retains every input until completion or cancellation.
         unsafe { crate::shared::memory::chain::finish_cooperative(self.stream).await? };
+        // The reduce read the TP2 shared output (when this lane computes it):
+        // release it now that the reduce is on the chain head.
+        if let Some(tp2) = self.tp2.as_deref() {
+            tp2.release_shared_output(values.device_id as usize)?;
+        }
         if host_ordered && crate::shared::memory::chain::active() {
             // The layer's one host wait for its streams: the reduce joined the
             // chain head (attention, router, shared FFN), so its completion is

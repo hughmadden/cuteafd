@@ -15,6 +15,10 @@ pub(crate) struct Wave<'a> {
     ready: [Event<'a>; 2],
     staging: [Allocation<'a>; 2],
     output: [Allocation<'a>; 2],
+    /// Per destination: the release of `output`'s last reader (the Spark
+    /// reduce on another stream), which the next `add` acquires instead of
+    /// joining the whole chain head (hunt A 1E).
+    released: [crate::shared::memory::row_window::ScratchGuard<'a>; 2],
     ranks: [RankWave<'a>; 2],
     add: Bf16Add<'a>,
     capacity: u32,
@@ -24,6 +28,12 @@ impl<'a> Wave<'a> {
     pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
         RankWave::device_bytes(library, capacity)?.checked_add(capacity as usize*5120*4)
             .context("shared TP2 workspace overflow")
+    }
+    /// The reader of `destination`'s output (the reduce) finished on the
+    /// unit's chain: the next `add` there may overwrite it.
+    pub(crate) fn release_output(&self, destination: usize) -> Result<()> {
+        ensure!(destination < 2, "invalid shared TP2 destination");
+        self.released[destination].release()
     }
     pub fn contains(&self, layer: usize) -> bool {
         self.ranks.iter().all(|rank| rank.weights.get(layer).is_some_and(|w| w.layer == layer))
@@ -40,6 +50,8 @@ impl<'a> Wave<'a> {
             ready: [Event::new(d0)?, Event::new(d1)?],
             staging: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
             output: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
+            released: [crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?,
+                crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?],
             ranks, add: d0.library.bf16_add()?, capacity,
         })
     }
@@ -74,8 +86,8 @@ impl<'a> Wave<'a> {
         let output = &mut self.output[destination];
         let add = &self.add;
         let count = rows as usize * 5120;
-        unsafe { self.transfers[destination].copy_then(&remote.output, &mut self.staging[destination],
-            &remote.stream, count*2, |peer, stream| {
+        unsafe { self.transfers[destination].copy_then_ordered(&remote.output, &mut self.staging[destination],
+            &remote.stream, count*2, Some(&self.released[destination]), |peer, stream| {
                 output.device.library.cuda_stream_wait_event(stream, ready.raw)?;
                 add.launch(local.output.buffer, peer, output.buffer, count, stream)
             }).await?; }

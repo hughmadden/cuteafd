@@ -402,6 +402,13 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
     }
 }
 
+/// The device whose event is the chain head (None outside a scope or before
+/// any stage finished).
+pub(crate) fn head_device() -> Option<i32> {
+    let current = current()?;
+    current.head.get().map(|head| current.events[head].0)
+}
+
 /// Records the current chain head into `event` (no host wait): another
 /// chain's stages ordered after it with [`depend`] follow everything chained
 /// here so far. No-op outside a scope or before any stage finished.
