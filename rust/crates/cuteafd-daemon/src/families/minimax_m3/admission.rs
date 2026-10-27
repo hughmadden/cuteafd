@@ -46,11 +46,8 @@ pub(super) fn spark_rings() -> Result<cuteafd_core::SparkRings> {
 /// MiniMax's NVFP4 package ladder: one decode owner, and one prefill owner buffering a unit per wave.
 pub(super) fn spark_model(sizing: RuntimeSizing) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let endpoint = sizing.spark_endpoint()?;
-    let exports = cuteafd_loader::plan::spark_executions::SparkBackend::Fp8.exports();
-    let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports, None,
-        sizing.unit_rows as u64, sizing.waves as u64)?;
     cuteafd_transport::worker_selection::ModelAdmission::for_clients(cuteafd_core::ExpertGeometry::MINIMAX_M3,
-        endpoint, spark_rings()?, 1, executions)
+        endpoint, spark_rings()?, 1, sizing.spark_executions()?)
 }
 
 /// Admit `request` into `available` measured free bytes: already capped by the logical device
@@ -196,7 +193,11 @@ mod tests {
                 let item = |group: &str| spark.items.iter().find(|i| i.group == group).map(|i| i.bytes);
                 assert_eq!((item("expert intake"), item("endpoint response prefixes"), item("rdma rings")),
                     (Some(io.intake), Some(io.endpoint_staging), Some(io.mapped_rings)), "TP{ranks} rank {}", spark.index);
-                assert_eq!(item("execution slots").is_some(), sizing.waves > 1, "TP{ranks} rank {}", spark.index);
+                // The typed owners, summed as the worker sums them (one decode, one prefill owner).
+                let owners = model.executions.workspace_bytes(|extent| admission::spark_owner_bytes(None, ranks, extent))?
+                    .unwrap();
+                assert_eq!((item("execution owners"), item("execution staging")),
+                    (Some(owners.device_bytes), Some(owners.pinned_bytes)), "TP{ranks} rank {}", spark.index);
             }
         }
         Ok(())
@@ -264,8 +265,8 @@ mod tests {
         runtime_and_manifest_plan_share_allocation_bytes(true, None)
     }
 
-    /// An exported Spark scratch large enough to onboard layers (each rank runs two execution slots
-    /// of it, one per wave) moves both ledgers alike.
+    /// An exported Spark scratch large enough to onboard layers (each rank's decode and prefill owners
+    /// take it at the package's one m256 export) moves both ledgers alike.
     #[test]
     fn minimax_exported_remote_scratch_onboards_alike_in_plan_and_server() -> Result<()> {
         runtime_and_manifest_plan_share_allocation_bytes(false, Some(20 << 30))

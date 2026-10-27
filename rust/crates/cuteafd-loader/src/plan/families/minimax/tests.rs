@@ -271,7 +271,7 @@ fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
 }
 
 /// The default Spark budget, measured on headless Sparks, holds every routed layer at TP2 with the
-/// default shape (two waves of 4096 rows, so two execution slots per rank, 64 sequences): nothing
+/// default shape (two waves of 4096 rows on each rank's typed owners, 64 sequences): nothing
 /// onboards onto the RTX.
 #[test]
 fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
@@ -294,7 +294,8 @@ fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "{:?}", memory.notes);
     let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
-    assert!(spark.items.iter().any(|i| i.group == "execution slots" && i.format == "1 more"), "{:?}", spark.items);
+    assert!(spark.items.iter().any(|i| i.group == "execution owners"
+        && i.format.starts_with("1 decode + 1 prefill (m4096 scratch once; 2 x 4096-row units)")), "{:?}", spark.items);
 }
 
 /// TP2 on the RTX PRO 6000 with automatic vision: the bundled tower stays on the coordinator GPU
@@ -404,8 +405,8 @@ fn rtx_5090_is_refused_by_name() {
 
 /// The RTX PRO 6000 cards (the example configs' shapes: 64 sequences, the checkpoint's context, FP8
 /// K/V, DFlash2 with its default rings, automatic vision, the default Spark budget) on the units
-/// contract: #762's shape, one Spark transport, an execution slot per wave on every rank, and every
-/// rank within its budget. The coordinator image's expert package carries its TP1 layout only, so
+/// contract: #762's shape, one Spark transport, the typed owners (one decode, one prefill buffering a
+/// unit per wave) on every rank, and every rank within its budget. The coordinator image's expert package carries its TP1 layout only, so
 /// Spark scratch is the estimate, as on a real launch.
 #[test]
 fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
@@ -432,11 +433,16 @@ fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
         assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "TP{ranks}: {:?}", memory.notes);
         let sparks = memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
         assert_eq!(sparks.len(), ranks);
+        let sizing = admission::RuntimeSizing { unit_rows: unit as usize, decode_rows: 64, sequences: 64, context: 1 << 20,
+            spark_ranks: ranks, logit_rows: 64, waves: waves as usize };
+        let owners = sizing.spark_executions().unwrap()
+            .workspace_bytes(|extent| admission::spark_owner_bytes(None, ranks, extent)).unwrap().unwrap();
         for spark in &sparks {
-            let slots = spark.items.iter().find(|i| i.group == "execution slots").unwrap();
-            assert_eq!(slots.format, format!("{} more", waves - 1), "TP{ranks}");
+            let owner = spark.items.iter().find(|i| i.group == "execution owners").unwrap();
+            assert_eq!(owner.format, format!("1 decode + 1 prefill (m4096 scratch once; {waves} x {unit}-row units); \
+                0 bytes already reserved"), "TP{ranks}");
             let item = |name: &str| spark.items.iter().find(|i| i.group == name).unwrap().bytes;
-            assert_eq!(slots.bytes, (waves - 1) * (item("expert intake") + item("expert package scratch")), "TP{ranks}");
+            assert_eq!((owner.bytes, item("execution staging")), (owners.device_bytes, owners.pinned_bytes), "TP{ranks}");
         }
         // One endpoint's rings per rank on the coordinator host.
         let host = report.host_ledger.as_ref().unwrap();
@@ -553,7 +559,11 @@ fn tp6_holds_every_routed_layer_in_six_equal_slices() {
     let experts = item(&ranks[0], "routed expert weights");
     assert!(ranks.iter().all(|d| item(d, "routed expert weights") == experts));
     assert!(experts < item(&sparks(&tp4)[1], "routed expert weights"));
-    // The package exports tp6: each rank's scratch is its 4096-row capacity, not the estimate.
-    assert!(ranks.iter().all(|d| item(d, "expert package scratch") == 987_654_321));
+    // The package exports tp6: each rank's owners take its capacities (decode m256, prefill m4096), not the estimate.
+    let owners = admission::RuntimeSizing { unit_rows: 2752, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
+        logit_rows: 64, waves: 3 }.spark_executions().unwrap();
+    assert_eq!((owners.decode[0].capacity, owners.prefill.unit_rows, owners.prefill.buffered_units), (64, 2752, 3));
+    let row = 6144 * 2 + 4 * 8 + 6144 * 2;
+    assert!(ranks.iter().all(|d| item(d, "execution owners") == 102_837_248 + 64 * row + 987_654_321 + 2752 * row));
     assert_eq!(tp6.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
 }

@@ -91,10 +91,13 @@ impl RuntimeSizing {
         }
         cfg.release_geometry().map_err(|e| manifest(e.to_string()))
     }
-    /// Execution slots every Spark rank runs (the shared rule, `plan::layout::spark_execution_slots`):
-    /// one per prefill wave in flight; decode keeps one request per rank.
-    pub fn execution_slots(self) -> u8 {
-        u8::try_from(self.waves.max(1)).unwrap_or(u8::MAX)
+    /// The typed Spark owners every rank allocates (the shared family admission on the NVFP4
+    /// package's export ladder): one decode owner of [`DECODE_ROWS`], and the one prefill owner at
+    /// the export covering a unit, buffering a unit per wave in flight. Plan, serve and golden seal
+    /// this value.
+    pub fn spark_executions(self) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+        let exports = crate::plan::spark_executions::SparkBackend::Fp8.exports();
+        crate::plan::spark_executions::admit_family("minimax_m3", &exports, None, self.unit_rows as u64, self.waves as u64)
     }
     /// The one Spark endpoint decode and prefill share: a wave of up to a unit's rows, BF16 in.
     pub fn spark_endpoint(self) -> std::result::Result<cuteafd_core::SparkEndpoint, std::num::TryFromIntError> {
@@ -469,6 +472,24 @@ pub fn default_draft_rings(sequences: usize, decode_rows: usize) -> usize {
 /// the coordinator): an estimate, until measured worker admission replaces it.
 pub const REMOTE_SCRATCH_ESTIMATE_BYTES: u64 = 512 << 20;
 
+/// One typed owner's bytes on a Spark rank of `world`, as the FP8-family worker admits it
+/// (`Fp8Modules::workspace_bytes`; a MiniMax rank holds one package group): the package scratch at
+/// the export covering the owner's rows, from the package's layout for the world when the
+/// coordinator has it (else [`REMOTE_SCRATCH_ESTIMATE_BYTES`] scaled by the export, as the shared
+/// legacy bound scales its 4096-row figure), the BF16 input, routes and BF16 output planes at its
+/// capacity, and pinned route staging per queued unit.
+pub fn spark_owner_bytes(package: Option<&Value>, world: usize, extent: cuteafd_core::OwnerExtent)
+    -> Result<cuteafd_core::OwnerBytes> {
+    let geometry = cuteafd_core::ExpertGeometry::MINIMAX_M3;
+    let (hidden, topk) = (u64::from(geometry.hidden), u64::from(geometry.topk));
+    let scratch = match package.filter(|p| p["layouts"][format!("tp{world}")].is_object()) {
+        Some(package) => expert_workspace(package, world, extent.capacity as usize)?,
+        None => REMOTE_SCRATCH_ESTIMATE_BYTES * u64::from(extent.compiled.max(80)) / 4096,
+    };
+    Ok(cuteafd_core::OwnerBytes { scratch, io: product(&[u64::from(extent.capacity), 4 * hidden + 8 * topk])?,
+        pinned_staging: product(&[u64::from(extent.staging_rows), topk, 8])? })
+}
+
 /// What one coordinator admits, beside its checkpoint and manifests.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -511,15 +532,12 @@ pub struct Recipe {
     pub graphs: crate::placement::inventory::StartupGraphs<usize>,
     /// The one Spark endpoint decode and every prefill wave share ([`RuntimeSizing::spark_endpoint`]).
     pub endpoints: Vec<cuteafd_core::SparkEndpoint>,
-    /// The package scratch on each Spark rank, when the package exports the world's layout.
-    pub remote_scratch: Option<u64>,
-    /// Execution slots every Spark rank runs ([`RuntimeSizing::execution_slots`]).
-    pub execution_slots: u8,
-    /// One execution slot's workspace on a Spark rank, as the worker admits it: the slot's BF16
-    /// inputs, routes and outputs at a unit's rows plus the package scratch (exported, or the estimate).
-    pub slot_workspace: u64,
-    /// Every Spark rank's bytes beside its experts: transport, every execution slot's workspace and
-    /// the runtime residual.
+    /// The typed owners every Spark rank allocates ([`RuntimeSizing::spark_executions`]).
+    pub executions: cuteafd_core::SparkExecutions,
+    /// Whether the package scratch is the package's own export for the Spark world (else the estimate).
+    pub exported_scratch: bool,
+    /// Every Spark rank's bytes beside its experts: transport, the typed owners' workspace and staging
+    /// ([`spark_owner_bytes`], summed as the worker sums them) and the runtime residual.
     pub remote_reserved: u64,
     pub reservations: Reservations,
 }
@@ -538,16 +556,17 @@ impl Recipe {
         let all_remote = crate::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.moe.iter().enumerate()
             .filter_map(|(layer, &moe)| moe.then_some(layer)).collect(), spark_ranks: sizing.spark_ranks, prefill_lanes: 1 };
         let io = all_remote.rank_endpoints_io(0, catalog.routed_experts().geometry()?, &endpoints, request.rings)?;
-        let world = format!("tp{}", sizing.spark_ranks);
-        let remote_scratch = package.filter(|p| p["layouts"][&world].is_object())
-            .map(|p| expert_workspace(p, sizing.spark_ranks, sizing.unit_rows)).transpose()?;
-        let scratch = remote_scratch.unwrap_or(REMOTE_SCRATCH_ESTIMATE_BYTES);
+        let exported_scratch = package.is_some_and(|p| p["layouts"][format!("tp{}", sizing.spark_ranks)].is_object());
         let residual = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES;
-        // The worker sizes every execution slot alike: its I/O (the rank's intake) and the scratch.
-        let (execution_slots, slot_workspace) = (sizing.execution_slots(), sum([io.intake, scratch])?);
-        let remote_reserved = sum([product(&[slot_workspace, u64::from(execution_slots)])?, io.host_exchange,
-            io.row_indices, io.endpoint_staging, io.mapped_rings, residual])?;
-        let remote = RemoteReserve { serve: remote_reserved, load: sum([scratch, residual])? };
+        // The worker's owner sum: every owner's scratch and I/O once, staging per queued unit.
+        let executions = sizing.spark_executions()?;
+        let owner = |extent| spark_owner_bytes(package, sizing.spark_ranks, extent);
+        let owners = executions.workspace_bytes(owner)?.and_then(|bytes| bytes.total())
+            .ok_or(AdmissionError::Overflow("Spark owner workspace"))?;
+        let prefill_scratch = executions.owners().last().map(owner).transpose()?.map_or(0, |bytes| bytes.scratch);
+        let remote_reserved = sum([owners, io.intake, io.host_exchange, io.row_indices, io.endpoint_staging,
+            io.mapped_rings, residual])?;
+        let remote = RemoteReserve { serve: remote_reserved, load: sum([prefill_scratch, residual])? };
         let with_vision = RemoteReserve { serve: sum([remote.serve, request.spark_vision_bytes])?,
             load: sum([remote.load, request.spark_vision_bytes])? };
         let onboarding = onboard_layers(catalog, cfg, sizing, request.spark_budget, with_vision, &request.local_layers);
@@ -575,8 +594,8 @@ impl Recipe {
         let reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes)
                 .context("MiniMax drafter reservation overflow")?, local_experts: onboarding.local_bytes,
             expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
-        Ok(Self { request, cache, ledger, programs, weights, onboarding, graphs, endpoints, remote_scratch,
-            execution_slots, slot_workspace, remote_reserved, reservations })
+        Ok(Self { request, cache, ledger, programs, weights, onboarding, graphs, endpoints, executions,
+            exported_scratch, remote_reserved, reservations })
     }
 
     /// The Spark working set once onboarding chose the coordinator's routed layers: one transport.
@@ -691,8 +710,8 @@ pub(crate) mod tests {
             assert_eq!(ledger.bytes("spark_intake"), Some(lanes as u64 * 3 * 256 * 6144 * 2));
             assert_eq!(ledger.bytes("spark_intake"), Some(crate::serving_capacity::prefill_return_bytes(lanes as u64, 256, 3, 6144)));
             assert_eq!(extend_launches(sizing, 1024), 16 + 1 + lanes as u64 - 1);
-            // One execution slot per wave in flight on every rank.
-            assert_eq!(sizing.execution_slots(), lanes as u8);
+            // One prefill owner buffering a unit per wave in flight on every rank.
+            assert_eq!(sizing.spark_executions().unwrap().prefill.buffered_units, lanes as u8);
         }
         assert!(RuntimeSizing { waves: 0, ..sizing() }.validate(&config()).is_err());
         assert!(RuntimeSizing { waves: 5, ..sizing() }.validate(&config()).is_err());
@@ -730,7 +749,9 @@ pub(crate) mod tests {
         let ledger = RuntimeLedger::new(&config(), sizing, &ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap()).unwrap();
         assert_eq!(ledger.bytes("residual"), Some(3 * 2752 * 6144 * 4));
         assert_eq!(ledger.bytes("spark_intake"), Some(3 * 6 * 2752 * 6144 * 2));
-        assert_eq!(sizing.execution_slots(), 3);
+        let executions = sizing.spark_executions().unwrap();
+        assert_eq!((executions.prefill.unit_rows, executions.prefill.compiled_capacity, executions.prefill.buffered_units),
+            (2752, 4096, 3));
         // A program exported for fewer rows than a unit is refused.
         let mut manifest = programs_manifest();
         manifest["programs"].as_array_mut().unwrap().iter_mut().filter(|p| p["name"] == "minimax_norm")
@@ -815,11 +836,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// One Spark endpoint carries decode and every wave; each rank runs one execution slot per wave
-    /// in flight, every slot the worker's whole workspace (its BF16 I/O at a unit's rows and the
-    /// package scratch), so a second wave reserves exactly one more.
+    /// One Spark endpoint carries decode and every wave; each rank allocates the typed owners: one
+    /// decode owner (m80 scratch, 64 rows of I/O) and one prefill owner (the unit's covering export
+    /// scratch once, a unit's I/O), so another wave in flight adds only its pinned route staging.
     #[test]
-    fn every_wave_in_flight_reserves_one_execution_slot_per_rank() -> anyhow::Result<()> {
+    fn every_wave_in_flight_adds_only_its_route_staging_to_the_typed_owners() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
         let checkpoint = Checkpoint::open(dir.path())?;
@@ -832,17 +853,21 @@ pub(crate) mod tests {
             draft_rings: 0, draft_staging: 0, host_embedding: false, startup_graphs: false,
             rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
                 slot_bytes: ring.slot_bytes, alignment: ring.alignment } });
-        let intake = 4096 * (6144 * 2 + 4 * 8 + 6144 * 2);
+        let row = 6144 * 2 + 4 * 8 + 6144 * 2;
         for package in [None, Some(expert_manifest())] {
-            let scratch = if package.is_some() { 987_654_321 } else { REMOTE_SCRATCH_ESTIMATE_BYTES };
+            // The fixture exports m256 and m4096: decode rows take m256's scratch there, the estimate's m80 share here.
+            let (decode, prefill) = if package.is_some() { (102_837_248, 987_654_321) }
+                else { (REMOTE_SCRATCH_ESTIMATE_BYTES * 80 / 4096, REMOTE_SCRATCH_ESTIMATE_BYTES) };
             let one = recipe(1, package.as_ref())?;
             assert_eq!(one.endpoints, [RuntimeSizing { unit_rows: 4096, ..sizing() }.spark_endpoint()?]);
-            assert_eq!((one.execution_slots, one.slot_workspace), (1, intake + scratch));
+            assert_eq!(one.exported_scratch, package.is_some());
+            let owners = one.executions.workspace_bytes(|extent| spark_owner_bytes(package.as_ref(), 3, extent))?.unwrap();
+            assert_eq!((owners.device_bytes, owners.pinned_bytes), (decode + 64 * row + prefill + 4096 * row, (64 + 4096) * 4 * 8));
             for lanes in [2, 3, 4] {
                 let waves = recipe(lanes, package.as_ref())?;
                 assert_eq!(waves.endpoints, one.endpoints, "one link at every wave count");
-                assert_eq!(waves.execution_slots, lanes as u8);
-                assert_eq!(waves.remote_reserved - one.remote_reserved, (lanes as u64 - 1) * (intake + scratch));
+                assert_eq!(waves.executions.prefill.buffered_units, lanes as u8);
+                assert_eq!(waves.remote_reserved - one.remote_reserved, (lanes as u64 - 1) * 4096 * 4 * 8);
                 assert_eq!(waves.working_set().prefill_lanes, 1);
             }
         }

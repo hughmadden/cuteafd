@@ -177,37 +177,36 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let slicing = crate::plan::experts::checkpoint_spark_recipe(input.checkpoint(), sizing.spark_ranks,
         &recipe.onboarding.spark_layers)?.slicing;
     let working = recipe.working_set();
-    let (remote_scratch, remote_basis) = recipe.remote_scratch.map_or(
-        (admission::REMOTE_SCRATCH_ESTIMATE_BYTES, Basis::Estimated), |bytes| (bytes, Basis::Exact));
     for rank in 0..sizing.spark_ranks {
         let assigned = SparkAssignment::from_catalog(catalog, &working, rank,
             SparkResidentLayout::Fp8 { world: sizing.spark_ranks, rank, slicing }, &recipe.endpoints, recipe.request.rings)?;
         let mut items = vec![Item::new(Category::Experts, "routed expert weights", "NVFP4 W4A4", assigned.resident_bytes, Basis::Exact),
-            cuteafd_core::memory_layout::spark_runtime_residual(),
-            Item::new(Category::Workspace, "expert package scratch", "exported capacity or remote estimate", remote_scratch, remote_basis)];
+            cuteafd_core::memory_layout::spark_runtime_residual()];
         for (name, bytes) in [("expert intake", assigned.io.intake), ("host expert exchange", assigned.io.host_exchange),
             ("expert row indices", assigned.io.row_indices), ("endpoint response prefixes", assigned.io.endpoint_staging),
             ("rdma rings", assigned.io.mapped_rings)] { items.push(Item::new(Category::Transport, name, "BF16", bytes, Basis::Formula)); }
-        // Slots beyond the first, each the intake and package scratch above (the worker sizes them alike).
-        if recipe.execution_slots > 1 {
-            items.push(Item::new(Category::Workspace, "execution slots", format!("{} more", recipe.execution_slots - 1),
-                recipe.slot_workspace * u64::from(recipe.execution_slots - 1), remote_basis));
-        }
         if encoder.spark_ranks().contains(&rank) { add_vision(&mut items); }
-        let used: u64 = items.iter().map(|i| i.bytes).sum();
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: budget, items, kv_tokens: 0 };
+        // The typed owners, through the owner sum the worker admits (one decode, one prefill owner).
+        crate::plan::layout::spark_slots::charge_owners(&mut device, &recipe.executions,
+            |extent| Ok(admission::spark_owner_bytes(package.as_ref(), sizing.spark_ranks, extent)?))?;
+        let used: u64 = device.items.iter().map(|i| i.bytes).sum();
         ensure!(used <= budget, "MiniMax Spark rank {rank} needs {used} bytes, budget {budget}");
         *report.bytes_by_owner.entry("routed expert weights".into()).or_default() += assigned.resident_bytes;
-        memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: budget, items, kv_tokens: 0 });
+        memory.devices.push(device);
     }
-    memory.notes.push(format!("MiniMax shape: prefill {lanes} waves of {rows} rows (span {span}) on one Spark link with \
-        {} execution slots per rank, sequences {sequences}, decode tile {}, context {}; Spark replies land in GPU planes; \
-        exported scratch is not scaled by runtime rows", recipe.execution_slots, recipe.programs.decode_capacity(), sizing.context));
+    memory.notes.push(format!("MiniMax shape: prefill {lanes} waves of {rows} rows (span {span}) on one Spark link; each \
+        rank's typed owners: one decode owner and one prefill owner buffering {lanes} units; sequences {sequences}, decode \
+        tile {}, context {}; Spark replies land in GPU planes; exported scratch is not scaled by runtime rows",
+        recipe.programs.decode_capacity(), sizing.context));
     if opts.host_embedding {
         report.bytes_by_owner.insert("host-mapped embedding".into(), edge(Component::Embedding));
         memory.notes.push("embedding placement: host (mapped BF16); untied LM head remains on GPU".into());
     }
     report.attention_placement = AttentionPlacement::Heads;
     report.encoder = Some(encoder);
-    if recipe.remote_scratch.is_none() { memory.notes.push("Remote expert scratch reserves 512 MiB per rank until measured worker admission; it is not an exact remote allocation ledger".into()); }
+    if !recipe.exported_scratch { memory.notes.push("Remote expert scratch is estimated (512 MiB at the m4096 export, scaled by \
+        export) until the package's layout for the Spark world is installed beside PROGRAMS.json; it is not an exact remote \
+        allocation ledger".into()); }
     Ok(memory)
 }
