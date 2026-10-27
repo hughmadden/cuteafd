@@ -269,7 +269,10 @@ pub(crate) fn sequence_units(span: usize, unit_rows: usize, waves: usize, layers
 
 /// The executor's exact order. Units enter free slots in order. Each turn
 /// serves one unit: land its pending wave, then run its layers until its next
-/// wave is sent or it ends. Turns rotate in send order, so waves land in
+/// wave is sent, it ends, or it ran a local layer followed by another local
+/// layer while another unit is live (runs of local layers interleave across
+/// units, as the paired encoder lanes did; the layer before a wave keeps the
+/// turn so the wave is sent at once). Turns rotate in send order, so waves land in
 /// dispatch order. A unit admitted into a freed slot is served before any
 /// older unit lands again, so its first wave queues on the Sparks behind the
 /// older units' last waves: the transport never drains between units.
@@ -325,6 +328,17 @@ pub(crate) fn prefill_schedule(routes: &[FfnRoute], units: &[Unit], waves: usize
                 pending[unit] = true;
             } else {
                 steps.push(Step::Local { layer, unit });
+                // Yield the turn after a local layer whose successor is local
+                // too, when another unit is live: dense runs interleave across
+                // units. The last local layer before a Spark layer keeps the
+                // turn, so the unit's next wave is sent without delay.
+                // Only to a unit that can run a local layer itself (no wave to
+                // land first): yielding to one that must land would wait on
+                // its Sparks before this unit's next GPU-only layer.
+                let other_local = live.iter().any(|&other| other != unit && !pending[other]
+                    && attend[other] < units[other].layers.end && routes[attend[other]] == FfnRoute::Local);
+                if other_local && attend[unit] < units[unit].layers.end
+                    && routes[attend[unit]] == FfnRoute::Local { break; }
             }
         }
         if !pending[unit] && attend[unit] == units[unit].layers.end {
@@ -666,6 +680,27 @@ mod tests {
             }
         }
         (gpu, idle)
+    }
+
+    /// Two-RTX V4.1 (layers 0-18 local, 19-39 Spark): units interleave their
+    /// local layers instead of one unit running all nineteen before the next
+    /// starts (hunt A rank 3). Unit k+1 still attends a layer only after unit k.
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_layer_runs_interleave_across_units() -> anyhow::Result<()> {
+        let routes = (0..40).map(|l| if l < 19 { FfnRoute::Local } else { FfnRoute::Spark }).collect::<Vec<_>>();
+        let units = sequence_units(8256, 2752, 3, 40)?;
+        let steps = prefill_schedule(&routes, &units, 3)?;
+        check_drivers(&routes, &units, 3, &steps).await?;
+        let at = |want: Step| steps.iter().position(|step| *step == want).expect("step scheduled");
+        // Unit 1 starts its local layers before unit 0 finished its own.
+        assert!(at(Step::Attention { layer: 0, unit: 1 }) < at(Step::Attention { layer: 2, unit: 0 }),
+            "unit 1 waited for unit 0's local layers");
+        assert!(at(Step::Attention { layer: 0, unit: 2 }) < at(Step::Attention { layer: 3, unit: 0 }));
+        // Causal order: unit k+1 attends layer L after unit k.
+        for layer in 0..40 { for unit in 1..units.len() {
+            assert!(at(Step::Attention { layer, unit: unit - 1 }) < at(Step::Attention { layer, unit }));
+        } }
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
