@@ -224,6 +224,10 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     }
     // As on one RTX: every hook polls in its unit's device-ordered chain (#815).
     async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+        // As on one RTX: the slot's previous unit committed without a host
+        // drain; drain before this unit rewrites the pass's pinned staging.
+        if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+        crate::shared::spark_waves::healthy()?;
         let chain = unit_chain(self.slots[unit.slot].pass)?;
         scoped(chain, self.begin_unit_inner(unit)).await
     }
@@ -277,8 +281,14 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         }).await
     }
     async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
-        if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+        // As on one RTX: every window and source was published on the device
+        // during the unit's layers, so its cache commit enqueues nothing and the
+        // commit is host bookkeeping. Without a device order (host-ordered peer
+        // transfers) the unit's work is drained first, as before.
         crate::shared::spark_waves::healthy()?;
+        if self.slots[unit.slot].pass.chain.is_some() && unit_chain(self.slots[unit.slot].pass)?.is_none() {
+            self.slots[unit.slot].pass.drain_chain()?;
+        }
         self.commit_unit_inner(unit).await
     }
 }
@@ -317,6 +327,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit, complete: false,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
+        // Every unit's chained work completes before the decoder replay reads it.
+        for slot in &hooks.slots { if slot.pass.chain.is_some() { slot.pass.drain_chain()?; } }
+        crate::shared::spark_waves::healthy()?;
         hooks.complete = true;
         Ok(())
     }

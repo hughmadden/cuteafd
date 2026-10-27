@@ -79,14 +79,12 @@ impl V41PrefillTimes {
         let end = (next + chunk_rows).min(tokens);
         if !streamed { return V41Unit::Single(next..end); }
         let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
-        if whole && waves > 1 && chunk_rows % 64 == 0 {
-            // The shared cut (PLAN "Prefill contract"): balanced units of at
-            // most reserve / k rows, a multiple of k when they stay half full.
-            if let Ok(units) = crate::shared::prefill_pipeline::prefill_units(tokens - next, chunk_rows, waves,
-                cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize) {
-                return V41Unit::Stream(units.into_iter().map(|unit| next + unit.start..next + unit.end).collect());
-            }
-        }
+        // V4.1 cuts fixed units of exactly the registered prefill rows and one
+        // tail: its owners capture graphs only at that width
+        // (graph_policy::captures_shape), and an uncaptured width runs every
+        // site eagerly, several with host waits. The shared balanced cut
+        // (prefill_units) would make every unit an uncaptured width.
+        let _ = waves;
         let mut chunks = vec![next..end];
         let mut next = end;
         while next < tokens && (whole || chunks.len() < 2) {
@@ -487,17 +485,15 @@ mod prefill_tests {
     }
 
     #[test]
-    fn whole_streams_take_the_shared_balanced_units() {
+    fn whole_streams_cut_fixed_captured_units_and_one_tail() {
         let times = V41PrefillTimes::default();
-        // Three units of the 8192-row reserve: an 8K prompt runs as 3 balanced units.
+        // Every unit but the tail is exactly the registered (captured) width.
         assert_eq!(stream(times.encoder_unit(8192, 2752, 3, 0, 0, true, ChunkBudget::WHOLE)),
             [0..2752, 2752..5504, 5504..8192]);
-        // 64K: a multiple of three units, none over 2752 rows.
+        assert_eq!(stream(times.encoder_unit(8192, 1024, 3, 0, 0, true, ChunkBudget::WHOLE)).len(), 8);
         let units = stream(times.encoder_unit(65536, 2752, 3, 0, 0, true, ChunkBudget::WHOLE));
-        assert_eq!(units.len() % 3, 0);
-        assert!(units.iter().all(|unit| unit.len() <= 2752));
+        assert!(units[..units.len() - 1].iter().all(|unit| unit.len() == 2752));
         assert_eq!((units[0].start, units.last().unwrap().end), (0, 65536));
-        // Cached prefixes offset the units; bounded budgets keep the old cut.
         assert_eq!(stream(times.encoder_unit(8492, 2752, 3, 300, 300, true, ChunkBudget::WHOLE)),
             [300..3052, 3052..5804, 5804..8492]);
         let budget = ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 };

@@ -740,7 +740,12 @@ impl BackboneRouterWave<'_, '_> {
         // Route-policy tracing reads routes from the pinned staging on the
         // host, so it keeps the wait too.
         let device_read = self.device_read();
-        if !cold && device_read {
+        // A shape that is never captured (a prompt's tail unit) has no capture
+        // to follow its eager run, so it chains like a replay instead of
+        // stalling the issuing thread on every layer.
+        let captures = super::graph_policy::captures_shape(rows)
+            && !crate::shared::decode_graph::census::eager("layer_row");
+        if (!cold || !captures) && device_read {
             unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
         } else {
             self.stream.wait().await?;
