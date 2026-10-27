@@ -226,6 +226,32 @@ fn read_ports_with_net(root: &Path, net_root: &Path) -> Vec<PortSample> {
                     counters.insert(key, value);
                 }
             }
+            let netdevs: BTreeSet<_> = std::fs::read_dir(path.join("gid_attrs/ndevs")).into_iter()
+                .flatten().flatten().filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty() && !name.contains('/') && name != "." && name != "..")
+                .collect();
+            // Some mlx5 netdev aliases expose the same physical PFC counters.
+            // Take one successful table, not a sum over aliases.
+            for name in &netdevs {
+                let mut pause = BTreeMap::new();
+                for directory in ["statistics", "hw_counters"] {
+                    if let Ok(entries) = std::fs::read_dir(net_root.join(name).join(directory)) {
+                        for entry in entries.flatten() {
+                            let key = entry.file_name().to_string_lossy().into_owned();
+                            if key.contains("prio") && key.ends_with("_pause") {
+                                if let Some(value) = std::fs::read_to_string(entry.path()).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+                                    pause.insert(format!("pfc/{key}"), value);
+                                }
+                            }
+                        }
+                    }
+                }
+                if pause.is_empty() && root == Path::new("/sys/class/infiniband") {
+                    pause = crate::bond::pause_counters(name).unwrap_or_default();
+                }
+                if !pause.is_empty() { counters.extend(pause); break; }
+            }
             result.push(PortSample { device: device.file_name().to_string_lossy().into_owned(), port,
                 state: std::fs::read_to_string(path.join("state")).ok().map(|s| s.trim().into()),
                 link_gbps: std::fs::read_to_string(path.join("rate")).ok()
@@ -471,7 +497,12 @@ mod tests {
         std::fs::write(port.join("gid_attrs/ndevs/0"), "net0\n").unwrap();
         std::fs::create_dir_all(root.join("net/net0")).unwrap();
         std::fs::write(root.join("net/net0/mtu"), "9000\n").unwrap();
+        std::fs::create_dir_all(root.join("net/net0/statistics")).unwrap();
+        std::fs::write(root.join("net/net0/statistics/rx_prio3_pause"), "5481796").unwrap();
+        std::fs::write(root.join("net/net0/statistics/tx_prio3_pause"), "4525150").unwrap();
         let ports = read_ports_with_net(&root, &root.join("net"));
+        assert_eq!(ports[0].counters["pfc/rx_prio3_pause"], 5_481_796);
+        assert_eq!(ports[0].counters["pfc/tx_prio3_pause"], 4_525_150);
         assert_eq!(ports[0].mtu, Some(9000));
         assert_eq!(ports[0].counters["port_xmit_data"], 492);
         assert_eq!(ports[0].counters["hw_counters/port_xmit_data"], 1824);

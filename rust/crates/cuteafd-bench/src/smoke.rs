@@ -1106,7 +1106,7 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
                         pair(p.foreign_sent_bytes,p.foreign_received_bytes)));
                 }
             }
-            for caveat in &o.fabric_caveats { out.push_str(&format!("\nA/B caveat {}: {caveat}\n",e.name)); }
+            for caveat in &o.fabric_caveats { out.push_str(&format!("\nFabric note {}: {caveat}\n",e.name)); }
         }
     }
     out
@@ -1525,8 +1525,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         outcome.error.get_or_insert_with(|| Cancelled(signal).to_string());
     }
     outcome.fabric_caveats = crate::fabric::caveats(&outcome.fabric);
-    outcome.ab_verdict = if outcome.fabric_caveats.is_empty() { "eligible" } else { "rerun" }.into();
-    for caveat in &outcome.fabric_caveats { let _ = writeln!(log, "fabric A/B caveat: {caveat}"); }
+    outcome.ab_verdict = if outcome.fabric.iter().any(|p| !crate::fabric::rerun_reasons(p).is_empty()) { "rerun" } else { "eligible" }.into();
+    for caveat in &outcome.fabric_caveats { let _ = writeln!(log, "fabric note: {caveat}"); }
     outcome.total_s = Some(started.elapsed().as_secs_f64());
     outcome.finished = crate::report::now_rfc3339();
     outcome

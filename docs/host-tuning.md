@@ -183,6 +183,21 @@ Tests use `TUNE_SYSFS_ROOT=PATH`: sysfs files live under PATH, proc files
 under PATH/proc, and external hardware probes are suppressed. Do not set
 this fixture override for real host tuning.
 
+## Lossless RoCE and results
+
+A lossless RoCE class maps the engine's DSCP marking to a dedicated switch
+priority, with Priority Flow Control (PFC) enabled for that priority on the
+switch and NICs. PFC pauses that class under pressure instead of dropping its
+packets. It reduces retransmits and their goodput cost, not numerical errors:
+**cuteafd works correctly without lossless RoCE and results remain valid**.
+
+Consider it when retransmits exceed about 0.5% of packets under sustained load
+(at least 2 GB moved per measured port). Go-back-N resends recover the data but
+may lower throughput. Check cabling and link errors too. Pause counts alone do
+not establish a pause storm; zero ECN marking is normal for Not-ECT/PFC traffic.
+See [#759](https://github.com/tpurtell/cuteafd/pull/759) for this cluster's
+DSCP 26 / priority 3 switch and NIC configuration and measured evidence.
+
 ## MikroTik CRS8xx lossless RoCE
 
 **Prepared, not applied. Do not merge until TJ applies and measures.** Stop all
