@@ -23,6 +23,17 @@ pub(super) fn unit_cuts(rows: usize, unit_rows: usize, waves: usize, logit_rows:
     else { prefill_units(rows, unit_rows, waves, MIN_UNIT_ROWS) }
 }
 
+/// The waves a call of `admitted` waves cuts its units with, and the waves it keeps in flight.
+pub(super) fn call_waves(admitted: usize, overlap: Overlap) -> Result<(usize, usize)> {
+    match overlap {
+        Overlap::Admitted => Ok((admitted, admitted)),
+        Overlap::Identity { waves } => {
+            ensure!((1..=admitted).contains(&waves), MiniMaxError::Invalid("identity waves beyond the admitted waves"));
+            Ok((1, waves))
+        }
+    }
+}
+
 /// A call's units from its `cuts`: every layer through `last_layer` of its one request, slots taken in turn.
 pub(super) fn call_units(cuts: Vec<std::ops::Range<usize>>, waves: usize, last_layer: usize) -> Vec<Unit> {
     cuts.into_iter().enumerate().map(|(index, rows)| Unit { index, sequence: 0, rows, layers: 0..last_layer + 1,
@@ -127,10 +138,11 @@ impl PrefillHooks for UnitHooks<'_, '_> {
 
 impl<'a> Execution<'a> {
     /// The units of a single-sequence prefill call of `rows` rows through `last_layer`, the head projecting
-    /// `logit_rows` of them, and the waves it keeps in flight.
-    pub(super) fn units(&self, rows: usize, logit_rows: usize, last_layer: usize) -> Result<(Vec<Unit>, usize)> {
-        let waves = self.waves;
-        Ok((call_units(unit_cuts(rows, self.unit_rows, waves, logit_rows, self.logit_rows)?, waves, last_layer), waves))
+    /// `logit_rows` of them, and the waves it keeps in flight (`overlap`).
+    pub(super) fn units(&self, rows: usize, logit_rows: usize, last_layer: usize, overlap: Overlap)
+        -> Result<(Vec<Unit>, usize)> {
+        let (cut, waves) = call_waves(self.waves, overlap)?;
+        Ok((call_units(unit_cuts(rows, self.unit_rows, cut, logit_rows, self.logit_rows)?, waves, last_layer), waves))
     }
 
     /// Runs a single-sequence prefill call's `units` on the shared executor with up to `waves` units' Spark waves
@@ -354,6 +366,30 @@ mod tests {
         }
         assert!(units.contains("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(super) struct Sent"));
         assert!(!units.contains(&["Wave", "Ticket"].concat()) && !units.contains("Allocation"));
+    }
+
+    /// The identity check's arms run the same units at every wave count: cut with one wave, slots taken
+    /// in turn among the waves in flight, never more units than the admitted slots; a full-span call cuts as
+    /// serving does, so the gate covers serving's cuts. Waves beyond the admitted ones are refused.
+    #[test] fn minimax_identity_units_cut_alike_at_every_wave_count() -> Result<()> {
+        for (unit_rows, admitted) in SHAPES {
+            let span = unit_rows * admitted;
+            for rows in (65..=span).step_by(41).chain([span]) {
+                let reference = unit_cuts(rows, unit_rows, 1, 1, 64)?;
+                for waves in 1..=admitted {
+                    let (cut, run) = call_waves(admitted, Overlap::Identity { waves })?;
+                    assert_eq!((cut, run), (1, waves));
+                    let units = call_units(unit_cuts(rows, unit_rows, cut, 1, 64)?, run, 59);
+                    ensure!(units.iter().map(|u| u.rows.clone()).eq(reference.iter().cloned()) && units.len() <= admitted
+                        && units.iter().all(|u| u.slot == u.index % waves), "{admitted} x {unit_rows}, {rows} rows at {waves} waves");
+                }
+            }
+            ensure!(unit_cuts(span, unit_rows, admitted, 1, 64)? == unit_cuts(span, unit_rows, 1, 1, 64)?,
+                "{admitted} x {unit_rows}: a full call cuts as serving does");
+        }
+        assert_eq!(call_waves(3, Overlap::Admitted)?, (3, 3));
+        assert!(call_waves(2, Overlap::Identity { waves: 3 }).is_err() && call_waves(2, Overlap::Identity { waves: 0 }).is_err());
+        Ok(())
     }
 
     /// Media rows land in the call's embedded rows before the step runs (`MiniMaxBackend::execute`), so a span

@@ -1,5 +1,5 @@
 //! Teacher-forced qualification through the serving programs and paged cache.
-use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES, PAGE_ROWS}, execution::{Execution, ExpertExecutor},
+use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES, PAGE_ROWS}, execution::{Execution, ExpertExecutor, Overlap},
     native::Native, prefix::{MiniMaxPrefix, Placement}, transaction::Step, MiniMaxError};
 use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, memory::device::Allocation, prefix::view,
     token_io::{EmbedPlacement, TokenEmbedding}};
@@ -60,6 +60,12 @@ pub(crate) struct GoldenArgs {
     resume: bool,
     #[arg(long)]
     check_prefix: bool,
+    /// Prefill the first window at one wave and at --prefill-waves (two or more), on the same units (cut
+    /// with one wave), each from an empty cache, and require bit-identical last-row outputs and K, V and
+    /// index bytes of every executed layer: the prefill contract's N=1-vs-N gate. Run it with
+    /// CUTEAFD_SPARK_INTAKE=pinned to isolate the executor from the intake.
+    #[arg(long)]
+    check_waves: bool,
     /// Read and validate checkpoint headers without loading a native library.
     #[arg(long)]
     check_headers: bool,
@@ -100,6 +106,8 @@ fn selection(args: &GoldenArgs) -> Result<Vec<usize>> {
     ensure!(args.last_layer < 60 && args.device >= 0, MiniMaxError::Invalid("golden layer or device"));
     ensure!(args.prefill_waves == 1 || args.prefill_rows % 64 == 0,
         MiniMaxError::Invalid("golden --prefill-waves above one needs --prefill-rows on whole 64-row pages"));
+    ensure!(!args.check_waves || args.prefill_waves >= 2,
+        MiniMaxError::Invalid("golden --check-waves compares one wave with --prefill-waves of two or more"));
     ensure!((args.peers.is_empty() || super::admission::spark_worlds().contains(&args.peers.len()))
         && args.peers.iter().enumerate().all(|(i, p)| !args.peers[..i].contains(p)),
         MiniMaxError::Invalid("golden peers require distinct endpoints of a Spark world the expert package ships"));
@@ -280,7 +288,7 @@ fn binding(args: &GoldenArgs, reference: &Value, windows: &[Window], checkpoint:
         "index_sha256":hash(&args.snapshot.join("model.safetensors.index.json"))?,
         "last_layer":args.last_layer,"local_layers":args.expert_layers,"peer_count":args.peers.len(),
         "prefill_rows":args.prefill_rows,"prefill_waves":args.prefill_waves,"score_shape":args.score_shape,
-        "check_prefix":args.check_prefix}))
+        "check_prefix":args.check_prefix,"check_waves":args.check_waves}))
 }
 
 fn completed(directory: &Path, binding: &Value, full: bool) -> Result<Option<Value>> {
@@ -314,7 +322,11 @@ impl<'a> ExpertExecutor<'a> for DenseOnly {
 struct Runner<'e, 'a> {
     execution: &'e Execution<'a>, cache: &'e Cache<'a>, embedding: &'e TokenEmbedding<'a>,
     ids: Allocation<'a>, embedded: Allocation<'a>, experts: Box<dyn ExpertExecutor<'a> + 'a>,
-    last_layer: usize, rows: usize,
+    last_layer: usize,
+    /// Rows of a scoring call: one unit.
+    rows: usize,
+    /// Rows of the widest prefill call: one unit per wave (`slot_rows`).
+    span: usize,
 }
 impl Runner<'_, '_> {
     /// One step of `tokens` from `placement`'s frontier, through the serving
@@ -327,7 +339,7 @@ impl Runner<'_, '_> {
         embedded?; drained?;
         let output = self.execution.execute_through(self.embedded.buffer, &batch, &self.cache.layers,
             &mut *self.experts, if prefill {ExpertV2SourceKind::Prefill} else {ExpertV2SourceKind::Decode}, self.last_layer,
-            0..tokens.len())?;
+            0..tokens.len(), Overlap::Admitted)?;
         let values = if let Some(logits) = output { logits.to_host(self.cache.library)? } else {
             let hidden = self.execution.hidden(tokens.len())?;
             let mut bytes = vec![0; tokens.len() * 6144 * 4];
@@ -342,27 +354,108 @@ impl Runner<'_, '_> {
         for chunk in tokens.chunks(self.rows) { self.evaluate(pool, placement, chunk, true)?; }
         Ok(())
     }
+    /// Prefills `tokens` from `placement`'s frontier in calls of the span, run at `overlap`, the head only on
+    /// the last call's last row, and returns that row's output: its logits, or its hidden row in a partial run.
+    fn prefill_span(&mut self, pool: &RefPagePool, placement: &mut Placement, tokens: &[u32], overlap: Overlap)
+        -> Result<Vec<f32>> {
+        let mut last = Vec::new();
+        for (index, chunk) in tokens.chunks(self.span).enumerate() {
+            let (rows, final_call) = (chunk.len(), (index + 1) * self.span >= tokens.len());
+            let batch = Step::begin(&[(&mut *placement, chunk)], pool, self.cache.sequences, self.span,
+                self.cache.context, self.cache.pages)?.batch(self.cache.pages);
+            let embedded = self.embedding.embed(chunk, self.ids.buffer, 1, self.embedded.buffer, self.execution.stream());
+            let drained = self.execution.drain();
+            embedded?; drained?;
+            let output = self.execution.execute_through(self.embedded.buffer, &batch, &self.cache.layers, &mut *self.experts,
+                ExpertV2SourceKind::Prefill, self.last_layer, if final_call {rows - 1..rows} else {rows..rows}, overlap)?;
+            if final_call {
+                last = if let Some(logits) = output { logits.to_host(self.cache.library)? } else {
+                    let hidden = view(self.execution.hidden(rows)?, (rows - 1) * 6144 * 4, 6144 * 4)?;
+                    let mut bytes = vec![0; 6144 * 4];
+                    self.cache.library.copy_d2h(&mut bytes, hidden)?;
+                    floats(&bytes, 6144)?
+                };
+            }
+            placement.committed += rows;
+        }
+        ensure!(!last.is_empty() && last.iter().all(|v| v.is_finite()), "missing or nonfinite last-row output");
+        Ok(last)
+    }
 }
 
 fn placement(pages: Vec<u32>) -> Placement {
     Placement {pages, sequence:0, committed:0, media:RequestMedia::new(Vec::new(), 6144, 0).expect("fixed text geometry")}
 }
 
+/// A committed page's planes in [`state`]'s order: name, page stride, the rows' offset in the page and bytes
+/// per row (K and V, then the index plane's keys and FP32 scales).
+const STATE_PLANES: [(&str, usize, usize, usize); 4] = [("K", KV_PAGE_BYTES, 0, 512), ("V", KV_PAGE_BYTES, 0, 512),
+    ("index keys", INDEX_PAGE_BYTES, 0, 128), ("index scales", INDEX_PAGE_BYTES, 8192, 4)];
+
+/// Every executed layer's cache bytes of `p`'s committed rows: per layer, per page, the [`STATE_PLANES`].
 fn state(cache: &Cache<'_>, p: &Placement, layers: usize) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     for layer in cache.layers.iter().take(layers) {
         for (logical, &page) in p.pages.iter().take(p.committed.div_ceil(64)).enumerate() {
             let rows = (p.committed - logical * 64).min(64);
-            for (plane, stride, offset, bytes) in [(&layer.key, KV_PAGE_BYTES, 0, rows * 512),
-                (&layer.value, KV_PAGE_BYTES, 0, rows * 512), (&layer.index, INDEX_PAGE_BYTES, 0, rows * 128),
-                (&layer.index, INDEX_PAGE_BYTES, 8192, rows * 4)] {
-                let mut values = vec![0; bytes];
-                cache.library.copy_d2h(&mut values, view(plane.buffer, page as usize * stride + offset, bytes)?)?;
+            for (plane, (_, stride, offset, width)) in [&layer.key, &layer.value, &layer.index, &layer.index].into_iter().zip(STATE_PLANES) {
+                let mut values = vec![0; rows * width];
+                cache.library.copy_d2h(&mut values, view(plane.buffer, page as usize * stride + offset, rows * width)?)?;
                 output.extend(values);
             }
         }
     }
     Ok(output)
+}
+
+/// Where two arms' [`state`] bytes of `committed` rows over `layers` layers first differ, by layer, page and plane.
+fn first_difference(a: &[u8], b: &[u8], committed: usize, layers: usize) -> Option<String> {
+    let at = a.iter().zip(b).position(|(x, y)| x != y).or((a.len() != b.len()).then(|| a.len().min(b.len())))?;
+    let mut offset = 0;
+    for layer in 0..layers {
+        for page in 0..committed.div_ceil(64) {
+            let rows = (committed - page * 64).min(64);
+            for (plane, _, _, width) in STATE_PLANES {
+                if at < offset + rows * width { return Some(format!("layer {layer} page {page} {plane} byte {}", at - offset)); }
+                offset += rows * width;
+            }
+        }
+    }
+    Some(format!("byte {at}, past the cache layout"))
+}
+
+/// The calls `--check-waves` prefills a `tokens`-token window in: spans of `unit_rows` x `waves` rows. It compares
+/// one wave with `waves`, which needs two or more and a window of at least two units.
+fn identity_calls(tokens: usize, unit_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!(waves >= 2, MiniMaxError::Invalid("golden --check-waves compares one wave with --prefill-waves of two or more"));
+    ensure!(tokens >= 2 * unit_rows, "MiniMax --check-waves needs a window of at least two prefill units ({} tokens)",
+        2 * unit_rows);
+    let span = unit_rows * waves;
+    Ok((0..tokens).step_by(span).map(|first| first..tokens.min(first + span)).collect())
+}
+
+/// `--check-waves`: the window's tokens prefilled at one wave and at `waves`, on the same units (cut with one
+/// wave), each from an empty cache. The last row's output and every executed layer's K, V and index bytes must
+/// match bit for bit (PLAN "Prefill contract": byte-identical logits and KV at N=1 vs N).
+fn check_waves(runner: &mut Runner<'_, '_>, tokens: &[u32], waves: usize) -> Result<()> {
+    let calls = identity_calls(tokens.len(), runner.rows, waves)?;
+    let layers = runner.last_layer + 1;
+    let mut pool = RefPagePool::new(runner.cache.pages, PAGE_ROWS);
+    let mut arms = Vec::new();
+    for arm in [1, waves] {
+        let mut p = placement(pool.alloc(tokens.len().div_ceil(PAGE_ROWS))?);
+        let output = runner.prefill_span(&pool, &mut p, tokens, Overlap::Identity { waves: arm })?;
+        arms.push((output, state(runner.cache, &p, layers)?));
+    }
+    let output = if runner.last_layer == 59 {"logits"} else {"hidden values"};
+    ensure!(arms[0].0.iter().map(|v| v.to_bits()).eq(arms[1].0.iter().map(|v| v.to_bits())),
+        "MiniMax N=1 vs N={waves} prefill identity failed: the last row's {output} differ");
+    if let Some(at) = first_difference(&arms[0].1, &arms[1].1, tokens.len(), layers) {
+        anyhow::bail!("MiniMax N=1 vs N={waves} prefill identity failed: cache bytes differ at {at}");
+    }
+    println!("MiniMax N=1 vs N={waves} prefill identity: passed ({} tokens in {} calls of up to {} rows; last-row {output} \
+        and {} cache bytes of {layers} layers bit-identical)", tokens.len(), calls.len(), runner.span, arms[0].1.len());
+    Ok(())
 }
 
 fn check_prefix(runner: &mut Runner<'_, '_>, tokens: &[u32]) -> Result<()> {
@@ -613,10 +706,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     if let Some(draft) = &args.draft { return draft_diagnostics(&args, &cfg, &checkpoint, draft); }
     let remote = selection(&args)?;
     if std::env::var_os("CUTEAFD_MINIMAX_DUMP_DIR").is_some() {
-        ensure!(args.window.is_some() && !args.check_prefix,
-            "layer dumps require one --window and a separate --check-prefix invocation");
+        ensure!(args.window.is_some() && !args.check_prefix && !args.check_waves,
+            "layer dumps require one --window and separate --check-prefix and --check-waves invocations");
     }
     let (reference, windows) = references(&args, &cfg)?;
+    if args.check_waves { identity_calls(windows[0].tokens.len(), args.prefill_rows as usize, args.prefill_waves)?; }
     let binding = binding(&args, &reference, &windows, &checkpoint)?;
     let output = args.save_logits.as_ref().context("MiniMax golden requires --save-logits output directory")?;
     std::fs::create_dir_all(output)?;
@@ -643,7 +737,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let (package, local_package) = super::admission::local_package(native)?;
     // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = library.cuda_memory_info()?.0 as u64;
-    let pool_tokens = if args.check_prefix {(context as u64).max(128) * 3 + 256} else {context as u64};
+    // The prefix check holds three windows' pages at once, the wave identity check two.
+    let pool_tokens = [context as u64, if args.check_waves {2 * context as u64} else {0},
+        if args.check_prefix {(context as u64).max(128) * 3 + 256} else {0}].into_iter().max().unwrap_or(0);
     // Serve's recipe for golden's layers, with no Spark ceiling (its workers admit their own
     // layers) and no startup decode graphs (every step runs eagerly).
     let admitted = super::admission::solve(&checkpoint, &read_json(&args.manifest)?, local_package.as_ref(), admission::Request {
@@ -666,8 +762,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             package: &package, embed: EmbedPlacement::Gpu, available, draft: None })?;
     let experts: Box<dyn ExpertExecutor<'_>> = match routed { Some(routed) => Box::new(routed), None => Box::new(DenseOnly) };
     let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids:token_ids, embedded, experts,
-        last_layer:args.last_layer, rows:sizing.unit_rows};
+        last_layer:args.last_layer, rows:sizing.unit_rows, span:sizing.slot_rows()};
     if args.check_prefix {check_prefix(&mut runner, &windows[0].tokens)?;}
+    if args.check_waves {check_waves(&mut runner, &windows[0].tokens, args.prefill_waves)?;}
     let mut results = Vec::new();
     for window in &windows {
         let directory = output.join("windows").join(&window.id);
@@ -677,7 +774,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     }
     execution.drain()?;
     let mut summary = json!({"schema":"cuteafd.minimax.golden/1","binding":binding,"windows":results,
-        "passed":true,"partial_target":args.last_layer != 59,"prefix_byte_exact":args.check_prefix});
+        "passed":true,"partial_target":args.last_layer != 59,"prefix_byte_exact":args.check_prefix,
+        "wave_identity":args.check_waves});
     if args.last_layer == 59 {
         let generated = results.iter().filter_map(|r| r["generated"].as_object()).collect::<Vec<_>>();
         let rows = generated.iter().map(|r| r["scored_tokens"].as_u64().unwrap()).sum::<u64>();
@@ -758,6 +856,44 @@ mod tests {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "minimax-golden", "--snapshot", "/snapshot"]
                 .into_iter().chain(extra.iter().copied())).is_err());
         }
+    }
+
+    /// `--check-waves` compares one wave with two or more, on windows of at least two units, prefilled in calls of
+    /// the span; it is refused at one wave before anything loads.
+    #[test]
+    fn minimax_golden_wave_identity_refuses_short_windows_and_one_wave() -> Result<()> {
+        let checked = args(&["--check-waves", "--prefill-rows", "4096", "--prefill-waves", "2"]);
+        assert!(checked.check_waves && !args(&[]).check_waves);
+        assert_eq!(identity_calls(16384, 4096, 2)?, [0..8192, 8192..16384]);
+        assert_eq!(identity_calls(16384, 2752, 3)?, [0..8256, 8256..16384]);
+        assert_eq!(identity_calls(8192, 4096, 2)?, [0..8192]);
+        let short = identity_calls(8191, 4096, 2).unwrap_err().to_string();
+        assert!(short.contains("at least two prefill units (8192 tokens)"), "{short}");
+        assert!(identity_calls(16384, 4096, 1).unwrap_err().to_string().contains("two or more"));
+        let one = selection(&args(&["--last-layer", "0", "--check-waves"])).unwrap_err().to_string();
+        assert!(one.contains("--check-waves compares one wave"), "{one}");
+        selection(&args(&["--last-layer", "0", "--check-waves", "--prefill-waves", "2"]))?;
+        Ok(())
+    }
+
+    /// A failed identity check names the first differing cache byte by layer, page and plane, in `state`'s
+    /// layout (per layer, per committed page: K, V, index keys, index scales).
+    #[test]
+    fn minimax_golden_identity_names_the_first_differing_byte() {
+        // Two layers of 65 committed rows: a full page, then one row.
+        let page = |rows: usize| rows * (512 + 512 + 128 + 4);
+        let bytes = 2 * (page(64) + page(1));
+        let a = vec![0u8; bytes];
+        assert_eq!(first_difference(&a, &a, 65, 2), None);
+        for (at, named) in [(0, "layer 0 page 0 K byte 0"), (64 * 512, "layer 0 page 0 V byte 0"),
+            (page(64) + 512 + 7, "layer 0 page 1 V byte 7"), (page(64) + page(1) + 64 * 1024 + 3, "layer 1 page 0 index keys byte 3"),
+            (bytes - 1, "layer 1 page 1 index scales byte 3")] {
+            let mut b = a.clone();
+            b[at] = 1;
+            assert_eq!(first_difference(&a, &b, 65, 2).as_deref(), Some(named));
+        }
+        assert_eq!(first_difference(&a, &a[..bytes - 1], 65, 2).as_deref(), Some("layer 1 page 1 index scales byte 3"));
+        assert_eq!(STATE_PLANES.map(|(_, _, offset, width)| (offset, width)), [(0, 512), (0, 512), (0, 128), (8192, 4)]);
     }
 
     #[test]

@@ -142,6 +142,16 @@ enum StepPath {
     Units,
 }
 
+/// How a unit call cuts its rows and how many of its units' waves it keeps in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Overlap {
+    /// Serving: cut and run at the admitted waves.
+    Admitted,
+    /// The N=1-vs-N identity check (golden `--check-waves`): cut with one wave, so every arm runs the same
+    /// units, and keep `waves` (at most the admitted waves) in flight.
+    Identity { waves:usize },
+}
+
 /// The path of a step of `rows` rows over `requests` requests (Kimi K3's unit-call rule; T6's
 /// prefill lanes took the same steps).
 fn step_path(requests:usize,rows:usize,kind:ExpertV2SourceKind,diagnostic:bool,decode_rows:usize,
@@ -340,21 +350,23 @@ impl<'a> Execution<'a> {
     /// empty range skips it.
     pub fn execute(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
-        self.execute_through(embedded,batch,caches,experts,kind,self.cfg.layers-1,logits)
+        self.execute_through(embedded,batch,caches,experts,kind,self.cfg.layers-1,logits,Overlap::Admitted)
     }
     pub fn hidden(&self,rows:usize)->Result<CuteafdDeviceBuffer> {
         ensure!(rows>0 && rows<=self.rows,MiniMaxError::Invalid("hidden row extent"));
         view(self.scratch.get("residual")?,0,rows*6144*4)
     }
+    /// [`Self::execute`] through `last_layer`, a unit call cut and run at `overlap`.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_through(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize,
-        logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
-        self.native.device().run(|| self.step(embedded,batch,caches,experts,kind,last_layer,logits))
+        logits:std::ops::Range<usize>, overlap:Overlap) -> Result<Option<DeviceLogits>> {
+        self.native.device().run(|| self.step(embedded,batch,caches,experts,kind,last_layer,logits,overlap))
     }
     #[allow(clippy::too_many_arguments)]
     fn step(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize,
-        logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
+        logits:std::ops::Range<usize>, overlap:Overlap) -> Result<Option<DeviceLogits>> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
         ensure!(last_layer<self.cfg.layers,MiniMaxError::Invalid("last execution layer"));
         ensure!(logits.end<=batch.positions.len() && logits.len()<=self.logit_rows,
@@ -374,7 +386,7 @@ impl<'a> Execution<'a> {
         let mut guard=self.native.cancellation_guard("MiniMax step");
         let result=(||{
             let units=match step_path(batch.requests.len(),rows,kind,diagnostics.is_some(),self.decode_rows,self.program_rows)? {
-                StepPath::Units => Some(self.units(rows,logits.len(),last_layer)?),
+                StepPath::Units => Some(self.units(rows,logits.len(),last_layer,overlap)?),
                 StepPath::OnePass => None,
             };
             let (waves,widest)=units.as_ref().map_or((1,rows),|(units,waves)|
