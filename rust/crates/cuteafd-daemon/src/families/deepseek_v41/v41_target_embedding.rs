@@ -120,6 +120,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         self.tokens.clear();
         self.positions.clear();
     }
+    /// Release after this input hook's block reader has joined the unit chain.
     pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
     #[cfg(test)]
     pub(crate) fn test_writer(&self, skip: bool) -> *mut std::ffi::c_void {

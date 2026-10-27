@@ -154,6 +154,7 @@ impl<'a> EngramDeviceRows<'a> {
         self.window = window;
         Ok(())
     }
+    /// Release after the gate consumed these rows and joined the unit chain.
     pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
     #[cfg(test)]
     pub(crate) fn test_writer(&self, skip: bool) -> *mut std::ffi::c_void {
