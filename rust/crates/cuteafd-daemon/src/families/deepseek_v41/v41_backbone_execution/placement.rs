@@ -256,25 +256,26 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         device.run(|| unsafe { index.get_mut().enqueue_projection(query) })?;
         Ok(pending)
     }
+    /// Window layers per attention GPU.
+    fn window_layers(placement: CachePlacement) -> Result<[Vec<usize>; 2]> {
+        let mut layers = [Vec::new(), Vec::new()];
+        for layer in 0..40 { layers[placement.attention(layer)?.min(1)].push(layer); }
+        Ok(layers)
+    }
     pub fn device_bytes(
         library: &NativeLibrary,
         placement: CachePlacement,
         capacity: u32,
     ) -> Result<[usize; 2]> {
         let mut bytes = [0usize; 2];
-        // One shared producer scratch per GPU that owns window layers; each
-        // layer keeps only its proposal.
-        let scratch = crate::families::deepseek_v41::v41_window::WindowScratch::device_bytes(library, capacity)?;
-        let mut owns = [false; 2];
-        for layer in 0..40 {
-            let gpu = placement.attention(layer)?;
-            owns[gpu] = true;
+        // One window storage per GPU that owns window layers: shared producer
+        // scratch and each layer's proposal plane.
+        for (gpu, layers) in Self::window_layers(placement)?.iter().enumerate() {
+            if layers.is_empty() { continue; }
             bytes[gpu] = bytes[gpu]
-                .checked_add(WindowWave::proposal_bytes(capacity))
+                .checked_add(crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+                    library, capacity as usize, capacity, layers.len())?)
                 .context("placed SWA workspace overflow")?;
-        }
-        for (gpu, owns) in owns.into_iter().enumerate() {
-            if owns { bytes[gpu] += scratch; }
         }
         for layer in SOURCES {
             let gpu = placement.attention(layer)?;
@@ -300,19 +301,21 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                 .all(|(need, budget)| need <= budget),
             "cache producer workspaces exceed a GPU budget"
         );
-        let mut scratch: [Option<std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowScratch<'a>>>; 2] = [None, None];
+        let layers = Self::window_layers(placement)?;
+        let mut storage: [Option<std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowStorage<'a>>>; 2] = [None, None];
         let windows = weights
             .windows
             .iter()
             .map(|weights| {
                 weights.device.own(|| {
-                    let gpu = usize::try_from(weights.device.id)?;
-                    let shared = match &scratch[gpu.min(1)] {
+                    let gpu = usize::try_from(weights.device.id)?.min(1);
+                    let shared = match &storage[gpu] {
                         Some(shared) => shared.clone(),
-                        None => crate::families::deepseek_v41::v41_window::WindowScratch::new(weights.device.library, capacity)?,
+                        None => crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.device.library,
+                            capacity as usize, capacity as usize, &layers[gpu], false)?,
                     };
-                    scratch[gpu.min(1)] = Some(shared.clone());
-                    weights.wave_shared(capacity, shared)
+                    storage[gpu] = Some(shared.clone());
+                    weights.on_storage(shared)
                 })
             })
             .collect::<Result<Vec<_>>>()?;
