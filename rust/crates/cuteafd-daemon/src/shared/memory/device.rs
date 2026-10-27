@@ -350,6 +350,13 @@ impl Drop for Event<'_> {
 }
 
 /// One transfer direction for one lane; stream and event are allocated at startup.
+/// `CUTEAFD_V41_PEER_COPY=sm`: device-ordered peer copies use the SM copy
+/// kernel (a runtime-sized grid) instead of the copy engines, for comparison.
+pub(crate) fn sm_peer_copy() -> bool {
+    static SM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SM.get_or_init(|| std::env::var("CUTEAFD_V41_PEER_COPY").is_ok_and(|value| value == "sm"))
+}
+
 pub(crate) struct PeerTransfer<'a> {
     destination: Stream<'a>,
     ready: Event<'a>,
@@ -396,21 +403,21 @@ impl<'a> PeerTransfer<'a> {
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
-        let sm = self.sm.as_ref().filter(|_| deferred);
+        let sm = self.sm.as_ref().filter(|_| deferred && sm_peer_copy());
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
+            // The destination's previous readers precede this write.
+            if deferred { super::chain::join(library, self.destination.raw)?; }
             match sm {
-                // An SM copy waiting on its event holds no copy-engine queue.
-                Some(sm) => {
-                    // The destination's previous readers precede this write.
-                    super::chain::join(library, self.destination.raw)?;
-                    sm.launch(destination.buffer, source.buffer, bytes, self.destination.raw)?
-                }
+                Some(sm) => sm.launch(destination.buffer, source.buffer, bytes, self.destination.raw)?,
+                // Device-ordered passes copy on the copy engines too (#815,
+                // prof13): this stream waits on events only, never a memory
+                // wait, so it holds no other lane's DMA behind it.
                 None => library.copy_peer_async(destination.buffer, source.buffer, bytes, self.destination.raw)?,
             }
             then(destination.buffer, self.destination.raw)
         })?;
-        if sm.is_some() {
+        if deferred {
             self.destination.device.run(|| unsafe { super::chain::finish(library, self.destination.raw) })?;
             drain.complete = true;
             return Ok(());
