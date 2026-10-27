@@ -435,7 +435,7 @@ impl GlmOutputParser {
 fn arguments(content: String) -> OutputChunk { OutputChunk::ToolArgumentsDelta { content } }
 
 /// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
+pub(crate) fn held_prefix(text: &str, marker: &str) -> usize {
     let longest = text.len().min(marker.len().saturating_sub(1));
     (1..=longest).rev()
         .find(|length| {
@@ -463,7 +463,7 @@ fn without_closing_tags(name: &str) -> &str {
 }
 
 /// A short excerpt of model text for a log line.
-fn excerpt(text: &str) -> String {
+pub(crate) fn excerpt(text: &str) -> String {
     match text.char_indices().nth(80) {
         Some((cut, _)) => format!("{:?}...", &text[..cut]),
         None => format!("{text:?}"),
