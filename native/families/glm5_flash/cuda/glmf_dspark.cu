@@ -189,6 +189,10 @@ constexpr int kMarkovThreads = 256;
 constexpr int kMarkovRank = 256;
 constexpr int kMaxSequences = 32;
 
+__device__ __forceinline__ uint32_t bounded_token(uint32_t token, int vocab) {
+  return token < uint32_t(vocab) ? token : 0;
+}
+
 // Lane's share of w2[v] . e (elements 8 * lane .. 8 * lane + 7), warp-summed.
 __device__ __forceinline__ float markov_dot(const bf16* w2, uint32_t v, const float* e, int lane) {
   const uint4 raw = *reinterpret_cast<const uint4*>(w2 + uint64_t(v) * kMarkovRank + 8 * lane);
@@ -212,7 +216,7 @@ __global__ void markov_partial_kernel(const float* logits, const bf16* w1, const
   __shared__ float floor_value[kMaxSequences], reach[kMaxSequences];
   for (int i = threadIdx.x; i < sequences * kMarkovRank; i += blockDim.x) {
     const int s = i / kMarkovRank, c = i % kMarkovRank;
-    const uint32_t prev = step == 0 ? anchors[s] : drafts[s * block + step - 1];
+    const uint32_t prev = bounded_token(step == 0 ? anchors[s] : drafts[s * block + step - 1], vocab);
     embed[s][c] = f(w1[uint64_t(prev) * kMarkovRank + c]);
   }
   __syncthreads();
@@ -223,7 +227,7 @@ __global__ void markov_partial_kernel(const float* logits, const bf16* w1, const
     for (int c = lane; c < kMarkovRank; c += 32) sum += embed[s][c] * embed[s][c];
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     const uint64_t row = uint64_t(s) * block + step;
-    const uint32_t t = top[row];
+    const uint32_t t = bounded_token(top[row], vocab);
     const float value = logits[row * vocab + t] + markov_dot(w2, t, embed[s], lane);
     if (lane == 0) {
       floor_value[s] = value;
@@ -314,7 +318,8 @@ __global__ void row_argmax_kernel(const float* logits, uint32_t* top, int vocab)
         b = wv[i];
         bi = wi[i];
       }
-    top[row] = bi;
+    // A row containing only NaN or -inf has no selected index.
+    top[row] = bounded_token(bi, vocab);
   }
 }
 
@@ -332,7 +337,7 @@ __global__ void row_norms_kernel(const bf16* w2, float* norms, int vocab) {
 }
 
 __global__ void markov_final_kernel(const float* partial_value, const uint32_t* partial_index, uint32_t* drafts,
-                                    int partials, int block, int step) {
+                                    int partials, int block, int step, int vocab) {
   const int s = blockIdx.x, lane = threadIdx.x;
   float b = -CUDART_INF_F;
   uint32_t bi = UINT32_MAX;
@@ -352,7 +357,7 @@ __global__ void markov_final_kernel(const float* partial_value, const uint32_t* 
       bi = oi;
     }
   }
-  if (lane == 0) drafts[s * block + step] = bi;
+  if (lane == 0) drafts[s * block + step] = bounded_token(bi, vocab);
 }
 
 // confidence[s, k] = sigmoid(w[:hidden] . h[s, k] + w[hidden:] . w1[prev] + bias), prev
@@ -363,7 +368,8 @@ __global__ void confidence_kernel(const bf16* hidden, const bf16* w1, const bf16
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
   if (warp >= rows) return;
   const int s = warp / block, k = warp % block;
-  const uint32_t prev = k == 0 ? anchors[s] : drafts[s * block + k - 1];
+  const uint32_t token = k == 0 ? anchors[s] : drafts[s * block + k - 1];
+  const uint32_t prev = token == UINT32_MAX ? 0 : token;
   float sum = 0;
   for (int i = lane; i < width; i += 32) sum = fmaf(f(hidden[uint64_t(warp) * width + i]), f(weight[i]), sum);
   for (int i = lane; i < rank; i += 32) sum = fmaf(f(w1[uint64_t(prev) * rank + i]), f(weight[width + i]), sum);
@@ -490,7 +496,8 @@ extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* w2, void* norms,
 extern "C" int32_t cuteafd_glmf_dspark_markov(const void* logits, const void* w1, const void* w2, const void* norms,
                                               const void* anchors, void* drafts, void* workspace, int32_t sequences,
                                               int32_t block, int32_t vocab, int32_t rank, void* stream) {
-  if (sequences < 1 || sequences > kMaxSequences || block < 1 || rank != kMarkovRank) return cudaErrorInvalidValue;
+  if (sequences < 1 || sequences > kMaxSequences || block < 1 || block > INT32_MAX / sequences ||
+      vocab < 1 || rank != kMarkovRank) return cudaErrorInvalidValue;
   auto s = static_cast<cudaStream_t>(stream);
   auto* values = static_cast<float*>(workspace);
   auto* indices = reinterpret_cast<uint32_t*>(values + uint64_t(sequences) * kMarkovBlocks);
@@ -502,7 +509,7 @@ extern "C" int32_t cuteafd_glmf_dspark_markov(const void* logits, const void* w1
         static_cast<const float*>(norms), top, static_cast<const uint32_t*>(anchors),
         static_cast<const uint32_t*>(drafts), values, indices, sequences, vocab, block, step);
     markov_final_kernel<<<sequences, 32, 0, s>>>(values, indices, static_cast<uint32_t*>(drafts), kMarkovBlocks,
-                                                 block, step);
+                                                 block, step, vocab);
   }
   return cudaGetLastError();
 }

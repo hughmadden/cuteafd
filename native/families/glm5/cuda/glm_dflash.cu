@@ -1,8 +1,8 @@
 #include "../../../shared/cuda/draft_attention.cuh"
 #include "../../../shared/cuda/draft_kv.cuh"
-// DFlash2 drafters (incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2): the
-// non-GEMM pieces of the context update, the block body and the candidate
-// selector.
+// DFlash2 drafters (incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2,
+// RadixArk/Minimax-M3.1-Flash-Dflash2): the non-GEMM pieces of the context
+// update, the block body and the candidate selector.
 // GEMMs run through cuBLAS (cuteafd_cuda_linear_bf16_cublas_async); the
 // vocabulary head is the engine's.
 //
@@ -11,6 +11,14 @@
 // each of its four accumulations; RoPE rounds each product and the sum; the
 // selector's edge and score are BF16). glmrt measured that reassociating these
 // in FP32 compounds through the six layers and destroys greedy acceptance.
+//
+// The `_gemma` entries are a Gemma-norm draft's (MiniMax M3.1 Flash: every
+// norm x * rsqrt(mean(x^2) + eps) * (1 + w), NeoX RoPE on a partial width,
+// SwiGLU-OAI): norms, RoPE and the activation compute in FP32 and round once,
+// as the MiniMax target does them (python/reference/families/minimax_m3/model.py)
+// and as SGLang's fused kernels serve that draft; a residual sum is normed
+// before its BF16 rounding, as a fused add-norm does. The convolution and the
+// selector keep the statements above.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -37,7 +45,16 @@ __device__ float block_sum(float v, float* shared) {
 constexpr int kNormThreads = 512;
 constexpr int kMaxHidden = 8192;
 
-// out = bf16(bf16(x * rsqrt(mean(x^2) + eps)) * w), one block per row.
+// The normalized value of `v` (unit-RMS factor `inv`) with weight `w`, before its final BF16 rounding:
+// Qwen3RMSNorm rounds v * inv to BF16 before the weight; Gemma's FP32 product takes (1 + w).
+template <bool gemma>
+__device__ __forceinline__ float norm_value(float v, float inv, bf16 w) {
+  if constexpr (gemma) return __fmul_rn(__fmul_rn(v, inv), __fadd_rn(1.0f, f(w)));
+  else return r(v * inv) * f(w);
+}
+
+// out = bf16(bf16(x * rsqrt(mean(x^2) + eps)) * w) (Gemma: bf16(x * rsqrt(..) * (1 + w))), one block per row.
+template <bool gemma>
 __global__ void rmsnorm_kernel(const bf16* x, const bf16* w, bf16* out, int width, float eps) {
   __shared__ float partial[kNormThreads / 32];
   const uint64_t row = blockIdx.x;
@@ -48,7 +65,7 @@ __global__ void rmsnorm_kernel(const bf16* x, const bf16* w, bf16* out, int widt
   }
   const float inv = rsqrtf(block_sum<kNormThreads>(sum, partial) / width + eps);
   for (int i = threadIdx.x; i < width; i += kNormThreads)
-    out[row * width + i] = __float2bfloat16(r(f(x[row * width + i]) * inv) * f(w[i]));
+    out[row * width + i] = __float2bfloat16(norm_value<gemma>(f(x[row * width + i]), inv, w[i]));
 }
 
 // One side of the two-tap grouped dynamic convolution of block rows.
@@ -74,7 +91,9 @@ __global__ void conv_kernel(const bf16* source, const bf16* dynamic, const bf16*
                                          group, 0));
 }
 
-// residual_out = bf16(residual + conv1(source)); normalized = RMSNorm(residual_out) * w.
+// residual_out = bf16(residual + conv1(source)); normalized = RMSNorm(residual_out) * w. The Gemma norm
+// takes the FP32 sum (a fused add-norm), whose BF16 rounding is the carried residual.
+template <bool gemma>
 __global__ void conv_residual_norm_kernel(const bf16* source, const bf16* dynamic, const bf16* base,
                                           const bf16* residual, const bf16* w, bf16* residual_out, bf16* normalized,
                                           int block_rows, int hidden, int group, float eps) {
@@ -84,26 +103,31 @@ __global__ void conv_residual_norm_kernel(const bf16* source, const bf16* dynami
   float sum = 0;
   for (int i = threadIdx.x; i < hidden; i += kNormThreads) {
     const float conv = conv_value(source, dynamic, base, row, i, block_rows, hidden, group, 1);
-    const float v = r(f(residual[row * hidden + i]) + conv);
+    const float total = f(residual[row * hidden + i]) + conv;
+    const float v = gemma ? total : r(total);
     values[i] = v;
     sum += v * v;
   }
   const float inv = rsqrtf(block_sum<kNormThreads>(sum, partial) / hidden + eps);
   for (int i = threadIdx.x; i < hidden; i += kNormThreads) {
     residual_out[row * hidden + i] = __float2bfloat16(values[i]);
-    normalized[row * hidden + i] = __float2bfloat16(r(values[i] * inv) * f(w[i]));
+    normalized[row * hidden + i] = __float2bfloat16(norm_value<gemma>(values[i], inv, w[i]));
   }
 }
 
 // One warp per (row, head) of [q heads | k heads]: per-head RMSNorm, then
 // rotate_half RoPE at the row's position; k and v rows go to `slots[row]`
-// (skipped when negative) of the [slot, kv_heads, 128] caches.
+// (skipped when negative) of the [slot, kv_heads, 128] caches. The Gemma
+// variant norms per head as the drafter's other norms and rotates the first
+// `rotary` channels (NeoX pairs e, e + rotary / 2) with FP32 cos/sin, rounding
+// once; the remaining channels pass through.
 constexpr int kHeadDim = 128;
 
-template <bool fp8>
+template <bool fp8, bool gemma, int rotary>
 __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
                                const int32_t* slots, bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads,
                                int kv_heads, float theta, float eps) {
+  static_assert(rotary == 128 || (gemma && rotary == 64), "GLM rotates every channel; Gemma 64 or 128");
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
   const int per_row = heads + kv_heads;
   if (warp >= rows * per_row) return;
@@ -124,17 +148,32 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
   const float inv = rsqrtf(sum / kHeadDim + eps);
 #pragma unroll
-  for (int j = 0; j < 4; ++j) x[j] = r(r(x[j] * inv) * f(norm[lane + 32 * j]));
+  for (int j = 0; j < 4; ++j) x[j] = r(norm_value<gemma>(x[j], inv, norm[lane + 32 * j]));
   const float position = float(positions[row]);
   float y[4];
+  if constexpr (gemma) {
+    // Element e = lane + 32 j pairs with e +- rotary / 2, i.e. j +- step.
+    constexpr int step = rotary / 64;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const int e = lane + 32 * j, i = e % (kHeadDim / 2);
-    const float inv_freq = 1.0f / powf(theta, float(2 * i) / kHeadDim);
-    const float angle = position * inv_freq;
-    const float c = r(cosf(angle)), s = r(sinf(angle));
-    const float pair = x[(j + 2) % 4];
-    y[j] = j < 2 ? r(r(x[j] * c) - r(pair * s)) : r(r(x[j] * c) + r(pair * s));
+    for (int j = 0; j < 4; ++j) {
+      if (j >= 2 * step) { y[j] = x[j]; continue; }
+      const int i = (lane + 32 * j) % (rotary / 2);
+      const float inv_freq = 1.0f / powf(theta, float(2 * i) / rotary);
+      const float angle = position * inv_freq;
+      const float c = cosf(angle), s = sinf(angle);
+      y[j] = j < step ? r(__fsub_rn(__fmul_rn(x[j], c), __fmul_rn(x[(j + step) & 3], s)))
+                      : r(__fadd_rn(__fmul_rn(x[j], c), __fmul_rn(x[(j - step) & 3], s)));
+    }
+  } else {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int e = lane + 32 * j, i = e % (kHeadDim / 2);
+      const float inv_freq = 1.0f / powf(theta, float(2 * i) / kHeadDim);
+      const float angle = position * inv_freq;
+      const float c = r(cosf(angle)), s = r(sinf(angle));
+      const float pair = x[(j + 2) % 4];
+      y[j] = j < 2 ? r(r(x[j] * c) - r(pair * s)) : r(r(x[j] * c) + r(pair * s));
+    }
   }
   if (is_q) {
     bf16* out = q_out + (uint64_t(row) * heads + head) * kHeadDim;
@@ -168,6 +207,20 @@ __global__ void silu_mul_kernel(const bf16* gate_up, bf16* out, uint64_t rows, i
     const int c = int(i % inter);
     const float g = f(gate_up[row * 2 * inter + c]), u = f(gate_up[row * 2 * inter + inter + c]);
     out[i] = __float2bfloat16(r(g / (1.0f + expf(-g))) * u);
+  }
+}
+
+// SwiGLU-OAI over [gate | up] rows: g = min(gate, limit), u = clamp(up, +-limit),
+// bf16(g * sigmoid(alpha * g) * (u + 1)) in FP32 (the MiniMax target's activation).
+__global__ void swiglu_oai_kernel(const bf16* gate_up, bf16* out, uint64_t rows, int inter, float alpha, float limit) {
+  const uint64_t total = rows * inter;
+  for (uint64_t i = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x; i < total; i += uint64_t(gridDim.x) * blockDim.x) {
+    const uint64_t row = i / inter;
+    const int c = int(i % inter);
+    const float g = fminf(f(gate_up[row * 2 * inter + c]), limit);
+    const float u = fminf(fmaxf(f(gate_up[row * 2 * inter + inter + c]), -limit), limit);
+    const float sigmoid = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-__fmul_rn(alpha, g))));
+    out[i] = __float2bfloat16(__fmul_rn(__fmul_rn(g, sigmoid), __fadd_rn(u, 1.0f)));
   }
 }
 
@@ -205,13 +258,15 @@ __device__ void block_argmax(float& v, int& i) {
   __syncthreads();
 }
 
-// Drafted row n is block row 1 + n % drafts of sequence n / drafts.
+// Drafted row n is block row 1 + n % drafts of sequence n / drafts. Each
+// thread holds kLocal of its chunk's logits: 12 covers GLM's 154,880-entry
+// vocabulary, 16 MiniMax's 200,064 (up to 262,144).
+template <int kLocal>
 __global__ void topk_partial_kernel(const float* logits, float* values, int* indices, int vocab, int block_rows,
                                     int drafts) {
   const int chunk = blockIdx.x, n = blockIdx.y;
   const uint64_t row = uint64_t(n / drafts) * block_rows + 1 + n % drafts;
   const int per = (vocab + kTopChunks - 1) / kTopChunks, first = chunk * per, last = min(vocab, first + per);
-  constexpr int kLocal = 12;
   float local[kLocal];
   const float* in = logits + row * vocab;
   for (int j = 0; j < kLocal; ++j) {
@@ -269,9 +324,12 @@ __global__ void topk_merge_kernel(const float* values, const int* indices, float
 // One block per sequence walks its drafted rows: score_k = bf16(unary_k +
 // bf16(sum_r bf16(pred[prev, r] * proj[r]) * succ[cand_k, r])); the best
 // (lowest rank on ties) becomes the next predecessor. Also writes the margin,
-// best probability, entropy and rank over the 16 scores per row.
+// best probability, entropy and rank over the 16 scores per row. With
+// `fp32_score` the score is the FP32 sum of the unary logit and the BF16 edge,
+// as SGLang's DFlash2 selector scores (MiniMax's reference); GLM's port rounds it.
 constexpr int kRank = 256;
 
+template <bool fp32_score>
 __global__ void select_kernel(const bf16* pred_cb, const bf16* succ_cb, const bf16* projected, const int* candidates,
                               const float* unary, const uint32_t* anchors, uint32_t* tokens, float* features,
                               int block_rows, int drafts) {
@@ -292,7 +350,10 @@ __global__ void select_kernel(const bf16* pred_cb, const bf16* succ_cb, const bf
       float dot = 0;
       for (int j = lane; j < kRank; j += 32) dot = fmaf(conditioned[j], f(succ[j]), dot);
       for (int o = 16; o; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
-      if (lane == 0) edges[k] = r(unary[n * kTopK + k] + r(dot));
+      if (lane == 0) {
+        const float score = unary[n * kTopK + k] + r(dot);
+        edges[k] = fp32_score ? score : r(score);
+      }
     }
     __syncthreads();
     if (t == 0) {
@@ -336,6 +397,27 @@ __global__ void tap_mean_kernel(const bf16* src, bf16* dst, int width, int hc, i
   }
 }
 
+// dst[row, offset : offset + width] = bf16(src[row, :]) of F32 rows (a target's FP32 residual),
+// rounded to nearest even as cuteafd_cuda_f32_to_bf16 rounds; four columns per thread.
+__global__ void tap_f32_kernel(const float* src, bf16* dst, int width, int stride, int offset) {
+  const uint64_t row = blockIdx.y;
+  for (int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4; i < width; i += gridDim.x * blockDim.x * 4) {
+    const float4 v = *reinterpret_cast<const float4*>(src + row * width + i);
+    const __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+    uint2 packed;
+    packed.x = *reinterpret_cast<const uint32_t*>(&lo);
+    packed.y = *reinterpret_cast<const uint32_t*>(&hi);
+    *reinterpret_cast<uint2*>(dst + row * stride + offset + i) = packed;
+  }
+}
+
+// Slices of 32 queries per KV head the block attention launches: at least the two the GLM drafters'
+// 64 queries per KV head take, so their partitions and reductions stay as they were.
+inline int attention_slices(int heads, int kv_heads, int block_rows) {
+  const int64_t slices = (int64_t(heads / kv_heads) * block_rows + 31) / 32;
+  return slices > 2 ? int(slices) : 2;
+}
+
 inline int grid_for(uint64_t total, int threads) {
   const uint64_t blocks = (total + threads - 1) / threads;
   return int(blocks < 8192 ? (blocks ? blocks : 1) : 8192);
@@ -346,7 +428,16 @@ inline int grid_for(uint64_t total, int threads) {
 extern "C" int32_t cuteafd_glm_dflash_rmsnorm(const void* x, const void* w, void* out, int32_t rows, int32_t width,
                                               float eps, void* stream) {
   if (rows < 1 || width < 1) return cudaErrorInvalidValue;
-  rmsnorm_kernel<<<rows, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+  rmsnorm_kernel<false><<<rows, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(x), static_cast<const bf16*>(w), static_cast<bf16*>(out), width, eps);
+  return cudaGetLastError();
+}
+
+// out = bf16(x * rsqrt(mean(x^2) + eps) * (1 + w)) (Gemma RMSNorm) of `rows` rows of `width`.
+extern "C" int32_t cuteafd_glm_dflash_rmsnorm_gemma(const void* x, const void* w, void* out, int32_t rows,
+                                                    int32_t width, float eps, void* stream) {
+  if (rows < 1 || width < 1) return cudaErrorInvalidValue;
+  rmsnorm_kernel<true><<<rows, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(x), static_cast<const bf16*>(w), static_cast<bf16*>(out), width, eps);
   return cudaGetLastError();
 }
@@ -371,7 +462,21 @@ extern "C" int32_t cuteafd_glm_dflash_conv_residual_norm(const void* source, con
                                                          void* normalized, int32_t rows, int32_t block_rows,
                                                          int32_t hidden, int32_t group, float eps, void* stream) {
   if (rows < 1 || block_rows < 1 || hidden % group || hidden > kMaxHidden) return cudaErrorInvalidValue;
-  conv_residual_norm_kernel<<<rows, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+  conv_residual_norm_kernel<false><<<rows, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(source), static_cast<const bf16*>(dynamic), static_cast<const bf16*>(base),
+      static_cast<const bf16*>(residual), static_cast<const bf16*>(w), static_cast<bf16*>(residual_out),
+      static_cast<bf16*>(normalized), block_rows, hidden, group, eps);
+  return cudaGetLastError();
+}
+
+// cuteafd_glm_dflash_conv_residual_norm with the Gemma norm of the FP32 sum; residual_out = bf16(sum).
+extern "C" int32_t cuteafd_glm_dflash_conv_residual_norm_gemma(const void* source, const void* dynamic,
+                                                               const void* base, const void* residual, const void* w,
+                                                               void* residual_out, void* normalized, int32_t rows,
+                                                               int32_t block_rows, int32_t hidden, int32_t group,
+                                                               float eps, void* stream) {
+  if (rows < 1 || block_rows < 1 || hidden % group || hidden > kMaxHidden) return cudaErrorInvalidValue;
+  conv_residual_norm_kernel<true><<<rows, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(source), static_cast<const bf16*>(dynamic), static_cast<const bf16*>(base),
       static_cast<const bf16*>(residual), static_cast<const bf16*>(w), static_cast<bf16*>(residual_out),
       static_cast<bf16*>(normalized), block_rows, hidden, group, eps);
@@ -387,11 +492,50 @@ extern "C" int32_t cuteafd_glm_dflash_qk_rope(const void* qkv, const void* q_nor
                                               float theta, float eps, void* stream) {
   if (rows < 1 || kv_heads < 1 || heads < 0) return cudaErrorInvalidValue;
   const int warps = rows * (heads + kv_heads);
-  qk_rope_kernel<false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  qk_rope_kernel<false, false, kHeadDim><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
       static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
       static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, theta, eps);
   return cudaGetLastError();
+}
+
+template <bool fp8>
+static int32_t qk_rope_gemma(const void* qkv, const void* q_norm, const void* k_norm, const void* positions,
+                      const void* slots, void* q_out, void* k_out, void* v_out, int32_t rows, int32_t heads,
+                      int32_t kv_heads, int32_t rotary, float theta, float eps, cudaStream_t stream) {
+  if (rows < 1 || kv_heads < 1 || heads < 0 || (rotary != 64 && rotary != kHeadDim)) return cudaErrorInvalidValue;
+  const int warps = rows * (heads + kv_heads);
+  const dim3 grid((warps * 32 + 255) / 256);
+  const auto* x = static_cast<const bf16*>(qkv);
+  const auto *qn = static_cast<const bf16*>(q_norm), *kn = static_cast<const bf16*>(k_norm);
+  const auto* p = static_cast<const int64_t*>(positions);
+  const auto* slot = static_cast<const int32_t*>(slots);
+  auto *q = static_cast<bf16*>(q_out), *k = static_cast<bf16*>(k_out), *v = static_cast<bf16*>(v_out);
+  if (rotary == 64) qk_rope_kernel<fp8, true, 64><<<grid, 256, 0, stream>>>(x, qn, kn, p, slot, q, k, v, rows, heads,
+                                                                             kv_heads, theta, eps);
+  else qk_rope_kernel<fp8, true, kHeadDim><<<grid, 256, 0, stream>>>(x, qn, kn, p, slot, q, k, v, rows, heads,
+                                                                     kv_heads, theta, eps);
+  return cudaGetLastError();
+}
+
+// cuteafd_glm_dflash_qk_rope with Gemma per-head norms and NeoX RoPE on the first `rotary` (64 or 128)
+// channels, in FP32 rounded once.
+extern "C" int32_t cuteafd_glm_dflash_qk_rope_gemma(const void* qkv, const void* q_norm, const void* k_norm,
+                                                    const void* positions, const void* slots, void* q_out,
+                                                    void* k_out, void* v_out, int32_t rows, int32_t heads,
+                                                    int32_t kv_heads, int32_t rotary, float theta, float eps,
+                                                    void* stream) {
+  return qk_rope_gemma<false>(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out, rows, heads, kv_heads,
+                              rotary, theta, eps, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int32_t cuteafd_glm_dflash_qk_rope_gemma_fp8(const void* qkv, const void* q_norm, const void* k_norm,
+                                                        const void* positions, const void* slots, void* q_out,
+                                                        void* k_out, void* v_out, int32_t rows, int32_t heads,
+                                                        int32_t kv_heads, int32_t rotary, float theta, float eps,
+                                                        void* stream) {
+  return qk_rope_gemma<true>(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out, rows, heads, kv_heads,
+                             rotary, theta, eps, static_cast<cudaStream_t>(stream));
 }
 
 // Workspace bytes cuteafd_glm_dflash_attention needs.
@@ -417,11 +561,45 @@ extern "C" int32_t cuteafd_glm_dflash_attention(const void* q, const void* k_blo
       ring, max_keys, window, false, kHeadDim, 2, false, scale, static_cast<cudaStream_t>(stream));
 }
 
+// Workspace bytes cuteafd_glm_dflash_block_attention needs for these heads and block rows.
+extern "C" uint64_t cuteafd_glm_dflash_block_attention_workspace(int32_t sequences, int32_t heads, int32_t kv_heads,
+                                                                 int32_t block_rows, int32_t max_keys) {
+  if (heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1) return 0;
+  return cuteafd::draft_attention::workspace(sequences, kv_heads, attention_slices(heads, kv_heads, block_rows),
+                                             max_keys, kHeadDim);
+}
+
+// cuteafd_glm_dflash_attention for any query count per KV head (in slices of 32, at least two: the GLM
+// drafters' launches are unchanged), with `causal` block rows (row r sees block rows 0..r; the context
+// as before).
+extern "C" int32_t cuteafd_glm_dflash_block_attention(const void* q, const void* k_block, const void* v_block,
+                                                      const void* k_ring, const void* v_ring, const void* seq_slots,
+                                                      const void* ctx_lengths, const void* ctx_ends, void* out,
+                                                      void* workspace, int32_t sequences, int32_t block_rows,
+                                                      int32_t heads, int32_t kv_heads, int32_t ring,
+                                                      int32_t max_keys, int32_t window, int32_t causal, float scale,
+                                                      void* stream) {
+  if (heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, window, causal != 0, kHeadDim, attention_slices(heads, kv_heads, block_rows), false, scale,
+      static_cast<cudaStream_t>(stream));
+}
+
 extern "C" int32_t cuteafd_glm_dflash_silu_mul(const void* gate_up, void* out, int32_t rows, int32_t inter,
                                                void* stream) {
   if (rows < 1 || inter < 1) return cudaErrorInvalidValue;
   silu_mul_kernel<<<grid_for(uint64_t(rows) * inter, 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(gate_up), static_cast<bf16*>(out), uint64_t(rows), inter);
+  return cudaGetLastError();
+}
+
+// out [rows, inter] = SwiGLU-OAI(gate, up) of `gate_up` [rows, 2 * inter] ([gate | up], not interleaved).
+extern "C" int32_t cuteafd_glm_dflash_swiglu_oai(const void* gate_up, void* out, int32_t rows, int32_t inter,
+                                                 float alpha, float limit, void* stream) {
+  if (rows < 1 || inter < 1 || !(limit > 0)) return cudaErrorInvalidValue;
+  swiglu_oai_kernel<<<grid_for(uint64_t(rows) * inter, 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(gate_up), static_cast<bf16*>(out), uint64_t(rows), inter, alpha, limit);
   return cudaGetLastError();
 }
 
@@ -435,14 +613,20 @@ extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) {
 extern "C" int32_t cuteafd_glm_dflash_topk(const void* logits, void* unary, void* candidates, void* workspace,
                                            int32_t sequences, int32_t block_rows, int32_t drafts, int32_t vocab,
                                            void* stream) {
-  if (sequences < 1 || drafts < 1 || drafts >= block_rows || (vocab + kTopChunks - 1) / kTopChunks > 12 * kTopThreads)
+  const int per = (vocab + kTopChunks - 1) / kTopChunks;
+  if (sequences < 1 || drafts < 1 || drafts >= block_rows || vocab < 1 || per > 16 * kTopThreads)
     return cudaErrorInvalidValue;
   const int rows = sequences * drafts;
   auto* values = static_cast<float*>(workspace);
   auto* indices = reinterpret_cast<int*>(values + uint64_t(rows) * kTopChunks * kTopK);
   auto s = static_cast<cudaStream_t>(stream);
-  topk_partial_kernel<<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(static_cast<const float*>(logits), values,
-                                                                     indices, vocab, block_rows, drafts);
+  const auto* in = static_cast<const float*>(logits);
+  if (per <= 12 * kTopThreads)
+    topk_partial_kernel<12><<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(in, values, indices, vocab, block_rows,
+                                                                           drafts);
+  else
+    topk_partial_kernel<16><<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(in, values, indices, vocab, block_rows,
+                                                                           drafts);
   topk_merge_kernel<<<rows, kTopThreads, 0, s>>>(values, indices, static_cast<float*>(unary),
                                                  static_cast<int*>(candidates));
   return cudaGetLastError();
@@ -451,16 +635,34 @@ extern "C" int32_t cuteafd_glm_dflash_topk(const void* logits, void* unary, void
 // tokens [sequences, drafts] U32 and features [sequences, drafts, 4] F32 from the
 // selector codebooks [vocab, 256], projected [sequences * block_rows, 256] and the
 // top-16 of each drafted row.
-extern "C" int32_t cuteafd_glm_dflash_select(const void* pred_cb, const void* succ_cb, const void* projected,
-                                             const void* candidates, const void* unary, const void* anchors,
-                                             void* tokens, void* features, int32_t sequences, int32_t block_rows,
-                                             int32_t drafts, int32_t rank, void* stream) {
+template <bool fp32_score>
+static int32_t select(const void* pred_cb, const void* succ_cb, const void* projected, const void* candidates,
+                      const void* unary, const void* anchors, void* tokens, void* features, int32_t sequences,
+                      int32_t block_rows, int32_t drafts, int32_t rank, void* stream) {
   if (sequences < 1 || rank != kRank || drafts < 1 || drafts >= block_rows) return cudaErrorInvalidValue;
-  select_kernel<<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
+  select_kernel<fp32_score><<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(pred_cb), static_cast<const bf16*>(succ_cb), static_cast<const bf16*>(projected),
       static_cast<const int*>(candidates), static_cast<const float*>(unary), static_cast<const uint32_t*>(anchors),
       static_cast<uint32_t*>(tokens), static_cast<float*>(features), block_rows, drafts);
   return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_glm_dflash_select(const void* pred_cb, const void* succ_cb, const void* projected,
+                                             const void* candidates, const void* unary, const void* anchors,
+                                             void* tokens, void* features, int32_t sequences, int32_t block_rows,
+                                             int32_t drafts, int32_t rank, void* stream) {
+  return select<false>(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features, sequences,
+                       block_rows, drafts, rank, stream);
+}
+
+// cuteafd_glm_dflash_select scoring each candidate as the FP32 sum of its unary logit and BF16 edge.
+extern "C" int32_t cuteafd_glm_dflash_select_fp32_score(const void* pred_cb, const void* succ_cb,
+                                                        const void* projected, const void* candidates,
+                                                        const void* unary, const void* anchors, void* tokens,
+                                                        void* features, int32_t sequences, int32_t block_rows,
+                                                        int32_t drafts, int32_t rank, void* stream) {
+  return select<true>(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features, sequences,
+                      block_rows, drafts, rank, stream);
 }
 
 // dst[row, offset : offset + width] = src[row, :] for `rows` BF16 rows (width,
@@ -483,6 +685,17 @@ extern "C" int32_t cuteafd_glm_dflash_tap_mean(const void* src, void* dst, int32
   return cudaGetLastError();
 }
 
+// dst[row, offset : offset + width] = bf16(src[row, :]) for `rows` F32 rows (width, stride and offset
+// multiples of 4; 16-byte aligned rows).
+extern "C" int32_t cuteafd_glm_dflash_tap_f32(const void* src, void* dst, int32_t rows, int32_t width, int32_t stride,
+                                              int32_t offset, void* stream) {
+  if (rows < 1 || width < 1 || width % 4 || stride % 4 || offset % 4 || offset + width > stride)
+    return cudaErrorInvalidValue;
+  tap_f32_kernel<<<dim3((width / 4 + 255) / 256, rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(src), static_cast<bf16*>(dst), width, stride, offset);
+  return cudaGetLastError();
+}
+
 
 extern "C" int32_t cuteafd_glm_dflash_qk_rope_fp8(const void* qkv, const void* q_norm, const void* k_norm,
                                               const void* positions, const void* slots, void* q_out, void* k_out,
@@ -490,7 +703,7 @@ extern "C" int32_t cuteafd_glm_dflash_qk_rope_fp8(const void* qkv, const void* q
                                               float theta, float eps, void* stream) {
   if (rows < 1 || kv_heads < 1 || heads < 0) return cudaErrorInvalidValue;
   const int warps = rows * (heads + kv_heads);
-  qk_rope_kernel<true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  qk_rope_kernel<true, false, kHeadDim><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
       static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
       static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, theta, eps);
@@ -506,4 +719,18 @@ extern "C" int32_t cuteafd_glm_dflash_attention_fp8(const void* q, const void* k
   return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
       ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
       ring, max_keys, window, false, kHeadDim, 2, true, scale, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int32_t cuteafd_glm_dflash_block_attention_fp8(const void* q, const void* k_block, const void* v_block,
+                                                          const void* k_ring, const void* v_ring,
+                                                          const void* seq_slots, const void* ctx_lengths,
+                                                          const void* ctx_ends, void* out, void* workspace,
+                                                          int32_t sequences, int32_t block_rows, int32_t heads,
+                                                          int32_t kv_heads, int32_t ring, int32_t max_keys,
+                                                          int32_t window, int32_t causal, float scale, void* stream) {
+  if (heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, window, causal != 0, kHeadDim, attention_slices(heads, kv_heads, block_rows), true, scale,
+      static_cast<cudaStream_t>(stream));
 }

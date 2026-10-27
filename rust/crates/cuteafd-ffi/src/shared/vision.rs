@@ -58,6 +58,10 @@ pub struct VisionSpec {
     pub norm2_bias: [u64; 28],
     pub q_norm: [u64; 28],
     pub k_norm: [u64; 28],
+    // ABI 3 MiniMax suffix; the preceding ABI 2 layout remains unchanged.
+    pub blocks_extra: [VisionBlock; 4],
+    pub norm1_bias_extra: [u64; 4],
+    pub norm2_bias_extra: [u64; 4],
 }
 
 #[repr(C)]
@@ -408,11 +412,14 @@ mod tests {
     #[test]
     fn c_header_layout_is_stable() {
         assert_eq!(std::mem::size_of::<VisionBlock>(), 96);
-        assert_eq!(std::mem::size_of::<VisionSpec>(), 3792);
+        assert_eq!(std::mem::size_of::<VisionSpec>(), 4240);
         assert_eq!(std::mem::size_of::<VisionLedger>(), 40);
         assert_eq!(std::mem::offset_of!(VisionSpec, blocks), 64);
         assert_eq!(std::mem::offset_of!(VisionSpec, hidden), 2752);
         assert_eq!(std::mem::offset_of!(VisionSpec, patch_bias), 2792);
         assert_eq!(std::mem::offset_of!(VisionSpec, norm1_bias), 2896);
+        assert_eq!(std::mem::offset_of!(VisionSpec, blocks_extra), 3792);
+        assert_eq!(std::mem::offset_of!(VisionSpec, norm1_bias_extra), 4176);
+        assert_eq!(std::mem::offset_of!(VisionSpec, norm2_bias_extra), 4208);
     }
 }

@@ -675,7 +675,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "cuda_stream_synchronize(self.bridge.exchange.stream(0))" in prime
     assert "self.bridge.exchange.wait(" not in prime and "self.bridge.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
-    assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
+    # The isolated prime fills the drafter's own tap rows (GLM 2048, MiniMax 4096).
+    assert "let tap_rows = self.cfg.tap_rows();" in isolated and "0..tap_rows" in isolated
+    assert "1..=self.max_sequences" in isolated
     assert "self.draft_device_with(" in isolated
     assert isolated.index("self.draft_device_with(") < isolated.index("for ring in")
     assert "DraftAttention::Gqa(layer)" in isolated and "self.discard_context(slot)?" in isolated

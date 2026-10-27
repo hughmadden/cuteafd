@@ -1051,6 +1051,7 @@ impl Opened {
         let drafter = if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(snapshot)?;
+            dflash::require_glm_ring(&cfg)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
@@ -1061,7 +1062,8 @@ impl Opened {
                 ::from_fp8_option(args.draft_fp8);
             let drafter = dflash::DflashDrafter::load(&self.library, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
+                mask, dflash::BlockMask::default(), representation, args.fp8_scales,
+                crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
             // Admission includes the shared drafter's maximum serving workspace.
             drafter.prepare_workspace()?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,

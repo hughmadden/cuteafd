@@ -201,7 +201,7 @@ impl GlmEncoding {
     }
 }
 
-fn read_chat_template(snapshot: &Path) -> Result<(String, PathBuf)> {
+pub(crate) fn read_chat_template(snapshot: &Path) -> Result<(String, PathBuf)> {
     let path = snapshot.join("chat_template.jinja");
     match std::fs::read_to_string(&path) {
         Ok(source) => Ok((source, path)),
@@ -287,7 +287,7 @@ fn resolve_template_snapshot(source: &str, hf_home: Option<&Path>) -> Result<Pat
         .with_context(|| format!("CHAT_TEMPLATE_FROM={source} has no cached snapshot; download it or supply a snapshot path"))
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }

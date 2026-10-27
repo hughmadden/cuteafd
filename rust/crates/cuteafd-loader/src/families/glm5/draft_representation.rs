@@ -1,6 +1,7 @@
-//! Immutable GLM/GLM Flash DFlash storage and its device-loading contract.
+//! Immutable DFlash storage (GLM, GLM Flash, MiniMax) and its device-loading contract.
 //! The target owns its one vocabulary head (BF16, or GLM 5.3 Flash's FP8-only
-//! head with --fp8-head); the drafter borrows it and never copies it.
+//! head with --fp8-head); the drafter borrows it and never copies it. A GQA
+//! drafter's ring and tapped rows are its checkpoint's `sliding_window` (2048 for GLM).
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,11 +34,17 @@ pub struct GlmDraftCapacity {
 impl GlmDraftCapacity {
     pub fn new(context_slots: usize, max_batch_sequences: usize, block: usize)
         -> Result<Self, GlmDraftStorageError> {
+        Self::with_ring(context_slots, max_batch_sequences, block, 2048)
+    }
+
+    /// [`Self::new`] for rings of `ring` positions per context slot.
+    pub fn with_ring(context_slots: usize, max_batch_sequences: usize, block: usize, ring: u64)
+        -> Result<Self, GlmDraftStorageError> {
         if context_slots == 0 || max_batch_sequences == 0 || max_batch_sequences > context_slots || block < 2 {
             return Err(GlmDraftStorageError::Unsupported("draft batch must fit nonzero context slots and block >= 2"));
         }
         // Native ring destinations use signed32 row indices (-1 means skip).
-        if mul(context_slots as u64, 2048)? > i32::MAX as u64 + 1 {
+        if mul(context_slots as u64, ring)? > i32::MAX as u64 + 1 {
             return Err(GlmDraftStorageError::Unsupported("context slots exceed native ring row indices"));
         }
         let block_rows = max_batch_sequences.checked_mul(block).ok_or(GlmDraftStorageError::Overflow)?;
@@ -191,19 +198,32 @@ pub fn draft_fp8_scratch_bytes(rows: u64, k: u64, n: u64, sms: u64, mode: u8) ->
         + if splits > 1 { align(splits * rows.min(capacity) * n * 4) } else { 0 }
 }
 
-/// SM-independent owned arenas and candidate-local linear/attention scratch at readiness.
-/// The target head and its mask row are borrowed.
+/// Slices of 32 queries per KV head the shared block attention launches: at least two (the GLM
+/// drafters' 64 queries per KV head), as `cuteafd_glm_dflash_block_attention` sizes them.
+pub fn draft_attention_slices(heads: u64, kv_heads: u64, block: u64) -> u64 {
+    (heads / kv_heads.max(1) * block).div_ceil(32).max(2)
+}
+
+/// SM-independent owned arenas and candidate-local linear/attention scratch at readiness, for
+/// rings and tapped rows of `ring` positions (the drafter's sliding window). The target head and
+/// its mask row are borrowed.
+#[allow(clippy::too_many_arguments)]
 pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, block: u64,
-    fp8: bool, sms: u64, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), GlmDraftStorageError> {
+    fp8: bool, sms: u64, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache, ring: u64)
+    -> Result<(u64, u64), GlmDraftStorageError> {
     // Validate before arithmetic, including hostile config.json values. Native kernels and
     // allocation indices are signed32; the additional bound keeps all arena products in u64.
     if [g.hidden, g.intermediate, g.layers, g.heads, g.kv_heads, g.head_dim, g.taps, g.vocab,
-        g.conv_group, g.selector_rank, block].iter().any(|&n| n == 0 || n > 1_000_000)
+        g.conv_group, g.selector_rank, block, ring].iter().any(|&n| n == 0 || n > 1_000_000)
         || g.layers > 1024 || g.heads > 4096 || g.kv_heads > 4096 || g.taps > 1024
         || capacity.max_batch_sequences > 32 || block > 128 || mode > 2 || sms == 0 || sms > 4096 {
         return Err(GlmDraftStorageError::Unsupported("draft geometry exceeds native arena limits"));
     }
-    GlmDraftRuntimeLayout::new(g, if fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only }, capacity, 2048)?;
+    if mul(capacity.context_slots as u64, ring)? > i32::MAX as u64 + 1 {
+        return Err(GlmDraftStorageError::Unsupported("context slots exceed native ring row indices"));
+    }
+    GlmDraftRuntimeLayout::new(g, if fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only },
+        capacity, ring as usize)?;
     let allocation = |n: u64| n.max(256);
     let sequences = capacity.max_batch_sequences as u64;
     let rows = sequences * block;
@@ -211,8 +231,8 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
     let kv = g.kv_heads * g.head_dim;
     let attention = g.heads * g.head_dim;
     let conv = mul(4, g.hidden)? / g.conv_group;
-    let owned = add(mul(mul(mul(2,g.layers)?,capacity.context_slots as u64)?,mul(2048, kv_cache.plane_record_bytes(g.kv_heads as usize, g.head_dim as usize) as u64)?)?,
-        mul(2048,sum([mul(mul(g.taps,g.hidden)?,2)?,mul(g.hidden,4)?,mul(kv,4)?,12])?)?)?;
+    let owned = add(mul(mul(mul(2,g.layers)?,capacity.context_slots as u64)?,mul(ring, kv_cache.plane_record_bytes(g.kv_heads as usize, g.head_dim as usize) as u64)?)?,
+        mul(ring,sum([mul(mul(g.taps,g.hidden)?,2)?,mul(g.hidden,4)?,mul(kv,4)?,12])?)?)?;
     let workspace = [4 << 20, rows * g.hidden * 2, rows * g.hidden * 2, rows * g.hidden * 2,
         rows * conv * 2, rows * (attention + 2 * kv) * 2, rows * attention * 2,
         rows * kv * 2, rows * kv * 2, rows * attention * 2, rows * g.hidden * 2,
@@ -221,14 +241,25 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
         rows * 4, drafted * 4, drafted * 16, rows * 8, 3 * sequences * 4,
         drafted * 64 * 16 * 8].into_iter().map(allocation).sum::<u64>();
     let scratch = if fp8 {
-        let layout = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, capacity, 2048)?;
+        let layout = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, capacity, ring as usize)?;
         layout.fp8_scratch.unwrap().shapes.iter().map(|s|
-            draft_fp8_scratch_bytes(2048.max(rows), s.k, s.n, sms, mode)).max().unwrap_or(256)
+            draft_fp8_scratch_bytes(ring.max(rows), s.k, s.n, sms, mode)).max().unwrap_or(256)
     } else { 0 };
     let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(sequences,
-        g.kv_heads, 2, 2048 + block, 128, sms).map_err(|_| GlmDraftStorageError::Overflow)?;
+        g.kv_heads, draft_attention_slices(g.heads, g.kv_heads, block), ring + block, 128, sms)
+        .map_err(|_| GlmDraftStorageError::Overflow)?;
     // Both SM-sized arenas follow the selected GPU, even for BF16 projections.
     Ok((add(owned, workspace)?, add(scratch, allocation(attention_scratch))?))
+}
+
+/// A GQA drafter's ring and tapped rows: its checkpoint's `sliding_window` (the GLM releases'
+/// 2048 when the config names none).
+pub fn draft_window(config: &serde_json::Value) -> Result<u64, GlmDraftStorageError> {
+    match config.get("sliding_window") {
+        None | Some(serde_json::Value::Null) => Ok(2048),
+        Some(window) => window.as_u64().filter(|&w| w > 0)
+            .ok_or(GlmDraftStorageError::Unsupported("invalid draft sliding window")),
+    }
 }
 
 pub fn draft_geometry(config: &serde_json::Value) -> Result<(GlmDraftGeometry, u64), GlmDraftStorageError> {
@@ -257,10 +288,12 @@ pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, 
         return dspark_resident_bytes(config, slots, sequences.min(32), sms, representation, mode, kv_cache);
     }
     let (g, block) = draft_geometry(config)?;
-    let capacity = GlmDraftCapacity::new(slots, sequences, usize::try_from(block).map_err(|_| GlmDraftStorageError::Overflow)?)?;
-    let layout = GlmDraftRuntimeLayout::new(g, representation, capacity, 2048)?;
+    let ring = draft_window(config)?;
+    let capacity = GlmDraftCapacity::with_ring(slots, sequences,
+        usize::try_from(block).map_err(|_| GlmDraftStorageError::Overflow)?, ring)?;
+    let layout = GlmDraftRuntimeLayout::new(g, representation, capacity, ring as usize)?;
     let (workspace, scratch) = draft_workspace_bytes(g, capacity, block,
-        representation == GlmDraftRepresentation::Fp8Only, sms, mode, kv_cache)?;
+        representation == GlmDraftRepresentation::Fp8Only, sms, mode, kv_cache, ring)?;
     Ok((add(layout.weights.resident_bytes()?, workspace)?, scratch))
 }
 
@@ -317,7 +350,8 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(
         sequences as u64, kvh, (heads / kvh * block).div_ceil(32), add(capacity,block)?, dim, sms)
         .map_err(|_| GlmDraftStorageError::Overflow)?.max(256);
-    workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
+    workspace = add(workspace,crate::serving_capacity::draft_markov_workspace_bytes(sequences as u64, block)
+        .map_err(|_| GlmDraftStorageError::Overflow)?.max(256))?;
     let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
     let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
         draft_fp8_scratch_bytes(rows.max(2048),k,n,sms,mode)).max().unwrap_or(256) } else { 0 };
@@ -389,7 +423,7 @@ mod tests {
         let g = geometry(true);
         let capacity = GlmDraftCapacity::new(8,8,8).unwrap();
         let layout = GlmDraftRuntimeLayout::new(g,GlmDraftRepresentation::Fp8Only,capacity,2048).unwrap();
-        let (arenas,scratch) = draft_workspace_bytes(g,capacity,8,true,188,2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
+        let (arenas,scratch) = draft_workspace_bytes(g,capacity,8,true,188,2, crate::families::qwen4::Qwen4KvCache::Bf16, 2048).unwrap();
         let old_attention = 8 * 8 * 17 * 64 * 130 * 4;
         let new_attention = crate::serving_capacity::draft_attention_workspace_bytes(8, 8, 2,
             2056, 128, 188).unwrap();
@@ -398,7 +432,7 @@ mod tests {
         // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
         assert_eq!(scratch,30_491_648 + 128 * 80 * 4 + new_attention);
         let mut invalid = g; invalid.conv_group = 0;
-        assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+        assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2, crate::families::qwen4::Qwen4KvCache::Bf16, 2048).is_err());
     }
 
     #[test]
@@ -410,9 +444,9 @@ mod tests {
             for weights in [false, true] {
                 for sms in [170, 188] {
                     let (bf16, bf16_scratch) = draft_workspace_bytes(g, capacity, 8, weights,
-                        sms, 2, Qwen4KvCache::Bf16).unwrap();
+                        sms, 2, Qwen4KvCache::Bf16, 2048).unwrap();
                     let (fp8, fp8_scratch) = draft_workspace_bytes(g, capacity, 8, weights,
-                        sms, 2, Qwen4KvCache::Fp8).unwrap();
+                        sms, 2, Qwen4KvCache::Fp8, 2048).unwrap();
                     assert_eq!(bf16 - fp8, 2 * g.layers * 20 * 2048 * (2048 - 1056));
                     assert_eq!(bf16_scratch, fp8_scratch);
                 }

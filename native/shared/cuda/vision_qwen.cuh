@@ -84,9 +84,10 @@ __global__ void qwen_rope(const float* qkv,const float* bias,const int32_t* hw,
     v[size_t(global)*1152+i]=bf16_bits(src[2304+i]+bias[2304+i]);
   }
 }
-__global__ void qwen_residual(float* x,const float* y,const float* bias,size_t count) {
+// BF16 residual stream: x = bf16(x + bf16(y + bias)); Qwen (1152) and MiniMax (1280).
+__global__ void qwen_residual(float* x,const float* y,const float* bias,size_t count,int width) {
   for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x)
-    x[i]=round_bf16(x[i]+round_bf16(y[i]+bias[i%1152]));
+    x[i]=round_bf16(x[i]+round_bf16(y[i]+bias[i%width]));
 }
 __global__ void qwen_biased_gelu(const float* x,const float* bias,uint16_t* out,size_t count,int width,bool tanh_mode) {
   for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x) {
@@ -134,7 +135,7 @@ int encode_qwen(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,
     for(int r=0;r<n;r+=CHUNK) {
       int rows=std::min(CHUNK,n-r);
       Q_RUN(gemm(o,o->attn+size_t(r)*1152,b.proj,rows,1152,1152,o->proj));
-      Q_LAUNCH((qwen_residual<<<grid_for(long(rows)*1152),256,0,stream>>>(o->x+size_t(r)*1152,o->proj,w(b.proj_bias),size_t(rows)*1152)));
+      Q_LAUNCH((qwen_residual<<<grid_for(long(rows)*1152),256,0,stream>>>(o->x+size_t(r)*1152,o->proj,w(b.proj_bias),size_t(rows)*1152,1152)));
     }
     Q_LAUNCH((layernorm_bf16_kernel<<<n,256,0,stream>>>(o->x,w(b.norm2),w(s.norm2_bias[i]),o->norm,1152,1e-6f)));
     for(int r=0;r<n;r+=CHUNK) {
@@ -142,7 +143,7 @@ int encode_qwen(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,
       Q_RUN(gemm(o,o->norm+size_t(r)*1152,b.gate_up,rows,4304,1152,o->gu));
       Q_LAUNCH((qwen_biased_gelu<<<grid_for(long(rows)*4304),256,0,stream>>>(o->gu,w(b.gate_up_bias),o->mlp,size_t(rows)*4304,4304,true)));
       Q_RUN(gemm(o,o->mlp,b.down,rows,1152,4304,o->proj));
-      Q_LAUNCH((qwen_residual<<<grid_for(long(rows)*1152),256,0,stream>>>(o->x+size_t(r)*1152,o->proj,w(b.down_bias),size_t(rows)*1152)));
+      Q_LAUNCH((qwen_residual<<<grid_for(long(rows)*1152),256,0,stream>>>(o->x+size_t(r)*1152,o->proj,w(b.down_bias),size_t(rows)*1152,1152)));
     }
     if((i+1)%4==0 || i==26)Q_RUN(observe(o,cb,ctx,i+1,o->x,n,1152,false));
   }

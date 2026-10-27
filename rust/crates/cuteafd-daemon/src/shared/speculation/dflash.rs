@@ -1,17 +1,20 @@
 //! Shared DFlash2 block runtime, currently used by GLM 5.3 (incoai/GLM-5.3-DFlash2: six layers,
-//! 64 query heads) and GLM 5.3 Flash (incoai/GLM-5.3-Flash-DFlash2: five
-//! layers, 32 query heads over 8 KV heads).
+//! 64 query heads), GLM 5.3 Flash (incoai/GLM-5.3-Flash-DFlash2: five
+//! layers, 32 query heads over 8 KV heads) and MiniMax M3.1 Flash
+//! (RadixArk/Minimax-M3.1-Flash-Dflash2: five layers, 64 query heads over 4 KV
+//! heads, a 4096-position window, Gemma norms, partial RoPE, SwiGLU-OAI).
 //!
 //! Every target step taps the outputs of the `target_layer_ids` layers
 //! (GLM 5.3: 5, 19, 33, 47, 61, 75; Flash: 5, 14, 24, 33, 42, where the tap is
-//! the mean of the four mHC streams, [`DflashDrafter::tap_streams`]) into
+//! the mean of the four mHC streams, [`DflashDrafter::tap_streams`]; MiniMax:
+//! 3, 17, 31, 45, 59 of its FP32 residual, [`DflashDrafter::tap_f32_at`]) into
 //! [`DflashDrafter::taps`]. Once a
 //! step's rows are committed, [`DflashDrafter::update`] projects their taps
 //! (`hidden_norm(fc(taps))`) into every draft layer's context K/V, a ring of
-//! the sequence's last 2048 positions. [`DflashDrafter::draft`] then runs the
+//! the sequence's last `sliding_window` positions (2048 for GLM). [`DflashDrafter::draft`] then runs the
 //! Qwen3-style layers (two-tap dynamic convolutions around attention and
 //! MLP) over the block `[anchor, mask x 7]` at the anchor's position,
-//! non-causally against the ring, takes the top 16 of the target head's
+//! against the ring ([`BlockMask`]: non-causally for GLM), takes the top 16 of the target head's
 //! logits per drafted row and walks the candidate selector greedily, all on
 //! the device. Drafts only steer speculation; the verify step keeps output
 //! identical to plain greedy decoding.
@@ -162,9 +165,11 @@ mod draft_head_tests {
 }
 
 
-/// Context entries each draft layer attends to (the checkpoint's sliding window).
+/// Context entries each GLM draft layer attends to (its checkpoints' sliding window). A drafter's
+/// own ring is its checkpoint's window, [`DflashConfig::window`].
 pub(crate) const RING: usize = 2048;
-/// Tapped rows one target step keeps (a prefill chunk's tail, or a verify step).
+/// Tapped rows one GLM target step keeps (a prefill chunk's tail, or a verify step); MLA drafts
+/// keep as many. A GQA drafter keeps [`DflashConfig::tap_rows`].
 pub(crate) const TAP_ROWS: usize = RING;
 #[derive(Debug, Clone, serde::Deserialize)]
 struct RawConfig {
@@ -177,13 +182,33 @@ struct RawConfig {
     rms_norm_eps: f64,
     sliding_window: usize,
     vocab_size: usize,
+    #[serde(default)]
+    draft_vocab_size: Option<usize>,
     rope_parameters: RawRope,
     dflash_config: RawDflash,
+    #[serde(default)]
+    use_gemma_norm: bool,
+    #[serde(default)]
+    qk_norm_type: Option<String>,
+    #[serde(default)]
+    attention_output_gate: bool,
+    #[serde(default)]
+    partial_rotary_factor: Option<f64>,
+    #[serde(default)]
+    rotary_dim: Option<usize>,
+    #[serde(default)]
+    hidden_act: Option<String>,
+    #[serde(default)]
+    swiglu_alpha: Option<f64>,
+    #[serde(default)]
+    swiglu_limit: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct RawRope {
     rope_theta: f64,
+    #[serde(default)]
+    partial_rotary_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -195,6 +220,50 @@ struct RawDflash {
     selector_rank: usize,
     selector_top_k: usize,
     target_layer_ids: Vec<usize>,
+}
+
+/// The MLP activation of a draft layer's `[gate | up]` rows (`hidden_act`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DraftActivation {
+    /// `silu(gate) * up` (GLM).
+    Silu,
+    /// `g * sigmoid(alpha g) * (u + 1)`, `g = min(gate, limit)`, `u = clamp(up, ±limit)` (MiniMax).
+    SwigluOai { alpha: f32, limit: f32 },
+}
+
+/// How a draft block attends: the family's port of its upstream's mask.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlockMask {
+    /// Mask each block row's context to its own window (upstream's
+    /// `|p - q| < window`); off, every block row sees the last `window`
+    /// context entries (the GLM 5.3 port's measured behavior).
+    pub row_window: bool,
+    /// Block row r attends block rows 0..=r only (SGLang's mask for sliding-window
+    /// draft layers whose config sets no `is_causal`); off, the whole block (GLM).
+    pub causal: bool,
+}
+
+impl BlockMask {
+    /// The mask SGLang's DFlash draft serves a checkpoint with (`models/dflash.py`): its
+    /// sliding_attention layers attend a per-row window and, unless the config sets `is_causal`,
+    /// causally; full_attention layers (or no `layer_types`) the whole block and context. Every
+    /// layer must share one kind. The GLM ports keep their own measured masks.
+    pub(crate) fn upstream(config: &serde_json::Value) -> Result<Self> {
+        let causal = match config.get("is_causal") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_bool().context("DFlash2 is_causal must be boolean")?),
+        };
+        let kinds = config["layer_types"].as_array().map(|kinds| kinds.iter()
+            .map(|kind| kind.as_str().context("DFlash2 layer_types entries are strings")).collect::<Result<Vec<_>>>())
+            .transpose()?.unwrap_or_default();
+        let sliding = match kinds.first().copied() {
+            None | Some("full_attention") => false,
+            Some("sliding_attention") => true,
+            Some(other) => anyhow::bail!("DFlash2 layer type {other} is unsupported"),
+        };
+        ensure!(kinds.iter().all(|&kind| kind == kinds[0]), "DFlash2 layers mixing attention kinds are unsupported");
+        Ok(Self { row_window: sliding, causal: causal.unwrap_or(sliding) })
+    }
 }
 
 /// The drafter geometry the kernels are written for, read from `config.json`.
@@ -220,21 +289,57 @@ pub(crate) struct DflashConfig {
     /// `|p - q| < window`); off, every block row sees the last `window`
     /// context entries (the GLM 5.3 port's measured behavior).
     pub row_window: bool,
+    /// Block rows attend causally within the block ([`BlockMask::causal`]).
+    pub causal: bool,
+    /// `use_gemma_norm`: every norm (input, post-attention, final, hidden and the per-head
+    /// q/k norms) is `x * rsqrt(mean(x^2) + eps) * (1 + w)` in FP32, and RoPE rotates in FP32,
+    /// each rounded once (the `_gemma` kernels); off, Qwen3 RMSNorm and BF16 rotate_half (GLM).
+    pub gemma: bool,
+    /// Head channels RoPE rotates (`head_dim * partial_rotary_factor`, NeoX pairs).
+    pub rotary: usize,
+    pub activation: DraftActivation,
 }
 
 impl DflashConfig {
     pub fn read(snapshot: &Path) -> Result<Self> {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
             .context("parsing the DFlash2 config.json")?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: RawConfig) -> Result<Self> {
         let d = &raw.dflash_config;
-        ensure!(raw.head_dim == 128 && raw.num_key_value_heads > 0
-            && raw.num_attention_heads % raw.num_key_value_heads == 0
-            && raw.num_attention_heads / raw.num_key_value_heads * d.block_size <= 64,
-            "DFlash2 kernels take 128-wide heads and at most 64 queries per kv head and block \
-             (got {} heads, {} kv, block {})", raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
+        // Block attention takes any query count per KV head, in slices of 32.
+        ensure!(raw.head_dim == 128 && raw.num_attention_heads > 0 && raw.num_key_value_heads > 0
+            && raw.num_attention_heads % raw.num_key_value_heads == 0 && d.block_size >= 2,
+            "DFlash2 kernels take 128-wide heads in whole groups per kv head and blocks of an anchor and drafts \
+             (got {} heads of {}, {} kv, block {})", raw.num_attention_heads, raw.head_dim,
+            raw.num_key_value_heads, d.block_size);
         ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
             "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
-        ensure!(raw.sliding_window == RING, "DFlash2 window {} (the ring holds {RING})", raw.sliding_window);
+        ensure!(raw.sliding_window > 0, "DFlash2 needs a sliding window (its context ring)");
+        ensure!(raw.draft_vocab_size.is_none_or(|v| v == raw.vocab_size),
+            "DFlash2 draft vocabulary {:?} differs from the target's {}: no token map is supported",
+            raw.draft_vocab_size, raw.vocab_size);
+        ensure!(raw.qk_norm_type.as_deref().is_none_or(|t| t == "per_head") && !raw.attention_output_gate,
+            "DFlash2 kernels take per-head q/k norms and no attention output gate");
+        let factor = raw.partial_rotary_factor.or(raw.rope_parameters.partial_rotary_factor).unwrap_or(1.0);
+        let rotary = (raw.head_dim as f64 * factor).round() as usize;
+        ensure!(factor > 0.0 && factor <= 1.0 && raw.rotary_dim.is_none_or(|r| r == rotary)
+            && (rotary == raw.head_dim || (raw.use_gemma_norm && rotary == 64)),
+            "DFlash2 RoPE on {rotary} of {} channels (rotary_dim {:?}): the kernels rotate all 128, or 64 \
+             with Gemma norms", raw.head_dim, raw.rotary_dim);
+        let activation = match raw.hidden_act.as_deref() {
+            None | Some("silu") => DraftActivation::Silu,
+            Some("swigluoai") => {
+                let (Some(alpha), Some(limit)) = (raw.swiglu_alpha, raw.swiglu_limit) else {
+                    anyhow::bail!("DFlash2 swigluoai needs swiglu_alpha and swiglu_limit");
+                };
+                ensure!(alpha.is_finite() && limit.is_finite() && limit > 0.0, "DFlash2 SwiGLU-OAI alpha/limit");
+                DraftActivation::SwigluOai { alpha: alpha as f32, limit: limit as f32 }
+            }
+            Some(other) => anyhow::bail!("DFlash2 kernels take silu or swigluoai MLPs, not {other}"),
+        };
         Ok(Self {
             hidden: raw.hidden_size,
             intermediate: raw.intermediate_size,
@@ -252,6 +357,10 @@ impl DflashConfig {
             vocab: raw.vocab_size,
             window: raw.sliding_window,
             row_window: false,
+            causal: false,
+            gemma: raw.use_gemma_norm,
+            rotary,
+            activation,
         })
     }
 
@@ -260,11 +369,18 @@ impl DflashConfig {
             heads: cfg.mla.heads, kv_heads: cfg.mla.heads, head_dim: cfg.mla.nope + cfg.mla.rope,
             eps: cfg.eps as f32, theta: 0.0, block: cfg.block, group: cfg.group,
             mask_token: cfg.mask_token, rank: cfg.selector_rank, taps: cfg.taps.clone(), vocab: cfg.vocab,
-            window: 0, row_window: false }
+            window: 0, row_window: false, causal: false, gemma: false, rotary: cfg.mla.rope,
+            activation: DraftActivation::Silu }
     }
 
     pub fn drafts(&self) -> usize {
         self.block - 1
+    }
+
+    /// Tapped rows one target step keeps: a prefill chunk's tail that fills the ring (a GQA
+    /// draft's sliding window; 2048 for GLM), or a verify step. MLA drafts keep [`TAP_ROWS`].
+    pub fn tap_rows(&self) -> usize {
+        if self.window > 0 { self.window } else { TAP_ROWS }
     }
 
     fn kv_width(&self) -> usize {
@@ -315,12 +431,16 @@ impl DflashConfig {
 
     pub(crate) fn runtime_layout(&self, mode: GlmDraftRepresentation, capacity: GlmDraftCapacity)
         -> Result<GlmDraftRuntimeLayout> {
+        // Native ring destinations are signed32 rows (-1 skips).
+        ensure!(capacity.context_slots.checked_mul(self.window).is_some_and(|rows| rows <= i32::MAX as usize + 1),
+            "{} DFlash2 context slots of {} positions exceed native ring row indices", capacity.context_slots,
+            self.window);
         Ok(GlmDraftRuntimeLayout::new(GlmDraftGeometry {
             hidden: self.hidden as u64, intermediate: self.intermediate as u64, layers: self.layers as u64,
             heads: self.heads as u64, kv_heads: self.kv_heads as u64, head_dim: self.head_dim as u64,
             taps: self.taps.len() as u64, vocab: self.vocab as u64, conv_group: self.group as u64,
             selector_rank: self.rank as u64,
-        }, mode, capacity, TAP_ROWS)?)
+        }, mode, capacity, self.tap_rows())?)
     }
 }
 
@@ -863,9 +983,9 @@ pub(crate) struct DflashDrafter<'a> {
     predecessor: Dev<'a>,
     successor: Dev<'a>,
     layers: Vec<DraftLayer<'a>>,
-    /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
+    /// [tap rows, taps * hidden] BF16: the last step's tapped rows ([`DflashConfig::tap_rows`]).
     pub taps: Dev<'a>,
-    /// Context update scratch: [TAP_ROWS, hidden] twice, [TAP_ROWS, 2 kv] and the tables.
+    /// Context update scratch: [tap rows, hidden] twice, [tap rows, 2 kv] and the tables.
     fused: Dev<'a>,
     fused_norm: Dev<'a>,
     context_positions: Dev<'a>,
@@ -879,6 +999,9 @@ pub(crate) struct DflashDrafter<'a> {
     /// How the borrowed BF16 head runs past one draft block ([`DraftHead`]; GLM 5.3
     /// Flash's --draft-head). [`DraftHead::Exact`] unless the target sets it.
     head_mode: Cell<DraftHead>,
+    /// The selector scores candidates in FP32 (SGLang's DFlash2 selector) rather than rounding
+    /// each score to BF16 (the GLM ports).
+    selector_fp32: Cell<bool>,
     /// How the FP8 GEMMs run (GLM 5.3 Flash's --draft-linear), and the latest mode the FP8
     /// scratch was admitted for.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
@@ -976,18 +1099,34 @@ impl Checkpoint {
     }
 }
 
-/// Header-only admission before native modules or target/drafter allocation.
+/// Header-only admission before native modules or target/drafter allocation, for the GLM
+/// integrations: they tap [`TAP_ROWS`]-row chunk tails, so the drafter's ring must be [`RING`].
 pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots: Option<usize>,
     max_batch_sequences: usize) -> Result<()> {
+    let cfg = check_headers(snapshot, fp8, context_slots.unwrap_or(20.max(max_batch_sequences)), max_batch_sequences)?;
+    require_glm_ring(&cfg)
+}
+
+/// The GLM integrations tap [`TAP_ROWS`]-row chunk tails into the drafter: its ring (its
+/// window) must be [`RING`]. Every GLM load site checks, beside the header check.
+pub(crate) fn require_glm_ring(cfg: &DflashConfig) -> Result<()> {
+    ensure!(cfg.window == RING, "DFlash2 window {} (the ring holds {RING})", cfg.window);
+    Ok(())
+}
+
+/// Header-only admission of a GQA drafter's `context_slots` rings and draft batches of
+/// `max_batch_sequences`, before native modules or target/drafter allocation.
+pub(crate) fn check_headers(snapshot: &Path, fp8: Option<bool>, context_slots: usize,
+    max_batch_sequences: usize) -> Result<DflashConfig> {
     let cfg = DflashConfig::read(snapshot)?;
     let mode = GlmDraftRepresentation::from_fp8_option(fp8);
-    let capacity = GlmDraftCapacity::new(context_slots.unwrap_or(20.max(max_batch_sequences)),
-        max_batch_sequences, cfg.block)?;
+    let capacity = GlmDraftCapacity::new(context_slots, max_batch_sequences, cfg.block)?;
     cfg.runtime_layout(mode, capacity)?;
     let path = snapshot.join("model.safetensors");
     let tensors: HashMap<_, _> = read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect();
     let file_bytes = std::fs::metadata(&path)?.len();
-    check_checkpoint_headers(&cfg, &tensors, file_bytes)
+    check_checkpoint_headers(&cfg, &tensors, file_bytes)?;
+    Ok(cfg)
 }
 
 /// The only shared head consumer in this tranche reads checkpoint BF16.
@@ -1057,10 +1196,13 @@ impl<'a> DflashDrafter<'a> {
             &self.confidence_key(family, fp8_head))
     }
 
-    fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
+    /// The selector prior's key: `family/dflash2/` and these numerics.
+    pub(crate) fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
         let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
         let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
-        let numerics = format!("{}-{:?}-{head}-{:?}{kv}-r1", self.representation.name(), self.fp8_rows.get(),
+        // An FP32-scored selector's features are their own distribution.
+        let score = if self.selector_fp32.get() { "-score-fp32" } else { "" };
+        let numerics = format!("{}-{:?}-{head}-{:?}{kv}{score}-r1", self.representation.name(), self.fp8_rows.get(),
             self.confidence_scales).to_ascii_lowercase();
         format!("{family}/dflash2/{numerics}")
     }
@@ -1069,20 +1211,22 @@ impl<'a> DflashDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the target embedding of
-    /// the mask token. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
+    /// the mask token; `mask` is how the block attends. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
     /// it and the modes before it, see [`Self::set_draft_linear`]).
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
-        max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
+        max_sequences: usize, mask_row: Vec<u8>, mask: BlockMask, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
+        let cfg = DflashConfig { row_window: mask.row_window, causal: mask.causal, ..DflashConfig::read(snapshot)? };
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
             &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8, kv_cache)?;
-        tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "DFlash shared readiness inventory");
+        tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, ring = cfg.window, tap_rows = cfg.tap_rows(),
+            gemma = cfg.gemma, rotary = cfg.rotary, causal = cfg.causal, row_window = cfg.row_window,
+            "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {
@@ -1101,6 +1245,7 @@ impl<'a> DflashDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+        let (ring, tap_rows) = (cfg.window, cfg.tap_rows());
         let fp8_workspace = layout.fp8_scratch.as_ref().map(|scratch| {
             let shapes: Vec<_> = scratch.shapes.iter().map(|shape|
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
@@ -1139,8 +1284,8 @@ impl<'a> DflashDrafter<'a> {
                     k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
                     o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
                         h, cfg.heads * cfg.head_dim)?,
-                    k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
-                    v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                    k_ring: zeroed(slots * ring * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                    v_ring: zeroed(slots * ring * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 }),
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
@@ -1164,12 +1309,12 @@ impl<'a> DflashDrafter<'a> {
             predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
             successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
             layers,
-            taps: zeroed(TAP_ROWS * taps * 2)?,
-            fused: zeroed(TAP_ROWS * h * 2)?,
-            fused_norm: zeroed(TAP_ROWS * h * 2)?,
-            context_positions: zeroed(TAP_ROWS * 8)?,
+            taps: zeroed(tap_rows * taps * 2)?,
+            fused: zeroed(tap_rows * h * 2)?,
+            fused_norm: zeroed(tap_rows * h * 2)?,
+            context_positions: zeroed(tap_rows * 8)?,
             context: DraftContext::Gqa(GqaContext {
-                kv: zeroed(TAP_ROWS * 2 * kv * 2)?, slots: zeroed(TAP_ROWS * 4)?,
+                kv: zeroed(tap_rows * 2 * kv * 2)?, slots: zeroed(tap_rows * 4)?,
             }),
             mask_row,
             workspace: RefCell::new(None),
@@ -1181,6 +1326,7 @@ impl<'a> DflashDrafter<'a> {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             head_mode: Cell::new(DraftHead::Exact),
+            selector_fp32: Cell::new(false),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
             cfg,
@@ -1280,7 +1426,8 @@ impl<'a> DflashDrafter<'a> {
                 layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
-            head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
+            head_mode: Cell::new(DraftHead::Exact), selector_fp32: Cell::new(false), fp8_rows: Cell::new(fp8_rows),
+            fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
@@ -1304,6 +1451,12 @@ impl<'a> DflashDrafter<'a> {
         self.head_mode.set(mode);
     }
 
+    /// Whether the selector scores candidates in FP32 (SGLang's DFlash2 selector) from now on,
+    /// rather than rounding each score to BF16 (the GLM ports' default).
+    pub fn set_selector_fp32(&self, fp32: bool) {
+        self.selector_fp32.set(fp32);
+    }
+
     pub(crate) fn draft_head_mode(&self) -> DraftHead {
         self.head_mode.get()
     }
@@ -1325,10 +1478,82 @@ impl<'a> DflashDrafter<'a> {
             DraftWeight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
                 // SAFETY: scratch covers every selected matrix and up to
-                // max(TAP_ROWS, max_batch_sequences*block) input rows in this
+                // max(tap rows, max_batch_sequences*block) input rows in this
                 // mode (set_draft_linear keeps it within the admitted one).
                 unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
                     self.fp8_rows.get()) }
+            }
+        }
+    }
+
+    /// `out` = the drafter's norm ([`DflashConfig::gemma`]) of `rows` rows of the hidden width.
+    ///
+    /// # Safety
+    /// `x` and `out` hold `rows` BF16 rows of the hidden width and `w` one, on this stream.
+    unsafe fn apply_norm(&self, x: *const c_void, w: *const c_void, out: *mut c_void, rows: usize) -> Result<()> {
+        let (h, eps, s) = (self.cfg.hidden, self.cfg.eps, self.stream);
+        // SAFETY: the caller's contract.
+        unsafe {
+            if self.cfg.gemma { self.library.glm_dflash_rmsnorm_gemma(x, w, out, rows, h, eps, s) }
+            else { self.library.glm_dflash_rmsnorm(x, w, out, rows, h, eps, s) }
+        }
+    }
+
+    /// `residual_out = residual + conv1(source)`, `normalized` = the drafter's norm of it.
+    ///
+    /// # Safety
+    /// As [`NativeLibrary::glm_dflash_conv_residual_norm`] for `rows` block rows of this drafter.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn conv_residual_norm(&self, source: *const c_void, dynamic: *const c_void, base: *const c_void,
+        residual: *const c_void, w: *const c_void, residual_out: *mut c_void, normalized: *mut c_void, rows: usize)
+        -> Result<()> {
+        let c = &self.cfg;
+        // SAFETY: the caller's contract.
+        unsafe {
+            if c.gemma {
+                self.library.glm_dflash_conv_residual_norm_gemma(source, dynamic, base, residual, w, residual_out,
+                    normalized, rows, c.block, c.hidden, c.group, c.eps, self.stream)
+            } else {
+                self.library.glm_dflash_conv_residual_norm(source, dynamic, base, residual, w, residual_out,
+                    normalized, rows, c.block, c.hidden, c.group, c.eps, self.stream)
+            }
+        }
+    }
+
+    /// Per-head q/k norms and RoPE of `rows` `qkv` rows ([`NativeLibrary::glm_dflash_qk_rope`];
+    /// the Gemma variant on [`DflashConfig::rotary`] channels).
+    ///
+    /// # Safety
+    /// As [`NativeLibrary::glm_dflash_qk_rope`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn qk_rope(&self, qkv: *const c_void, q_norm: *const c_void, k_norm: *const c_void,
+        positions: *const c_void, slots: *const c_void, q_out: *mut c_void, k_out: *mut c_void, v_out: *mut c_void,
+        rows: usize, heads: usize, fp8_kv: bool) -> Result<()> {
+        let c = &self.cfg;
+        // SAFETY: the caller's contract.
+        unsafe {
+            if c.gemma {
+                self.library.glm_dflash_qk_rope_gemma(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
+                    rows, heads, c.kv_heads, c.rotary, c.theta, c.eps, fp8_kv, self.stream)
+            } else {
+                self.library.glm_dflash_qk_rope(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
+                    rows, heads, c.kv_heads, c.theta, c.eps, fp8_kv, self.stream)
+            }
+        }
+    }
+
+    /// `out` [rows, intermediate] = the drafter's activation of `gate_up` [rows, 2 * intermediate].
+    ///
+    /// # Safety
+    /// Both buffers hold `rows` rows of their widths on this stream.
+    unsafe fn activation(&self, gate_up: *const c_void, out: *mut c_void, rows: usize) -> Result<()> {
+        let inter = self.cfg.intermediate;
+        // SAFETY: the caller's contract.
+        unsafe {
+            match self.cfg.activation {
+                DraftActivation::Silu => self.library.glm_dflash_silu_mul(gate_up, out, rows, inter, self.stream),
+                DraftActivation::SwigluOai { alpha, limit } =>
+                    self.library.glm_dflash_swiglu_oai(gate_up, out, rows, inter, alpha, limit, self.stream),
             }
         }
     }
@@ -1347,11 +1572,24 @@ impl<'a> DflashDrafter<'a> {
     /// [`Self::tap`] into tap rows `to..to + n`.
     pub fn tap_at(&self, layer: usize, hidden: *const c_void, first: usize, n: usize, to: usize) -> Result<()> {
         let Some(index) = self.tap_index(layer) else { return Ok(()) };
-        let (h, width) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden);
-        ensure!(to + n <= TAP_ROWS, "tap rows {to}..{} exceed {TAP_ROWS}", to + n);
-        // SAFETY: `hidden` holds first + n rows; the tap buffer TAP_ROWS rows.
+        let (h, width, rows) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden, self.cfg.tap_rows());
+        ensure!(to + n <= rows, "tap rows {to}..{} exceed {rows}", to + n);
+        // SAFETY: `hidden` holds first + n rows; the tap buffer `rows` rows.
         unsafe {
             self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(),
+                self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, width, index * h, self.stream)
+        }
+    }
+
+    /// [`Self::tap_at`] of F32 rows (`hidden` [rows, hidden] F32, MiniMax's residual), each
+    /// rounded to BF16 (to nearest even).
+    pub fn tap_f32_at(&self, layer: usize, hidden: *const c_void, first: usize, n: usize, to: usize) -> Result<()> {
+        let Some(index) = self.tap_index(layer) else { return Ok(()) };
+        let (h, width, rows) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden, self.cfg.tap_rows());
+        ensure!(to + n <= rows, "tap rows {to}..{} exceed {rows}", to + n);
+        // SAFETY: `hidden` holds first + n F32 rows; the tap buffer `rows` rows.
+        unsafe {
+            self.library.glm_dflash_tap_f32(hidden.cast::<u8>().add(first * h * 4).cast(),
                 self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, width, index * h, self.stream)
         }
     }
@@ -1367,9 +1605,9 @@ impl<'a> DflashDrafter<'a> {
     pub fn tap_streams_at(&self, layer: usize, streams: *const c_void, hc: usize, first: usize, n: usize, to: usize)
         -> Result<()> {
         let Some(index) = self.tap_index(layer) else { return Ok(()) };
-        let (h, width) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden);
-        ensure!(to + n <= TAP_ROWS, "tap rows {to}..{} exceed {TAP_ROWS}", to + n);
-        // SAFETY: `streams` holds first + n rows of hc streams; the tap buffer TAP_ROWS rows.
+        let (h, width, rows) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden, self.cfg.tap_rows());
+        ensure!(to + n <= rows, "tap rows {to}..{} exceed {rows}", to + n);
+        // SAFETY: `streams` holds first + n rows of hc streams; the tap buffer `rows` rows.
         unsafe {
             self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(),
                 self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, hc, width, index * h, self.stream)
@@ -1445,12 +1683,13 @@ impl<'a> DflashDrafter<'a> {
         let DraftContext::Gqa(context) = &self.context else { unreachable!() };
         let (first, last) = (rows.iter().map(|r| r.tap_row).min().unwrap(), rows.iter().map(|r| r.tap_row).max().unwrap());
         let n = last - first + 1;
-        ensure!(last < TAP_ROWS, "tap row {last} past {TAP_ROWS}");
+        let (ring, tap_rows) = (self.cfg.window, self.cfg.tap_rows());
+        ensure!(last < tap_rows, "tap row {last} past {tap_rows}");
         let (mut positions, mut slots) = (vec![0i64; n], vec![-1i32; n]);
         for row in rows {
             ensure!(row.slot < self.slots, "ring slot {} of {}", row.slot, self.slots);
             positions[row.tap_row - first] = row.position as i64;
-            slots[row.tap_row - first] = (row.slot * RING + row.position % RING) as i32;
+            slots[row.tap_row - first] = (row.slot * ring + row.position % ring) as i32;
         }
         self.put(&self.context_positions, bytes_of(&positions))?;
         self.put(&context.slots, bytes_of(&slots))?;
@@ -1459,21 +1698,20 @@ impl<'a> DflashDrafter<'a> {
         let width = self.cfg.taps.len() * h;
         let s = self.stream;
         let context_span = self.timing.begin("context", None, n, s)?;
-        // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
+        // SAFETY: every buffer holds tap_rows rows of its width; the stream orders the chain.
         unsafe {
             self.linear(at(&self.taps, first * width * 2), &self.fc, 0,
                 self.fused.buffer.ptr, n, width, h)?;
-            self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
-                self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
+            self.apply_norm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr, self.fused_norm.buffer.ptr, n)?;
             for layer in &self.layers {
                 let layer = layer.attention.gqa()?;
                 let q_rows = self.cfg.heads * self.cfg.head_dim;
                 self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
                     context.kv.buffer.ptr, n, h, 2 * kv)?;
-                self.library.glm_dflash_qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
+                self.qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, context.slots.buffer.ptr,
-                    std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
-                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                    std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0,
+                    self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -1806,9 +2044,11 @@ impl<'a> DflashDrafter<'a> {
         self.prime_metadata()?;
         if matches!(self.context, DraftContext::Mla(_)) { self.reset_context(0, 0)?; }
         self.library.cuda_zero_bytes(self.taps.buffer, self.taps.buffer.bytes)?;
-        self.update(&(0..TAP_ROWS).map(|tap_row| ContextRow { tap_row, slot: 0,
+        let tap_rows = self.cfg.tap_rows();
+        self.update(&(0..tap_rows).map(|tap_row| ContextRow { tap_row, slot: 0,
             position: tap_row }).collect::<Vec<_>>())?;
         if matches!(self.context, DraftContext::Mla(_)) {
+            // MLA drafts keep TAP_ROWS tap rows (they have no window).
             for slot in 0..self.slots { self.reset_context(slot, TAP_ROWS)?; }
         }
         // SAFETY: this drafter owns its live startup stream.
@@ -1819,7 +2059,7 @@ impl<'a> DflashDrafter<'a> {
         };
         for count in 1..=self.max_sequences {
             let sequences = (0..count).map(|slot| DraftSeq { slot, anchor: self.cfg.mask_token,
-                position: TAP_ROWS, valid_from: TAP_ROWS }).collect::<Vec<_>>();
+                position: tap_rows, valid_from: tap_rows }).collect::<Vec<_>>();
             let head = |_: *const c_void, out: *mut f32, rows: usize, stream: *mut c_void| {
                 let bytes = rows * self.cfg.vocab * 4;
                 // SAFETY: initialized scratch logits precede selection on this stream.
@@ -1875,7 +2115,8 @@ impl<'a> DflashDrafter<'a> {
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+            alloc(self.library.glm_dflash_block_attention_workspace(sequences, c.heads, c.kv_heads, c.block,
+                c.window + c.block)?)?
         };
         Ok(Workspace {
             sequences,
@@ -2033,7 +2274,7 @@ impl<'a> DflashDrafter<'a> {
             ensure!(seq.slot < self.slots, "ring slot {} of {}", seq.slot, self.slots);
             positions.extend((seq.position..seq.position + block).map(|p| p as i64));
             tables[i] = seq.slot as i32;
-            tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
+            tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(c.window) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
         // Eager per-round launch: keep the arena capacity-sized, not this work bound.
@@ -2066,13 +2307,13 @@ impl<'a> DflashDrafter<'a> {
             }
         }
         let (s, l) = (self.stream, self.library);
-        let (eps, group, inter) = (c.eps, c.group, c.intermediate);
+        let (group, inter) = (c.group, c.intermediate);
         let attention_width = c.heads * c.head_dim;
         let forward_span = self.timing.begin("forward", None, rows, s)?;
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
-            l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+            self.apply_norm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows)?;
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
                 self.linear(w.n.buffer.ptr, &layer.attn_conv, 0, w.dynamic.buffer.ptr,
@@ -2082,14 +2323,15 @@ impl<'a> DflashDrafter<'a> {
                 match (&layer.attention, &w.attention, &self.context) {
                     (DraftAttention::Gqa(a), AttentionWorkspace::Gqa(attention), DraftContext::Gqa(_)) => {
                         self.linear(w.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
-                        l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
+                        self.qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
-                            rows, c.heads, c.kv_heads, c.theta, eps, false, s)?;
-                        l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
+                            rows, c.heads, false)?;
+                        l.glm_dflash_block_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
-                            attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                            attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, c.window,
+                            max_keys, if c.row_window { c.window } else { 0 }, c.causal, 1.0 / (c.head_dim as f32).sqrt(),
+                            self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                         self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, attention_width, h)?;
                     }
                     (DraftAttention::Mla(a), AttentionWorkspace::Mla(attention), DraftContext::Mla(context)) => {
@@ -2110,20 +2352,20 @@ impl<'a> DflashDrafter<'a> {
                     }
                     _ => anyhow::bail!("DFlash layer/workspace mismatch"),
                 }
-                l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
-                    w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                self.conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
+                    w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows)?;
                 self.linear(w.n.buffer.ptr, &layer.mlp_conv, 0, w.dynamic.buffer.ptr,
                     rows, h, c.conv_width())?;
                 l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr, w.conv.buffer.ptr,
                     rows, block, h, group, s)?;
                 self.linear(w.conv.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
                     rows, h, 2 * inter)?;
-                l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
+                self.activation(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows)?;
                 self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
                     inter, h)?;
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
-                l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
-                    w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                self.conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
+                    w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows)?;
                 self.timing.end(layer_span, s)?;
             }
             self.timing.end(forward_span, s)?;
@@ -2141,7 +2383,9 @@ impl<'a> DflashDrafter<'a> {
             let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
             self.linear(w.n.buffer.ptr, &self.projection, 0,
                 w.projected.buffer.ptr, rows, h, c.rank)?;
-            l.glm_dflash_select(self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
+            let select = if self.selector_fp32.get() { NativeLibrary::glm_dflash_select_fp32_score }
+                else { NativeLibrary::glm_dflash_select };
+            select(l, self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
                 w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
                 w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
             self.timing.end(select_span, s)?;
@@ -2280,7 +2524,7 @@ impl ReplayDrafter for DflashDrafter<'_> {
     }
 
     fn tap_rows(&self) -> usize {
-        TAP_ROWS
+        self.cfg.tap_rows()
     }
 
     fn last_hidden(&self, sequences: usize) -> Result<Vec<u8>> {
@@ -2318,6 +2562,8 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
         let mut out = Vec::with_capacity(anchors.len());
         let mut rows_seen = Vec::new();
         let (mut text, mut greedy_ok, mut first) = (0usize, 0usize, 0usize);
+        // Anchors whose first k drafts all hold against the greedy picks, k = 1..=drafts.
+        let mut reached = vec![0usize; drafts];
         for &p in &anchors {
             while done < p {
                 let n = (p - done).min(drafter.tap_rows());
@@ -2338,6 +2584,7 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
                 kept += 1;
             }
             greedy_ok += kept;
+            reached[..kept].iter_mut().for_each(|count| *count += 1);
             first += usize::from(draft[0] == greedy[p]);
             out.push(draft);
         }
@@ -2347,6 +2594,12 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
             greedy {:.1}%, draft median {:.3} ms (p10 {:.3}, p90 {:.3})", mode.name,
             anchors.len(), text as f64 / n, greedy_ok as f64 / n, 100.0 * first as f64 / n,
             1e3 * seconds[seconds.len() / 2], 1e3 * seconds[seconds.len() / 10], 1e3 * seconds[seconds.len() * 9 / 10]);
+        println!("draft replay {} by position vs greedy (all of 1..k held; conditional on k - 1):{}", mode.name,
+            reached.iter().enumerate().map(|(k, &count)| {
+                let before = if k == 0 { anchors.len() } else { reached[k - 1] };
+                format!(" {}: {:.1}% ({:.1}%)", k + 1, 100.0 * count as f64 / n,
+                    100.0 * count as f64 / before.max(1) as f64)
+            }).collect::<String>());
         outputs.push(out);
         hidden.push(rows_seen);
         // Draft steps of several sequences (slot i drafts at the last anchor's position).
@@ -2731,7 +2984,8 @@ mod checkpoint_header_tests {
     fn small_config() -> DflashConfig {
         DflashConfig { hidden: 128, intermediate: 128, layers: 2, heads: 1, kv_heads: 1, head_dim: 128,
             eps: 1e-6, theta: 10000., block: 8, group: 16, mask_token: 0, rank: 256,
-            taps: vec![0], vocab: 16, window: RING, row_window: false }
+            taps: vec![0], vocab: 16, window: RING, row_window: false, causal: false, gemma: false, rotary: 128,
+            activation: DraftActivation::Silu }
     }
 
     fn complete_headers(cfg: &DflashConfig) -> (HashMap<String, SafetensorsTensorMetadata>, u64) {
@@ -2787,6 +3041,183 @@ mod checkpoint_header_tests {
         head.byte_length = 4096;
         head.shape = vec![128, 16];
         assert!(check_target_bf16_head(&head, 128, 16, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// incoai/GLM-5.3-DFlash2's config.json (the fields the reader takes).
+    fn glm() -> serde_json::Value {
+        serde_json::json!({"architectures": ["DFlash2DraftModel"], "head_dim": 128, "hidden_act": "silu",
+            "hidden_size": 6144, "intermediate_size": 12288, "is_causal": false, "num_attention_heads": 64,
+            "num_hidden_layers": 6, "num_key_value_heads": 8, "rms_norm_eps": 1e-5,
+            "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"}, "sliding_window": 2048,
+            "vocab_size": 154880, "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+                "mask_token_id": 154856, "selector_rank": 256, "selector_top_k": 16,
+                "target_layer_ids": [5, 19, 33, 47, 61, 75]}})
+    }
+
+    /// RadixArk/Minimax-M3.1-Flash-Dflash2's config.json (the fields the reader takes).
+    pub(crate) fn minimax() -> serde_json::Value {
+        serde_json::json!({"architectures": ["MiniMaxDFlash2DraftModel"], "attention_output_gate": false,
+            "draft_vocab_size": 200064, "head_dim": 128, "hidden_act": "swigluoai", "hidden_size": 6144,
+            "intermediate_size": 12288, "num_attention_heads": 64, "num_hidden_layers": 5,
+            "num_key_value_heads": 4, "partial_rotary_factor": 0.5, "qk_norm_type": "per_head",
+            "rms_norm_eps": 1e-6, "rope_parameters": {"partial_rotary_factor": 0.5, "rope_theta": 10000000,
+                "rope_type": "default"}, "rope_theta": 10000000, "rotary_dim": 64, "sliding_window": 4096,
+            "swiglu_alpha": 1.702, "swiglu_limit": 7.0, "use_gemma_norm": true, "vocab_size": 200064,
+            "layer_types": vec!["sliding_attention"; 5],
+            "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+                "mask_token_id": 200058, "selector_rank": 256, "selector_top_k": 16,
+                "target_layer_ids": [3, 17, 31, 45, 59]}})
+    }
+
+    fn parse(config: serde_json::Value) -> Result<DflashConfig> {
+        DflashConfig::from_raw(serde_json::from_value(config)?)
+    }
+
+    #[test]
+    fn glm_drafts_keep_qwen3_numerics_full_rope_silu_and_the_2048_ring() {
+        let cfg = parse(glm()).unwrap();
+        assert!(!cfg.gemma && !cfg.causal && !cfg.row_window);
+        assert_eq!((cfg.rotary, cfg.activation, cfg.window, cfg.tap_rows()), (128, DraftActivation::Silu, RING, TAP_ROWS));
+        assert_eq!((cfg.heads, cfg.kv_heads, cfg.block, cfg.layers, cfg.taps.len()), (64, 8, 8, 6, 6));
+    }
+
+    /// incoai/GLM-5.3-Flash-DFlash2's released config.json reads as before, and SGLang's mask for it
+    /// is the one the GLM Flash port passes.
+    #[test]
+    fn glm_flash_release_config_reads_unchanged_and_upstream_masks_it_as_the_port_does() {
+        let config = serde_json::json!({"architectures": ["DFlash2DraftModel"], "attention_bias": false,
+            "attention_dropout": 0.0, "bos_token_id": null, "dflash_config": {"block_size": 8, "conv_group_size": 16,
+                "conv_kernel_size": 2, "mask_token_id": 154856, "selector_rank": 256, "selector_top_k": 16,
+                "target_layer_ids": [5, 14, 24, 33, 42]},
+            "dtype": "bfloat16", "eos_token_id": [154820, 154827, 154829], "head_dim": 128, "hidden_act": "silu",
+            "hidden_size": 4096, "initializer_range": 0.02, "intermediate_size": 12288, "is_causal": false,
+            "layer_types": vec!["sliding_attention"; 5], "max_position_embeddings": 1048576, "max_window_layers": 5,
+            "model_type": "qwen3", "num_attention_heads": 32, "num_hidden_layers": 5, "num_key_value_heads": 8,
+            "num_target_layers": 45, "pad_token_id": 154820, "rms_norm_eps": 1e-05,
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}, "sliding_window": 2048,
+            "tie_word_embeddings": false, "transformers_version": "5.7.0", "use_cache": false,
+            "use_sliding_window": true, "vocab_size": 154880});
+        let cfg = parse(config.clone()).unwrap();
+        assert!(!cfg.gemma);
+        assert_eq!((cfg.rotary, cfg.activation, cfg.window, cfg.tap_rows()), (128, DraftActivation::Silu, RING, TAP_ROWS));
+        assert_eq!((cfg.heads, cfg.kv_heads, cfg.hidden, cfg.vocab, cfg.eps), (32, 8, 4096, 154880, 1e-5));
+        assert_eq!(BlockMask::upstream(&config).unwrap(), BlockMask { row_window: true, causal: false });
+    }
+
+    #[test]
+    fn minimax_draft_reads_gemma_norms_partial_rope_swiglu_oai_and_its_window() {
+        let cfg = parse(minimax()).unwrap();
+        assert!(cfg.gemma);
+        assert_eq!(cfg.rotary, 64);
+        assert_eq!(cfg.activation, DraftActivation::SwigluOai { alpha: 1.702, limit: 7.0 });
+        assert_eq!((cfg.window, cfg.tap_rows()), (4096, 4096));
+        // 16 queries per KV head x a block of 8: four 32-query attention slices.
+        assert_eq!(cfg.heads / cfg.kv_heads * cfg.block, 128);
+        assert_eq!((cfg.eps, cfg.theta, cfg.mask_token, cfg.vocab), (1e-6, 1e7, 200058, 200064));
+        assert_eq!(cfg.taps, [3, 17, 31, 45, 59]);
+        // Without a window the drafter has no context ring.
+        let mut config = minimax();
+        config["sliding_window"] = 0.into();
+        assert!(parse(config).is_err());
+    }
+
+    #[test]
+    fn unsupported_draft_numerics_are_refused_by_name() {
+        for (key, value, needle) in [
+            ("partial_rotary_factor", serde_json::json!(0.25), "RoPE on 32"),
+            ("rotary_dim", serde_json::json!(128), "rotary_dim"),
+            ("use_gemma_norm", serde_json::json!(false), "with Gemma norms"),
+            ("hidden_act", serde_json::json!("gelu"), "not gelu"),
+            ("qk_norm_type", serde_json::json!("all_heads"), "per-head"),
+            ("attention_output_gate", serde_json::json!(true), "output gate"),
+            ("draft_vocab_size", serde_json::json!(32000), "token map"),
+            ("swiglu_limit", serde_json::Value::Null, "swiglu_alpha and swiglu_limit"),
+        ] {
+            let mut config = minimax();
+            config[key] = value;
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{key}: {error}");
+        }
+        // A Qwen3-norm draft keeps full-width RoPE; a partial width needs the Gemma kernels.
+        let mut config = glm();
+        config["partial_rotary_factor"] = 0.5.into();
+        assert!(parse(config).is_err());
+        let mut config = glm();
+        config["head_dim"] = 64.into();
+        assert!(parse(config).is_err());
+    }
+
+    #[test]
+    fn upstream_masks_follow_sglang_layer_types_and_explicit_causality() {
+        // MiniMax: sliding layers without is_causal attend a per-row window, causally.
+        assert_eq!(BlockMask::upstream(&minimax()).unwrap(), BlockMask { row_window: true, causal: true });
+        // GLM's explicit is_causal false keeps the block bidirectional.
+        let mut config = glm();
+        config["layer_types"] = serde_json::json!(vec!["sliding_attention"; 6]);
+        assert_eq!(BlockMask::upstream(&config).unwrap(), BlockMask { row_window: true, causal: false });
+        // Full attention (or no layer types) defaults to the whole block and context.
+        config["layer_types"] = serde_json::json!(vec!["full_attention"; 6]);
+        assert_eq!(BlockMask::upstream(&config).unwrap(), BlockMask::default());
+        config.as_object_mut().unwrap().remove("layer_types");
+        config["is_causal"] = true.into();
+        assert_eq!(BlockMask::upstream(&config).unwrap(), BlockMask { row_window: false, causal: true });
+        config["layer_types"] = serde_json::json!(["sliding_attention", "full_attention"]);
+        assert!(BlockMask::upstream(&config).is_err());
+        config["layer_types"] = serde_json::json!(["chunked_attention"]);
+        assert!(BlockMask::upstream(&config).is_err());
+        config["layer_types"] = serde_json::json!(["sliding_attention"]);
+        config["is_causal"] = "yes".into();
+        assert!(BlockMask::upstream(&config).is_err());
+    }
+
+    /// Every GLM load site refuses a drafter whose window is not the GLM ring.
+    #[test]
+    fn glm_load_sites_refuse_a_window_their_taps_do_not_fill() {
+        assert!(require_glm_ring(&parse(glm()).unwrap()).is_ok());
+        let error = require_glm_ring(&parse(minimax()).unwrap()).unwrap_err().to_string();
+        assert!(error.contains("window 4096") && error.contains("2048"), "{error}");
+    }
+
+    /// The GLM integrations tap TAP_ROWS-row chunk tails: their header check keeps refusing other windows.
+    #[test]
+    fn glm_checkpoint_admission_keeps_its_2048_ring_and_general_admission_takes_the_window() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let write = |config: &serde_json::Value| -> Result<()> {
+            let cfg = DflashConfig::from_raw(serde_json::from_value(config.clone())?)?;
+            std::fs::write(dir.path().join("config.json"), serde_json::to_vec(config)?)?;
+            let mut headers = serde_json::Map::new();
+            let mut offset = 0u64;
+            for (name, shape) in cfg.tensor_shapes() {
+                let bytes = shape.iter().product::<usize>() as u64 * 2;
+                headers.insert(name, serde_json::json!({"dtype": "BF16", "shape": shape,
+                    "data_offsets": [offset, offset + bytes]}));
+                offset += bytes;
+            }
+            let header = serde_json::to_vec(&headers)?;
+            let mut file = std::fs::File::create(dir.path().join("model.safetensors"))?;
+            std::io::Write::write_all(&mut file, &(header.len() as u64).to_le_bytes())?;
+            std::io::Write::write_all(&mut file, &header)?;
+            file.set_len(8 + header.len() as u64 + offset)?;
+            Ok(())
+        };
+        // Small geometries with each checkpoint's numerics and window.
+        for (mut config, window) in [(glm(), 2048usize), (minimax(), 4096)] {
+            config["hidden_size"] = 256.into();
+            config["intermediate_size"] = 256.into();
+            config["vocab_size"] = 64.into();
+            if config.get("draft_vocab_size").is_some() { config["draft_vocab_size"] = 64.into(); }
+            config["dflash_config"]["target_layer_ids"] = serde_json::json!([0, 1]);
+            write(&config)?;
+            let cfg = check_headers(dir.path(), Some(false), 8, 4)?;
+            assert_eq!(cfg.window, window);
+            assert_eq!(check_checkpoint(dir.path(), Some(false), Some(8), 4).is_ok(), window == RING);
+        }
+        Ok(())
     }
 }
 

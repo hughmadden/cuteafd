@@ -7,6 +7,7 @@ use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::block_dspark::DraftHeads;
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::read_safetensors_metadata;
@@ -74,7 +75,7 @@ impl Drop for PageLease<'_, '_> {
 }
 
 /// Most sequences one draft step takes (the Markov kernel's limit).
-pub(crate) const MAX_SEQUENCES: usize = 32;
+pub(crate) const MAX_SEQUENCES: usize = cuteafd_ffi::block_dspark::MARKOV_SEQUENCES;
 
 /// Whether `snapshot` holds a Speculators dSpark checkpoint.
 pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
@@ -131,12 +132,7 @@ impl DsparkConfig {
     }
 
     fn context_row(&self, slot: usize, position: usize, slots: usize, capacity: usize) -> Result<i32> {
-        ensure!(slot < slots && capacity > 0, "dSpark context slot/capacity outside admission");
-        ensure!(self.window.is_some() || position < capacity,
-            "full-context dSpark position {position} exceeds admitted {capacity}");
-        let row = slot.checked_mul(capacity).and_then(|base| base.checked_add(position % capacity))
-            .context("dSpark context row overflow")?;
-        Ok(i32::try_from(row)?)
+        context_row(self.window.is_some(), slot, position, slots, capacity)
     }
 
     /// Drafted tokens per draft step (every block row predicts one).
@@ -155,6 +151,16 @@ impl DsparkConfig {
     pub(crate) fn qkv_width(&self) -> usize {
         self.q_width() + 2 * self.kv_width()
     }
+}
+
+/// The context ring row of `position` in `slot`'s ring of `capacity` rows: a
+/// sliding window wraps it, a full context refuses positions past its admission.
+pub(crate) fn context_row(sliding: bool, slot: usize, position: usize, slots: usize, capacity: usize) -> Result<i32> {
+    ensure!(slot < slots && capacity > 0, "dSpark context slot/capacity outside admission");
+    ensure!(sliding || position < capacity, "full-context dSpark position {position} exceeds admitted {capacity}");
+    let row = slot.checked_mul(capacity).and_then(|base| base.checked_add(position % capacity))
+        .context("dSpark context row overflow")?;
+    Ok(i32::try_from(row)?)
 }
 
 fn validate_target_taps(taps: &[super::target::HiddenTap], layers: &[usize], hidden: usize,
@@ -470,8 +476,7 @@ impl<'a> DsparkDrafter<'a> {
         let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
         let markov_norms = DeviceAllocation::new(library, cfg.vocab * 4)?;
         // SAFETY: both buffers hold `vocab` rows; the stream orders the kernel before any draft.
-        unsafe { library.glmf_dspark_markov_norms(markov_w2.buffer.ptr, markov_norms.buffer.ptr, cfg.vocab, cfg.rank,
-            stream)? };
+        unsafe { library.dspark_markov_norms(markov_w2.buffer, markov_norms.buffer, cfg.vocab, stream)? };
         Ok(Self {
             kv_cache,
             library,
@@ -1007,12 +1012,10 @@ impl<'a> DsparkDrafter<'a> {
                     weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
-            l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
-                self.markov_norms.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
-                c.rank, s)?;
-            l.glmf_dspark_confidence(w.n.buffer.ptr, self.markov_w1.buffer.ptr, self.confidence_w.buffer.ptr,
-                self.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.confidence.buffer.ptr,
-                s_count, block, h, c.rank, s)?;
+            let heads = DraftHeads { w1: self.markov_w1.buffer, w2: self.markov_w2.buffer, norms: self.markov_norms.buffer,
+                weight: self.confidence_w.buffer, bias: self.confidence_b.buffer };
+            l.dspark_draft_heads(&heads, w.logits.buffer, w.n.buffer, w.anchors.buffer, w.tokens.buffer,
+                w.markov_workspace.buffer, w.confidence.buffer, s_count, block, c.vocab, h, s)?;
             // The round's results download on its stream; one host wait then
             // covers the round and both copies (no second, synchronous drain).
             // SAFETY: the device buffers hold `rows` words; the landing is
