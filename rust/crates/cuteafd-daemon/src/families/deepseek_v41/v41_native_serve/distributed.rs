@@ -324,7 +324,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, (slots * wave_bytes) as u64)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(capacity), spark_ranks, slots)?)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -420,24 +420,35 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let lanes = crate::shared::serve::lanes::LaneSet::default();
-    let mut make_transport = |lane: usize| -> Result<_> {
-        let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
-        let mut transport = devices[1].own(|| {
-            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world,
-                u32::try_from(lane)?)?;
-            NativeTp4Wave::new(&lib, roce, wave_bytes)
+    let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
+    // Decode lanes own a link each; prefill-only slots own only their reduce
+    // output and TP2 workspace (their units send on the one prefill link).
+    let mut make_transport = |lane: Option<usize>| -> Result<_> {
+        let mut transport = devices[1].own(|| match lane {
+            Some(lane) => NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, capacity, timing, spark_world,
+                u32::try_from(lane)?)?, wave_bytes),
+            None => NativeTp4Wave::unlinked(&lib, capacity),
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
-        if expert_layers < 40 {
+        if expert_layers < 40 && lane.is_some() {
             // The workers serve their layers: open the sessions and start the
             // link's exchange worker (the first remote layer sizes the rings).
             devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
         Ok(transport)
     };
-    let [mut transport, mut second_transport] = lanes.try_map(|lane| make_transport(lane.index()))?;
-    let extra_transports = (2..slots).map(&mut make_transport).collect::<Result<Vec<_>>>()?;
-    let mut extra = extra_passes.into_iter().zip(extra_transports).collect::<Vec<_>>();
+    let [mut transport, mut second_transport] = lanes.try_map(|lane| make_transport(Some(lane.index())))?;
+    let extra_transports = (2..slots).map(|_| make_transport(None)).collect::<Result<Vec<_>>>()?;
+    let extra = extra_passes.into_iter().zip(extra_transports).collect::<Vec<_>>();
+    // The one prefill link (endpoint after the lanes'), on the transports' GPU.
+    let prefill_reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(capacity));
+    let mut prefill_link = devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+        super::spark_transport(&args.peers, capacity, timing, spark_world, 2)?, slots, capacity,
+        usize::try_from(prefill_reserve)?))?;
+    if expert_layers < 40 {
+        devices[1].run(|| prefill_link.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
+    }
+    let mut prefill_slots = super::prefill_target::PrefillSlots { link: prefill_link, extra };
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     // Allocation must consume exactly the admitted pages; do not run a second
@@ -461,7 +472,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
-    for (slot, _) in &mut extra { slot.configure_cache_replicas(requests.cache())?; }
+    for (slot, _) in &mut prefill_slots.extra { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
@@ -474,7 +485,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
-        &mut transport, &mut second_transport, &mut extra, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
+        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
 }
 
 

@@ -548,8 +548,8 @@ impl LaneFfn<'_, '_, '_> {
     /// # Safety
     /// The unit's slot keeps this lane's FFN input and shared workspace
     /// unchanged until the returned owner lands or the pass is discarded.
-    pub(crate) async unsafe fn send_unit(&mut self, transport: &mut NativeTp4Wave<'_>,
-        placement: u64, image_mask: &[u8], rows: &[ExpertRow]) -> Result<LaneUnitFfn> {
+    pub(crate) async unsafe fn send_unit<'l>(&mut self, transport: &mut NativeTp4Wave<'l>,
+        link: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>, placement: u64, image_mask: &[u8], rows: &[ExpertRow]) -> Result<LaneUnitFfn> {
         let prior = std::mem::replace(self.phase, Phase::Invalid);
         ensure!(prior == Phase::Ffn && !transport.has_local_layer(self.input.layer),
             "prefill unit remote FFN phase or route differs");
@@ -564,7 +564,7 @@ impl LaneFfn<'_, '_, '_> {
         let routed_us = started.elapsed().as_micros() as u64;
         // SAFETY: as `execute_tp4`'s dispatch: the router outputs stay unchanged
         // until the wave's staging copies, which its stream orders.
-        let ticket = unsafe { transport.dispatch_unit(&routed, routed.stream, placement, rows)? };
+        let ticket = unsafe { transport.dispatch_unit(link, &routed, routed.stream, placement, rows)? };
         let dispatched_us = started.elapsed().as_micros() as u64;
         // Two RTX: the shared expert runs TP2 into this slot's transport-owned
         // workspace; one RTX: in this lane's shared workspace.
@@ -904,11 +904,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// unit's send queued (FIFO turn from the shared executor).
     /// # Safety
     /// This unit's shared and output storage have not been reused since its send.
-    pub(crate) async unsafe fn land_unit<'t>(&mut self, transport: &'t mut NativeTp4Wave<'_>,
-        pending: LaneUnitFfn) -> Result<crate::families::deepseek_v41::v41_experts::coordinator::NativeFfnOutput<'t>> {
+    pub(crate) async unsafe fn land_unit<'t, 'l>(&mut self, transport: &'t mut NativeTp4Wave<'l>,
+        link: &'t mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>, pending: LaneUnitFfn)
+        -> Result<crate::families::deepseek_v41::v41_experts::coordinator::NativeFfnOutput<'t>> {
         self.enter(Phase::UnitPending)?;
         self.block.ffn_input(pending.binding)?;
-        let result = unsafe { transport.collect_unit(pending.ticket, pending.shared, pending.destination).await? };
+        let result = unsafe { transport.collect_unit(link, pending.ticket, pending.shared, pending.destination).await? };
         ensure!(result.binding() == pending.binding, "prefill unit FFN result binding differs");
         let collect_us = (pending.started.elapsed().as_micros() as u64).saturating_sub(pending.shared_us);
         if self.capture_timing {

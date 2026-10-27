@@ -1587,6 +1587,18 @@ impl<'a> SparkLink<'a> {
         Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, capacity as usize, timing)
     }
 
+    /// [`Self::from_transport`] admitting up to `slots` outstanding waves of up
+    /// to `wave_rows` rows, cut from one `reserve_rows`-row range per rank
+    /// (one prefill transport with N waves, PLAN "Prefill contract").
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_transport_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
+        row_bytes: usize, preference: IntakePreference, slots: usize, wave_rows: u32, reserve_rows: usize,
+        timing: bool) -> Result<Self> {
+        ensure!((1..=transport.capacity()).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
+        transport.set_max_waves(slots)?;
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, slots, wave_rows, reserve_rows, timing)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, enable_egress: bool, waves: usize, wave_rows: u32,

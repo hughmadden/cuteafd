@@ -1349,6 +1349,14 @@ mod tests {
             )
         })?;
         other_transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 20, 16, [None, None])?)?;
+        // The one prefill link (execution lane 2), two return slots of 16 rows.
+        let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
+            link: devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16,
+                    TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
+                        timeout: Duration::from_secs(120), max_frame_bytes: 2 << 20 }, 2)?, 2, 16, 32))?,
+            extra: Vec::new(),
+        };
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;
             requests.begin_encoder(reference_lease, prompt.len() as u64)?;
@@ -1380,7 +1388,7 @@ mod tests {
                 devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
             draft.admit(id)?;
             let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
-                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
+                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], &mut prefill_slots, lease,
                 &prompt, chunk_rows, 2, Some(draft.get_mut()))?;
             assert_eq!(anchor, reference_anchor, "serving prefill anchor differs from matching sequential chunks");
             draft.validate_position(id, 7)?;
@@ -1392,7 +1400,7 @@ mod tests {
                 "serving prefill to draft handoff differs");
             let continued: Vec<_> = prompt.into_iter().chain([800, 900]).collect();
             let next = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
-                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
+                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], &mut prefill_slots, lease,
                 &continued, chunk_rows, 2, Some(draft.get_mut()))?;
             ensure!(next < 129280, "invalid continuation anchor");
             assert_eq!(requests.cache().committed_end(lease)?, 9);
@@ -1485,7 +1493,7 @@ mod tests {
                     .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
                 if interleaved {
                     runtime.block_on(unsafe {
-                        DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(()))
+                        DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut prefill_slots.link, &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(()))
                     })?;
                 } else {
                     for chunk in &chunks {
@@ -1651,7 +1659,7 @@ mod tests {
             .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
         let calls = std::cell::Cell::new(0);
         let result = runtime.block_on(unsafe {
-            DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &|| {
+            DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut prefill_slots.link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &|| {
                     calls.set(calls.get() + 1);
                     calls.get() < 12
                 }, &|| Ok(()))

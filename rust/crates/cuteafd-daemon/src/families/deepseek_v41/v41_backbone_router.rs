@@ -1023,7 +1023,7 @@ mod host_order_tests {
         let read = router.split("fn device_read(&self) -> bool {").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(read.contains("crate::shared::memory::chain::active() && if self.full_request { self.ring_capture || !trace }")
             && read.contains("else { crate::shared::memory::chain::deferred() }"), "{read}");
-        assert!(router.contains("if !cold && device_read {") && router.contains("self.stream.wait().await?;"));
+        assert!(router.contains("if (!cold || !captures) && device_read {") && router.contains("self.stream.wait().await?;"));
         let memory = include_str!("../../shared/memory.rs");
         let complete = memory.split("pub(crate) fn require_complete(&self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(complete.contains("if chain::deferred() {") && complete.contains("cuda_stream_query"));
@@ -1031,9 +1031,9 @@ mod host_order_tests {
         let advance = lane.split("pub fn advance(&mut self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(advance.contains("self.query.rebind(") && advance.contains("self.router.rebind("));
         let coordinator = include_str!("v41_experts/coordinator.rs");
-        let dispatch = coordinator.split("pub(crate) unsafe fn dispatch_ffn<'w>(").nth(1).unwrap()
-            .split("\n    }\n").next().unwrap();
-        assert!(dispatch.contains("crate::shared::memory::chain::join(self.library, stage)?;")
+        let dispatch = coordinator.split("unsafe fn send_on<'a>(").nth(1).unwrap()
+            .split("\n}\n").next().unwrap();
+        assert!(dispatch.contains("crate::shared::memory::chain::join(library, stage)?;")
             && dispatch.contains("exchange.send(routed.rows as usize, layout, sources, stage, build)"));
         let collect = coordinator.split("async unsafe fn finish_values(").nth(1).unwrap().split("\n    }\n").next().unwrap();
         let landed = collect.find("while !exchange.landed(&self.ticket)").expect("host-ordered collect waits for the reply");

@@ -38,6 +38,19 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
     Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
 }
 
+/// Every Spark transport of `slots` target passes (PLAN "Prefill contract"):
+/// the two decode lanes' links ([`transport_bytes`]), each further prefill
+/// slot's reduce output, and the one prefill link's intake: every rank's
+/// partial-sum plane over the reserve its return slots are cut from
+/// (`wave_control::reserve_rows`).
+pub fn transports_bytes(rows: u64, ranks: usize, slots: usize) -> Result<u64> {
+    ensure!((2..=4).contains(&slots), "invalid V4.1 prefill slots");
+    let reserve = crate::serving_capacity::wave_control::reserve_rows(slots as u64, rows);
+    let lanes = 2 * transport_bytes(rows, ranks)?;
+    let outputs = (slots as u64 - 2) * rows * 5120 * 2;
+    Ok(lanes + outputs + reserve * ranks as u64 * 5120 * 2)
+}
+
 /// Full vocabulary packing peak above the pre-weight sample. The first lane's
 /// backbone/cache/index/embedding/Engram owners already exist; heads, taps,
 /// transports, the second lane, draft, vision and marks do not.

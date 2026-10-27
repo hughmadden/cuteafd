@@ -11,10 +11,10 @@ fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, wave
     // The shared ladder: the unit's covering export, `waves` units buffered.
     let executions = admit_family("deepseek_v41", &SparkBackend::for_catalog(catalog)?.exports(), None,
         u64::from(capacity), u64::from(waves))?;
-    // One endpoint per link: one per target pass (two decode lanes, then each
-    // further prefill slot).
+    // The two decode lanes' links and the one prefill link (its `waves` units
+    // are the prefill owner's buffered units).
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![SparkEndpoint { ring_depth: None, capacity, ingress }; usize::from(waves).max(2)],
+        vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 3],
         crate::shared::placement::spark_rings(64 << 20)?, executions)?;
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)
@@ -98,7 +98,7 @@ mod spark_tests {
                     capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
                     compiled_capacity: compiled, unit_rows: live, buffered_units: 2 });
-                assert_eq!(model.endpoints.len(), 2);
+                assert_eq!(model.endpoints.len(), 3);
                 assert!(model.endpoints.iter().all(|e| e.capacity == live && e.ingress == if bf16 {
                     cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 }));
             }
@@ -197,7 +197,7 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        passes as u64 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
+        owners::transports_bytes(u64::from(capacity), args.peers.len(), passes)?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
@@ -695,6 +695,25 @@ pub(super) fn preload(
 
 #[cfg(test)]
 mod admission_tests {
+
+    /// The planner's transport charge is exactly what serve allocates: two
+    /// decode lanes' linked waves, each further slot's unlinked reduce output
+    /// and the one prefill link's intake over the shared reserve.
+    #[test]
+    fn transport_charge_equals_serve_allocation() -> anyhow::Result<()> {
+        use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, V41Link};
+        for (rows, ranks) in [(1024u32, 3usize), (1408, 3), (2752, 4), (2752, 6), (4096, 4)] {
+            for slots in 2..=4usize {
+                let reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(rows));
+                let runtime = 2 * NativeTp4Wave::device_bytes_for(rows, ranks)?
+                    + (slots - 2) * rows as usize * 5120 * 2
+                    + V41Link::prefill_device_bytes(reserve as usize, ranks)?;
+                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(rows), ranks, slots)?, runtime as u64,
+                    "{slots} x {rows} rows on {ranks} ranks");
+            }
+        }
+        Ok(())
+    }
     use super::*;
     use clap::Parser;
 

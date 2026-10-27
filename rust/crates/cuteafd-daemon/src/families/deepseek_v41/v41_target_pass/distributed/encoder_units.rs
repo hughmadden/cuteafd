@@ -47,7 +47,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let prepared = prepared.into_unit().await?;
         // Publish this layer's window now (as one RTX does): the next unit
         // attends it before this unit lands its FFN.
-        if crate::shared::memory::chain::deferred() && !super::super::encoder_units::diag_host("window") {
+        if crate::shared::memory::chain::deferred() {
             // Device-ordered (#815 option (i)): a chained direct commit after the attention.
             requests.borrow_mut().publish_distributed_unit_window(batch, &mut self.resources.execution, layer)?;
         } else {
@@ -81,6 +81,9 @@ struct UnitSlot<'s, 'w, 'a> {
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
+    /// The one prefill transport (on the transports' GPU): every unit's wave
+    /// lands in its own return slot.
+    prefill: &'s mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>,
     requests: RefCell<&'r mut Requests<'a>>,
     lease: CacheLease,
     chunks: &'s [&'s [u32]],
@@ -167,7 +170,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         let device = slot.pass.resources.lanes[gpu].device;
         // SAFETY: the slot is retained until the matching FIFO landing hook.
         device.future(unsafe { prepared.send(slot.pass.resources.lanes[gpu].get_mut(), slot.transport.get_mut(),
-            0, batch.image_mask()) }).await
+            self.prefill.get_mut(), 0, batch.image_mask()) }).await
     }
     async fn land_experts_inner(&mut self, layer: usize, unit: &Unit, ticket: UnitPendingLayer) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
@@ -178,7 +181,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         // As `PlacedPreparedLayer::execute`: on the lane's GPU; the collect
         // switches to the transport's GPU and returns the result here.
         let completed = device.future(unsafe { ticket.land(slot.pass.resources.lanes[gpu].get_mut(),
-            slot.transport.get_mut()) }).await?;
+            slot.transport.get_mut(), self.prefill.get_mut()) }).await?;
         unsafe { slot.pass.complete_unit_layer(&self.requests, batch, layer, completed).await }
     }
     async fn end_unit_inner(&mut self, unit: &Unit) -> Result<()> {
@@ -236,14 +239,12 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         // attention orders after the previous unit's publication of this layer;
         // its window and source publications are chained direct commits.
         crate::shared::spark_waves::healthy()?;
-        let diag = super::super::encoder_units::diag_host("attention");
-        let chain = if diag { None } else { unit_chain(self.slots[unit.slot].pass)? };
-        let Some(chain) = chain else {
+        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
             // Host-ordered TP2 peer transfers keep the established host order.
             if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
             return self.attention_inner(layer, unit).await;
         };
-        let event = if super::super::encoder_units::diag_host("depend") { None } else { self.previous_publication(unit, layer) };
+        let event = self.previous_publication(unit, layer);
         chain.scope(async {
             super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
             self.attention_inner(layer, unit).await?;
@@ -266,14 +267,12 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         // Device-ordered (#815 option (i)): the suffix capture and the
         // boundary source publication chain behind the unit's last layer.
         crate::shared::spark_waves::healthy()?;
-        let diag = super::super::encoder_units::diag_host("end");
-        let chain = if diag { None } else { unit_chain(self.slots[unit.slot].pass)? };
-        let Some(chain) = chain else {
+        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
             if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
             return self.end_unit_inner(unit).await;
         };
         let boundary = super::super::encoder_units::BOUNDARY;
-        let event = if super::super::encoder_units::diag_host("depend") { None } else { self.previous_publication(unit, boundary) };
+        let event = self.previous_publication(unit, boundary);
         chain.scope(async {
             super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
             self.end_unit_inner(unit).await?;
@@ -301,7 +300,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     /// Passes and transports have independent mutable storage and the same model,
     /// placement and capacity. Poll on one CUDA-owning executor thread.
     pub(crate) async unsafe fn execute_encoder_units(slots: Vec<(&mut Self, &mut DeviceOwner<'a, NativeTp4Wave<'a>>)>,
-        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]],
+        prefill: &mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>, requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]],
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
         let waves = slots.len();
@@ -318,6 +317,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let map = slots[0].0.resources.map;
         let library = slots[0].0.resources.lanes[0].device.library;
         let mut hooks = UnitHooks {
+            prefill,
             slots: slots.into_iter().map(|(pass, transport)| {
                 pass.set_attention_decode(false);
                 let published = super::super::encoder_units::PublishedLayers::on_devices(library,

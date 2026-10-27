@@ -77,17 +77,6 @@ pub(super) fn order_after(library: &cuteafd_ffi::NativeLibrary, event: Option<*m
     // SAFETY: a live event recorded by the previous unit's chain.
     unsafe { crate::shared::memory::chain::depend(library, event) }
 }
-/// Temporary bisect switches for the 2-RTX (i) fidelity break (#815); removed
-/// with the fix. `CUTEAFD_DIAG_V41_UNIT_HOST` is a comma list of: attention
-/// (drain before attention, host order), source (enqueue-and-poll source
-/// publication), window (enqueue-and-poll window publication), end (drain and
-/// cooperative suffix capture at the unit's end), depend (skip cross-slot waits).
-pub(crate) fn diag_host(part: &str) -> bool {
-    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    PARTS.get_or_init(|| std::env::var("CUTEAFD_DIAG_V41_UNIT_HOST").unwrap_or_default()
-        .split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect())
-        .iter().any(|p| p == part)
-}
 /// The slot that ran the unit before `unit`, when it is another slot.
 pub(super) fn previous_slot(unit: &Unit, waves: usize) -> Option<usize> {
     unit.index.checked_sub(1).map(|index| index % waves).filter(|&slot| slot != unit.slot)
@@ -136,6 +125,8 @@ struct UnitSlot<'s, 'w, 'a> {
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
+    /// The one prefill transport: every unit's wave lands in its own return slot.
+    prefill: &'s mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>,
     requests: RefCell<&'r mut Requests<'a>>,
     lease: CacheLease,
     chunks: &'s [&'s [u32]],
@@ -276,6 +267,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                 .send(
                     &mut slot.pass.resources.lane,
                     slot.transport,
+                    self.prefill,
                     0,
                     batch.image_mask(),
                 )
@@ -293,7 +285,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         // SAFETY: no other unit can overwrite this original slot's shared values.
         let completed = unsafe {
             ticket
-                .land(&mut slot.pass.resources.lane, slot.transport)
+                .land(&mut slot.pass.resources.lane, slot.transport, self.prefill)
                 .await?
         };
         // SAFETY: result and batch belong to the original prepared layer. The
@@ -452,8 +444,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// Every slot retains its independent lane/TP2/shared/output storage until
     /// completion or drained cancellation. Decode is idle during this span.
     pub(crate) async unsafe fn execute_encoder_units(
-        slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, requests: &mut Requests<'a>, lease: CacheLease,
-        chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
+        slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, prefill: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, requests: &mut Requests<'a>,
+        lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let waves = slots.len();
@@ -465,6 +457,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 "encoder slot expert placement differs");
         }
         let mut hooks = UnitHooks {
+            prefill,
             slots: slots.into_iter().map(|(pass, transport)| {
                 pass.set_attention_decode(false);
                 Ok(UnitSlot { published: PublishedLayers::new(pass.library()?)?, pass, transport,

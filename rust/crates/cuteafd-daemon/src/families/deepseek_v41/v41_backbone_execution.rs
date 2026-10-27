@@ -94,9 +94,9 @@ impl CompletedLayer<'_> {
 impl UnitPendingLayer {
     /// # Safety
     /// Preserve the original unit's buffers until this FIFO ticket completes.
-    pub async unsafe fn land<'t>(self, lane: &mut BackboneLane<'_, '_>,
-        transport: &'t mut NativeTp4Wave<'_>) -> Result<CompletedLayer<'t>> {
-        let result = unsafe { lane.land_unit(transport, self.pending).await? };
+    pub async unsafe fn land<'t, 'l>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'l>, link: &'t mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>) -> Result<CompletedLayer<'t>> {
+        let result = unsafe { lane.land_unit(transport, link, self.pending).await? };
         let prepared = self.prepared;
         Ok(CompletedLayer { result, batch: prepared.batch, layer: prepared.layer,
             rows: prepared.rows.len(), routed_backend: "spark_tp4", shared_tp: self.shared_tp,
@@ -109,12 +109,12 @@ impl UnitPreparedLayer {
     /// # Safety
     /// The original lane's input and shared result remain in this unit's slot
     /// until `UnitPendingLayer::land` finishes or the pass is discarded.
-    pub async unsafe fn send(self, lane: &mut BackboneLane<'_, '_>,
-        transport: &mut NativeTp4Wave<'_>, placement: u64, image_mask: &[u8])
+    pub async unsafe fn send<'a>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &mut NativeTp4Wave<'a>, link: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, placement: u64, image_mask: &[u8])
         -> Result<UnitPendingLayer> {
         let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
         let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
-        let pending = unsafe { ffn.send_unit(transport, placement, image_mask, &self.rows).await? };
+        let pending = unsafe { ffn.send_unit(transport, link, placement, image_mask, &self.rows).await? };
         Ok(UnitPendingLayer { prepared: self, pending, shared_tp })
     }
     /// # Safety

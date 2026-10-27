@@ -334,8 +334,9 @@ mod scoring_workspace_tests {
 /// Qwen: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
-        // One link per V4.1 target pass: two decode lanes, more prefill slots.
-        "deepseek_v41" => (lanes as usize).max(2),
+        // The two decode lanes' links and one prefill link (its waves share
+        // that endpoint's rings).
+        "deepseek_v41" => 3,
         "deepseek_v4" => 2,
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 1 + usize::from(lanes > 1),

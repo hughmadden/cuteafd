@@ -165,8 +165,72 @@ impl ReplicatedGroupPlanner {
     }
 }
 
-pub(crate) struct NativeTp4Wave<'a> {
+/// A Spark link with V4.1's request contract: the link and, for an explicit
+/// `TP×EP` topology, the planner that encodes each request's ownership in
+/// issue order (shared with the exchange worker). Decode lanes each own one;
+/// prefill units share one link whose return slots hold the in-flight units
+/// (PLAN "Prefill contract": one transport, N waves).
+pub(crate) struct V41Link<'a> {
     link: crate::shared::spark_intake::SparkLink<'a>,
+    native: Option<(SparkTopology, std::sync::Arc<std::sync::Mutex<ReplicatedGroupPlanner>>)>,
+}
+impl<'a> V41Link<'a> {
+    pub(crate) fn new(link: crate::shared::spark_intake::SparkLink<'a>,
+        topology: Option<SparkTopology>) -> Result<Self> {
+        let native = topology.map(|topology| ReplicatedGroupPlanner::new(topology)
+            .map(|planner| (topology, std::sync::Arc::new(std::sync::Mutex::new(planner))))).transpose()?;
+        Ok(Self { link, native })
+    }
+    /// The one prefill link: `slots` return slots of up to `unit_rows` rows cut
+    /// from a `reserve_rows`-row range per rank.
+    pub(crate) fn prefill(library: &'a NativeLibrary, transport: SparkExperts, slots: usize, unit_rows: u32,
+        reserve_rows: usize) -> Result<Self> {
+        let ranks = transport.world_size();
+        library.v41_compact_reducer()?.require_rank_count(ranks as u32)?;
+        let topology = transport.ownership_topology();
+        let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
+        Self::new(crate::shared::spark_intake::SparkLink::from_transport_waves(library, transport,
+            V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, slots, unit_rows,
+            reserve_rows, timing)?, topology)
+    }
+    /// Device bytes of the prefill link's intake: every rank's partial-sum
+    /// plane over the `reserve_rows` reserve.
+    pub(crate) fn prefill_device_bytes(reserve_rows: usize, ranks: usize) -> Result<usize> {
+        ensure!((1..=8).contains(&ranks) && reserve_rows > 0, "invalid V4.1 prefill link geometry");
+        reserve_rows.checked_mul(ranks * V41_PARTIAL_ROW_BYTES as usize).context("prefill link budget overflow")
+    }
+    pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
+    pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }
+    pub(crate) fn world_size(&self) -> usize { self.link.world_size() }
+    pub(crate) fn native_topology(&self) -> Option<SparkTopology> { self.native.as_ref().map(|(topology, _)| *topology) }
+    pub(crate) fn reset_connections(&mut self) -> Result<()> { self.link.reset_connections() }
+    /// Opens every rank's session once the workers serve `layer` (a remote
+    /// layer) and starts the link's exchange worker. The widest request (the
+    /// link's capacity, in the checkpoint's wire format) sizes the rings;
+    /// only the control bootstrap runs, nothing is posted.
+    pub(crate) fn bootstrap(&mut self, layer: u32, nvfp4: bool) -> Result<()> {
+        use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
+        let rows = self.link.capacity();
+        let (dtype, width) = if nvfp4 { (ExpertV2Dtype::Bf16, 10240) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, 5280) };
+        let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row.into(),
+            source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row.into(),
+            route_offset: row * 6, route_count: 6 }).collect();
+        let routes = (0..rows * 6).map(|i| ExpertProtocolV2RouteEntry { row_index: i / 6,
+            expert_id: i % V41_ROUTED_EXPERTS as u32, gate_weight: 0.0 }).collect();
+        let mut request = ExpertProtocolV2Request::new(1, 0, layer, 5120, dtype, descriptors, routes,
+            vec![0; rows as usize * width])?;
+        request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        if let Some((_, planner)) = &self.native {
+            planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.encode(&mut request)?;
+        }
+        self.link.bootstrap(&request)
+    }
+}
+
+pub(crate) struct NativeTp4Wave<'a> {
+    /// The lane's own link (decode lanes); `None` for a prefill-only slot,
+    /// whose units send on the shared prefill link.
+    link: Option<V41Link<'a>>,
     // Drop drains the stream before fields release any GPU allocations.
     stream: LoadStream<'a>,
     output: DeviceAllocation<'a>,
@@ -174,17 +238,16 @@ pub(crate) struct NativeTp4Wave<'a> {
     ready_rows: Option<u32>,
     local: Option<super::local::LocalExpertWave<'a>>,
     tp2: Option<Box<super::tp2_ffn::Wave<'a>>>,
-    /// Present only for an explicit `TP×EP` topology; legacy transports stay on
-    /// the canonical request contract. Shared with the exchange worker, which
-    /// encodes each request's ownership in issue order.
-    native: Option<(SparkTopology, std::sync::Arc<std::sync::Mutex<ReplicatedGroupPlanner>>)>,
 }
 
 impl<'a> NativeTp4Wave<'a> {
-    pub(crate) fn spark_world(&self) -> usize { self.link.world_size() }
+    fn own_link(&mut self) -> Result<&mut V41Link<'a>> {
+        self.link.as_mut().context("prefill-only slot has no Spark link of its own")
+    }
+    pub(crate) fn spark_world(&self) -> usize { self.link.as_ref().map_or(0, V41Link::world_size) }
     /// Explicit replicated topology of this lane, or `None` for the legacy path.
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> {
-        self.native.as_ref().map(|(topology, _)| *topology)
+        self.link.as_ref().and_then(V41Link::native_topology)
     }
 
     pub fn install_local(&mut self, wave: super::local::LocalExpertWave<'a>) -> Result<()> {
@@ -251,7 +314,7 @@ impl<'a> NativeTp4Wave<'a> {
     /// exchange, resets the connections and starts it again.
     pub fn reset_connections(&mut self) -> Result<()> {
         self.ready_rows = None;
-        self.link.reset_connections()
+        match self.link.as_mut() { Some(link) => link.reset_connections(), None => Ok(()) }
     }
     /// Legacy TP4 upper-bound reservation (four rank planes), also sufficient
     /// for a legacy TP2 transport.
@@ -293,49 +356,33 @@ impl<'a> NativeTp4Wave<'a> {
         // or output allocation. Legacy two-rank transports also fail here rather
         // than at their first request.
         reducer.require_rank_count(world_size as u32)?;
-        let native = transport
-            .ownership_topology()
-            .map(|topology| ReplicatedGroupPlanner::new(topology)
-                .map(|planner| (topology, std::sync::Arc::new(std::sync::Mutex::new(planner)))))
-            .transpose()?;
+        let topology = transport.ownership_topology();
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
-        let hidden_bytes = capacity as usize * 5120 * 2;
+        let link = V41Link::new(crate::shared::spark_intake::SparkLink::from_transport(library, transport,
+            V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, timing)?, topology)?;
+        let mut wave = Self::unlinked(library, capacity)?;
+        wave.link = Some(link);
+        Ok(wave)
+    }
+    /// A prefill-only slot's FFN owner: its reduce output, stream and local or
+    /// TP2 expert workspace, without a Spark link (its units send on the
+    /// shared prefill link).
+    pub fn unlinked(library: &'a NativeLibrary, capacity: u32) -> Result<Self> {
+        ensure!(capacity > 0 && capacity <= 4096, "invalid native TP wave capacity");
         Ok(Self {
-            link: crate::shared::spark_intake::SparkLink::from_transport(library, transport,
-                V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, timing)?,
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            output: DeviceAllocation::new(library, hidden_bytes)?,
+            link: None,
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            output: DeviceAllocation::new(library, capacity as usize * 5120 * 2)?,
             library,
             ready_rows: None,
             local: None,
             tp2: None,
-            native,
         })
     }
 
-    /// Opens every rank's session once the workers serve `layer` (a remote
-    /// layer) and starts the link's exchange worker. The widest request (the
-    /// transport's capacity, in the checkpoint's wire format) sizes the rings;
-    /// only the control bootstrap runs, nothing is posted.
+    /// Opens the lane's own link ([`V41Link::bootstrap`]).
     pub(crate) fn bootstrap(&mut self, layer: u32, nvfp4: bool) -> Result<()> {
-        use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
-        let rows = self.link.capacity();
-        let (dtype, width) = if nvfp4 { (ExpertV2Dtype::Bf16, 10240) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, 5280) };
-        let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row.into(),
-            source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row.into(),
-            route_offset: row * 6, route_count: 6 }).collect();
-        let routes = (0..rows * 6).map(|i| ExpertProtocolV2RouteEntry { row_index: i / 6,
-            expert_id: i % V41_ROUTED_EXPERTS as u32, gate_weight: 0.0 }).collect();
-        let mut request = ExpertProtocolV2Request::new(1, 0, layer, 5120, dtype, descriptors, routes,
-            vec![0; rows as usize * width])?;
-        request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        if let Some((_, planner)) = &self.native {
-            planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.encode(&mut request)?;
-        }
-        self.link.bootstrap(&request)
+        self.own_link()?.bootstrap(layer, nvfp4)
     }
 
     /// Sends a remote layer's wave on the link's exchange: the router's route
@@ -353,58 +400,44 @@ impl<'a> NativeTp4Wave<'a> {
         router_stream: *mut std::ffi::c_void, placement: u64,
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativePendingFfn<'w, 'a>> {
         self.ready_rows = None;
-        let capacity = self.link.capacity();
-        ensure!(routed.rows > 0 && routed.rows <= capacity, "native dispatched FFN rows exceed capacity");
-        let (binding, build) = routed.request_builder(placement, rows,
-            self.native.as_ref().map(|(_, planner)| std::sync::Arc::clone(planner)))?;
-        let (layout, sources) = routed.wave_sources()?;
-        // Stage on this wave's own stream when the router shares its GPU: the
-        // lane's owners (the router among them) then carry nothing past their
-        // per-layer host waits, which a host-ordered pass relies on when it
-        // rebinds them (`LoadStream::require_complete`). A router on the other
-        // GPU (TP2 shared, device-ordered passes) stages from its own stream.
-        let stage = if sources[0].device_id == self.link.device() { self.stream.raw } else { router_stream };
-        let exchange = self.link.exchange()?;
-        // SAFETY: the sources are the router's live device outputs, complete in
-        // chain order: `stage` joins the chain head, which the router's stage
-        // finished (caller contract).
-        let ticket = unsafe {
-            crate::shared::memory::chain::join(self.library, stage)?;
-            exchange.send(routed.rows as usize, layout, sources, stage, build)?
-        };
-        Ok(NativePendingFfn { ticket, binding, layer: routed.layer, rows: routed.rows, library: self.library,
-            stream: &self.stream, link: &mut self.link, output: self.output.buffer, ready_rows: &mut self.ready_rows,
-            tp2: self.tp2.as_deref_mut() })
+        let link = self.link.as_mut().context("prefill-only slot has no Spark link of its own")?;
+        let ticket = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
+        Ok(NativePendingFfn { ticket: ticket.0, binding: ticket.1, layer: routed.layer, rows: routed.rows,
+            library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() })
     }
-    /// [`Self::dispatch_ffn`] for a prefill unit on the shared executor: the
-    /// returned ticket owns nothing borrowed, so the unit's later land hook
-    /// collects it after other units' hooks ran ([`Self::collect_unit`]).
+    /// A prefill unit's wave on the shared prefill `link` (its return slots
+    /// hold the in-flight units): the returned ticket owns nothing borrowed, so
+    /// the unit's later land hook collects it after other units' hooks ran
+    /// ([`Self::collect_unit`]); this slot's reduce output and stream stay its own.
     ///
     /// # Safety
     /// As [`Self::dispatch_ffn`].
-    pub(crate) unsafe fn dispatch_unit(&mut self,
+    pub(crate) unsafe fn dispatch_unit(&mut self, link: &mut V41Link<'a>,
         routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
         router_stream: *mut std::ffi::c_void, placement: u64,
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativeUnitFfn> {
-        let pending = unsafe { self.dispatch_ffn(routed, router_stream, placement, rows)? };
-        Ok(NativeUnitFfn { ticket: pending.ticket, binding: pending.binding, layer: pending.layer,
-            rows: pending.rows, owner: self.output.buffer.ptr as usize })
+        self.ready_rows = None;
+        let (ticket, binding) = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
+        Ok(NativeUnitFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
+            owner: self.output.buffer.ptr as usize })
     }
-    /// Lands a unit's wave (waves land in dispatch order: the executor's FIFO)
-    /// and reduces it with its `shared` values.
+    /// Lands a unit's wave from the shared prefill `link` (waves land in
+    /// dispatch order: the executor's FIFO) and reduces it with its `shared`
+    /// values into this slot's output.
     ///
     /// # Safety
     /// `shared` holds the unit's completed shared contribution for exactly this
     /// wave's rows and stays unchanged until the reduce completes.
-    pub(crate) async unsafe fn collect_unit(&mut self, unit: NativeUnitFfn, shared: CuteafdDeviceBuffer,
-        destination: i32) -> Result<NativeFfnOutput<'_>> {
-        ensure!(unit.owner == self.output.buffer.ptr as usize, "prefill unit ticket belongs to another transport");
+    pub(crate) async unsafe fn collect_unit<'w>(&'w mut self, link: &'w mut V41Link<'a>, unit: NativeUnitFfn,
+        shared: CuteafdDeviceBuffer, destination: i32) -> Result<NativeFfnOutput<'w>> {
+        ensure!(unit.owner == self.output.buffer.ptr as usize, "prefill unit ticket belongs to another slot");
         ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= unit.rows as usize * 10240,
             "prefill unit shared contribution differs from its wave");
         let mut values = shared;
         values.bytes = unit.rows as usize * 10240;
         let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
-            library: self.library, stream: &self.stream, link: &mut self.link, output: self.output.buffer,
+            library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
             ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() };
         let destination = Some(destination).filter(|&device| device != self.output.buffer.device_id);
         if destination.is_some() {
@@ -438,6 +471,38 @@ impl<'a> NativeTp4Wave<'a> {
     pub fn synchronize(&self) -> Result<()> {
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
     }
+}
+/// Sends a remote layer's wave on `link`'s exchange (see
+/// [`NativeTp4Wave::dispatch_ffn`]), staging on `stream` when the router shares
+/// the link's GPU.
+///
+/// # Safety
+/// As [`NativeTp4Wave::dispatch_ffn`].
+unsafe fn send_on<'a>(library: &'a NativeLibrary, stream: &LoadStream<'a>, link: &mut V41Link<'a>,
+    routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+    router_stream: *mut std::ffi::c_void, placement: u64,
+    rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow])
+    -> Result<(crate::shared::spark_waves::WaveTicket, crate::families::deepseek_v41::v41_attention_binding::QueryBinding)> {
+    let capacity = link.link.capacity();
+    ensure!(routed.rows > 0 && routed.rows <= capacity, "native dispatched FFN rows exceed capacity");
+    let (binding, build) = routed.request_builder(placement, rows,
+        link.native.as_ref().map(|(_, planner)| std::sync::Arc::clone(planner)))?;
+    let (layout, sources) = routed.wave_sources()?;
+    // Stage on this wave's own stream when the router shares its GPU: the
+    // lane's owners (the router among them) then carry nothing past their
+    // per-layer host waits, which a host-ordered pass relies on when it
+    // rebinds them (`LoadStream::require_complete`). A router on the other
+    // GPU (TP2 shared, device-ordered passes) stages from its own stream.
+    let stage = if sources[0].device_id == link.link.device() { stream.raw } else { router_stream };
+    let exchange = link.link.exchange()?;
+    // SAFETY: the sources are the router's live device outputs, complete in
+    // chain order: `stage` joins the chain head, which the router's stage
+    // finished (caller contract).
+    let ticket = unsafe {
+        crate::shared::memory::chain::join(library, stage)?;
+        exchange.send(routed.rows as usize, layout, sources, stage, build)?
+    };
+    Ok((ticket, binding))
 }
 impl Drop for NativeTp4Wave<'_> {
     fn drop(&mut self) {

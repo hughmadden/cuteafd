@@ -475,21 +475,26 @@ fn worker(
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
-    // Prefill slots beyond the two lanes: their own pass and Spark endpoint.
-    let mut extra = (2..slots).map(|lane| -> Result<_> {
-        let pass = make_prefill_pass()?;
-        let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world, u32::try_from(lane)?)?;
-        Ok((pass, NativeTp4Wave::new(&lib, roce, wave_bytes)?))
+    // Prefill slots beyond the two lanes: their own pass and FFN owner; every
+    // slot's units send on the one prefill link (endpoint after the lanes'),
+    // whose return slots are cut from one reserve range per rank.
+    let mut extra = (2..slots).map(|_| -> Result<_> {
+        Ok((make_prefill_pass()?, NativeTp4Wave::unlinked(&lib, capacity)?))
     }).collect::<Result<Vec<_>>>()?;
+    let prefill_reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(capacity));
+    let prefill_link = crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+        spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world, 2)?, slots, capacity,
+        usize::try_from(prefill_reserve)?)?;
+    let mut prefill_slots = prefill_target::PrefillSlots { link: prefill_link, extra };
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-slots");
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     pass.install_attention_plan(attention_plan)?;
     prefill_pass.install_attention_plan(attention_plan)?;
-    for (slot, _) in &mut extra { slot.install_attention_plan(attention_plan)?; }
+    for (slot, _) in &mut prefill_slots.extra { slot.install_attention_plan(attention_plan)?; }
     if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
         pass.enable_l2_prefetch(budget)?;
         prefill_pass.enable_l2_prefetch(budget)?;
-        for (slot, _) in &mut extra { slot.enable_l2_prefetch(budget)?; }
+        for (slot, _) in &mut prefill_slots.extra { slot.enable_l2_prefetch(budget)?; }
     }
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
@@ -546,7 +551,7 @@ fn worker(
     let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
     pass.bind_execution_plan(&pool.placement)?;
     prefill_pass.bind_execution_plan(&pool.placement)?;
-    for (slot, _) in &mut extra { slot.bind_execution_plan(&pool.placement)?; }
+    for (slot, _) in &mut prefill_slots.extra { slot.bind_execution_plan(&pool.placement)?; }
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,local_layers=pool.placement.onboard_layers,
         projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
@@ -590,7 +595,7 @@ fn worker(
             let modules = exl3_modules.take().context("missing admitted EXL3 modules")?;
             ensure!(modules.len() == slots, "EXL3 modules admitted for {} of {slots} target passes", modules.len());
             let transports = std::iter::once(&mut transport).chain(std::iter::once(&mut prefill_transport))
-                .chain(extra.iter_mut().map(|(_, transport)| transport));
+                .chain(prefill_slots.extra.iter_mut().map(|(_, transport)| transport));
             for (transport, modules) in transports.zip(modules) {
                 // SAFETY: the admitted modules were loaded on this device from the same pinned exports.
                 transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights.clone(),
@@ -605,7 +610,7 @@ fn worker(
             let weights = std::rc::Rc::new(loaded);
             transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_lane)?)?;
             prefill_transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_lane)?)?;
-            for (_, transport) in &mut extra {
+            for (_, transport) in &mut prefill_slots.extra {
                 transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_lane)?)?;
             }
         }
@@ -618,7 +623,7 @@ fn worker(
         // link's exchange worker (the first remote layer sizes the rings).
         transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
         prefill_transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
-        for (_, transport) in &mut extra { transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?; }
+        prefill_slots.link.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
@@ -644,7 +649,7 @@ fn worker(
         .send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut prefill_pass,
-        &mut requests, &mut transport, &mut prefill_transport, &mut extra, draft.as_mut(), &mut vision, stats, prefixes)
+        &mut requests, &mut transport, &mut prefill_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes)
 }
 
 /// The HC-9 prefill pacing hold at a chunk boundary: bounded by the host cache's store
@@ -663,7 +668,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     requests: &mut Requests<'a>,
     transport: &mut P::Transport,
     other_transport: &mut P::Transport,
-    extra: &mut [(P, P::Transport)],
+    prefill_slots: &mut prefill_target::PrefillSlots<'a, P>,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
     tokens: &[u32],
     shape: PrefillShape,
@@ -684,7 +689,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
             if index == 0 {
                 let mut times = V41PrefillTimes::default();
                 let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
-                    other_transport, extra: &mut *extra, lease, tokens: chunk, chunk_rows, waves, job, draft: draft.as_deref_mut(),
+                    other_transport, prefill: &mut *prefill_slots, lease, tokens: chunk, chunk_rows, waves, job, draft: draft.as_deref_mut(),
                     hold, times: &mut times };
                 scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
             } else if cold_step.decode {
@@ -713,7 +718,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     }
     let mut times = V41PrefillTimes::default();
     let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
-        other_transport, extra, lease, tokens, chunk_rows, waves, job, draft, hold, times: &mut times };
+        other_transport, prefill: prefill_slots, lease, tokens, chunk_rows, waves, job, draft, hold, times: &mut times };
     crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
 }
 
@@ -808,7 +813,7 @@ impl ScoringPlan {
 #[allow(clippy::too_many_arguments)]
 fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, other: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
-    other_transport: &mut P::Transport, extra: &mut [(P, P::Transport)],
+    other_transport: &mut P::Transport, prefill_slots: &mut prefill_target::PrefillSlots<'a, P>,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
     tokens: &[u32], from: usize, shape: PrefillShape, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
@@ -817,7 +822,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let from = from.clamp(1, tokens.len() - 1);
-    let first = prefill(lib, runtime, pass, other, requests, transport, other_transport, extra, lease, &tokens[..from],
+    let first = prefill(lib, runtime, pass, other, requests, transport, other_transport, prefill_slots, lease, &tokens[..from],
         shape, job, draft.as_deref_mut(), hold)?;
     probe.row(from, &first.logits()?);
     for step in plan.steps(from, tokens.len()) {

@@ -8,6 +8,8 @@ pub(in crate::families::deepseek_v41::v41_native_serve) trait ServingTarget<'w, 
     type Chain: DraftChain<'a>;
     fn begin_request(transport: &mut Self::Transport) -> Result<()>;
     fn reset_connections(transport: &mut Self::Transport) -> Result<()>;
+    /// After a failed pass whose streams drained: resets the prefill link.
+    fn reset_prefill(link: &mut Self::PrefillLink) -> Result<()>;
     fn decode_round(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,
         first_transport: &mut Self::Transport, second_transport: &mut Self::Transport,
@@ -24,6 +26,7 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for TargetPass<'_, 'a> {
     fn reset_connections(transport: &mut Self::Transport) -> Result<()> {
         transport.reset_connections(); Ok(())
     }
+    fn reset_prefill(link: &mut Self::PrefillLink) -> Result<()> { link.reset_connections() }
     fn decode_round(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,
         first_transport: &mut Self::Transport, second_transport: &mut Self::Transport,
@@ -52,6 +55,10 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for DistributedTargetPass<'_, 'a> {
     fn reset_connections(transport: &mut Self::Transport) -> Result<()> {
         let device = transport.device;
         device.run(|| { transport.reset_connections(); Ok(()) })
+    }
+    fn reset_prefill(link: &mut Self::PrefillLink) -> Result<()> {
+        let device = link.device;
+        device.run(|| link.reset_connections())
     }
     fn decode_round(_lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,

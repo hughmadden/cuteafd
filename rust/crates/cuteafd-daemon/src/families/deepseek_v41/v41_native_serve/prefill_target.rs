@@ -14,14 +14,14 @@ use std::time::Duration;
 #[cfg(test)]
 pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, pass: &mut P, other: &mut P,
-    requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], lease: CacheLease,
-    tokens: &[u32], chunk_rows: usize, waves: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+    requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], prefill: &mut PrefillSlots<'a, P>,
+    lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
 ) -> Result<u32> {
     let (events, _receive) = mpsc::unbounded_channel();
     let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     let [first_transport, second_transport] = transports;
     ensure!(waves <= 2, "the test fixture builds the two decode lanes' slots only");
-    super::prefill(lib, runtime, pass, other, requests, first_transport, second_transport, &mut [],
+    super::prefill(lib, runtime, pass, other, requests, first_transport, second_transport, prefill,
         lease, tokens, super::PrefillShape { rows: chunk_rows, waves }, &job, draft, &mut || Ok(()))?.select(None)
 }
 
@@ -126,8 +126,8 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
     pub(crate) chunk_rows: usize,
     /// Units in flight on the shared executor.
     pub(crate) waves: usize,
-    /// Prefill slots beyond the two decode lanes' passes (waves - 2 of them).
-    pub(crate) extra: &'s mut [(P, P::Transport)],
+    /// The prefill link and the slots beyond the two decode lanes' passes.
+    pub(crate) prefill: &'s mut PrefillSlots<'a, P>,
     pub(crate) job: &'s NativeRequest,
     pub(crate) draft: Option<&'s mut DraftRuntime<'w, 'a, C>>,
     pub(crate) hold: &'s mut dyn FnMut() -> Result<()>,
@@ -244,12 +244,12 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 // is a prefill-only pass with its own link.
                 let mut slots: Vec<(&mut P, &mut P::Transport)> = vec![(&mut *self.pass, &mut *self.transport),
                     (&mut *self.other, &mut *self.other_transport)];
-                slots.extend(self.extra.iter_mut().map(|(pass, transport)| (pass, transport)));
+                slots.extend(self.prefill.extra.iter_mut().map(|(pass, transport)| (pass, transport)));
                 slots.truncate(self.waves);
                 let keep_running = || !self.job.events.is_closed();
                 // SAFETY: every slot's pass and link retain the request and
                 // suffix through drained completion or cancellation.
-                self.runtime.block_on(unsafe { P::encoder_units(slots, self.requests, self.lease, &chunks, suffix,
+                self.runtime.block_on(unsafe { P::encoder_units(slots, &mut self.prefill.link, self.requests, self.lease, &chunks, suffix,
                     &keep_running, &before_unit) })?;
                 tracing::debug!(target: "cuteafd::timing", rows=chunks.iter().map(|c| c.len()).sum::<usize>(),
                     units=chunks.len(), waves=self.waves, total_us=started.elapsed().as_micros() as u64,
@@ -308,8 +308,20 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 }
 
+/// Serving prefill beyond the decode lanes (PLAN "Prefill contract"): the one
+/// prefill link whose return slots hold the in-flight units, and the slot
+/// passes beyond the two decode lanes' (waves - 2 of them; their FFN owners
+/// have no link of their own).
+pub(crate) struct PrefillSlots<'a, P: PrefillTarget<'a>> {
+    pub link: P::PrefillLink,
+    pub extra: Vec<(P, P::Transport)>,
+}
+
 pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type Suffix;
+    /// The one prefill transport (PLAN "Prefill contract"): its return slots
+    /// hold the in-flight units' waves.
+    type PrefillLink;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
@@ -317,14 +329,15 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()>;
     /// Encoder units of one prompt on the shared executor, one unit per slot
-    /// in flight: slot k is `slots[k]`, a target pass with its Spark link.
+    /// in flight: slot k is `slots[k]`, a target pass with its reduce/FFN
+    /// owner; every unit's wave goes out on the one `prefill` link.
     /// # Safety
     /// The passes have independent workspaces and the same layout/model; the
     /// chunks and suffix follow the encoder's request/cache contract.
     /// `before_unit` runs synchronously before each unit (host-cache store
     /// pacing, packet HC-9).
-    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
+    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
         keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()>;
     /// # Safety
     /// Batch inputs and optional completed encoder suffix match this target.
@@ -336,6 +349,7 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
 }
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     type Suffix = EncoderSuffix<'a>;
+    type PrefillLink = crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -346,10 +360,10 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
             unsafe { self.execute_encoder_replay(requests, batch, transport, 0, suffix).await }
         } else { unsafe { self.execute_encoder(requests, batch, transport, 0, suffix).await } }
     }
-    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
+    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
         keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { Self::execute_encoder_units(slots, requests, lease, chunks, suffix, keep_running, before_unit).await }
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, keep_running, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -371,6 +385,7 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
 }
 impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     type Suffix = DeviceOwner<'a, EncoderSuffix<'a>>;
+    type PrefillLink = DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
     }
@@ -379,10 +394,10 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         self.set_attention_decode(false);
         unsafe { self.execute(&RefCell::new(requests), batch, transport, 0, &[], Some(suffix), None, false).await }
     }
-    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
+    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
         keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { Self::execute_encoder_units(slots, requests, lease, chunks, suffix, keep_running, before_unit).await }
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, keep_running, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
