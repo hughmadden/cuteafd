@@ -309,6 +309,20 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
         }
         Ok(())
     }
+    /// A prefill unit publishes layer `layer`'s window KV right after its
+    /// attention was queued (as one RTX does), before its FFN: the next unit
+    /// attends `layer` before this one lands it (shared executor order).
+    /// # Safety
+    /// As [`Self::enqueue_encoder_publication`]; the layer's production completed.
+    pub unsafe fn enqueue_unit_window_publication(&mut self, bank: &BackboneCache<'_>,
+        batch: &CacheBatch, layer: usize) -> Result<()> {
+        ensure!(batch.is_reserved() && batch.stage() == CacheStage::Encoder && self.publication.is_none()
+            && self.progress.invalid && self.progress.batch == Some(batch.identity())
+            && layer < 20 && self.progress.next == layer,
+            "unit window publication requires this layer's queued attention");
+        self.publication = Some((batch.identity(), layer));
+        unsafe { bank.enqueue_encoder_window(batch, layer, &mut self.producers.windows[layer]) }
+    }
     pub fn poll_encoder_publication(&self) -> Result<bool> {
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;
         let (_, layer) = self.publication.context("encoder publication absent")?;
