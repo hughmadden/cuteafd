@@ -157,6 +157,10 @@ pub(crate) struct Wave<'a> {
 /// Copies `bytes` from `source` (the other GPU) into `destination` on
 /// `stream`: an SM copy ordered by events under a device-ordered pass (no
 /// copy-engine queue held behind an event), else a copy-engine peer copy.
+fn sm_peer_copy() -> bool {
+    static SM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SM.get_or_init(|| std::env::var("CUTEAFD_V41_PEER_COPY").is_ok_and(|value| value == "sm"))
+}
 unsafe fn peer_copy(
     stream: &Stream<'_>,
     sm: Option<&cuteafd_ffi::V41PeerCopy<'_>>,
@@ -164,7 +168,12 @@ unsafe fn peer_copy(
     source: CuteafdDeviceBuffer,
     bytes: usize,
 ) -> Result<()> {
-    match sm.filter(|_| crate::shared::memory::chain::deferred()) {
+    // Device-ordered passes copy on the copy engines by default (#815,
+    // prof12: SM copies took ~1.2 s of GPU0 SM time per 64K prefill on two
+    // RTX). The issuing stream is this wave's own, ordered by a
+    // `cudaStreamWaitEvent` on the chain head, never a memory wait.
+    // `CUTEAFD_V41_PEER_COPY=sm` keeps the SM copy (a runtime-sized grid).
+    match sm.filter(|_| crate::shared::memory::chain::deferred() && sm_peer_copy()) {
         Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
         None => unsafe {
             stream

@@ -33,7 +33,11 @@ bool extent(uint64_t width,uint64_t rows,uint64_t pitch,uint64_t& bytes) {
 template<class T> int32_t dispatch_rows(void* destination,const void* source,uint64_t width,
     uint64_t rows,uint64_t destination_pitch,uint64_t source_pitch,void* stream) {
   const uint64_t blocks=(width/sizeof(T)*rows+255)/256;
-  copy_rows<T><<<unsigned(blocks<4096?blocks:4096),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+  int device=0,sms=0;
+  if(cudaGetDevice(&device)!=cudaSuccess ||
+      cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess || sms<=0)sms=64;
+  const uint64_t cap=sms/8>8?uint64_t(sms/8):8;
+  copy_rows<T><<<unsigned(blocks<cap?blocks:cap),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<T*>(destination),static_cast<const T*>(source),width/sizeof(T),rows,
       destination_pitch/sizeof(T),source_pitch/sizeof(T));
   return cudaGetLastError();
@@ -59,7 +63,14 @@ extern "C" int32_t cuteafd_peer_copy_async(void* destination,const void* source,
       dst>UINTPTR_MAX-bytes || src>UINTPTR_MAX-bytes || !(dst+bytes<=src || src+bytes<=dst))
     return cudaErrorInvalidValue;
   const uint64_t units=((dst|src|bytes)&15)==0?bytes/16:(((dst|src|bytes)&3)==0?bytes/4:bytes);
-  const unsigned blocks=unsigned((units+255)/256<1024?(units+255)/256:1024);
+  // Bandwidth-bound: an eighth of this device's SMs (at least 8 blocks) saturate
+  // a peer link and leave the rest to the compute it overlaps (RTX PRO 6000 and
+  // 5090 alike; queried at runtime, never baked in).
+  int device=0,sms=0;
+  if(cudaGetDevice(&device)!=cudaSuccess ||
+      cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess || sms<=0)sms=64;
+  const uint64_t cap=sms/8>8?uint64_t(sms/8):8;
+  const unsigned blocks=unsigned((units+255)/256<cap?(units+255)/256:cap);
   peer_copy<<<blocks,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<uint8_t*>(destination),static_cast<const uint8_t*>(source),bytes);
   return cudaGetLastError();
