@@ -5471,9 +5471,9 @@ Every family that sends experts to Sparks prefills the same way.
   (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. The reserve is sized
   before KV and never shrunk for it (TJ, 2026-10-27): the planner admits
   8192 rows, or on a card where that doesn't fit (5090) the largest multiple
-  of 768 rows (12 pages, so every k = 2..4 split stays page-aligned) that
-  does, split into k units automatically or by pin; the KV pool takes what
-  remains.
+  of 64 rows that does. Units are roundup64(reserve / k), k = 2..4
+  automatically or by pin, and a reserve charges its largest split (8192
+  charges 8256 for 3 × 2752); the KV pool takes what remains.
 - **One transport, N waves:** each unit's expert wave goes out on one
   transport that admits N outstanding waves, each with its own return slot.
   The Spark side already pipelines (rings 8 deep, in order); only the
