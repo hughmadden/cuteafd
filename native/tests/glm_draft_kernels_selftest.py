@@ -4,6 +4,7 @@ Usage: python native/tests/glm_draft_kernels_selftest.py /path/to/libcuteafd_nat
            [--head SHARD.safetensors] [--head-shape VOCAB WIDTH] [--head-only]
            [--head-rows 8,64] [--profile-head] [--quick]
            [--mimo-forward SNAPSHOT/dflash --fp8-rows 8,64 --profile-mimo --fp8-baseline LIB]
+           [--dflash2-only [--fp8-baseline LIB]]
 
 Run with Python containing CUDA PyTorch, on one GPU.
 
@@ -15,6 +16,14 @@ Run with Python containing CUDA PyTorch, on one GPU.
    only within adjacent FP64 near-ties (1e-5 relative per row).
    `--head-input` qualifies each file at its serving row count, not as one concatenated GEMM.
    `--head` reads `lm_head.weight` from a checkpoint shard; otherwise the weight is synthetic.
+3. `--dflash2-only`: the shared DFlash2 kernels a MiniMax M3.1 Flash draft adds (`_gemma` norms,
+   partial RoPE in BF16 and FP8 rings, SwiGLU-OAI, the F32 tap, the 200,064-entry top-16, the
+   FP32-scored selector, block attention over 128 queries per KV head, causal or not) against torch oracles that round where
+   the kernels round, and the new block attention ABI against the GLM drafters' one bit for bit
+   on GLM shapes. Every check runs and prints its result; the run fails at the end if any did.
+   With --fp8-baseline (a library built before these kernels), every GLM entry point must return
+   the baseline's bytes exactly. `--attention-only` also times the MiniMax block shape (64 query /
+   4 KV heads, blocks of 8, a 4096-position ring and window, causal or not).
 2. FP8 GEMMs (`cuteafd_fp8_linear`, `--draft-linear`): mode 1 (passes of 128 rows) must equal
    mode 0 (passes of 64) bit for bit at every row count; mode 2 (W8A8 past 8 rows) must equal
    mode 0 bit for bit up to 8 rows; past them it must match mode 0 to accumulation rounding on
@@ -725,9 +734,15 @@ def attention_check(lib, args):
         "cuteafd_glmf_dspark_attention_workspace": ([C.c_int32] * 3, C.c_uint64),
         "cuteafd_glmf_dspark_attention": ([P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
     }
+    # The shared DFlash2 drafter's block attention (any queries per KV head, causal blocks); a
+    # baseline library may predate it, so only this library binds it.
+    block_signatures = {
+        "cuteafd_glm_dflash_block_attention_workspace": ([C.c_int32] * 5, C.c_uint64),
+        "cuteafd_glm_dflash_block_attention": ([P] * 10 + [C.c_int32] * 8 + [C.c_float, P], C.c_int32),
+    }
     baseline = C.CDLL(args.fp8_baseline) if args.fp8_baseline else None
-    for native in [lib] + ([baseline] if baseline else []):
-        for name, (types, result) in signatures.items():
+    for native, bound in [(lib, {**signatures, **block_signatures})] + ([(baseline, signatures)] if baseline else []):
+        for name, (types, result) in bound.items():
             getattr(native, name).argtypes = types
             getattr(native, name).restype = result
     torch.manual_seed(197)
@@ -750,13 +765,25 @@ def attention_check(lib, args):
         ("mimo", 128, 64, 8, 8, 1024, 1024, False, True),
         ("glm", 128, 32, 8, 8, 1024, 1024, False, False),
         ("glmf", 64, 64, 64, 8, 1024, 0, True, False),
+        # MiniMax M3.1 Flash DFlash2 on the shared block attention: 64 query / 4 KV heads and blocks
+        # of 8 (128 queries per KV head, four 32-query slices) over its 4096-position ring, each row
+        # windowed to 4096 positions, the block causal (SGLang's mask for the release) or not.
+        ("minimax", 128, 64, 4, 8, 0, 4096, False, False),
+        ("minimax", 128, 64, 4, 8, 0, 4096, True, False),
+        ("minimax", 128, 64, 4, 8, 33, 4096, True, False),
+        ("minimax", 128, 64, 4, 8, 1031, 4096, False, False),
+        ("minimax", 128, 64, 4, 8, 4095, 4096, True, False),
+        ("minimax", 128, 64, 4, 8, 4096, 4096, False, False),
+        ("minimax", 128, 64, 4, 8, 4096, 4096, True, False),
     ]
     for family, dim, heads, kvh, block, context, window, causal, sink in cases:
         prefix = {"mimo": "cuteafd_mimo_dflash", "glm": "cuteafd_glm_dflash",
-                  "glmf": "cuteafd_glmf_dspark"}[family]
+                  "glmf": "cuteafd_glmf_dspark", "minimax": "cuteafd_glm_dflash_block"}[family]
         slices = ((heads // kvh * block + 31) // 32 if family == "mimo"
+                  else max(2, (heads // kvh * block + 31) // 32) if family == "minimax"
                   else 2 if family == "glm" else 1)
-        ring = max(257, context + 17)
+        # MiniMax's ring is its window; a full context wraps every slot of it.
+        ring = window if family == "minimax" else max(257, context + 17)
         max_keys = context + block
         partitions = min((max_keys + 31) // 32, (2 * sms + kvh * slices - 1) // (kvh * slices))
         for sequences in (1, 8):
@@ -773,7 +800,7 @@ def attention_check(lib, args):
             sinks = torch.linspace(-3., 2., heads, device="cuda").bfloat16() if sink else None
             out = torch.empty_like(q)
             workspace_fn = getattr(lib, prefix + "_attention_workspace")
-            arena = (workspace_fn(16, heads, kvh, block, max_keys) if family == "mimo"
+            arena = (workspace_fn(16, heads, kvh, block, max_keys) if family in ("mimo", "minimax")
                      else workspace_fn(16, kvh, max_keys))
             scalar_chunks = (min(max_keys, 1024 + 16) + 127) // 128
             scalar_stride = 32 if dim == 64 else 16
@@ -787,9 +814,12 @@ def attention_check(lib, args):
                             slots.data_ptr(), lengths.data_ptr(), ends.data_ptr()]
                 if family == "mimo":
                     pointers.append(sinks.data_ptr() if sinks is not None else None)
+                # The block attention takes both the row window and block causality.
+                mask = ((window, int(causal)) if family == "minimax"
+                        else (int(causal),) if family == "glmf" else (window,))
                 return getattr(native, prefix + "_attention")(*pointers, output.data_ptr(),
                     workspace.data_ptr(), sequences, block, heads, kvh, ring, max_keys,
-                    int(causal) if family == "glmf" else window, dim ** -0.5, stream)
+                    *mask, dim ** -0.5, stream)
 
             assert launch(lib, out, scratch) == 0
             torch.cuda.synchronize()
@@ -824,7 +854,8 @@ def attention_check(lib, args):
 
             median = timed(lambda: checked_launch(lib, out, scratch), 5)
             old_median = None
-            if baseline is not None:
+            # A baseline library predating the block attention has no MiniMax entry to time.
+            if baseline is not None and family != "minimax":
                 old_fn = getattr(baseline, prefix + "_attention_workspace")
                 old_bytes = (old_fn(sequences, heads, kvh, block, max_keys) if family == "mimo"
                              else old_fn(sequences, kvh, max_keys))
@@ -838,6 +869,540 @@ def attention_check(lib, args):
                   f"context={context} window={window} causal={causal} sink={sink} "
                   f"max_abs={maximum:.3e} rel_rms={relative_rms:.3e} "
                   f"median_ms={median:.6f} baseline_ms={old_median} arena_bytes={arena}")
+
+
+class Checks:
+    """Every check runs and prints its result; `finish` fails the run if any failed, so one run
+    shows every result."""
+
+    def __init__(self, what):
+        self.what, self.count, self.failures = what, 0, []
+
+    def __call__(self, name, ok, detail=""):
+        self.count += 1
+        line = f"{name}: {'passed' if ok else 'FAILED'}" + (f", {detail}" if detail else "")
+        print(line, flush=True)
+        if not ok:
+            self.failures.append(line)
+        return bool(ok)
+
+    def launched(self, name, status):
+        """A native entry's status: a refusal fails `name` and its comparisons are skipped."""
+        return status == 0 or self(name, False, f"the launch returned {status}")
+
+    def section(self, name, run):
+        """One group of checks; an exception (a CUDA fault, a missing entry) fails only this group."""
+        try:
+            run()
+        except Exception as error:  # report it and run the remaining groups
+            self(name, False, f"stopped by {type(error).__name__}: {error}")
+
+    def finish(self):
+        if self.failures:
+            raise AssertionError(f"{self.what}: {len(self.failures)} of {self.count} checks failed:\n  "
+                                 + "\n  ".join(self.failures))
+        print(f"{self.what}: all {self.count} checks passed")
+
+
+class GemmaDraftNumerics:
+    """Torch oracles of a Gemma-norm DFlash2 draft (MiniMax M3.1 Flash's), as its target computes them: the
+    norm, RoPE and activation in FP32, each rounded once. Kept here so the self-test needs no family reference."""
+
+    @staticmethod
+    def gemma_norm(x, weight, eps):
+        value = x.float()
+        return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps)
+                * (1.0 + weight.float())).to(x.dtype)
+
+    @staticmethod
+    def rope_partial(x, positions, rotary, theta):
+        """NeoX pairing on leading channels, FP32 trigonometry and rotation."""
+        frequency = 1.0 / (theta ** (torch.arange(0, rotary, 2, device=x.device).float() / rotary))
+        phase = positions.float()[:, None] * frequency
+        cos, sin = phase.cos()[:, None], phase.sin()[:, None]
+        a, b = x[..., :rotary // 2].float(), x[..., rotary // 2:rotary].float()
+        return torch.cat(((a * cos - b * sin).to(x.dtype),
+                          (b * cos + a * sin).to(x.dtype), x[..., rotary:]), -1)
+
+    @staticmethod
+    def swiglu_oai(gate, up, alpha=1.702, limit=7.0):
+        g, u = gate.float().clamp(max=limit), up.float().clamp(-limit, limit)
+        return (g * torch.sigmoid(alpha * g) * (u + 1.0)).to(gate.dtype)
+
+
+def dflash2_check(lib, args):
+    """MiniMax DFlash2 kernels against torch oracles; GLM entries unchanged.
+
+    Every check runs and reports; the run fails at the end if any failed. The oracles round where
+    the kernels round. A norm's unit-RMS factor is an FP32 sum of squares and rsqrtf, so a norm
+    must equal its formula at a factor within BAND of the FP64 one: a last-bit factor difference
+    can move the Qwen3 norm's first BF16 rounding, which its second rounding carries to up to two
+    BF16 units, and the Gemma norm's single rounding by one."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference"))
+    from families.glm5.dflash2.reference import conv as glm_conv
+    model = GemmaDraftNumerics
+    I, Fl = C.c_int32, C.c_float
+    norm = ([P, P, P, I, I, Fl, P], I)
+    conv_norm = ([P] * 7 + [I] * 4 + [Fl, P], I)
+    rope = ([P] * 8 + [I] * 3 + [Fl] * 2 + [P], I)
+    rope_gemma = ([P] * 8 + [I] * 4 + [Fl] * 2 + [P], I)
+    attention = ([P] * 10 + [I] * 7 + [Fl, P], I)
+    block_attention = ([P] * 10 + [I] * 8 + [Fl, P], I)
+    signatures = {
+        "cuteafd_glm_dflash_rmsnorm": norm, "cuteafd_glm_dflash_rmsnorm_gemma": norm,
+        "cuteafd_glm_dflash_conv_residual_norm": conv_norm, "cuteafd_glm_dflash_conv_residual_norm_gemma": conv_norm,
+        "cuteafd_glm_dflash_qk_rope": rope, "cuteafd_glm_dflash_qk_rope_fp8": rope,
+        "cuteafd_glm_dflash_qk_rope_gemma": rope_gemma, "cuteafd_glm_dflash_qk_rope_gemma_fp8": rope_gemma,
+        "cuteafd_glm_dflash_silu_mul": ([P, P, I, I, P], I),
+        "cuteafd_glm_dflash_swiglu_oai": ([P, P, I, I, Fl, Fl, P], I),
+        "cuteafd_glm_dflash_tap_f32": ([P, P, I, I, I, I, P], I),
+        "cuteafd_glm_dflash_topk_workspace": ([I], C.c_uint64),
+        "cuteafd_glm_dflash_topk": ([P] * 4 + [I] * 4 + [P], I),
+        "cuteafd_glm_dflash_attention_workspace": ([I] * 3, C.c_uint64),
+        "cuteafd_glm_dflash_attention": attention, "cuteafd_glm_dflash_attention_fp8": attention,
+        "cuteafd_glm_dflash_block_attention_workspace": ([I] * 5, C.c_uint64),
+        "cuteafd_glm_dflash_block_attention": block_attention, "cuteafd_glm_dflash_block_attention_fp8": block_attention,
+        "cuteafd_glm_dflash_select": ([P] * 8 + [I] * 4 + [P], I),
+        "cuteafd_glm_dflash_select_fp32_score": ([P] * 8 + [I] * 4 + [P], I),
+    }
+    glm_entries = [name for name in signatures if "gemma" not in name and "swiglu" not in name
+                   and "tap_f32" not in name and "block_attention" not in name and "fp32_score" not in name]
+    baseline = C.CDLL(args.fp8_baseline) if args.fp8_baseline else None
+    for native, names in [(lib, signatures)] + ([(baseline, glm_entries)] if baseline else []):
+        for name in names:
+            getattr(native, name).argtypes, getattr(native, name).restype = signatures[name]
+    torch.manual_seed(1702)
+    stream = torch.cuda.current_stream().cuda_stream
+    bf16 = torch.bfloat16
+    ptr = lambda t: t.data_ptr() if t is not None else None
+    checks = Checks("dflash2")
+    hidden = 6144
+
+    def ulps(a, b):
+        """Elements that differ, and the largest difference in BF16 units of the larger magnitude."""
+        a, b = a.float().flatten(), b.float().flatten()
+        unit = torch.maximum(a.abs(), b.abs()).clamp_min(2.0 ** -126) * 2.0 ** -7
+        differ = a != b
+        return int(differ.sum()), float(((a - b).abs() / unit).max()) if differ.any() else 0.0
+
+    def close(name, actual, expected, fraction=1e-3, units=1.0):
+        count, worst = ulps(actual, expected)
+        return checks(name, count <= fraction * actual.numel() and worst <= units,
+                      f"{count}/{actual.numel()} elements differ, at most {worst:.2f} BF16 units")
+
+    # Relative bound on the kernels' unit-RMS factor error: an FP32 sum of at most 12 squares per
+    # thread and a 10-level tree is within 22 FP32 units, rsqrtf within two (about 2^-20 together).
+    BAND = 2.0 ** -17
+
+    def qwen3(values, inv, w):
+        """Qwen3RMSNorm's boundaries (GLM): bf16(bf16(x * inv) * w)."""
+        return ((values * inv).to(bf16).float() * w.float()).to(bf16)
+
+    def gemma(values, inv, w):
+        """GemmaRMSNorm's (MiniMax): bf16(x * inv * (1 + w)), FP32 throughout."""
+        return (values * inv * (1.0 + w.float())).to(bf16)
+
+    def band(values, eps, w, formula):
+        """`formula` (FP32 `values`, BF16 `w`) at both ends of the factor band around the FP64 factor."""
+        inv = torch.rsqrt(values.double().square().mean(-1, keepdim=True) + eps)
+        return [formula(values, (inv * (1 + side * BAND)).float(), w) for side in (-1, 1)]
+
+    def banded(name, actual, values, w, eps, formula):
+        """Every element of `actual` is the formula's at a factor within BAND (either band end)."""
+        low, high = band(values, eps, w, formula)
+        outside = int(((actual != low) & (actual != high)).sum())
+        count, worst = ulps(actual, formula(values, torch.rsqrt(values.square().mean(-1, keepdim=True) + eps), w))
+        return checks(name, outside == 0, f"{outside}/{actual.numel()} outside the factor band; {count} differ "
+                      f"from torch's FP32 factor, at most {worst:.2f} BF16 units")
+
+    def ring_record(values):
+        """The shared E4M3 ring writer's codes and per-head scales of BF16 `values` [..., heads, dim]:
+        amax / 448 and its reciprocal, each correctly rounded, then round-to-nearest-even codes. On
+        the CPU, as draft_kv_selftest.py packs: CUDA torch divides by a Python scalar through its
+        reciprocal, which can miss the kernel's __fdiv_rn by a unit."""
+        values = values.cpu().float()
+        amax = values.abs().amax(-1)
+        scales = torch.where(amax > 0, amax / 448.0, 1.0)
+        return (values * (1.0 / scales)[..., None]).to(torch.float8_e4m3fn), scales
+
+    def tap_f32():
+        # The F32 residual tap rounds to nearest even into its column block, leaving the rest.
+        rows = 37
+        src = torch.randn(rows, hidden, device="cuda") * 3
+        src[0, :8] = torch.tensor([1 + 2 ** -8, 1 + 3 * 2 ** -8, -(1 + 2 ** -8), 2 ** -130, 0.0, -0.0, 65504.0, 1e30])
+        taps = torch.full((rows, 5 * hidden), 7.0, device="cuda", dtype=bf16)
+        if not checks.launched("tap_f32", lib.cuteafd_glm_dflash_tap_f32(ptr(src), ptr(taps), rows, hidden,
+                                                                          5 * hidden, 2 * hidden, stream)):
+            return
+        torch.cuda.synchronize()
+        checks("tap_f32 rounding", torch.equal(taps[:, 2 * hidden:3 * hidden], src.to(bf16)),
+               "round-to-nearest-even bytes at its offset")
+        checks("tap_f32 other columns", bool(torch.all(taps[:, :2 * hidden] == 7) and torch.all(taps[:, 3 * hidden:] == 7)))
+
+    def swiglu():
+        # SwiGLU-OAI on [gate | up], against the MiniMax target reference's FP32 formula (expf may
+        # differ from torch's exp in the last FP32 bit, moving a rare BF16 rounding).
+        for rows, inter in ((64, 12288), (7, 96)):
+            gate_up = (torch.randn(rows, 2 * inter, device="cuda") * 5).to(bf16)
+            out = torch.empty(rows, inter, device="cuda", dtype=bf16)
+            name = f"swiglu_oai {rows}x{inter}"
+            if not checks.launched(name, lib.cuteafd_glm_dflash_swiglu_oai(ptr(gate_up), ptr(out), rows, inter,
+                                                                            1.702, 7.0, stream)):
+                continue
+            torch.cuda.synchronize()
+            close(name, out, model.swiglu_oai(gate_up[:, :inter], gate_up[:, inter:]), 1e-4)
+
+    def norms():
+        # Gemma RMSNorm rows (input, final and hidden norms) and the GLM Qwen3 formula beside it;
+        # with a baseline, the unchanged GLM entry returns the baseline's bytes on the same rows.
+        eps = 1e-6
+        for rows in (1, 64, 4096):
+            x = (torch.randn(rows, hidden, device="cuda") * 3).to(bf16)
+            w = (torch.randn(hidden, device="cuda") * 0.1).to(bf16)
+            for name, formula in (("cuteafd_glm_dflash_rmsnorm_gemma", gemma), ("cuteafd_glm_dflash_rmsnorm", qwen3)):
+                out = torch.empty_like(x)
+                label = f"{name} rows={rows}"
+                if not checks.launched(label, getattr(lib, name)(ptr(x), ptr(w), ptr(out), rows, hidden, eps, stream)):
+                    continue
+                torch.cuda.synchronize()
+                banded(label, out, x.float(), w, eps, formula)
+                if baseline is not None and formula is qwen3:
+                    old = torch.empty_like(x)
+                    if checks.launched(f"{label} baseline", baseline.cuteafd_glm_dflash_rmsnorm(
+                            ptr(x), ptr(w), ptr(old), rows, hidden, eps, stream)):
+                        torch.cuda.synchronize()
+                        checks(f"{label} versus the baseline", torch.equal(out, old), "bit-identical")
+
+    def conv_norms():
+        # The second convolution side plus the residual, then the norm: Gemma norms the FP32 sum,
+        # Qwen3 its BF16 rounding; the carried residual is that rounding, exactly.
+        group, block, eps = 16, 8, 1e-6
+        for sequences in (1, 8):
+            rows = sequences * block
+            source = (torch.randn(rows, hidden, device="cuda")).to(bf16)
+            dynamic = (torch.randn(rows, 4 * hidden // group, device="cuda") * 0.1).to(bf16)
+            base = (torch.randn(2, 2, hidden, device="cuda") * 0.5 + 0.5).to(bf16)
+            residual = (torch.randn(rows, hidden, device="cuda") * 2).to(bf16)
+            w = (torch.randn(hidden, device="cuda") * 0.1).to(bf16)
+            conv = torch.cat([glm_conv(source[i:i + block], dynamic[i:i + block], base, 1, group)
+                              for i in range(0, rows, block)])
+            total = residual.float() + conv.float()
+            for name, gemma_norm in (("cuteafd_glm_dflash_conv_residual_norm_gemma", True),
+                                     ("cuteafd_glm_dflash_conv_residual_norm", False)):
+                residual_out, normalized = torch.empty_like(residual), torch.empty_like(residual)
+                label = f"{name} C{sequences}"
+                if not checks.launched(label, getattr(lib, name)(ptr(source), ptr(dynamic), ptr(base), ptr(residual),
+                        ptr(w), ptr(residual_out), ptr(normalized), rows, block, hidden, group, eps, stream)):
+                    continue
+                torch.cuda.synchronize()
+                count, worst = ulps(residual_out, total.to(bf16))
+                checks(f"{label} residual", count == 0, f"{count} elements differ, at most {worst:.2f} BF16 units")
+                banded(f"{label} norm", normalized, total if gemma_norm else total.to(bf16).float(), w, eps,
+                       gemma if gemma_norm else qwen3)
+
+    def qk_rope():
+        # Gemma per-head q/k norms and NeoX RoPE on the first 64 channels (MiniMax: 64 q / 4 kv
+        # heads), block rows to q/k/v and context rows to ring slots; the FP8 ring writer packs the
+        # same K and V. RoPE rotates the BF16 norm output in FP32 and rounds once, so each output
+        # must be RoPE of either band rounding of its pair's two norm outputs.
+        heads, kv_heads, dim, theta, eps = 64, 4, 128, 1e7, 1e-6
+        positions = torch.tensor([0, 1, 63, 4095, 4096, 131071, 1048575, 777], device="cuda", dtype=torch.int64)
+        rows = len(positions)
+        qkv = (torch.randn(rows, heads + 2 * kv_heads, dim, device="cuda") * 2).to(bf16)
+        q_norm, k_norm = ((torch.randn(dim, device="cuda") * 0.2).to(bf16) for _ in range(2))
+        slots = torch.tensor([5, -1, 0, 7, 2, 3, 1, 4], device="cuda", dtype=torch.int32)
+        q = torch.empty(rows, heads, dim, device="cuda", dtype=bf16)
+        k, v = (torch.zeros(8, kv_heads, dim, device="cuda", dtype=bf16) for _ in range(2))
+        if not checks.launched("qk_rope_gemma", lib.cuteafd_glm_dflash_qk_rope_gemma(ptr(qkv), ptr(q_norm),
+                ptr(k_norm), ptr(positions), ptr(slots), ptr(q), ptr(k), ptr(v), rows, heads, kv_heads, 64,
+                theta, eps, stream)):
+            return
+        torch.cuda.synchronize()
+
+        def rope_banded(name, actual, x, w, at):
+            choices = band(x.float(), eps, w, gemma)
+            frequency = 1.0 / (theta ** (torch.arange(0, 64, 2, device="cuda").float() / 64))
+            phase = at.float()[:, None] * frequency
+            cos, sin = phase.cos()[:, None], phase.sin()[:, None]
+            inside = torch.zeros_like(actual[..., :64], dtype=torch.bool)
+            for a in [c[..., :32].float() for c in choices]:
+                for b in [c[..., 32:64].float() for c in choices]:
+                    inside |= actual[..., :64] == torch.cat(((a * cos - b * sin).to(bf16),
+                                                             (b * cos + a * sin).to(bf16)), -1)
+            passed = (actual[..., 64:] == choices[0][..., 64:]) | (actual[..., 64:] == choices[1][..., 64:])
+            outside = int((~inside).sum()) + int((~passed).sum())
+            count, worst = ulps(actual, model.rope_partial(model.gemma_norm(x, w, eps), at, 64, theta))
+            checks(name, outside == 0, f"{outside}/{actual.numel()} outside the factor band; {count} differ "
+                   f"from the reference's FP32 factor, at most {worst:.2f} BF16 units")
+
+        written = slots >= 0
+        rope_banded("qk_rope_gemma q", q, qkv[:, :heads], q_norm, positions)
+        rope_banded("qk_rope_gemma k", k[slots[written].long()], qkv[written, heads:heads + kv_heads], k_norm,
+                    positions[written])
+        checks("qk_rope_gemma v rows", torch.equal(v[slots[written].long()], qkv[written, heads + kv_heads:]))
+        checks("qk_rope_gemma negative slot", bool(torch.all(k.view(8, -1)[6] == 0)), "wrote no K row")
+        record = (kv_heads * (dim + 4) + 15) // 16 * 16
+        q8 = torch.empty_like(q)
+        k8, v8 = (torch.full((8, record), 0xA5, device="cuda", dtype=torch.uint8) for _ in range(2))
+        if not checks.launched("qk_rope_gemma_fp8", lib.cuteafd_glm_dflash_qk_rope_gemma_fp8(ptr(qkv), ptr(q_norm),
+                ptr(k_norm), ptr(positions), ptr(slots), ptr(q8), ptr(k8), ptr(v8), rows, heads, kv_heads, 64,
+                theta, eps, stream)):
+            return
+        torch.cuda.synchronize()
+        checks("qk_rope_gemma_fp8 queries", torch.equal(q8, q), "the BF16 kernel's bytes")
+        rows = slots[written].long()
+        for name, plane, values in (("K", k8, k), ("V", v8, v)):
+            want_codes, want_scales = ring_record(values[rows])
+            got_codes = plane[rows, :kv_heads * dim].cpu().view(torch.float8_e4m3fn).view(-1, kv_heads, dim)
+            got_scales = plane[rows, kv_heads * dim:kv_heads * (dim + 4)].cpu().contiguous().view(torch.float32)
+            codes = int((got_codes.view(torch.uint8) != want_codes.view(torch.uint8)).sum())
+            scales = int((got_scales != want_scales).sum())
+            code_step = float((got_codes.float() - want_codes.float()).abs().max())
+            scale_error = float(((got_scales - want_scales).abs() / want_scales).max())
+            checks(f"qk_rope_gemma_fp8 {name} ring codes and scales", codes == 0 and scales == 0,
+                   f"the BF16 kernel's {name} packed: {codes}/{want_codes.numel()} codes differ by at most "
+                   f"{code_step:.3g}, {scales}/{want_scales.numel()} scales by at most {scale_error:.2e} relative")
+
+    def topk():
+        # Top-16 of BF16-rounded logits over MiniMax's vocabulary (and GLM's, and the largest admitted).
+        for vocab in (154880, 200064, 262144):
+            sequences, drafts = 3, 7
+            logits = torch.randn(sequences * (drafts + 1), vocab, device="cuda") * 8
+            logits[:, 5] = logits[:, 200 % vocab] = 40.0  # a tie at the top: the lower index first
+            unary = torch.empty(sequences * drafts, 16, device="cuda")
+            candidates = torch.empty(sequences * drafts, 16, device="cuda", dtype=torch.int32)
+            workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(sequences * drafts), device="cuda",
+                                    dtype=torch.uint8)
+            label = f"topk vocab={vocab}"
+            if not checks.launched(label, lib.cuteafd_glm_dflash_topk(ptr(logits), ptr(unary), ptr(candidates),
+                    ptr(workspace), sequences, drafts + 1, drafts, vocab, stream)):
+                continue
+            torch.cuda.synchronize()
+            drafted = logits.view(sequences, drafts + 1, vocab)[:, 1:].reshape(-1, vocab)
+            expected = top16(drafted)
+            checks(f"{label} ids", torch.equal(candidates.long(), expected))
+            checks(f"{label} values", torch.equal(unary, drafted.to(bf16).float().gather(1, expected)), "BF16 exact")
+        workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(7), device="cuda", dtype=torch.uint8)
+        checks("topk vocab=262145 refused", lib.cuteafd_glm_dflash_topk(ptr(logits), ptr(unary), ptr(candidates),
+               ptr(workspace), 1, 8, 7, 262145, stream) != 0, "past the top-16 capacity")
+
+    def selector():
+        # The greedy candidate walk: BF16 scores (the GLM ports) and FP32 ones (SGLang's DFlash2
+        # selector, MiniMax). Each step is checked on the kernel's own path against an FP64-edge
+        # oracle: the FP32 edge sum may move a BF16 edge rounding, so a choice within that slack
+        # of the oracle's best passes, but most must be the oracle's best exactly.
+        vocab, rank, sequences, block = 4096, 256, 6, 8
+        drafts = block - 1
+        pred = (torch.randn(vocab, rank, device="cuda") * 0.3).to(bf16)
+        succ = (torch.randn(vocab, rank, device="cuda") * 0.3).to(bf16)
+        projected = (torch.randn(sequences * block, rank, device="cuda") * 0.5).to(bf16)
+        candidates = torch.stack([torch.randperm(vocab, device="cuda")[:16] for _ in range(sequences * drafts)]).int()
+        # Top-16 values as the head's top-k leaves them: BF16-rounded, largest first, close calls.
+        unary = (20 + torch.randn(sequences * drafts, 16, device="cuda") * 0.4).to(bf16).float().sort(-1, True).values
+        anchors = torch.randint(0, vocab, (sequences,), device="cuda", dtype=torch.int32)
+        chosen = {}
+        for name, fp32 in (("cuteafd_glm_dflash_select", False), ("cuteafd_glm_dflash_select_fp32_score", True)):
+            tokens = torch.zeros(sequences * drafts, device="cuda", dtype=torch.int32)
+            features = torch.zeros(sequences * drafts, 4, device="cuda")
+            if not checks.launched(name, getattr(lib, name)(ptr(pred), ptr(succ), ptr(projected), ptr(candidates),
+                    ptr(unary), ptr(anchors), ptr(tokens), ptr(features), sequences, block, drafts, rank, stream)):
+                continue
+            torch.cuda.synchronize()
+            chosen[fp32] = tokens.clone()
+            exact = within = 0
+            worst = 0.0
+            for s_ in range(sequences):
+                previous = int(anchors[s_])
+                for i in range(drafts):
+                    n = s_ * drafts + i
+                    conditioned = (pred[previous].float() * projected[s_ * block + 1 + i].float()).to(bf16)
+                    dot = (conditioned.double()[None] * succ[candidates[n].long()].double()).sum(-1)
+                    score = unary[n] + dot.float().to(bf16).float()
+                    if not fp32:
+                        score = score.to(bf16).float()
+                    best = int(torch.argmax(score))
+                    pick = int((candidates[n] == tokens[n]).nonzero()[0]) if (candidates[n] == tokens[n]).any() else -1
+                    gap = float(score[best] - score[pick]) if pick >= 0 else float("inf")
+                    exact += int(pick == best)
+                    within += int(pick >= 0 and gap <= 2.0 ** -6 * max(abs(float(score[best])), 1.0))
+                    worst = max(worst, gap)
+                    previous = int(tokens[n])
+            total = sequences * drafts
+            checks(f"{name} walk", within == total and exact >= 0.9 * total,
+                   f"{exact}/{total} the oracle's best, {within}/{total} within the edge-rounding slack (worst gap {worst:.3g})")
+            valid = bool(((features[:, 0] >= 0) & (features[:, 1] > 0) & (features[:, 1] <= 1) & (features[:, 2] >= -1e-5)
+                          & (features[:, 2] <= 2.80) & (features[:, 3] >= 0) & (features[:, 3] < 16)).all())
+            checks(f"{name} features", valid, "margin, probability, entropy and rank in the fit's ranges")
+        if len(chosen) == 2:
+            print(f"selector: FP32 and BF16 scores choose differently in {int((chosen[True] != chosen[False]).sum())}"
+                  f"/{chosen[True].numel()} steps on these close calls")
+
+    def block_attention_checks():
+        # Block attention: 16 queries per KV head x 8 block rows (four 32-query slices), per-row
+        # 4096 windows over a 4096-position ring, causal or bidirectional blocks, BF16 and FP8 rings;
+        # GLM shapes against the old ABI.
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        dim = 128
+        for heads, kv_heads, window, contexts in ((64, 4, 4096, (0, 33, 1031, 4096)), (64, 8, 0, (24, 1031)),
+                                                  (32, 8, 2048, (33, 2048))):
+            block = 8
+            for sequences in (1, 8):
+                for context in contexts:
+                    ring = window if window == 4096 else max(257, context + 17)
+                    max_keys = context + block
+                    shape = f"heads={heads}/{kv_heads} C{sequences} context={context} window={window}"
+                    q = torch.randn(sequences, block, heads, dim, device="cuda").to(bf16)
+                    kb = torch.randn(sequences, block, kv_heads, dim, device="cuda").to(bf16)
+                    vb = torch.randn_like(kb)
+                    kr = torch.randn(sequences, ring, kv_heads, dim, device="cuda").to(bf16)
+                    vr = torch.randn_like(kr)
+                    seq_slots = torch.arange(sequences, device="cuda", dtype=torch.int32).flip(0).contiguous()
+                    lengths = torch.tensor([max(0, context - i % 3) for i in range(sequences)], device="cuda",
+                                           dtype=torch.int32)
+                    ends = torch.tensor([ring + context + 13 + i for i in range(sequences)], device="cuda",
+                                        dtype=torch.int32)
+                    size = lib.cuteafd_glm_dflash_block_attention_workspace(sequences, heads, kv_heads, block, max_keys)
+                    slices = max(2, (heads // kv_heads * block + 31) // 32)
+                    capacity = min((max_keys + 31) // 32, (2 * sms + kv_heads * slices - 1) // (kv_heads * slices))
+                    scalar = (min(max_keys, 1024 + 16) + 127) // 128 * 16
+                    expected_size = sequences * kv_heads * max(slices * capacity * 32, scalar) * (dim + 2) * 4
+                    checks(f"block_attention workspace {shape}", size == expected_size, f"{size} bytes")
+                    scratch = torch.full((max(size, expected_size) + 256,), 173, device="cuda", dtype=torch.uint8)
+                    pointers = lambda kr, vr: [ptr(q), ptr(kb), ptr(vb), ptr(kr), ptr(vr), ptr(seq_slots), ptr(lengths),
+                                               ptr(ends)]
+                    for causal in (0, 1):
+                        out = torch.empty_like(q)
+                        label = f"block_attention {shape} causal={causal}"
+                        if not checks.launched(label, lib.cuteafd_glm_dflash_block_attention(*pointers(kr, vr), ptr(out),
+                                ptr(scratch), sequences, block, heads, kv_heads, ring, max_keys, window, causal,
+                                dim ** -0.5, stream)):
+                            continue
+                        torch.cuda.synchronize()
+                        checks(f"{label} workspace bound", bool(torch.all(scratch[size:] == 173)), "no overrun")
+                        ref = torch.empty(q.shape, dtype=torch.float64, device="cuda")
+                        for s in range(sequences):
+                            ctx, end, slot = lengths[s].item(), ends[s].item(), seq_slots[s].item()
+                            indices = torch.arange(end - ctx, end, device="cuda")
+                            keys = torch.cat((kr[slot, indices % ring], kb[s])).double()
+                            values = torch.cat((vr[slot, indices % ring], vb[s])).double()
+                            mask = torch.ones((block, ctx + block), device="cuda", dtype=torch.bool)
+                            if window:
+                                mask[:, :ctx] = indices[None] >= end + torch.arange(block, device="cuda")[:, None] - window + 1
+                            if causal:
+                                mask[:, ctx:] = (torch.arange(block, device="cuda")[None]
+                                                 <= torch.arange(block, device="cuda")[:, None])
+                            for h in range(heads):
+                                kv = h // (heads // kv_heads)
+                                score = (q[s, :, h].double() @ keys[:, kv].T * dim ** -0.5).masked_fill(~mask, -torch.inf)
+                                ref[s, :, h] = score.softmax(-1) @ values[:, kv]
+                        delta = out.double() - ref
+                        maximum = delta.abs().max().item()
+                        relative = (delta.square().mean() / ref.square().mean().clamp_min(1e-20)).sqrt().item()
+                        checks(label, bool(torch.isfinite(out).all()) and maximum < 0.025 and relative < 0.01,
+                               f"FP64 oracle max_abs={maximum:.3e} rel_rms={relative:.3e}")
+                        if heads // kv_heads * block <= 64 and not causal:
+                            # The GLM drafters' ABI (two slices) must give the same bytes.
+                            old = torch.empty_like(q)
+                            old_size = lib.cuteafd_glm_dflash_attention_workspace(sequences, kv_heads, max_keys)
+                            checks(f"{label} GLM workspace", old_size == size, f"{old_size} bytes")
+                            old_scratch = torch.empty(max(old_size, size), device="cuda", dtype=torch.uint8)
+                            if checks.launched(f"{label} GLM ABI", lib.cuteafd_glm_dflash_attention(*pointers(kr, vr),
+                                    ptr(old), ptr(old_scratch), sequences, block, heads, kv_heads, ring, max_keys,
+                                    window, dim ** -0.5, stream)):
+                                torch.cuda.synchronize()
+                                checks(f"{label} GLM ABI", torch.equal(old, out), "bit-identical")
+                    # FP8 rings: the dequantized BF16 rings give the same bytes.
+                    record = (kv_heads * (dim + 4) + 15) // 16 * 16
+
+                    def pack(x):
+                        codes, scales = ring_record(x)
+                        out = torch.zeros(*x.shape[:-2], record, dtype=torch.uint8)
+                        out[..., :kv_heads * dim] = codes.view(torch.uint8).flatten(-2)
+                        out[..., kv_heads * dim:kv_heads * (dim + 4)] = scales.contiguous().view(torch.uint8)
+                        return out.cuda(), (codes.float() * scales[..., None]).to(bf16).cuda()
+
+                    (k8, kd), (v8, vd) = pack(kr), pack(vr)
+                    for causal in (0, 1):
+                        bf, fp = torch.empty_like(q), torch.empty_like(q)
+                        label = f"block_attention_fp8 {shape} causal={causal}"
+                        if (checks.launched(label, lib.cuteafd_glm_dflash_block_attention(*pointers(kd, vd), ptr(bf),
+                                ptr(scratch), sequences, block, heads, kv_heads, ring, max_keys, window, causal,
+                                dim ** -0.5, stream))
+                                and checks.launched(label, lib.cuteafd_glm_dflash_block_attention_fp8(*pointers(k8, v8),
+                                ptr(fp), ptr(scratch), sequences, block, heads, kv_heads, ring, max_keys, window, causal,
+                                dim ** -0.5, stream))):
+                            torch.cuda.synchronize()
+                            checks(label, torch.equal(bf, fp), "the dequantized BF16 rings' bytes")
+
+    def baseline_checks():
+        # Every GLM entry point returns the baseline's bytes (GLM 5.3 and Flash shapes, BF16 and FP8
+        # rings), the norms on the rows the oracles use as well.
+        def same(name, make, outputs):
+            results = []
+            for native in (lib, baseline):
+                for out in outputs:
+                    out.fill_(0)
+                if not checks.launched(name, make(getattr(native, name))):
+                    return
+                torch.cuda.synchronize()
+                results.append([out.clone() for out in outputs])
+            checks(f"{name} versus the baseline", all(torch.equal(a, b) for a, b in zip(*results)), "bit-identical")
+
+        for hidden_width, heads, kv_heads in ((6144, 64, 8), (4096, 32, 8)):
+            for rows in (1, 64, 4096):
+                x = (torch.randn(rows, hidden_width, device="cuda") * 3).to(bf16)
+                w = (torch.randn(hidden_width, device="cuda") * 0.1).to(bf16)
+                out = torch.empty_like(x)
+                same("cuteafd_glm_dflash_rmsnorm", lambda f: f(ptr(x), ptr(w), ptr(out), rows, hidden_width, 1e-5,
+                                                               stream), [out])
+            rows = 64
+            w = (torch.randn(hidden_width, device="cuda") * 0.1).to(bf16)
+            x = torch.empty(rows, hidden_width, device="cuda", dtype=bf16)
+            source, residual = (torch.randn(rows, hidden_width, device="cuda").to(bf16) for _ in range(2))
+            dynamic = (torch.randn(rows, 4 * hidden_width // 16, device="cuda") * 0.1).to(bf16)
+            base = (torch.randn(2, 2, hidden_width, device="cuda") * 0.5).to(bf16)
+            residual_out, normalized = torch.empty_like(x), torch.empty_like(x)
+            same("cuteafd_glm_dflash_conv_residual_norm", lambda f: f(ptr(source), ptr(dynamic), ptr(base),
+                 ptr(residual), ptr(w), ptr(residual_out), ptr(normalized), rows, 8, hidden_width, 16, 1e-5, stream),
+                 [residual_out, normalized])
+            qkv = torch.randn(rows, heads + 2 * kv_heads, 128, device="cuda").to(bf16)
+            positions = torch.randint(0, 1 << 20, (rows,), device="cuda", dtype=torch.int64)
+            slots = torch.randperm(rows, device="cuda").to(torch.int32)
+            q = torch.empty(rows, heads, 128, device="cuda", dtype=bf16)
+            k, v = (torch.empty(rows, kv_heads, 128, device="cuda", dtype=bf16) for _ in range(2))
+            head_w = w[:128].contiguous()
+            same("cuteafd_glm_dflash_qk_rope", lambda f: f(ptr(qkv), ptr(head_w), ptr(head_w), ptr(positions),
+                 ptr(slots), ptr(q), ptr(k), ptr(v), rows, heads, kv_heads, 1e6, 1e-5, stream), [q, k, v])
+            record = (kv_heads * 132 + 15) // 16 * 16
+            k8, v8 = (torch.empty(rows, record, device="cuda", dtype=torch.uint8) for _ in range(2))
+            same("cuteafd_glm_dflash_qk_rope_fp8", lambda f: f(ptr(qkv), ptr(head_w), ptr(head_w), ptr(positions),
+                 ptr(slots), ptr(q), ptr(k8), ptr(v8), rows, heads, kv_heads, 1e6, 1e-5, stream), [q, k8, v8])
+        gate_up = torch.randn(64, 2 * 12288, device="cuda").to(bf16)
+        act = torch.empty(64, 12288, device="cuda", dtype=bf16)
+        same("cuteafd_glm_dflash_silu_mul", lambda f: f(ptr(gate_up), ptr(act), 64, 12288, stream), [act])
+        logits = torch.randn(16 * 8, 154880, device="cuda") * 8
+        unary = torch.empty(16 * 7, 16, device="cuda")
+        candidates = torch.empty(16 * 7, 16, device="cuda", dtype=torch.int32)
+        workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(16 * 7), device="cuda", dtype=torch.uint8)
+        same("cuteafd_glm_dflash_topk", lambda f: f(ptr(logits), ptr(unary), ptr(candidates), ptr(workspace), 16, 8, 7,
+             154880, stream), [unary, candidates])
+        pred, succ = ((torch.randn(154880, 256, device="cuda") * 0.3).to(bf16) for _ in range(2))
+        projected = (torch.randn(16 * 8, 256, device="cuda") * 0.5).to(bf16)
+        anchors = torch.randint(0, 154880, (16,), device="cuda", dtype=torch.int32)
+        tokens = torch.empty(16 * 7, device="cuda", dtype=torch.int32)
+        features = torch.empty(16 * 7, 4, device="cuda")
+        same("cuteafd_glm_dflash_select", lambda f: f(ptr(pred), ptr(succ), ptr(projected), ptr(candidates), ptr(unary),
+             ptr(anchors), ptr(tokens), ptr(features), 16, 8, 7, 256, stream), [tokens, features])
+
+    for name, run in (("tap_f32", tap_f32), ("swiglu_oai", swiglu), ("rmsnorm", norms),
+                      ("conv_residual_norm", conv_norms), ("qk_rope_gemma", qk_rope), ("topk", topk),
+                      ("selector", selector), ("block_attention", block_attention_checks)):
+        checks.section(name, run)
+    if baseline is None:
+        print("dflash2: no --fp8-baseline: GLM entry points were not compared with a sealed library")
+    else:
+        checks.section("baseline", baseline_checks)
+    checks.finish()
 
 
 def main():
@@ -865,6 +1430,8 @@ def main():
     group.add_argument("--skip-head", action="store_true")
     group.add_argument("--head-only", action="store_true", help="skip unrelated FP8 checks")
     group.add_argument("--attention-only", action="store_true", help="shared attention FP64 masks/tails and capacity gate")
+    group.add_argument("--dflash2-only", action="store_true",
+                       help="MiniMax DFlash2 kernels against torch oracles; GLM entries against --fp8-baseline")
     args = parser.parse_args()
     try:
         args.head_rows = [int(value) for value in args.head_rows.split(",")]
@@ -898,7 +1465,9 @@ def main():
         parser.error("--mimo-forward has its own profile range and cannot run separate head/FP8 checks")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
-    if args.attention_only:
+    if args.dflash2_only:
+        dflash2_check(lib, args)
+    elif args.attention_only:
         attention_check(lib, args)
     elif args.mimo_forward:
         mimo_forward_check(lib, args)
