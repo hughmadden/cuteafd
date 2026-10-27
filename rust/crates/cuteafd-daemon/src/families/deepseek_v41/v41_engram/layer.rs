@@ -1,5 +1,7 @@
 //! Native engram projection carriers and fused residual gate ownership.
 use super::EngramDeviceView;
+use std::rc::Rc;
+use crate::shared::memory::{chain, row_window::{RowWindow, MAX_RESERVE_ROWS}};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use crate::shared::decode_graph::RowGraphs;
@@ -71,17 +73,35 @@ impl<'a> EngramLayerWeights<'a> {
     }
 }
 
+/// Shared gate storage. Row planes: output (block handoff), residual,
+/// embeddings and text_mask (public input destinations may be written on other
+/// streams). Scratch: projected, GEMM workspace and alpha, fully consumed on
+/// the gate stream inside one hook. Weight binding/graphs/ready state are per slot.
+pub(crate) struct EngramGateStorage<'a> {
+    stream: LoadStream<'a>,
+    output: DeviceAllocation<'a>,
+    residual: DeviceAllocation<'a>,
+    embeddings: DeviceAllocation<'a>,
+    text_mask: DeviceAllocation<'a>,
+    projected: DeviceAllocation<'a>,
+    scratch: DeviceAllocation<'a>,
+    alpha: DeviceAllocation<'a>,
+    kernel: V41Fp8Plan<'a>,
+    rows: usize,
+    unit: usize,
+}
+impl Drop for EngramGateStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: owned stream; all scratch users precede its drain.
+        crate::shared::decode_graph::fatal_drain(unsafe {
+            self.stream.library.cuda_stream_synchronize(self.stream.raw)
+        }, "Engram gate storage");
+    }
+}
 pub(crate) struct EngramGate<'weights, 'library> {
-    stream: LoadStream<'library>,
-    output: DeviceAllocation<'library>,
-    residual: DeviceAllocation<'library>,
-    embeddings: DeviceAllocation<'library>,
-    text_mask: DeviceAllocation<'library>,
+    storage: Rc<EngramGateStorage<'library>>,
+    window: RowWindow,
     graphs: RowGraphs<'library>,
-    projected: DeviceAllocation<'library>,
-    scratch: DeviceAllocation<'library>,
-    alpha: DeviceAllocation<'library>,
-    kernel: V41Fp8Plan<'library>,
     weights: &'weights EngramLayerWeights<'library>,
     capacity: usize,
     ready_rows: Option<usize>,
@@ -99,7 +119,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         gathered: &EngramDeviceView,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        if !crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32) {
+        if self.window.is_windowed() || !crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32) {
             return unsafe { self.execute(residual, gathered) };
         }
         if self.graphs.get(gathered.rows).is_none() {
@@ -118,51 +138,48 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         capacity: usize,
         device_budget: usize,
     ) -> Result<Self> {
-        ensure!(
-            capacity > 0 && capacity <= 4096,
-            "invalid engram gate capacity"
-        );
-        let kernel = weights.library.v41_fp8_matrix_plan(u32::try_from(capacity)?, 6144, 25600)?;
-        let scratch_bytes = usize::try_from(kernel.info().scratch_bytes)?;
-        let output_bytes = capacity * 4 * 5120 * 2;
-        let projected_bytes = capacity * 5 * 5120 * 2;
-        let input_bytes = output_bytes + capacity * 24 * 512 + capacity;
-        let bytes = output_bytes
-            .checked_add(projected_bytes)
-            .and_then(|n| n.checked_add(scratch_bytes))
-            .and_then(|n| n.checked_add(4 + input_bytes))
-            .context("engram execution budget overflow")?;
-        ensure!(
-            bytes <= device_budget,
-            "engram execution exceeds device budget"
-        );
-        let value = Self {
-            stream: LoadStream {
-                library: weights.library,
-                raw: weights.library.cuda_stream_create()?,
-            },
-            output: DeviceAllocation::new(weights.library, output_bytes)?,
-            residual: DeviceAllocation::new(weights.library, output_bytes)?,
-            embeddings: DeviceAllocation::new(weights.library, capacity * 24 * 512)?,
-            text_mask: DeviceAllocation::new(weights.library, capacity)?,
-            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS),
-            projected: DeviceAllocation::new(weights.library, projected_bytes)?,
-            scratch: DeviceAllocation::new(weights.library, scratch_bytes)?,
-            alpha: DeviceAllocation::new(weights.library, 4)?,
-            kernel,
-            weights,
-            capacity,
-            ready_rows: None,
+        ensure!(Self::device_bytes(weights.library, capacity)? <= device_budget,
+            "engram execution exceeds device budget");
+        Self::on_storage(weights, Self::storage(weights.library, capacity, capacity)?)
+    }
+    pub(crate) fn storage(library: &'library NativeLibrary, rows: usize, unit: usize)
+        -> Result<Rc<EngramGateStorage<'library>>> {
+        ensure!((1..=MAX_RESERVE_ROWS).contains(&rows) && (1..=4096).contains(&unit)
+            && unit <= rows, "invalid Engram gate storage dimensions");
+        let kernel = library.v41_fp8_matrix_plan(unit as u32, 6144, 25600)?;
+        let scratch_bytes = kernel.info().scratch_bytes as usize;
+        let storage = EngramGateStorage {
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            output: DeviceAllocation::new(library, rows * 40960)?,
+            residual: DeviceAllocation::new(library, rows * 40960)?,
+            embeddings: DeviceAllocation::new(library, rows * 24 * 512)?,
+            text_mask: DeviceAllocation::new(library, rows)?,
+            projected: DeviceAllocation::new(library, unit * 51200)?,
+            scratch: DeviceAllocation::new(library, scratch_bytes)?,
+            alpha: DeviceAllocation::new(library, 4)?, kernel, rows, unit,
         };
-        unsafe {
-            value.kernel.initialize_scratch(
-                value.scratch.buffer,
-                value.alpha.buffer,
-                value.stream.raw,
-            )?;
+        // SAFETY: workspace is owned by storage and initialization drains here.
+        unsafe { storage.kernel.initialize_scratch(storage.scratch.buffer,
+            storage.alpha.buffer, storage.stream.raw)?;
+            library.cuda_stream_synchronize(storage.stream.raw)?; }
+        Ok(Rc::new(storage))
+    }
+    pub(crate) fn on_storage(weights: &'weights EngramLayerWeights<'library>,
+        storage: Rc<EngramGateStorage<'library>>) -> Result<Self> {
+        ensure!(weights.tensors.get(&weights.names[0])?.device_id == storage.output.buffer.device_id,
+            "Engram weights and storage devices differ");
+        Ok(Self { capacity: storage.unit, storage, weights, window: RowWindow::NONE,
+            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS), ready_rows: None })
+    }
+    /// Slot reuse, including all cross-stream readers, is drained by the caller.
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.end <= self.storage.rows
+                && range.len() <= self.capacity, "Engram gate window outside storage or unit");
         }
-        value.synchronize()?;
-        Ok(value)
+        self.ready_rows = None;
+        self.window = window;
+        Ok(())
     }
     /// Quantize gathered rows by K32, project with native FP8 weights, then gate.
     ///
@@ -178,10 +195,13 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
         let launched = unsafe {
-            self.stage_inputs(residual, gathered)?;
+            chain::join(self.weights.library, self.storage.stream.raw)?;
+            self.enqueue_inputs(residual, gathered)?;
             self.enqueue(gathered.rows)
         };
-        launched.and(self.synchronize())?;
+        if let Err(error) = launched { self.synchronize()?; return Err(error); }
+        // SAFETY: the gate output is produced before the chain head is recorded.
+        unsafe { chain::finish(self.weights.library, self.storage.stream.raw)?; }
         self.ready_rows = Some(gathered.rows);
         self.output()
     }
@@ -189,9 +209,9 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     /// Never free or retain after this owner drops; finish writes before execution.
     pub fn inputs(&self) -> [CuteafdDeviceBuffer; 3] {
         [
-            self.residual.buffer,
-            self.embeddings.buffer,
-            self.text_mask.buffer,
+            self.window.apply(self.storage.residual.buffer, 40960),
+            self.window.apply(self.storage.embeddings.buffer, 12288),
+            self.window.apply(self.storage.text_mask.buffer, 1),
         ]
     }
     unsafe fn stage_inputs(
@@ -200,7 +220,10 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         gathered: &EngramDeviceView,
     ) -> Result<()> {
         self.synchronize()?;
-        unsafe { self.enqueue_inputs(residual, gathered) }?;
+        // SAFETY: a block handoff may still be queued on its non-blocking
+        // attention stream, even for a private decode gate inside a chain.
+        unsafe { chain::join(self.weights.library, self.storage.stream.raw)?;
+            self.enqueue_inputs(residual, gathered)?; }
         self.synchronize()
     }
     unsafe fn enqueue_inputs(&self, residual: CuteafdDeviceBuffer, gathered: &EngramDeviceView) -> Result<()> {
@@ -209,7 +232,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             "engram gate layer mismatch"
         );
         ensure!(
-            gathered.rows > 0 && gathered.rows <= self.capacity,
+            gathered.rows > 0 && gathered.rows <= self.capacity && self.window.admits(gathered.rows),
             "engram gate exceeds capacity"
         );
         let sources = [residual, gathered.embeddings, gathered.text_mask];
@@ -248,7 +271,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
                             destinations[index],
                             sources[index],
                             sizes[index],
-                            self.stream.raw,
+                            self.storage.stream.raw,
                         )?;
                     }
                 }
@@ -260,25 +283,25 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     }
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
         unsafe {
-            self.kernel.launch(
-                self.embeddings.buffer,
+            self.storage.kernel.launch(
+                self.window.apply(self.storage.embeddings.buffer, 12288),
                 self.weights.tensors.get(&self.weights.names[0])?,
                 self.weights.packed_scales.buffer,
-                self.scratch.buffer,
-                self.alpha.buffer,
-                self.projected.buffer,
+                self.storage.scratch.buffer,
+                self.storage.alpha.buffer,
+                self.storage.projected.buffer,
                 u32::try_from(rows)?,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
             self.weights.library.cuda_engram_gate_bf16_async(
-                self.residual.buffer,
-                self.projected.buffer,
+                self.window.apply(self.storage.residual.buffer, 40960),
+                self.storage.projected.buffer,
                 self.weights.tensors.get(&self.weights.names[2])?,
                 self.weights.tensors.get(&self.weights.names[3])?,
-                Some(self.text_mask.buffer),
-                self.output.buffer,
+                Some(self.window.apply(self.storage.text_mask.buffer, 1)),
+                self.window.apply(self.storage.output.buffer, 40960),
                 i32::try_from(rows)?,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
         }
         Ok(())
@@ -291,22 +314,26 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView,
     ) -> Result<()> {
+        ensure!(!self.window.is_windowed(), "windowed gate cannot capture");
         ensure!(self.graphs.get(gathered.rows).is_none(), "engram graph is already captured");
         unsafe {
             self.execute(residual, gathered)?;
         }
+        // Decode graph warmup must drain even inside a device-ordered chain.
+        self.synchronize()?;
         unsafe { self.capture_ready(gathered.rows) }
     }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.ready_rows = None;
+        ensure!(!self.window.is_windowed(), "windowed gate cannot capture");
         unsafe {
             self.weights
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
         // End on both paths so a failed enqueue cannot leave the stream capturing.
-        let captured = unsafe { self.weights.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.weights.library.cuda_graph_end_capture(self.storage.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 // SAFETY: eager warmup drained all users; this capture has not launched.
@@ -336,12 +363,13 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
         let rows = gathered.rows;
+        ensure!(!self.window.is_windowed(), "windowed gate cannot replay");
         let graph = self.graphs.get(rows).context("engram graph has not been captured for these rows")?;
         let launched = unsafe {
             self.stage_inputs(residual, gathered)?;
             self.weights
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.storage.stream.raw)
         };
         launched.and(self.synchronize())?;
         self.ready_rows = Some(rows);
@@ -353,27 +381,27 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     pub async unsafe fn execute_into_cooperative(&mut self, residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView) -> Result<()> {
         self.ready_rows = None;
-        let graph = self.graphs.get(gathered.rows);
+        let graph = if self.window.is_windowed() { None } else { self.graphs.get(gathered.rows) };
         let cold = graph.is_none();
         let launched = (|| unsafe {
-            crate::shared::memory::chain::join(self.weights.library, self.stream.raw)?;
+            crate::shared::memory::chain::join(self.weights.library, self.storage.stream.raw)?;
             self.enqueue_inputs(residual, gathered)?;
-            crate::shared::decode_graph::census::dispatch(self.weights.library, self.stream.raw, c"layer_row",
+            crate::shared::decode_graph::census::dispatch(self.weights.library, self.storage.stream.raw, c"layer_row",
                 gathered.rows, graph, || self.enqueue(gathered.rows))
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        if cold && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
+        if cold && !self.window.is_windowed() && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
             && !crate::shared::decode_graph::census::eager("layer_row") {
-            self.stream.wait().await?;
+            self.storage.stream.wait().await?;
             unsafe { self.capture_ready(gathered.rows)?; }
             let graph = self.graphs.get(gathered.rows).context("engram graph missing after capture")?;
-            let launched = unsafe { self.weights.library.cuda_graph_launch(graph, self.stream.raw) };
+            let launched = unsafe { self.weights.library.cuda_graph_launch(graph, self.storage.stream.raw) };
             if let Err(error) = launched { self.synchronize()?; return Err(error); }
         }
-        let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.output.buffer,
-            gathered.rows * 40960, self.stream.raw) };
+        let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.window.apply(self.storage.output.buffer, 40960),
+            gathered.rows * 40960, self.storage.stream.raw) };
         if let Err(error) = copied { self.synchronize()?; return Err(error); }
-        unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await?; }
+        unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await?; }
         self.ready_rows = Some(gathered.rows);
         Ok(())
     }
@@ -414,7 +442,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let rows = self
             .ready_rows
             .context("engram gate output is not complete")?;
-        let mut output = self.output.buffer;
+        let mut output = self.window.apply(self.storage.output.buffer, 40960);
         output.bytes = rows * 4 * 5120 * 2;
         Ok(output)
     }
@@ -422,7 +450,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         unsafe {
             self.weights
                 .library
-                .cuda_stream_synchronize(self.stream.raw)
+                .cuda_stream_synchronize(self.storage.stream.raw)
         }
     }
 }
