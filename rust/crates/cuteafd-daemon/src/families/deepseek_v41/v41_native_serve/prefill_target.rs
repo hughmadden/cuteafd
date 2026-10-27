@@ -390,9 +390,7 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
         chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
         keep_running: &dyn Fn() -> bool) -> Result<()> {
-        self.set_attention_decode(false);
-        other.set_attention_decode(false);
-        unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
+        unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports, suffix, keep_running, 2).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],

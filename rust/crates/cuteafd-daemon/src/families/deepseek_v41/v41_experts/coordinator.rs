@@ -396,8 +396,8 @@ impl<'a> NativeTp4Wave<'a> {
     /// # Safety
     /// `shared` holds the unit's completed shared contribution for exactly this
     /// wave's rows and stays unchanged until the reduce completes.
-    pub(crate) async unsafe fn collect_unit(&mut self, unit: NativeUnitFfn, shared: CuteafdDeviceBuffer)
-        -> Result<NativeFfnOutput<'_>> {
+    pub(crate) async unsafe fn collect_unit(&mut self, unit: NativeUnitFfn, shared: CuteafdDeviceBuffer,
+        destination: i32) -> Result<NativeFfnOutput<'_>> {
         ensure!(unit.owner == self.output.buffer.ptr as usize, "prefill unit ticket belongs to another transport");
         ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= unit.rows as usize * 10240,
             "prefill unit shared contribution differs from its wave");
@@ -406,7 +406,25 @@ impl<'a> NativeTp4Wave<'a> {
         let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
             library: self.library, stream: &self.stream, link: &mut self.link, output: self.output.buffer,
             ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() };
-        unsafe { pending.finish_values(values, None).await }
+        let destination = Some(destination).filter(|&device| device != self.output.buffer.device_id);
+        if destination.is_some() {
+            let device = crate::shared::memory::device::Device { library: self.library, id: self.output.buffer.device_id };
+            device.future(unsafe { pending.finish_values(values, destination) }).await
+        } else {
+            unsafe { pending.finish_values(values, None).await }
+        }
+    }
+    /// The TP2 shared contribution of a prefill unit, into this transport's
+    /// workspace (one transport per in-flight slot), on the reduce GPU.
+    /// # Safety
+    /// The unit's normalized input stays unchanged until it completes; the
+    /// returned values stay unchanged until the unit lands.
+    pub(crate) async unsafe fn unit_shared(&mut self,
+        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<CuteafdDeviceBuffer> {
+        ensure!(matches!(input.values.device_id, 0 | 1), "TP2 shared input device differs");
+        unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
+            .execute_shared_on(input.layer, input.tokens.len() as u32, input.values,
+                self.output.buffer.device_id as usize).await }
     }
     /// Borrowed device view; never free it or retain it across wave reuse/drop.
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {

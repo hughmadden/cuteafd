@@ -314,6 +314,8 @@ pub(crate) struct LaneUnitFfn {
     ticket: crate::families::deepseek_v41::v41_experts::coordinator::NativeUnitFfn,
     binding: QueryBinding,
     shared: CuteafdDeviceBuffer,
+    /// The lane's GPU, which the reduced result returns to.
+    destination: i32,
     started: std::time::Instant,
     routed_us: u64,
     dispatched_us: u64,
@@ -549,8 +551,8 @@ impl LaneFfn<'_, '_, '_> {
     pub(crate) async unsafe fn send_unit(&mut self, transport: &mut NativeTp4Wave<'_>,
         placement: u64, image_mask: &[u8], rows: &[ExpertRow]) -> Result<LaneUnitFfn> {
         let prior = std::mem::replace(self.phase, Phase::Invalid);
-        ensure!(prior == Phase::Ffn && !transport.has_local_layer(self.input.layer)
-            && !transport.has_tp2_shared_layer(self.input.layer), "prefill unit remote FFN phase or route differs");
+        ensure!(prior == Phase::Ffn && !transport.has_local_layer(self.input.layer),
+            "prefill unit remote FFN phase or route differs");
         let started = std::time::Instant::now();
         self.router.set_local_mode(false)?;
         let ring = self.router.ring_capture();
@@ -564,16 +566,22 @@ impl LaneFfn<'_, '_, '_> {
         // until the wave's staging copies, which its stream orders.
         let ticket = unsafe { transport.dispatch_unit(&routed, routed.stream, placement, rows)? };
         let dispatched_us = started.elapsed().as_micros() as u64;
-        let shared = self.shared.as_mut().context("prefill unit shared workspace absent")?;
-        let contribution = unsafe { if self.cooperative { shared.execute_ffn_cooperative(&self.input).await? }
-            else { shared.execute_ffn(&self.input)? } };
-        ensure!(contribution.binding()? == self.input.binding(), "prefill unit shared contribution differs");
-        let shared_values = contribution.values;
+        // Two RTX: the shared expert runs TP2 into this slot's transport-owned
+        // workspace; one RTX: in this lane's shared workspace.
+        let shared_values = if transport.has_tp2_shared_layer(self.input.layer) {
+            unsafe { transport.unit_shared(&self.input).await? }
+        } else {
+            let shared = self.shared.as_mut().context("prefill unit shared workspace absent")?;
+            let contribution = unsafe { if self.cooperative { shared.execute_ffn_cooperative(&self.input).await? }
+                else { shared.execute_ffn(&self.input)? } };
+            ensure!(contribution.binding()? == self.input.binding(), "prefill unit shared contribution differs");
+            contribution.values
+        };
         let shared_us = started.elapsed().as_micros() as u64;
         if let Some(l2) = self.l2 { l2.issue(self.input.layer)?; }
         *self.phase = Phase::UnitPending;
-        Ok(LaneUnitFfn { ticket, binding: self.input.binding(), shared: shared_values, started,
-            routed_us, dispatched_us, shared_us })
+        Ok(LaneUnitFfn { ticket, binding: self.input.binding(), shared: shared_values,
+            destination: self.input.values.device_id, started, routed_us, dispatched_us, shared_us })
     }
     /// # Safety
     /// No external writes race the preserved FFN input or shared workspace.
@@ -900,7 +908,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         pending: LaneUnitFfn) -> Result<crate::families::deepseek_v41::v41_experts::coordinator::NativeFfnOutput<'t>> {
         self.enter(Phase::UnitPending)?;
         self.block.ffn_input(pending.binding)?;
-        let result = unsafe { transport.collect_unit(pending.ticket, pending.shared).await? };
+        let result = unsafe { transport.collect_unit(pending.ticket, pending.shared, pending.destination).await? };
         ensure!(result.binding() == pending.binding, "prefill unit FFN result binding differs");
         let collect_us = (pending.started.elapsed().as_micros() as u64).saturating_sub(pending.shared_us);
         if self.capture_timing {

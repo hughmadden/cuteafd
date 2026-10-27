@@ -85,6 +85,14 @@ impl PlacedPreparedLayer<'_, '_, '_> {
             .await
     }
 }
+impl PlacedPreparedLayer<'_, '_, '_> {
+    /// Finish the attention on its GPU and release the lane borrow (a prefill
+    /// unit's FFN runs in a later executor hook).
+    pub async fn into_unit(mut self) -> Result<super::UnitPreparedLayer> {
+        let prepared = self.prepared.take().context("prepared layer absent")?;
+        self.device.future(prepared.into_unit()).await
+    }
+}
 impl Drop for PlacedPreparedLayer<'_, '_, '_> {
     fn drop(&mut self) {
         if let Some(prepared) = self.prepared.take() {

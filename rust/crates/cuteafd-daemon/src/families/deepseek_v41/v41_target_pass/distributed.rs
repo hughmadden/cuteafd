@@ -1,13 +1,12 @@
 //! Full target-pass sequencing with GPU-local lanes and short request borrows.
 use super::*;
 use crate::families::deepseek_v41::v41_target_head::distributed_target::{DistributedTargetHead, DistributedTargetLogits};
-mod encoder_stream;
+mod encoder_units;
 use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
 use crate::shared::peer_split::hop::DirectInputHop;
 use crate::families::deepseek_v41::v41_engram::placement::PlacedEngram;
 use crate::shared::memory::device::DeviceOwner;
-use encoder_stream::EncoderFlow;
 
 #[cfg(test)]
 fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>)
@@ -431,7 +430,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         suffix,
                         encoder,
                         greedy,
-                        None,
                     )
                     .await?;
             }
@@ -440,7 +438,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         } else {
             unsafe {
                 self.execute_inner(
-                    requests, batch, transport, placement, selected, suffix, encoder, greedy, None,
+                    requests, batch, transport, placement, selected, suffix, encoder, greedy,
                 )
                 .await
             }
@@ -456,7 +454,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         mut suffix: Option<&mut DeviceOwner<'a, EncoderSuffix<'a>>>,
         encoder: Option<&BlockOutput<'_>>,
         greedy: bool,
-        flow: Option<EncoderFlow<'_, '_, 'a>>,
     ) -> Result<()> {
         let begin_timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         requests.with_requests(|r| r.validate(batch))?;
@@ -488,78 +485,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             completed: false,
         };
         let mut guard = guard;
-        self.resources.execution.restart_for(stage);
-        for index in self.resources.indices.iter_mut().flatten() {
-            let device = index.device;
-            device.run(|| {
-                if stage == CacheStage::Replay {
-                    index.restart_decoder()
-                } else {
-                    index.restart()
-                }
-            })?;
-        }
-        if !stage.is_encoder() {
-            self.resources.taps.begin(guard.batch.cache()?)?;
-        }
-        let first = stage.windows().start;
-        let gpu = self.resources.map.attention(first)?;
-        let device = self.resources.lanes[gpu].device;
-        if stage == CacheStage::Replay {
-            let encoder = encoder.context("distributed replay requires retained encoder suffix")?;
-            ensure!(
-                encoder.tokens == guard.batch.cache()?.positions(),
-                "distributed replay suffix rows differ"
-            );
-            if encoder.residual.device_id == device.id {
-                device.run(|| self.resources.lanes[gpu].restart_decoder(encoder))?;
-            } else {
-                unsafe {
-                    self.resources.lanes[gpu]
-                        .get_mut()
-                        .import_previous_cooperative(encoder, &mut self.resources.transfers[gpu])
-                        .await?;
-                }
-            }
-            device
-                .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
-                .await?;
-        } else {
-            device.run(|| self.resources.lanes[gpu].restart())?;
-            let text = requests.with_requests(|r| r.text_embedding_input(guard.batch))?;
-            if let Some((tokens, positions)) = text {
-                device
-                    .future(unsafe {
-                        self.resources.lanes[gpu].get_mut().begin_tokens_cooperative(
-                            self.resources.embedding.get_mut(),
-                            tokens,
-                            &positions,
-                        )
-                    })
-                    .await?;
-            } else {
-                unsafe {
-                    requests.with_requests(|r| {
-                        device.run(|| {
-                            r.begin_input(
-                                guard.batch,
-                                self.resources.embedding.get_mut(),
-                                self.resources.lanes[gpu].get_mut(),
-                            )
-                        })
-                    })?;
-                }
-            }
-        }
+        unsafe { self.begin_stage(requests, guard.batch, stage, encoder).await?; }
         if let Some(t) = begin_timed {
             tracing::debug!(target: "cuteafd::timing", rows, begin_us=t.elapsed().as_micros() as u64,
                 "distributed pass begin");
         }
         layer_schedule!(stage; layer, first; {
-            if let Some(flow) = &flow {
-                flow.permit.wait_predecessor(layer).await;
-                ensure!((flow.keep_running)(), "client disconnected");
-            }
             let gpu = self.resources.map.attention(layer)?;
             let device = self.resources.lanes[gpu].device;
         }; device.library; {
@@ -774,75 +705,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     self.publish_encoder_layer(requests, guard.batch, layer)
                         .await?;
                 }
-                if let Some(flow) = &flow {
-                    flow.permit.publish(layer);
-                }
             }
         });
         if stage.is_encoder() {
-            let gpu = self.resources.map.attention(19)?;
-            let device = self.resources.lanes[gpu].device;
-            if let Some(flow) = &flow {
-                flow.permit.wait_commit_turn().await;
-                ensure!((flow.keep_running)(), "client disconnected");
-                let mut suffix = flow.suffix.borrow_mut();
-                ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
-                let output = self.resources.lanes[gpu].output()?;
-                device
-                    .future(unsafe {
-                        suffix
-                            .get_mut()
-                            .capture_cooperative(&output, &self.resources.suffix_stream)
-                    })
-                    .await?;
-            } else {
-                let suffix = suffix
-                    .as_mut()
-                    .context("distributed encoder suffix owner missing")?;
-                ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
-                let output = self.resources.lanes[gpu].output()?;
-                device
-                    .future(unsafe {
-                        suffix
-                            .get_mut()
-                            .capture_cooperative(&output, &self.resources.suffix_stream)
-                    })
-                    .await?;
-            }
-            if stage == CacheStage::Encoder {
-                unsafe {
-                    self.advance(20).await?;
-                }
-                let gpu = self.resources.map.attention(20)?;
-                let device = self.resources.lanes[gpu].device;
-                device
-                    .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
-                    .await?;
-                let mut production = unsafe {
-                    requests.with_requests(|r| {
-                        self.resources.execution.enqueue_production(
-                            r.cache(),
-                            guard.batch.cache()?,
-                            &self.resources.lanes[gpu],
-                            None,
-                        )
-                    })?
-                };
-                while !unsafe {
-                    if reserved {
-                        requests
-                            .borrow_mut()
-                            .poll_distributed_encoder_production(guard.batch, &mut production)?
-                    } else {
-                        requests
-                            .with_requests(|r| production.poll(r.cache(), guard.batch.cache()?))?
-                    }
-                } {
-                    tokio::task::yield_now().await;
-                }
-                drop(production);
-                self.resources.execution.finish_decoder_source(guard.batch.cache()?)?;
-            }
+            let suffix = suffix.as_mut().context("distributed encoder suffix owner missing")?;
+            unsafe { self.finish_encoder_stage(requests, guard.batch, stage, suffix).await?; }
             self.state = State::Encoded(id);
         } else {
             self.resources.taps.output(guard.batch.cache()?)?;
@@ -857,6 +724,116 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             self.state = State::Ready(id);
         }
         guard.completed = true;
+        Ok(())
+    }
+    /// Restart the pass's owners for `batch` at `stage` and embed its rows (or
+    /// import the retained encoder suffix for the decoder replay).
+    /// # Safety
+    /// The pass exclusively owns its lanes; `encoder` is this batch's retained suffix.
+    async unsafe fn begin_stage(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch, stage: CacheStage, encoder: Option<&BlockOutput<'_>>) -> Result<()> {
+        self.resources.execution.restart_for(stage);
+        for index in self.resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| {
+                if stage == CacheStage::Replay {
+                    index.restart_decoder()
+                } else {
+                    index.restart()
+                }
+            })?;
+        }
+        if !stage.is_encoder() {
+            self.resources.taps.begin(batch.cache()?)?;
+        }
+        let first = stage.windows().start;
+        let gpu = self.resources.map.attention(first)?;
+        let device = self.resources.lanes[gpu].device;
+        if stage == CacheStage::Replay {
+            let encoder = encoder.context("distributed replay requires retained encoder suffix")?;
+            ensure!(
+                encoder.tokens == batch.cache()?.positions(),
+                "distributed replay suffix rows differ"
+            );
+            if encoder.residual.device_id == device.id {
+                device.run(|| self.resources.lanes[gpu].restart_decoder(encoder))?;
+            } else {
+                unsafe {
+                    self.resources.lanes[gpu]
+                        .get_mut()
+                        .import_previous_cooperative(encoder, &mut self.resources.transfers[gpu])
+                        .await?;
+                }
+            }
+            device
+                .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
+                .await?;
+        } else {
+            device.run(|| self.resources.lanes[gpu].restart())?;
+            let text = requests.with_requests(|r| r.text_embedding_input(batch))?;
+            if let Some((tokens, positions)) = text {
+                device
+                    .future(unsafe {
+                        self.resources.lanes[gpu].get_mut().begin_tokens_cooperative(
+                            self.resources.embedding.get_mut(),
+                            tokens,
+                            &positions,
+                        )
+                    })
+                    .await?;
+            } else {
+                unsafe {
+                    requests.with_requests(|r| {
+                        device.run(|| {
+                            r.begin_input(
+                                batch,
+                                self.resources.embedding.get_mut(),
+                                self.resources.lanes[gpu].get_mut(),
+                            )
+                        })
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// The encoder tail: capture the suffix rows, then (full encoder) advance
+    /// to layer 20 and produce the decoder source.
+    /// # Safety
+    /// The pass's encoder output for `batch` is complete; `suffix` is this prompt's.
+    async unsafe fn finish_encoder_stage(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch, stage: CacheStage, suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>) -> Result<()> {
+        let reserved = batch.cache()?.is_reserved();
+        let gpu = self.resources.map.attention(19)?;
+        let device = self.resources.lanes[gpu].device;
+        ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
+        let output = self.resources.lanes[gpu].output()?;
+        device.future(unsafe { suffix.get_mut().capture_cooperative(&output, &self.resources.suffix_stream) }).await?;
+        if stage == CacheStage::Encoder {
+            unsafe { self.advance(20).await?; }
+            let gpu = self.resources.map.attention(20)?;
+            let device = self.resources.lanes[gpu].device;
+            device.future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() }).await?;
+            let mut production = unsafe { requests.with_requests(|r| self.resources.execution.enqueue_production(
+                r.cache(), batch.cache()?, &self.resources.lanes[gpu], None))? };
+            while !unsafe {
+                if reserved { requests.borrow_mut().poll_distributed_encoder_production(batch, &mut production)? }
+                else { requests.with_requests(|r| production.poll(r.cache(), batch.cache()?))? }
+            } {
+                tokio::task::yield_now().await;
+            }
+            drop(production);
+            self.resources.execution.finish_decoder_source(batch.cache()?)?;
+        }
+        Ok(())
+    }
+    /// A unit's encoder tail on the shared executor (units end in order).
+    /// # Safety
+    /// As [`Self::finish_encoder_stage`].
+    pub(super) async unsafe fn finish_encoder_unit(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch, suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>) -> Result<()> {
+        unsafe { self.finish_encoder_stage(requests, batch, CacheStage::Encoder, suffix).await?; }
+        self.state = State::Encoded(batch.cache()?.identity());
         Ok(())
     }
     async unsafe fn publish_encoder_layer(
@@ -1501,7 +1478,7 @@ mod tests {
                     .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
                 if interleaved {
                     runtime.block_on(unsafe {
-                        pass.execute_encoder_stream(
+                        pass.execute_encoder_units(
                             &mut other,
                             &mut requests,
                             lease,
@@ -1509,6 +1486,7 @@ mod tests {
                             [&mut transport, &mut other_transport],
                             &mut suffix,
                             &|| true,
+                            2,
                         )
                     })?;
                 } else {
@@ -1675,7 +1653,7 @@ mod tests {
             .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
         let calls = std::cell::Cell::new(0);
         let result = runtime.block_on(unsafe {
-            pass.execute_encoder_stream(
+            pass.execute_encoder_units(
                 &mut other,
                 &mut requests,
                 lease,
@@ -1686,9 +1664,10 @@ mod tests {
                     calls.set(calls.get() + 1);
                     calls.get() < 12
                 },
+                2,
             )
         });
-        assert!(result.is_err(), "disconnected encoder stream succeeded");
+        assert!(result.is_err(), "disconnected encoder units succeeded");
         assert!(requests.cache().request_id(lease).is_err());
         assert_eq!(pass.state, State::Idle);
         assert_eq!(other.state, State::Idle);
