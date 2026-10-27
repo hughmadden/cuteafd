@@ -34,6 +34,28 @@ function mark(name, attrs, parent) {
   return node;
 }
 
+// Reconcile retained receivers with the exact coordinator peer, not host totals.
+function reconciled(port, ports) {
+  const local = new Set((port.peers || []).map((p) => (p.local_gid || '').replaceAll(':', '').toLowerCase()).filter(Boolean));
+  const ip = address(port.host || '').split('.');
+  const fallback = ip.length === 4 && ip.every((n) => /^\d+$/.test(n) && +n <= 255)
+    ? '00000000000000000000ffff' + ip.map((n) => (+n).toString(16).padStart(2, '0')).join('') : null;
+  const unique = ports.filter((p) => p.host === port.host && p.peers?.length).length === 1;
+  const peers = port.peers?.length ? ports.filter((p) => p.host === 'coordinator').flatMap((p) => p.peers || []).filter((p) => {
+    const gid = (p.peer || '').replaceAll(':', '').toLowerCase();
+    return local.size ? local.has(gid) : unique && fallback && gid === fallback;
+  }) : [];
+  const out = { ...port };
+  for (const [side, opposite] of [['sent', 'received'], ['received', 'sent']]) {
+    const key = `engine_${side}_bytes`;
+    if (Number.isFinite(out[key])) out[key] = Math.max(out[key], peers.reduce((n, p) => n + (p[`${opposite}_bytes`] || 0), 0));
+    const foreign = `foreign_${side}_bytes`;
+    if (Number.isFinite(out[foreign]) && Number.isFinite(out[`${side}_bytes`]) && Number.isFinite(out[key]))
+      out[foreign] = Math.min(out[foreign], Math.max(0, out[`${side}_bytes`] - out[key] * 1.65 - (out[`sparknest_${side}_bytes`] || 0)));
+  }
+  return out;
+}
+
 // One observation of one port, in its busier direction.
 function point(port, label) {
   const s = port.seconds > 0 ? port.seconds : null;
@@ -59,15 +81,14 @@ function judge(history) {
   const last = history.at(-1).port;
   const active = /ACTIVE/.test(last.state || '');
   const peak = Math.max(0, ...history.map((p) => p.nic || 0));
-  const engine = history.some((p) => (p.engine || 0) > 0);
-  const shares = history.map((p) => p.retransmit).filter(Number.isFinite);
+  const engine = history.some((p) => (p.port.engine_sent_bytes || 0) > 0 || (p.port.engine_received_bytes || 0) > 0);
+  const shares = history.filter((p) => p.judged).map((p) => p.retransmit).filter(Number.isFinite);
   const worst = shares.length ? Math.max(...shares) : null;
   const limit = history.at(-1).limit;
   const high = history.some((p) => p.judged && p.retransmit > limit);
   let issue = null, severity = null;
-  if (engine && !active) { issue = 'down'; severity = 'bad'; }
+  if (engine && /DOWN/.test(last.state || '')) { issue = 'down'; severity = 'bad'; }
   else if (high) { issue = `retransmits ${pct2(worst)}`; severity = 'warn'; }
-  else if (history.some((p) => p.verdict === 'warn')) { issue = 'warning'; severity = 'warn'; }
   const used = peak > 0 || engine;
   return { active, peak, engine, worst, limit, issue, severity, used };
 }
@@ -77,9 +98,19 @@ function chart(key, history, j) {
   const last = history.at(-1).port;
   const link = last.link_gbps;
   const port = `${last.device}/${last.port}`;
-  const verdict = j.issue ? `<b class="${j.severity}">${esc(j.issue)}</b>` : j.worst != null ? `retransmits ${pct2(j.worst)}` : 'OK';
+  const verdict = j.issue ? (j.severity === 'warn' ? `<button type="button" class="fabric-hint-chip warn" aria-label="Retransmit warning: explain">${esc(j.issue)} ?</button>` : `<b class="${j.severity}">${esc(j.issue)}</b>`) : j.worst != null ? `retransmits ${pct2(j.worst)}` : 'Idle / unavailable';
   card.innerHTML = `<figcaption><span class="host">${esc(hostName(last))}</span><span class="peak">peak ${gb(j.peak)} Gb/s</span>`
     + `<span class="sub" title="${esc(port)}">${esc(port.replace(/^roce/, ''))} · ${verdict}</span></figcaption>`;
+  card.querySelector('.fabric-hint-chip')?.addEventListener('click', () => {
+    let dialog = document.getElementById('fabric-hint');
+    if (!dialog) {
+      dialog = document.createElement('dialog'); dialog.id = 'fabric-hint'; dialog.className = 'admin-dialog';
+      dialog.setAttribute('aria-labelledby', 'fabric-hint-title');
+      dialog.innerHTML = `<div><h2 id="fabric-hint-title">Retransmits cost throughput</h2><p>Go-back-N resends cost goodput; no data is lost and results remain valid.</p><p>A lossless RoCE class with switch PFC can help; also check cabling and link errors. <a href="https://github.com/tpurtell/cuteafd/blob/work/p0/docs/host-tuning.md#lossless-roce-and-results" target="_blank" rel="noopener">Lossless RoCE guide</a> (<a href="https://github.com/tpurtell/cuteafd/pull/759" target="_blank" rel="noopener">#759</a>).</p></div><form method="dialog" class="actions"><button class="btn">CLOSE</button></form>`;
+      document.body.append(dialog);
+    }
+    dialog.showModal();
+  });
   const W = 200, H = 96, top = 4, base = H - 2;
   const svg = document.createElementNS(NS, 'svg');
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.setAttribute('preserveAspectRatio', 'none');
@@ -143,7 +174,7 @@ function table(rows) {
         + `<td>${j.active ? 'up' : esc((p.state || 'unknown').replace(/^\d+:\s*/, '').toLowerCase())}</td><td>${gb(p.link_gbps)}</td><td>${gb(j.peak)}</td>`
         + ['engine', 'sparknest', 'foreign', 'other'].map((k) => `<td>${gb(mean(h, k))}</td>`).join('')
         + `<td>${j.worst == null ? '–' : pct2(j.worst)}</td><td>${j.issue ? `<b>${esc(j.issue)}</b>` : j.used ? 'ok' : 'idle'}</td></tr>`;
-    }).join('') + `</tbody></table><p class="note">Gb/s in the busier direction, mean over ${live ? 'live observations' : 'the run\'s phases'}; peak is the largest NIC rate. Retransmits are go-back-N resends as a share of packets moved (no data is lost); a warning above ${pct2(rows[0]?.[2].limit)}, judged only where a window moved at least 2 GB. Other is NIC traffic not attributed to the engine, SparkNest or a foreign source (headers, ACKs, retries, timing skew).</p></div>`;
+    }).join('') + `</tbody></table><p class="note">Gb/s in the busier direction, mean over ${live ? 'live observations' : 'the run\'s phases'}; peak is the largest NIC rate. Retransmits are go-back-N resends as a share of packets moved (no data is lost; results remain valid); a warning above ${pct2(rows[0]?.[2].limit)}, judged only where a window moved at least 2 GB. Other is NIC traffic not attributed to the engine, SparkNest or a foreign source (headers, ACKs, retries, timing skew).</p></div>`;
 }
 
 function render() {
@@ -186,7 +217,7 @@ window.CuteFabric = {
     for (const port of event.interval?.ports || []) {
       const key = `${port.host} ${port.device}/${port.port}`;
       const history = histories.get(key) || [];
-      history.push(point(port, `+${sequence} s`));
+      history.push(point(reconciled(port, event.interval.ports), `+${sequence} s`));
       if (history.length > KEEP) history.shift();
       histories.set(key, history);
     }
@@ -200,7 +231,7 @@ window.CuteFabric = {
     for (const phase of (report.fabric || []).filter((p) => p.timed !== false)) {
       for (const port of phase.ports || []) {
         const key = `${port.host} ${port.device}/${port.port}`;
-        const history = histories.get(key) || []; history.push(point(port, phase.name)); histories.set(key, history);
+        const history = histories.get(key) || []; history.push(point(reconciled(port, phase.ports), phase.name)); histories.set(key, history);
       }
     }
     render();
