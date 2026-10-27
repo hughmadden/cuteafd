@@ -31,10 +31,10 @@ impl<'a> WindowWave<'_, 'a> {
         ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
             && self.replica.is_none(), "window replica requires an unused wave");
         replica.validate_owner(state)?;
-        ensure!(state.layer==self.weights.layer && state.values.buffer.device_id==self.values.buffer.device_id
-            && std::ptr::eq(state.ends.library,self.stream.library),
+        ensure!(state.layer==self.weights.layer && state.values.buffer.device_id==self.values().device_id
+            && std::ptr::eq(state.ends.library,self.stream().library),
             "window replica producer differs");
-        let source=crate::shared::memory::device::Device { library:self.stream.library,id:self.values.buffer.device_id };
+        let source=crate::shared::memory::device::Device { library:self.stream().library,id:self.values().device_id };
         let publication=crate::shared::memory::peer_publication::PeerPublication::new(source,replica.device())?;
         self.replica=Some((replica,publication)); Ok(())
     }
@@ -59,6 +59,8 @@ impl<'a> WindowWave<'_, 'a> {
     }
     unsafe fn enqueue_commit_on(&mut self, state: &WindowState<'_>, accepted: &[u32],
         external: Option<*mut c_void>) -> Result<Option<BatchedWindowCommit>> {
+        let (lib, raw) = (self.stream().library, self.stream().raw);
+        let (values, scales, device_destinations) = (self.values(), self.scales(), self.destinations());
         ensure!(self.pending_commit.is_none(), "window commit already pending");
         if let Some(configured)=&state.replica {
             ensure!(self.replica.as_ref().is_some_and(|(storage,_)|
@@ -86,7 +88,7 @@ impl<'a> WindowWave<'_, 'a> {
             }
             ends.push(c.position + n as u64);
         }
-        let staging = self.commit_staging.bytes_mut();
+        let staging = self.commit_host().bytes_mut();
         for (i, d) in destinations.iter().enumerate() {
             staging[i * 8..i * 8 + 8].copy_from_slice(&d.to_ne_bytes());
         }
@@ -103,8 +105,8 @@ impl<'a> WindowWave<'_, 'a> {
                 destinations: destinations.clone(),
                 ends: pending_ends,
                 layer: cuteafd_ffi::V41KvStoreLayer {
-                    values: self.values.buffer.ptr as u64,
-                    scales: self.scales.buffer.ptr as u64,
+                    values: values.ptr as u64,
+                    scales: scales.ptr as u64,
                     cache: state.values.buffer.ptr as u64,
                     cache_scales: state.scales.buffer.ptr as u64,
                     ends: state.ends.buffer.ptr as u64,
@@ -113,40 +115,42 @@ impl<'a> WindowWave<'_, 'a> {
                     destinations: 0,
                     end_pairs: 0,
                 },
-                device: self.values.buffer.device_id,
+                device: values.device_id,
             }
         });
         self.pending_commit = Some(PendingCommit { prepared: p, ends, accepted: accepted.to_vec(),
             external, _reservation: WriteReservation { flags: state.writing.clone(), mask } });
         if batched.is_some() { return Ok(batched); }
+        // The H2D source: the commit staging written above (raw view, so the
+        // closure below can borrow the wave).
+        let host = self.commit_host().buffer;
         let p = &self.pending_commit.as_ref().unwrap().prepared;
         (|| -> Result<()> {
             unsafe {
-                self.stream.library.copy_h2d_async(
-                    self.destinations.buffer,
-                    &self.commit_staging.bytes_mut()[..p.rows * 8],
-                    self.stream.raw,
+                lib.copy_host_buffer_h2d_async(
+                    device_destinations, host, p.rows * 8, raw,
                 )?;
                 self.kv.store(
-                    self.values.buffer,
-                    self.scales.buffer,
-                    self.destinations.buffer,
+                    values,
+                    scales,
+                    device_destinations,
                     state.values.buffer,
                     state.scales.buffer,
                     p.rows,
                     state.slot_count * 128,
-                    self.stream.raw,
+                    raw,
                 )?;
                 for (i, c) in p.chunks.iter().enumerate() {
-                    self.stream.library.copy_h2d_async(
-                        slice(state.ends.buffer, c.lease.slot * 8, 8),
-                        &self.commit_staging.bytes_mut()[p.rows * 8 + i * 8..p.rows * 8 + i * 8 + 8],
-                        self.stream.raw,
+                    let mut end = host;
+                    end.ptr = host.ptr.cast::<u8>().wrapping_add(p.rows * 8 + i * 8).cast();
+                    end.bytes = 8;
+                    lib.copy_host_buffer_h2d_async(
+                        slice(state.ends.buffer, c.lease.slot * 8, 8), end, 8, raw,
                     )?;
                 }
                 if let Some((replica,publication)) = self.replica.as_mut() {
                     let pending=self.pending_commit.as_ref().unwrap();
-                    publication.enqueue(self.stream.raw,|stream| {
+                    publication.enqueue(raw,|stream| {
                         for (chunk,&end) in pending.prepared.chunks.iter().zip(&pending.ends) {
                             replica.copy_commit(state,chunk.lease,end,stream)?;
                         }
@@ -161,7 +165,7 @@ impl<'a> WindowWave<'_, 'a> {
     pub(crate) fn has_replica(&self) -> bool { self.replica.is_some() }
     pub fn poll_commit(&self) -> Result<bool> {
         let Some(pending) = &self.pending_commit else { return Ok(true) };
-        unsafe { self.stream.library.cuda_stream_query(pending.external.unwrap_or(self.stream.raw)) }
+        unsafe { self.stream().library.cuda_stream_query(pending.external.unwrap_or(self.stream().raw)) }
     }
     pub(super) fn validate_pending_commit(&self, state: &WindowState<'_>) -> Result<&Prepared> {
         let pending = self.pending_commit.as_ref().context("window commit absent")?;
@@ -183,7 +187,7 @@ impl<'a> WindowWave<'_, 'a> {
             // chain follows every chained reader of the private wave (#815
             // units); outside a chain they already completed (no-op).
             // SAFETY: this wave's live stream on the chain's device.
-            unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::join(self.stream().library, self.stream().raw)?; }
             let launched = unsafe { self.enqueue_commit(state, accepted) };
             // Device-ordered prefill units (#815 option (i)) record the chain
             // head instead of a host wait: every later reader of this window's
@@ -191,7 +195,7 @@ impl<'a> WindowWave<'_, 'a> {
             // next unit through its publication event). Its host staging is
             // this pass's own and is reused only after the unit's drained commit.
             let completed = if crate::shared::memory::chain::deferred() {
-                unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) }
+                unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) }
             } else { self.synchronize() };
             if let Err(error) = launched.and(completed) {
                 self.abort_commit(state)?;
@@ -227,7 +231,7 @@ impl<'a> WindowWave<'_, 'a> {
         }
         let mut drained = self.synchronize();
         if let Some(stream) = self.pending_commit.as_ref().unwrap().external {
-            drained = drained.and(unsafe { self.stream.library.cuda_stream_synchronize(stream) });
+            drained = drained.and(unsafe { self.stream().library.cuda_stream_synchronize(stream) });
         }
         let pending = self.pending_commit.take().unwrap();
         let leases = pending.prepared.chunks.iter().map(|c| c.lease).collect::<Vec<_>>();
@@ -267,7 +271,13 @@ mod tests {
     /// pinned staging).
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
-    fn native_commit_staging_survives_a_queued_producer_upload() -> Result<()> {
+    fn native_commit_staging_survives_a_queued_producer_upload() -> Result<()> { commit_behind_queued_upload(false) }
+    /// Negative control: staging the commit through the producer's position
+    /// staging (the pre-#815 layout) must clobber the queued upload.
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn native_shared_commit_staging_clobbers_a_queued_producer_upload() -> Result<()> { commit_behind_queued_upload(true) }
+    fn commit_behind_queued_upload(shared_staging: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
         let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
@@ -284,32 +294,173 @@ mod tests {
             let value = ((i % 23) as f32 / 23.0).to_bits();
             ((value >> 16) as u16).to_ne_bytes()
         }).collect();
-        let chunk = |lease| WindowChunk { lease, position: 0, tokens: rows as u32 };
+        // Positions start past the 128-row window so the commit's destinations
+        // ((300 + j) % 128) differ from the producer's positions (300 + j):
+        // at position 0 both are 0..rows, and a clobber would be invisible.
+        let chunk = |lease| WindowChunk { lease, position: 300, tokens: rows as u32 };
+        // Advance both windows to position 300 (ungated; also warms every kernel).
+        for start in (0..300u64).step_by(15) {
+            let tokens = (300 - start).min(15) as u32;
+            let warm: Vec<u8> = (0..tokens as usize * 5120).flat_map(|i| {
+                let value = ((i % 19) as f32 / 19.0 - 0.3).to_bits();
+                ((value >> 16) as u16).to_ne_bytes()
+            }).collect();
+            lib.copy_h2d(direct.input(), &warm)?;
+            for (window, held) in [(&mut reference, original), (&mut state, lease)] {
+                unsafe { direct.execute(window, &[WindowChunk { lease: held, position: start, tokens }])?; }
+                direct.commit(window, &[tokens])?;
+            }
+        }
         lib.copy_h2d(direct.input(), &input)?;
         unsafe { direct.execute(&reference, &[chunk(original)])?; }
         direct.commit(&mut reference, &[rows as u32])?;
         lib.copy_h2d(gated.input(), &input)?;
         {
-            let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, gated.stream.raw)? };
+            let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, gated.stream().raw)? };
             let prepared = gated.prepare(&state, &[chunk(lease)])?;
             gated.upload(&prepared)?;
             unsafe { gated.enqueue(prepared.rows)?; }
             gated.ready = Some(prepared);
             // The commit stages on the host while the upload above is still queued.
-            unsafe { gated.enqueue_commit(&state, &[rows as u32])?; }
+            crate::families::deepseek_v41::v41_window::SHARED_COMMIT_STAGING.with(|shared| shared.set(shared_staging));
+            let staged = unsafe { gated.enqueue_commit(&state, &[rows as u32]) };
+            crate::families::deepseek_v41::v41_window::SHARED_COMMIT_STAGING.with(|shared| shared.set(false));
+            staged?;
             drop(gate);
         }
         gated.synchronize()?;
+        // The bug's direct observable: the positions the queued upload delivered.
+        // (The packed window values do not change with these positions at this
+        // layer, so they alone cannot detect the clobber.)
+        let mut device = vec![0u8; rows * 8];
+        lib.copy_d2h(&mut device, slice(gated.storage.positions.buffer, 0, rows * 8))?;
+        let delivered: Vec<u64> = device.chunks_exact(8).map(|b| u64::from_ne_bytes(b.try_into().unwrap())).collect();
+        let intended: Vec<u64> = (300..300 + rows as u64).collect();
         gated.commit(&mut state, &[rows as u32])?;
         let (actual, expected) = (state.view(lease)?, reference.view(original)?);
+        let mut equal = true;
         for (a, b, width) in [(actual.values, expected.values, 512), (actual.scales, expected.scales, 16)] {
             let mut left = vec![0; rows * width];
             let mut right = left.clone();
             lib.copy_d2h(&mut left, slice(a, 0, rows * width))?;
             lib.copy_d2h(&mut right, slice(b, 0, rows * width))?;
-            assert_eq!(left, right, "queued producer positions were overwritten by commit staging");
+            equal &= left == right;
+        }
+        if shared_staging {
+            assert_ne!(delivered, intended,
+                "sharing the producer's staging did not clobber the queued upload: the test cannot detect #815");
+        } else {
+            assert_eq!(delivered, intended, "queued producer positions were overwritten by commit staging");
+            assert!(equal, "committed window differs from the direct run");
         }
         Ok(())
+    }
+    /// row_window contract, window storage: two units (slots 0 and 1) on one
+    /// shared storage, windows 0..13 and 16..29 of a 48-row reserve, produce
+    /// and commit layer 0. The gate holds the shared stream after unit A wrote
+    /// its scratch input and before A's kernels, so every host staging write
+    /// (both units' positions and commit destinations) happens before any of
+    /// that work runs. Unit B must stay queued behind it: the shared stream is
+    /// what orders the plain scratch. Both units' ring rows must equal private
+    /// runs. `ordered == false` is the negative control: each wave gets its
+    /// own stream (`PRIVATE_STREAM`), B runs while A is held and overwrites
+    /// the shared scratch input, so A's ring rows must differ.
+    fn shared_window_storage(ordered: bool) -> Result<()> {
+        use crate::shared::memory::row_window::RowWindow;
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
+        let weights = WindowWeights::load(&lib, &catalog, 0,
+            WindowWeights::device_bytes(&lib, &catalog, 0)?, 1024*1024)?;
+        let (unit, reserve, rows) = (16usize, 48usize, 13usize);
+        let input = |seed: usize| -> Vec<u8> { (0..rows*5120).flat_map(|i| {
+            let value = (((i * 7 + seed * 11) % 23) as f32 / 23.0 - 0.3).to_bits();
+            ((value >> 16) as u16).to_ne_bytes()
+        }).collect() };
+        let chunk = |lease| WindowChunk { lease, position: 0, tokens: rows as u32 };
+        let read = |state: &WindowState<'_>, lease| -> Result<Vec<u8>> {
+            let view = state.view(lease)?;
+            let mut bytes = vec![0; rows * 528];
+            lib.copy_d2h(&mut bytes[..rows*512], slice(view.values, 0, rows*512))?;
+            lib.copy_d2h(&mut bytes[rows*512..], slice(view.scales, 0, rows*16))?;
+            Ok(bytes)
+        };
+        // Private runs: the expected rows, and an ungated warm-up of every
+        // kernel and copy the gated run issues (lazy module loading would
+        // otherwise synchronize behind the gate).
+        let mut expected = Vec::new();
+        for seed in 0..2 {
+            let mut reference = WindowState::new(&lib, 0, 1, usize::MAX)?;
+            let lease = reference.begin_request(0, 11)?;
+            let mut private = weights.wave(unit as u32, usize::MAX)?;
+            lib.copy_h2d(private.input(), &input(seed))?;
+            unsafe { private.execute(&reference, &[chunk(lease)])?; }
+            private.commit(&mut reference, &[rows as u32])?;
+            expected.push(read(&reference, lease)?);
+        }
+        let sources = [input(0), input(1)].map(|host| -> Result<DeviceAllocation<'_>> {
+            let buffer = DeviceAllocation::new(&lib, host.len())?;
+            lib.copy_h2d(buffer.buffer, &host)?;
+            Ok(buffer)
+        }).into_iter().collect::<Result<Vec<_>>>()?;
+        let storage = WindowStorage::new(&lib, reserve, unit, &[0], true)?;
+        crate::families::deepseek_v41::v41_window::PRIVATE_STREAM.with(|private| private.set(!ordered));
+        let built = (|| -> Result<Vec<_>> { Ok(vec![weights.on_storage(storage.clone())?, weights.on_storage(storage.clone())?]) })();
+        crate::families::deepseek_v41::v41_window::PRIVATE_STREAM.with(|private| private.set(false));
+        let mut slots = built?;
+        assert_eq!(std::ptr::eq(slots[0].stream(), slots[1].stream()), ordered);
+        slots[0].select_window(RowWindow::within(0..rows, reserve)?)?;
+        slots[1].select_window(RowWindow::within(unit..unit + rows, reserve)?)?;
+        let mut state = WindowState::new(&lib, 0, 2, usize::MAX)?;
+        let leases = [state.begin_request(0, 11)?, state.begin_request(1, 22)?];
+        let produce = |wave: &mut WindowWave<'_, '_>, seed: usize, gate: bool, state: &WindowState<'_>|
+            -> Result<Option<cuteafd_ffi::test_support::CudaStreamGate<'_>>> {
+            let prepared = wave.prepare(state, &[chunk(leases[seed])])?;
+            let stream = wave.stream().raw;
+            unsafe { lib.copy_d2d_async(wave.input(), sources[seed].buffer, rows * 10240, stream)?; }
+            wave.upload(&prepared)?;
+            let gate = gate.then(|| unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, stream) }).transpose()?;
+            unsafe { wave.enqueue(prepared.rows)?; }
+            wave.ready = Some(prepared);
+            unsafe { wave.enqueue_commit(state, &[rows as u32])?; }
+            Ok(gate)
+        };
+        let gate = produce(&mut slots[0], 0, true, &state)?;
+        produce(&mut slots[1], 1, false, &state)?;
+        // B is queued: unordered (negative control) it completes while A is
+        // held; ordered it stays pending behind A on the shared stream.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if ordered { 2 } else { 10 });
+        let mut b_done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { lib.cuda_stream_query(slots[1].stream().raw)? } { b_done = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(b_done, !ordered, "unit B {} while unit A was held mid-production",
+            if b_done { "completed" } else { "stayed pending" });
+        drop(gate);
+        for (seed, wave) in slots.iter_mut().enumerate() {
+            wave.synchronize()?;
+            wave.commit(&mut state, &[rows as u32])?;
+            let got = read(&state, leases[seed])?;
+            if ordered || seed == 1 {
+                assert_eq!(got, expected[seed], "unit {seed} differs from its private run on shared window storage");
+            } else {
+                assert_ne!(got, expected[seed], "without the shared stream unit B should clobber A's scratch: the test cannot detect a race");
+            }
+        }
+        eprintln!("PASS shared window storage ordered={ordered}: unit B {} while A was held",
+            if b_done { "completed" } else { "stayed pending" });
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn shared_window_storage_units_match_private_runs_behind_a_gated_stream() -> Result<()> {
+        shared_window_storage(true)
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn private_streams_on_shared_window_storage_clobber_scratch() -> Result<()> {
+        shared_window_storage(false)
     }
     fn queued_windows(replicated: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };

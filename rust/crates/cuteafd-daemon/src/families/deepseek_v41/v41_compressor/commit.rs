@@ -14,9 +14,9 @@ impl<'a> CompressorWave<'_, 'a> {
         ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
             && self.replica.is_none(), "source replica requires an unused wave");
         replica.validate_owner(&state.index)?;
-        ensure!(state.layer==self.weights.layer && state.index.kv_values.buffer.device_id==self.kv_values.buffer.device_id
-            && std::ptr::eq(state.index.kv_values.library,self.stream.library), "source replica producer differs");
-        let source=crate::shared::memory::device::Device { library:self.stream.library,id:self.kv_values.buffer.device_id };
+        ensure!(state.layer==self.weights.layer && state.index.kv_values.buffer.device_id==self.kv_values().device_id
+            && std::ptr::eq(state.index.kv_values.library,self.stream().library), "source replica producer differs");
+        let source=crate::shared::memory::device::Device { library:self.stream().library,id:self.kv_values().device_id };
         let publication=crate::shared::memory::peer_publication::PeerPublication::new(source,replica.device())?;
         self.replica=Some((replica,publication)); Ok(())
     }
@@ -24,6 +24,9 @@ impl<'a> CompressorWave<'_, 'a> {
     /// Proposal consumers are complete. Keep wave and state alive and drain on
     /// every error before dropping page claims or releasing participating slots.
     pub unsafe fn enqueue_commit(&mut self, state: &CompressorState<'_>, accepted: &[u32]) -> Result<()> {
+        let (lib, raw) = (self.stream().library, self.stream().raw);
+        let storage = self.storage.clone();
+        let (cache_destinations, index_packed, index_scales, kv_values, kv_scales, projected, scores) = (self.cache_destinations(), self.index_packed(), self.index_scales(), self.kv_values(), self.kv_scales(), self.projected(), self.scores());
         ensure!(self.pending_commit.is_none(), "compressor commit already pending");
         if let Some(configured)=&state.index.replica {
             ensure!(self.replica.as_ref().is_some_and(|(storage,_)|
@@ -53,6 +56,12 @@ impl<'a> CompressorWave<'_, 'a> {
                 .version
                 .checked_add(1)
                 .context("compressor version exhausted")?;
+        }
+        // A ratio-two carry is read from this layer's unit-cap scratch: valid
+        // while no later production of the layer was queued on this stream.
+        if state.pending.is_some() && !self.carry_intact() {
+            self.ready = Some(prepared);
+            anyhow::bail!("compressor carry of layer {} overwritten by a later production", self.weights.layer);
         }
         let ratio = self.weights.ratio;
         let mut completed = vec![];
@@ -105,30 +114,30 @@ impl<'a> CompressorWave<'_, 'a> {
         (|| -> Result<()> {
             if !completed.is_empty() {
                 unsafe {
-                    self.stream.library.copy_h2d_async(
-                        self.cache_destinations.buffer,
+                    lib.copy_h2d_async(
+                        cache_destinations,
                         &self.commit_destinations.bytes_mut()[..prepared.rows * 8],
-                        self.stream.raw,
+                        raw,
                     )?;
-                    self.kernel.index_store(
-                        self.index_packed.buffer,
-                        self.index_scales.buffer,
-                        self.cache_destinations.buffer,
+                    storage.kernel.index_store(
+                        index_packed,
+                        index_scales,
+                        cache_destinations,
                         state.index.packed.buffer,
                         state.index.scales.buffer,
                         prepared.rows,
                         state.index.capacity,
-                        self.stream.raw,
+                        raw,
                     )?;
                     self.kv.store(
-                        self.kv_values.buffer,
-                        self.kv_scales.buffer,
-                        self.cache_destinations.buffer,
+                        kv_values,
+                        kv_scales,
+                        cache_destinations,
                         state.index.kv_values.buffer,
                         state.index.kv_scales.buffer,
                         prepared.rows,
                         state.index.capacity,
-                        self.stream.raw,
+                        raw,
                     )?;
                 }
             }
@@ -138,15 +147,15 @@ impl<'a> CompressorWave<'_, 'a> {
                     if count > 0 && (chunk.position + count as u64) % 2 == 1 {
                         let row = prepared.offsets[i] + count - 1;
                         for (dst, src) in [
-                            (pending[0].buffer, self.projected.buffer),
-                            (pending[1].buffer, self.scores.as_ref().unwrap().buffer),
+                            (pending[0].buffer, projected),
+                            (pending[1].buffer, scores.unwrap()),
                         ] {
                             unsafe {
-                                self.stream.library.copy_d2d_async(
+                                lib.copy_d2d_async(
                                     slice(dst, chunk.lease.slot),
                                     slice(src, row),
                                     2048,
-                                    self.stream.raw,
+                                    raw,
                                 )?;
                             }
                         }
@@ -154,9 +163,9 @@ impl<'a> CompressorWave<'_, 'a> {
                 }
             }
             unsafe {
-                state.index.upload_staged(plan, self.commit_staging.bytes_mut(), self.stream.raw)?;
+                state.index.upload_staged(plan, self.commit_staging.bytes_mut(), raw)?;
                 if let Some((replica,publication))=self.replica.as_mut() {
-                    publication.enqueue(self.stream.raw,|stream|replica.copy_append(&state.index,plan,stream))?;
+                    publication.enqueue(raw,|stream|replica.copy_append(&state.index,plan,stream))?;
                 }
             }
             Ok(())
@@ -165,7 +174,7 @@ impl<'a> CompressorWave<'_, 'a> {
     }
     pub fn poll_commit(&self) -> Result<bool> {
         if self.pending_commit.is_none() { return Ok(true); }
-        unsafe { self.stream.library.cuda_stream_query(self.stream.raw) }
+        unsafe { self.stream().library.cuda_stream_query(self.stream().raw) }
     }
     pub(super) fn validate_pending_commit(&self, state: &CompressorState<'_>) -> Result<&Prepared> {
         let pending = self.pending_commit.as_ref().context("source commit absent")?;
@@ -186,7 +195,7 @@ impl<'a> CompressorWave<'_, 'a> {
             // chain follows every chained reader of the private wave (#815
             // units); outside a chain they already completed (no-op).
             // SAFETY: this wave's live stream on the chain's device.
-            unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::join(self.stream().library, self.stream().raw)?; }
             let launched = unsafe { self.enqueue_commit(state, accepted) };
             // Device-ordered prefill units (#815 option (i)) record the chain
             // head instead of a host wait: every later reader of this source's
@@ -194,7 +203,7 @@ impl<'a> CompressorWave<'_, 'a> {
             // next unit through its publication event). Its host staging is
             // this pass's own and is reused only after the unit's drained commit.
             let completed = if crate::shared::memory::chain::deferred() {
-                unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) }
+                unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) }
             } else { self.synchronize() };
             if let Err(error) = launched.and(completed) {
                 if let Err(cleanup) = self.abort_commit(state) { tracing::error!(%cleanup, "revoking failed source commit"); }
@@ -270,6 +279,158 @@ mod tests {
     #[ignore = "requires SM peer copy, CUTEAFD_CACHE_COMMIT_MODEL and two CUDA GPUs"]
     fn native_independent_source_commits_publish_peer_payloads_and_metadata() -> Result<()> {
         source_commits(true)
+    }
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Shared { Ordered, PrivateStreams, LateCommit, LateCommitUnchecked }
+    /// row_window contract, compressor storage: two units (slots 0 and 1) on
+    /// one shared storage of ratio-two source layer 2, windows 0..13 and
+    /// 16..29 of a 48-row reserve, each producing and committing 13 tokens (so
+    /// the commit copies the carry row 12 from the unit-cap scratch).
+    /// - `Ordered`: the gate holds the shared stream after unit A wrote its
+    ///   scratch input and before its kernels; A then commits, B produces and
+    ///   commits. Every host staging write happens before any of it runs, B
+    ///   must stay pending behind A, and both units' cache rows and carries
+    ///   equal private runs.
+    /// - `PrivateStreams` (negative control for the shared stream): each wave
+    ///   has its own stream, B runs while A is held and clobbers A's scratch.
+    /// - `LateCommit`: B produces before A commits; A's commit must refuse
+    ///   (its carry scratch was overwritten).
+    /// - `LateCommitUnchecked` (negative control for the carry check): the
+    ///   refusal is skipped and A's carry row differs from its private run.
+    fn shared_compressor_storage(mode: Shared) -> Result<()> {
+        use crate::shared::memory::row_window::RowWindow;
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
+        let layer = 2;
+        let weights = CompressorWeights::load(&lib, &catalog, layer,
+            CompressorWeights::device_bytes(&catalog, layer)?, 1024*1024)?;
+        let (unit, reserve, rows) = (16usize, 48usize, 13usize);
+        let input = |seed: usize| -> Vec<u8> { (0..rows*5120).flat_map(|i| {
+            let value = (((i * 7 + seed * 11) % 19) as f32 / 19.0 - 0.3).to_bits();
+            ((value >> 16) as u16).to_ne_bytes()
+        }).collect() };
+        let chunk = |lease| CompressorChunk { lease, position: 0, tokens: rows as u32 };
+        let carry = |state: &CompressorState<'_>, slot: usize| -> Result<Vec<u8>> {
+            let mut bytes = vec![0; 4096];
+            for (k, pending) in state.pending.as_ref().context("ratio-two carry")?.iter().enumerate() {
+                lib.copy_d2h(&mut bytes[k*2048..(k+1)*2048], CuteafdDeviceBuffer {
+                    ptr: unsafe { pending.buffer.ptr.cast::<u8>().add(slot * 2048).cast() }, bytes: 2048, ..pending.buffer })?;
+            }
+            Ok(bytes)
+        };
+        let cached = rows / 2;
+        // Private runs: expected rows, and an ungated warm-up of every kernel
+        // and copy the gated run issues (lazy module loading would otherwise
+        // synchronize behind the gate).
+        let mut expected = Vec::new();
+        for seed in 0..2 {
+            let mut reference = CompressorState::new(&lib, layer, 1, 2, usize::MAX)?;
+            let lease = reference.begin_request(0, 11)?;
+            let mut private = weights.wave(unit, usize::MAX)?;
+            lib.copy_h2d(private.input(), &input(seed))?;
+            unsafe { private.execute(&reference, &[chunk(lease)])?; }
+            private.commit(&mut reference, &[rows as u32])?;
+            expected.push((read(&reference, 0, cached, &lib)?, carry(&reference, 0)?));
+        }
+        let sources = [input(0), input(1)].map(|host| -> Result<DeviceAllocation<'_>> {
+            let buffer = DeviceAllocation::new(&lib, host.len())?;
+            lib.copy_h2d(buffer.buffer, &host)?;
+            Ok(buffer)
+        }).into_iter().collect::<Result<Vec<_>>>()?;
+        let storage = CompressorStorage::new(&lib, reserve, unit, &[layer])?;
+        let private_streams = mode == Shared::PrivateStreams;
+        crate::families::deepseek_v41::v41_compressor::PRIVATE_STREAM.with(|p| p.set(private_streams));
+        let built = (|| -> Result<Vec<_>> { Ok(vec![weights.on_storage(storage.clone())?, weights.on_storage(storage.clone())?]) })();
+        crate::families::deepseek_v41::v41_compressor::PRIVATE_STREAM.with(|p| p.set(false));
+        let mut slots = built?;
+        assert_eq!(std::ptr::eq(slots[0].stream(), slots[1].stream()), !private_streams);
+        slots[0].select_window(RowWindow::within(0..rows, reserve)?)?;
+        slots[1].select_window(RowWindow::within(unit..unit + rows, reserve)?)?;
+        let mut state = CompressorState::new(&lib, layer, 2, 4, usize::MAX)?;
+        let leases = [state.begin_request(0, 11)?, state.begin_request(1, 22)?];
+        // Stage the scratch input; the gate (unit A only) goes before the kernels.
+        let stage = |wave: &mut CompressorWave<'_, '_>, seed: usize, state: &CompressorState<'_>| -> Result<Prepared> {
+            let prepared = wave.prepare(state, &[chunk(leases[seed])])?;
+            unsafe { lib.copy_d2d_async(wave.input(), sources[seed].buffer, rows * 10240, wave.stream().raw)?; }
+            wave.upload_queued(&prepared)?;
+            Ok(prepared)
+        };
+        let launch = |wave: &mut CompressorWave<'_, '_>, prepared: Prepared, state: &CompressorState<'_>| -> Result<()> {
+            unsafe { wave.enqueue(state, prepared.rows)?; }
+            wave.ready = Some(prepared);
+            Ok(())
+        };
+        let late = matches!(mode, Shared::LateCommit | Shared::LateCommitUnchecked);
+        let prepared = stage(&mut slots[0], 0, &state)?;
+        let mut gate = Some(unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, slots[0].stream().raw)? });
+        launch(&mut slots[0], prepared, &state)?;
+        if !late { unsafe { slots[0].enqueue_commit(&state, &[rows as u32])?; } }
+        let prepared = stage(&mut slots[1], 1, &state)?;
+        launch(&mut slots[1], prepared, &state)?;
+        unsafe { slots[1].enqueue_commit(&state, &[rows as u32])?; }
+        if late {
+            crate::families::deepseek_v41::v41_compressor::SKIP_CARRY_CHECK
+                .with(|skip| skip.set(mode == Shared::LateCommitUnchecked));
+            let refused = unsafe { slots[0].enqueue_commit(&state, &[rows as u32]) };
+            crate::families::deepseek_v41::v41_compressor::SKIP_CARRY_CHECK.with(|skip| skip.set(false));
+            if mode == Shared::LateCommit {
+                let error = refused.expect_err("a commit after another production of its layer must refuse");
+                assert!(error.to_string().contains("carry"), "{error:#}");
+                drop(gate.take());
+                slots[1].synchronize()?;
+                slots[1].commit(&mut state, &[rows as u32])?;
+                assert_eq!((read(&state, 1, cached, &lib)?, carry(&state, 1)?), expected[1]);
+                eprintln!("PASS shared compressor storage {mode:?}: stale carry refused");
+                return Ok(());
+            }
+            refused?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if private_streams { 10 } else { 2 });
+        let mut b_done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { lib.cuda_stream_query(slots[1].stream().raw)? } { b_done = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(b_done, private_streams, "unit B {} while unit A was held mid-production",
+            if b_done { "completed" } else { "stayed pending" });
+        drop(gate.take());
+        for wave in &slots { wave.synchronize()?; }
+        for wave in slots.iter_mut() { wave.commit(&mut state, &[rows as u32])?; }
+        let got = (0..2).map(|seed| Ok((read(&state, seed, cached, &lib)?, carry(&state, seed)?))).collect::<Result<Vec<_>>>()?;
+        assert_eq!(got[1], expected[1], "unit B differs from its private run");
+        match mode {
+            Shared::Ordered => assert_eq!(got[0], expected[0], "unit A differs from its private run on shared compressor storage"),
+            Shared::PrivateStreams => assert_ne!(got[0], expected[0],
+                "without the shared stream unit B should clobber A's scratch: the test cannot detect a race"),
+            _ => {
+                assert_eq!(got[0].0, expected[0].0, "unit A's planes are its own rows");
+                assert_ne!(got[0].1, expected[0].1, "an unchecked late commit should copy B's carry: the check is untested");
+            }
+        }
+        eprintln!("PASS shared compressor storage {mode:?}: unit B {} while A was held",
+            if b_done { "completed" } else { "stayed pending" });
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn shared_compressor_storage_units_match_private_runs_behind_a_gated_stream() -> Result<()> {
+        shared_compressor_storage(Shared::Ordered)
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn private_streams_on_shared_compressor_storage_clobber_scratch() -> Result<()> {
+        shared_compressor_storage(Shared::PrivateStreams)
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn compressor_commit_refuses_a_carry_overwritten_by_a_later_production() -> Result<()> {
+        shared_compressor_storage(Shared::LateCommit)
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn unchecked_late_compressor_commit_copies_a_clobbered_carry() -> Result<()> {
+        shared_compressor_storage(Shared::LateCommitUnchecked)
     }
     fn source_commits(replicated: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
