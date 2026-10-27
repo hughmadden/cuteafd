@@ -428,15 +428,13 @@ impl<'w> NativePendingFfn<'w, '_> {
     /// # Safety
     /// Shared values hold the completed contribution for this exact request and
     /// remain immutable until the final reduction completes on the stream.
+    /// Every wait yields to the executor; cancellation drains before releasing frames.
     pub async unsafe fn finish(self,
         shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'w>> {
-        unsafe { self.finish_inner(shared, false).await }
-    }
-    /// # Safety
-    /// Same input retention as finish; cancellation drains before releasing frames.
-    pub async unsafe fn finish_cooperative(self,
-        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'w>> {
-        unsafe { self.finish_inner(shared, true).await }
+        ensure!(self.binding == shared.binding()? && self.layer == shared.layer && self.rows == shared.rows
+            && shared.values.bytes == self.rows as usize * 10240 && shared.values.device_id == self.output.device_id,
+            "native TP shared contribution differs from routed request");
+        unsafe { self.finish_values(shared.values, None).await }
     }
     /// Run shared TP2 after the Spark dispatch, reduce on the transport GPU, and
     /// return the result to the block's GPU. The pending owner retains every lane workspace.
@@ -452,20 +450,12 @@ impl<'w> NativePendingFfn<'w, '_> {
         let destination = input.values.device_id;
         if destination != self.output.device_id {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.device_id };
-            device.future(unsafe { self.finish_values(values, true, Some(destination)) }).await
+            device.future(unsafe { self.finish_values(values, Some(destination)) }).await
         } else {
-            unsafe { self.finish_values(values, true, Some(destination)).await }
+            unsafe { self.finish_values(values, Some(destination)).await }
         }
     }
-    async unsafe fn finish_inner(self,
-        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>, cooperative: bool) -> Result<NativeFfnOutput<'w>> {
-        ensure!(self.binding == shared.binding()? && self.layer == shared.layer && self.rows == shared.rows
-            && shared.values.bytes == self.rows as usize * 10240 && shared.values.device_id == self.output.device_id,
-            "native TP shared contribution differs from routed request");
-        unsafe { self.finish_values(shared.values, cooperative, None).await }
-    }
-    async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, cooperative: bool,
-        destination: Option<i32>) -> Result<NativeFfnOutput<'w>> {
+    async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, destination: Option<i32>) -> Result<NativeFfnOutput<'w>> {
         ensure!(values.device_id == self.output.device_id && values.bytes == self.rows as usize * 10240,
             "shared reduction device/extent differs");
         let timing = std::time::Instant::now();
@@ -478,14 +468,22 @@ impl<'w> NativePendingFfn<'w, '_> {
         // and only then queues the landing and reduce, so no stream sits
         // blocked on a device wait through the round trip. A device-ordered
         // pass queues them at once (the device waits).
+        //
+        // Every wait here yields to the executor rather than blocking the
+        // thread (#815): prefill polls its two encoder lanes on this thread,
+        // and a lane that spun or slept through its ~10 ms round trip kept
+        // the other lane from issuing its next layer, so only one wave was
+        // ever in flight and the Sparks idled half the time. A lone future
+        // (decode) re-polls at once, so its wait is still a spin.
         let host_ordered = !crate::shared::memory::chain::deferred();
         if host_ordered {
-            // `--host-wait block` spins briefly before it sleeps: a reply
-            // usually lands within that, and this wait is the critical path.
+            // The shared host-wait pacing still applies (`--host-wait block`
+            // sleeps past its spin window), between yields.
             let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
             while !exchange.landed(&self.ticket) {
                 crate::shared::spark_waves::healthy()?;
-                if cooperative { tokio::task::yield_now().await } else { backoff.pause() }
+                backoff.pause();
+                tokio::task::yield_now().await;
             }
         }
         // SAFETY: the reduce stream joins the chain (the shared contribution's
@@ -497,20 +495,15 @@ impl<'w> NativePendingFfn<'w, '_> {
             exchange.land(self.ticket, self.stream.raw)?;
             exchange.reduce(slot, values.ptr.cast(), self.output.ptr.cast(), rows as usize, self.stream.raw)?;
         }
-        if cooperative {
-            // SAFETY: the pending owner retains every input until completion or cancellation.
-            unsafe { crate::shared::memory::chain::finish_cooperative(self.stream).await? };
-        } else {
-            // SAFETY: the same stream owns the reduction and its inputs.
-            unsafe { crate::shared::memory::chain::finish(self.library, self.stream.raw)? };
-        }
+        // Inside a chain this records the head; unchained (prefill) it yields
+        // until the reduce completes instead of synchronizing the thread.
+        // SAFETY: the pending owner retains every input until completion or cancellation.
+        unsafe { crate::shared::memory::chain::finish_cooperative(self.stream).await? };
         if host_ordered && crate::shared::memory::chain::active() {
             // The layer's one host wait for its streams: the reduce joined the
             // chain head (attention, router, shared FFN), so its completion is
             // what the next layer's rebinds check (`require_complete`).
-            if cooperative { self.stream.wait().await?; }
-            // SAFETY: this owner's live stream.
-            else { unsafe { self.library.cuda_stream_synchronize(self.stream.raw)? }; }
+            self.stream.wait().await?;
         }
         tracing::debug!(target: "cuteafd::timing", layer = self.layer, rows,
             collect_us = timing.elapsed().as_micros() as u64, "target collection");

@@ -1035,5 +1035,9 @@ mod host_order_tests {
         let land = collect.find("exchange.land(self.ticket, self.stream.raw)").unwrap();
         let drain = collect.find("if host_ordered && crate::shared::memory::chain::active() {").unwrap();
         assert!(landed < land && land < drain, "reply wait, then landing and reduce, then the layer's stream wait");
+        // #815: no wait in the collect blocks the engine thread; the peer
+        // encoder lane must be able to issue its next layer meanwhile.
+        assert!(!collect.contains("cuda_stream_synchronize") && !collect.contains("chain::finish(")
+            && collect[landed..land].contains("tokio::task::yield_now().await"), "collect waits must yield");
     }
 }
