@@ -283,7 +283,7 @@ and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
 
 - **slots == waves** pins the depth (static families, and any user
   `PREFILL_WAVES`, which makes the plan admit only its own waves).
-- **slots > waves** is an adaptive family (GLM 5 and Kimi today; Step,
+- **slots > waves** is an adaptive family (GLM 5, Kimi and Step today;
   GLM Flash and V4 to follow). It admits four slots of the widest unit the
   reserve allows, `ADAPTIVE_UNIT_ROWS` = reserve / 2 = 4096 rows
   (`prefill_waves.rs:134`), bounded by the compiled capacity. Its plan names
@@ -299,8 +299,9 @@ and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
   and returned in the reply header, and it is read without a host wait.
   Busy + idle per row on the critical rank is the call's delivered period.
   `WaveControl` measures each candidate depth (2 × 4096, 3 × 2752,
-  4 × 2048) once, then runs the lowest, re-measuring the current depth on
-  every full-depth call. No depth is predicted from another, because
+  4 × 2048) once per context class (calls ending at most 16K context rows,
+  and longer), then runs the class's lowest, re-measuring the current depth
+  on every full-depth call. No depth is predicted from another, because
   coordinator turnaround per row depends on the unit size. The engine then
   takes the next depth, re-cuts the prefill link's return slots at
   rest, and brackets the call. GLM 5 does this in `start_prefill`

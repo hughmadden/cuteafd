@@ -83,7 +83,7 @@ fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
     // Admitted slots (#762): at least the starting depth; more only where the
     // family's executor chooses its depth at runtime.
     let (waves, slots) = (value["prefill_waves"].as_u64().unwrap(), value["prefill_slots"].as_u64().unwrap());
-    let adaptive = matches!(value["family"].as_str(), Some("glm5" | "kimi_k3"));
+    let adaptive = matches!(value["family"].as_str(), Some("glm5" | "kimi_k3" | "step5"));
     assert!(slots == waves || (adaptive && slots > waves && slots <= 4), "prefill_slots {slots} for {waves} waves: {value}");
     // Exercise the launcher's actual consumer, not a copied jq predicate or a
     // fabricated plan. Sourcing the whole launcher would start containers.
