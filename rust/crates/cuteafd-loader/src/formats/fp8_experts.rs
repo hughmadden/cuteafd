@@ -76,6 +76,11 @@ pub enum ExpertFormat {
 }
 
 impl ExpertFormat {
+    /// Native input rows: calibrated NVFP4 and BF16 weights consume BF16.
+    pub fn bf16_input(self) -> bool {
+        matches!(self, Self::Bf16 | Self::Nvfp4)
+    }
+
     /// Canonical native arithmetic package. NVFP4 always quantizes activations
     /// with the checkpoint's calibrated K16 scales (W4A4), at every row count.
     pub fn package_name(self, geometry: &str) -> String {
@@ -1312,6 +1317,14 @@ mod tests {
         let name = format!("{}_scale", tensors.name(3, 0, Fp8Projection::Down));
         Arc::make_mut(&mut tensors.tensors).remove(&name);
         assert!(tensors.validate_layer(3).is_err());
+    }
+
+    #[test]
+    fn native_input_follows_checkpoint_format() {
+        assert!(ExpertFormat::Bf16.bf16_input());
+        assert!(ExpertFormat::Nvfp4.bf16_input());
+        assert!(!ExpertFormat::Fp8Block128.bf16_input());
+        assert!(!ExpertFormat::Mxfp4.bf16_input());
     }
 
     #[test]

@@ -57,6 +57,8 @@ pub struct SparkEndpoint {
 pub enum SparkIngress {
     Fp8K32,
     Bf16,
+    /// Each layer uses its package's native input; the worker checks the dtype.
+    Native,
     /// Decode rows are unquantized; prefill uses FP8 K32 on the same QP.
     Bf16Decode { rows: u32 },
 }
@@ -217,7 +219,7 @@ impl SparkEndpoint {
     pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
         if !(1..=4096).contains(&self.capacity) { return None; }
         let (request, response) = geometry.compact_wire_bytes(self.capacity,
-            self.ingress == SparkIngress::Bf16)?;
+            matches!(self.ingress, SparkIngress::Bf16 | SparkIngress::Native))?;
         let request = match self.ingress {
             SparkIngress::Bf16Decode { rows } => {
                 if rows == 0 || rows > self.capacity { return None; }
@@ -464,6 +466,19 @@ mod tests {
         let serialized = serde_json::to_value(endpoint).unwrap();
         assert_eq!(serialized["ring_depth"], 2);
         assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+    }
+
+    #[test]
+    fn native_endpoint_reserves_bf16_maximum() {
+        for capacity in [1, 80, 2048, 2752, 4096] {
+            let native = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Native };
+            let bf16 = SparkEndpoint { ingress: SparkIngress::Bf16, ..native };
+            let fp8 = SparkEndpoint { ingress: SparkIngress::Fp8K32, ..native };
+            assert_eq!(native.wire_bytes(ExpertGeometry::STEP5), bf16.wire_bytes(ExpertGeometry::STEP5));
+            assert!(native.wire_bytes(ExpertGeometry::STEP5).unwrap().0 > fp8.wire_bytes(ExpertGeometry::STEP5).unwrap().0);
+            let encoded = serde_json::to_value(native).unwrap();
+            assert_eq!(serde_json::from_value::<SparkEndpoint>(encoded).unwrap(), native);
+        }
     }
 
     #[test]

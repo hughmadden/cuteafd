@@ -425,6 +425,7 @@ fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Resu
 pub(super) fn request(
     layer: usize,
     rows: usize,
+    dtype: ExpertV2Dtype,
     routes: Vec<ExpertProtocolV2RouteEntry>,
     wire: bytes::Bytes,
 ) -> Result<ExpertProtocolV2Request> {
@@ -433,7 +434,7 @@ pub(super) fn request(
         17,
         layer as u32,
         H as u32,
-        ExpertV2Dtype::Bf16,
+        dtype,
         (0..rows as u32)
             .map(|row| ExpertProtocolV2RowDescriptor {
                 row_id: row as u64,
@@ -485,12 +486,12 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         args.peers.len(),
         None,
         super::serve::spark_model(&exports,
-            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: SparkIngress::Bf16 },
+            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: if format.bf16_input() { SparkIngress::Bf16 } else { SparkIngress::Native } },
             u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Bf16 }, 1)?;
+        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: if format.bf16_input() { SparkIngress::Bf16 } else { SparkIngress::Native } }, 1)?;
     Ok((world, config))
 }
 
@@ -499,6 +500,7 @@ fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]
     let warm = request(
         3,
         rows,
+        ExpertV2Dtype::Bf16,
         (0..rows * 8)
             .map(|i| ExpertProtocolV2RouteEntry {
                 row_index: (i / 8) as u32,

@@ -66,7 +66,10 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
         return {name: (lambda width=width, outputs=outputs, dtype=dtype:
                 p.compile_bf16_projection_aot(width=width, outputs=outputs, output_dtype=dtype))
                 for name, (width, outputs, dtype) in shapes.items()}
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd.dsv4_ffn import compile_dsv4_expert_input_quant_aot
     result = {
+        "expert_input_quant": lambda: compile_dsv4_expert_input_quant_aot(SimpleNamespace(hidden=4096)),
         "pack_fp8_kv_plane": lambda: p.compile_pack_fp8_kv_plane_aot(kv_heads=groups, head_dim=192),
         "residual_bf16": lambda: p.compile_residual_add_aot(width=4096),
         "residual_f32": lambda: p.compile_residual_add_aot(width=4096, delta_dtype=torch.float32),
