@@ -4,6 +4,8 @@ use anyhow::{ensure, Context, Result};
 use crate::shared::decode_graph::LayerGraphs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
+use std::rc::Rc;
+use crate::shared::memory::row_window::{RowWindow, ScratchGuard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind { QueryB, OutputB }
@@ -56,9 +58,17 @@ impl<'a> Weights<'a> {
     }
 }
 
-struct Rank<'w,'a> {
-    graphs: LayerGraphs<'w,'a,Weights<'a>>,
-    weights: &'w [Weights<'a>],
+/// Guarded unit-cap inputs/outputs; gathered/query fork readers finish inside
+/// the hook. GEMM scratch/alpha are plain scratch on each rank's shared stream.
+#[cfg(test)]
+thread_local! { static SKIP_STORAGE_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+fn acquire(guard: &ScratchGuard<'_>, stream: *mut std::ffi::c_void) -> Result<()> {
+    #[cfg(test)]
+    if SKIP_STORAGE_ACQUIRE.with(|skip|skip.get()) { return Ok(()); }
+    // SAFETY: caller invokes on this live writer's device.
+    unsafe { guard.acquire(stream) }
+}
+struct RankStorage<'a> {
     stream: Stream<'a>,
     plan: V41Fp8Plan<'a>,
     copy: V41PeerCopy<'a>,
@@ -66,34 +76,56 @@ struct Rank<'w,'a> {
     output: Allocation<'a>,
     scratch: Allocation<'a>,
     alpha: Allocation<'a>,
+    guard: ScratchGuard<'a>,
+}
+struct Rank<'w, 'a> {
+    graphs: LayerGraphs<'w, 'a, Weights<'a>>,
+    weights: &'w [Weights<'a>],
+    storage: Rc<RankStorage<'a>>,
+}
+impl<'a> RankStorage<'a> {
+    fn allocation_sizes(scratch: usize, kind: Kind, unit: u32) -> [usize; 4] {
+        let (k,n) = kind.geometry(); [scratch,16,unit as usize*k*2,unit as usize*n]
+    }
+    fn new(device: Device<'a>, kind: Kind, capacity: u32, readers: &[i32]) -> Result<Rc<Self>> {
+        let (k, n) = kind.geometry();
+        let plan = device.run(|| device.library.v41_fp8_matrix_plan(capacity, k as u32, (n / 2) as u32))?;
+        let stream = Stream::new(device)?;
+        let [scratch_bytes, alpha_bytes, input_bytes, output_bytes] = Self::allocation_sizes(plan.info().scratch_bytes as usize, kind, capacity);
+        let scratch = Allocation::new(device, scratch_bytes)?;
+        let alpha = Allocation::new(device, alpha_bytes)?;
+        let initialized = device.run(|| unsafe { plan.initialize_scratch(scratch.buffer, alpha.buffer, stream.raw) });
+        initialized.and(stream.drain())?;
+        Ok(Rc::new(Self { stream, plan, copy: device.run(|| device.library.v41_peer_copy())?,
+            input: Allocation::new(device, input_bytes)?,
+            output: Allocation::new(device, output_bytes)?, scratch, alpha,
+            guard: ScratchGuard::new(device.library, readers)?,
+        }))
+    }
+}
+impl Drop for RankStorage<'_> {
+    fn drop(&mut self) { self.stream.drain_or_abort("projection rank storage"); }
 }
 impl<'w,'a> Rank<'w,'a> {
-    fn new(weights: &'w [Weights<'a>], capacity: u32) -> Result<Self> {
+    fn on_storage(weights: &'w [Weights<'a>], storage: Rc<RankStorage<'a>>) -> Result<Self> {
         let first=weights.first().context("projection shard weights absent")?;
-        let device=first.device; let (k,n)=first.kind.geometry();
+        let device=first.device;
         ensure!(weights.len()<=40 && weights.iter().all(|w|w.kind==first.kind
             && w.rank==first.rank && w.device.id==device.id
             && std::ptr::eq(w.device.library,device.library)),"projection weight bank differs");
         for (index,w) in weights.iter().enumerate() {
             ensure!(!weights[..index].iter().any(|other|other.layer==w.layer),"duplicate projection layer");
         }
-        let plan=device.run(||device.library.v41_fp8_matrix_plan(capacity,k as u32,(n/2) as u32))?;
-        let stream=Stream::new(device)?;
-        let scratch=Allocation::new(device,plan.info().scratch_bytes as usize)?;
-        let alpha=Allocation::new(device,16)?;
-        let initialized=device.run(||unsafe { plan.initialize_scratch(scratch.buffer,alpha.buffer,stream.raw) });
-        let drained=stream.drain();initialized.and(drained)?;
+        ensure!(storage.stream.device.id == device.id, "projection rank storage device differs");
         let mut graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32);graphs.enable_small_shapes();
-        Ok(Self { graphs,weights,stream,plan,copy:device.run(||device.library.v41_peer_copy())?,
-            input:Allocation::new(device,capacity as usize*k*2)?,
-            output:Allocation::new(device,capacity as usize*n)?,scratch,alpha })
+        Ok(Self { graphs, weights, storage })
     }
 }
 
 impl<'w,'a> Rank<'w,'a> {
     unsafe fn enqueue(&self,weights:&Weights<'a>,rows:u32)->Result<()> {
-        unsafe { self.plan.launch(self.input.buffer,weights.weight.buffer,weights.scales.buffer,
-            self.scratch.buffer,self.alpha.buffer,self.output.buffer,rows,self.stream.raw) }
+        unsafe { self.storage.plan.launch(self.storage.input.buffer,weights.weight.buffer,weights.scales.buffer,
+            self.storage.scratch.buffer,self.storage.alpha.buffer,self.storage.output.buffer,rows,self.storage.stream.raw) }
     }
     // Called only after the gathered result has completed, which also covers
     // the peer rank. Capture records the next invocation without repeating work.
@@ -101,11 +133,11 @@ impl<'w,'a> Rank<'w,'a> {
         let weights=self.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
-        let device=self.stream.device;
+        let device=self.storage.stream.device;
         device.run(||unsafe {
-            device.library.cuda_graph_begin_capture(self.stream.raw)?;
+            device.library.cuda_graph_begin_capture(self.storage.stream.raw)?;
             let queued=self.enqueue(weights,rows);
-            let captured=device.library.cuda_graph_end_capture(self.stream.raw);
+            let captured=device.library.cuda_graph_end_capture(self.storage.stream.raw);
             match (queued,captured) {
                 (Ok(()),Ok(graph)) => {
                     if let Err(error)=self.graphs.insert(layer,weights,rows,graph) {
@@ -121,20 +153,52 @@ impl<'w,'a> Rank<'w,'a> {
 }
 impl Drop for Rank<'_,'_> {
     fn drop(&mut self) {
-        if let Err(error)=self.stream.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection rank"); }
-        let device=self.stream.device;
+        if let Err(error)=self.storage.stream.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection rank"); }
+        let device=self.storage.stream.device;
         if let Err(error)=device.run(||unsafe { self.graphs.clear() }) {
             tracing::error!(%error,"destroying projection rank graphs");
         }
     }
 }
 
+/// One TP2 projection storage shared by all slots. All device data are
+/// guarded scratch at the unit cap; events/streams/plans live with storage.
+pub(crate) struct Storage<'a> {
+    ranks: [Rc<RankStorage<'a>>; 2],
+    output: Allocation<'a>,
+    peer_done: Event<'a>,
+    input_ready: [Event<'a>; 2],
+    guard: ScratchGuard<'a>,
+    owner: usize,
+    unit: u32,
+    kind: Kind,
+}
+impl<'a> Storage<'a> {
+    pub(crate) fn storage_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind, unit: u32, owner: usize) -> Result<[usize; 2]> {
+        Wave::device_bytes(library, kind, unit, owner)
+    }
+    pub(crate) fn new(devices: [Device<'a>; 2], kind: Kind, unit: u32, owner: usize) -> Result<Rc<Self>> {
+        ensure!(owner < 2 && unit > 0 && unit <= 4096 && devices[0].id != devices[1].id,
+            "invalid projection storage geometry");
+        let readers = [devices[0].id, devices[1].id];
+        for i in 0..2 { devices[i].run(|| devices[i].library.cuda_enable_peer(devices[1-i].id))?; }
+        Ok(Rc::new(Self {
+            ranks: [RankStorage::new(devices[0], kind, unit, &readers)?, RankStorage::new(devices[1], kind, unit, &readers)?],
+            output: Allocation::new(devices[owner], unit as usize * kind.geometry().1 * 2)?,
+            peer_done: Event::new(devices[1-owner])?,
+            input_ready: [Event::new(devices[0])?, Event::new(devices[1])?],
+            guard: ScratchGuard::new(devices[0].library, &readers)?, owner, unit, kind,
+        }))
+    }
+}
+impl Drop for Storage<'_> {
+    fn drop(&mut self) { for rank in &self.ranks { rank.stream.drain_or_abort("projection storage"); } }
+}
 pub(crate) struct Wave<'w,'a> {
     gather_graphs: LayerGraphs<'w,'a,Weights<'a>>,
     ranks: [Rank<'w,'a>;2],
-    output: Allocation<'a>,
-    peer_done: Event<'a>,
-    input_ready: [Event<'a>;2],
+    storage: Rc<Storage<'a>>,
+    window: RowWindow,
     owner: usize,
     capacity: u32,
     kind: Kind,
@@ -149,12 +213,13 @@ impl Drop for Drain<'_,'_,'_> {
 }
 impl<'w,'a> Wave<'w,'a> {
     pub fn kind(&self) -> Kind { self.kind }
-    pub fn output_device(&self) -> Device<'a> { self.output.device }
+    pub(crate) fn capacity(&self) -> u32 { self.capacity }
+    pub fn output_device(&self) -> Device<'a> { self.storage.output.device }
     pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary,kind: Kind,capacity: u32,owner: usize) -> Result<[usize;2]> {
         ensure!(owner<2 && (1..=4096).contains(&capacity),"invalid projection wave geometry");
         let (k,n)=kind.geometry();
         let plan=library.v41_fp8_matrix_plan_info(capacity,k as u32,(n/2) as u32)?;
-        let half=plan.scratch_bytes as usize+16+capacity as usize*(k*2+n);
+        let half=RankStorage::allocation_sizes(plan.scratch_bytes as usize,kind,capacity).into_iter().sum::<usize>();
         let mut bytes=[half;2];bytes[owner]+=capacity as usize*n*2;Ok(bytes)
     }
     pub fn new(weights: [&'w [Weights<'a>];2],capacity: u32,owner: usize,budgets: [usize;2]) -> Result<Self> {
@@ -166,22 +231,39 @@ impl<'w,'a> Wave<'w,'a> {
             "projection rank layers differ");
         let needed=Self::device_bytes(a.device.library,a.kind,capacity,owner)?;
         ensure!(needed.iter().zip(budgets).all(|(&need,budget)|need<=budget),"projection workspace exceeds budget");
-        for (device,peer) in [(a.device,b.device),(b.device,a.device)] {
-            device.run(||device.library.cuda_enable_peer(peer.id))?;
-        }
-        let devices=[a.device,b.device];let (_,n)=a.kind.geometry();
+        Self::on_storage(weights, Storage::new([a.device, b.device], a.kind, capacity, owner)?)
+    }
+    pub(crate) fn on_storage(weights: [&'w [Weights<'a>]; 2], storage: Rc<Storage<'a>>) -> Result<Self> {
+        let a = weights[0].first().context("projection rank 0 absent")?;
+        let b = weights[1].first().context("projection rank 1 absent")?;
+        ensure!(a.kind == storage.kind && b.kind == storage.kind && a.rank == 0 && b.rank == 1
+            && a.device.id == storage.ranks[0].stream.device.id && b.device.id == storage.ranks[1].stream.device.id
+            && std::ptr::eq(a.device.library, storage.ranks[0].stream.device.library)
+            && std::ptr::eq(b.device.library, storage.ranks[1].stream.device.library),
+            "projection weights/storage differ");
+        ensure!(weights[0].len() == weights[1].len()
+            && weights[0].iter().zip(weights[1]).all(|(a,b)| a.layer == b.layer),
+            "projection rank layers differ");
         let mut gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32);gather_graphs.enable_small_shapes();
-        Ok(Self { gather_graphs,ranks:[Rank::new(weights[0],capacity)?,Rank::new(weights[1],capacity)?],
-            output:Allocation::new(devices[owner],capacity as usize*n*2)?,
-            peer_done:Event::new(devices[1-owner])?,
-            input_ready:[Event::new(devices[0])?,Event::new(devices[1])?],owner,capacity,kind:a.kind })
+        Ok(Self { gather_graphs,
+            ranks: [Rank::on_storage(weights[0], storage.ranks[0].clone())?, Rank::on_storage(weights[1], storage.ranks[1].clone())?],
+            owner: storage.owner, capacity: storage.unit, kind: storage.kind, storage, window: RowWindow::NONE })
+    }
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        if let Some(range) = window.range() { ensure!(range.start < range.end && range.len() <= self.capacity as usize,
+            "projection window exceeds unit"); }
+        self.window = window; Ok(())
+    }
+    pub(crate) fn release_scratch(&self) -> Result<()> {
+        for rank in &self.ranks { rank.storage.guard.release()?; }
+        self.storage.guard.release()
     }
     unsafe fn enqueue_gather(&self,rows:u32)->Result<()> {
         let (_,n)=self.kind.geometry();let owner=&self.ranks[self.owner];
         for (i,rank) in self.ranks.iter().enumerate() {
-            let mut dst=self.output.buffer;
+            let mut dst=self.storage.output.buffer;
             dst.ptr=unsafe { dst.ptr.cast::<u8>().add(i*n).cast() };dst.bytes-=i*n;
-            unsafe { owner.copy.launch_rows(dst,rank.output.buffer,n,rows as usize,n*2,n,owner.stream.raw)?; }
+            unsafe { owner.storage.copy.launch_rows(dst,rank.storage.output.buffer,n,rows as usize,n*2,n,owner.storage.stream.raw)?; }
         }
         Ok(())
     }
@@ -190,7 +272,7 @@ impl<'w,'a> Wave<'w,'a> {
         let weights=&self.ranks[self.owner].weights[0];
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
-        let stream=self.ranks[self.owner].stream.raw;let device=self.output.device;
+        let stream=self.ranks[self.owner].storage.stream.raw;let device=self.storage.output.device;
         device.run(||unsafe {
             device.library.cuda_graph_begin_capture(stream)?;
             let queued=self.enqueue_gather(rows);
@@ -208,7 +290,7 @@ impl<'w,'a> Wave<'w,'a> {
         })
     }
     fn drain(&self) -> Result<()> {
-        let first=self.ranks[0].stream.drain();let second=self.ranks[1].stream.drain();first.and(second)
+        let first=self.ranks[0].storage.stream.drain();let second=self.ranks[1].storage.stream.drain();first.and(second)
     }
     /// # Safety
     /// Input production is complete. Keep input live/unchanged until completion
@@ -227,48 +309,53 @@ impl<'w,'a> Wave<'w,'a> {
         producer: Option<*mut std::ffi::c_void>,
         consume: impl FnOnce(CuteafdDeviceBuffer,*mut std::ffi::c_void)->Result<T>) -> Result<T> {
         let (k,n)=self.kind.geometry();
-        ensure!(rows>0 && rows<=self.capacity && input.bytes>=rows as usize*k*2
-            && !input.ptr.is_null() && self.ranks.iter().any(|r|r.stream.device.id==input.device_id),
+        ensure!(rows>0 && rows<=self.capacity && self.window.admits(rows as usize) && input.bytes>=rows as usize*k*2
+            && !input.ptr.is_null() && self.ranks.iter().any(|r|r.storage.stream.device.id==input.device_id),
             "projection input differs");
         let mut guard=Drain { wave:self,complete:false };let wave=&mut *guard.wave;
-        let input_rank=wave.ranks.iter().position(|r|r.stream.device.id==input.device_id).unwrap();
+        let input_rank=wave.ranks.iter().position(|r|r.storage.stream.device.id==input.device_id).unwrap();
         if let Some(producer)=producer {
-            wave.ranks[input_rank].stream.device.run(||unsafe {
-                wave.ranks[input_rank].stream.device.library.cuda_event_record(wave.input_ready[input_rank].raw,producer)
+            wave.ranks[input_rank].storage.stream.device.run(||unsafe {
+                wave.ranks[input_rank].storage.stream.device.library.cuda_event_record(wave.storage.input_ready[input_rank].raw,producer)
             })?;
         }
         for rank in &wave.ranks {
             let weights=rank.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
-            rank.stream.device.run(||unsafe {
+            rank.storage.stream.device.run(||unsafe {
+                acquire(&rank.storage.guard, rank.storage.stream.raw)?;
                 if producer.is_some() {
-                    rank.stream.device.library.cuda_stream_wait_event(rank.stream.raw,wave.input_ready[input_rank].raw)?;
+                    rank.storage.stream.device.library.cuda_stream_wait_event(rank.storage.stream.raw,wave.storage.input_ready[input_rank].raw)?;
                 }
-                rank.copy.launch_rows(rank.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.stream.raw)?;
-                crate::shared::decode_graph::census::dispatch(rank.stream.device.library, rank.stream.raw,
-                    c"layer_row", rows as usize, rank.graphs.get_shape(layer,weights,rows).map(|(raw,_)|raw),
+                rank.storage.copy.launch_rows(rank.storage.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.storage.stream.raw)?;
+                crate::shared::decode_graph::census::dispatch(rank.storage.stream.device.library, rank.storage.stream.raw,
+                    c"layer_row", rows as usize, if wave.window.is_windowed() { None } else { rank.graphs.get_shape(layer,weights,rows).map(|(raw,_)|raw) },
                     || rank.enqueue(weights,rows))
             })?;
         }
         let owner=&wave.ranks[wave.owner];let peer=&wave.ranks[1-wave.owner];
-        wave.peer_done.record(&peer.stream)?;
-        owner.stream.device.run(||unsafe {
-            owner.stream.device.library.cuda_stream_wait_event(owner.stream.raw,wave.peer_done.raw)?;
-            crate::shared::decode_graph::census::dispatch(owner.stream.device.library, owner.stream.raw,
-                c"layer_row", rows as usize, wave.gather_graphs.get_shape(0,&owner.weights[0],rows).map(|(raw,_)|raw),
+        peer.storage.stream.device.run(|| unsafe { peer.storage.stream.device.library.cuda_event_record(
+            wave.storage.peer_done.raw, peer.storage.stream.raw) })?;
+        owner.storage.stream.device.run(||unsafe {
+            acquire(&wave.storage.guard, owner.storage.stream.raw)?;
+            owner.storage.stream.device.library.cuda_stream_wait_event(owner.storage.stream.raw,wave.storage.peer_done.raw)?;
+            crate::shared::decode_graph::census::dispatch(owner.storage.stream.device.library, owner.storage.stream.raw,
+                c"layer_row", rows as usize, if wave.window.is_windowed() { None } else { wave.gather_graphs.get_shape(0,&owner.weights[0],rows).map(|(raw,_)|raw) },
                 || wave.enqueue_gather(rows))
         })?;
-        let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.output.buffer };
-        let result=owner.stream.device.run(||consume(output,owner.stream.raw))?;
-        owner.stream.wait().await?;
-        for rank in &mut wave.ranks { rank.capture_ready(layer,rows)?; }
-        wave.capture_gather_ready(rows)?;
+        let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.storage.output.buffer };
+        let result=owner.storage.stream.device.run(||consume(output,owner.storage.stream.raw))?;
+        owner.storage.stream.complete().await?;
+        if !wave.window.is_windowed() && !crate::shared::memory::chain::deferred() {
+            for rank in &mut wave.ranks { rank.capture_ready(layer,rows)?; }
+            wave.capture_gather_ready(rows)?;
+        }
         guard.complete=true;Ok(result)
     }
 }
 impl Drop for Wave<'_,'_> {
     fn drop(&mut self) {
         if let Err(error)=self.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection"); }
-        let device=self.output.device;
+        let device=self.storage.output.device;
         if let Err(error)=device.run(||unsafe { self.gather_graphs.clear() }) {
             tracing::error!(%error,"destroying projection gather graphs");
         }
@@ -366,5 +453,85 @@ mod tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn projection_storage_bytes_equal_rank_allocation_plan() {
+        for kind in [Kind::QueryB,Kind::OutputB] {for unit in [4096,2752,2048] {
+            let (k,n)=kind.geometry();
+            let sizes=RankStorage::allocation_sizes(123,kind,unit);
+            assert_eq!(sizes.into_iter().sum::<usize>(),123+16+unit as usize*(k*2+n));
+        }}
+    }
+}
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    use crate::shared::memory::chain::StageChain;
+    fn run(kind: Kind, guarded: bool) -> Result<()> {
+        let lib=unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        lib.cuda_set_device(0)?;
+        let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
+        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(kind))?],
+            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(kind))?]];
+        let banks=[weights[0].as_slice(),weights[1].as_slice()];
+        let (rows,unit)=(13u32,16u32);let (k,n)=kind.geometry();
+        let inputs=[Allocation::new(devices[0],rows as usize*k*2)?,Allocation::new(devices[0],rows as usize*k*2)?];
+        for (seed,input) in inputs.iter().enumerate() {
+            let host:Vec<u8>=(0..rows as usize*k).flat_map(|i| {
+                let f=((i*7+seed*11)%29) as f32/32.0-0.4;((f.to_bits()>>16) as u16).to_ne_bytes()
+            }).collect();lib.copy_h2d(input.buffer,&host)?;
+        }
+        let runtime=tokio::runtime::Builder::new_current_thread().build()?;
+        let mut private=Wave::new(banks,unit,0,Wave::device_bytes(&lib,kind,unit,0)?)?;
+        let expected=runtime.block_on(unsafe {private.execute(2,rows,inputs[0].buffer)})?;
+        let mut want=vec![0;rows as usize*n*2];lib.copy_d2h(&mut want,expected)?;
+        let storage=Storage::new(devices,kind,unit,0)?;
+        let mut slots=[Wave::on_storage(banks,storage.clone())?,Wave::on_storage(banks,storage.clone())?];
+        for (i,slot) in slots.iter_mut().enumerate() {
+            slot.select_window(RowWindow::within(i*unit as usize..i*unit as usize+rows as usize,48)?)?;
+            runtime.block_on(unsafe {slot.execute(2,rows,inputs[i].buffer)})?;
+        }
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,storage.output.buffer,want.len(),reader.raw)})?;reader.drain()?;
+        let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
+        let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;
+        runtime.block_on(chains[0].handle().scope(async {
+            let output=unsafe {slots[0].execute(2,rows,inputs[0].buffer).await?};
+            devices[1].run(||unsafe {crate::shared::memory::chain::join(&lib,reader.raw)?;
+                lib.copy_peer_async(saved.buffer,output,want.len(),reader.raw)?;
+                crate::shared::memory::chain::finish(&lib,reader.raw)})?;
+            slots[0].release_scratch()
+        }))?;
+        SKIP_STORAGE_ACQUIRE.with(|flag|flag.set(!guarded));
+        let queued=runtime.block_on(chains[1].handle().scope(async {
+            unsafe {slots[1].execute(2,rows,inputs[1].buffer).await?;} anyhow::Ok(())
+        }));
+        SKIP_STORAGE_ACQUIRE.with(|flag|flag.set(false));queued?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(if guarded {2} else {10});let mut done=false;
+        while std::time::Instant::now()<deadline {
+            if devices[0].run(||unsafe {lib.cuda_stream_query(storage.ranks[0].stream.raw)})? {done=true;break;}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(gate);for chain in &chains {chain.drain()?;}reader.drain()?;
+        assert_eq!(done,!guarded,"projection B completion before A peer-reader release");
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        if guarded {assert_eq!(got,want);} else {assert_ne!(got,want,"negative control did not clobber gather output");}
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires projection AOT, snapshot and two GPUs"]
+    fn tp2_projection_shared_scratch_preserves_gated_peer_reader() -> Result<()> {
+        for _ in 0..3 {for kind in [Kind::QueryB,Kind::OutputB] {run(kind,true)?;}} Ok(())
+    }
+    #[test]
+    #[ignore = "requires projection AOT, snapshot and two GPUs"]
+    fn tp2_projection_without_guard_clobbers_gated_peer_reader() -> Result<()> {
+        for _ in 0..3 {for kind in [Kind::QueryB,Kind::OutputB] {run(kind,false)?;}} Ok(())
     }
 }

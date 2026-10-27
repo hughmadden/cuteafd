@@ -56,18 +56,61 @@ pub(crate) trait AttentionGraphTail {
 }
 pub(crate) type SparseAttentionWave<'a> = LocalSparseAttentionWave<'a,64>;
 pub(crate) type CompactSparseAttentionWave<'a> = LocalSparseAttentionWave<'a,32>;
-pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
+/// Query/output are guarded unit scratch: fork readers on either GPU consume
+/// them inside the attention hook. Other device buffers are plain unit scratch
+/// on this storage's one stream. Pinned LayerStaging, graphs and cold plans are
+/// per slot. release_scratch must follow the hook's final reader join.
+#[cfg(test)]
+thread_local! { static SKIP_STORAGE_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(crate) struct SparseAttentionStorage<'a, const HEADS: usize> {
     stream: LoadStream<'a>,
     kernel: V41SparseAttention<'a>,
     query: DeviceAllocation<'a>,
     output: DeviceAllocation<'a>,
     split_scratch: DeviceAllocation<'a>,
     descriptors: DeviceAllocation<'a>,
+    replay_begins: DeviceAllocation<'a>,
+    metadata: DeviceAllocation<'a>,
+    guard: crate::shared::memory::row_window::ScratchGuard<'a>,
+    unit: usize,
+}
+impl<'a, const HEADS: usize> SparseAttentionStorage<'a, HEADS> {
+    fn allocation_sizes(unit: usize) -> Result<[usize; 6]> {
+        ensure!((1..=4096).contains(&unit) && matches!(HEADS, 32 | 64), "invalid sparse storage unit/heads");
+        let batch = unit.min(cuteafd_core::V41_VERIFY_ROWS);
+        Ok([unit * HEADS * 1024, unit * HEADS * 1024,
+            V41SparseAttention::split_scratch_bytes(batch, 10)? / 64 * HEADS,
+            V41SparseAttention::batch_descriptor_bytes(batch)?, unit * 8, unit * 80])
+    }
+    pub(crate) fn storage_bytes(unit: usize) -> Result<usize> {
+        Ok(Self::allocation_sizes(unit)?.into_iter().sum())
+    }
+    pub(crate) fn new(library: &'a NativeLibrary, unit: usize, readers: &[i32]) -> Result<std::rc::Rc<Self>> {
+        let [query, output, split, descriptors, replay, metadata] = Self::allocation_sizes(unit)?;
+        Ok(std::rc::Rc::new(Self {
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            kernel: if HEADS == 64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
+            query: DeviceAllocation::new(library, query)?, output: DeviceAllocation::new(library, output)?,
+            split_scratch: DeviceAllocation::new(library, split)?, descriptors: DeviceAllocation::new(library, descriptors)?,
+            replay_begins: DeviceAllocation::new(library, replay)?, metadata: DeviceAllocation::new(library, metadata)?,
+            guard: crate::shared::memory::row_window::ScratchGuard::new(library, readers)?, unit,
+        }))
+    }
+}
+impl<const HEADS: usize> Drop for SparseAttentionStorage<'_, HEADS> {
+    fn drop(&mut self) {
+        // SAFETY: the shared stream is owned here and drains before its buffers.
+        crate::shared::decode_graph::fatal_drain(unsafe {
+            self.stream.library.cuda_stream_synchronize(self.stream.raw)
+        }, "sparse attention storage");
+    }
+}
+pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
+    storage: std::rc::Rc<SparseAttentionStorage<'a, HEADS>>,
+    window: crate::shared::memory::row_window::RowWindow,
     /// Per-layer pinned staging (see `LayerStaging`): metadata, descriptors
     /// and replay begins differ by layer and may still be queued.
     descriptor_staging: LayerStaging<'a>,
-    replay_begins: DeviceAllocation<'a>,
-    metadata: DeviceAllocation<'a>,
     staging: LayerStaging<'a>,
     replay_staging: LayerStaging<'a>,
     capacity: usize,
@@ -129,52 +172,45 @@ fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDevi
 }
 impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
-        ensure!(
-            (1..=4096).contains(&capacity) && matches!(HEADS,32|64),
-            "invalid sparse attention capacity"
-        );
-        Ok(capacity * (HEADS*2048+88) + V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS), 10)?/64*HEADS
-            + V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?)
+        SparseAttentionStorage::<'_, HEADS>::storage_bytes(capacity)
     }
     pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
-        ensure!(
-            Self::device_bytes(capacity)? <= budget,
-            "sparse attention exceeds budget"
-        );
+        ensure!(Self::device_bytes(capacity)? <= budget, "sparse attention exceeds budget");
+        Self::on_storage(SparseAttentionStorage::new(library, capacity, &[library.cuda_get_device()?])?)
+    }
+    pub(crate) fn on_storage(storage: std::rc::Rc<SparseAttentionStorage<'a, HEADS>>) -> Result<Self> {
+        let library = storage.stream.library;
+        let capacity = storage.unit;
+        let batch = capacity.min(cuteafd_core::V41_VERIFY_ROWS);
         Ok(Self {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            kernel: if HEADS==64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
-            query: DeviceAllocation::new(library, capacity * (HEADS*1024))?,
-            output: DeviceAllocation::new(library, capacity * (HEADS*1024))?,
-            split_scratch: DeviceAllocation::new(
-                library,
-                V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS), 10)?/64*HEADS,
-            )?,
-            descriptors: DeviceAllocation::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?)?,
-            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?, 40)?,
-            replay_begins: DeviceAllocation::new(library, capacity * 8)?,
-            metadata: DeviceAllocation::new(library, capacity * 80)?,
+            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40)?,
             staging: LayerStaging::new(library, capacity * 80, 40)?,
             replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
-            capacity,
-            batch_rows: capacity.min(cuteafd_core::V41_VERIFY_ROWS),
-            attention_plan: None,
-            decode: false,
-            graphs: GraphBank::new(None),
-            graph_limit: 1,
-            warmed_kernels: 0,
-            cold: None,
+            storage, window: crate::shared::memory::row_window::RowWindow::NONE,
+            capacity, batch_rows: batch, attention_plan: None, decode: false,
+            graphs: GraphBank::new(None), graph_limit: 1, warmed_kernels: 0, cold: None,
         })
+    }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        ensure!(self.cold.is_none(), "sparse window changes while cold preparation pending");
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.len() <= self.capacity, "sparse window exceeds unit");
+        }
+        self.window = window; Ok(())
+    }
+    pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
+    fn acquire_scratch(&self) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_STORAGE_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+        // SAFETY: writer is this storage's live stream on the current device.
+        unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
     }
     pub fn install_attention_plan(&mut self,
         plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
         validate_plan_installation(self.attention_plan.is_some(), self.graphs.len(), self.cold.is_some(),
             self.batch_rows, plan.capacity_rows())?;
-        self.kernel.validate_plan(plan, &[self.query.buffer, self.output.buffer, self.split_scratch.buffer,
-            self.descriptors.buffer, self.replay_begins.buffer, self.metadata.buffer])?;
+        self.storage.kernel.validate_plan(plan, &[self.storage.query.buffer, self.storage.output.buffer, self.storage.split_scratch.buffer,
+            self.storage.descriptors.buffer, self.storage.replay_begins.buffer, self.storage.metadata.buffer])?;
         self.attention_plan = Some(plan);
         Ok(())
     }
@@ -188,28 +224,29 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             "sparse decode reservation requires an unused wave");
         if rows <= self.batch_rows { return Ok(()); }
         ensure!(self.attention_plan.is_none(), "attention workspace is immutable after plan admission");
-        let library = self.stream.library;
+        let library = self.storage.stream.library;
         let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS)?;
         let bytes = V41SparseAttention::batch_descriptor_bytes(rows)?;
         let descriptors = DeviceAllocation::new(library, bytes)?;
         let staging = LayerStaging::new(library, bytes, 40)?;
         let additional_device_bytes = scratch.buffer.bytes + descriptors.buffer.bytes
-            - self.split_scratch.buffer.bytes - self.descriptors.buffer.bytes;
-        self.split_scratch = scratch;
-        self.descriptors = descriptors;
+            - self.storage.split_scratch.buffer.bytes - self.storage.descriptors.buffer.bytes;
+        let storage = std::rc::Rc::get_mut(&mut self.storage).context("cannot resize shared sparse storage")?;
+        storage.split_scratch = scratch;
+        storage.descriptors = descriptors;
         self.descriptor_staging = staging;
         self.batch_rows = rows;
         if self.graph_limit > 1 { self.graph_limit = rows; }
-        tracing::info!(device=self.query.buffer.device_id, rows, additional_device_bytes,
+        tracing::info!(device=self.storage.query.buffer.device_id, rows, additional_device_bytes,
             "sparse decode batch reservation before KV sizing");
         Ok(())
     }
     pub fn enable_small_graph_shapes(&mut self) { self.graph_limit = self.batch_rows; }
     pub fn input(&self) -> CuteafdDeviceBuffer {
-        self.query.buffer
+        self.storage.query.buffer
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.drain_chain()?;
@@ -219,9 +256,9 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     }
     fn graph_count(&self, layer: usize) -> usize { self.graphs.count(|(l, _)| *l == layer) }
     fn insert_graph(&mut self, layer: usize, fingerprint: Vec<usize>, graph: *mut c_void) -> Result<()> {
-        let device = self.stream.library.cuda_get_device()?;
+        let device = self.storage.stream.library.cuda_get_device()?;
         // SAFETY: the lane guard retains all captured cache/selection/tail storage.
-        let owner = unsafe { GraphOwner::new(self.stream.library, device, graph, ())? };
+        let owner = unsafe { GraphOwner::new(self.storage.stream.library, device, graph, ())? };
         tracing::debug!(target: "cuteafd::graph_capture", site = "sparse_attention", device, layer,
             bank = self as *const Self as usize, key = ?fingerprint, "native binding graph captured");
         self.graphs.insert((layer, fingerprint), owner, None);
@@ -235,30 +272,30 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         batch: Option<&V41SparseBatch>,
     ) -> Result<()> {
         if let Some(batch) = batch {
-            return unsafe { self.kernel.launch_batch(batch, self.query.buffer, sink,
-                self.metadata.buffer, selected, self.output.buffer, self.descriptors.buffer,
-                self.replay_begins.buffer, self.split_scratch.buffer, self.stream.raw) };
+            return unsafe { self.storage.kernel.launch_batch(batch, self.storage.query.buffer, sink,
+                self.storage.metadata.buffer, selected, self.storage.output.buffer, self.storage.descriptors.buffer,
+                self.storage.replay_begins.buffer, self.storage.split_scratch.buffer, self.storage.stream.raw) };
         }
         let mut offset = 0;
         for l in launches {
             unsafe {
-                self.kernel.launch(
-                    slice(self.query.buffer, offset * (HEADS*1024), l.rows * (HEADS*1024)),
+                self.storage.kernel.launch(
+                    slice(self.storage.query.buffer, offset * (HEADS*1024), l.rows * (HEADS*1024)),
                     sink,
-                    slice(self.metadata.buffer, offset * 80, l.rows * 80),
+                    slice(self.storage.metadata.buffer, offset * 80, l.rows * 80),
                     selected.map(|b| slice(b, offset * 2048, l.rows * 2048)),
                     &l.window,
                     l.source.as_ref(),
-                    slice(self.output.buffer, offset * (HEADS*1024), l.rows * (HEADS*1024)),
+                    slice(self.storage.output.buffer, offset * (HEADS*1024), l.rows * (HEADS*1024)),
                     l.rows,
                     l.width,
                     // All request launches share this arena on one stream;
                     // each merge finishes before the next partial write.
                     (l.rows <= 16).then_some((
-                        self.split_scratch.buffer,
+                        self.storage.split_scratch.buffer,
                         if l.source.is_some() { 10 } else { 2 },
                     )),
-                    self.stream.raw,
+                    self.storage.stream.raw,
                 )?;
             }
             offset += l.rows;
@@ -279,9 +316,9 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let tokens = query.tokens()?;
         ensure!(
             query.rows == tokens.len()
-                && query.rows <= self.capacity
+                && query.rows <= self.capacity && self.window.admits(query.rows)
                 && query.rotated.bytes == query.rows*(HEADS*1024)
-            && query.rotated.device_id == self.query.buffer.device_id
+            && query.rotated.device_id == self.storage.query.buffer.device_id
                 && requests
                     .iter()
                     .flat_map(|r| r.positions.iter().copied())
@@ -291,9 +328,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         if let Some(s) = selection {
             s.validate_query(binding)?;
         }
+        self.acquire_scratch()?;
         let copied = unsafe {
-            self.stream.library.copy_d2d_async(
-                self.query.buffer, query.rotated, query.rotated.bytes, self.stream.raw,
+            self.storage.stream.library.copy_d2d_async(
+                self.storage.query.buffer, query.rotated, query.rotated.bytes, self.storage.stream.raw,
             )
         };
         if let Err(error) = copied {
@@ -318,8 +356,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         requests: &'s [AttentionRequest<'s>],
         selection: Option<&'s IndexSelectionOutput<'s>>,
     ) -> Result<SparseAttentionOutput<'s>> {
-        let library = self.stream.library;
-        let stream = self.stream.raw;
+        let library = self.storage.stream.library;
+        let stream = self.storage.stream.raw;
         let result = unsafe { self.execute_staged(layer, sink, requests, selection) };
         let drained = unsafe { library.cuda_stream_synchronize(stream) };
         let queued = result.and_then(|v| drained.map(|()| v))?;
@@ -341,12 +379,12 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     /// Complete the queued attention chain: ordered inside a stage chain,
     /// otherwise awaited on the host.
     pub async fn wait_chain(&self) -> Result<()> {
-        unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await }
+        unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await }
     }
     pub fn drain_chain(&mut self) -> Result<()> {
         let drained = self.synchronize(); self.cold = None; drained
     }
-    pub fn chain_stream(&self) -> *mut c_void { self.stream.raw }
+    pub fn chain_stream(&self) -> *mut c_void { self.storage.stream.raw }
     /// # Safety
     /// Retain query/cache/selection buffers until warmup and downstream consumers
     /// complete or drain. No new submission may reuse this owner while pending.
@@ -357,15 +395,16 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         ensure!(self.cold.is_none(), "cold attention preparation already pending");
         let binding = query.binding()?;
         let tokens = query.tokens()?;
-        ensure!(query.rows == tokens.len() && query.rows <= self.capacity
+        ensure!(query.rows == tokens.len() && query.rows <= self.capacity && self.window.admits(query.rows)
             && query.rotated.bytes == query.rows*(HEADS*1024)
-            && query.rotated.device_id == self.query.buffer.device_id
+            && query.rotated.device_id == self.storage.query.buffer.device_id
             && requests.iter().flat_map(|r| r.positions.iter().copied()).eq(tokens.iter().copied()),
             "attention query token order or device differs");
         if let Some(s) = selection { s.validate_query(binding)?; }
         let result = (|| unsafe {
-            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-            self.stream.library.copy_d2d_async(self.query.buffer, query.rotated, query.rotated.bytes, self.stream.raw)?;
+            self.acquire_scratch()?;
+            crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.storage.stream.library.copy_d2d_async(self.storage.query.buffer, query.rotated, query.rotated.bytes, self.storage.stream.raw)?;
             self.execute_staged_inner(query.layer, sink, requests, selection, defer_warmup, tail)
         })();
         if result.is_err() { self.drain_chain()?; }
@@ -378,29 +417,29 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let plan = self.cold.take().context("cold attention preparation absent")?;
         #[cfg(test)]
         eprintln!("queued sparse warmup layer={} rows={} batched={}", plan.layer, plan.rows, plan.batch.is_some());
-        self.stream.wait().await?;
+        self.storage.stream.wait().await?;
         ensure!(plan.tail_identity == tail.as_ref().map(|t| t.identity()), "cold attention tail identity changed");
         if let Some(tail) = tail.as_deref_mut() { unsafe { tail.restore_warmup()?; } }
         self.warmed_kernels |= plan.needed;
         let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
         self.insert_graph(plan.layer, plan.fingerprint, graph)?;
-        let launched = unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) };
+        let launched = unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw) };
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        Ok(QueuedSparseAttention { values: slice(self.output.buffer, 0, plan.rows * (HEADS*1024)),
+        Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
             layer: plan.layer, rows: plan.rows })
     }
     unsafe fn capture_plan(&self, plan: &ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<*mut c_void> {
-        unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
+        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
         let launched = (|| unsafe {
             self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
             if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&QueuedSparseAttention {
-                values: slice(self.output.buffer, 0, plan.rows * (HEADS*1024)), layer: plan.layer, rows: plan.rows }, self.stream.raw)?; }
+                values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)), layer: plan.layer, rows: plan.rows }, self.storage.stream.raw)?; }
             Ok(())
         })();
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => Ok(graph),
-            (Err(error), Ok(graph)) => { unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; } Err(error) }
+            (Err(error), Ok(graph)) => { unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; } Err(error) }
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -417,10 +456,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 }
             } }
         }
-        let mut drain = Drain(self.stream.library, self.stream.raw, false);
+        let mut drain = Drain(self.storage.stream.library, self.storage.stream.raw, false);
         let queued = unsafe { self.enqueue_query_prepared(query, sink, requests, selection, false, Some(tail)) };
         let drained = if queued.is_err() { self.synchronize() }
-            else { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) } };
+            else { unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) } };
         drain.2 = true;
         queued.and_then(|value| value.context("direct graph unexpectedly deferred")).and(drained)
     }
@@ -429,14 +468,14 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         consume: impl FnOnce(QueuedSparseAttention, *mut c_void) -> Result<T>) -> Result<T> {
         let binding = query.binding()?;
         let tokens = query.tokens()?;
-        ensure!(query.rows == tokens.len() && query.rows <= self.capacity
+        ensure!(query.rows == tokens.len() && query.rows <= self.capacity && self.window.admits(query.rows)
             && query.rotated.bytes == query.rows*(HEADS*1024)
-            && query.rotated.device_id == self.query.buffer.device_id
+            && query.rotated.device_id == self.storage.query.buffer.device_id
             && requests.iter().flat_map(|r| r.positions.iter().copied()).eq(tokens.iter().copied()),
             "attention query token order or device differs");
         if let Some(s) = selection { s.validate_query(binding)?; }
-        let library = self.stream.library;
-        let stream = self.stream.raw;
+        let library = self.storage.stream.library;
+        let stream = self.storage.stream.raw;
         // Also drain on unwinding before the caller can release consumer owners.
         struct Drain<'a>(&'a NativeLibrary, *mut c_void, bool);
         impl Drop for Drain<'_> {
@@ -448,7 +487,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         }
         let mut drain = Drain(library, stream, false);
         let result = (|| unsafe {
-            library.copy_d2d_async(self.query.buffer, query.rotated, query.rotated.bytes, stream)?;
+            self.acquire_scratch()?;
+            library.copy_d2d_async(self.storage.query.buffer, query.rotated, query.rotated.bytes, stream)?;
             let queued = self.execute_staged(query.layer, sink, requests, selection)?;
             consume(queued, stream)
         })();
@@ -469,6 +509,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     unsafe fn execute_staged_inner(&mut self, layer: usize, sink: CuteafdDeviceBuffer,
         requests: &[AttentionRequest<'_>], selection: Option<&IndexSelectionOutput<'_>>,
         defer_warmup: bool, mut tail: Option<&mut dyn AttentionGraphTail>) -> Result<Option<QueuedSparseAttention>> {
+        self.acquire_scratch()?;
         ensure!(self.cold.is_none(), "attention warmup is pending");
         ensure!(
             layer < 40 && !requests.is_empty() && requests.len() <= 16,
@@ -476,13 +517,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         );
         let rows: usize = requests.iter().map(|r| r.positions.len()).sum();
         ensure!(
-            rows > 0 && rows <= self.capacity,
-            "attention rows exceed capacity"
+            rows > 0 && rows <= self.capacity && self.window.admits(rows),
+            "attention rows exceed capacity or differ from slot window"
         );
         ensure!(
             sink.bytes >= HEADS*4
                 && !sink.ptr.is_null()
-                && sink.device_id == self.query.buffer.device_id,
+                && sink.device_id == self.storage.query.buffer.device_id,
             "attention sink differs"
         );
         ensure!(
@@ -551,7 +592,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 proposal_scales: w.scales,
                 end: w.cache.device_end,
                 proposal_capacity: w.capacity,
-                replay_begins: (HEADS==32 || w.cache.begin != 0).then(|| slice(self.replay_begins.buffer,
+                replay_begins: (HEADS==32 || w.cache.begin != 0).then(|| slice(self.storage.replay_begins.buffer,
                     (metadata.len() / 10 - r.positions.len()) * 8, r.positions.len() * 8)),
             };
             let source = r.source.map(|s| V41SparseSource {
@@ -588,7 +629,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             }
             for b in buffers {
                 ensure!(
-                    b.device_id == self.query.buffer.device_id && !b.ptr.is_null(),
+                    b.device_id == self.storage.query.buffer.device_id && !b.ptr.is_null(),
                     "attention proposal device differs"
                 );
                 fingerprint.extend([b.ptr as usize, b.bytes]);
@@ -603,7 +644,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let selected = if let Some(s) = selection {
             s.validate_attention(layer, &bindings)?;
             ensure!(
-                s.selected.device_id == self.query.buffer.device_id
+                s.selected.device_id == self.storage.query.buffer.device_id
                     && s.selected.bytes == rows * 2048,
                 "attention selection device or size differs"
             );
@@ -616,21 +657,21 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         ensure!(fixed_plan.is_none() || rows <= self.batch_rows,
             "decode rows exceed admitted attention execution capacity");
         // Decode always uses descriptors, including C1; prefill remains explicit legacy dispatch.
-        let batch = if fixed_plan.is_some() || (self.kernel.supports_batch() && launches.len() > 1
+        let batch = if fixed_plan.is_some() || (self.storage.kernel.supports_batch() && launches.len() > 1
             && rows <= self.batch_rows && launches.iter().all(|launch| launch.rows <= 16)) {
             let bindings: Vec<_> = launches.iter()
                 .map(|launch| (&launch.window, launch.source.as_ref(), launch.rows)).collect();
             let batch = if let Some(plan) = fixed_plan {
-                self.kernel.prepare_batch_planned(self.query.buffer, sink, self.metadata.buffer,
-                    selected, &bindings, self.output.buffer, self.descriptors.buffer,
-                    self.replay_begins.buffer, self.split_scratch.buffer, plan)?
-            } else { self.kernel.prepare_batch(self.query.buffer, sink, self.metadata.buffer,
-                selected, &bindings, self.output.buffer, self.descriptors.buffer,
-                self.replay_begins.buffer, self.split_scratch.buffer)? };
+                self.storage.kernel.prepare_batch_planned(self.storage.query.buffer, sink, self.storage.metadata.buffer,
+                    selected, &bindings, self.storage.output.buffer, self.storage.descriptors.buffer,
+                    self.storage.replay_begins.buffer, self.storage.split_scratch.buffer, plan)?
+            } else { self.storage.kernel.prepare_batch(self.storage.query.buffer, sink, self.storage.metadata.buffer,
+                selected, &bindings, self.storage.output.buffer, self.storage.descriptors.buffer,
+                self.storage.replay_begins.buffer, self.storage.split_scratch.buffer)? };
             let (host, bytes) = self.descriptor_staging.region(layer);
             bytes[..batch.bytes().len()].copy_from_slice(batch.bytes());
-            unsafe { self.stream.library.copy_host_buffer_h2d_async(self.descriptors.buffer,
-                host, batch.bytes().len(), self.stream.raw)?; }
+            unsafe { self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.descriptors.buffer,
+                host, batch.bytes().len(), self.storage.stream.raw)?; }
             // The kernel reads current descriptors rather than capturing external
             // cache pointers or request row counts. Selection is lane-owned and
             // stable; still include its address to guard any future owner change.
@@ -643,8 +684,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             bytes[i * 8..i * 8 + 8].copy_from_slice(&m.to_ne_bytes());
         }
         unsafe {
-            self.stream.library.copy_host_buffer_h2d_async(
-                self.metadata.buffer, host, rows * 80, self.stream.raw,
+            self.storage.stream.library.copy_host_buffer_h2d_async(
+                self.storage.metadata.buffer, host, rows * 80, self.storage.stream.raw,
             )?;
         }
         if HEADS==32 || batch.is_some() || requests.iter().any(|r| r.window.cache.begin != 0) {
@@ -658,33 +699,33 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 }
             }
             unsafe {
-                self.stream.library.copy_host_buffer_h2d_async(
-                    self.replay_begins.buffer, host, rows * 8, self.stream.raw,
+                self.storage.stream.library.copy_host_buffer_h2d_async(
+                    self.storage.replay_begins.buffer, host, rows * 8, self.storage.stream.raw,
                 )?;
             }
         }
-        let queued = QueuedSparseAttention { values: slice(self.output.buffer, 0, rows * (HEADS*1024)), layer, rows };
+        let queued = QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, rows * (HEADS*1024)), layer, rows };
         let tail_identity = tail.as_ref().map(|t| t.identity());
         if let Some(identity) = &tail_identity {
             fingerprint.push(usize::MAX - 1); fingerprint.extend(identity);
-            unsafe { tail.as_deref_mut().unwrap().prepare(self.stream.raw)?; }
+            unsafe { tail.as_deref_mut().unwrap().prepare(self.storage.stream.raw)?; }
         }
         let key = (layer, fingerprint.clone());
-        let cached = self.graphs.get(&key).map(|owner| owner.raw);
+        let cached = if self.window.is_windowed() { None } else { self.graphs.get(&key).map(|owner| owner.raw) };
         if crate::shared::decode_graph::census::eager("sparse") {
             // Retain every executable; only dispatch changes between census arms.
             unsafe {
-                self.stream.library.cuda_graph_census_call(self.stream.raw, c"sparse", rows, false,
+                self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"sparse", rows, false,
                     crate::shared::decode_graph::census::arm(), || {
                         self.enqueue(sink, &launches, selected, batch.as_ref())?;
-                        if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.stream.raw)?; }
+                        if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.storage.stream.raw)?; }
                         Ok(())
                     })?;
             }
             return Ok(Some(queued));
         }
         let fixed_limit = super::graph_policy::fixed_binding_limit();
-        if cached.is_none() && (!super::graph_policy::captures_shape(rows as u32)
+        if cached.is_none() && (self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
             || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)
             || exact_small_shape(batch.is_some(), rows, self.batch_rows)) {
             // Exact fingerprints can include launch recipes beyond row count.
@@ -693,7 +734,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 retained=self.graph_count(layer), "V4.1 sparse attention eager binding");
             unsafe {
                 self.enqueue(sink, &launches, selected, batch.as_ref())?;
-                if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.stream.raw)?; }
+                if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.storage.stream.raw)?; }
             }
             return Ok(Some(queued));
         }
@@ -702,8 +743,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             if let Some(tail) = tail.as_deref_mut() { unsafe { tail.replay_state()?; } }
             if crate::shared::decode_graph::census::enabled() {
                 unsafe {
-                    self.stream.library.cuda_graph_census_call(self.stream.raw, c"sparse", rows, true,
-                        crate::shared::decode_graph::census::arm(), || self.stream.library.cuda_graph_launch(graph, self.stream.raw))?;
+                    self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"sparse", rows, true,
+                        crate::shared::decode_graph::census::arm(), || self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw))?;
                 }
                 return Ok(Some(queued));
             }
@@ -718,7 +759,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             if self.graph_count(layer) >= limit {
                 self.graphs.retire_oldest(|(l, _)| *l == layer);
                 // Preserve ownership until a later stream drain, including deferred warmup.
-                let library = self.stream.library; let stream = self.stream.raw;
+                let library = self.storage.stream.library; let stream = self.storage.stream.raw;
                 drop(self.graphs.drain_retired(|| unsafe { library.cuda_stream_synchronize(stream) })?);
             }
             // Native dispatch has four row recipes per cache format: split,
@@ -735,7 +776,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             if needs_warmup {
                 let launched = (|| unsafe {
                     self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
-                    if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.stream.raw)?; }
+                    if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.storage.stream.raw)?; }
                     Ok(())
                 })();
                 if defer_warmup {
@@ -754,13 +795,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             graph
         };
         let launched = unsafe {
-            self.stream
+            self.storage.stream
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.storage.stream.raw)
         };
         launched?;
         Ok(Some(QueuedSparseAttention {
-            values: slice(self.output.buffer, 0, rows * (HEADS*1024)), layer, rows,
+            values: slice(self.storage.output.buffer, 0, rows * (HEADS*1024)), layer, rows,
         }))
     }
 }
@@ -785,7 +826,7 @@ impl LocalSparseAttentionWave<'_,32> {
         let binding = query.binding()?;
         let tokens = query.tokens()?;
         ensure!(binding.layer() == query.layer && query.rows > 0
-            && query.rows == tokens.len() && query.rows <= self.capacity
+            && query.rows == tokens.len() && query.rows <= self.capacity && self.window.admits(query.rows)
             && query.rows.checked_mul(64*1024) == Some(query.rotated.bytes)
             && requests.iter().flat_map(|r| r.positions.iter().copied()).eq(tokens.iter().copied()),
             "split attention query layer, extent or token order differs");
@@ -793,8 +834,9 @@ impl LocalSparseAttentionWave<'_,32> {
         let offset = first_head*1024;
         let input = slice(query.rotated, offset, query.rotated.bytes-offset);
         let result = (|| unsafe {
-            copy.launch_rows(self.query.buffer, input, 32*1024, query.rows,
-                32*1024, 64*1024, self.stream.raw)?;
+            self.acquire_scratch()?;
+            copy.launch_rows(self.storage.query.buffer, input, 32*1024, query.rows,
+                32*1024, 64*1024, self.storage.stream.raw)?;
             self.execute_staged_inner(query.layer, sink, requests, selection, defer_warmup, tail)
         })();
         if result.is_err() { self.drain_chain()?; }
@@ -838,4 +880,102 @@ mod exact_small_shape_tests {
         // Full prefill chunks and the decoder replay keep their own retained graphs.
         for rows in [128, 2048] { assert!(!exact_small_shape(false, rows, 64)); }
     }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn sparse_storage_bytes_equal_planned_allocations() -> Result<()> {
+        for unit in [4096, 2752, 2048] {
+            assert_eq!(SparseAttentionStorage::<64>::storage_bytes(unit)?,
+                SparseAttentionStorage::<64>::allocation_sizes(unit)?.into_iter().sum::<usize>());
+            assert_eq!(SparseAttentionStorage::<32>::storage_bytes(unit)?,
+                SparseAttentionStorage::<32>::allocation_sizes(unit)?.into_iter().sum::<usize>());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    use crate::shared::memory::{chain::StageChain, device::{Allocation, Device, Stream}};
+    fn run<const HEADS: usize>(guarded: bool) -> Result<()> {
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let device = Device { library: &lib, id: 0 };
+        let storage = SparseAttentionStorage::<HEADS>::new(&lib, 4, &[0,1])?;
+        let mut slots = [LocalSparseAttentionWave::on_storage(storage.clone())?, LocalSparseAttentionWave::on_storage(storage.clone())?];
+        for (i,slot) in slots.iter_mut().enumerate() { slot.select_window(crate::shared::memory::row_window::RowWindow::within(i*4..i*4+4,8)?)?; }
+        let scales=Allocation::new(device,128*16)?; let end=Allocation::new(device,8)?;
+        let sink=Allocation::new(device,HEADS*4)?;
+        let sources=[Allocation::new(device,128*512)?,Allocation::new(device,128*512)?];
+        lib.copy_h2d(sources[0].buffer,&vec![0x38;128*512])?;
+        lib.copy_h2d(sources[1].buffer,&vec![0x40;128*512])?;
+        lib.copy_h2d(scales.buffer,&vec![127;128*16])?;lib.copy_h2d(end.buffer,&[0;8])?;
+        lib.copy_h2d(sink.buffer,&vec![0;HEADS*4])?;
+        let metadata:Vec<u8>=(0..4).flat_map(|pos| [0u64,0,4,pos,0,0,0,0,0,0].into_iter().flat_map(u64::to_ne_bytes)).collect();
+        lib.copy_h2d(storage.metadata.buffer,&metadata)?;
+        lib.copy_h2d(storage.replay_begins.buffer,&[0;32])?;
+        lib.copy_h2d(storage.query.buffer,&vec![0;4*HEADS*1024])?;
+        let enqueue=|slot: &LocalSparseAttentionWave<'_, HEADS>, seed: usize| -> Result<()> {
+            slot.acquire_scratch()?;
+            let window=V41SparseWindow { values:sources[seed].buffer,scales:scales.buffer,
+                proposals:sources[seed].buffer,proposal_scales:scales.buffer,end:end.buffer,
+                proposal_capacity:128,replay_begins:Some(storage.replay_begins.buffer) };
+            unsafe { storage.kernel.launch(storage.query.buffer,sink.buffer,storage.metadata.buffer,None,
+                &window,None,storage.output.buffer,4,0,None,storage.stream.raw) }
+        };
+        let output_bytes=4*HEADS*1024;
+        // Private reference storage launches the identical native kernel.
+        let private=SparseAttentionStorage::<HEADS>::new(&lib,4,&[0])?;
+        lib.copy_h2d(private.metadata.buffer,&metadata)?;lib.copy_h2d(private.replay_begins.buffer,&[0;32])?;
+        lib.copy_h2d(private.query.buffer,&vec![0;output_bytes])?;
+        let window=V41SparseWindow { values:sources[0].buffer,scales:scales.buffer,
+            proposals:sources[0].buffer,proposal_scales:scales.buffer,end:end.buffer,
+            proposal_capacity:128,replay_begins:Some(private.replay_begins.buffer) };
+        unsafe { private.kernel.launch(private.query.buffer,sink.buffer,private.metadata.buffer,None,
+            &window,None,private.output.buffer,4,0,None,private.stream.raw)?;
+            lib.cuda_stream_synchronize(private.stream.raw)?; }
+        let mut want=vec![0;output_bytes];lib.copy_d2h(&mut want,private.output.buffer)?;
+        for seed in 0..2 { enqueue(&slots[seed],seed)?; unsafe { lib.cuda_stream_synchronize(storage.stream.raw)?; } }
+        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes)?;
+        unsafe { lib.copy_d2d_async(saved.buffer,storage.output.buffer,output_bytes,reader.raw)?; }
+        reader.drain()?;
+        let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
+        let runtime=tokio::runtime::Builder::new_current_thread().build()?;
+        let gate=unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)? };
+        runtime.block_on(chains[0].handle().scope(async {
+            enqueue(&slots[0],0)?;
+            unsafe { crate::shared::memory::chain::finish(&lib,storage.stream.raw)?;
+                crate::shared::memory::chain::join(&lib,reader.raw)?;
+                lib.copy_d2d_async(saved.buffer,storage.output.buffer,output_bytes,reader.raw)?;
+                crate::shared::memory::chain::finish(&lib,reader.raw)?; }
+            slots[0].release_scratch()
+        }))?;
+        SKIP_STORAGE_ACQUIRE.with(|flag|flag.set(!guarded));
+        let queued=runtime.block_on(chains[1].handle().scope(async {
+            enqueue(&slots[1],1)?;
+            unsafe { crate::shared::memory::chain::finish(&lib,storage.stream.raw) }
+        }));
+        SKIP_STORAGE_ACQUIRE.with(|flag|flag.set(false)); queued?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(if guarded {2} else {10});
+        let mut done=false;
+        while std::time::Instant::now()<deadline {
+            if unsafe { lib.cuda_stream_query(storage.stream.raw)? } { done=true;break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(gate); for chain in &chains {chain.drain()?;} reader.drain()?;
+        assert_eq!(done,!guarded,"sparse B completion before releasing A reader");
+        let mut got=vec![0;output_bytes];lib.copy_d2h(&mut got,saved.buffer)?;
+        if guarded {assert_eq!(got,want);} else {assert_ne!(got,want,"negative control did not clobber");}
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires native sparse CUDA kernels"]
+    fn sparse_shared_scratch_preserves_gated_reader() -> Result<()> { for _ in 0..3 {run::<64>(true)?;} Ok(()) }
+    #[test]
+    #[ignore = "requires native sparse CUDA kernels"]
+    fn sparse_without_guard_clobbers_gated_reader() -> Result<()> { for _ in 0..3 {run::<64>(false)?;} Ok(()) }
 }

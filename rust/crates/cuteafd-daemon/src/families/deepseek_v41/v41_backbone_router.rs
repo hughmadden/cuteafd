@@ -8,6 +8,51 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer, V41Router};
 use cuteafd_loader::OfficialV41Catalog;
 use std::marker::PhantomData;
+use std::rc::Rc;
+use crate::shared::memory::row_window::RowWindow;
+#[cfg(test)]
+thread_local! {
+    static PRIVATE_ALIAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+const ROW_BYTES: [usize; 6] = [10240, 1, 1536, 24, 24, 5280];
+
+/// Reserve planes: hidden, mask, scores, ids, routing, wire. These outputs
+/// may survive hooks or be read on fork streams. Pinned staging and the ring
+/// remain per-slot: host reads its [40][unit][6] ring only after its stream
+/// drains, so another slot's queued D2H can never write the read allocation.
+pub(crate) struct BackboneRouterStorage<'a> {
+    stream: LoadStream<'a>,
+    buffers: Vec<DeviceAllocation<'a>>,
+    rows: u32,
+    unit: u32,
+}
+impl<'a> BackboneRouterStorage<'a> {
+    pub(crate) fn storage_bytes(rows: u32, unit: u32) -> Result<usize> {
+        ensure!(unit > 0 && unit <= 4096 && unit <= rows
+            && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS,
+            "invalid router storage rows/unit");
+        Ok(Self::allocation_sizes(rows).into_iter().sum())
+    }
+    fn allocation_sizes(rows: u32) -> [usize; 6] { ROW_BYTES.map(|n| n * rows as usize) }
+    pub(crate) fn new(library: &'a NativeLibrary, rows: u32, unit: u32) -> Result<Rc<Self>> {
+        Self::storage_bytes(rows, unit)?;
+        Ok(Rc::new(Self {
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            buffers: Self::allocation_sizes(rows).into_iter()
+                .map(|n| DeviceAllocation::new(library, n)).collect::<Result<_>>()?,
+            rows, unit,
+        }))
+    }
+}
+impl Drop for BackboneRouterStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this storage owns its stream; drain before freeing planes.
+        crate::shared::decode_graph::fatal_drain(unsafe {
+            self.stream.library.cuda_stream_synchronize(self.stream.raw)
+        }, "router storage");
+    }
+}
+
 pub(crate) struct BackboneRouterWeights<'a> {
     library: &'a NativeLibrary,
     layer: usize,
@@ -71,17 +116,21 @@ impl<'a> BackboneRouterWeights<'a> {
             BackboneRouterWave::device_bytes(capacity)? <= budget,
             "backbone router wave exceeds budget"
         );
+        self.on_storage(BackboneRouterStorage::new(self.library, capacity, capacity)?)
+    }
+    pub(crate) fn on_storage(&self, storage: Rc<BackboneRouterStorage<'a>>) -> Result<BackboneRouterWave<'_, 'a>> {
+        ensure!(std::ptr::eq(storage.stream.library, self.library)
+            && storage.buffers[0].buffer.device_id == self.library.cuda_get_device()?, "router storage device/library differs");
+        let capacity = storage.unit;
         Ok(BackboneRouterWave {
-            stream: LoadStream {
-                library: self.library,
-                raw: self.library.cuda_stream_create()?,
-            },
+            #[cfg(test)]
+            private_stream: if PRIVATE_ALIAS.with(|flag| flag.get()) {
+                Some(LoadStream { library: self.library, raw: self.library.cuda_stream_create()? })
+            } else { None },
+            storage,
+            window: RowWindow::NONE,
             kernel: self.library.v41_router()?,
             input_quantizer: self.library.v41_expert_input_quantizer()?,
-            buffers: [10240, 1, 1536, 24, 24, 5280]
-                .into_iter()
-                .map(|n| DeviceAllocation::new(self.library, n * capacity as usize))
-                .collect::<Result<Vec<_>>>()?,
             // Decode/verification benefits from batching small DMA transfers.
             // Large prefill retains direct downloads to avoid another host copy.
             request_staging: HostAllocation::new(self.library,
@@ -340,11 +389,13 @@ mod reuse_tests {
     }
 }
 pub(crate) struct BackboneRouterWave<'w, 'a> {
-    stream: LoadStream<'a>,
+    storage: Rc<BackboneRouterStorage<'a>>,
+    #[cfg(test)]
+    private_stream: Option<LoadStream<'a>>,
+    window: RowWindow,
     kernel: V41Router<'a>,
     input_quantizer: V41ExpertInputQuantizer<'a>,
     weights: &'w BackboneRouterWeights<'a>,
-    buffers: Vec<DeviceAllocation<'a>>,
     request_staging: HostAllocation<'a>,
     /// The modality mask's own pinned source under device-ordered passes, where
     /// the host stages the next layer while this layer's route download into
@@ -370,7 +421,7 @@ impl<'w, 'a> BackboneRouterWave<'w, 'a> {
     pub fn rebind(&mut self, weights: &'w BackboneRouterWeights<'a>) -> Result<()> {
         self.invalidate();
         ensure!(
-            std::ptr::eq(self.stream.library, weights.library),
+            std::ptr::eq(self.stream().library, weights.library),
             "router rebound library differs"
         );
         ensure!(self.weights.nvfp4 == weights.nvfp4,
@@ -381,13 +432,30 @@ impl<'w, 'a> BackboneRouterWave<'w, 'a> {
                 "router rebound weight device differs"
             );
         }
-        self.stream.require_complete()?;
+        if !crate::shared::memory::chain::active() { self.stream().require_complete()?; }
         self.weights = weights;
         self.layer = weights.layer;
         Ok(())
     }
 }
-impl BackboneRouterWave<'_, '_> {
+impl<'a> BackboneRouterWave<'_, 'a> {
+    fn stream(&self) -> &LoadStream<'a> {
+        #[cfg(test)]
+        if let Some(stream) = &self.private_stream { return stream; }
+        &self.storage.stream
+    }
+
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        ensure!(self.ring_pending.is_empty(), "router window changes before route-ring drain");
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.end <= self.storage.rows as usize
+                && range.len() <= self.capacity as usize, "router window outside storage/unit");
+        }
+        self.invalidate();
+        self.window = window;
+        Ok(())
+    }
+
     /// Device-ordered passes keep captured local routes in the ring.
     pub fn set_ring_capture(&mut self, enabled: bool) {
         self.ring_capture = enabled && self.route_ring.is_some();
@@ -424,7 +492,7 @@ impl BackboneRouterWave<'_, '_> {
     }
     pub fn set_local_mode(&mut self, local: bool) -> Result<()> {
         if self.full_request == !local { return Ok(()); }
-        self.stream.require_complete()?;
+        self.stream().require_complete()?;
         self.invalidate();
         std::mem::swap(&mut self.graphs, &mut self.other_graphs);
         self.full_request = !local;
@@ -435,17 +503,21 @@ impl BackboneRouterWave<'_, '_> {
             (1..=4096).contains(&capacity),
             "invalid backbone router capacity"
         );
-        Ok(capacity as usize * (11825 + 5280))
+        BackboneRouterStorage::storage_bytes(capacity, capacity)
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
-        self.buffers[i].buffer
+        {
+            #[cfg(test)]
+            if self.private_stream.is_some() { return self.storage.buffers[i].buffer; }
+            self.window.apply(self.storage.buffers[i].buffer, ROW_BYTES[i])
+        }
     }
     pub fn inputs(&self) -> [CuteafdDeviceBuffer; 2] {
         [self.b(0), self.b(1)]
     }
     fn synchronize(&self) -> Result<()> {
         // SAFETY: the router's live stream, on the current device.
-        unsafe { self.wait.borrow_mut().wait(self.stream.raw) }
+        unsafe { self.wait.borrow_mut().wait(self.stream().raw) }
     }
     fn invalidate(&mut self) {
         self.ready = None;
@@ -455,7 +527,7 @@ impl BackboneRouterWave<'_, '_> {
     fn validate(&mut self, rows: u32) -> Result<()> {
         self.invalidate();
         ensure!(
-            rows > 0 && rows <= self.capacity,
+            rows > 0 && rows <= self.capacity && self.window.admits(rows as usize),
             "backbone router rows exceed capacity"
         );
         Ok(())
@@ -474,19 +546,19 @@ impl BackboneRouterWave<'_, '_> {
                 self.b(4),
                 rows as usize,
                 384,
-                self.stream.raw,
+                self.stream().raw,
             )?;
             // NVFP4 consumes BF16 directly; its FP8 buffer has no consumer.
             if !self.weights.nvfp4 {
                 self.input_quantizer
-                    .launch(self.b(0), self.b(5), rows, self.stream.raw)?;
+                    .launch(self.b(0), self.b(5), rows, self.stream().raw)?;
             }
             let hidden_row_bytes = request_hidden_format(self.weights.nvfp4).1;
             let bytes = rows as usize * if self.full_request { hidden_row_bytes + 48 } else { 24 };
             if !self.full_request {
                 ensure!(bytes <= self.request_staging.buffer.bytes, "local route staging too small");
                 let ids = std::slice::from_raw_parts_mut(self.request_staging.buffer.ptr.cast::<u8>(), bytes);
-                self.stream.library.copy_d2h_async(ids, self.b(3), self.stream.raw)?;
+                self.stream().library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
             } else if bytes <= self.request_staging.buffer.bytes {
                 let staging = std::slice::from_raw_parts_mut(
                     self.request_staging.buffer.ptr.cast::<u8>(),
@@ -494,11 +566,11 @@ impl BackboneRouterWave<'_, '_> {
                 );
                 let (hidden, routes) = staging.split_at_mut(rows as usize * hidden_row_bytes);
                 let (ids, weights) = routes.split_at_mut(rows as usize * 24);
-                let library = self.stream.library;
+                let library = self.stream().library;
                 library.copy_d2h_async(hidden,
-                    self.b(if self.weights.nvfp4 { 0 } else { 5 }), self.stream.raw)?;
-                library.copy_d2h_async(ids, self.b(3), self.stream.raw)?;
-                library.copy_d2h_async(weights, self.b(4), self.stream.raw)?;
+                    self.b(if self.weights.nvfp4 { 0 } else { 5 }), self.stream().raw)?;
+                library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
+                library.copy_d2h_async(weights, self.b(4), self.stream().raw)?;
             }
             Ok(())
         }
@@ -531,19 +603,19 @@ impl BackboneRouterWave<'_, '_> {
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
         self.invalidate();
         unsafe {
-            self.stream
+            self.stream()
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.stream().raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 if let Err(error) =
                     unsafe { self.graphs.insert(self.layer, self.weights, rows, graph) }
                 {
                     unsafe {
-                        self.stream.library.cuda_graph_exec_destroy(graph)?;
+                        self.stream().library.cuda_graph_exec_destroy(graph)?;
                     }
                     return Err(error);
                 }
@@ -551,7 +623,7 @@ impl BackboneRouterWave<'_, '_> {
             }
             (Err(e), Ok(graph)) => {
                 unsafe {
-                    self.stream.library.cuda_graph_exec_destroy(graph)?;
+                    self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(e)
             }
@@ -568,15 +640,15 @@ impl BackboneRouterWave<'_, '_> {
             .context("backbone router graph missing")?;
         ensure!(count == rows, "backbone router captured rows differ");
         let launched = unsafe {
-            self.stream
+            self.stream()
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.stream().raw)
         };
         // Device-read routes ([`Self::device_read`]): later stages join the
         // chain; the remote layer's collect is its host wait.
         let device_read = self.device_read();
         launched.and_then(|()| unsafe { self.ring_download(rows) })
-            .and_then(|()| if device_read { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) } }
+            .and_then(|()| if device_read { unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) } }
                 else { self.synchronize() })
             .or_else(|error| self.synchronize().and(Err(error)))?;
         self.ready = Some(rows);
@@ -597,8 +669,8 @@ impl BackboneRouterWave<'_, '_> {
             // SAFETY: the slot lies inside the [40][capacity][6] u32 ring.
             ptr: unsafe { ring.ptr.cast::<u8>().add(slot) }.cast(), bytes: rows as usize * 24, ..ring };
         // SAFETY: the ring is pinned and owned by this wave; read only after the pass drains.
-        unsafe { self.stream.library.copy_d2h_host_buffer_async(target, self.b(3), rows as usize * 24,
-            self.stream.raw)?; }
+        unsafe { self.stream().library.copy_d2h_host_buffer_async(target, self.b(3), rows as usize * 24,
+            self.stream().raw)?; }
         // A cold shape runs eagerly, then replays: one entry per layer.
         self.ring_pending.retain(|&(layer, _)| layer != self.layer);
         self.ring_pending.push((self.layer, rows));
@@ -632,15 +704,15 @@ impl BackboneRouterWave<'_, '_> {
             );
         }
         let staged = (|| unsafe {
-            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-            self.stream
+            crate::shared::memory::chain::join(self.stream().library, self.stream().raw)?;
+            self.stream()
                 .library
-                .copy_d2d_async(self.b(0), input, input.bytes, self.stream.raw)?;
-            self.stream.library.copy_host_buffer_h2d_async(
+                .copy_d2d_async(self.b(0), input, input.bytes, self.stream().raw)?;
+            self.stream().library.copy_host_buffer_h2d_async(
                 self.b(1),
                 source,
                 mask.len(),
-                self.stream.raw,
+                self.stream().raw,
             )
         })();
         if staged.is_err() {
@@ -686,7 +758,7 @@ impl BackboneRouterWave<'_, '_> {
     /// Same initialized finite hidden and binary-mask contract as execute.
     pub unsafe fn execute_captured(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
         self.invalidate();
-        if !super::graph_policy::captures_shape(rows) {
+        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows) {
             return unsafe { self.execute(rows) };
         }
         if self
@@ -720,8 +792,8 @@ impl BackboneRouterWave<'_, '_> {
         let cold = self.graphs.get_shape(self.layer, self.weights, rows).is_none();
         let launched = (|| unsafe {
             self.stage_inputs(input.values, image_mask)?;
-            let graph = self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw);
-            let library = self.stream.library; let stream = self.stream.raw;
+            let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw) };
+            let library = self.stream().library; let stream = self.stream().raw;
             crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 graph, || self.enqueue(rows))
         })();
@@ -743,14 +815,14 @@ impl BackboneRouterWave<'_, '_> {
         // A shape that is never captured (a prompt's tail unit) has no capture
         // to follow its eager run, so it chains like a replay instead of
         // stalling the issuing thread on every layer.
-        let captures = super::graph_policy::captures_shape(rows)
+        let captures = !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row");
         if (!cold || !captures) && device_read {
-            unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw)?; }
         } else {
-            self.stream.wait().await?;
+            self.stream().wait().await?;
         }
-        if cold && super::graph_policy::captures_shape(rows)
+        if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
@@ -783,7 +855,7 @@ impl BackboneRouterWave<'_, '_> {
             request_staging: self.request_staging.buffer,
             full_request: self.full_request,
             origin: self.origin,
-            stream: self.stream.raw,
+            stream: self.stream().raw,
             _owner: PhantomData,
         })
     }
@@ -1023,7 +1095,7 @@ mod host_order_tests {
         let read = router.split("fn device_read(&self) -> bool {").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(read.contains("crate::shared::memory::chain::active() && if self.full_request { self.ring_capture || !trace }")
             && read.contains("else { crate::shared::memory::chain::deferred() }"), "{read}");
-        assert!(router.contains("if (!cold || !captures) && device_read {") && router.contains("self.stream.wait().await?;"));
+        assert!(router.contains("if (!cold || !captures) && device_read {") && router.contains("self.stream().wait().await?;"));
         let memory = include_str!("../../shared/memory.rs");
         let complete = memory.split("pub(crate) fn require_complete(&self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(complete.contains("if chain::deferred() {") && complete.contains("cuda_stream_query"));
@@ -1044,5 +1116,123 @@ mod host_order_tests {
         // encoder lane must be able to issue its next layer meanwhile.
         assert!(!collect.contains("cuda_stream_synchronize") && !collect.contains("chain::finish(")
             && collect[landed..land].contains("tokio::task::yield_now().await"), "collect waits must yield");
+    }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn router_storage_bytes_equal_planned_allocations() -> Result<()> {
+        for unit in [4096, 2752, 2048] {
+            assert_eq!(BackboneRouterStorage::storage_bytes(8192, unit)?,
+                BackboneRouterStorage::allocation_sizes(8192).into_iter().sum::<usize>());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    use crate::shared::memory::chain::StageChain;
+    fn run(ordered: bool) -> Result<()> {
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let weights = BackboneRouterWeights::load(&lib, &catalog, 2, usize::MAX, 1 << 20)?;
+        let (rows, unit, reserve) = (13usize, 16u32, 48u32);
+        let inputs = [0, 1].map(|seed| -> Result<_> {
+            let hidden: Vec<u8> = (0..rows * 5120).flat_map(|i| {
+                let f = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
+                ((f.to_bits() >> 16) as u16).to_ne_bytes()
+            }).collect();
+            let source = DeviceAllocation::new(&lib, hidden.len())?;
+            lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
+        }).into_iter().collect::<Result<Vec<_>>>()?;
+        let read = |wave: &BackboneRouterWave<'_, '_>| -> Result<Vec<Vec<u8>>> {
+            (0..6).map(|i| {
+                let mut bytes = vec![0; rows * ROW_BYTES[i]];
+                lib.copy_d2h(&mut bytes, wave.b(i))?; Ok(bytes)
+            }).collect()
+        };
+        let mut expected = Vec::new();
+        for source in &inputs {
+            let mut wave = weights.wave(unit, usize::MAX)?;
+            lib.copy_h2d(wave.b(0), &vec![0; unit as usize * 10240])?;
+            lib.copy_h2d(wave.b(1), &vec![0; unit as usize])?;
+            unsafe { lib.copy_d2d_async(wave.b(0), source.buffer, source.buffer.bytes, wave.stream().raw)?; }
+            unsafe { wave.execute(rows as u32)?; }
+            expected.push(read(&wave)?);
+        }
+        assert_ne!(expected[0][2], expected[1][2]);
+        let storage = BackboneRouterStorage::new(&lib, reserve, unit)?;
+        PRIVATE_ALIAS.with(|flag| flag.set(!ordered));
+        let built = (|| -> Result<_> { Ok([weights.on_storage(storage.clone())?, weights.on_storage(storage.clone())?]) })();
+        PRIVATE_ALIAS.with(|flag| flag.set(false));
+        let mut slots = built?;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.select_window(RowWindow::within(i * unit as usize..i * unit as usize + rows, reserve as usize)?)?;
+            slot.set_ring_capture(true);
+            lib.copy_h2d(slot.b(1), &vec![0; rows])?;
+        }
+        let chains = [StageChain::new(&lib)?, StageChain::new(&lib)?];
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        // Warm the exact shared kernels and pinned D2H paths before gating.
+        for (i, slot) in slots.iter_mut().enumerate() {
+            unsafe {
+                lib.copy_d2d_async(slot.b(0), inputs[i].buffer, rows * 10240, slot.stream().raw)?;
+                slot.enqueue(rows as u32)?;
+                slot.ring_download(rows as u32)?;
+            }
+            slot.synchronize()?;
+            slot.ring_pending.clear();
+        }
+        let mut gate = None;
+        for i in 0..2 {
+            runtime.block_on(chains[i].handle().scope(async {
+                let slot = &mut slots[i]; let stream = slot.stream().raw;
+                // SAFETY: sources and planes outlive both chains and the gate.
+                unsafe {
+                    crate::shared::memory::chain::join(&lib, stream)?;
+                    lib.copy_d2d_async(slot.b(0), inputs[i].buffer, rows * 10240, stream)?;
+                    if i == 0 { gate = Some(cuteafd_ffi::test_support::CudaStreamGate::new(&lib, stream)?); }
+                    slot.enqueue(rows as u32)?;
+                    slot.ring_download(rows as u32)?;
+                    crate::shared::memory::chain::finish(&lib, stream)
+                }
+            }))?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if ordered { 2 } else { 10 });
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { lib.cuda_stream_query(slots[1].stream().raw)? } { done = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(done, !ordered, "router B completion before gate release");
+        drop(gate);
+        for chain in &chains { chain.drain()?; }
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.synchronize()?;
+            let got = read(slot)?;
+            if ordered || i == 1 { assert_eq!(got, expected[i]); }
+            else { assert_ne!(got, expected[i], "negative control failed to detect aliased planes"); }
+            let mut ring = vec![Vec::new(); 40];
+            assert_eq!(slot.drain_ring(&mut ring)?, vec![2]);
+            let route_bytes: Vec<u8> = ring[2].iter().flat_map(|row| row.iter().flat_map(|id| id.to_ne_bytes())).collect();
+            assert_eq!(route_bytes, got[3]);
+        }
+        eprintln!("PASS router shared storage ordered={ordered}, B_completed_before_gate={done}");
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires snapshot, native library and CUDA"]
+    fn router_shared_planes_match_private_runs_behind_gate() -> Result<()> {
+        for _ in 0..3 { run(true)?; } Ok(())
+    }
+    #[test]
+    #[ignore = "requires snapshot, native library and CUDA"]
+    fn router_private_streams_and_aliased_planes_clobber_gated_run() -> Result<()> {
+        for _ in 0..3 { run(false)?; } Ok(())
     }
 }

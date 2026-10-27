@@ -316,6 +316,12 @@ impl<'a> OwnerReduce<'a> {
             capacity as u64, geometry.hidden as u64, geometry.topk as u64)?)?)
     }
 
+    pub(super) fn allocation_sizes(capacity: u32, geometry: cuteafd_core::ExpertGeometry) -> Result<[usize; 2]> {
+        Self::workspace_bytes(capacity, geometry)?;
+        Ok([capacity as usize * geometry.hidden as usize * geometry.topk as usize * 4,
+            capacity as usize * geometry.hidden as usize * 2])
+    }
+
     pub(crate) fn new(
         devices: [Device<'a>; 2],
         policy: Combine,
@@ -333,14 +339,12 @@ impl<'a> OwnerReduce<'a> {
             "invalid owner reduction devices"
         );
         let local = devices[owner as usize];
+        let [staging_bytes, output_bytes] = Self::allocation_sizes(capacity, geometry)?;
         Ok(Self {
             transfer: PeerTransfer::new(devices[1 - owner as usize], local)?,
             local_ready: Event::new(local)?,
-            staging: Allocation::new(
-                local,
-                capacity as usize * geometry.hidden as usize * geometry.topk as usize * 4,
-            )?,
-            output: Allocation::new(local, capacity as usize * geometry.hidden as usize * 2)?,
+            staging: Allocation::new(local, staging_bytes)?,
+            output: Allocation::new(local, output_bytes)?,
             reducer: local.run(|| local.library.v41_tp2_expert_reducer())?,
             capacity,
             local_rank: owner,

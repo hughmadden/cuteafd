@@ -235,6 +235,12 @@ impl<'a> NativeTp2<'a> {
         output_policy: NativeOutputPolicy,
         nvfp4: bool,
     ) -> Result<usize> {
+        Ok(Self::allocation_sizes_for_format(library, max_rows, selection, output_policy, nvfp4)?
+            .into_iter().sum())
+    }
+
+    pub(crate) fn allocation_sizes_for_format(library: &NativeLibrary, max_rows: usize,
+        selection: RtxSelectionPolicy, output_policy: NativeOutputPolicy, nvfp4: bool) -> Result<[usize; 2]> {
         ensure!(
             !nvfp4
                 || (output_policy == NativeOutputPolicy::KernelPlanes
@@ -256,14 +262,14 @@ impl<'a> NativeTp2<'a> {
             .into_iter()
             .max()
             .unwrap();
-        scratch
-            .checked_add(Self::partial_bytes(
-                expert_geometry(),
-                max_rows,
-                output_policy,
-                nvfp4,
-            )?)
-            .context("TP2 workspace overflow")
+        Self::allocation_sizes(scratch, expert_geometry(), max_rows, output_policy, nvfp4)
+    }
+
+    pub(super) fn allocation_sizes(scratch: usize, geometry: ExpertGeometry, rows: usize,
+        output_policy: NativeOutputPolicy, nvfp4: bool) -> Result<[usize; 2]> {
+        let partial = Self::partial_bytes(geometry, rows, output_policy, nvfp4)?;
+        scratch.checked_add(partial).context("TP2 workspace overflow")?;
+        Ok([scratch, partial])
     }
 
     fn partial_bytes(
@@ -674,11 +680,10 @@ impl<'a> NativeTp2<'a> {
             .map(|k| k.info().scratch_bytes as usize)
             .max()
             .unwrap();
+        let [scratch_bytes, partial_bytes] = Self::allocation_sizes(
+            scratch_bytes, geometry, max_rows, output_policy, nvfp4)?;
         let scratch = Allocation::new(device, scratch_bytes)?;
-        let output = Allocation::new(
-            device,
-            Self::partial_bytes(geometry, max_rows, output_policy, nvfp4)?,
-        )?;
+        let output = Allocation::new(device, partial_bytes)?;
         let stream = Stream::new(device)?;
         let states = device.own(|| {
             let mut states = Vec::with_capacity(kernels.len());

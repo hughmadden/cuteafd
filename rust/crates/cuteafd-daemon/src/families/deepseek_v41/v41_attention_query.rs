@@ -167,6 +167,7 @@ impl<'a> AttentionQueryWeights<'a> {
             weights: self,
             capacity: storage.unit,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            window: crate::shared::memory::row_window::RowWindow::NONE,
             tp2_prefix_graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             ready: None,
             binding: None,
@@ -241,6 +242,7 @@ pub(crate) struct AttentionQueryWave<'w, 'a> {
     norm: V41AttentionOps<'a>,
     weights: &'w AttentionQueryWeights<'a>,
     capacity: u32,
+    window: crate::shared::memory::row_window::RowWindow,
     graphs: LayerGraphs<'w, 'a, AttentionQueryWeights<'a>>,
     tp2_prefix_graphs: LayerGraphs<'w, 'a, AttentionQueryWeights<'a>>,
     ready: Option<u32>,
@@ -260,7 +262,7 @@ impl<'w, 'a> AttentionQueryWave<'w, 'a> {
                 && weights.tensors.get(&weights.names[0])?.device_id == self.b(0).device_id,
             "attention rebound weight library or device differs"
         );
-        self.storage.stream.require_complete()?;
+        if !crate::shared::memory::chain::active() { self.storage.stream.require_complete()?; }
         self.weights = weights;
         Ok(())
     }
@@ -279,6 +281,12 @@ impl AttentionQueryWave<'_, '_> {
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         self.storage.buffers[i].as_ref().expect("query buffer is allocated").buffer
+    }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.len() <= self.capacity as usize, "query window exceeds unit");
+        }
+        self.ready = None; self.binding = None; self.tokens.clear(); self.window = window; Ok(())
     }
     /// Releases the outputs for the next unit's writer, in any slot: call
     /// after the attention hook's last reader joined the unit's stage chain
@@ -308,8 +316,8 @@ impl AttentionQueryWave<'_, '_> {
         self.binding = None;
         self.tokens.clear();
         ensure!(
-            rows > 0 && rows <= self.capacity,
-            "query rows exceed capacity"
+            rows > 0 && rows <= self.capacity && self.window.admits(rows as usize),
+            "query rows exceed capacity or differ from slot window"
         );
         Ok(())
     }
@@ -498,7 +506,7 @@ impl AttentionQueryWave<'_, '_> {
             // The normalized input is complete here; cache producers fork from it.
             unsafe { crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?; }
             let rows = tokens.len() as u32;
-            if !super::graph_policy::captures_shape(rows) {
+            if self.window.is_windowed() || !super::graph_policy::captures_shape(rows) {
                 unsafe { self.execute(rows)?; }
                 return Ok(());
             }
@@ -541,7 +549,7 @@ impl AttentionQueryWave<'_, '_> {
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
-        let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
+        let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.weights.layer, self.weights, rows) };
         let queued = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
             self.acquire_scratch()?;
@@ -559,7 +567,7 @@ impl AttentionQueryWave<'_, '_> {
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
             // Replaying now would duplicate work whenever a shape was evicted.
-            if super::graph_policy::captures_shape(rows) && !crate::shared::decode_graph::census::eager("layer_row") {
+            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows) && !crate::shared::decode_graph::census::eager("layer_row") {
                 unsafe { self.capture_ready(rows)?; }
             }
         }
@@ -601,7 +609,7 @@ impl AttentionQueryWave<'_, '_> {
             }
         }
         let mut guard=Drain { stream:&self.storage.stream,complete:false };
-        let graph=self.tp2_prefix_graphs.get_shape(self.weights.layer,self.weights,rows);
+        let graph=if self.window.is_windowed() { None } else { self.tp2_prefix_graphs.get_shape(self.weights.layer,self.weights,rows) };
         unsafe {
             // The projection's own stream writes `b(3)` after this stream's
             // rank stage, so this acquire orders it too.
@@ -618,7 +626,7 @@ impl AttentionQueryWave<'_, '_> {
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
-        if graph.is_none() && super::graph_policy::captures_shape(rows)
+        if !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };

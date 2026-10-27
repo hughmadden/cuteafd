@@ -9,8 +9,75 @@ use std::rc::Rc;
 /// (a push lands them and packs at Done), then [`Weights::release_raw_scales`].
 struct Matrix<'a> { weight: Allocation<'a>, scales: Allocation<'a>, source_scales: Option<Allocation<'a>> }
 
-/// Complete shared TP2 operation for one lane, with either GPU as destination.
+/// Shared TP2 storage. Final outputs are reserve planes read by a later
+/// Spark reduction hook. Rank GEMM arenas and peer staging are unit scratch;
+/// rank_released orders next writers after both rank readers join. The 1E
+/// per-destination released guards remain on the output-add transfer. Launch
+/// bookkeeping is shared under the submission mutex and GPU guarded, never
+/// presumed idle merely because its Rust future returned under device ordering.
+#[cfg(test)]
+thread_local! { static SKIP_RANK_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(crate) struct Storage<'a> {
+    execution: tokio::sync::Mutex<Execution<'a>>,
+    rows: u32,
+    unit: u32,
+    layers: usize,
+}
+impl<'a> Storage<'a> {
+    pub(crate) fn storage_bytes(library: &cuteafd_ffi::NativeLibrary, rows: u32, unit: u32) -> Result<usize> {
+        ensure!(unit > 0 && unit <= 4096 && unit <= rows
+            && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS, "invalid shared TP2 storage geometry");
+        Ok(RankWave::device_bytes(library, unit)? + unit as usize * 10240 + rows as usize * 10240)
+    }
+    pub(crate) fn new(weights: [Rc<Vec<Weights<'a>>>; 2], rows: u32, unit: u32) -> Result<Rc<Self>> {
+        let first = weights[0].first().context("shared TP2 weights absent")?;
+        Self::storage_bytes(first.device.library, rows, unit)?;
+        let layers = weights[0].len();
+        Ok(Rc::new(Self { execution: tokio::sync::Mutex::new(Execution::new(weights, rows, unit)?), rows, unit, layers }))
+    }
+}
 pub(crate) struct Wave<'a> {
+    storage: Rc<Storage<'a>>,
+    window: crate::shared::memory::row_window::RowWindow,
+}
+impl<'a> Wave<'a> {
+    pub(crate) fn device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
+        Storage::storage_bytes(library, capacity, capacity)
+    }
+    pub(crate) fn new(weights: [Rc<Vec<Weights<'a>>>; 2], capacity: u32) -> Result<Self> {
+        Ok(Self::on_storage(Storage::new(weights, capacity, capacity)?))
+    }
+    pub(crate) fn on_storage(storage: Rc<Storage<'a>>) -> Self {
+        Self { storage, window: crate::shared::memory::row_window::RowWindow::NONE }
+    }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.end <= self.storage.rows as usize
+                && range.len() <= self.storage.unit as usize, "shared TP2 window exceeds reserve/unit");
+        }
+        self.window = window; Ok(())
+    }
+    pub(crate) fn contains(&self, layer: usize) -> bool { layer < self.storage.layers }
+    pub(crate) fn release_output(&self, destination: usize) -> Result<()> {
+        self.storage.execution.try_lock().context("shared TP2 submission still borrowed")?.release_output(destination)
+    }
+    pub(crate) fn release_scratch(&self) -> Result<()> {
+        self.storage.execution.try_lock().context("shared TP2 submission still borrowed")?.rank_released.release()
+    }
+    /// # Safety
+    /// Inputs remain live and immutable until the enclosing chain drains; the
+    /// caller consumes the returned plane before reusing this slot's window.
+    pub(crate) async unsafe fn execute(&mut self, layer: usize, rows: u32, destination: usize,
+        inputs: [CuteafdDeviceBuffer; 2], producers: [&Stream<'a>; 2]) -> Result<CuteafdDeviceBuffer> {
+        ensure!(self.window.admits(rows as usize), "shared TP2 rows differ from window");
+        let mut execution = self.storage.execution.lock().await;
+        execution.window = self.window.clone();
+        unsafe { execution.execute(layer, rows, destination, inputs, producers).await }
+    }
+}
+
+/// Complete shared TP2 operation for one lane, with either GPU as destination.
+struct Execution<'a> {
     transfers: [PeerTransfer<'a>; 2],
     ready: [Event<'a>; 2],
     staging: [Allocation<'a>; 2],
@@ -22,13 +89,10 @@ pub(crate) struct Wave<'a> {
     ranks: [RankWave<'a>; 2],
     add: Bf16Add<'a>,
     capacity: u32,
+    window: crate::shared::memory::row_window::RowWindow,
+    rank_released: crate::shared::memory::row_window::ScratchGuard<'a>,
 }
-impl<'a> Wave<'a> {
-    /// Per GPU, per lane, excluding immutable weights and CUDA state.
-    pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
-        RankWave::device_bytes(library, capacity)?.checked_add(capacity as usize*5120*4)
-            .context("shared TP2 workspace overflow")
-    }
+impl<'a> Execution<'a> {
     /// The reader of `destination`'s output (the reduce) finished on the
     /// unit's chain: the next `add` there may overwrite it.
     pub(crate) fn release_output(&self, destination: usize) -> Result<()> {
@@ -38,7 +102,7 @@ impl<'a> Wave<'a> {
     pub fn contains(&self, layer: usize) -> bool {
         self.ranks.iter().all(|rank| rank.weights.get(layer).is_some_and(|w| w.layer == layer))
     }
-    pub fn new(weights: [Rc<Vec<Weights<'a>>>; 2], capacity: u32) -> Result<Self> {
+    fn new(weights: [Rc<Vec<Weights<'a>>>; 2], rows: u32, capacity: u32) -> Result<Self> {
         ensure!(!weights[0].is_empty() && weights[0].len() == weights[1].len(), "shared TP2 rank layers differ");
         let d0 = weights[0][0].device;
         let d1 = weights[1][0].device;
@@ -49,10 +113,12 @@ impl<'a> Wave<'a> {
             transfers: [PeerTransfer::new(d1,d0)?, PeerTransfer::new(d0,d1)?],
             ready: [Event::new(d0)?, Event::new(d1)?],
             staging: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
-            output: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
+            output: [Allocation::new(d0,rows as usize*10240)?, Allocation::new(d1,rows as usize*10240)?],
             released: [crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?,
                 crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?],
             ranks, add: d0.library.bf16_add()?, capacity,
+            window: crate::shared::memory::row_window::RowWindow::NONE,
+            rank_released: crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?,
         })
     }
     /// # Safety
@@ -72,6 +138,13 @@ impl<'a> Wave<'a> {
                 }
             }
         }
+        #[cfg(test)]
+        let skip = SKIP_RANK_ACQUIRE.with(|s|s.get());
+        #[cfg(not(test))]
+        let skip = false;
+        if !skip { for rank in &self.ranks {
+            rank.stream.device.run(|| unsafe { self.rank_released.acquire(rank.stream.raw) })?;
+        }}
         let mut drain = Drain { ranks: &mut self.ranks, complete: false };
         for rank in 0..2 {
             unsafe { drain.ranks[rank].enqueue(layer, rows, inputs[rank], producers[rank])?; }
@@ -83,16 +156,18 @@ impl<'a> Wave<'a> {
         }
         self.ready[destination].record(&local.stream)?;
         let ready = &self.ready[destination];
-        let output = &mut self.output[destination];
+        let output = &self.output[destination];
+        let output_buffer = self.window.apply(output.buffer, 10240);
         let add = &self.add;
         let count = rows as usize * 5120;
         unsafe { self.transfers[destination].copy_then_ordered(&remote.output, &mut self.staging[destination],
             &remote.stream, count*2, Some(&self.released[destination]), |peer, stream| {
                 output.device.library.cuda_stream_wait_event(stream, ready.raw)?;
-                add.launch(local.output.buffer, peer, output.buffer, count, stream)
+                add.launch(local.output.buffer, peer, output_buffer, count, stream)
             }).await?; }
         drain.complete = true;
-        let mut result = self.output[destination].buffer;
+        self.rank_released.release()?;
+        let mut result = output_buffer;
         result.bytes = count*2;
         Ok(result)
     }
@@ -158,13 +233,14 @@ pub(crate) struct RankWave<'a> {
     capacity: u32,
 }
 impl<'a> RankWave<'a> {
+    fn allocation_sizes(up: usize, down: usize, unit: u32) -> [usize;7] {
+        [up, down, 16, unit as usize*2304, unit as usize*2304, unit as usize*2304, unit as usize*10240]
+    }
     pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
         ensure!((1..=4096).contains(&capacity), "invalid shared TP2 capacity");
-        let up = library.v41_fp8_matrix_plan(capacity,5120,1152)?;
-        let down = library.v41_fp8_matrix_plan(capacity,1152,5120)?;
-        usize::try_from(up.info().scratch_bytes)?.checked_add(usize::try_from(down.info().scratch_bytes)?)
-            .and_then(|bytes| bytes.checked_add(16 + capacity as usize*(3*1152+5120)*2))
-            .context("shared TP2 rank workspace overflow")
+        let up = library.v41_fp8_matrix_plan_info(capacity,5120,1152)?;
+        let down = library.v41_fp8_matrix_plan_info(capacity,1152,5120)?;
+        Ok(Self::allocation_sizes(up.scratch_bytes as usize, down.scratch_bytes as usize, capacity).into_iter().sum())
     }
     pub fn new(weights: Rc<Vec<Weights<'a>>>, capacity: u32) -> Result<Self> {
         ensure!(!weights.is_empty() && weights.len() <= 40, "shared TP2 needs resident layers");
@@ -174,9 +250,11 @@ impl<'a> RankWave<'a> {
         let up_kernel = device.run(|| device.library.v41_fp8_matrix_plan(capacity, 5120, 1152))?;
         let down_kernel = device.run(|| device.library.v41_fp8_matrix_plan(capacity, 1152, 5120))?;
         let stream = Stream::new(device)?;
-        let up_scratch = Allocation::new(device, up_kernel.info().scratch_bytes as usize)?;
-        let down_scratch = Allocation::new(device, down_kernel.info().scratch_bytes as usize)?;
-        let alpha = Allocation::new(device, 16)?;
+        let [up,down,a,gate,u,intermediate,output] = Self::allocation_sizes(
+            up_kernel.info().scratch_bytes as usize, down_kernel.info().scratch_bytes as usize, capacity);
+        let up_scratch = Allocation::new(device, up)?;
+        let down_scratch = Allocation::new(device, down)?;
+        let alpha = Allocation::new(device, a)?;
         let initialized = device.run(|| unsafe {
             up_kernel.initialize_scratch(up_scratch.buffer, alpha.buffer, stream.raw)?;
             down_kernel.initialize_scratch(down_scratch.buffer, alpha.buffer, stream.raw)
@@ -185,10 +263,10 @@ impl<'a> RankWave<'a> {
         initialized.and(drained)?;
         Ok(Self { stream, ready: Event::new(device)?, weights, up_kernel, down_kernel,
             activation: device.library.v41_shared_tp2_swiglu()?, up_scratch, down_scratch, alpha,
-            gate: Allocation::new(device, capacity as usize * 1152 * 2)?,
-            up: Allocation::new(device, capacity as usize * 1152 * 2)?,
-            intermediate: Allocation::new(device, capacity as usize * 1152 * 2)?,
-            output: Allocation::new(device, capacity as usize * 5120 * 2)?, capacity })
+            gate: Allocation::new(device, gate)?,
+            up: Allocation::new(device, u)?,
+            intermediate: Allocation::new(device, intermediate)?,
+            output: Allocation::new(device, output)?, capacity })
     }
     /// # Safety
     /// Previous use has completed. Input writes are ordered on producer, and
@@ -255,7 +333,7 @@ mod tests {
             assert_eq!(actual[0], actual[1], "destination changed shared output");
             let mut partials = [vec![0; actual[0].len()], vec![0; actual[0].len()]];
             for rank in 0..2 {
-                let mut buffer = lanes[0].ranks[rank].output.buffer;
+                let mut buffer = lanes[0].storage.execution.try_lock()?.ranks[rank].output.buffer;
                 buffer.bytes = partials[rank].len();
                 devices[rank].run(|| lib.copy_d2h(&mut partials[rank], buffer))?;
             }
@@ -321,6 +399,78 @@ impl Weights<'_> {
             let p = format!("gpu{}.shared_tp2.layers.{}.{name}.", self.device.id, self.layer);
             f(format!("{p}weight"), m.weight.buffer);
             f(format!("{p}packed_scale"), m.scales.buffer);
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    use crate::shared::memory::{chain::StageChain,row_window::RowWindow};
+    fn run(guarded: bool)->Result<()> {
+        let lib=unsafe {cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};
+        lib.cuda_set_device(0)?;
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
+        let weights=[Rc::new(vec![Weights::load(devices[0],&catalog,0,Weights::load_peak_device_bytes())?]),
+            Rc::new(vec![Weights::load(devices[1],&catalog,0,Weights::load_peak_device_bytes())?])];
+        let runtime=tokio::runtime::Builder::new_current_thread().build()?;
+        let inputs=[ [Allocation::new(devices[0],16*10240)?,Allocation::new(devices[1],16*10240)?],
+            [Allocation::new(devices[0],16*10240)?,Allocation::new(devices[1],16*10240)?] ];
+        for (seed,pair) in inputs.iter().enumerate() {for input in pair {
+            input.device.run(||lib.copy_h2d(input.buffer,&(if seed==0 {0x3e80u16}else {0xbe80u16}).to_ne_bytes().repeat(16*5120)))?;
+        }}
+        let producers=[Stream::new(devices[0])?,Stream::new(devices[1])?];
+        let mut private=Wave::new(weights.clone(),16)?;
+        runtime.block_on(unsafe {private.execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
+        let private_rank=private.storage.execution.try_lock().unwrap().ranks[0].output.buffer;
+        let mut want=vec![0;16*10240];lib.copy_d2h(&mut want,private_rank)?;
+        let storage=Storage::new(weights,48,16)?;
+        let mut slots=[Wave::on_storage(storage.clone()),Wave::on_storage(storage.clone())];
+        for (i,slot) in slots.iter_mut().enumerate() {
+            slot.select_window(RowWindow::within(i*16..i*16+16,48)?)?;
+            runtime.block_on(unsafe {slot.execute(0,16,i,inputs[i].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
+        }
+        let rank=storage.execution.try_lock().unwrap().ranks[0].output.buffer;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,rank,want.len(),reader.raw)})?;reader.drain()?;
+        let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
+        let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;
+        runtime.block_on(chains[0].handle().scope(async {
+            unsafe {slots[0].execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]]).await?;}
+            devices[1].run(||unsafe {crate::shared::memory::chain::join(&lib,reader.raw)?;
+                lib.copy_peer_async(saved.buffer,rank,want.len(),reader.raw)?;
+                crate::shared::memory::chain::finish(&lib,reader.raw)})?;
+            slots[0].release_scratch()
+        }))?;
+        SKIP_RANK_ACQUIRE.with(|s|s.set(!guarded));
+        let queued=runtime.block_on(chains[1].handle().scope(async {
+            unsafe {slots[1].execute(0,16,1,inputs[1].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]]).await?;}
+            anyhow::Ok(())
+        }));SKIP_RANK_ACQUIRE.with(|s|s.set(false));queued?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(if guarded {2}else {10});let mut done=false;
+        while std::time::Instant::now()<deadline {
+            let execution=storage.execution.try_lock().unwrap();let stream=&execution.ranks[0].stream;
+            if stream.device.run(||unsafe {lib.cuda_stream_query(stream.raw)})? {done=true;break;}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        devices[1].run(|| {drop(gate);Ok(())})?;for chain in &chains {chain.drain()?;}reader.drain()?;
+        assert_eq!(done,!guarded,"shared TP2 rank B completion before reader release");
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        if guarded {assert_eq!(got,want);}else {assert_ne!(got,want,"shared rank negative did not clobber");}
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires shared TP2 native kernels, snapshot and two GPUs"]
+    fn shared_tp2_rank_scratch_preserves_gated_peer_reader()->Result<()> {for _ in 0..3 {run(true)?;} Ok(())}
+    #[test]
+    #[ignore = "requires shared TP2 native kernels, snapshot and two GPUs"]
+    fn shared_tp2_without_rank_guard_clobbers_gated_peer_reader()->Result<()> {for _ in 0..3 {run(false)?;} Ok(())}
+    #[test]
+    fn shared_tp2_storage_bytes_equal_planned_allocations() {
+        for unit in [4096,2752,2048] {
+            let rank=RankWave::allocation_sizes(123,456,unit).into_iter().sum::<usize>();
+            assert_eq!(rank+unit as usize*10240+8192*10240,123+456+16+unit as usize*27392+8192*10240);
         }
     }
 }

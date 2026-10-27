@@ -76,6 +76,16 @@ impl<'a> BackboneHcWeights<'a> {
             capacity,
         ))
     }
+    pub(crate) fn block_on_storage(&self,
+        attention: std::rc::Rc<crate::families::deepseek_v41::v41_hc::HcStorage<'a>>,
+        ffn: std::rc::Rc<crate::families::deepseek_v41::v41_hc::HcStorage<'a>>,
+        unit: usize,
+    ) -> Result<crate::families::deepseek_v41::v41_block::BackboneBlockWave<'_, 'a>> {
+        Ok(crate::families::deepseek_v41::v41_block::BackboneBlockWave::new(
+            self.library, self.layer,
+            HcSublayer::on_storage(self.library, &self.tensors, Self::names(self.layer, true)?, attention, unit)?,
+            HcSublayer::on_storage(self.library, &self.tensors, Self::names(self.layer, false)?, ffn, unit)?, unit))
+    }
     pub fn boundary(
         &self,
         attention: bool,
