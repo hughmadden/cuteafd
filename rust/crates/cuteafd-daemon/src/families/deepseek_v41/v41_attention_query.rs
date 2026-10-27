@@ -7,6 +7,11 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
 use std::marker::PhantomData;
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the negative control skips the scratch guard's acquire.
+    static SKIP_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 const MATRICES: [(u32, u32); 2] = [(5120, 1280), (1280, 32768)];
 const ROW_BYTES: [usize; 7] = [10240, 2560, 2560, 65536, 65536, 8, 256];
 fn part(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
@@ -281,6 +286,8 @@ impl AttentionQueryWave<'_, '_> {
     pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
     /// Orders this stream's next writes after the last release.
     fn acquire_scratch(&self) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
         // SAFETY: the storage's own live stream, on the current device.
         unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
     }
@@ -786,7 +793,9 @@ mod guarded_scratch_tests {
     use crate::shared::memory::chain::StageChain;
     use crate::shared::memory::device::{Device, Stream};
 
-    fn run(reader_device: i32) -> Result<()> {
+    /// `guarded`: false skips unit B's acquire (test-only), which must let B
+    /// overwrite A's outputs before A's reader: the test can fail.
+    fn run(reader_device: i32, guarded: bool) -> Result<()> {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         library.cuda_set_device(0)?;
@@ -835,7 +844,8 @@ mod guarded_scratch_tests {
             })?; }
         }
         reader.device.run(|| unsafe {
-            library.copy_peer_async(copy.buffer, shared.buffers[3].as_ref().unwrap().buffer, rotated_bytes, reader.raw)?;
+            let warm = shared.buffers[3].as_ref().unwrap().buffer;
+            if reader_device == 0 { library.copy_d2d_async(copy.buffer, warm, rotated_bytes, reader.raw)?; } else { library.copy_peer_async(copy.buffer, warm, rotated_bytes, reader.raw)?; }
             library.cuda_stream_synchronize(reader.raw)
         })?;
         unsafe { library.cuda_stream_synchronize(shared.stream.raw)?; }
@@ -849,12 +859,13 @@ mod guarded_scratch_tests {
             let rotated = output.rotated;
             reader.device.run(|| unsafe {
                 crate::shared::memory::chain::join(&library, reader.raw)?;
-                library.copy_peer_async(copy.buffer, rotated, rotated_bytes, reader.raw)?;
+                if reader_device == 0 { library.copy_d2d_async(copy.buffer, rotated, rotated_bytes, reader.raw)?; } else { library.copy_peer_async(copy.buffer, rotated, rotated_bytes, reader.raw)?; }
                 crate::shared::memory::chain::finish(&library, reader.raw)
             })?;
             slots[0].release_scratch()
         }))?;
         // Unit B (another slot, its own chain): acquires, then overwrites.
+        if !guarded { SKIP_ACQUIRE.with(|skip| skip.set(true)); }
         runtime.block_on(chains[1].handle().scope(async {
             let source = sources[1].buffer;
             unsafe { slots[1].execute_tokens_prepared(&tokens(1), |stream, destination| {
@@ -862,22 +873,44 @@ mod guarded_scratch_tests {
             })?; }
             anyhow::Ok(())
         }))?;
-        // B is queued; only now may A's reader run.
+        // B is queued. Give it every chance to run: unordered (no guard) it
+        // completes while A's reader is held; guarded it must still be
+        // pending. Asserting both makes the outcome deterministic, not a race
+        // between B's launch and the gate's release.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(if guarded { 2 } else { 10 });
+        let mut b_done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { library.cuda_stream_query(shared.stream.raw)? } { b_done = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(b_done, !guarded, "unit B {} while A's fork reader was held",
+            if b_done { "completed" } else { "stayed pending" });
+        // Only now may A's reader run.
         drop(reader_gate);
         for chain in &chains { chain.drain()?; }
         unsafe { library.cuda_stream_synchronize(shared.stream.raw)?; }
         reader.device.run(|| unsafe { library.cuda_stream_synchronize(reader.raw) })?;
         let mut got = vec![0; rotated_bytes];
         reader.device.run(|| library.copy_d2h(&mut got, copy.buffer))?;
-        assert_eq!(got, want, "unit B overwrote shared query outputs before unit A's fork reader joined");
+        SKIP_ACQUIRE.with(|skip| skip.set(false));
+        if guarded {
+            assert_eq!(got, want, "unit B overwrote shared query outputs before unit A's fork reader joined");
+        } else {
+            assert_ne!(got, want, "without the guard unit B should overwrite first: the test cannot detect a race");
+        }
         Ok(())
     }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
-    fn guarded_query_scratch_waits_for_a_same_gpu_fork_reader() -> Result<()> { run(0) }
+    fn guarded_query_scratch_waits_for_a_same_gpu_fork_reader() -> Result<()> { run(0, true) }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
+    fn unguarded_query_scratch_races_a_gated_fork_reader() -> Result<()> { run(0, false) }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two GPUs"]
-    fn guarded_query_scratch_waits_for_a_fork_reader_on_the_other_gpu() -> Result<()> { run(1) }
+    fn guarded_query_scratch_waits_for_a_fork_reader_on_the_other_gpu() -> Result<()> { run(1, true) }
 }
