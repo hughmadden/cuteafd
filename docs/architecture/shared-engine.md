@@ -296,8 +296,13 @@ and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
   Spark pace to its `PrefillDepth`
   ([daemon/shared/prefill_depth.rs:19](../../rust/crates/cuteafd-daemon/src/shared/prefill_depth.rs#L19)).
   The pace is busy and idle time per unit, measured on the Spark prefill owner
-  and returned in the reply header, and it is read without a host wait. The
-  engine then takes the next depth, re-cuts the prefill link's return slots at
+  and returned in the reply header, and it is read without a host wait.
+  Busy + idle per row on the critical rank is the call's delivered period.
+  `WaveControl` measures each candidate depth (2 × 4096, 3 × 2752,
+  4 × 2048) once, then runs the lowest, re-measuring the current depth on
+  every full-depth call. No depth is predicted from another, because
+  coordinator turnaround per row depends on the unit size. The engine then
+  takes the next depth, re-cuts the prefill link's return slots at
   rest, and brackets the call. GLM 5 does this in `start_prefill`
   ([daemon/families/glm5/engine.rs:1368](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1368)),
   Kimi in `RoutedLane::start_prefill`
