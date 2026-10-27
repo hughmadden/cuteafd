@@ -115,17 +115,18 @@ impl<'a> AttentionOutputWeights<'a> {
         };
         let kernel=self.scales.as_ref().map(|_|self.library.v41_fp8_matrix_plan(unit,8192,5120)).transpose()?;
         let grouped = self.library.v41_fp8_matrix_plan(unit, 32768, 8192)?;
-        let grouped_scratch = DeviceAllocation::new(self.library, grouped.info().scratch_bytes as usize)?;
+        let (grouped_bytes, down_bytes, alpha_bytes, planes) = AttentionOutputStorage::allocation_sizes(
+            grouped.info().scratch_bytes as usize, kernel.as_ref().map(|k|k.info().scratch_bytes as usize).unwrap_or(0), rows);
         let storage = AttentionOutputStorage {
             stream,
             grouped,
-            grouped_scratch,
-            scratch: kernel.as_ref().map(|k|DeviceAllocation::new(self.library,k.info().scratch_bytes as usize)).transpose()?,
+            grouped_scratch: DeviceAllocation::new(self.library, grouped_bytes)?,
+            scratch: kernel.as_ref().map(|_|DeviceAllocation::new(self.library, down_bytes)).transpose()?,
             kernel,
-            alpha: DeviceAllocation::new(self.library, 4)?,
-            buffers: ROW_BYTES
+            alpha: DeviceAllocation::new(self.library, alpha_bytes)?,
+            buffers: planes
                 .into_iter()
-                .map(|n| DeviceAllocation::new(self.library, n * rows as usize))
+                .map(|n| DeviceAllocation::new(self.library, n))
                 .collect::<Result<Vec<_>>>()?,
             rows,
             unit,
@@ -200,6 +201,20 @@ pub(crate) struct AttentionOutputStorage<'a> {
     rows: u32,
     unit: u32,
 }
+impl AttentionOutputStorage<'_> {
+    fn allocation_sizes(grouped: usize, down: usize, rows: u32) -> (usize, usize, usize, [usize; 5]) {
+        (grouped, down, 4, ROW_BYTES.map(|n|n * rows as usize))
+    }
+
+    pub(crate) fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32, split: bool) -> Result<usize> {
+        ensure!(unit > 0 && unit <= 4096 && unit <= rows
+            && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS, "invalid output storage geometry");
+        let (grouped, down, alpha, planes) = Self::allocation_sizes(
+            library.v41_fp8_matrix_plan_info(unit, 32768, 8192)?.scratch_bytes as usize,
+            if split { 0 } else { library.v41_fp8_matrix_plan_info(unit, 8192, 5120)?.scratch_bytes as usize }, rows);
+        Ok(grouped + down + alpha + planes.into_iter().sum::<usize>())
+    }
+}
 impl Drop for AttentionOutputStorage<'_> {
     fn drop(&mut self) {
         // SAFETY: the stream is owned here; queued work reads only this storage.
@@ -232,7 +247,7 @@ impl<'w, 'a> AttentionOutputWave<'w, 'a> {
                 && weights.grouped_scales.buffer.device_id == self.b(0).device_id,
             "attention rebound weight library or device differs"
         );
-        self.storage.stream.require_complete()?;
+        if !crate::shared::memory::chain::active() { self.storage.stream.require_complete()?; }
         self.weights = weights;
         Ok(())
     }
@@ -242,10 +257,7 @@ impl AttentionOutputWave<'_, '_> {
         Self::device_bytes_with_split(library,capacity,false)
     }
     pub fn device_bytes_with_split(library:&NativeLibrary,capacity:u32,split_output_b:bool)->Result<usize> {
-        Ok(library.v41_fp8_matrix_plan_info(capacity, 32768, 8192)?.scratch_bytes as usize
-            + 4
-            + capacity as usize * ROW_BYTES.iter().sum::<usize>()
-            + if split_output_b {0} else {library.v41_fp8_matrix_plan_info(capacity,8192,5120)?.scratch_bytes as usize})
+        AttentionOutputStorage::storage_bytes(library, capacity, capacity, split_output_b)
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         self.window.apply(self.storage.buffers[i].buffer, ROW_BYTES[i])
@@ -746,5 +758,21 @@ impl AttentionOutputWeights<'_> {
         self.tensors.visit(prefix, f);
         f(format!("{prefix}grouped_scale"), self.grouped_scales.buffer);
         if let Some(s) = &self.scales { f(format!("{prefix}packed_scale"), s.buffer); }
+    }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn output_storage_bytes_equal_allocation_requests() {
+        for rows in [2048, 2752, 4096, 8192] {
+            for down in [0, 456] {
+                let (grouped, down, alpha, planes) = AttentionOutputStorage::allocation_sizes(123, down, rows);
+                assert_eq!(planes, [65536, 16384, 10240, 8, 256].map(|n|n * rows as usize));
+                assert_eq!(grouped + down + alpha + planes.into_iter().sum::<usize>(),
+                    123 + down + 4 + rows as usize * 92424);
+            }
+        }
     }
 }
