@@ -1155,6 +1155,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
     /// After a device-ordered pass drained: the ring-captured local layers'
     /// routes into the capture; returns those layers.
+    pub fn captures_routes(&self) -> bool { self.capture_routes }
     pub fn drain_route_ring(&mut self) -> Result<Vec<usize>> {
         if !self.capture_routes { return Ok(Vec::new()); }
         self.router.drain_ring(&mut self.route_capture)

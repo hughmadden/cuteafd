@@ -360,7 +360,14 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     // stages it queues order on the device and it waits on the host for none
     // of them, so the executor's next hook issues at once.
     async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
-        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        // A slot's previous unit committed without a host drain; its queued
+        // H2D copies may still read this pass's pinned staging (positions,
+        // destinations, Engram rows), which this unit now rewrites. Drain
+        // here, k - 1 units later, where that work has normally finished.
+        let slot = &self.slots[unit.slot];
+        slot.pass.drain_chain()?;
+        crate::shared::spark_waves::healthy()?;
+        let chain = slot.pass.unit_chain()?;
         chain.scope(self.begin_unit_inner(unit)).await
     }
     async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
@@ -405,11 +412,15 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         }).await
     }
     async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
-        // The unit's chained work completes before its commit reads it; a
-        // failed Spark wire released its waits over garbage planes.
-        let slot = &mut self.slots[unit.slot];
-        slot.pass.drain_chain()?;
+        // No host drain: every window and source of an encoder unit was
+        // published on the device during its layers, so the commit is host
+        // bookkeeping only. The slot drains before its next unit reuses the
+        // pass, and every slot drains (with a Spark health check: a failed
+        // wire releases its waits over garbage planes) before the prompt's
+        // decoder replay reads the cache; a failure releases the request.
         crate::shared::spark_waves::healthy()?;
+        let slot = &mut self.slots[unit.slot];
+        if slot.pass.resources.lane.captures_routes() { slot.pass.drain_chain()?; }
         slot.pass.resources.lane.drain_route_ring()?;
         self.commit_unit_inner(unit).await
     }
@@ -461,7 +472,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             }).collect::<Result<Vec<_>>>()?,
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
         };
-        run_prefill_units_async(&mut hooks, &units, waves).await
+        run_prefill_units_async(&mut hooks, &units, waves).await?;
+        // Every unit's chained work completes before the decoder replay (or a
+        // caller) reads what the units published.
+        for slot in &hooks.slots { slot.pass.drain_chain()?; }
+        crate::shared::spark_waves::healthy()
     }
 }
 
