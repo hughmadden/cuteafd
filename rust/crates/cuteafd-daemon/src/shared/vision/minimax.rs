@@ -3,7 +3,7 @@ use super::{tower_catalog, Result, TensorRead, TowerSpec, VisionError};
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{VisionBlock, VisionSpec, NO_VISION_OFFSET};
 use cuteafd_loader::families::minimax_m3::config::MiniMaxM3VisionConfig;
-use std::{fs::File, path::Path};
+use std::path::Path;
 
 fn validate(config: &serde_json::Value, max_tokens: usize) -> Result<()> {
     let cfg = MiniMaxM3VisionConfig::from_hf(config)
@@ -24,7 +24,7 @@ fn validate(config: &serde_json::Value, max_tokens: usize) -> Result<()> {
 
 impl TowerSpec {
     pub fn minimax(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let config: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         validate(&config, max_tokens)?;
         let tensors = tower_catalog(snapshot, &["vision_tower.", "multi_modal_projector.", "patch_merge_mlp."])?;
         let mut reads = Vec::new();
@@ -169,7 +169,7 @@ mod tests {
             map.insert(name.clone(), serde_json::json!("vision.safetensors"));
         }
         let bytes = serde_json::to_vec(&header).unwrap();
-        let mut file = File::create(dir.path().join("vision.safetensors")).unwrap();
+        let mut file = std::fs::File::create(dir.path().join("vision.safetensors")).unwrap();
         file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
         file.write_all(&bytes).unwrap();
         file.set_len(8 + bytes.len() as u64 + end).unwrap();

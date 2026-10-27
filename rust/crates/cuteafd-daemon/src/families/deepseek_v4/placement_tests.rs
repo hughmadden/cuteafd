@@ -130,14 +130,15 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
             (budget, Baseline::Measured { free_bytes: budget - loaded })
         }).collect();
     // The planner's EXL3 arena from the same capacity manifests serve-dsv4 reads.
-    let expert_workspace = layout_expert_workspace(case, &catalog)?;
+    let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
+    let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
+    let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        loaded_modes: None, cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
+        loaded_modes: None, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
-            &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
-                .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
+            &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32 };
     let request = admission::request(&cli.engine, &inputs)?;
     assert_eq!(request.hops.terminal, cuteafd_loader::placement::TerminalHome::Head);
@@ -167,11 +168,9 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
 
 /// serve-dsv4's `local::workspace_bytes` without CUDA: the EXL3 package's
 /// capacity arenas plus BF16 output rows, or the native export's scratch.
-fn layout_expert_workspace(case: &Case<'_>, catalog: &cuteafd_loader::OfficialV41Catalog) -> anyhow::Result<u64> {
+fn layout_expert_workspace(case: &Case<'_>, catalog: &cuteafd_loader::OfficialV41Catalog,
+    rows: u64) -> anyhow::Result<u64> {
     let shape = *catalog.routed_experts();
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
-    let rows = manifest["capacities"]["prefill_rows"].as_u64().unwrap()
-        .max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
     match catalog.exl3() {
         Some(exl3) => {
             let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
@@ -250,6 +249,26 @@ fn synthetic_context(dir: &Path) -> PathBuf {
     }
     std::fs::write(&path, manifest.to_string()).unwrap();
     path
+}
+
+#[test]
+fn planner_equals_runtime_topology_selected_live_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic_context(dir.path());
+    let shared = Shared::open(dir.path()).unwrap();
+    for rtx in [1, 2] {
+        for sparks in [1, 2, 4, 5, 6, 8] {
+            let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks,
+                context: 1_048_576, budget: 24 << 30, onboard: Some(Onboard::Layers(2)),
+                dspark: false, exchange_f32: false, peer_budget: None, attention: None };
+            if matches!(sparks, 2 | 4) {
+                assert_equal(&shared, &case, &format!("topology {rtx} RTX + {sparks} Sparks"));
+            } else {
+                let (_, supported, hints) = planned(&shared, &case);
+                assert!(!supported, "unexported native TP{sparks} must refuse: {hints:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -786,17 +805,18 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
     let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| (g.total_bytes,
         Baseline::Measured { free_bytes: g.free_with_current_code(code[gpu]) })).collect();
-    let expert_workspace = layout_expert_workspace(case, &catalog)?;
+    let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
+    let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
+    let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
     let loaded_modes = vec![if case.rtx == 2 { cuteafd_loader::placement::LayerMode::HeadSplit }
         else { cuteafd_loader::placement::LayerMode::Whole { gpu: 0,
             ffn: cuteafd_loader::placement::FfnMode::Owner } }; cfg.n_layers];
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        loaded_modes: Some(&loaded_modes), cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
+        loaded_modes: Some(&loaded_modes), cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
-            &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
-                .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
+            &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32 };
     Ok(solve(&admission::request(&cli.engine, &inputs)?)?)
 }

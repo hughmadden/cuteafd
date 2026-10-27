@@ -51,7 +51,7 @@ pub use formats::attention_format::{
 };
 pub use catalog::{
     build_catalog, build_catalog_for_snapshot, classification_summary_markdown, read_model_facts,
-    read_safetensors_metadata, SafetensorsTensorMetadata,
+    read_safetensors_metadata, read_json_file, JsonFileError, SafetensorsTensorMetadata,
 };
 pub use formats::dspark_format::{
     native_deepseek_v4_dspark_tensor_specs, validate_native_deepseek_v4_dspark_catalog,

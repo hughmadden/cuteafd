@@ -87,6 +87,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                 expected_options.extend(f"--device nvidia.com/gpu={name}" for name in names)
             else:
                 expected_options.append(option)
+        # Serving containers run under --init (tini forwards SIGTERM to the daemon).
+        if "--init" not in expected_options:
+            expected_options.append("--init")
         assert after["options"] == sorted(expected_options), where
         # shared_thermal_args also mounts the host power governor's state read-only
         # when gpu-powerd runs on this host (#114).
@@ -174,8 +177,22 @@ def test_goldens_cover_every_v41_example_and_gate_card() -> None:
     examples = {p.stem for p in (ROOT / "examples" / "configs").glob("deepseek-v41-*.config")}
     assert examples <= set(CASES)
     kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
-    assert {e["name"] for e in kit["entries"] if e.get("family") == "deepseek_v41"} <= set(CASES)
+    assert {e["name"] for e in kit["entries"] if e.get("family") == "deepseek_v41"} <= set(KIT_CARDS)
     assert {p.stem for p in FIXTURES.glob("*.json")} == set(CASES)
+
+
+def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
+    result = capture(ROOT, "v41-flash-sim5090")
+    containers = [parse_run(item["argv"]) for item in result["containers"]]
+    coordinator = containers[0]
+    assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
+    command = dict(flag_values(coordinator["command"]))
+    for flag, value in {"--rtx-gpus": "1", "--spark-tp": "4", "--spark-ep": "1",
+                        "--prefill-batch-tokens": "1024", "--max-context-tokens": "1048576"}.items():
+        assert command[flag] == value
+    assert len(containers) == 5
+    for plan in result["plans"]:
+        assert plan[plan.index("--coordinator-gpu-budget-gib") + 1] == "31.8"
 
 
 def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> None:

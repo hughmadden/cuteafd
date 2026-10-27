@@ -11,7 +11,7 @@ phase="${6:-all}"
 # Name the failing line and command: a container exec only reports an exit code.
 trap 'status=$?; echo "build-wip-artifacts.sh: line $LINENO: \"$BASH_COMMAND\" exited $status (role ${2:-?}, phase $phase)" >&2' ERR
 # export: only the native/AOT outputs and their native-store entry, no Cargo and
-# no daemon (an export host such as oliver; the slot's own native phase then
+# no daemon (an export host such as maxq; the slot's own native phase then
 # restores the entry with CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1).
 case "$phase" in all|rust|native|export) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
@@ -133,6 +133,7 @@ export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-dis
 # CUTEAFD_WIP_HOST_ISA overrides (e.g. "x86-64-v2 x86-64-v4" for both). Each ISA
 # builds into $CARGO_TARGET_DIR-<isa>.
 source "$(dirname "${BASH_SOURCE[0]}")/host-isa.sh"
+cuteafd_build_parallelism
 host_isa_text="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")"
 mapfile -t host_isas <<<"$host_isa_text"
 host_isa_cmake="${host_isa_text//$'\n'/;}"

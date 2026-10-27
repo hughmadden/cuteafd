@@ -13,18 +13,14 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
-    if options.prefill_lanes > 0 { options.prefill_waves = options.prefill_lanes; }
     let local = report.placement == ExpertPlacement::Local;
-    let policy = ShapePolicy { prefill_rows: local.then_some(4096), ..ShapePolicy::manifest_bounded() };
-    let shape = Shape::resolve(report, model, options, policy);
-    // Local TP1/TP2 retain whole-step execution, not the Spark unit executor.
-    options.prefill_unit_rows = Some(shape.prefill_rows);
-    report.prefill_transports = Some(u64::from(!local));
-    if local && options.prefill_waves != 1 {
-        report.placement_supported = false;
-        report.hints.push(super::super::Hint { what: "Qwen local and dual prefill execute one whole-step wave".into(),
-            how: "Use --prefill-waves 1; continuous units require single-owner Spark experts.".into() });
-    }
+    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+        crate::families::qwen4::prefill_limits(local)) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
+    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    report.prefill_span_rows = Some(prefill.span_rows);
     if options.rtx_bytes.len() == 2 && options.head_split && local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
             shape.context_tokens, shape.native_layers > 0, shape.manifest.as_ref());
@@ -152,7 +148,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
         wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
     let endpoints = spark_endpoints("qwen4", 1);
-    let mut sparks = spark_devices(report, model, checkpoint, options, charges, &working, endpoints, &mut waste, &mut notes);
+    let mut sparks = spark_devices(report, model, input, options, charges, &working, endpoints, &mut waste, &mut notes);
     if report.encoder.is_none() {
         let target = options.pool_tokens.filter(|&tokens| tokens != 0)
             .unwrap_or(options.target_pool_tokens.max(shape.context_tokens));
@@ -175,7 +171,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         notes.push(format!("full-context admission shortfall: context {} tokens, pool {pool_tokens} tokens, shortfall {} tokens",
             shape.context_tokens, shape.context_tokens - pool_tokens));
     }
-    charge_spark_devices(report, model, checkpoint, options, charges, &working, endpoints, &mut sparks,
+    charge_spark_devices(report, model, input, options, charges, &working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -208,7 +204,6 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
             "Qwen prefill waves require single-owner Spark experts");
         let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 4096 };
         let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
-        anyhow::ensure!(units.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
         Some(units)
     } else { None };
     let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());

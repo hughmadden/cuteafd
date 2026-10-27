@@ -97,6 +97,7 @@ fn main() -> Result<()> {
     let host_isa = cuteafd_ffi::host_isa::startup()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
     tracing::info!("{host_isa}");
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())

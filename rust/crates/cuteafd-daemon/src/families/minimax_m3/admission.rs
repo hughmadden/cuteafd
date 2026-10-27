@@ -42,15 +42,15 @@ pub(super) fn spark_rings() -> Result<cuteafd_core::SparkRings> {
 }
 
 /// The worker admission serve seals to every Spark rank: the one endpoint decode and every prefill
-/// wave share (a unit's rows, BF16 in), and one execution slot per wave in flight, as the recipe
-/// charges them ([`RuntimeSizing::execution_slots`]).
+/// wave share (a unit's rows, BF16 in), and the typed owners the shared family admission gives
+/// MiniMax's NVFP4 package ladder: one decode owner, and one prefill owner buffering a unit per wave.
 pub(super) fn spark_model(sizing: RuntimeSizing) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let endpoint = sizing.spark_endpoint()?;
-    let mut model = cuteafd_transport::worker_selection::ModelAdmission::for_clients(cuteafd_core::ExpertGeometry::MINIMAX_M3,
-        endpoint, endpoint.capacity, spark_rings()?, 1)?;
-    model.execution_slots = sizing.execution_slots();
-    model.validate(cuteafd_core::ExpertGeometry::MINIMAX_M3)?;
-    Ok(model)
+    let exports = cuteafd_loader::plan::spark_executions::SparkBackend::Fp8.exports();
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports, None,
+        sizing.unit_rows as u64, sizing.waves as u64)?;
+    cuteafd_transport::worker_selection::ModelAdmission::for_clients(cuteafd_core::ExpertGeometry::MINIMAX_M3,
+        endpoint, spark_rings()?, 1, executions)
 }
 
 /// Admit `request` into `available` measured free bytes: already capped by the logical device
@@ -107,17 +107,21 @@ mod tests {
         Ok(())
     }
 
-    /// Serve seals one endpoint (decode and every wave) and an execution slot per wave in flight to
-    /// every rank: what the shared recipe charges each rank for.
+    /// Serve seals one endpoint (decode and every wave) and the typed owners to every rank: one
+    /// decode owner at the package's covering m80 export, and one prefill owner at the unit's
+    /// covering export (m4096 for 4096, 2752 and 2048 rows) buffering a unit per wave.
     #[test]
-    fn minimax_spark_model_seals_one_endpoint_and_a_slot_per_wave() -> Result<()> {
+    fn minimax_spark_model_seals_one_endpoint_and_typed_owners() -> Result<()> {
+        use cuteafd_core::{DecodeExecution, PrefillExecution};
         for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
             let sizing = RuntimeSizing { unit_rows: rows, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
                 logit_rows: 64, waves: lanes };
             let model = spark_model(sizing)?;
             assert_eq!(model.endpoints, [sizing.spark_endpoint()?]);
-            assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (rows as u32, rows as u32, lanes as u8));
-            assert_eq!(model.execution_slots, sizing.execution_slots());
+            assert_eq!(model.executions.decode, [DecodeExecution { capacity: 64, compiled_capacity: 80 }]);
+            assert_eq!(model.executions.prefill, PrefillExecution { capacity: rows as u32, compiled_capacity: 4096,
+                unit_rows: rows as u32, buffered_units: lanes as u8 });
+            assert_eq!((model.capacity(), model.compiled_capacity()), (rows as u32, 4096));
             model.require_clients(sizing.spark_endpoint()?, 1)?;
         }
         Ok(())
@@ -175,7 +179,8 @@ mod tests {
             let model = spark_model(sizing)?;
             assert_eq!(model.endpoints, [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: sizing.unit_rows as u32,
                 ingress: cuteafd_core::SparkIngress::Bf16 }], "TP{ranks}");
-            assert_eq!((model.execution_slots as usize, report.prefill_transports), (sizing.waves, Some(1)), "TP{ranks}");
+            assert_eq!((model.executions.prefill.buffered_units as usize, report.prefill_transports), (sizing.waves, Some(1)),
+                "TP{ranks}");
             assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("minimax_m3", sizing.waves as u64), 1);
             let ring = cuteafd_loader::plan::layout::spark_ring_geometry(1);
             assert_eq!(model.rings, cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,

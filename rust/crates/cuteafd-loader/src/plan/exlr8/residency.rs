@@ -1,7 +1,7 @@
 //! Checkpoint-native, unit-major EXLR8 residency and bounded range reads.
 //! Arena offsets are independent of a CUDA address; the owner binds them only
 //! after exact weight/workspace admission and retains the arena for graph life.
-use super::{Header, Layer, manifest, number, owner};
+use super::{Header, Layer, number, owner};
 use crate::plan::checkpoint::read_json;
 use anyhow::{Context, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,6 +11,79 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, ResidencyError>;
+
+#[derive(serde::Deserialize)]
+struct SelectedManifest {
+    format: String,
+    name: String,
+    #[serde(rename = "version")]
+    _version: String,
+    set_id: String,
+    layers: BTreeMap<String, SelectedLayer>,
+}
+#[derive(serde::Deserialize)]
+struct SelectedLayer {
+    gate: Vec<Vec<usize>>,
+    up: Vec<Vec<usize>>,
+    down: Vec<usize>,
+    shared: SelectedShared,
+}
+#[derive(serde::Deserialize)]
+struct SelectedShared { gate: Vec<usize>, up: Vec<usize>, down: usize }
+
+/// One invocation's immutable native metadata; payload/header checks still run per arena.
+pub struct MetadataInput {
+    snapshot: PathBuf,
+    selected: String,
+    pub(super) config: serde_json::Value,
+    manifest: SelectedManifest,
+    pub(crate) identity: String,
+}
+impl MetadataInput {
+    pub fn open(snapshot: &Path, selected: &str) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        ensure!(!selected.is_empty() && selected.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "manifest must be a published name, not a path");
+        let mut bytes = Vec::new();
+        File::open(snapshot.join(format!("manifests/exlr8-manifest-{selected}.json")))?
+            .take((64 << 20) + 1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 64 << 20, "oversized EXLR8 manifest");
+        let manifest: SelectedManifest = serde_json::from_slice(&bytes)?;
+        ensure!(manifest.format == "exlr8-v2-manifest" && manifest.name == selected,
+            "invalid EXLR8 manifest identity");
+        ensure!(manifest.set_id.len() == 64 && manifest.set_id.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid EXLR8 set_id");
+        Ok(Self { snapshot: snapshot.into(), selected: selected.into(), config: read_json(&snapshot.join("config.json"))?,
+            manifest, identity: format!("{:x}", Sha256::digest(&bytes)) })
+    }
+
+    pub fn plan(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<Residency> {
+        Residency::plan_inner(self, layer, world, rank, set).map_err(Into::into)
+    }
+
+    fn layer(&self, layer: &Layer, units: usize, experts: usize) -> anyhow::Result<&SelectedLayer> {
+        let choices = self.manifest.layers.get(&layer.id.to_string()).context("missing manifest layer")?;
+        let width = |k: usize, widths: &BTreeSet<usize>| -> anyhow::Result<()> {
+            ensure!((2..=4).contains(&k) && widths.contains(&k), "manifest requests absent K{k}");
+            Ok(())
+        };
+        for rows in [&choices.gate, &choices.up] {
+            ensure!(rows.len() == experts, "manifest expert count mismatch");
+            for row in rows {
+                ensure!(row.len() == units, "manifest unit count mismatch");
+                for &k in row { width(k, &layer.widths)?; }
+            }
+        }
+        ensure!(choices.down.len() == experts, "manifest expert count mismatch");
+        for &k in &choices.down { width(k, &layer.widths)?; }
+        for row in [&choices.shared.gate, &choices.shared.up] {
+            ensure!(row.len() == units, "manifest shared unit count mismatch");
+            for &k in row { width(k, &layer.shared_widths)?; }
+        }
+        width(choices.shared.down, &layer.shared_widths)?;
+        Ok(choices)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("EXLR8 residency: {0:#}")]
@@ -205,12 +278,14 @@ impl Residency {
         rank: usize,
         set: ExpertSet,
     ) -> Result<Self> {
-        Self::plan_inner(snapshot, selected, layer, world, rank, set).map_err(Into::into)
+        if !(1..=8).contains(&world) || rank >= world {
+            return Err(anyhow::anyhow!("expected TP1..8 and rank below world").into());
+        }
+        MetadataInput::open(snapshot, selected)?.plan(layer, world, rank, set)
     }
 
     fn plan_inner(
-        snapshot: &Path,
-        selected: &str,
+        input: &MetadataInput,
         layer: usize,
         world: usize,
         rank: usize,
@@ -220,7 +295,9 @@ impl Residency {
             (1..=8).contains(&world) && rank < world,
             "expected TP1..8 and rank below world"
         );
-        let config = read_json(&snapshot.join("config.json"))?;
+        let snapshot = &input.snapshot;
+        let selected = &input.selected;
+        let config = &input.config;
         ensure!(
             config["architectures"] == serde_json::json!(["GlmMoeDsaForCausalLM"]),
             "unsupported architecture"
@@ -276,9 +353,7 @@ impl Residency {
             widths: widths("widths")?,
             shared_widths: widths("shared_widths")?,
         };
-        let checked = manifest(snapshot, selected, hidden, units, routed, &[layer_spec])?;
-        let value = read_json(&snapshot.join(format!("manifests/exlr8-manifest-{selected}.json")))?;
-        let choices = &value["layers"][layer.to_string()];
+        let choices = input.layer(&layer_spec, units, routed)?;
         let experts = if set == ExpertSet::Shared { 1 } else { routed };
         let prefix = if set == ExpertSet::Shared {
             "shared."
@@ -322,14 +397,14 @@ impl Residency {
                     continue;
                 }
                 for (p, projection) in ["gate", "up", "down"].iter().enumerate() {
-                    let chosen = if set == ExpertSet::Shared {
-                        &choices["shared"][projection]
-                    } else {
-                        &choices[projection][e]
+                    let k = match (set, p) {
+                        (ExpertSet::Shared, 0) => choices.shared.gate[u],
+                        (ExpertSet::Shared, 1) => choices.shared.up[u],
+                        (ExpertSet::Shared, _) => choices.shared.down,
+                        (ExpertSet::Routed, 0) => choices.gate[e][u],
+                        (ExpertSet::Routed, 1) => choices.up[e][u],
+                        (ExpertSet::Routed, _) => choices.down[e],
                     };
-                    let k = (if p == 2 { chosen } else { &chosen[u] })
-                        .as_u64()
-                        .context("missing manifest width")? as usize;
                     let stem = format!("{prefix}k{k}");
                     let offset_at = ((e * 3 + p) * units + u) * 16;
                     let offset = read_u64(
@@ -486,8 +561,8 @@ impl Residency {
             experts,
             units,
             set,
-            set_id: checked.set_id,
-            manifest: selected.into(),
+            set_id: input.manifest.set_id.clone(),
+            manifest: selected.clone(),
             loads,
             signs,
             signs_offsets,
@@ -641,6 +716,27 @@ mod tests {
     }
 
     use crate::plan::testing::exlr8::fixture;
+
+    #[test]
+    fn metadata_input_reuses_selection_but_rechecks_payload_headers() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        let input = MetadataInput::open(root.path(), "mixed").unwrap();
+        for world in 1..=8 {
+            for rank in 0..world {
+                for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                    let cached = input.plan(3, world, rank, set).unwrap();
+                    let fresh = Residency::plan(root.path(), "mixed", 3, world, rank, set).unwrap();
+                    assert_eq!((cached.resident_bytes, cached.payload_bytes, cached.staging_bytes),
+                        (fresh.resident_bytes, fresh.payload_bytes, fresh.staging_bytes));
+                    assert_eq!(format!("{cached:?}"), format!("{fresh:?}"));
+                }
+            }
+        }
+        let path = root.path().join("experts/exlr8-layer-003.k2.safetensors");
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(8).unwrap();
+        assert!(input.plan(3, 1, 0, ExpertSet::Routed).is_err());
+    }
 
     #[test]
     fn residency_ownership_mixed_widths_shared_and_padded_ranges() {

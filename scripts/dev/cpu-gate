@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """One CPU gate for a checkout: cargo workspace tests and the script suite.
 
-  scripts/dev/cpu-gate --task NAME [--jobs N] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV] [--keep]
+  scripts/dev/cpu-gate --task NAME [--jobs N] [--full] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV] [--keep]
 
 --jobs is the total worker budget: split evenly between Cargo and pytest when
-both run, otherwise given entirely to the requested suite. --slow adds the
-explicit CPU slow tier and is required at release cuts. Install cargo-nextest
+both run, otherwise given entirely to the requested suite. Default excludes
+15 measured full-plan/cache tests; --full restores them and is required for
+work/p0 merges and releases. This includes the installed-example deployment-to-
+release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
+inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
+The sweep discovers PROGRAMS.json in /opt/cuteafd/share, ~/.local/share/cuteafd,
+or the live V4 fixture's ~/.cache/cuteafd/builds/v3-p4/c1/artifacts (in that order).
+CUTEAFD_DEPLOYMENT_TEST_PROGRAMS overrides discovery, retaining adjacent capacity
+manifests. Configs requiring an absent PROGRAMS file skip with an explicit counted
+reason; planner failures with present inputs still fail.
+Receipts name every exclusion. --slow separately
+adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
 The gate finds it on PATH or there automatically; cargo test remains the fallback.
 When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
@@ -63,6 +73,24 @@ BUILDS = Path.home() / '.cache/cuteafd/builds'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
+# Actual >60s IDs from the 081a00072 full gate, not the earlier estimated list.
+FULL_TESTS = (
+    'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
+    'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
+    'families::step5::admission::tests::public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation',
+    'fidelity_dataset::tests::cached_published_qualifications_and_manifests_load',
+    'families::kimi_k3::admission::tests::planner_equals_runtime_context_extent_at_256k_512k_and_1m',
+    'families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation',
+    'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count',
+    'plan::families::step5::tests::full_context_mtp_forecast_charges_private_predictors_before_allocation',
+    'plan::layout::draft_prefix_tests::kimi_host_snapshots_use_serve_context_and_selected_draft_record',
+    'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only',
+    'families::kimi_k3::serve::tests::shared_prefill_policy_matches_planner_and_runtime_admission',
+    'plan::families::kimi::tests::planner_resolves_every_spark_count_before_recipe_refusal',
+    'plan::families::kimi::tests::direct_layout_uses_shared_host_mark_rule_and_preserves_overrides',
+    'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
+    'installed_example_deployments_publish_executable_prefill_shapes',
+)
 SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'),
               ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
               ('cuteafd-loader', 'mounted_mimo_audio_inventory_is_independently_admitted'))
@@ -368,27 +396,36 @@ def cargo(source, root, args, env):
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
                 f'exit {code}; missing or unsuccessful build-finished event')}
-    skips = []
-    if args.skip_live_planners:
-        for name in LIVE_PLANNERS:
-            skips += ['--skip', name]
+    full = getattr(args, 'full', False)
+    if full:
+        env.setdefault('CUTEAFD_DEPLOYMENT_TEST_HF_HOME',
+                       env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
+    skipped_full = [] if full else list(FULL_TESTS)
+    skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
+    skipped = skipped_full + skipped_live
+    skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
         test_args.append('--exact')
     nextest = nextest_for(env)
     # nextest's store is workspace-relative, independent of CARGO_TARGET_DIR.
-    report = root / 'logs/nextest/cpu-gate/junit.xml'
+    profile_name = 'cpu-gate-full' if full else 'cpu-gate'
+    report = root / f'logs/nextest/{profile_name}/junit.xml'
     if nextest:
         config = root / 'nextest.toml'
         profile = source / 'rust/.config/nextest.toml'
         if not profile.is_file():  # --base may predate nextest support.
             profile = REPO / 'rust/.config/nextest.toml'
-        config.write_text('[store]\ndir = ' + json.dumps(str(root / 'logs/nextest')) + '\n' + profile.read_text())
+        profile_text = profile.read_text()
+        if full and '[profile.cpu-gate-full]' not in profile_text:
+            full_profile = (REPO / 'rust/.config/nextest.toml').read_text().split('[profile.cpu-gate-full]', 1)[1]
+            profile_text += '\n[profile.cpu-gate-full]' + full_profile
+        config.write_text('[store]\ndir = ' + json.dumps(str(root / 'logs/nextest')) + '\n' + profile_text)
         test_args = ['nice', '-n', '19', nextest, 'nextest', 'run', '--workspace', '--locked',
-                     '--config-file', str(config), '--profile', 'cpu-gate', '--no-fail-fast', '--test-threads',
+                     '--config-file', str(config), '--profile', profile_name, '--no-fail-fast', '--test-threads',
                      env['RUST_TEST_THREADS']]
-        if args.skip_live_planners:
-            test_args += ['-E', ' & '.join(f'not test(={name})' for name in LIVE_PLANNERS)]
+        if skipped:
+            test_args += ['-E', ' & '.join(f'not test(={name})' for name in skipped)]
     if nextest:
         report.unlink(missing_ok=True)
     log(f"cargo: running tests ({'nextest' if nextest else 'cargo test'}, {env['RUST_TEST_THREADS']} workers, no build slot)")
@@ -429,7 +466,8 @@ def cargo(source, root, args, env):
             code = code or slow_code or (0 if sum(t[0] + t[1] for t in slow_totals) == 1 else 1)
             test_s += seconds
     result.update(exit=code, test_s=round(test_s), log=str(test_log), passed=passed, failed=failed, ignored=ignored,
-                  binaries=len(totals), failing=ids, skipped_live_planners=list(LIVE_PLANNERS) if skips else [])
+                  binaries=len(totals), failing=ids, full=full,
+                  skipped_full_tests=skipped_full, skipped_live_planners=skipped_live)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.cargo_timeout} s')
     elif passed == 0:
@@ -568,6 +606,10 @@ def render(record):
         note = suite.get('error', '')
         if suite.get('skipped_live_planners'):
             note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
+        if suite.get('skipped_full_tests'):
+            note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; not a merge/release gate"
+        elif suite.get('full'):
+            note = (note + '; ' if note else '') + 'full tier'
         for test, values in suite.get('medians', {}).items():
             note = (note + '; ' if note else '') + f"{test} medians " + ', '.join(f'{k} {v:.0f} us' for k, v in values.items())
         lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
@@ -588,7 +630,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--jobs', type=int, default=os.environ.get('CUTEAFD_TEST_JOBS', max(1, (os.cpu_count() or 2) // 2)),
                         help='total CPU worker budget (default: CUTEAFD_TEST_JOBS or half logical CPUs)')
-    parser.add_argument('--slow', action='store_true', help='also run the explicit slow CPU tier (required at release cuts; never enables GPU tests)')
+    parser.add_argument('--full', action='store_true', help='include measured full-plan/cache tests (required for work/p0 merges and releases)')
+    parser.add_argument('--slow', action='store_true', help='also run explicit ignored CPU soaks (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')
     parser.add_argument('--scripts', action='store_true')
@@ -640,6 +683,7 @@ def main():
 
 def run_gate(args, root):
     record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+              'full': getattr(args, 'full', False),
               'skip_live_planners': args.skip_live_planners, **gate(args.source.resolve(), root / 'head', args)}
     if args.base:
         base_source = root / 'base-src'

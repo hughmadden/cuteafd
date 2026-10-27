@@ -85,7 +85,7 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
     assert 'smi=/usr/lib/wsl/lib/nvidia-smi' in remote
     admit = remote.index('"$placement" reserve --ledger')
-    container = remote.index('docker run --rm --memory')
+    container = remote.index('docker run --rm --init --memory')
     assert admit < container  # admission precedes the export container
     assert 'mem_get_info' not in remote
     # Bulk data only through sparknest, never one ssh pipe.
@@ -137,7 +137,7 @@ def test_the_export_containers_gpu_binding_has_one_call_site():
 
 
 def test_remote_export_matches_the_dev_image_by_layer_content_not_local_id():
-    # docker save | load gave oliver the same layers under another image ID; a
+    # docker save | load can give the same layers another image ID; a
     # local-ID check refused a usable host. Content identity is the layer list,
     # while the native key keeps raptor's ID (CUTEAFD_WIP_DEV_IMAGE_ID via ENV_FILE).
     remote = (ROOT / 'scripts/build/export-remote.sh').read_text()

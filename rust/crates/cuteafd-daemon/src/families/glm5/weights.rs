@@ -170,7 +170,7 @@ impl<'a> GlmLoader<'a> {
             .then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(self.catalog.snapshot())).transpose()?;
         for index in range {
             for (operand, suffix) in [("gate", "weight"), ("gate.bias", "e_score_correction_bias")] {
-                let allocation = crate::shared::peer_split::on_device(self.library, peer.device, self.device, || {
+                let allocation = crate::shared::peer_split::on_device(self.library, peer.device, || {
                     let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 router replica");
                     let name = format!("model.layers.{index}.mlp.gate.{suffix}");
                     if let Some(records) = &native {
@@ -569,7 +569,7 @@ impl<'a> GlmLoader<'a> {
             return body(self.stream);
         }
         let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
-        crate::shared::peer_split::on_device(self.library, peer.device, self.device, || body(peer.stream))
+        crate::shared::peer_split::on_device(self.library, peer.device, || body(peer.stream))
     }
 
     /// The FP8 weights `names` concatenated by rows, each sliced over `ranks`

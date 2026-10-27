@@ -161,7 +161,7 @@ fn main() -> Result<()> {
         SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
                 timeout: Duration::from_secs(30),
                 max_frame_bytes: 2 * 1024 * 1024,
-            })
+            }, 0)
     };
     let mut lanes = [make()?, make()?];
     let runtime = tokio::runtime::Builder::new_current_thread()

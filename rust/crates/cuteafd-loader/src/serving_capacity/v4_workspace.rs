@@ -452,9 +452,24 @@ mod tests {
             {"name": "dsv4p_index_topk_prefill_m4096", "scratch_bytes_at_capacity": {"scratch": 300}},
             {"name": "dsv4p_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 40}}
         ]});
-        for rows in [512, 1024, 2048, 4096] {
+        for rows in [512, 1024, 2048, 2752, 4096] {
             assert_eq!(deepseek_v4_workspace_scratch(&manifest, "dsv4p", false, rows, 64)
                 .unwrap().index_topk_bytes, 300);
+        }
+        let scratch = deepseek_v4_workspace_scratch(&manifest, "dsv4p", false, 2752, 64).unwrap();
+        for ranks in [1, 2] {
+            let cfg = config(true);
+            let with = deepseek_v4_workspace_geometry(&cfg, 2752, 64, 131072, ranks, 3, scratch).unwrap();
+            let without = deepseek_v4_workspace_geometry(&cfg, 2752, 64, 131072, ranks, 3,
+                V4WorkspaceScratch::default()).unwrap();
+            for (actual, baseline) in with.iter().zip(&without) {
+                // One fixed compiled top-k allocation per prefill/decode workspace,
+                // not per live row or wave; zero-byte buffers retain a 256-byte floor.
+                assert_eq!(actual.fixed_device_bytes - baseline.fixed_device_bytes, 2 * (300 - 256));
+                assert_eq!(actual.prefill_waves, 3);
+                assert_eq!(actual.pool_unit_device_bytes, baseline.pool_unit_device_bytes);
+                assert_eq!(actual.pinned_host_bytes, baseline.pinned_host_bytes);
+            }
         }
     }
 

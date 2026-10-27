@@ -195,10 +195,88 @@ def test_live_planner_skip_is_explicit_and_recorded(tmp_path, monkeypatch):
     calls = _fake(monkeypatch, [(0, BUILD_OK), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**{**vars(ARGS), 'skip_live_planners': True}), {})
     test_cmd = calls[1]
-    assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == 2
+    assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == len(gate.FULL_TESTS) + 2
     assert result['skipped_live_planners'] == list(gate.LIVE_PLANNERS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert 'live V4 planner tests skipped' in gate.render(record)
+
+
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('nextest', [False, True])
+def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, monkeypatch, full, nextest):
+    (tmp_path / 'logs').mkdir()
+    ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ok), (0, ok)])
+    if nextest:
+        monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
+        monkeypatch.setattr(gate, 'parse_nextest', lambda report: ([(1, 0, 0)], []))
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), {})
+    assert result['status'] == 'pass' and result['full'] == full
+    assert result['skipped_full_tests'] == ([] if full else list(gate.FULL_TESTS))
+    assert result['skipped_live_planners'] == []
+    command = calls[1]
+    if nextest:
+        assert command[command.index('--profile') + 1] == ('cpu-gate-full' if full else 'cpu-gate')
+        assert ('-E' in command) != full
+        if not full:
+            assert command[command.index('-E') + 1] == ' & '.join(f'not test(={name})' for name in gate.FULL_TESTS)
+    else:
+        assert command.count('--skip') == (0 if full else len(gate.FULL_TESTS))
+        if not full:
+            assert command[-1] == '--exact'
+            assert command[command.index('--') + 1:-1:2] == ['--skip'] * len(gate.FULL_TESTS)
+            assert command[command.index('--') + 2:-1:2] == list(gate.FULL_TESTS)
+    record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
+    assert ('not a merge/release gate' in gate.render(record)) != full
+    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 15
+    assert 'installed_example_deployments_publish_executable_prefill_shapes' in gate.FULL_TESTS
+
+
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('inventory', ['home', 'hf-home', 'override'])
+@pytest.mark.parametrize('programs_override', [False, True])
+def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monkeypatch, full, inventory, programs_override):
+    (tmp_path / 'logs').mkdir()
+    calls = []
+    def run_logged(cmd, path, env, cwd, timeout):
+        calls.append(dict(env))
+        Path(path).write_text(BUILD_OK if len(calls) == 1 else
+                              'test result: ok. 1 passed; 0 failed; 0 ignored\n')
+        return 0, 1.
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'run_logged', run_logged)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **kwargs: '')
+    env = {'HOME': str(tmp_path)}
+    expected = str(tmp_path / '.cache/huggingface')
+    if inventory in ('hf-home', 'override'):
+        env['HF_HOME'] = expected = str(tmp_path / 'hf-home')
+    if inventory == 'override':
+        env['CUTEAFD_DEPLOYMENT_TEST_HF_HOME'] = expected = str(tmp_path / 'selected-inventory')
+    if programs_override:
+        env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] = str(tmp_path / 'PROGRAMS.json')
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), env)
+    assert result['status'] == 'pass'
+    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == (expected if full or inventory == 'override' else None)
+    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS') == env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
+    assert ('CUTEAFD_DEPLOYMENT_TEST_HF_HOME' in env) == (inventory == 'override')
+
+
+def test_full_tier_adds_only_its_missing_profile_for_an_older_base(tmp_path, monkeypatch):
+    source = tmp_path / 'base'
+    profile = source / 'rust/.config/nextest.toml'
+    profile.parent.mkdir(parents=True)
+    profile.write_text('[profile.cpu-gate]\nretries = 0\n[profile.cpu-gate.junit]\npath = "junit.xml"\n')
+    (tmp_path / 'logs').mkdir()
+    ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
+    _fake(monkeypatch, [(0, BUILD_OK), (0, ok), (0, ok)])
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
+    monkeypatch.setattr(gate, 'parse_nextest', lambda report: ([(1, 0, 0)], []))
+    result = gate.cargo(source, tmp_path, SimpleNamespace(**vars(ARGS), full=True), {})
+    assert result['status'] == 'pass'
+    import tomllib
+    config = tomllib.loads((tmp_path / 'nextest.toml').read_text())
+    assert set(config['profile']) == {'cpu-gate', 'cpu-gate-full'}
+    assert config['profile']['cpu-gate-full']['junit']['report-skipped'] == 'all'
 
 
 def test_scripts_parse_failing_ids_and_empty_runs(tmp_path, monkeypatch):

@@ -331,7 +331,7 @@ fn tap_offset(to: usize, rows: usize, stride: usize, tap_rows: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Default lane rows (unit 2048 x 2 waves) for these tap fixtures.
+    /// Fixed lane rows for these tap fixtures, independent of serving defaults.
     const TARGET_TAP_ROWS: usize = 4096;
 
     #[test]

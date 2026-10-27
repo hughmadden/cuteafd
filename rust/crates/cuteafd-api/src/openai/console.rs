@@ -330,7 +330,9 @@ mod tests {
         for text in [PAGE, UI_CSS, UI_JS] {
             for external in ["http://", "https://"] {
                 assert!(!text.contains(&format!("src=\"{external}")), "page loads an external script");
-                assert!(!text.contains(&format!("href=\"{external}")), "page loads an external stylesheet");
+                for link in text.split("<link").skip(1).filter_map(|tag| tag.split('>').next()) {
+                    assert!(!link.contains(&format!("href=\"{external}")), "page loads an external stylesheet");
+                }
                 assert!(!text.contains(&format!("url({external}")), "page loads an external resource");
             }
         }

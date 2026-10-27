@@ -19,6 +19,12 @@ pub struct RankAdmission {
     pub workspace: u64,
 }
 
+pub fn validate_span_rows(rows: usize) -> Result<()> {
+    let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows;
+    ensure!(rows > 0 && rows as u64 <= limit, "Step-5 allocation span must be 1..={limit} rows");
+    Ok(())
+}
+
 pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 16]> {
     ensure!(
         (1..=4096).contains(&rows) && matches!(heads, 32 | 64),
@@ -89,8 +95,8 @@ pub fn csa_planes(rows: usize) -> Result<[usize; 32]> {
     .map(|n| n.max(256)))
 }
 
-pub fn routed_planes(rows: usize) -> Result<[usize; 14]> {
-    ensure!((1..=4096).contains(&rows), "Step-5 routed allocation rows");
+pub fn routed_planes(rows: usize) -> Result<[usize; 15]> {
+    validate_span_rows(rows)?;
     const E: usize = 352;
     const K: usize = 8;
     const I: usize = 1536;
@@ -109,12 +115,13 @@ pub fn routed_planes(rows: usize) -> Result<[usize; 14]> {
         (H, 4),
         (H, 4),
         (H, 4),
+        (H + H / 32, 1),
     ]
     .map(|(width, element)| (rows * width * element).max(256)))
 }
 
 pub fn dense_planes(rows: usize) -> Result<[usize; 6]> {
-    ensure!((1..=4096).contains(&rows), "Step-5 dense allocation rows");
+    validate_span_rows(rows)?;
     Ok([(H, 4), (H, 2), (2 * 13824, 2), (13824, 2), (H, 2), (H, 4)]
         .map(|(width, elem)| (rows * width * elem).max(256)))
 }
@@ -142,14 +149,14 @@ fn region(sizes: &[usize], order: &[usize], start: usize) -> Result<(Vec<(usize,
 
 /// Live planes hold every in-flight unit's rows (`span` rows, each unit at its
 /// own row offset); FFN scratch is hook-local and holds one unit.
-fn routed_sizes(unit: usize, span: usize) -> Result<[usize; 14]> {
-    ensure!(unit > 0 && unit <= span, "Step-5 FFN unit rows exceed the span");
+fn routed_sizes(unit: usize, span: usize) -> Result<[usize; 15]> {
+    ensure!((1..=4096).contains(&unit) && unit <= span, "Step-5 FFN unit rows exceed kernel capacity or span");
     let (local, live) = (routed_planes(unit)?, routed_planes(span)?);
     Ok(std::array::from_fn(|plane| if ROUTED_LIVE.contains(&plane) { live[plane] } else { local[plane] }))
 }
 
 fn dense_sizes(unit: usize, span: usize) -> Result<[usize; 6]> {
-    ensure!(unit > 0 && unit <= span, "Step-5 FFN unit rows exceed the span");
+    ensure!((1..=4096).contains(&unit) && unit <= span, "Step-5 FFN unit rows exceed kernel capacity or span");
     let (local, live) = (dense_planes(unit)?, dense_planes(span)?);
     Ok(std::array::from_fn(|plane| if DENSE_LIVE.contains(&plane) { live[plane] } else { local[plane] }))
 }
@@ -164,11 +171,11 @@ fn live_prefix(unit: usize, span: usize) -> Result<usize> {
 
 /// (offset, bytes) per routed plane, in the routed owner's plane-index order,
 /// relative to the rank's FFN region. `full` (CSA) layers use the second reply plane.
-pub fn routed_layout(unit: usize, span: usize, full: bool) -> Result<[(usize, usize); 14]> {
+pub fn routed_layout(unit: usize, span: usize, full: bool) -> Result<[(usize, usize); 15]> {
     let sizes = routed_sizes(unit, span)?;
     let (mut layout, swa_end) = region(&sizes, &ROUTED_LIVE, 0)?;
     if full { layout[9].0 = swa_end; }
-    let local = (0..14).filter(|plane| !ROUTED_LIVE.contains(plane)).collect::<Vec<_>>();
+    let local = (0..15).filter(|plane| !ROUTED_LIVE.contains(plane)).collect::<Vec<_>>();
     let (tail, _) = region(&sizes, &local, live_prefix(unit, span)?)?;
     for &plane in &local { layout[plane] = tail[plane]; }
     Ok(layout.try_into().expect("routed plane count"))
@@ -221,7 +228,7 @@ pub fn head_rows(rows: usize, full_prefill_logits: bool) -> usize {
 }
 
 pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
-    ensure!((1..=4096).contains(&rows), "Step-5 head allocation rows");
+    validate_span_rows(rows)?;
     Ok([rows * H * 2, rows * H * 2, rows * 128896 * 4, 4 << 20])
 }
 
@@ -344,7 +351,7 @@ mod tests {
             // Head-split and whole-owned replies never share storage; every
             // other plane is identical between the two routed kinds.
             assert!(routed[9].0 + routed[9].1 <= csa[9].0);
-            assert!((0..14).filter(|&p| p != 9).all(|p| routed[p] == csa[p]));
+            assert!((0..15).filter(|&p| p != 9).all(|p| routed[p] == csa[p]));
             let region = usize::try_from(ffn_region_bytes(rows, rows)?)?;
             // OUTPUT first, then INPUT, in both kinds.
             assert_eq!((routed[13].0, dense[5].0), (0, 0));
@@ -366,7 +373,7 @@ mod tests {
                 assert!(live.iter().all(|b| dense[plane].0 >= b.0 + b.1));
             }
             for kind in [&routed, &csa] {
-                for plane in (0..14).filter(|plane| !ROUTED_LIVE.contains(plane)) {
+                for plane in (0..15).filter(|plane| !ROUTED_LIVE.contains(plane)) {
                     assert!(live.iter().all(|b| kind[plane].0 >= b.0 + b.1));
                 }
             }
@@ -374,10 +381,10 @@ mod tests {
             assert!(region < usize::try_from(plane_bytes(&routed_planes(rows)?)? + plane_bytes(&dense_planes(rows)?)?)?);
         }
         // Units: live planes span every in-flight unit's rows, scratch holds one unit.
-        for (unit, span) in [(256, 512), (512, 1024), (2048, 4096)] {
+        for (unit, span) in [(256, 512), (512, 1024), (2048, 4096), (4096, 8192), (2752, 8256), (2048, 8192)] {
             let routed = routed_layout(unit, span, true)?;
             let dense = dense_layout(unit, span)?;
-            for plane in 0..14 {
+            for plane in 0..15 {
                 let expected = if routed_live(plane) { routed_planes(span)?[plane] } else { routed_planes(unit)?[plane] };
                 assert_eq!(routed[plane].1, expected);
             }
@@ -385,8 +392,19 @@ mod tests {
                 let expected = if dense_live(plane) { dense_planes(span)?[plane] } else { dense_planes(unit)?[plane] };
                 assert_eq!(dense[plane].1, expected);
             }
-            assert!(ffn_region_bytes(unit, span)? < ffn_region_bytes(span, span)?);
+            if span <= 4096 { assert!(ffn_region_bytes(unit, span)? < ffn_region_bytes(span, span)?); }
         }
+        let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows as usize;
+        for span in [0, limit + 1, usize::MAX] {
+            assert!(routed_planes(span).is_err());
+            assert!(dense_planes(span).is_err());
+            assert!(head_planes(span).is_err());
+            assert!(routed_layout(512, span, false).is_err());
+            assert!(dense_layout(512, span).is_err());
+        }
+        assert!(routed_planes(limit).is_ok());
+        assert!(dense_planes(limit).is_ok());
+        assert!(head_planes(limit).is_ok());
         assert!(routed_layout(512, 256, false).is_err());
         Ok(())
     }

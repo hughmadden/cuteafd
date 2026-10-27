@@ -86,7 +86,6 @@ pub(crate) enum TerminalPeerError {
 struct AbortSide<'a> {
     library: &'a NativeLibrary,
     device: i32,
-    home: i32,
     word: DeviceAllocation<'a>,
     stream: *mut c_void,
 }
@@ -95,7 +94,7 @@ impl Drop for AbortSide<'_> {
     fn drop(&mut self) {
         // No blocked wait is ever enqueued on this independent stream. The
         // complete engine is quarantined instead of dropped after a failed drain.
-        if let Err(error) = on_device(self.library, self.device, self.home, || {
+        if let Err(error) = on_device(self.library, self.device, || {
             // SAFETY: this owned stream only publishes into the still-live word.
             unsafe {
                 self.library.cuda_stream_synchronize(self.stream)?;
@@ -141,23 +140,16 @@ mod cooperative_wait_tests {
 }
 
 fn run_on_rank<T>(library: &NativeLibrary, rank: RankDevice, body: impl FnOnce() -> Result<T>) -> Result<T> {
-    crate::shared::memory::device::Device { library, id: rank.device }.run(body)
+    on_device(library, rank.device, body)
 }
 
-/// Runs `body` with `device` current, then `home` again (whatever `body` returned).
+/// Runs synchronous work on `device`, restoring the caller's device on every exit.
 pub(crate) fn on_device<T>(
     library: &NativeLibrary,
     device: i32,
-    home: i32,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if device == home {
-        return body();
-    }
-    library.cuda_set_device(device)?;
-    let out = body();
-    library.cuda_set_device(home)?;
-    out
+    crate::shared::memory::device::Device { library, id: device }.run(body)
 }
 
 /// One GPU's end: receive buffers and, per flag (slot, plus [`DIRECT`]), four
@@ -219,7 +211,7 @@ impl<'a> PeerExchange<'a> {
         );
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
         let end = |rank: usize| -> Result<End<'a>> {
-            on_device(library, ranks[rank].device, ranks[0].device, || {
+            on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 // Lazy native module loading may synchronize behind an unmatched
                 // peer wait. Force every registered helper before any wait exists.
@@ -265,7 +257,7 @@ impl<'a> PeerExchange<'a> {
         library.peer_abort_available()?;
         let mut exchange = Self::new(library, ranks, slots, slot_bytes)?;
         let side = |rank: usize| {
-            on_device(library, ranks[rank].device, ranks[0].device, || {
+            on_device(library, ranks[rank].device, || {
                 let probe = |stage| crate::shared::inventory::startup_probe(
                     library, &[ranks[rank].device], stage);
                 probe("peer-abort-before-preload")?;
@@ -279,7 +271,6 @@ impl<'a> PeerExchange<'a> {
                 Ok(AbortSide {
                     library,
                     device: ranks[rank].device,
-                    home: ranks[0].device,
                     word,
                     stream,
                 })
@@ -709,7 +700,9 @@ mod tests {
         library.cuda_set_device(1)?;
         let target = RankDevice { device: 0, stream: std::ptr::null_mut() };
         let remote = RankDevice { device: 1, stream: std::ptr::null_mut() };
-        assert_eq!(run_on_rank(&library, target, || library.cuda_get_device())?, 0);
+        assert_eq!(on_device(&library, target.device, || library.cuda_get_device())?, 0);
+        assert_eq!(library.cuda_get_device()?, 1);
+        assert_eq!(on_device(&library, remote.device, || library.cuda_get_device())?, 1);
         assert_eq!(library.cuda_get_device()?, 1);
         let result: Result<()> = run_on_rank(&library, target, || {
             assert_eq!(library.cuda_get_device()?, 0);
@@ -724,6 +717,54 @@ mod tests {
         }));
         assert!(panic.is_err());
         assert_eq!(library.cuda_get_device()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn peer_scopes_restore_the_caller_instead_of_a_fixed_home() {
+        let source = include_str!("peer_split.rs");
+        let helper = source.split("pub(crate) fn on_device<T>").nth(1).unwrap()
+            .split("/// One GPU's end").next().unwrap();
+        assert!(helper.contains("Device { library, id: device }.run(body)"));
+        assert!(!helper.contains("home"));
+        let mimo = include_str!("../families/mimo_v2/engine.rs");
+        let rank_scope = mimo.split("pub(crate) fn on<T>").nth(1).unwrap()
+            .split("pub(crate) fn is_terminal").next().unwrap();
+        assert!(rank_scope.contains("Device { library: self.library, id: device }.run(body)"));
+        assert!(!rank_scope.contains("cuda_set_device"));
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
+    fn peer_scopes_preserve_terminal_device_for_blocking_stream_waits() -> Result<()> {
+        use crate::shared::memory::{device::{Device, Event, Stream}, BlockingWait};
+        use cuteafd_transport::wait_policy::{set_wait_policy, HostWait, WaitPolicy};
+        set_wait_policy(WaitPolicy { wait: HostWait::Block, ..Default::default() })?;
+        // SAFETY: all streams and events are destroyed before the loaded library.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+        let streams = devices.map(Stream::new).into_iter().collect::<Result<Vec<_>>>()?;
+        let mut landed = BlockingWait::new(&library);
+        for terminal in [1usize, 0] {
+            library.cuda_set_device(terminal as i32)?;
+            let mut produced = Event::new(devices[terminal])?;
+            for rank in [0usize, 1, 0] {
+                on_device(&library, rank as i32, || {
+                    assert_eq!(library.cuda_get_device()?, rank as i32);
+                    Ok(())
+                })?;
+                assert_eq!(library.cuda_get_device()?, terminal as i32);
+                produced.record(&streams[terminal])?;
+                // SAFETY: this terminal-device stream remains owned through the wait.
+                unsafe { landed.wait(streams[terminal].raw)?; }
+            }
+            let failure: Result<()> = on_device(&library, 1 - terminal as i32,
+                || anyhow::bail!("injected peer failure"));
+            assert!(failure.is_err());
+            assert_eq!(library.cuda_get_device()?, terminal as i32);
+            // SAFETY: failed peer work restored the same live terminal-device stream.
+            unsafe { landed.wait(streams[terminal].raw)?; }
+        }
         Ok(())
     }
 

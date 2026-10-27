@@ -26,17 +26,68 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 }
 
 #[test]
+fn shared_catalog_rejects_the_same_unindexed_headers_as_standalone() {
+    let dir = snapshot(false);
+    let path = dir.path().join("model-00000.safetensors");
+    testing::write_safetensors(&path, &[t("unindexed.weight", "BF16", &[2])]);
+    let input = PlanInput::open(dir.path()).unwrap();
+    let cached = format!("{:#}", input.expert_catalog().unwrap_err());
+    let standalone = format!("{:#}", crate::read_expert_catalog(dir.path()).unwrap_err());
+    assert!(cached.contains("index/header tensor count mismatch"), "{cached}");
+    assert_eq!(cached, standalone);
+}
+
+#[test]
 fn planner_publishes_kimi_runtime_default_and_explicit_units() {
-    let dir = snapshot(true);
-    for (unit, waves, expected) in [(0, 0, (2048, 2, 4096)), (1024, 2, (1024, 2, 2048)), (4096, 1, (4096, 1, 4096))] {
+    let dir = snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    for (unit, waves, expected) in [(0, 0, (2752, 3, 8256)), (1024, 2, (1024, 2, 2048)),
+        (4096, 1, (4096, 1, 4096)), (0, 4, (2048, 4, 8192)), (4096, 2, (4096, 2, 8192))] {
         let mut options = with_layout(6, None);
         let layout = options.layout.as_mut().unwrap();
         layout.prefill_rows = unit;
         layout.prefill_lanes = waves;
         layout.host_memory = Some((128 << 30, 128 << 30));
-        let report = plan::plan(dir.path(), &options).unwrap();
+        let report = input.plan(&options).unwrap();
         assert_eq!((report.prefill_unit_rows.unwrap(), report.prefill_waves.unwrap(), report.prefill_span_rows.unwrap()), expected);
         assert_eq!(report.prefill_transports, Some(1));
+    }
+}
+
+#[test]
+fn planner_resolves_every_spark_count_before_recipe_refusal() {
+    let dir = snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    for ranks in 0..=8 {
+        let report = input.plan(&with_layout(ranks, None)).unwrap();
+        let daemon = crate::serving_capacity::prefill_waves::prefill_shape(ranks,
+            crate::plan::Family::prefill_limits(&super::KIMI_K3), Default::default()).unwrap();
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+            (Some(daemon.unit_rows), Some(daemon.waves), Some(daemon.span_rows)), "ranks={ranks}: {:?}", report.hints);
+        if ranks != 6 {
+            assert!(!report.fits && !report.placement_supported && !report.wip_launchable());
+            assert!(report.hints.iter().any(|hint| hint.what.contains(&format!("kimik3:exl3-k23 TP{ranks}"))),
+                "ranks={ranks}: {:?}", report.hints);
+            assert!(report.memory_layout.unwrap().devices.is_empty());
+        }
+    }
+}
+
+#[test]
+fn planner_refuses_shapes_outside_shared_live_reserve() {
+    let dir = snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    for (unit, waves, span) in [(4096, 4, None), (4096, 3, None), (2753, 3, None),
+        (2752, 3, Some(8192)), (2752, 3, Some(16384))] {
+        let mut options = with_layout(6, None);
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = unit;
+        layout.prefill_lanes = waves;
+        layout.prefill_span_rows = span;
+        let report = input.plan(&options).unwrap();
+        assert!(!report.fits && !report.placement_supported);
+        assert!(report.hints.iter().any(|hint| hint.what.contains("prefill unsupported")), "{:?}", report.hints);
+        assert!(report.memory_layout.unwrap().devices.is_empty());
     }
 }
 
@@ -130,7 +181,7 @@ fn header_acceptance_is_independent_of_runtime_inventory() {
 #[test]
 fn release_headers_classify_native_text_without_installed_artifacts() {
     let dir = snapshot(false);
-    let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+    let report = testing::plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("kimi_k3"));
     assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
     assert!(report.unclassified.is_empty(), "{:?}", &report.unclassified[..report.unclassified.len().min(5)]);
@@ -159,7 +210,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
     assert!(!report.executable());
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
-    let vision_report = plan::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
+    let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
     assert!(vision_report.hints.iter().any(|h| h.what.contains("vision execution is not implemented")));
 }
@@ -182,7 +233,7 @@ fn context_refuses_the_missing_executor_instead_of_claiming_fit() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(!report.placement_supported && !report.fits && !report.executable());
     let reason = report.config_error.as_deref().unwrap();
     assert!(reason.contains("kimi_k3") && reason.contains("context")
@@ -219,7 +270,7 @@ fn header_contract_refuses_other_shapes_and_dtypes() {
         let entry = tensors.iter_mut().find(|(n, ..)| *n == full).unwrap();
         *entry = t(full.clone(), dtype, &shape);
         testing::write_snapshot(dir.path(), &config(), &tensors, None);
-        let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+        let report = testing::plan(dir.path(), &PlanOptions::default()).unwrap();
         let error = report.config_error.unwrap_or_default();
         assert!(error.contains(&full) && error.contains("release contract"), "{error}");
     }
@@ -236,6 +287,7 @@ fn category(d: &cuteafd_core::memory_layout::DeviceLayout, c: cuteafd_core::memo
 fn direct_layout_uses_shared_host_mark_rule_and_preserves_overrides() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mark_bytes = 449_372_160;
     for (host, entries, explicit) in [
         (Some(0), 20, None), (None, 20, None), (Some(32 << 30), 20, None),
@@ -253,7 +305,7 @@ fn direct_layout_uses_shared_host_mark_rule_and_preserves_overrides() {
         layout.prefix_slots = explicit;
         let expected = explicit.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
             layout.concurrency, entries, mark_bytes, layout.mimo_prefix_mark_bytes, host != Some(0)));
-        let report = plan::plan(dir.path(), &options).unwrap();
+        let report = input.plan(&options).unwrap();
         assert!(report.fits, "host={host:?} entries={entries} explicit={explicit:?}: {:?}", report.hints);
         let reserved = device(report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx)
             .into_iter().map(|gpu| category(gpu, Category::Prefix)).sum::<u64>();
@@ -266,6 +318,7 @@ fn direct_layout_uses_shared_host_mark_rule_and_preserves_overrides() {
 fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(108 << 30));
     let layout = options.layout.as_mut().unwrap();
     layout.host_cache_bytes = None;
@@ -274,7 +327,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     layout.pool_tokens = Some(1_048_576);
     layout.prefix_slots = Some(2);
     layout.context_tokens = 262144;
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = input.plan(&options).unwrap();
     assert!(report.fits && report.placement_supported, "{:#?}", report.hints);
     let memory = report.memory_layout.as_ref().unwrap();
     assert_eq!(memory.pool_tokens, 1_048_576);
@@ -282,7 +335,8 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
         && note.contains("compiled max context: 1048576")), "{:?}", memory.notes);
     assert!(memory.notes.iter().any(|note| note.contains("selected RTX expert layers:")
         && note.contains("retained marks:")), "{:?}", memory.notes);
-    assert!(memory.notes.iter().any(|note| note.contains("estimated runtime/workspace reserve")));
+    assert!(memory.notes.iter().any(|note| note.contains("runtime residual")
+        && note.contains("typed execution owners")), "{:?}", memory.notes);
     let sparks = device(memory, DeviceKind::Spark);
     assert_eq!(sparks.len(), 6);
     for spark in &sparks {
@@ -298,16 +352,16 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert_eq!(category(rtx[0], Category::Experts), category(rtx[1], Category::Experts));
     // Numeric overrides are strict, never silently increased to satisfy the workers.
     options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = input.plan(&options).unwrap();
     assert!(!refused.fits);
     assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit --rtx-expert-layers 0")));
     // An impossible Spark ceiling must refuse instead of shrinking the 1M extent.
     options.layout.as_mut().unwrap().onboard = None;
     options.spark_budget_bytes = Some(1);
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = input.plan(&options).unwrap();
     assert!(!refused.fits);
     // Other card columns are refused by name.
-    let refused = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
+    let refused = input.plan(&with_layout(4, None)).unwrap();
     assert!(refused.hints.iter().any(|h| h.what.contains("missing Spark recipe kimik3:exl3-k23 TP4")));
 }
 
@@ -337,7 +391,7 @@ fn mounted_release_plan_is_manifest_independent_and_wip_only() -> anyhow::Result
     layout.onboard = Some(crate::placement::Onboard::Layers(5));
     // Match the serving card's automatic pool, not a forced 2M allocation.
     layout.pool_tokens = None;
-    let report = plan::plan(std::path::Path::new(&snapshot), &options)?;
+    let report = testing::plan(std::path::Path::new(&snapshot), &options)?;
     assert_eq!(report.experts.as_ref().context("deployment expert package")?.package, PACKAGE);
     assert!(report.fits && report.placement_supported && report.wip_launchable(), "{:#?}", report.hints);
     assert!(!report.executable(), "release readiness is not qualified by a header-only plan");
@@ -527,11 +581,11 @@ fn default_context_follows_the_checkpoint_core() -> Result<()> {
         let checkpoint = Checkpoint::open(dir)?;
         assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
         // The planner's unset context selects the same extent; an explicit one wins.
-        let report = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+        let report = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
         let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
-        let explicit = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+        let explicit = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
             ..Default::default() })?;
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();

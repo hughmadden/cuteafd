@@ -557,7 +557,7 @@ PASSED = 'running 1 test\ntest families::step5::chain::tests::native_step5_layer
 
 
 @pytest.mark.parametrize('hosts,match', [
-    ('oliver', 'Kimi'),
+    ('maxq', 'not a pool Spark'),
     ('kakapo', 'build seed'), ('dodo,dodo', 'repeats'), ('emu,nosuch', 'not a pool Spark'), (' , ', 'no host'),
 ])
 def test_spark_hosts_refused(hosts, match):

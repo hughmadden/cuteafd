@@ -5,10 +5,11 @@
 //! workers.
 //!
 //! - Busy waits ([`HostWait`]): `block` (default) spins for [`BLOCK_SPIN`]
-//!   in each critical-path wait (most per-layer waits end within it), then
-//!   sleeps: per-step syncs on blocking-sync events, the rest in
-//!   [`BLOCK_SLEEP`] slices at 1 us timer slack; the exchange worker paces its
-//!   polling to each wave's expected duration. `spin` spins in
+//!   in each critical-path wait (every per-layer decode wait ends within it),
+//!   then sleeps: per-step syncs on blocking-sync events, the rest in
+//!   [`BLOCK_SLEEP`] slices at 1 us timer slack; the exchange worker spins
+//!   through the same window and paces longer waits to each wave's expected
+//!   duration. `spin` spins in
 //!   host syncs and keeps the exchange worker polling between a wave's post
 //!   and its replies, for the lowest latency at one busy core per waiting
 //!   thread.
@@ -78,11 +79,35 @@ pub fn set_wait_policy(policy: WaitPolicy) -> anyhow::Result<()> {
 pub fn wait_policy() -> WaitPolicy { POLICY.get().copied().unwrap_or_default() }
 
 /// How long a critical-path wait under [`HostWait::Block`] polls before it
-/// starts sleeping. Most per-layer waits (a router, a Spark reply) complete
-/// within this, so they never pay a sleep's wake-up; longer ones sleep.
-pub const BLOCK_SPIN: Duration = Duration::from_micros(250);
+/// starts sleeping: the one hybrid spin window for every block-mode wait
+/// ([`Backoff`], [`spin_window`], the Spark exchange worker's pacing).
+///
+/// 10 ms (TJ 2026-10-26), up from 250 us: every per-layer decode wait (a
+/// router, a Spark reply) ends within it, so decode never pays a sleep's
+/// wake-up; only prefill-length waits sleep, and an idle server still parks
+/// after [`WaitPolicy::idle_park`]. At 250 us Kimi K3 BF16 max, whose
+/// per-layer Spark round is 0.6-0.7 ms, slept in every per-layer wait: C8
+/// basic 0.913 and sweep 0.946 of spin, and the timed Spark compute for
+/// identical kernels grew 33.6 -> 38.9 ms (#731 comment 6415231320).
+pub const BLOCK_SPIN: Duration = Duration::from_millis(10);
 /// One sleep of a critical-path wait past [`BLOCK_SPIN`].
 pub const BLOCK_SLEEP: Duration = Duration::from_micros(20);
+
+/// Whether a block-mode wait that has lasted `waited` still spins
+/// (inside [`BLOCK_SPIN`]) rather than sleeps.
+pub fn block_spins(waited: Duration) -> bool { waited < BLOCK_SPIN }
+
+/// The spin phase of a block-mode wait: polls `ready` until it reports
+/// `true` (returns `true`) or [`BLOCK_SPIN`] has passed (returns `false`; the
+/// caller then sleeps until the condition holds, e.g. on a blocking event).
+pub fn spin_window<E>(mut ready: impl FnMut() -> Result<bool, E>) -> Result<bool, E> {
+    let started = Instant::now();
+    loop {
+        if ready()? { return Ok(true); }
+        if !block_spins(started.elapsed()) { return Ok(false); }
+        std::hint::spin_loop();
+    }
+}
 
 /// A bounded backoff for one host wait on the critical path: under
 /// [`HostWait::Spin`] it always spins; under [`HostWait::Block`] it spins for
@@ -95,9 +120,12 @@ impl Backoff {
     }
     /// One pass of the wait: spin, or sleep once the spin budget is spent.
     pub fn pause(&mut self) {
-        if !self.block { return std::hint::spin_loop(); }
-        let started = *self.started.get_or_insert_with(Instant::now);
-        if started.elapsed() < BLOCK_SPIN { std::hint::spin_loop() } else { std::thread::sleep(BLOCK_SLEEP) }
+        if self.sleeps() { std::thread::sleep(BLOCK_SLEEP) } else { std::hint::spin_loop() }
+    }
+    /// Whether this pass sleeps (block mode, past [`BLOCK_SPIN`] since the
+    /// first pause after the last progress).
+    fn sleeps(&mut self) -> bool {
+        self.block && !block_spins(self.started.get_or_insert_with(Instant::now).elapsed())
     }
     /// The wait made progress: the next pause spins again.
     pub fn reset(&mut self) { self.started = None; }
@@ -141,19 +169,49 @@ mod tests {
     }
 
     #[test]
-    fn backoff_spins_first_then_sleeps_under_block() {
-        let mut backoff = Backoff { block: true, started: None };
+    fn block_spin_window_is_ten_ms_and_covers_a_kimi_layer_round() {
+        assert_eq!(BLOCK_SPIN, Duration::from_millis(10));
+        // Kimi K3's per-layer Spark round (0.6-0.7 ms) and V4.1's must spin.
+        assert!(block_spins(Duration::ZERO));
+        assert!(block_spins(Duration::from_micros(700)));
+        assert!(block_spins(Duration::from_micros(9_999)));
+        assert!(!block_spins(BLOCK_SPIN));
+        assert!(!block_spins(Duration::from_millis(50)));
+        // Parking stays separate and unchanged.
+        assert_eq!(WaitPolicy::default().idle_park, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn spin_window_returns_when_ready_and_gives_up_after_the_window() {
+        // Ready after 1 ms of polling: caught inside the window, no sleep.
         let started = Instant::now();
-        backoff.pause();
-        assert!(started.elapsed() < BLOCK_SLEEP, "the first pause spins");
-        std::thread::sleep(BLOCK_SPIN);
+        let ready = spin_window(|| Ok::<_, ()>(started.elapsed() >= Duration::from_millis(1))).unwrap();
+        assert!(ready, "a sub-window wait completes while spinning");
+        assert!(started.elapsed() < BLOCK_SPIN);
+        // Never ready: spins the whole window, then hands back to the caller.
+        let started = Instant::now();
+        assert!(!spin_window(|| Ok::<_, ()>(false)).unwrap());
+        assert!(started.elapsed() >= BLOCK_SPIN, "spins the full window before blocking");
+        // Errors from the poll propagate at once.
+        assert_eq!(spin_window(|| Err::<bool, _>("poll failed")), Err("poll failed"));
+    }
+
+    #[test]
+    fn backoff_spins_through_the_window_then_sleeps_under_block() {
+        let mut backoff = Backoff { block: true, started: None };
+        assert!(!backoff.sleeps(), "the first pause spins");
+        // A Kimi K3 per-layer round (0.6-0.7 ms) in: still spinning.
+        backoff.started = Instant::now().checked_sub(Duration::from_micros(700));
+        assert!(!backoff.sleeps(), "a per-layer wait never sleeps");
+        backoff.started = Instant::now().checked_sub(BLOCK_SPIN);
+        assert!(backoff.sleeps(), "past the spin budget it sleeps");
         let late = Instant::now();
         backoff.pause();
-        assert!(late.elapsed() >= BLOCK_SLEEP, "past the spin budget it sleeps");
+        assert!(late.elapsed() >= BLOCK_SLEEP, "a sleeping pause sleeps");
         backoff.reset();
-        let again = Instant::now();
-        backoff.pause();
-        assert!(again.elapsed() < BLOCK_SLEEP, "progress restarts the spin");
+        assert!(!backoff.sleeps(), "progress restarts the spin");
+        let mut spin = Backoff { block: false, started: Instant::now().checked_sub(Duration::from_secs(1)) };
+        assert!(!spin.sleeps(), "spin mode never sleeps");
     }
 
     #[test]

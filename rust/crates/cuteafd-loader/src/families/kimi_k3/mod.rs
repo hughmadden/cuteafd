@@ -21,10 +21,29 @@ pub fn default_context(core: &core::CoreInventory) -> usize {
 }
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
-/// Offline ceiling only; the first full worker load/steady census qualifies it.
-pub const SPARK_ESTIMATED_WORKSPACE_BYTES: u64 = 512 << 20;
-pub const SPARK_ESTIMATED_RESERVE_BYTES: u64 =
-    cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + SPARK_ESTIMATED_WORKSPACE_BYTES;
+/// TP6 retained EXL3 arenas/private capacities plus 4096-row K32 input/routes
+/// (#762 census). GlmFlashK64 does not retain the m16 specialization.
+pub const SPARK_SLOT_BYTES: u64 = 844_696_852;
+
+/// Kimi's typed Spark owners on its EXL3 K64 ladder.
+pub fn spark_executions(waves: u64, unit_rows: u64) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    let exports = crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::GlmFlashK64).exports();
+    crate::plan::spark_executions::admit_family("kimi_k3", &exports, None, unit_rows, waves)
+}
+
+/// One Kimi owner's bytes (the shared EXL3 owner census at latent width).
+pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    crate::plan::layout::spark_slots::exl3_owner_bytes("kimi_k3", cuteafd_core::ExpertGeometry::KIMI_K3, extent)
+}
+
+/// The Spark execution reserve used before placement and in its ledger: the
+/// runtime residual plus the typed owners (one prefill scratch at the admitted
+/// unit's export, the decode owner, per-unit route staging times the waves).
+pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
+    let owners = spark_executions(waves, unit_rows)?.workspace_bytes(spark_owner_bytes)?
+        .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Kimi Spark owner reserve overflow"))?;
+    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
+}
 
 /// Target taps for one prefill call (`rows` lane rows) while the common MLA
 /// drafter consumes 2048-row slices.

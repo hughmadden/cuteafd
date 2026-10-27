@@ -10,23 +10,26 @@ use super::PlanError;
 /// Most decode lanes one coordinator runs.
 pub const MAX_DECODE_LANES: u8 = 2;
 
+/// The reason of a descriptor with no decode loop of its own (a drafter
+/// checkpoint, which drafts inside its target family's lane).
+pub const DRAFTER: &str = "a drafter has no decode loop of its own: it drafts inside its target family's lane";
+
 /// What a family's executor supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneSupport {
-    /// One decode batch only.
-    One,
+    /// One decode batch only; `reason` records why a second lane is not
+    /// wired (a measurement or the predicted cost), and the planner reports it.
+    One { reason: &'static str },
     /// One or two; `default` until a hardware A/B qualifies another default.
     OneOrTwo { default: u8 },
     /// A fixed pair (the executor has no one-lane path).
     FixedTwo,
 }
 
-/// The family's lane support. A family moves from `One` when its port onto
-/// the shared lane owners lands (with its planner charges).
-pub fn support(family: &str) -> LaneSupport {
-    match family {
-        "deepseek_v41" => LaneSupport::FixedTwo,
-        _ => LaneSupport::One,
+impl LaneSupport {
+    /// Most lanes the executor can run (each owns a Spark decode execution).
+    pub fn max_lanes(self) -> u8 {
+        match self { Self::One { .. } => 1, Self::OneOrTwo { .. } | Self::FixedTwo => MAX_DECODE_LANES }
     }
 }
 
@@ -34,10 +37,10 @@ pub fn support(family: &str) -> LaneSupport {
 ///
 /// A family that admits one or two resolves one lane at configured
 /// concurrency one: an idle second lane would cost memory for nothing.
-pub fn resolve(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
-    let support = support(family);
+pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+    let support = family.decode_lanes();
     let lanes = requested.unwrap_or(match support {
-        LaneSupport::One => 1,
+        LaneSupport::One { .. } => 1,
         LaneSupport::OneOrTwo { default } => default,
         LaneSupport::FixedTwo => 2,
     });
@@ -46,11 +49,11 @@ pub fn resolve(family: &str, requested: Option<u8>, concurrency: u64) -> Result<
     }
     let refusal = match (support, lanes) {
         (LaneSupport::FixedTwo, 1) => Some("the executor has a fixed pair of decode lanes"),
-        (LaneSupport::One, 2) => Some("this family has no independent second decode lane"),
+        (LaneSupport::One { reason }, 2) => Some(reason),
         _ => None,
     };
     if let Some(reason) = refusal {
-        return Err(PlanError::UnsupportedOption { option: "--decode-lanes", value: lanes, family: family.into(), reason });
+        return Err(PlanError::UnsupportedOption { option: "--decode-lanes", value: lanes, family: family.id().into(), reason });
     }
     Ok(match support {
         LaneSupport::OneOrTwo { .. } if concurrency <= 1 => 1,
@@ -70,28 +73,52 @@ mod tests {
 
     #[test]
     fn every_family_resolves_its_default_and_refuses_what_it_cannot_run() {
-        for (family, default) in [("deepseek_v41", 2), ("mimo_v2", 1), ("glm5", 1), ("glm5_flash", 1),
-            ("deepseek_v4", 1), ("qwen4", 1), ("qwen3_5", 1), ("kimi_k3", 1), ("step5", 1),
-            ("minimax_m3", 1)] {
-            assert_eq!(resolve(family, None, 16).unwrap(), default, "{family}");
+        for family in super::super::family::registry() {
+            let default = match family.decode_lanes() {
+                LaneSupport::One { .. } => 1, LaneSupport::OneOrTwo { default } => default, LaneSupport::FixedTwo => 2 };
+            assert_eq!(resolve(*family, None, 16).unwrap(), default, "{}", family.id());
             for lanes in [1, 2] {
-                let supported = match support(family) {
-                    LaneSupport::One => lanes == 1,
+                let supported = match family.decode_lanes() {
+                    LaneSupport::One { .. } => lanes == 1,
                     LaneSupport::OneOrTwo { .. } => true,
                     LaneSupport::FixedTwo => lanes == 2,
                 };
-                let result = resolve(family, Some(lanes), 16);
+                let result = resolve(*family, Some(lanes), 16);
                 if supported { assert_eq!(result.unwrap(), lanes); } else {
                     assert!(matches!(result, Err(PlanError::UnsupportedOption { option: "--decode-lanes", value, .. })
-                        if value == lanes), "{family} {lanes}");
+                        if value == lanes), "{} {lanes}", family.id());
                 }
             }
             for lanes in [0, 3, 255] {
-                assert!(matches!(resolve(family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
+                assert!(matches!(resolve(*family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
             }
         }
         // The fixed pair holds at concurrency one.
-        assert_eq!(resolve("deepseek_v41", Some(2), 1).unwrap(), 2);
+        let v41 = &crate::plan::families::deepseek::DEEPSEEK_V41;
+        assert_eq!(resolve(v41, Some(2), 1).unwrap(), 2);
+        assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::FixedTwo);
+    }
+
+    #[test]
+    fn one_lane_families_record_their_reason() {
+        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2", "glm5", "glm5_flash", "deepseek_v4"] {
+            let family = crate::plan::spark_executions::descriptor(id).unwrap();
+            let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
+            assert!(reason != DRAFTER && reason.contains("#744"), "{id}: {reason}");
+            assert!(matches!(resolve(family, Some(2), 16),
+                Err(PlanError::UnsupportedOption { reason: refused, .. }) if refused == reason), "{id}");
+        }
+    }
+
+    /// Every target family runs decode on the shared lane owners (#744): only
+    /// drafter descriptors keep the default.
+    #[test]
+    fn only_drafters_keep_the_default_reason() {
+        for family in super::super::family::registry() {
+            let drafter = matches!(family.id(), "dflash2" | "dspark");
+            let default = family.decode_lanes() == (LaneSupport::One { reason: DRAFTER });
+            assert_eq!(default, drafter, "{}", family.id());
+        }
     }
 
     #[test]

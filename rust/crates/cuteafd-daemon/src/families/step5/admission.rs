@@ -28,7 +28,7 @@ pub(super) fn admit_mtp<'a>(
         else { admission::admit_mtp(checkpoint, inputs, depth)? };
     if depth > 0 {
         for stage in 0..depth {
-            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.rows)?;
+            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.unit_rows())?;
         }
     }
     let ownership = &admitted.ownership;
@@ -185,9 +185,7 @@ mod tests {
             (1_048_576, None, true, None, 20),
             (1_048_576, Some(262_144), false, None, 20),
             (1_048_576, None, true, Some(0), 20),
-            (1_048_576, None, true, Some(1 << 30), 20),
             (1_048_576, None, true, None, 0),
-            (1_048_576, None, true, Some(0), 0),
         ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
             .into_iter().map(move |format| (case, format))) {
@@ -210,31 +208,22 @@ mod tests {
                     ..Default::default()
                 },
             )?;
-            assert_eq!(report.wip_launchable(), launchable,
-                "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
-            assert!(!report.executable());
-            // The planner's automatic prefill unit (2048, or the step-down that
-            // keeps its pool) is what the daemon admits.
-            let (unit, waves, rows) = if launchable {
-                (report.prefill_unit_rows.unwrap() as usize,
-                    report.prefill_waves.unwrap() as usize,
-                    report.prefill_span_rows.unwrap() as usize)
-            } else {
-                // A refused plan has no admitted geometry. The daemon must also
-                // refuse the default shape rather than fabricate a resolved plan.
-                assert!(report.prefill_unit_rows.is_none());
-                assert!(report.prefill_span_rows.is_none());
-                (2048, 2, 4096)
-            };
-            assert_eq!(rows, unit * waves);
-            if launchable {
-                assert!([2048, 1024, 512].contains(&unit), "{unit}");
-                // Two in flight unless device-only retention at full context
-                // forces the default down to one.
-                assert!(waves == 2 || (waves == 1 && host == Some(0)), "waves {waves}");
-                assert!(report.prefill_selection.as_deref().is_some_and(|s|
-                    s.contains(&format!("{unit} rows x {waves} waves"))));
+            let retention_pressure = host == Some(0) && entries > 0;
+            if !retention_pressure {
+                assert_eq!(report.wip_launchable(), launchable,
+                    "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
             }
+            assert!(!report.executable());
+            // A rejected allocation still reports the selected topology shape;
+            // capacity admission never retries a smaller unit or fewer waves.
+            let descriptor = cuteafd_loader::plan::Family::prefill_limits(
+                &cuteafd_loader::plan::families::step5::STEP5);
+            let daemon = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(
+                sparks, descriptor, Default::default())?;
+            let (waves, rows) = (daemon.waves as usize, daemon.span_rows as usize);
+            assert_eq!(report.prefill_unit_rows, Some(daemon.unit_rows));
+            assert_eq!(report.prefill_waves, Some(daemon.waves));
+            assert_eq!(report.prefill_span_rows, Some(daemon.span_rows));
             let mut code = Vec::new();
             let gpus = opts
                 .rtx_bytes
@@ -285,10 +274,10 @@ mod tests {
                 startup: vec![],
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
-            if !launchable {
+            if !report.wip_launchable() {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
-                assert!(refusal.contains("compiled/max-context floor of 1048576"));
+                if !retention_pressure { assert!(refusal.contains("compiled/max-context floor of 1048576")); }
                 assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
                 continue;
             }

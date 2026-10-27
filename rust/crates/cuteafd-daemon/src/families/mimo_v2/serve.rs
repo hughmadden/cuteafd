@@ -36,6 +36,7 @@ use cuteafd_api::openai::{
     PromptUsage,
 };
 use crate::shared::console;
+use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -281,11 +282,12 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         engine.check_tp2_routers()?;
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
-        }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select, host_config, &mut media, preparer.as_deref())
+            args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
+                }
+            })
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| (args.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -484,12 +486,12 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
     host_config: Option<cuteafd_hostcache::config::Config>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let mut owners = super::serving_owners::ServingOwners::new(engine);
     let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
     owners.prefix(family, cache);
     owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
-    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer)
+    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer, ready)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,7 +499,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let head_numerics = match engine.head().weight {
@@ -517,7 +519,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         resource::publish(&shared.policy, 0, 0, None);
         Some(shared)
     } else { None };
-    let (mut observed_rounds, mut skipped_rounds) = (0u64, 0u64);
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let (family, cache, selector) = owners.parts();
@@ -530,16 +531,19 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
-    // Verify steps since the last completed request, and host seconds in
-    // them (engine) and in token selection + streaming.
-    let mut steps = 0u64;
-    let (mut verify_s, mut draft_s, mut emit_s) = (0f64, 0f64, 0f64);
+    let mut lane = DecodeLane::default();
+    // MiMo's only decode lane (`LaneSupport::One`), polled on this thread.
+    let lanes = LaneSet::default();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut seconds_per_row = 0.01f64;
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     let mut snapshot_waiter: Option<MediaReady<super::media::Prompt>> = None;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     let config = &opened.checkpoint.config;
     let mut failures = FailureRecipients::default();
+    publish(stats, requests, generated_total, 0, 0, cache, media, preparer);
+    // The API may advertise capacity only after every fallible startup owner exists.
+    ready();
     // Keep admitted request owners alive until a fatal cause has reached every
     // affected client, including requests waiting for prefill or KV admission.
     let result = (|| -> Result<()> { loop {
@@ -927,330 +931,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         }
         if active.is_empty() { continue; }
         let cycle = Instant::now();
-        let mut round_clock = RoundClock::at(cycle);
-        let mut drafted_requests = 0;
-        let mut drafted_width = 0;
-        let mut tally = console::Step::begin(0);
-        let (draft0, emit0) = (draft_s, emit_s);
-        let engine_before = tally.live().then(|| *engine.profile.borrow());
-        // Rows each sequence may add after its next token.
-        let room = DECODE_ROWS.saturating_sub(active.len());
-        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
-            .min(a.capacity - a.placement.len - 1) }).collect();
-        let ready: Vec<_> = active.iter().map(|a| match drafter {
-            Some(_) => a.slot.is_some(),
-            None => engine.mtp.as_ref().is_some_and(|mtp| {
-                let start = a.placement.len.saturating_sub(engine.cfg.window + mtp.stages.len());
-                if a.media.ready(start, a.history.len()) { true } else {
-                    // Restored media is in target state, not host embeddings.
-                    engine.mtp_reset(a.placement.ring as usize, a.placement.len);
-                    false
-                }
-            }),
-        }).collect();
-        let draft_rooms = eligible_draft_rooms(&limits, &ready, width);
-        let action_requests: Vec<_> = active.iter().zip(&limits).map(|(a, &room)| (a.ticket.id(), room)).collect();
-        let run_draft = match shared.as_mut() {
-            Some(shared) => select_draft_action(&mut shared.policy, &action_requests, &draft_rooms,
-                width, DECODE_ROWS, policy.fixed)?,
-            None => false,
-        };
-        // DFlash drafts after every next token (sequences with a ring slot),
-        // then the adaptive plan's counts.
-        let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if run_draft => {
-                let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.filter(|_| draft_rooms[i] > 0).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
-                        valid_from: a.draft_from })))
-                    .collect();
-                for &(i, _) in &seqs {
-                    active[i].counts[5] += 1;
-                }
-                let timer = Instant::now();
-                drafted_requests = seqs.len();
-                drafted_width = width;
-                let drafts = round_clock.draft(|| engine.submit(|| drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.head())));
-                let ms = timer.elapsed().as_secs_f64() * 1e3;
-                draft_s += ms / 1e3;
-                let mut out = vec![None; active.len()];
-                match drafts {
-                    Ok(drafts) => {
-                        for ((i, _), draft) in seqs.into_iter().zip(drafts) {
-                            out[i] = Some(draft);
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!("DFlash draft failed: {error:#}");
-                        if engine.is_terminal() {
-                            return Err(error);
-                        }
-                    }
-                }
-                out
-            }
-            // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
-            None if run_draft && engine.mtp.is_some() && policy.fixed != Some(0)
-                && limits.iter().any(|&limit| limit > 0) => {
-                let indices: Vec<usize> = (0..active.len()).filter(|&i| draft_rooms[i] > 0).collect();
-                for &i in &indices {
-                    active[i].counts[5] += 1;
-                }
-                let seqs: Vec<MtpSeq<'_>> = indices.iter().map(|&i| {
-                    let a = &active[i];
-                    MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history, media: Some(&a.media) }
-                }).collect();
-                let stages = engine.mtp.as_ref().map_or(0, |m| m.stages.len());
-                let timer = Instant::now();
-                drafted_requests = seqs.len();
-                drafted_width = stages;
-                let drafts = round_clock.draft(|| engine.mtp_draft(&seqs, stages));
-                let ms = timer.elapsed().as_secs_f64() * 1e3;
-                draft_s += ms / 1e3;
-                match drafts {
-                    Ok(drafts) => {
-                        let mut out = vec![None; active.len()];
-                        for (i, tokens) in indices.into_iter().zip(drafts) {
-                            let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
-                            out[i] = Some(super::dflash::Draft { tokens, features });
-                        }
-                        out
-                    },
-                    Err(error) => {
-                        tracing::warn!("MTP draft failed: {error:#}");
-                        if engine.is_terminal() {
-                            return Err(error);
-                        }
-                        vec![None; active.len()]
-                    }
-                }
-            }
-            _ => vec![None; active.len()],
-        };
-        let plan_timer = Instant::now();
-        let priors: Vec<Vec<f64>> = active.iter().enumerate().zip(&drafted).map(|((i, a), draft)| {
-            let (Some(shared), Some(draft)) = (shared.as_ref(), draft.as_ref()) else { return Vec::new() };
-            if drafter.is_some() {
-                shared.prior(&a.drafts, &resource::DraftEvidence::Selector(&draft.features),
-                    crate::shared::draft::copy::COPY_EXTENSION)
-            } else {
-                let pooled = a.drafts.pooled(draft.tokens.len(), active.iter().enumerate()
-                    .filter(|&(other, _)| other != i).map(|(_, other)| &other.drafts));
-                shared.prior(&a.drafts, &resource::DraftEvidence::History(&pooled),
-                    crate::shared::draft::copy::COPY_EXTENSION)
-            }
-        }).collect();
-        let copy_agreement = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
-            d.as_ref().map_or(0, |d| crate::shared::draft::copy::agreement(&a.history, &d.tokens)))
-            .collect::<Vec<_>>());
-        let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
-            crate::shared::draft::copy::trace_window(&a.history,
-                d.as_ref().map_or(0, |d| d.tokens.len() + crate::shared::draft::copy::COPY_EXTENSION)))
-            .collect::<Vec<_>>());
-        let mut priors = priors;
-        let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
-            .map(|(((a, d), &limit), prior)| match (shared.as_ref(), d.as_ref()) {
-                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
-                    a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
-                _ => None,
-            }).collect();
-        for (i, prior) in priors.iter_mut().enumerate() {
-            let available = copies[i].as_ref().map_or_else(
-                || drafted[i].as_ref().map_or(0, |draft| draft.tokens.len()), |copy| copy.tokens.len());
-            prior.truncate(available);
-        }
-        let mut predicted = None;
-        let mut planned = if let Some(fixed) = policy.fixed {
-            drafted.iter().zip(&limits).map(|(d, &limit)| d.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect()
-        } else if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0) {
-            let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
-                resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
-            let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
-            predicted = selection.predicted;
-            selection.lengths
-        } else { vec![0; active.len()] };
-        if resource::trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
-        if policy.fixed.is_some() {
-            if let Some(shared) = shared.as_ref() {
-                let candidates: Vec<_> = active.iter().zip(&priors).map(|(a, prior)|
-                    cuteafd_core::DraftCandidate { id: a.ticket.id(), confidence: prior }).collect();
-                crate::shared::draft::binding::trace_selection(&shared.policy, &candidates,
-                    drafted_width, drafted_requests, DECODE_ROWS, &planned);
-            }
-        }
-        let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
-            let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
-                .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
-            let mut rows: Vec<u32> = std::iter::once(a.next).chain(full.iter().take(planned[i]).copied()).collect();
-            if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
-            Ok(rows)
-        }).collect::<Result<_>>()?;
-        let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
-        let plan_us = console::us(plan_timer);
-        let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-        steps += 1;
-        let timer = Instant::now();
-        // A sequence whose grammar fails is failed alone after the step; an
-        // error inside `submit` would end the engine.
-        let mut poisoned: Vec<Option<String>> = vec![None; active.len()];
-        cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.ticket.id(), s.len() as u32)).collect());
-        engine.probe_begin(tokens.len());
-        let step = engine.submit(|| {
-            let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
-                .map(|(a, s)| (&mut a.placement, s.len())).collect();
-            let logits = engine.verify_device(&mut rows, &tokens, None)?.context("decode needs every layer")?;
-            drop(rows);
-            // Each row draws at the position after it, masked along its sequence's drafts.
-            let mut batch = SelectBatch::default();
-            for (i, ((a, rows), &start)) in active.iter().zip(&sequences).zip(&starts).enumerate() {
-                poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
-            }
-            Ok((selector.select(&logits, &batch)?, logits))
-        });
-        engine.probe_end();
-        let step_s = timer.elapsed().as_secs_f64();
-        verify_s += step_s;
-        let timer = Instant::now();
-        let (selected, logits) = match step {
-            Ok(step) => step,
-            Err(error) => {
-                tracing::warn!("decode step failed: {error:#}");
-                if engine.is_terminal() {
-                    return Err(error);
-                }
-                for request in active.drain(..) {
-                    if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
-                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
-                }
-                continue;
-            }
-        };
-        let mut offset = 0;
-        let mut context = Vec::new();
-        let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
-        let mut verified = vec![(0usize, 1usize, Some(Censor::Cancelled)); active.len()];
-        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
-            .map(|(i, ((request, rows), &start))| {
-            if let Some(error) = poisoned[i].take() {
-                let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
-                verified[i] = (rows.len(), 1, Some(Censor::Cancelled));
-                offset += rows.len();
-                return true;
-            }
-            let mut finished = false;
-            let mut cancelled = false;
-            let mut last = None;
-            for j in 0..rows.len() {
-                // Rows 0..=j are committed; the token row j produces is next.
-                request.placement.len = start + j + 1;
-                probe::decode_row(&engine.library, &request.job.probe, &logits, offset + j, request.generated,
-                    request.history.len());
-                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
-                    Ok((token, done)) => {
-                        last = Some(token);
-                        finished = done;
-                        if done && cache.enabled() && !probe::cold(&request.job.probe) {
-                            // A normal finish (the client took the last chunk): the row that
-                            // produced the last token follows the turn snapshot.
-                            request.turn = logits.row_host(engine.library, offset + j).ok();
-                        }
-                        if done || rows.get(j + 1) != Some(&token) {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                        finished = true;
-                        cancelled = true;
-                        break;
-                    }
-                }
-            }
-            let committed = request.placement.len - start;
-            if let Some(slot) = request.slot.filter(|_| !finished || (prefix.mimo_prefix_draft && request.turn.is_some())) {
-                context.extend((0..committed).map(|r| ContextRow { tap_row: offset + r, slot, position: start + r }));
-            }
-            offset += rows.len();
-            let (proposed, accepted) = (rows.len() - 1, committed - 1);
-            if prefix.mimo_prefix_draft && request.counts[0] == 0 {
-                tracing::info!(position = start, valid_from = request.draft_from, drafted = proposed, accepted,
-                    copy = false, neural_calls = request.counts[5], "first draft verification");
-            }
-            request.counts[0] += 1;
-            let censor = if cancelled { Some(Censor::Cancelled) } else {
-                resource::finish_censor(finished, committed, rows, last, &request.job.stop_token_ids) };
-            verified[i] = (rows.len(), committed, censor);
-            request.counts[1] += proposed;
-            request.counts[2] += accepted;
-            let neural = proposed.min(copies[i].as_ref().map_or_else(
-                || drafted[i].as_ref().map_or(0, |d| d.tokens.len()), |c| c.neural));
-            request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
-            finished
-        }).collect();
-        for (request, &done) in active.iter().zip(&finished) {
-            if done { failures.finished(&request.job.events); }
-        }
-        if let Some(drafter) = drafter.filter(|_| !context.is_empty()) {
-            engine.submit(|| drafter.update(&context))?;
-        }
-        emit_s += timer.elapsed().as_secs_f64();
-        if let Some(shared) = shared.as_mut() {
-            let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
-                let (rows, accepted, censor) = verified[i];
-                let neural = drafted[i].as_ref().map_or(0, |draft| draft.tokens.len())
-                    .min(copies[i].as_ref().map_or(usize::MAX, |copy| copy.neural))
-                    .min(rows.saturating_sub(1)).min(priors[i].len());
-                resource::Verified { id: a.ticket.id(), rows, accepted,
-                    source: if neural > 0 { DraftSource::Neural } else { DraftSource::Undrafted },
-                    prior: (neural > 0).then_some(&priors[i][..neural]),
-                    features: drafter.and_then(|_| drafted[i].as_ref().map(|d| &d.features[..neural])), censor }
-            }).collect();
-            let times = round_clock.observe();
-            match engine.probe_finish(|routes, layer_us| resource::observe_drafted(&mut shared.policy,
-                &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
-                Some(Ok(())) => observed_rounds += 1,
-                Some(Err(error)) => {
-                    skipped_rounds += 1;
-                    tracing::debug!(%error, "MiMo draft round not observed");
-                }
-                None => {
-                    skipped_rounds += 1;
-                    tracing::debug!("MiMo draft round probe incomplete");
-                }
-            }
-            resource::publish(&shared.policy, observed_rounds, skipped_rounds, None);
-        }
-        if let Some(trace) = trace.as_mut() {
-            let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
-                "draft_width": drafted_width, "drafted_requests": drafted_requests,
-                "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
-                "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
-                "neural_lengths": drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
-                "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
-                "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
-                "copy_windows": copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
-                    serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
-                "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-                "copy_agreement": copy_agreement,
-                "copy_neural_prefix": copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
-                "copy_lengths": copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
-                "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
-            if let Err(error) = trace.write(&line) {
-                tracing::warn!(%error, "MiMo speculation trace write failed");
-            }
-        }
-        for (i, request) in active.iter().enumerate() {
-            let proposal = &sequences[i][1..];
-            tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
-                request.constraint.is_some(), finished[i]);
-        }
-        tally.end(|| {
-            let engine_now = *engine.profile.borrow();
-            let gpu = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
-            vec![("draft", 1e6 * (draft_s - draft0)), ("plan", plan_us), ("verify", 1e6 * step_s),
-                ("emit", 1e6 * (emit_s - emit0)), ("gpu", gpu(0)), ("experts", gpu(1))]
-        });
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, policy.fixed,
+            prefix.mimo_prefix_draft, width, &mut lane, &mut active, &mut shared, selector, family, cache,
+            &mut free_rings, &mut free_slots, &mut failures, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1264,10 +947,11 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             let [cycles, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps, verify_s, draft_s, emit_s, gpu_wait_s = phases[0],
+                active = active.len(), steps = lane.steps, verify_s = lane.verify_s, draft_s = lane.draft_s,
+                emit_s = lane.emit_s, gpu_wait_s = phases[0],
                 experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
                 "request complete");
-            (steps, verify_s, draft_s, emit_s) = (0, 0.0, 0.0, 0.0);
+            (lane.steps, lane.verify_s, lane.draft_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = request.turn.as_ref().filter(|_| !probe::cold(&request.job.probe)) {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.keyed_history[..request.placement.len];
@@ -1289,6 +973,377 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         failures.fail_and_close(error, receive);
     }
     result
+}
+
+/// Lane-owned decode state: MiMo's only lane (`LaneSupport::One`). Verify
+/// steps since the last completed request, host seconds in them (engine), in
+/// drafting and in token selection + streaming, and observed draft rounds.
+#[derive(Default)]
+struct DecodeLane {
+    steps: u64,
+    verify_s: f64,
+    draft_s: f64,
+    emit_s: f64,
+    observed_rounds: u64,
+    skipped_rounds: u64,
+}
+
+/// The lane's commit. MiMo keeps no recurrent target state (a verify's
+/// rejected rows just set the sequence length back during emission), so the
+/// commit is the DFlash drafter's context update for the committed rows. A
+/// failed submission has already drained the engine (`MimoEngine::submit`
+/// tears it down terminally), so there is nothing left to drain here.
+struct DraftContext<'e, 'a> {
+    engine: &'e MimoEngine<'a>,
+    drafter: Option<&'e super::dflash::MimoDrafter<'a>>,
+    context: Vec<ContextRow>,
+}
+
+impl LaneCommit for DraftContext<'_, '_> {
+    fn begin(&mut self) -> Result<()> {
+        match self.drafter.filter(|_| !self.context.is_empty()) {
+            Some(drafter) => self.engine.submit(|| drafter.update(&self.context)),
+            None => Ok(()),
+        }
+    }
+    fn ready(&mut self) -> Result<bool> { Ok(true) }
+    fn publish(&mut self) -> Result<()> { Ok(()) }
+    fn abort_and_drain(&mut self) -> Result<()> { Ok(()) }
+}
+
+/// One round of lane 0: draft, plan, verify, select, emit and commit. `None`
+/// when a non-terminal step failure released every active request.
+#[allow(clippy::too_many_arguments)]
+async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Option<usize>, prefix_draft: bool,
+    width: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>,
+    shared: &mut Option<crate::shared::draft::runtime::SharedPolicy>, selector: &mut TokenSelector<'_>,
+    family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, free_rings: &mut Vec<i32>,
+    free_slots: &mut Vec<usize>, failures: &mut FailureRecipients,
+    trace: &mut Option<crate::shared::speculation_trace::Trace>, cycle: Instant) -> Result<Option<Vec<bool>>> {
+    let drafter = engine.drafter.as_ref();
+    let mut round_clock = RoundClock::at(cycle);
+    let mut drafted_requests = 0;
+    let mut drafted_width = 0;
+    let mut tally = console::Step::begin(lease.index());
+    let (draft0, emit0) = (lane.draft_s, lane.emit_s);
+    let engine_before = tally.live().then(|| *engine.profile.borrow());
+    // Rows each sequence may add after its next token.
+    let room = DECODE_ROWS.saturating_sub(active.len());
+    let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
+        .min(a.capacity - a.placement.len - 1) }).collect();
+    let ready: Vec<_> = active.iter().map(|a| match drafter {
+        Some(_) => a.slot.is_some(),
+        None => engine.mtp.as_ref().is_some_and(|mtp| {
+            let start = a.placement.len.saturating_sub(engine.cfg.window + mtp.stages.len());
+            if a.media.ready(start, a.history.len()) { true } else {
+                // Restored media is in target state, not host embeddings.
+                engine.mtp_reset(a.placement.ring as usize, a.placement.len);
+                false
+            }
+        }),
+    }).collect();
+    let draft_rooms = eligible_draft_rooms(&limits, &ready, width);
+    let action_requests: Vec<_> = active.iter().zip(&limits).map(|(a, &room)| (a.ticket.id(), room)).collect();
+    let run_draft = match shared.as_mut() {
+        Some(shared) => select_draft_action(&mut shared.policy, &action_requests, &draft_rooms,
+            width, DECODE_ROWS, fixed)?,
+        None => false,
+    };
+    // DFlash drafts after every next token (sequences with a ring slot),
+    // then the adaptive plan's counts.
+    let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
+        Some(drafter) if run_draft => {
+            let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
+                .filter_map(|(i, a)| a.slot.filter(|_| draft_rooms[i] > 0).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
+                    valid_from: a.draft_from })))
+                .collect();
+            for &(i, _) in &seqs {
+                active[i].counts[5] += 1;
+            }
+            let timer = Instant::now();
+            drafted_requests = seqs.len();
+            drafted_width = width;
+            let drafts = round_clock.draft(|| engine.submit(|| drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
+                engine.head())));
+            let ms = timer.elapsed().as_secs_f64() * 1e3;
+            lane.draft_s += ms / 1e3;
+            let mut out = vec![None; active.len()];
+            match drafts {
+                Ok(drafts) => {
+                    for ((i, _), draft) in seqs.into_iter().zip(drafts) {
+                        out[i] = Some(draft);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("DFlash draft failed: {error:#}");
+                    if engine.is_terminal() {
+                        return Err(error);
+                    }
+                }
+            }
+            out
+        }
+        // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
+        None if run_draft && engine.mtp.is_some() && fixed != Some(0)
+            && limits.iter().any(|&limit| limit > 0) => {
+            let indices: Vec<usize> = (0..active.len()).filter(|&i| draft_rooms[i] > 0).collect();
+            for &i in &indices {
+                active[i].counts[5] += 1;
+            }
+            let seqs: Vec<MtpSeq<'_>> = indices.iter().map(|&i| {
+                let a = &active[i];
+                MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history, media: Some(&a.media) }
+            }).collect();
+            let stages = engine.mtp.as_ref().map_or(0, |m| m.stages.len());
+            let timer = Instant::now();
+            drafted_requests = seqs.len();
+            drafted_width = stages;
+            let drafts = round_clock.draft(|| engine.mtp_draft(&seqs, stages));
+            let ms = timer.elapsed().as_secs_f64() * 1e3;
+            lane.draft_s += ms / 1e3;
+            match drafts {
+                Ok(drafts) => {
+                    let mut out = vec![None; active.len()];
+                    for (i, tokens) in indices.into_iter().zip(drafts) {
+                        let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
+                        out[i] = Some(super::dflash::Draft { tokens, features });
+                    }
+                    out
+                },
+                Err(error) => {
+                    tracing::warn!("MTP draft failed: {error:#}");
+                    if engine.is_terminal() {
+                        return Err(error);
+                    }
+                    vec![None; active.len()]
+                }
+            }
+        }
+        _ => vec![None; active.len()],
+    };
+    let plan_timer = Instant::now();
+    let priors: Vec<Vec<f64>> = active.iter().enumerate().zip(&drafted).map(|((i, a), draft)| {
+        let (Some(shared), Some(draft)) = (shared.as_ref(), draft.as_ref()) else { return Vec::new() };
+        if drafter.is_some() {
+            shared.prior(&a.drafts, &resource::DraftEvidence::Selector(&draft.features),
+                crate::shared::draft::copy::COPY_EXTENSION)
+        } else {
+            let pooled = a.drafts.pooled(draft.tokens.len(), active.iter().enumerate()
+                .filter(|&(other, _)| other != i).map(|(_, other)| &other.drafts));
+            shared.prior(&a.drafts, &resource::DraftEvidence::History(&pooled),
+                crate::shared::draft::copy::COPY_EXTENSION)
+        }
+    }).collect();
+    let copy_agreement = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
+        d.as_ref().map_or(0, |d| crate::shared::draft::copy::agreement(&a.history, &d.tokens)))
+        .collect::<Vec<_>>());
+    let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
+        crate::shared::draft::copy::trace_window(&a.history,
+            d.as_ref().map_or(0, |d| d.tokens.len() + crate::shared::draft::copy::COPY_EXTENSION)))
+        .collect::<Vec<_>>());
+    let mut priors = priors;
+    let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
+        .map(|(((a, d), &limit), prior)| match (shared.as_ref(), d.as_ref()) {
+            (Some(shared), Some(d)) if fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
+                a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
+            _ => None,
+        }).collect();
+    for (i, prior) in priors.iter_mut().enumerate() {
+        let available = copies[i].as_ref().map_or_else(
+            || drafted[i].as_ref().map_or(0, |draft| draft.tokens.len()), |copy| copy.tokens.len());
+        prior.truncate(available);
+    }
+    let mut predicted = None;
+    let mut planned = if let Some(fixed) = fixed {
+        drafted.iter().zip(&limits).map(|(d, &limit)| d.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect()
+    } else if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0) {
+        let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
+            resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
+        let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
+        predicted = selection.predicted;
+        selection.lengths
+    } else { vec![0; active.len()] };
+    if resource::trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
+    if fixed.is_some() {
+        if let Some(shared) = shared.as_ref() {
+            let candidates: Vec<_> = active.iter().zip(&priors).map(|(a, prior)|
+                cuteafd_core::DraftCandidate { id: a.ticket.id(), confidence: prior }).collect();
+            crate::shared::draft::binding::trace_selection(&shared.policy, &candidates,
+                drafted_width, drafted_requests, DECODE_ROWS, &planned);
+        }
+    }
+    let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
+        let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
+            .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
+        let mut rows: Vec<u32> = std::iter::once(a.next).chain(full.iter().take(planned[i]).copied()).collect();
+        if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
+        Ok(rows)
+    }).collect::<Result<_>>()?;
+    let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+    let plan_us = console::us(plan_timer);
+    let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
+    lane.steps += 1;
+    let timer = Instant::now();
+    // A sequence whose grammar fails is failed alone after the step; an
+    // error inside `submit` would end the engine.
+    let mut poisoned: Vec<Option<String>> = vec![None; active.len()];
+    cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.ticket.id(), s.len() as u32)).collect());
+    engine.probe_begin(tokens.len());
+    let step = engine.submit(|| {
+        let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
+            .map(|(a, s)| (&mut a.placement, s.len())).collect();
+        let logits = engine.verify_device(&mut rows, &tokens, None)?.context("decode needs every layer")?;
+        drop(rows);
+        // Each row draws at the position after it, masked along its sequence's drafts.
+        let mut batch = SelectBatch::default();
+        for (i, ((a, rows), &start)) in active.iter().zip(&sequences).zip(&starts).enumerate() {
+            poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
+        }
+        Ok((selector.select(&logits, &batch)?, logits))
+    });
+    engine.probe_end();
+    let step_s = timer.elapsed().as_secs_f64();
+    lane.verify_s += step_s;
+    let timer = Instant::now();
+    let (selected, logits) = match step {
+        Ok(step) => step,
+        Err(error) => {
+            tracing::warn!("decode step failed: {error:#}");
+            if engine.is_terminal() {
+                return Err(error);
+            }
+            for request in active.drain(..) {
+                if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                release(family, cache, free_rings, free_slots, &request.placement, request.slot);
+            }
+            return Ok(None);
+        }
+    };
+    let mut offset = 0;
+    let mut context = Vec::new();
+    let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
+    let mut verified = vec![(0usize, 1usize, Some(Censor::Cancelled)); active.len()];
+    let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
+        .map(|(i, ((request, rows), &start))| {
+        if let Some(error) = poisoned[i].take() {
+            let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+            verified[i] = (rows.len(), 1, Some(Censor::Cancelled));
+            offset += rows.len();
+            return true;
+        }
+        let mut finished = false;
+        let mut cancelled = false;
+        let mut last = None;
+        for j in 0..rows.len() {
+            // Rows 0..=j are committed; the token row j produces is next.
+            request.placement.len = start + j + 1;
+            probe::decode_row(&engine.library, &request.job.probe, &logits, offset + j, request.generated,
+                request.history.len());
+            match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
+                Ok((token, done)) => {
+                    last = Some(token);
+                    finished = done;
+                    if done && cache.enabled() && !probe::cold(&request.job.probe) {
+                        // A normal finish (the client took the last chunk): the row that
+                        // produced the last token follows the turn snapshot.
+                        request.turn = logits.row_host(engine.library, offset + j).ok();
+                    }
+                    if done || rows.get(j + 1) != Some(&token) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    finished = true;
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+        let committed = request.placement.len - start;
+        if let Some(slot) = request.slot.filter(|_| !finished || (prefix_draft && request.turn.is_some())) {
+            context.extend((0..committed).map(|r| ContextRow { tap_row: offset + r, slot, position: start + r }));
+        }
+        offset += rows.len();
+        let (proposed, accepted) = (rows.len() - 1, committed - 1);
+        if prefix_draft && request.counts[0] == 0 {
+            tracing::info!(position = start, valid_from = request.draft_from, drafted = proposed, accepted,
+                copy = false, neural_calls = request.counts[5], "first draft verification");
+        }
+        request.counts[0] += 1;
+        let censor = if cancelled { Some(Censor::Cancelled) } else {
+            resource::finish_censor(finished, committed, rows, last, &request.job.stop_token_ids) };
+        verified[i] = (rows.len(), committed, censor);
+        request.counts[1] += proposed;
+        request.counts[2] += accepted;
+        let neural = proposed.min(copies[i].as_ref().map_or_else(
+            || drafted[i].as_ref().map_or(0, |d| d.tokens.len()), |c| c.neural));
+        request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
+        finished
+    }).collect();
+    for (request, &done) in active.iter().zip(&finished) {
+        if done { failures.finished(&request.job.events); }
+    }
+    lanes::commit(&mut DraftContext { engine, drafter, context }).await?;
+    lane.emit_s += timer.elapsed().as_secs_f64();
+    if let Some(shared) = shared.as_mut() {
+        let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
+            let (rows, accepted, censor) = verified[i];
+            let neural = drafted[i].as_ref().map_or(0, |draft| draft.tokens.len())
+                .min(copies[i].as_ref().map_or(usize::MAX, |copy| copy.neural))
+                .min(rows.saturating_sub(1)).min(priors[i].len());
+            resource::Verified { id: a.ticket.id(), rows, accepted,
+                source: if neural > 0 { DraftSource::Neural } else { DraftSource::Undrafted },
+                prior: (neural > 0).then_some(&priors[i][..neural]),
+                features: drafter.and_then(|_| drafted[i].as_ref().map(|d| &d.features[..neural])), censor }
+        }).collect();
+        let times = round_clock.observe();
+        match engine.probe_finish(|routes, layer_us| resource::observe_drafted(&mut shared.policy,
+            &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
+            Some(Ok(())) => lane.observed_rounds += 1,
+            Some(Err(error)) => {
+                lane.skipped_rounds += 1;
+                tracing::debug!(%error, "MiMo draft round not observed");
+            }
+            None => {
+                lane.skipped_rounds += 1;
+                tracing::debug!("MiMo draft round probe incomplete");
+            }
+        }
+        resource::publish(&shared.policy, lane.observed_rounds, lane.skipped_rounds, None);
+    }
+    if let Some(trace) = trace.as_mut() {
+        let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
+            "draft_width": drafted_width, "drafted_requests": drafted_requests,
+            "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
+            "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+            "neural_lengths": drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
+            "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+            "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
+            "copy_windows": copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
+            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
+            "copy_agreement": copy_agreement,
+            "copy_neural_prefix": copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
+            "copy_lengths": copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
+            "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
+        if let Err(error) = trace.write(&line) {
+            tracing::warn!(%error, "MiMo speculation trace write failed");
+        }
+    }
+    for (i, request) in active.iter().enumerate() {
+        let proposal = &sequences[i][1..];
+        tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
+            request.constraint.is_some(), finished[i]);
+    }
+    tally.end(|| {
+        let engine_now = *engine.profile.borrow();
+        let gpu = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
+        vec![("draft", 1e6 * (lane.draft_s - draft0)), ("plan", plan_us), ("verify", 1e6 * step_s),
+            ("emit", 1e6 * (lane.emit_s - emit0)), ("gpu", gpu(0)), ("experts", gpu(1))]
+    });
+    Ok(Some(finished))
 }
 
 /// Serving statistics for `/v1/stats`.
@@ -1330,6 +1385,25 @@ fn serving_queue_depth(explicit: Option<usize>) -> usize { explicit.unwrap_or(16
 fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>, warm: bool) -> usize {
     if warm { explicit.unwrap_or(sequences).max(sequences).max(rings) }
     else { explicit.unwrap_or(sequences).max(rings) }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    #[test]
+    fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
+        let source = include_str!("serve.rs");
+        let schedule = source.split_once("\nfn schedule_inner(").unwrap().1
+            .split_once("\n/// Lane-owned decode state").unwrap().0;
+        // One lane (`LaneSupport::One`): every decode round, and only it, runs on the set.
+        assert_eq!(schedule.matches("lanes.run_one(|lease| decode_round(lease,").count(), 1);
+        assert!(!schedule.contains("lanes.run(") && !schedule.contains("lanes.join("));
+        assert!(!schedule.contains("engine.verify_device(&mut rows,"), "no private decode round remains");
+        let round = source.split_once("\nasync fn decode_round").unwrap().1
+            .split_once("\n/// Serving statistics").unwrap().0;
+        assert!(round.contains("console::Step::begin(lease.index())"));
+        assert!(round.contains("lanes::commit(&mut DraftContext { engine, drafter, context }).await?;"));
+        assert!(!round.contains("drafter.update("), "the drafter commit goes through the lane commit");
+    }
 }
 
 #[cfg(test)]

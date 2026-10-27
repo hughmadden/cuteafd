@@ -90,3 +90,16 @@ def test_v41_release_exports_all_decoder_families_and_compact_companions():
     assert 'set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING' in cmake
     assert '${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}' in release
     assert '--compact-companions' in cmake
+
+
+def test_spark_exec_forwards_context_admission_inputs():
+    wip = (ROOT / 'wip.sh').read_text()
+    remote = wip.split('ensure_remote_container() {', 1)[1].split('\nREMOTE\n}', 1)[0]
+    assert 'run -d --init --name "$container"' in remote
+    assert '--user "$(id -u):$(id -g)"' in remote
+    spark = wip.split('build_command="docker exec', 1)[1].split('\n', 1)[0]
+    assert 'CUTEAFD_EXPORT_HOST_CONTEXTS=' in spark
+    assert 'CUTEAFD_EXPORT_WORKER_RAM_MIB=' in spark
+    cards = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    scopes = cards.split('def build_scopes(cards):', 1)[1].split('def package_dir', 1)[0]
+    assert 'CMAKE_BUILD_PARALLEL_LEVEL' not in scopes

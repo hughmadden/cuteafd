@@ -86,6 +86,7 @@ impl<'a> TargetChain<'a> {
         let mut bytes = weights
             .checked_add(contract.rope_tables.allocation_bytes)
             .context("chain rope overflow")?;
+        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
         let mut routed = Vec::new();
         for layer in &contract.layers[..count] {
             let workspace = if layer.sliding.is_some() {
@@ -99,7 +100,9 @@ impl<'a> TargetChain<'a> {
                     .workspace_bytes()
             } else {
                 let plan =
-                    RoutedPlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?;
+                    RoutedPlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?
+                        .with_expert_format(catalog.as_ref().and_then(|c| c.fp8())
+                            .context("Step-5 native expert headers missing")?.layer_format(layer.layer)?);
                 let workspace = plan.workspace_bytes();
                 routed.push(Some(plan));
                 workspace
@@ -510,6 +513,7 @@ mod tests {
     fn request(
         layer: usize,
         rows: usize,
+        dtype: ExpertV2Dtype,
         routes: Vec<ExpertProtocolV2RouteEntry>,
         wire: bytes::Bytes,
     ) -> Result<ExpertProtocolV2Request> {
@@ -518,7 +522,7 @@ mod tests {
             17,
             layer as u32,
             H as u32,
-            ExpertV2Dtype::Bf16,
+            dtype,
             (0..rows as u32)
                 .map(|row| ExpertProtocolV2RowDescriptor {
                     row_id: row as u64,
@@ -537,7 +541,7 @@ mod tests {
     }
 
     fn link<'a>(device: Device<'a>, snapshot: &Path, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-        use crate::shared::placement::{spark_rings, SparkAdmission};
+        use crate::shared::placement::SparkAdmission;
         let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?
             .split(',')
             .map(str::parse)
@@ -568,20 +572,7 @@ mod tests {
                 && tp4["tp"] == peers.len(),
             "sealed Step-5 expert geometry"
         );
-        let capacities = tp4["capacities"]
-            .as_array()
-            .context("sealed FP8 TP capacities")?;
-        let compiled = capacities
-            .iter()
-            .map(|c| c["capacity"].as_u64().context("FP8 capacity integer"))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .context("empty FP8 capacities")?;
-        ensure!(
-            (64..=4096).contains(&compiled),
-            "FP8 package must cover chain rows"
-        );
+        let exports = crate::families::step5::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
         SparkAdmission::plan(
             snapshot,
             ExpertGeometry::STEP5,
@@ -594,20 +585,15 @@ mod tests {
             },
             peers.len(),
             None,
-            ModelAdmission {
-                capacity: 64,
-                compiled_capacity: u32::try_from(compiled)?,
-                endpoints: vec![SparkEndpoint { ring_depth: None,
-                    capacity: 64,
-                    ingress: SparkIngress::Bf16
-                }],
-                rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1
-            },
+            crate::families::step5::serve::spark_model(&exports,
+                SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Native },
+                1, 1, config.max_frame_bytes)?,
         )?
         .select(&peers)?;
         let warm = request(
             layers[0],
             64,
+            ExpertV2Dtype::Bf16,
             (0..64 * 8)
                 .map(|i| ExpertProtocolV2RouteEntry {
                     row_index: (i / 8) as u32,

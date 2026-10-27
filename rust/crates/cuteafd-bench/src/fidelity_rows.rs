@@ -54,7 +54,7 @@ pub fn sha256(path: &Path) -> Result<String> {
 }
 
 pub fn manifest(root: &Path, checkpoint: &str, set_sha256: &str, vocab: usize) -> Result<RowsManifest> {
-    let rows: RowsManifest = serde_json::from_reader(File::open(root.join("rows.json"))?)?;
+    let rows: RowsManifest = cuteafd_loader::read_json_file(&root.join("rows.json"))?;
     ensure!(rows.schema == "cuteafd.fidelity.rows/1" && rows.kind == "log_softmax" && rows.dtype == "<f2",
         "unsupported full-row manifest");
     ensure!(rows.checkpoint == checkpoint && rows.set_sha256 == set_sha256 && rows.vocab == vocab,

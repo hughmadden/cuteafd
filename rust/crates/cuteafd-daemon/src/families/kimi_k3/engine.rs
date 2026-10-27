@@ -112,7 +112,7 @@ impl<'a> Engine<'a> {
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; 2],
         peer: PeerExchange<'a>, hops: HopLink<'a>, peers: Vec<std::net::SocketAddr>,
-        config: cuteafd_transport::TcpTransportConfig, compiled_rows: u32,
+        config: cuteafd_transport::TcpTransportConfig,
         mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2]) -> Result<Self> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
@@ -127,15 +127,15 @@ impl<'a> Engine<'a> {
             && std::ptr::eq(devices[0].library, devices[1].library)
             && std::ptr::eq(devices[0].library, library.as_ref()),
             "Kimi startup programs differ from exchange devices/library");
-        let rows = u32::try_from(plan.spec().rows)?;
+        let rows = u32::try_from(admission.unit_rows())?;
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32 };
             plan.spec().lanes as usize];
-        let model = ModelAdmission { capacity: rows, compiled_capacity: compiled_rows,
-            endpoints, rings: spark_rings(config.max_frame_bytes)?,
-            // Each routed lane's wave is in flight to a rank at once.
-            execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("kimi_k3", plan.spec().lanes as u64, 1) };
-        model.validate(ExpertGeometry::KIMI_K3)?;
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+        let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
+            &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
+            u64::from(rows), admission.waves() as u64)?;
+        let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
+        model.validate(ExpertGeometry::KIMI_K3)?;
         let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
             Some(&catalog), &admission.working_set(), 6, None, model)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as

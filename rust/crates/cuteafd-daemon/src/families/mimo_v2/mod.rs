@@ -32,7 +32,7 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
-    /// Independent decode views. Only one is supported until second-view admission lands.
+    /// Decode lanes; MiMo runs one (`LaneSupport::One`; the planner reports why).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
     /// Shared GQA drafter-ring storage (independent of weight precision).
@@ -902,7 +902,7 @@ impl Opened {
         // The configured bound remains a sanity cap, not a reserved GiB.
         let module_bound = cuteafd_loader::families::mimo_v2::admission::tensor_bytes("MiMo module sanity bound", &[args.runtime_reserve_mib, 1 << 20])?;
         for device in std::iter::once(args.device).chain(split_device) {
-            crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+            crate::shared::peer_split::on_device(&self.library, device, || {
                 let before = self.library.cuda_memory_info()?.0;
                 let family = self.cfg.program_family()?;
                 let split_cfg = self.cfg.head_split(if split_device.is_some() { 2 } else { 1 })?;
@@ -960,12 +960,15 @@ impl Opened {
                 else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
                     rows: u32::try_from(engine::DECODE_ROWS)? } }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
-            let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress };
-                    usize::try_from(preflight.working_set.prefill_lanes)?],
-                rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
-            };
+            // MiMo lanes are independent links; each lane's unit queues on the one prefill owner.
+            let catalog = self.catalog.as_ref().context("MiMo Spark admission requires routed expert headers")?;
+            let lanes = preflight.working_set.prefill_lanes;
+            let executions = cuteafd_loader::plan::spark_executions::admit_family("mimo_v2",
+                &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(), None,
+                u64::from(capacity), lanes)?;
+            let model = cuteafd_transport::worker_selection::ModelAdmission::new(
+                vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }; usize::try_from(lanes)?],
+                crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?;
             // Each coordinator GPU joins the Spark push group as one more rank with
@@ -1146,7 +1149,7 @@ impl Opened {
             // succeeds. Its caller still owns the created peer stream on an
             // earlier failure, so engine-only drainage cannot certify it.
             if let Some((device, peer_owned)) = uninstalled_peer {
-                crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                crate::shared::peer_split::on_device(&self.library, device, || {
                     // SAFETY: the stream is still owned by this scope; no peer
                     // wait was submitted before attach_peer installed exchange.
                     unsafe { self.library.cuda_stream_synchronize(peer_owned)?; }

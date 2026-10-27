@@ -689,7 +689,7 @@ mod tests {
                     let config = crate::TcpTransportConfig { max_frame_bytes: bytes,
                         ..crate::TcpTransportConfig::default() };
                     let world = SparkWorld::canonical(ranks)?;
-                    assert_eq!(SparkExperts::new_world(world, &peers, capacity, config.clone()).is_ok(), valid,
+                    assert_eq!(SparkExperts::new_world(world, &peers, capacity, config.clone(), 0).is_ok(), valid,
                         "RoCE capacity={capacity} ranks={ranks} frame={bytes}");
                     assert_eq!(V41Tp4Tcp::new_world(world, &peers, capacity, config).is_ok(), valid,
                         "TCP capacity={capacity} ranks={ranks} frame={bytes}");

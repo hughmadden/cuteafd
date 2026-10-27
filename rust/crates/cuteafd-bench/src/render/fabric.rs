@@ -26,17 +26,20 @@ fn rate(bytes: Option<u64>, seconds: f64) -> Option<f64> {
     Some(bytes? as f64 * 8.0 / seconds / 1e9)
 }
 
-fn bar(phase: &str, p: &Port) -> Bar {
+fn bar(phase: &Phase, p: &Port) -> Bar {
     let tx = rate(p.sent_bytes, p.seconds).or(p.xmit_gbps);
     let rx = rate(p.received_bytes, p.seconds).or(p.rcv_gbps);
     let sent = !matches!((tx, rx), (t, Some(r)) if t.is_none_or(|t| r > t));
     let pick = |a: Option<u64>, b: Option<u64>| rate(if sent { a } else { b }, p.seconds).unwrap_or(0.0);
     let nic = if sent { tx } else { rx };
-    let engine = pick(p.engine_sent_bytes, p.engine_received_bytes);
+    let (engine_tx, engine_rx) = crate::fabric::exchange_bytes(phase, p);
+    let engine = pick(engine_tx, engine_rx);
     let storage = pick(p.sparknest_sent_bytes, p.sparknest_received_bytes);
-    let foreign = pick(p.foreign_sent_bytes, p.foreign_received_bytes);
+    // Same-port protocol overhead stays other, not a fabricated foreign flow.
+    let foreign = pick(p.foreign_sent_bytes, p.foreign_received_bytes)
+        .min(nic.map_or(0.0, |n| (n - engine * 1.65 - storage).max(0.0)));
     let other = nic.map_or(0.0, |n| (n - engine - storage - foreign).max(0.0));
-    Bar { phase: phase.into(), values: [engine, storage, foreign, other], nic }
+    Bar { phase: phase.name.clone(), values: [engine, storage, foreign, other], nic }
 }
 
 /// Display name of a fabric host: its own hostname, the coordinator's host,
@@ -73,19 +76,19 @@ fn views(report: &Report, phases: &[Phase]) -> Vec<PortView> {
             let key = (rank(p), p.host.clone(), format!("{}/{}", p.device, p.port));
             let view = ports.entry(key.clone()).or_insert_with(|| PortView { name: host_name(report, p), port: key.2.clone(),
                 link: p.link_gbps, bars: Vec::new(), peak: 0.0, worst: None, limit: cuteafd_transport::fabric_health::RETRANSMIT_WARN_PCT, issue: None, warn: false, used: false });
-            let b = bar(&phase.name, p);
+            let b = bar(phase, p);
             view.peak = view.peak.max(b.nic.unwrap_or(0.0));
             view.used |= b.values[0] > 0.0 || b.nic.is_some_and(|n| n > 0.0);
             // Retransmits as a share of packets, judged only where the phase moved enough.
             if let Some(h) = &p.health {
                 if h.retransmit_warn_pct > 0.0 { view.limit = h.retransmit_warn_pct; }
-                if let Some(share) = h.retransmit_pct {
+                if let Some(share) = h.retransmit_pct.filter(|_| h.retransmit_judged) {
                     view.worst = Some(view.worst.map_or(share, |w: f64| w.max(share)));
                     if h.retransmit_judged && share > view.limit { view.warn = true; }
                 }
             }
-            let active = p.state.as_deref().is_some_and(|s| s.contains("ACTIVE"));
-            if b.values[0] > 0.0 && !active { view.issue = Some("down".into()); }
+            let engine_used = p.engine_sent_bytes.is_some_and(|n| n > 0) || p.engine_received_bytes.is_some_and(|n| n > 0);
+            if engine_used && p.state.as_deref().is_some_and(|s| s.contains("DOWN")) { view.issue = Some("down".into()); }
             view.link = p.link_gbps.or(view.link);
             view.bars.push(b);
         }
@@ -158,7 +161,7 @@ fn cell(doc: &mut Doc, t: &Theme, v: &PortView, x: f64, y: f64, w: f64) {
     let pad = 9.0;
     doc.text(x + pad, y + 16.0, Font::new(11.0, t.ink).weight(600), &fit(&v.name, 11.0, w - 2.0 * pad - 80.0));
     doc.text(x + w - pad, y + 16.0, Font::new(11.0, t.ink).anchor(Anchor::End), &format!("peak {} Gb/s", gb(v.peak)));
-    let verdict = v.issue.clone().unwrap_or_else(|| v.worst.map_or("OK".into(), |l| format!("retransmits {}", pct(l))));
+    let verdict = v.issue.clone().unwrap_or_else(|| v.worst.map_or("Idle / unavailable".into(), |l| format!("retransmits {}", pct(l))));
     let short = v.port.trim_start_matches("roce").to_string();
     doc.spans(x + pad, y + 30.0, 10.0, Anchor::Start, &[(&fit(&format!("{short} · "), 10.0, w * 0.6), t.muted, 400),
         (&verdict, severity.unwrap_or(t.muted), if v.issue.is_some() { 600 } else { 400 })]);
@@ -206,6 +209,21 @@ mod tests {
             seconds: 1.0, sent_bytes: Some(nic), received_bytes: Some(0), engine_sent_bytes: Some(engine),
             engine_received_bytes: Some(0), sparknest_sent_bytes: Some(0), sparknest_received_bytes: Some(0),
             foreign_sent_bytes: Some(0), foreign_received_bytes: Some(0), ..Default::default() }
+    }
+
+    #[test]
+    fn unknown_state_and_small_windows_do_not_warn_and_rx_only_down_does() {
+        let mut report = crate::sample::report(false);
+        let mut p = port("coordinator", "mlx5_0", 0, 2_000_000_000, "");
+        p.engine_received_bytes = Some(2_000_000_000);
+        p.health = Some(cuteafd_transport::fabric_health::Health {
+            retransmit_judged: false, retransmit_pct: Some(90.0), ..Default::default()
+        });
+        report.fabric = vec![Phase { timed: true, ports: vec![p], ..Default::default() }];
+        let v = views(&report, &report.fabric);
+        assert!(v[0].issue.is_none() && v[0].worst.is_none());
+        report.fabric[0].ports[0].state = Some("1: DOWN".into());
+        assert_eq!(views(&report, &report.fabric)[0].issue.as_deref(), Some("down"));
     }
 
     #[test]

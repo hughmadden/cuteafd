@@ -138,7 +138,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
     let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
             timeout: Duration::from_secs(120),
             max_frame_bytes: 2 * 1024 * 1024,
-        })?;
+        }, 0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
     if std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some()
         || std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
@@ -157,7 +157,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         let mut second_transport = NativeTp4Wave::new(&lib,
             SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
                 timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
-            })?, NativeTp4Wave::device_bytes(80)?)?;
+            }, 0)?, NativeTp4Wave::device_bytes(80)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         if std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
             let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(

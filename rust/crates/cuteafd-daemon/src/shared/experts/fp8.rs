@@ -341,6 +341,17 @@ pub(crate) struct Fp8Modules {
     bf16: Option<Fp8MoeModule>,
 }
 impl Fp8Modules {
+    pub(crate) fn workspace_bytes(&self, capacity: usize) -> Result<(usize, usize)> {
+        use cuteafd_ffi::fp8_moe::{fp8_slot_io_bytes, fp8_slot_scratch_bytes};
+        let mut scratch = fp8_slot_scratch_bytes(self.module.scratch_layout(), capacity)?;
+        if let Some(module) = &self.bf16 {
+            scratch = scratch.max(fp8_slot_scratch_bytes(module.scratch_layout(), capacity)?);
+        }
+        let info = self.module.info();
+        Ok((scratch, fp8_slot_io_bytes(info.hidden, info.topk, info.wire_input,
+            self.bf16.is_some(), capacity)?))
+    }
+
     pub(crate) fn load(directory: &Path, bf16_directory: Option<&Path>) -> Result<Self> {
         // SAFETY: selected trusted AOT packages for the current owner device.
         let module = unsafe { load_module(directory) }?;
@@ -685,12 +696,18 @@ impl<'a> Fp8Weights<'a> {
 /// weights directly; Spark slots share immutable weights and own distinct scratch.
 pub(crate) struct Fp8Experts<'a, W = Fp8Weights<'a>> {
     weights: W,
-    scratch: DeviceAllocation<'a>,
+    scratch: Rc<DeviceAllocation<'a>>,
 }
 
 impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
     pub(crate) fn from_shared(library: &'a NativeLibrary, weights: W, capacity: usize) -> Result<Self> {
-        let scratch = Self::allocate_scratch(library, weights.borrow().slot_scratch_bytes(capacity)?)?;
+        let scratch = Rc::new(Self::allocate_scratch(library, weights.borrow().slot_scratch_bytes(capacity)?)?);
+        Self::from_scratch(weights, capacity, scratch)
+    }
+
+    pub(crate) fn from_scratch(weights: W, capacity: usize, scratch: Rc<DeviceAllocation<'a>>) -> Result<Self> {
+        ensure!(scratch.buffer.bytes >= weights.borrow().slot_scratch_bytes(capacity)?,
+            "shared native scratch does not cover this expert package");
         Ok(Self { weights, scratch })
     }
 }
@@ -715,7 +732,7 @@ impl<'a> Fp8Experts<'a> {
             "FP8 resident weights plus execution scratch exceed budget");
         let scratch = Self::allocate_scratch(library, bytes)?;
         weights.load_mount(library, tensors, layers, tensors.slicing_for_directory(directory, tp))?;
-        Ok(Self { weights, scratch })
+        Ok(Self { weights, scratch: Rc::new(scratch) })
     }
 }
 

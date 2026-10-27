@@ -8,6 +8,39 @@ use serde::{Deserialize, Serialize};
 /// Native EXLR8 workers reuse one device arena across serial request chunks.
 pub const EXLR8_EXECUTION_ROWS: usize = 64;
 
+/// Capacity-specific execution payload from the selected installed packages.
+/// Mapped request/reply rings retain each network unit separately; device I/O
+/// and scratch are reused in stream order by one execution owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparkOwnerWorkspace {
+    pub scratch_bytes: u64,
+    pub io_bytes: u64,
+    pub pinned_staging_bytes: u64,
+    pub buffered_units: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparkWorkspaceBytes {
+    pub device_bytes: u64,
+    pub pinned_bytes: u64,
+}
+impl SparkWorkspaceBytes {
+    pub fn total(self) -> Option<u64> { self.device_bytes.checked_add(self.pinned_bytes) }
+}
+
+/// Shared planner/worker owner census. Unit buffering multiplies only pinned
+/// route staging, never compute scratch or stream-ordered device input planes.
+pub fn spark_owner_workspace_bytes(owners: impl IntoIterator<Item = SparkOwnerWorkspace>)
+    -> Option<SparkWorkspaceBytes> {
+    owners.into_iter().try_fold(SparkWorkspaceBytes::default(), |mut total, owner| {
+        if !(1..=4).contains(&owner.buffered_units) { return None; }
+        total.device_bytes = total.device_bytes.checked_add(owner.scratch_bytes)?.checked_add(owner.io_bytes)?;
+        total.pinned_bytes = total.pinned_bytes.checked_add(owner.pinned_staging_bytes
+            .checked_mul(u64::from(owner.buffered_units))?)?;
+        Some(total)
+    })
+}
+
 /// One persistent coordinator-to-Spark connection, resolved before allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,14 +52,13 @@ pub struct SparkEndpoint {
     pub ring_depth: Option<usize>,
 }
 
-/// Most execution slots one Spark rank runs (a link admits at most four waves).
-pub const MAX_SPARK_EXECUTION_SLOTS: u8 = 4;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SparkIngress {
     Fp8K32,
     Bf16,
+    /// Each layer uses its package's native input; the worker checks the dtype.
+    Native,
     /// Decode rows are unquantized; prefill uses FP8 K32 on the same QP.
     Bf16Decode { rows: u32 },
 }
@@ -187,7 +219,7 @@ impl SparkEndpoint {
     pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
         if !(1..=4096).contains(&self.capacity) { return None; }
         let (request, response) = geometry.compact_wire_bytes(self.capacity,
-            self.ingress == SparkIngress::Bf16)?;
+            matches!(self.ingress, SparkIngress::Bf16 | SparkIngress::Native))?;
         let request = match self.ingress {
             SparkIngress::Bf16Decode { rows } => {
                 if rows == 0 || rows > self.capacity { return None; }
@@ -394,6 +426,24 @@ pub fn expert_geometry() -> ExpertGeometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_workspace_charges_scratch_once_and_retains_every_route_stage() {
+        use super::*;
+        let decode = SparkOwnerWorkspace { scratch_bytes: 7, io_bytes: 11,
+            pinned_staging_bytes: 13, buffered_units: 1 };
+        let prefill = SparkOwnerWorkspace { scratch_bytes: 101, io_bytes: 103,
+            pinned_staging_bytes: 107, buffered_units: 3 };
+        let bytes = spark_owner_workspace_bytes([decode, decode, prefill]).unwrap();
+        assert_eq!(bytes.device_bytes, 2 * (7 + 11) + 101 + 103);
+        assert_eq!(bytes.pinned_bytes, 2 * 13 + 3 * 107);
+        assert_eq!(bytes.total(), Some(bytes.device_bytes + bytes.pinned_bytes));
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { buffered_units: 0, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { buffered_units: 5, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { scratch_bytes: u64::MAX, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { pinned_staging_bytes: u64::MAX,
+            buffered_units: 3, ..decode }]).is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -422,6 +472,19 @@ mod tests {
         let serialized = serde_json::to_value(endpoint).unwrap();
         assert_eq!(serialized["ring_depth"], 2);
         assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+    }
+
+    #[test]
+    fn native_endpoint_reserves_bf16_maximum() {
+        for capacity in [1, 80, 2048, 2752, 4096] {
+            let native = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Native };
+            let bf16 = SparkEndpoint { ingress: SparkIngress::Bf16, ..native };
+            let fp8 = SparkEndpoint { ingress: SparkIngress::Fp8K32, ..native };
+            assert_eq!(native.wire_bytes(ExpertGeometry::STEP5), bf16.wire_bytes(ExpertGeometry::STEP5));
+            assert!(native.wire_bytes(ExpertGeometry::STEP5).unwrap().0 > fp8.wire_bytes(ExpertGeometry::STEP5).unwrap().0);
+            let encoded = serde_json::to_value(native).unwrap();
+            assert_eq!(serde_json::from_value::<SparkEndpoint>(encoded).unwrap(), native);
+        }
     }
 
     #[test]

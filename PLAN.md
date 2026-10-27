@@ -5453,10 +5453,20 @@ Every family that sends experts to Sparks prefills the same way.
 - **Units:** the prompt runs as a continuous stream of row units: a
   planner-admitted maximum of k units in flight inside one 8192-row reserve
   (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
-  capacity (k = 2/3/4 → 4096/2752/2048). k hides raptor's turnaround T behind
-  the Sparks' per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks,
-  2 below. A prompt that would cut units below half a unit runs on fewer
-  waves. `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
+  capacity (k = 2/3/4 → 4096/2752/2048). Each family descriptor supplies a
+  base estimate: Spark compute S_ref at a reference unit and N_ref Sparks,
+  plus raptor turnaround T. Shared code scales S = S_ref × N_ref / N and
+  admits k = ⌈T/S⌉ + 1, at most 4 and bounded by the hard executor/arena
+  capacities; zero Sparks use one wave. Families without independent S/T use
+  their measured best k, explicitly sourced in the descriptor. Unmeasured
+  families keep a conservative estimate; hard constraints (Qwen's two-slot
+  mapped-PLE ring) are separate. Planner, serve and golden consume the same
+  descriptor; there are no shared family-name constants, per-family automatic
+  row caps or Spark-count thresholds. Supported explicit pins override the
+  estimate, never hard capacities. Runtime S/T refinement (#762 stages 2–4)
+  follows separately. A short prompt that cannot half-fill units uses fewer
+  waves without reallocating or recapturing.
+  `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
   5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
   (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
   fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.
@@ -5640,7 +5650,7 @@ file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
 |---|---|---|
 | DeepSeek V4.1 Flash | min 1 RTX + 3 Sparks; reference 1 RTX + 4 Sparks; max 2 RTX + 6 Sparks | hardware levels |
 | DeepSeek V4 Flash | min; reference 1 RTX + 4 Sparks; max | hardware levels |
-| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6 | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), hardware levels |
+| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6; **EXLR8 max 2 RTX + 6 with A8 prefill (`glm53-exlr8-a8-max`)** | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), A16 vs A8 prefill at max, hardware levels |
 | Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
 | Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
 | Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`); 27B BF16 min 1 RTX, speculation off (`qwen38-27b-bf16-min-nospec`); 27B FP8 min 1 RTX, speculation off (`qwen38-27b-fp8-min-nospec`) | sizes, quants and dSpark vs no speculator (all 0 Sparks, no TP2 card; no MTP comparison card) |
@@ -5650,6 +5660,11 @@ EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
 (`EXLR8_MANIFEST=bit325`, the checkpoint's KL-optimized 3.25 bpw
 manifest; ~75 GB of routed experts per rank at TP4), so the family shows
 the up1-vs-bit325 trade at the same hardware.
+
+The EXLR8 A8 max card (TJ, 2026-10-26) is the max card with
+`EXLR8_PREFILL_ACTIVATIONS=a8`: expert prefill quantizes activations to FP8
+on the compressed-weight paths. It shows the A8 prefill speed and its
+fidelity beside the default A16 max card.
 
 **Retired section** (below the family sections): every model that no
 longer ships keeps its last Release-smoke card, one per row with its

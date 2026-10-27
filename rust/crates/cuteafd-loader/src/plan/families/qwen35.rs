@@ -7,6 +7,10 @@ pub struct Qwen35;
 pub static QWEN35: Qwen35 = Qwen35;
 
 impl Family for Qwen35 {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "dense Qwen runs RTX-only: no Spark round trip for a second lane to hide (#744)" }
+    }
     fn id(&self) -> &'static str { "qwen3_5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
@@ -123,16 +127,12 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(options.drafter_bytes == 0 && !(options.dense_qwen_mtp && options.dense_qwen_drafter_snapshot.is_some()),
         "dense native planner requires one checkpoint-native drafter admission");
     let rows = PREFILL_ROWS as u64;
-    ensure!(options.prefill_rows == 0 || options.prefill_rows == rows,
-        "dense native prefill requires capacity {rows}");
-    ensure!(options.prefill_unit_rows.is_none_or(|n| n == rows)
-        && options.prefill_span_rows.is_none_or(|n| n == rows)
-        && options.prefill_waves == 1 && options.prefill_lanes <= 1,
+    let prefill = crate::plan::layout::resolve_prefill(report, options, 0,
+        crate::serving_capacity::prefill_waves::PrefillLimits {
+            max_unit_rows: rows, max_span_rows: rows, max_waves: 1, ..Default::default()
+        })?;
+    ensure!(prefill.unit_rows == rows && prefill.span_rows == rows,
         "dense native prefill requires one coordinator unit of {rows} rows and one wave, with no Spark exchange");
-    // Dense execution retains one coordinator chunk, not Spark exchange slots.
-    options.prefill_unit_rows = Some(rows);
-    report.prefill_span_rows = Some(rows);
-    report.prefill_transports = Some(0);
     let prefix = match (cfg.hidden, cfg.intermediate, cfg.heads, cfg.gdn.value_heads) {
         (4096, 12288, 16, 32) => "qwen35", (5120, 17408, 24, 48) => "qwen38",
         _ => anyhow::bail!("dense Qwen geometry lacks native exports"),

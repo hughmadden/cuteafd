@@ -338,6 +338,11 @@ pub fn split_stem(name: &str) -> (&str, &str) {
 
 /// Groups tensors by stem, keeping each group's members keyed by suffix.
 pub fn group_by_stem(tensors: &[CheckpointTensor]) -> BTreeMap<String, BTreeMap<String, &CheckpointTensor>> {
+    group_tensor_refs(tensors.iter())
+}
+
+pub(crate) fn group_tensor_refs<'a>(tensors: impl IntoIterator<Item = &'a CheckpointTensor>)
+    -> BTreeMap<String, BTreeMap<String, &'a CheckpointTensor>> {
     let mut groups: BTreeMap<String, BTreeMap<String, &CheckpointTensor>> = BTreeMap::new();
     for tensor in tensors {
         let (stem, suffix) = split_stem(&tensor.meta.name);

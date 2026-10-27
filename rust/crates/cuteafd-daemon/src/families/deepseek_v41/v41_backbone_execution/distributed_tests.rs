@@ -196,7 +196,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
     let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
             timeout: Duration::from_secs(120),
             max_frame_bytes: 2 * 1024 * 1024,
-        })?;
+        }, 0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
     use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
     let local_budget = ExpertWeights::plan(&lib, &catalog, ExpertLayer::BackboneFull { layer: 0 })?;
@@ -436,7 +436,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
     let mut execution1 = BackboneExecution::new(&producers, 80, BackboneExecution::workspace_bytes(&lib, 80)?)?;
     let roce1 = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
         timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
-    })?;
+    }, 0)?;
     let mut transport1 = NativeTp4Wave::new(&lib, roce1, NativeTp4Wave::device_bytes(80)?)?;
     let leases = (0..16).map(|slot| requests.admit(slot, 3000 + slot as u64)).collect::<Result<Vec<_>>>()?;
     for &lease in &leases { requests.begin_encoder(lease, 10)?; }

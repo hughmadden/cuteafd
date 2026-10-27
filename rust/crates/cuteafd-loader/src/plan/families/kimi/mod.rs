@@ -252,6 +252,21 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
 }
 
 impl Family for KimiK3 {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "large experts and dense core: compute-heavy Spark waves leave little round trip to hide (predicted loss, #744)" }
+    }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        // Kimi decode/verify steps send at most 64 rows (`rows.min(64)`).
+        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+    }
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
+        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
+            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
+            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; K6/BF16 k3 versus legacy k2, no independent S/T",
+        }, ..Default::default() }
+    }
     fn id(&self) -> &'static str { "kimi_k3" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
@@ -360,9 +375,9 @@ impl FamilyModel for Model {
             local: Err("Kimi K3 routed experts (637 GiB) cannot all be resident on the coordinators".into()),
         })
     }
-    fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        Some(Ok(placement::layout(self, report, options, requested)))
+        Some(Ok(placement::layout(self, input, report, options, requested)))
     }
 }

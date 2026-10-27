@@ -50,7 +50,7 @@ CUTEAFD_GOLDEN_EXPERT_LAYERS (expanded --expert-layers) and CUTEAFD_GOLDEN_SPARK
 (the workers' package manifest.json files, identical on every host, read-only under
 /opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Workers are
 removed (logs kept) after every run, on failure, timeout and SIGTERM/SIGINT too, before
-the locks are released. oliver (reserved) and the LAN-only build seeds are refused.
+the locks are released. The LAN-only build seeds are refused.
 
 Hardware: the locks (sparks for dodo/emu, gpu0, gpu1, rhea, moa, in that order) are
 taken once through the fair queue (scripts/hw/hwlock.py) and every arm and repeat runs
@@ -127,7 +127,6 @@ def namespace_root():
 HUB = '/mnt/sparknest/hf-home/hub'
 # Real experts. Hosts refused outright, with the reason (lift a refusal here once cleared).
 REFUSED_HOSTS = {
-    'oliver': 'reserved for the Kimi F32 golden',
     'kakapo': 'build seed for the fidelity goldens, not a serving rank',
     'cassowary': 'LAN-only build seed, not a serving rank',
     'raptor': 'the coordinator, not a Spark rank',
@@ -771,7 +770,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
         mounts.append((state['fixtures'], state['fixtures']))
     if packages is not None:
         mounts.append((str(packages), SPARK_PACKAGES))
-    cmd = ['docker', 'run', '--rm', '--name', container_name(state['task'], name),
+    cmd = ['docker', 'run', '--rm', '--init', '--name', container_name(state['task'], name),
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
            *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
            '--ulimit', 'memlock=-1:-1']
@@ -1080,7 +1079,7 @@ def compare_one(state, python, tool, args, out, record):
         cmd = [*python, str(tool), *args]
     else:  # the dev image has numpy; read-only views of the outputs
         image = state['slots'][record['a']]['image_id']
-        cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
+        cmd = ['docker', 'run', '--rm', '--init', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
                '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
                'python3', image, str(tool), *args]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)

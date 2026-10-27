@@ -13,7 +13,7 @@ usage() {
     '--seed-hosts: build-only Spark seeds that also receive the Spark image' \
     '  (default: the LAN-only seeds, kakapo,cassowary; empty for none).' \
     '--export-hosts: remote coordinator export hosts that receive the coordinator image' \
-    '  (default: the config'"'"'s CUTEAFD_EXPORT_HOST, reached at CUTEAFD_EXPORT_HOST_ADDR; empty for none).' \
+    '  (default: the config'"'"'s CUTEAFD_EXPORT_HOST, reached by ssh hostname; empty for none).' \
     '  Its previous image stays under :prev-ID; a running container keeps its image.' \
     '--distribute-only: build nothing and retag nothing here or on the seed; copy this toolchain'"'"'s' \
     '  existing images to receivers whose copy differs (layer list). A host that already matches is skipped.' \
@@ -71,16 +71,11 @@ seed_only_hosts=()
 [[ "$export_hosts_csv" != __config__ ]] || export_hosts_csv="${CUTEAFD_EXPORT_HOST:-}"
 export_hosts=()
 [[ -z "$export_hosts_csv" ]] || IFS=, read -ra export_hosts <<<"$export_hosts_csv"
-((${#export_hosts[@]} <= 1)) || [[ -z "${CUTEAFD_EXPORT_HOST_ADDR:-}" ]] ||
-  release_die 'CUTEAFD_EXPORT_HOST_ADDR names one host; pass one --export-hosts entry with it'
-# export_ssh HOST ARGS...: the remote export's own route (its address under HOST's
-# ssh configuration and host key), as scripts/build/export-remote.sh connects.
+# export_ssh HOST ARGS...: connect by name, as scripts/build/export-remote.sh does.
 export_ssh() {
-  local host="$1" addr="${CUTEAFD_EXPORT_HOST_ADDR:-}"
+  local host="$1"
   shift
-  local -a route=()
-  [[ -z "$addr" || "$addr" == "$host" ]] || route=(-o "HostName=$addr" -o "HostKeyAlias=$host")
-  release_ssh -o ConnectTimeout=10 ${route[@]+"${route[@]}"} "$host" "$@"
+  release_ssh -o ConnectTimeout=10 "$host" "$@"
 }
 if [[ "$role" != coordinator ]]; then
   ((${#spark_hosts[@]})) || release_die 'no Spark build host'

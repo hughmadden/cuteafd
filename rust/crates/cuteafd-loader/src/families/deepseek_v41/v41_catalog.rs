@@ -884,14 +884,28 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    if kimi_catalog_config(&config) {
-        return read_kimi_expert_catalog(snapshot, &config);
+    read_expert_catalog_with_checkpoint(snapshot, &config, None)
+}
+
+pub(crate) fn expert_catalog_from_checkpoint(checkpoint: &crate::plan::Checkpoint,
+    validation: &Result<(), String>) -> Result<OfficialV41Catalog> {
+    if checkpoint.config["quantization_config"]["quant_method"] == "exl3" {
+        validation.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+        ensure!(checkpoint.missing_shards.is_empty(), "expert catalog needs readable shards: {:?}", checkpoint.missing_shards);
+    }
+    read_expert_catalog_with_checkpoint(&checkpoint.snapshot, &checkpoint.config, Some(checkpoint))
+}
+
+fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if kimi_catalog_config(config) {
+        return read_kimi_expert_catalog(snapshot, config, checkpoint);
     }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
-        return read_glm_dsa_expert_catalog(snapshot, &config);
+        return read_glm_dsa_expert_catalog(snapshot, config, checkpoint);
     }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen4_exp") {
-        return read_qwen4_expert_catalog(snapshot, &config);
+        return read_qwen4_expert_catalog(snapshot, config, checkpoint);
     }
     if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
         let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
@@ -920,8 +934,8 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
         return read_official_v41_catalog(snapshot);
     }
     match config.get("model_type").and_then(serde_json::Value::as_str) {
-        Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
-        Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, &config),
+        Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot, checkpoint),
+        Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, config, checkpoint),
         Some("mimo_v2_flash" | "mimo_v2") => read_mimo_v2_expert_catalog(snapshot, &config),
         other => anyhow::bail!(
             "the Spark expert service does not know model_type {other:?}; add a family \
@@ -931,13 +945,26 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     }
 }
 
+fn exl3_catalog_or_read(snapshot: &Path, shape: RoutedExpertShape, tiers: &[usize],
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if let Some(checkpoint) = checkpoint {
+        return deepseek_v4_exl3_catalog_input(snapshot, &checkpoint.weight_map, shape, tiers, Some(checkpoint));
+    }
+    #[derive(Deserialize)]
+    struct Index { weight_map: BTreeMap<String, String> }
+    let index: Index = serde_json::from_value(crate::families::deepseek_v41::v41_exl3::read_json(
+        &snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?)?;
+    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, tiers)
+}
+
 fn kimi_catalog_config(config: &serde_json::Value) -> bool {
     matches!(config["model_type"].as_str(), Some("kimi_k3" | "kimi_linear"))
         || config["architectures"].as_array().is_some_and(|architectures| architectures.iter().any(|name|
             matches!(name.as_str(), Some("KimiK3ForConditionalGeneration" | "KimiLinearForCausalLM"))))
 }
 
-fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     let cfg = crate::families::kimi_k3::config::KimiK3Config::from_hf(config)?;
     cfg.release_geometry()?;
     ensure!(config["quantization_config"]["quant_method"] == "exl3",
@@ -947,8 +974,12 @@ fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Resu
     let shape = RoutedExpertShape { layers: cfg.layers, first_layer, experts: cfg.experts,
         topk: cfg.topk, hidden: cfg.latent, intermediate: cfg.moe_intermediate,
         draft_stages: 0, draft_experts: 0 };
-    let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
-    let catalog = deepseek_v4_exl3_catalog(snapshot, &checkpoint.weight_map, shape, &[2, 3])?;
+    let catalog = if let Some(checkpoint) = checkpoint {
+        deepseek_v4_exl3_catalog_input(snapshot, &checkpoint.weight_map, shape, &[2, 3], Some(checkpoint))?
+    } else {
+        let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
+        deepseek_v4_exl3_catalog(snapshot, &checkpoint.weight_map, shape, &[2, 3])?
+    };
     ensure!(catalog.experts.draft_stages == 0, "Kimi K3 has no native draft expert stages");
     Ok(catalog)
 }
@@ -957,7 +988,8 @@ fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Resu
 /// the Sparks today (the official FP8 experts need ~675 GiB); dense layers
 /// come first, and the MTP layer after the backbone keeps its experts on the
 /// coordinator.
-fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     // The geometry from the coordinator's own config readers, so the Spark
     // ranks and serve-glm / serve-glmf agree on the routed layers.
     let (dense, shape) = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
@@ -1005,19 +1037,13 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1), \
          ModelOpt NVFP4 releases or, coordinator-local, from the official FP8 checkpoint"
     );
-    #[derive(Deserialize)]
-    struct Index {
-        weight_map: BTreeMap<String, String>,
-    }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
-        .and_then(|value| Ok(serde_json::from_value(value)?))?;
     // The tier pair of the family's expert packages (glmf:exl3-k34, glm:exl3-k45).
     let tiers: &[usize] = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         &[3, 4]
     } else {
         &[4, 5]
     };
-    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, tiers)
+    exl3_catalog_or_read(snapshot, shape, tiers, checkpoint)
 }
 
 /// Qwen 3.8 Flash Next (qwen4_exp) routed experts: every layer is MoE (512
@@ -1032,7 +1058,7 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
 pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<OfficialV41Catalog> {
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     if config["quantization_config"]["quant_method"] == "exl3" {
-        return read_qwen4_expert_catalog(snapshot, &config);
+        return read_qwen4_expert_catalog(snapshot, &config, None);
     }
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config)?;
     ensure!(stages > 0 && stages <= cfg.mtp_layers, "Qwen MTP role requests {stages} stages, config provides {}", cfg.mtp_layers);
@@ -1045,7 +1071,8 @@ pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<O
         exl3: None, nvfp4: None, fp8: Some(fp8) })
 }
 
-fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(config)?;
     let shape = RoutedExpertShape {
         layers: cfg.layers,
@@ -1067,15 +1094,8 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
         return fp8_catalog(snapshot, shape);
     }
     if quant["quant_method"] == "exl3" {
-        #[derive(Deserialize)]
-        struct Index {
-            weight_map: BTreeMap<String, String>,
-        }
-        let index: Index =
-            crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
-                .and_then(|value| Ok(serde_json::from_value(value)?))?;
         // qwen4:exl3-k45.
-        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, &[4, 5]);
+        return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
     }
     if quant.get("config_groups").is_some() || quant["quant_method"] == "modelopt" {
         anyhow::bail!("Qwen ModelOpt routed experts other than NVFP4 have no expert package: serve the \
@@ -1158,14 +1178,9 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
 
 /// DeepSeek V4 routed experts; every other tensor stays with the coordinator
 /// and is not validated here.
-fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
+fn read_deepseek_v4_expert_catalog(snapshot: &Path,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     let v4 = crate::families::deepseek_v4::DeepseekV4Config::read(snapshot, 0)?;
-    #[derive(Deserialize)]
-    struct Index {
-        weight_map: BTreeMap<String, String>,
-    }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
-        .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let (hidden, intermediate) = (v4.dim, v4.moe_inter_dim);
     ensure!(
         hidden % 32 == 0 && intermediate % 32 == 0,
@@ -1184,8 +1199,14 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     let raw_config = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if raw_config["quantization_config"]["quant_method"] == "exl3" {
         // dsv4p:exl3-k23.
-        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, backbone, &[2, 3]);
+        return exl3_catalog_or_read(snapshot, backbone, &[2, 3], checkpoint);
     }
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: BTreeMap<String, String>,
+    }
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+        .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let draft_stages = index.weight_map.keys()
         .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
         .max()
@@ -1215,9 +1236,8 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     for (shard, names) in shards {
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
-        ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
+        crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
         for tensor in metadata {
-            ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
             let placement = match expect(&tensor.name) {
                 Some((dtype, shape)) => {
                     ensure!(
@@ -1284,9 +1304,8 @@ fn read_index_headers(
     for (shard, names) in shards {
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
-        ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
+        crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
         for tensor in metadata {
-            ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
             headers.push((shard.to_string(), tensor));
         }
     }
@@ -1304,7 +1323,16 @@ fn deepseek_v4_exl3_catalog(
     backbone: RoutedExpertShape,
     tiers: &[usize],
 ) -> Result<OfficialV41Catalog> {
-    let headers = read_index_headers(snapshot, weight_map)?;
+    deepseek_v4_exl3_catalog_input(snapshot, weight_map, backbone, tiers, None)
+}
+
+fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String, String>,
+    backbone: RoutedExpertShape, tiers: &[usize], checkpoint: Option<&crate::plan::Checkpoint>)
+    -> Result<OfficialV41Catalog> {
+    let headers = match checkpoint {
+        Some(checkpoint) => checkpoint.tensors.iter().map(|tensor| (tensor.shard.clone(), tensor.meta.clone())).collect(),
+        None => read_index_headers(snapshot, weight_map)?,
+    };
     let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(
         snapshot,
         backbone,

@@ -3,36 +3,35 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool)
+fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
+    use cuteafd_loader::plan::spark_executions::{admit_family, SparkBackend};
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    // The descriptor's legacy stream shape queues the live chunk on one owner.
+    let executions = admit_family("deepseek_v41", &SparkBackend::for_catalog(catalog)?.exports(), None,
+        u64::from(capacity), 1)?;
     // One endpoint per link: the decode transport and the prefill transport.
-    let endpoints = vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2];
-    let model = cuteafd_transport::worker_selection::ModelAdmission {
-        capacity, compiled_capacity, endpoints,
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
-        // Both lanes' waves (decode rounds, or prefill's two encoder streams)
-        // are in flight to a rank at once.
-        execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("deepseek_v41", 1, 2)
-    };
+    let model = cuteafd_transport::worker_selection::ModelAdmission::new(
+        vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2],
+        crate::shared::placement::spark_rings(64 << 20)?, executions)?;
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)
 }
 
 pub(super) fn start_sparks(args: &crate::cli::NativeServeArgs,
     catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
-    capacity: u32, compiled_capacity: u32,
+    capacity: u32,
     topology: Option<cuteafd_transport::expert::SparkTopology>)
     -> Result<Option<crate::shared::placement::PendingSparkAdmission>> {
-    plan_sparks(args, catalog, local_layers, capacity, compiled_capacity, topology)?
+    plan_sparks(args, catalog, local_layers, capacity, topology)?
         .map(|admission| admission.start(&args.peers)).transpose()
 }
 
 /// The Spark admission (headers only), before any worker is contacted.
 pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
-    capacity: u32, compiled_capacity: u32,
+    capacity: u32,
     topology: Option<cuteafd_transport::expert::SparkTopology>)
     -> Result<Option<crate::shared::placement::SparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
@@ -45,7 +44,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
-        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some())?)?))
+        spark_model(catalog, capacity, catalog.nvfp4().is_some())?)?))
 }
 
 #[cfg(test)]
@@ -56,7 +55,7 @@ mod spark_tests {
     fn local_load_overlaps_spark_load_before_transport_connects() {
         for (source, load, connect) in [
             (include_str!("../v41_native_serve.rs"), "ExpertWeights::load(", "transport.bootstrap("),
-            (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "let mut make_transport ="),
+            (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "super::spark_transport("),
         ] {
             let start = source.find("admission::start_sparks(").or_else(|| source.find("plan.start_with(")).unwrap();
             let load = source[start..].find(load).unwrap() + start;
@@ -67,17 +66,40 @@ mod spark_tests {
     }
 
     #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let backend = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
+        for live in [256u32, 2048, 4096] {
+            // V4.1's layout pins its unit to the live chunk at one wave.
+            let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
+                prefill_waves: 1, ..Default::default() };
+            assert_eq!(spark_model(&catalog, live, false)?.executions,
+                cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_contract_covers_the_decode_and_prefill_links() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
             for bf16 in [false, true] {
-                let model = spark_model(live, compiled, bf16)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));
+                let model = spark_model(&catalog, live, bf16)?;
+                assert_eq!((model.capacity(), model.compiled_capacity()), (live, compiled));
+                // Two decode lanes, one prefill owner; two streams queue on it.
+                assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
+                    capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
+                assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
+                    compiled_capacity: compiled, unit_rows: live, buffered_units: 2 });
                 assert_eq!(model.endpoints.len(), 2);
                 assert!(model.endpoints.iter().all(|e| e.capacity == live && e.ingress == if bf16 {
                     cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 }));
             }
         }
-        assert!(spark_model(4096, 2048, false).is_err());
         Ok(())
     }
 }

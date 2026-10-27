@@ -415,12 +415,12 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    // Lane rows: the longest scored chunk, at most `waves` units (an explicit
-    // unit) or one 4096-row unit.
-    use cuteafd_loader::families::kimi_k3::allocation::UNIT_ROWS_MAX;
-    let lane = args.prefill_rows.map_or(UNIT_ROWS_MAX, |unit| unit * usize::from(args.prefill_waves));
-    let rows = scoring.map_or(reference.tokens.len(), |windows| windows.iter().map(|w| w.tokens.len() - 1)
-        .max().unwrap_or(1).min(lane));
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+    let prefill = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
+        unit_rows: args.prefill_rows.map(|rows| rows as u64),
+        waves: Some(u64::from(args.prefill_waves)), span_rows: None,
+    })?;
+    let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);
     let graphs = verify.is_some() && args.graphs == "on";
     let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
@@ -429,7 +429,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
-            rows, waves: usize::from(args.prefill_waves), prefill_rows: args.prefill_rows,
+            rows, waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
             slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,
             draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
             verify_rows: verify.unwrap_or(0),
@@ -623,7 +623,8 @@ mod tests {
             scored += count;
         }
         assert_eq!(scored, 4096);
-        for (tokens, capacity) in [(1, 1), (16385, 4096), (513, 0), (513, 8193)] {
+        assert_eq!(forward_chunks(10827, 8256)?, [0..8256, 8256..10826]);
+        for (tokens, capacity) in [(1, 1), (16385, 4096), (513, 0), (513, 8257)] {
             assert!(forward_chunks(tokens, capacity).is_err());
         }
         Ok(())
@@ -797,7 +798,7 @@ mod tests {
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
-            cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+            cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
         let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
@@ -822,7 +823,7 @@ mod tests {
         eprintln!("Kimi CPU host forecast concurrency={slots} context=1048576 mark_bytes={mark_bytes} page_bytes={page_bytes} chunk={chunk} required={required} resolved={host_bytes} marks={} legacy_marks={marks}", admitted.mark_selection.slots);
         for rank in 0..6 {
             eprintln!("Kimi CPU Spark forecast rank={rank} retained={} budget={} reserve={} estimated_until_W9_census=true",
-                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES);
+                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?);
         }
         for rank in 0..2 {
             let items = &admitted.placement.items[rank];

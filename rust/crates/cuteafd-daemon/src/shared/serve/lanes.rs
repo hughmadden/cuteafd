@@ -32,6 +32,11 @@ impl LaneSet {
         LaneLease { index, stop: &self.stop }
     }
 
+    /// Construct each lane's owners with the same identities used by `run`.
+    pub fn try_map<T>(&self, mut setup: impl FnMut(LaneLease<'_>) -> Result<T>) -> Result<[T; 2]> {
+        Ok([setup(self.lease(0))?, setup(self.lease(1))?])
+    }
+
     /// Run both lane loops with shared failure propagation, without cancelling
     /// an outstanding device or transport operation.
     pub async fn run<'s, F, G>(&'s self,
@@ -41,6 +46,14 @@ impl LaneSet {
     where F: Future<Output = Result<()>>, G: Future<Output = Result<()>> {
         self.join(self.lease(0).run(first(self.lease(0))),
             self.lease(1).run(second(self.lease(1)))).await
+    }
+
+    /// Run a family's only decode lane (`LaneSupport::One`): lane 0 under the
+    /// same lease, failure stop and host-wait pacing as a pair.
+    pub async fn run_one<'s, T, F>(&'s self, lane: impl FnOnce(LaneLease<'s>) -> F) -> Result<T>
+    where F: Future<Output = Result<T>> {
+        let lease = self.lease(0);
+        paced(std::pin::pin!(lease.run(lane(lease)))).await
     }
 
     /// Poll two lanes to completion. Neither is cancelled when the other fails;
@@ -56,8 +69,8 @@ impl LaneSet {
 
 /// Lanes wait by yielding (stream queries, reply and commit polls), so the
 /// executor re-polls at once: `--host-wait spin` keeps that; under `block` a
-/// pending stretch spins for its first [`BLOCK_SPIN`] (most per-layer waits
-/// end within it, and they are the critical path), then sleeps
+/// pending stretch spins for its first [`BLOCK_SPIN`] (10 ms: every
+/// per-layer wait ends within it, and they are the critical path), then sleeps
 /// [`BLOCK_SLEEP`] per poll. A poll that completes restarts the spin.
 ///
 /// [`BLOCK_SPIN`]: cuteafd_transport::wait_policy::BLOCK_SPIN
@@ -97,7 +110,7 @@ impl LaneLease<'_> {
     /// Ask every lane of the set to return at its next completed boundary.
     pub fn stop(&self) { self.stop.set(true); }
     /// Run this lane's loop; an error stops the peers.
-    pub async fn run(self, lane: impl Future<Output = Result<()>>) -> Result<()> {
+    pub async fn run<T>(self, lane: impl Future<Output = Result<T>>) -> Result<T> {
         let result = lane.await;
         if result.is_err() { self.stop(); }
         result
@@ -155,6 +168,44 @@ mod tests {
     async fn failing(lease: LaneLease<'_>) -> Result<()> {
         for _ in 0..3 { tokio::task::yield_now().await; }
         anyhow::ensure!(lease.index() == 0, "lane failed");
+        Ok(())
+    }
+
+    #[test]
+    fn owner_setup_and_execution_share_lane_identities() -> Result<()> {
+        let set = LaneSet::default();
+        let identities = set.try_map(|lease| Ok(lease.index()))?;
+        let ran = RefCell::new(Vec::new());
+        block_on(set.run(
+            |lease| record(&ran, lease.index(), false),
+            |lease| record(&ran, lease.index(), false),
+        ))?;
+        assert_eq!(identities, [0, 1]);
+        assert_eq!(*ran.borrow(), identities);
+        let mut attempted = Vec::new();
+        assert!(set.try_map::<()>(|lease| {
+            attempted.push(lease.index());
+            anyhow::bail!("setup failed")
+        }).is_err());
+        assert_eq!(attempted, [0]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_lane_runs_as_lane_zero_and_a_failure_stops_the_set() {
+        let set = LaneSet::default();
+        let value = block_on(set.run_one(|lease| async move {
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            Ok((lease.index(), lease.stopping()))
+        })).unwrap();
+        assert_eq!(value, (0, false));
+        assert!(!set.lease(0).stopping());
+        let error = block_on(set.run_one(failing_one)).unwrap_err();
+        assert_eq!(error.to_string(), "single lane failed");
+        assert!(set.lease(0).stopping());
+    }
+    async fn failing_one(lease: LaneLease<'_>) -> Result<()> {
+        anyhow::ensure!(lease.index() != 0, "single lane failed");
         Ok(())
     }
 

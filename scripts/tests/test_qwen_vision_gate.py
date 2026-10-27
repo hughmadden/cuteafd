@@ -283,10 +283,10 @@ def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
 def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
-    timer = serve[serve.index("        let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
+    timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
+    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
     assert '"verify": verify.snapshot()' in serve
-    assert serve.count("&cache, media, preparer, &verify_stats);") == 2
+    assert serve.count("&cache, media, preparer, &lane.stats);") == 2
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in engine
     assert "decode_bucket(rows, spec) } else { rows }" in engine
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
@@ -295,13 +295,13 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
 def test_shared_copy_extensions_precede_grammar_and_verify_width():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
-    trim = serve[serve.index("        let mut sequences: Vec<Vec<u32>>"):serve.index("        let starts: Vec<usize>")]
+    trim = serve[serve.index("    let sequences: Vec<Vec<u32>>"):serve.index("    let starts: Vec<usize>")]
     assert trim.index("state.truncate_proposal") < trim.index("let spec = sequences.iter().any")
     assert "Drafts::Copy" not in serve
     copy = serve.index("resource::copy_continuation(")
     select = serve.index("resource::select_drafted(", copy)
     substitute = serve.index("*proposal = copy.tokens;", select)
-    assert copy < select < substitute < serve.index("let mut sequences: Vec<Vec<u32>>")
+    assert copy < select < substitute < serve.index("let sequences: Vec<Vec<u32>>")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route
@@ -324,7 +324,7 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     scoring = serve[serve.index("|placement, chunk|"):serve.index("|placement, chunk|") + 160]
     assert "verify_device_ungraphed" in scoring
     assert "active.iter().any(|a| a.job.probe.is_some())" in serve
-    assert "if diagnostic {\n            engine.verify_device_ungraphed" in serve
+    assert "if diagnostic {\n        engine.verify_device_ungraphed" in serve
     assert "logits.rows = rows;" in engine
     assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
     assert "Qwen serving graph was not captured at startup" in engine

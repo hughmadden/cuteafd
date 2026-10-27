@@ -65,6 +65,14 @@ fn request(geometry: ExpertGeometry, layer: usize, rows: usize, dtype: ExpertV2D
     Ok(request)
 }
 
+/// A gate drives one worker at `rows`: one decode and one prefill owner at
+/// that extent over the checkpoint backend's export ladder.
+pub(super) fn gate_executions(catalog: &cuteafd_loader::OfficialV41Catalog, rows: u32)
+    -> Result<cuteafd_core::SparkExecutions> {
+    let backend = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?;
+    Ok(cuteafd_core::SparkExecutions::admit(&[rows], rows, rows, 1, &backend.exports())?)
+}
+
 fn validate_source(catalog: &cuteafd_loader::OfficialV41Catalog, family: &str, format: &str)
     -> Result<ExpertGeometry> {
     let geometry = catalog.routed_experts().geometry()?;
@@ -269,9 +277,8 @@ fn native_tp_rank_sum() -> Result<()> {
     SparkAdmission::plan(&snapshot, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
             spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
-        ModelAdmission { capacity: 16, compiled_capacity: 4096,
-            endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress }],
-            rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1 })?.select(&peers)?;
+        ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress }],
+            spark_rings(config.max_frame_bytes)?, gate_executions(&catalog, 16)?)?)?.select(&peers)?;
     let h = geometry.hidden as usize;
     let zero = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
     let output = DeviceAllocation::new(&library, 16 * output_row_bytes)?;

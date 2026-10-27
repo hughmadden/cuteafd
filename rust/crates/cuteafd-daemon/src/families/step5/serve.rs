@@ -34,11 +34,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 1_048_576)]
     max_context: u64,
     /// Prefill unit rows (PLAN "Prefill contract"); a prefill call holds
-    /// `--prefill-waves` units, at most 4096 rows.
-    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    /// `--prefill-waves` units; zero selects the shared topology shape.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=4096))]
     prefill_rows: u32,
     /// Prefill units in flight: Spark waves outstanding on the one transport.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     prefill_waves: u8,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
@@ -68,18 +68,30 @@ impl ServeArgs {
     /// One prefill call's rows: `--prefill-waves` units of `--prefill-rows`.
     fn span(&self) -> u32 { self.prefill_rows * u32::from(self.prefill_waves) }
 
+    fn endpoint(&self, bf16: bool) -> SparkEndpoint {
+        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Native } }
+    }
+
+    fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
+            unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
+            waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
+            span_rows: None,
+        })?)
+    }
+
     fn validate(&self) -> Result<()> {
-        ensure!(self.span() <= 4096 && (self.prefill_waves == 1 || self.prefill_rows % 64 == 0),
-            "Step-5 --prefill-rows x --prefill-waves must hold at most 4096 page-aligned rows");
+        let shape = self.shape()?;
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
         ensure!(matches!(self.peers.len(), 4 | 6), "Step-5 requires TP4 or TP6 Spark experts");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
         ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");
-        ensure!(usize::from(self.max_sequences) <= self.prefill_rows as usize,
+        ensure!(u64::from(self.max_sequences) <= shape.unit_rows,
             "Step-5 sequence capacity exceeds row capacity");
-        ensure!(usize::from(self.mtp) < self.prefill_rows as usize,
+        ensure!(u64::from(self.mtp) < shape.unit_rows,
             "Step-5 predictor depth exceeds row capacity");
         ensure!(self.token_io.embed_placement == EmbedPlacement::Gpu,
             "Step-5 requires admitted GPU token embeddings");
@@ -89,24 +101,33 @@ impl ServeArgs {
     }
 }
 
-/// The sealed package's actual compiled extent, not the live row count. All
+/// The sealed package's exports, which the shared Spark admission covers. All
 /// layouts must agree; worker admission independently validates loaded exports.
-fn compiled_capacity(manifest: &serde_json::Value, rows: u32) -> Result<u32> {
+pub(crate) fn package_exports(manifest: &serde_json::Value) -> Result<Vec<u32>> {
     let layouts = manifest["layouts"].as_object().context("Step-5 package layouts missing")?;
-    let mut compiled = None;
+    let mut exports = None;
     for layout in layouts.values() {
         ensure!(layout["hidden"] == 4096 && layout["experts"] == 352
             && layout["top_k"] == 8 && layout["intermediate"] == 1536,
             "Step-5 package geometry differs from checkpoint");
-        let capacity = layout["capacities"].as_array().context("Step-5 package capacities missing")?
-            .iter().map(|v| v["capacity"].as_u64().context("Step-5 package capacity must be integer"))
-            .collect::<Result<Vec<_>>>()?.into_iter().max().context("Step-5 package capacities empty")?;
-        let capacity = u32::try_from(capacity)?;
-        ensure!((rows..=4096).contains(&capacity) && compiled.is_none_or(|n| n == capacity),
-            "Step-5 installed package extents disagree or cannot cover live rows");
-        compiled = Some(capacity);
+        let capacities = layout["capacities"].as_array().context("Step-5 package capacities missing")?
+            .iter().map(|v| v["capacity"].as_u64().context("Step-5 package capacity must be integer")
+                .and_then(|capacity| Ok(u32::try_from(capacity)?)))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!capacities.is_empty() && exports.as_ref().is_none_or(|known| known == &capacities),
+            "Step-5 installed package extents disagree or are empty");
+        exports = Some(capacities);
     }
-    compiled.context("Step-5 installed package has no layouts")
+    exports.context("Step-5 installed package has no layouts")
+}
+
+/// The one Step-5 Spark admission for serve and golden: the endpoint's unit,
+/// typed owners over the sealed package's exports.
+pub(crate) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, clients: usize,
+    max_frame_bytes: usize) -> Result<ModelAdmission> {
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("step5", exports, None,
+        u64::from(endpoint.capacity), waves)?;
+    ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, spark_rings(max_frame_bytes)?, clients, executions)
 }
 
 fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
@@ -116,6 +137,11 @@ fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crat
 
 fn with_backend<T>(args: &ServeArgs,
     run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
+    let shape = args.shape()?;
+    let mut resolved = args.clone();
+    resolved.prefill_rows = u32::try_from(shape.unit_rows)?;
+    resolved.prefill_waves = u8::try_from(shape.waves)?;
+    let args = &resolved;
     args.validate()?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
@@ -131,7 +157,7 @@ fn with_backend<T>(args: &ServeArgs,
     let package = args.native_lib.parent().context("native library directory")?.join("fp8")
         .join(format.package_name("step5")).join("manifest.json");
     let metadata = cuteafd_loader::plan::checkpoint::read_json(&package)?;
-    let compiled = compiled_capacity(&metadata, args.span())?;
+    let exports = package_exports(&metadata)?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.
     let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
     library.cuda_set_device(args.device)?;
@@ -178,7 +204,7 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: args.span(), ingress: SparkIngress::Bf16 };
+    let endpoint = args.endpoint(format.bf16_input());
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
@@ -187,8 +213,7 @@ fn with_backend<T>(args: &ServeArgs,
     let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
         rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
-        ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, compiled,
-            spark_rings(config.max_frame_bytes)?, clients)?)?;
+        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
@@ -196,7 +221,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
-                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(args.mtp), inputs.kv_format)?);
+                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?);
         }
         let native = native.check(u64::MAX, &[])?;
         let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
@@ -217,8 +242,8 @@ fn with_backend<T>(args: &ServeArgs,
         .collect::<Result<Vec<_>>>()?;
     let stages = devices.iter().enumerate().map(|(rank, &device)| {
         let cache = caches[rank].borrow();
-        Staging::new_for_sequences(device, &programs, &cache,
-            Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences)
+        Staging::new_for_units(device, &programs, &cache,
+            Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences, inputs.unit_rows())
     }).collect::<Result<Vec<_>>>()?;
     let target_input = Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?)?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
@@ -293,11 +318,11 @@ fn with_backend<T>(args: &ServeArgs,
     let transport = devices[0].own(|| {
         // One return slot per prefill unit in flight, each holding one unit.
         let mut link = if args.prefill_waves > 1 {
-            SparkLink::new_waves(&library, world, &args.peers, args.span(), config, 4096 * 2,
+            SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
                 usize::from(args.prefill_waves), args.prefill_rows)?
-        } else { SparkLink::new(&library, world, &args.peers, args.span(), config, 4096 * 2)? };
+        } else { SparkLink::new(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2)? };
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(inputs.rows, 1)?)?;
+        link.bootstrap(&super::execution::bootstrap_request(inputs.unit_rows(), 1)?)?;
         Ok(link)
     })?;
     library.cuda_set_device(args.device)?;
@@ -305,7 +330,7 @@ fn with_backend<T>(args: &ServeArgs,
         Some(transport), 92, 1)?;
     let mtp = predictor_budget.map(|(available, reserved)| super::mtp::Runtime::load(
         &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
-        usize::from(args.mtp), inputs.rows, available, &[reserved])).transpose()?;
+        usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_units(args.prefill_rows as usize, usize::from(args.prefill_waves))?;
@@ -391,6 +416,7 @@ mod tests {
         let mut args = args();
         args.split_device = Some(1);
         args.prefill_rows = 64;
+        args.prefill_waves = 1;
         args.max_sequences = 3;
         args.mtp = 3;
         // Smallest supported request context; the checkpoint's 1M compiled extent stays unchanged.
@@ -427,6 +453,7 @@ mod tests {
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
         args.split_device = Some(1);
         args.prefill_rows = 256;
+        args.prefill_waves = 1;
         args.max_sequences = 16;
         args.prefix.host_cache_bytes = crate::shared::prefix::HostBudget::Auto;
         args.peers = (1..=6).map(|port| format!("127.0.0.1:{port}").parse()).collect::<std::result::Result<_, _>>()?;
@@ -440,7 +467,7 @@ mod tests {
         let package = args.native_lib.parent().context("native package")?.join("fp8")
             .join(format.package_name("step5")).join("manifest.json");
         let metadata = plan::checkpoint::read_json(&package)?;
-        let compiled = compiled_capacity(&metadata, args.prefill_rows)?;
+        let exports = package_exports(&metadata)?;
         let manifest = plan::checkpoint::read_json(&args.manifest)?;
         ensure!(manifest["programs"].as_array().context("native programs")?.iter()
             .all(|program| program.get("card_plans").is_none()),
@@ -472,12 +499,11 @@ mod tests {
                     "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
                     cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
+            let endpoint = args.endpoint(format.bf16_input());
             let clients = admitted.ownership.routed_endpoints()?;
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
-                6, None, ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, compiled,
-                    spark_rings(TcpTransportConfig::default().max_frame_bytes)?, clients)?)?;
+                6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?)?;
             super::super::execution::bootstrap_request(inputs.rows, 1)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
@@ -485,7 +511,7 @@ mod tests {
                     &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 if rank == head_rank {
                     native.workspace = native.workspace.max(
-                        plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth), inputs.kv_format)?);
+                        plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?);
                 }
                 let native = native.check(u64::MAX, &[])?;
                 let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
@@ -499,7 +525,7 @@ mod tests {
                 && admitted.cache.ranks[head_rank].mtp_lengths.len() == usize::from(depth),
                 "predictor runtime exceeds admitted owners/cache");
             for stage in 0..usize::from(depth) {
-                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.rows)?;
+                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.unit_rows())?;
                 super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage,
                     plan::families::step5::native::head_rows(inputs.rows, false))?;
                 super::super::ffn::DensePlan::for_mtp_stage(&programs, &checkpoint,
@@ -673,15 +699,85 @@ mod tests {
     }
 
     #[test]
+    fn topology_shapes_and_explicit_units_match_admission() -> Result<()> {
+        for (sparks, unit, waves, span) in [(4, 2048, 4, 8192), (6, 2048, 4, 8192)] {
+            let mut args = args();
+            args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
+                .collect::<std::result::Result<_, _>>()?;
+            args.validate()?;
+            let shape = args.shape()?;
+            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
+            args.prefill_rows = unit as u32;
+            args.prefill_waves = waves as u8;
+            assert_eq!(args.span(), span as u32);
+            let exports = [1, 16, 80, 256, 1024, 4096];
+            let model = spark_model(&exports, args.endpoint(false), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+            // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
+            assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
+                compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });
+            assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution { capacity: 64, compiled_capacity: 80 }]);
+            assert_eq!(model.endpoints[0].capacity, unit as u32);
+            assert!(model.endpoints[0].capacity < args.span());
+            for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
+                args.prefill_rows = unit;
+                args.prefill_waves = waves;
+                let shape = args.shape()?;
+                assert_eq!((shape.unit_rows, shape.waves), (u64::from(unit), u64::from(waves)));
+                args.validate()?;
+            }
+            args.prefill_rows = 512;
+            for waves in 1..=4 {
+                args.prefill_waves = waves;
+                args.validate()?;
+                let shape = args.shape()?;
+                assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
+                    (512, u64::from(waves), 512 * u64::from(waves)));
+            }
+            args.prefill_rows = 4097;
+            assert!(args.validate().is_err());
+            args.prefill_rows = 2753;
+            assert!(args.validate().is_err());
+        }
+        Ok(())
+    }
+
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_serve_and_golden_admit_identical_spark_owners() -> Result<()> {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for (waves, unit) in [(1u64, 4096u32), (2, 4096), (3, 2752), (4, 2048), (3, 640)] {
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: unit, ingress: SparkIngress::Bf16 };
+            // Serve and golden share `spark_model`; the planner charges the same owners.
+            assert_eq!(spark_model(&SparkBackend::Fp8.exports(), endpoint, waves, 1, 64 << 20)?.executions,
+                planned("step5", SparkBackend::Fp8, None, u64::from(unit), waves));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn installed_capacity_is_not_live_rows_or_assumed_fp8_format() -> Result<()> {
         let mut metadata = serde_json::json!({"layouts":{"tp4":{"hidden":4096,"experts":352,
             "top_k":8,"intermediate":1536,"capacities":[{"capacity":1},{"capacity":1024}]}}});
-        assert_eq!(compiled_capacity(&metadata, 256)?, 1024);
-        assert!(compiled_capacity(&metadata, 2048).is_err());
+        assert_eq!(package_exports(&metadata)?, [1, 1024]);
+        // A fixed unit inside the package's largest export is admitted there;
+        // one beyond it is refused, never stretched.
+        let endpoint = |capacity| SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
+        let admitted = spark_model(&package_exports(&metadata)?, endpoint(256), 1, 1, 64 << 20)?;
+        assert_eq!(admitted.executions.prefill.compiled_capacity, 1024);
+        let error = spark_model(&package_exports(&metadata)?, endpoint(2048), 1, 1, 64 << 20).unwrap_err();
+        assert!(matches!(error.downcast_ref::<cuteafd_core::ExecutionAdmissionError>(),
+            Some(cuteafd_core::ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 2048, .. })), "{error:#}");
         metadata["layouts"]["tp6"] = metadata["layouts"]["tp4"].clone();
         metadata["layouts"]["tp6"]["capacities"][1]["capacity"] = 4096.into();
-        assert!(compiled_capacity(&metadata, 256).is_err());
-        assert!(compiled_capacity(&serde_json::json!({"layouts":{}}), 1).is_err());
+        assert!(package_exports(&metadata).is_err());
+        assert!(package_exports(&serde_json::json!({"layouts":{}})).is_err());
         Ok(())
     }
 }

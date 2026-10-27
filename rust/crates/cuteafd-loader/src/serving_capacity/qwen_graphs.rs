@@ -236,7 +236,7 @@ pub fn qwen_graph_pool(available: u64, fixed: u64, per_token: u64, target: u64, 
 }
 
 /// Device bytes of one Qwen step workspace (`Qwen4Engine::workspace`) of `t`
-/// rows: every buffer rounded up to 256 bytes, the shared program scratch
+/// rows: every buffer has a 256-byte allocation minimum, the shared program scratch
 /// (`scratch`, the largest of the step's programs) and the index top-k
 /// scratch, `logit_rows` vocabulary rows and the 4 MiB head workspace. `pages`
 /// is the pool's record pages (decode tables hold one row per step row).
@@ -378,18 +378,32 @@ mod tests {
         use crate::serving_capacity::PrefillShape;
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
         let h = cfg.hidden as u64;
-        for rows in [512, 1024, 2048, 4096] {
-            let one = PrefillShape { unit_rows: rows, waves: 1 };
-            let two = PrefillShape { unit_rows: rows, waves: 2 };
+        for rows in [512, 1024, 2048, 2752, 4096] {
             let base = qwen_workspace_bytes(&cfg, rows, false, 1, 0, Some(160), 12345, 6789);
-            assert_eq!(qwen_unit_workspace_bytes(&cfg, one, 0, 1, Some(160), 12345, 6789), base);
             let extra_slot = rows * (2 * 4 * h * 2 + 4 * 2 + 3 * h * 2);
-            let slot_bytes = qwen_unit_workspace_bytes(&cfg, two, 0, 1, Some(160), 12345, 6789);
-            assert_eq!(slot_bytes, base + extra_slot);
-            assert_eq!(qwen_unit_workspace_bytes(&cfg, two, 4096, 1, Some(160), 12345, 6789),
-                slot_bytes + 4096 * 4 * h * 2);
+            for waves in 1..=4 {
+                let shape = PrefillShape { unit_rows: rows, waves }.validate().unwrap();
+                let slot_bytes = qwen_unit_workspace_bytes(&cfg, shape, 0, 1, Some(160), 12345, 6789);
+                assert_eq!(slot_bytes, base + (waves - 1) * extra_slot);
+                for terminal in [4096, shape.slot_rows(), 16384] {
+                    assert_eq!(qwen_unit_workspace_bytes(&cfg, shape, terminal, 1, Some(160), 12345, 6789),
+                        slot_bytes + terminal * 4 * h * 2);
+                }
+            }
         }
         assert_eq!(crate::serving_capacity::prefill_return_bytes(2, 2048, 4, 2048), 64 << 20);
+    }
+
+    #[test]
+    fn full_prefill_logits_charge_matches_workspace_minimum_allocations() {
+        use super::qwen_workspace_bytes;
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let baseline = qwen_workspace_bytes(&cfg, 2048, false, 1, 0, Some(160), 0, 0);
+        for logits in [1, 16, 32, 33, 2048, 2752, 8192, 8256, 16384] {
+            let runtime = qwen_workspace_bytes(&cfg, 2048, false, logits, 0, Some(160), 0, 0) - baseline;
+            assert_eq!(crate::plan::layout::full_prefill_logits_bytes("qwen4", logits, cfg.vocab_size as u64),
+                runtime, "{logits} logit rows");
+        }
     }
 
     #[test]

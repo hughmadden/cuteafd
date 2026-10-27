@@ -657,6 +657,8 @@ def test_step5_norms_take_runtime_epsilon_and_keep_final_bf16_boundary(monkeypat
     monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
     monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=pointwise))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.dsv4_ffn", SimpleNamespace(
+        compile_dsv4_expert_input_quant_aot=lambda geometry: geometry))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = {name: build() for name, build in module.builders(heads, "pointwise").items()
@@ -687,6 +689,8 @@ def test_step5_rope_builders_cover_all_policy_modes_without_recipe_specializatio
     monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
     monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.dsv4_ffn", SimpleNamespace(
+        compile_dsv4_expert_input_quant_aot=lambda geometry: geometry))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.rope", SimpleNamespace(
         compile_rope_tables_aot=lambda **kwargs: kwargs))
     module = importlib.util.module_from_spec(spec)

@@ -94,7 +94,7 @@ impl RuntimeSizing {
     /// Execution slots every Spark rank runs (the shared rule, `plan::layout::spark_execution_slots`):
     /// one per prefill wave in flight; decode keeps one request per rank.
     pub fn execution_slots(self) -> u8 {
-        crate::plan::layout::spark_execution_slots("minimax_m3", self.waves as u64, 1)
+        u8::try_from(self.waves.max(1)).unwrap_or(u8::MAX)
     }
     /// The one Spark endpoint decode and prefill share: a wave of up to a unit's rows, BF16 in.
     pub fn spark_endpoint(self) -> std::result::Result<cuteafd_core::SparkEndpoint, std::num::TryFromIntError> {
@@ -109,7 +109,7 @@ impl RuntimeSizing {
 /// A 2752-row wave runs on the expert package's 4096-row programs, which take any rows up to their
 /// capacity, so six Sparks need no other export.
 pub fn prefill_shape(rows: u64, waves: u64, spark_ranks: usize) -> anyhow::Result<PrefillShape> {
-    let waves = if waves > 0 { waves } else { prefill_waves::planned_waves(spark_ranks) };
+    let waves = if waves > 0 { waves } else { match spark_ranks { 0 => 1, 1..=5 => 2, _ => 3 } };
     let unit_rows = if rows > 0 { rows } else { prefill_waves::unit_rows(waves) };
     PrefillShape { unit_rows, waves }.validate()
 }

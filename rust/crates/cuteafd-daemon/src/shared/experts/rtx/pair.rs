@@ -174,6 +174,9 @@ pub(crate) fn submit_scoped<T>(
             Ok(value)
         }
         Err(cause) => {
+            // Teardown may abort to retain unsafe-to-release owners. Preserve
+            // the submission error before that fail-safe can hide its cause.
+            tracing::error!(error = %format!("{cause:#}"), "submission failed; draining queued owners");
             let drain = match guard.shutdown() {
                 Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
                 Err(error) => format!("queued owners retained: {error:#}"),
@@ -1123,6 +1126,32 @@ mod tests {
             .is_err());
             assert!(!replayed.get());
         }
+    }
+
+    #[test]
+    fn original_submission_error_is_logged_before_shutdown() {
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let result: Result<()> = submit_scoped(|| Ok(()), || {
+                let logged = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+                assert!(logged.contains("submission failed; draining queued owners"), "{logged}");
+                assert!(logged.contains("short-prompt prefill: injected original cause"), "{logged}");
+                Ok(())
+            }, |_| Err(anyhow::anyhow!("injected original cause").context("short-prompt prefill")));
+            assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+        });
     }
 
     #[test]

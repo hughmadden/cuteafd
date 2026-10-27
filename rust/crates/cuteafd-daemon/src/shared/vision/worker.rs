@@ -53,7 +53,7 @@ pub struct AudioWorkerConfig {
 pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&AudioWorkerConfig>,
     snapshot: &Path, library: PathBuf, budget: u64) -> Result<(Option<EncoderServer>, Option<EncoderServer>, u64)> {
     if vision.is_none() && audio.is_none() { return Ok((None, None, 0)); }
-    let config: serde_json::Value = serde_json::from_reader(std::fs::File::open(snapshot.join("config.json"))?)?;
+    let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
     if config["model_type"].as_str() == Some("deepseek_v41") {
         ensure!(audio.is_none(), "V4.1 audio encoder is unsupported");
         return match vision {

@@ -43,6 +43,9 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
+        # Serving containers now run under --init (tini forwards SIGTERM to the daemon).
+        if "--init" not in before["options"]:
+            before["options"] = sorted([*before["options"], "--init"])
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
@@ -50,15 +53,30 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
+            ranks = int(selected["set"]["SPARK_COUNT"])
             if entry["family"] == "qwen4":
-                # Local/dual still execute their whole-step default, now explicit in the plan.
+                # Local stays one wave; remote PLE admits at most two waves.
                 position = before["command"].index("--console-secret-file")
-                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "1"]
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "1" if ranks == 0 else "2"]
+            if entry["family"] == "glm5":
+                waves = 3 if ranks >= 6 and "nvfp4" not in entry["name"] else 2
+                unit = 2752 if waves == 3 else 4096
+                for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves),
+                                    ("--prefill-span-rows", unit * waves)]:
+                    before["command"][before["command"].index(flag) + 1] = str(value)
             if entry["family"] == "deepseek_v4":
                 # V4 forwards the planner's resolved unit and wave defaults.
                 anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
                 position = before["command"].index(anchor) + 2
-                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "2"]
+                waves = 3 if ranks >= 6 else 2
+                before["command"][position:position] = ["--prefill-rows", "2752" if waves == 3 else "4096", "--prefill-waves", str(waves)]
+            if entry["family"] == "glm5_flash":
+                # Remote cards keep 2x4096; local EXL3 uses 1x4096. Both now
+                # reserve exactly the live rows instead of the old 16384 span.
+                waves = "1" if selected["set"]["SPARK_COUNT"] == "0" else "2"
+                position = before["command"].index("--console-secret-file")
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", waves,
+                    "--prefill-span-rows", "4096" if waves == "1" else "8192"]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]

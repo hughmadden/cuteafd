@@ -1,6 +1,8 @@
 //! `cuteafd plan`: inspect a checkpoint and report what this build can serve.
 use anyhow::{Context, Result};
-use cuteafd_loader::plan::{budget_bytes, plan, plan_spark_count, render, ExpertPlacement, PlanError, PlanOptions};
+use cuteafd_loader::plan::{budget_bytes, render, ExpertPlacement, PlanError, PlanOptions};
+#[cfg(test)]
+use cuteafd_loader::plan::plan;
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
 
@@ -251,8 +253,14 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         "--exlr8-manifest requires an EXLR8 checkpoint");
     anyhow::ensure!(args.exlr8_prefill_activations.is_none(),
         "--exlr8-prefill-activations requires an EXLR8 checkpoint");
-    let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
-    let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
+    let role_inventory = args.files || args.fetch || args.role.is_some();
+    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open(&snapshot)?) };
+    let inventory;
+    let checkpoint = if let Some(input) = &input { input.checkpoint() } else {
+        inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        &inventory
+    };
+    let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
@@ -278,13 +286,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             layout.minimax_drafter_snapshot = args.drafter_snapshot.clone();
             layout.minimax_draft_bf16 = args.minimax_draft_bf16;
         }
-        let config = std::fs::File::open(snapshot.join("config.json")).ok()
-            .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
-        let v41 = config.as_ref().is_some_and(|value| {
-            value.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41")
-                || value.get("architectures").and_then(serde_json::Value::as_array)
-                    .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"))
-        });
+        let config = &checkpoint.config;
+        let v41 = config.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41")
+            || config.get("architectures").and_then(serde_json::Value::as_array)
+                .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
     }
     if args.files || args.fetch || args.role.is_some() {
@@ -306,7 +311,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         let roles = if let Some(layout) = &args.file_layout {
             anyhow::ensure!(args.role.is_none(), "--role and --file-layout are mutually exclusive");
             let hosts: std::collections::BTreeMap<String, Vec<String>> =
-                serde_json::from_reader(std::fs::File::open(layout)?)?;
+                cuteafd_loader::read_json_file(layout)?;
             if let Some(host) = &args.host {
                 hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?
                     .iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?
@@ -363,13 +368,14 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         return Ok(());
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
+    let input = input.context("full planner input missing after role-inventory dispatch")?;
     if args.spark_range {
-        let columns = cuteafd_loader::plan::PlanInput::open(&snapshot)?.spark_ranges(&options)?;
+        let columns = input.spark_ranges(&options)?;
         if args.json { println!("{}", serde_json::to_string_pretty(&columns)?); }
         else { print!("{}", cuteafd_loader::plan::spark_range::render(&columns)); }
         return Ok(());
     }
-    let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
+    let report = input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?;
     if args.json || args.deployment {
         if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
         if let Some(selection) = &report.prefill_selection { eprintln!("{selection}"); }
@@ -499,7 +505,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
     resolve_speculator(&mut args, snapshot, family, &cfg)?;
     let needs_drafter = if let Some(layout) = &args.file_layout {
         let hosts: std::collections::BTreeMap<String, Vec<String>> =
-            serde_json::from_reader(std::fs::File::open(layout)?)?;
+            cuteafd_loader::read_json_file(layout)?;
         let roles = if let Some(host) = &args.host {
             hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?.clone()
         } else { hosts.into_values().flatten().collect() };

@@ -112,6 +112,22 @@ impl FamilyModel for Described {
 
 pub trait Family: Sync {
     fn id(&self) -> &'static str;
+    /// Base timing estimate and hard executor limits, consumed unchanged by
+    /// shared planning, serving and golden. Pins bypass only the estimate.
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        Default::default()
+    }
+    /// Decode lanes the executor runs (PLAN "Two decode lanes"). Every target
+    /// family states its own entry and reason; the default is a drafter's.
+    fn decode_lanes(&self) -> super::decode_lanes::LaneSupport {
+        super::decode_lanes::LaneSupport::One { reason: super::decode_lanes::DRAFTER }
+    }
+    /// Spark decode compute owners: one per decode lane, each admitting the
+    /// family's decode rows (its covering export comes from the backend ladder).
+    /// `None` for families without Spark experts.
+    fn spark_decode(&self) -> Option<super::spark_executions::SparkDecode> { None }
+    /// How the executor feeds the single Spark prefill owner.
+    fn spark_prefill(&self) -> super::spark_executions::SparkPrefill { super::spark_executions::SparkPrefill::Ladder }
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
     /// Parses the checkpoint's configuration into the family's canonical model

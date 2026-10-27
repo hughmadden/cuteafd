@@ -221,6 +221,10 @@ fn spec(cfg: &MiniMaxM3Config, vision: bool, draft: Option<&MiniMaxM3DsparkConfi
 }
 
 impl Family for MiniMaxM3 {
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        // MiniMax decode/verify steps send at most `admission::DECODE_ROWS` (64) rows.
+        Some(crate::plan::spark_executions::SparkDecode { rows: admission::DECODE_ROWS as u32 })
+    }
     fn id(&self) -> &'static str { "minimax_m3" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
