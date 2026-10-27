@@ -1,14 +1,14 @@
 //! Single coordinator startup: validate, admit, load, bind, schedule.
 use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Cache,
     execution::Execution, media::ReadyVision, routed::Routed, MiniMaxError};
-use crate::shared::{memory::device::{Allocation, Device}, placement::{SparkAdmission, spark_rings},
+use crate::shared::{memory::device::{Allocation, Device}, placement::SparkAdmission,
     prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
     token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
 use anyhow::{Context, Result};
-use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_core::ExpertGeometry;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
     plan::{checkpoint::Checkpoint, MediaMode}, placement::SparkWorkingSet, serving_capacity::prefill_lanes};
-use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
+use cuteafd_transport::{expert::SparkWorld, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
 #[derive(Debug, Clone, clap::Args)]
@@ -209,15 +209,16 @@ pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, devi
     let library = library_owner.as_ref();
     let Start { snapshot, checkpoint, cfg, sizing, ledger, cache, local_layers, spark_layers, peers, catalog,
         package, embed, available, draft } = start;
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.unit_rows)?, ingress: SparkIngress::Bf16 };
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
-    // One link carries decode and every prefill lane's waves: one persistent client per rank.
+    // One link carries decode and every prefill wave: one persistent client per rank, its endpoint a
+    // unit's rows, and an execution slot per wave in flight, as the planner charges every rank.
+    let model = admission::spark_model(sizing)?;
+    let endpoint = sizing.spark_endpoint()?;
     let pending = if spark_layers.is_empty() { None } else {
         let working = SparkWorkingSet { rtx_layers: local_layers.to_vec(), spark_layers: spark_layers.to_vec(),
             spark_ranks: peers.len(), prefill_lanes: 1 };
         Some(SparkAdmission::plan(snapshot, ExpertGeometry::MINIMAX_M3, Some(catalog), &working, peers.len(), None,
-            ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, endpoint.capacity,
-                spark_rings(config.max_frame_bytes)?, 1)?)?.start(peers)?)
+            model)?.start(peers)?)
     };
     let buffer = |name: &str| -> Result<Allocation<'a>> {
         let bytes = ledger.bytes(name).with_context(|| format!("MiniMax {name} admission"))?;

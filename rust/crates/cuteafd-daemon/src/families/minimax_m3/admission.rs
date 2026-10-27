@@ -43,9 +43,7 @@ pub(super) fn spark_rings() -> Result<cuteafd_core::SparkRings> {
 
 /// The worker admission serve seals to every Spark rank: the one endpoint decode and every prefill
 /// wave share (a unit's rows, BF16 in), and one execution slot per wave in flight, as the recipe
-/// charges them ([`RuntimeSizing::execution_slots`]). Serve's start-up takes it with the one-link
-/// Spark exchange; until then it opens a refusing link per wave.
-#[cfg_attr(not(test), allow(dead_code))]
+/// charges them ([`RuntimeSizing::execution_slots`]).
 pub(super) fn spark_model(sizing: RuntimeSizing) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let endpoint = sizing.spark_endpoint()?;
     let mut model = cuteafd_transport::worker_selection::ModelAdmission::for_clients(cuteafd_core::ExpertGeometry::MINIMAX_M3,
