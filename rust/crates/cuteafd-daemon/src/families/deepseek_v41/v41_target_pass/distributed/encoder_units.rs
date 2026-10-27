@@ -152,9 +152,11 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         let slot = &mut self.slots[unit.slot];
         let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
         let gpu = slot.pass.resources.map.attention(layer)?;
-        let transport_device = slot.transport.device;
+        let device = slot.pass.resources.lanes[gpu].device;
         // SAFETY: no other unit overwrote this slot's shared values or input.
-        let completed = transport_device.future(unsafe { ticket.land(slot.pass.resources.lanes[gpu].get_mut(),
+        // As `PlacedPreparedLayer::execute`: on the lane's GPU; the collect
+        // switches to the transport's GPU and returns the result here.
+        let completed = device.future(unsafe { ticket.land(slot.pass.resources.lanes[gpu].get_mut(),
             slot.transport.get_mut()) }).await?;
         unsafe { slot.pass.complete_unit_layer(&self.requests, batch, layer, completed).await }
     }
