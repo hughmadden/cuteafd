@@ -85,9 +85,10 @@ RTX 5090 is not supported on this engine yet: `cuteafd plan` refuses an RTX
 | RTX PRO 6000 | [TP2](minimax-m31-flash-nvfp4-pro6000-tp2.config) | [TP3](minimax-m31-flash-nvfp4-pro6000-tp3.config) | [TP4](minimax-m31-flash-nvfp4-pro6000-tp4.config) | [TP6](minimax-m31-flash-nvfp4-pro6000-tp6.config) |
 
 The examples keep the launcher's `VISION=auto` and serve the tower, on the GPU at
-TP2 and on a Spark rank at TP3, TP4 and TP6. Prefill runs in the plan's units on
-one Spark link: two waves of 4096 rows at every Spark count while MiniMax's prefill
-estimate is unmeasured (`PREFILL_ROWS` and `PREFILL_WAVES` pin them). Speculation is DFlash2 by default, with the
+TP2 and on a Spark rank at TP3, TP4 and TP6. Prefill runs on one Spark link within
+the plan's four admitted 4096-row slots: the engine starts at two waves (MiniMax has
+no measured estimate) and chooses each call's depth at runtime from the Sparks'
+measured pace (`PREFILL_WAVES` pins it). Speculation is DFlash2 by default, with the
 RadixArk/Minimax-M3.1-Flash-Dflash2 draft on the shared drafter, which cuteafd does
 not distribute: download it beside the release. `SPECULATOR=dspark` runs the
 release's bundled drafter and `SPECULATOR=off` none. Expert loading uses mounted

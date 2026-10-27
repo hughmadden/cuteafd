@@ -1775,9 +1775,9 @@ if [[ "$family" == minimax_m3 ]]; then
   minimax_concurrency="$(get CONCURRENCY 64)"
   [[ "$minimax_concurrency" =~ ^[1-9][0-9]*$ && "$minimax_concurrency" -le 64 ]] ||
     release_die "MiniMax CONCURRENCY must be 1..64"
-  # Prefill units (PLAN "Prefill contract"): PREFILL_ROWS rows each, PREFILL_WAVES of them in
-  # flight on one Spark link. The plan resolves both from MiniMax's descriptor (unset: its estimate is
-  # unmeasured, so two 4096-row waves at every Spark count) and serve-minimax runs the shape it resolved.
+  # Prefill units (PLAN "Prefill contract", #762): the plan admits slots of the unit on one Spark link
+  # and serve-minimax chooses each call's depth within them at runtime (unset: four 4096-row slots,
+  # starting at two waves while its estimate is unmeasured). PREFILL_WAVES pins the depth.
   minimax_context="$(get MAX_CONTEXT_TOKENS 0)"
   [[ "$minimax_context" =~ ^(0|[1-9][0-9]{0,6})$ && "$minimax_context" -le 1048576 ]] ||
     release_die "MiniMax MAX_CONTEXT_TOKENS must be 0 (automatic) or 1..1048576"
