@@ -46,6 +46,11 @@ pub(crate) struct GoldenArgs {
     last_layer: usize,
     #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: u32,
+    /// Spark waves a prefill call keeps in flight (1 to 4): the link's return slots and the call span
+    /// (--prefill-rows x waves). Scoring calls keep every scored row in one unit, so scores do not
+    /// depend on it. Above one, --prefill-rows must be whole 64-row pages (the plan's unit shape).
+    #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4))]
+    prefill_waves: usize,
     #[arg(long, value_enum, default_value = "decode")]
     score_shape: ScoreShape,
     #[arg(long, alias = "out")]
@@ -93,6 +98,8 @@ pub(crate) struct GoldenArgs {
 
 fn selection(args: &GoldenArgs) -> Result<Vec<usize>> {
     ensure!(args.last_layer < 60 && args.device >= 0, MiniMaxError::Invalid("golden layer or device"));
+    ensure!(args.prefill_waves == 1 || args.prefill_rows % 64 == 0,
+        MiniMaxError::Invalid("golden --prefill-waves above one needs --prefill-rows on whole 64-row pages"));
     ensure!((args.peers.is_empty() || super::admission::spark_worlds().contains(&args.peers.len()))
         && args.peers.iter().enumerate().all(|(i, p)| !args.peers[..i].contains(p)),
         MiniMaxError::Invalid("golden peers require distinct endpoints of a Spark world the expert package ships"));
@@ -272,7 +279,8 @@ fn binding(args: &GoldenArgs, reference: &Value, windows: &[Window], checkpoint:
         "binary_sha256":hash(&std::env::current_exe()?)?, "config_sha256":hash(&args.snapshot.join("config.json"))?,
         "index_sha256":hash(&args.snapshot.join("model.safetensors.index.json"))?,
         "last_layer":args.last_layer,"local_layers":args.expert_layers,"peer_count":args.peers.len(),
-        "prefill_rows":args.prefill_rows,"score_shape":args.score_shape,"check_prefix":args.check_prefix}))
+        "prefill_rows":args.prefill_rows,"prefill_waves":args.prefill_waves,"score_shape":args.score_shape,
+        "check_prefix":args.check_prefix}))
 }
 
 fn completed(directory: &Path, binding: &Value, full: bool) -> Result<Option<Value>> {
@@ -630,7 +638,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let context = windows.iter().map(|w| w.tokens.len()).max().unwrap().div_ceil(64) * 64;
     ensure!(!args.check_prefix || windows[0].tokens.len() >= 66, "prefix qualification needs 66 tokens in first window");
     let sizing = admission::RuntimeSizing {unit_rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
-        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize, waves:1};
+        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize,
+        waves:args.prefill_waves};
     let (package, local_package) = super::admission::local_package(native)?;
     // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = library.cuda_memory_info()?.0 as u64;
@@ -648,8 +657,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             ensure!(selected == remote, "golden runner worker layers differ from executed remote layers");
         }
     }
-    // Serve's start-up: one Spark link with one return slot (golden runs one lane), and every step
-    // eager, as serving's are.
+    // Serve's start-up: one Spark link with a return slot per prefill wave, and every step eager, as
+    // serving's are.
     let super::serve::Runtime { execution, cache, embedding, token_ids, embedded, routed } =
         super::serve::start(&library, args.device, &programs, super::serve::Start {
             snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &admitted.ledger, cache: &admitted.cache,
@@ -702,10 +711,12 @@ mod tests {
     fn minimax_golden_parses_runner_arguments_and_local_subset() -> Result<()> {
         let args = args(&["--golden", "/reference", "--window", "code-1", "--native-lib", "/native.so",
             "--manifest", "/PROGRAMS.json", "--last-layer", "5", "--expert-layers", "3,4,5",
-            "--save-logits", "/output", "--resume", "--check-prefix", "--prefill-rows", "64", "--score-shape", "prefill"]);
+            "--save-logits", "/output", "--resume", "--check-prefix", "--prefill-rows", "64", "--score-shape", "prefill",
+            "--prefill-waves", "2"]);
         assert_eq!(args.last_layer, 5); assert_eq!(args.expert_layers, [3, 4, 5]);
         assert_eq!(args.prefill_rows, 64); assert_eq!(args.score_shape, ScoreShape::Prefill);
         assert!(args.resume && args.check_prefix); assert!(selection(&args)?.is_empty());
+        assert_eq!((args.prefill_waves, self::args(&[]).prefill_waves), (2, 1));
         Ok(())
     }
 
@@ -737,7 +748,13 @@ mod tests {
             assert!(selection(&args(extra)).is_err());
         }
         assert!(selection(&args(&["--last-layer", "0"])).is_ok());
-        for extra in [&["--prefill-rows", "0"][..], &["--prefill-rows", "4097"], &["--resume"], &["--score-shape", "unknown"]] {
+        // Several waves cut on whole pages; one wave takes any window.
+        let unaligned = selection(&args(&["--last-layer", "0", "--prefill-rows", "100", "--prefill-waves", "2"])).unwrap_err();
+        assert!(unaligned.to_string().contains("whole 64-row pages"), "{unaligned}");
+        assert!(selection(&args(&["--last-layer", "0", "--prefill-rows", "100"])).is_ok());
+        assert!(selection(&args(&["--last-layer", "0", "--prefill-rows", "2752", "--prefill-waves", "3"])).is_ok());
+        for extra in [&["--prefill-rows", "0"][..], &["--prefill-rows", "4097"], &["--resume"], &["--score-shape", "unknown"],
+            &["--prefill-waves", "0"], &["--prefill-waves", "5"]] {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "minimax-golden", "--snapshot", "/snapshot"]
                 .into_iter().chain(extra.iter().copied())).is_err());
         }
