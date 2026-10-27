@@ -13,7 +13,8 @@ static_assert(offsetof(cuteafd_vision_spec, blocks) == 64, "vision prefix ABI");
 static_assert(offsetof(cuteafd_vision_spec, hidden) == 2752, "vision ABI 1 size");
 static_assert(offsetof(cuteafd_vision_spec, patch_bias) == 2792, "vision bias ABI");
 static_assert(offsetof(cuteafd_vision_spec, norm1_bias) == 2896, "vision norm ABI");
-static_assert(sizeof(cuteafd_vision_spec) == 3792, "vision ABI 2 size");
+static_assert(offsetof(cuteafd_vision_spec, blocks_extra) == 3792, "vision ABI 2 size");
+static_assert(sizeof(cuteafd_vision_spec) == 4240, "vision ABI 3 size");
 
 namespace {
 constexpr size_t BLAS_BYTES = 4 * 1024 * 1024;
@@ -101,13 +102,14 @@ __global__ void rgb_patches(const uint8_t* rgb, const float* lut, uint16_t* patc
   int x=(unit%(gw/2))*32+(r%2)*16+pixel%16;
   patches[i] = bf16_bits(lut[c*256+rgb[(size_t(y)*gw*16+x)*3+c]]);
 }
+// Grid-stride: exact grids and grid_for's capped grids both cover every element.
 __global__ void cast_bf16(const float* x, uint16_t* y, size_t n) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<n)y[i]=bf16_bits(x[i]);
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
+    y[i]=bf16_bits(x[i]);
 }
 __global__ void cast_float(const uint16_t* x, float* y, size_t n) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<n)y[i]=__bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(x+i));
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
+    y[i]=__bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(x+i));
 }
 int gemm(Owner* o, const uint16_t* x, uint64_t offset, int m, int n, int k, float* y) {
   const float one=1,zero=0;
@@ -160,7 +162,8 @@ size_t scratch_tower(Owner* o) {
 extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd_vision_ledger* out) {
   if(!s || !out || !valid_tower(*s))return cudaErrorInvalidValue;
   Owner o;
-  std::memcpy(&o.spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) : sizeof(*s));
+  std::memcpy(&o.spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) :
+    s->abi_version==2 ? offsetof(cuteafd_vision_spec,blocks_extra) : sizeof(*s));
   size_t bytes=scratch_tower(&o);
   *out={s->weight_bytes,bytes-BLAS_BYTES,BLAS_BYTES,0,0}; return 0;
 }
@@ -188,7 +191,8 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   e=cudaSetDevice(device);if(e)return e;
   auto* o=new(std::nothrow)Owner; if(!o)return cudaErrorMemoryAllocation;
   // ABI 1 callers (including old qualification clients) own only the prefix.
-  std::memcpy(&o->spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) : sizeof(*s));
+  std::memcpy(&o->spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) :
+    s->abi_version==2 ? offsetof(cuteafd_vision_spec,blocks_extra) : sizeof(*s));
   o->ledger=ledger; o->device=device;
   auto fail=[&](int rc){cuteafd_vision_destroy(o);return rc;};
   int low,high; e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
@@ -197,7 +201,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   e=cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace);if(e)return fail(e);++o->ledger.device_allocations;
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
-  if(s->abi_version==2) {
+  if(s->abi_version>=2) {
     e=cuteafd_vision_attention_create(s->head_dim,&o->attention);if(e)return fail(e);
   }
 #endif
