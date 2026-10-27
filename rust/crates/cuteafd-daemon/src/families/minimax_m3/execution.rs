@@ -272,7 +272,7 @@ impl<'a> Execution<'a> {
         ensure!(extend_rows>0 && extend_rows%4==0 && native.capacity("minimax_attention_extend")?==extend_rows,
             MiniMaxError::Invalid("prefill index/attention capacity stride"));
         let program_rows=native.capacity("minimax_norm")?;
-        ensure!(rows==sizing.chunk_rows() && sizing.rows<=program_rows,MiniMaxError::Invalid("prefill lane rows"));
+        ensure!(rows==sizing.slot_rows() && sizing.unit_rows<=program_rows,MiniMaxError::Invalid("prefill lane rows"));
         let scratch=Scratch::new(device,ledger)?;
         let table_stride=usize::try_from(cuteafd_loader::plan::families::minimax::admission::extend_table_stride(context as u64))?;
         ensure!(scratch.get("page_table")?.bytes>=decode_rows*table_stride*4,MiniMaxError::Invalid("page-table admission"));
@@ -292,7 +292,7 @@ impl<'a> Execution<'a> {
             native.drain()?;
             Ok((weights,TargetHeadOwner::new(&native,&scratch,logit_rows,cfg.vocab_size)?))
         })?;
-        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.rows,lanes:sizing.lanes,program_rows,
+        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.unit_rows,lanes:sizing.waves,program_rows,
             logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None})
     }

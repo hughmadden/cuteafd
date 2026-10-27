@@ -3,7 +3,7 @@
 //! [`crate::shared::spark_waves::Waves`]).
 use super::{MiniMaxError, execution::ExpertExecutor, native::Native};
 use crate::shared::{experts::{fp8::Fp8Experts, staging::RouteStaging}, memory::device::Device,
-    spark_intake::{self, IntakePreference, SparkLink}, spark_waves::WaveTicket};
+    spark_intake::SparkLink, spark_waves::WaveTicket};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -19,12 +19,6 @@ const TOPK: usize = 4;
 /// memory. A GeForce coordinator (no dma-buf landing) is refused by name, never served on a
 /// fallback path.
 pub(crate) const RTX_5090_UNSUPPORTED: &str = "MiniMax on an RTX 5090 is not supported on this engine yet";
-
-/// Whether this GPU's Spark partials land in pinned host planes: the allocation ledger's intake
-/// charge reads it (the planner packet replaces that charge; the links probe their own intake).
-pub(super) fn host_landing(library: &NativeLibrary) -> Result<bool> {
-    Ok(!spark_intake::preferred_device_exchange_available(library, IntakePreference::Probed)?)
-}
 
 /// Refuses a GeForce coordinator ([`RTX_5090_UNSUPPORTED`]), named by its CUDA device name.
 pub(super) fn require_device_landing(library: &NativeLibrary, device: i32) -> Result<()> {

@@ -31,7 +31,7 @@ pub(crate) struct ServeArgs {
     kv_cache: Qwen4KvCache,
     #[arg(long, default_value_t = 0)]
     max_context: u64,
-    /// Rows of one prefill lane (and of a serial chunk).
+    /// Rows of one prefill unit: one Spark wave, and the most rows a program launch takes.
     #[arg(long, alias = "prefill-batch-tokens", alias = "prefill-lane-rows", default_value_t = 4096,
         value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: u32,
@@ -209,7 +209,7 @@ pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, devi
     let library = library_owner.as_ref();
     let Start { snapshot, checkpoint, cfg, sizing, ledger, cache, local_layers, spark_layers, peers, catalog,
         package, embed, available, draft } = start;
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.rows)?, ingress: SparkIngress::Bf16 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.unit_rows)?, ingress: SparkIngress::Bf16 };
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // One link carries decode and every prefill lane's waves: one persistent client per rank.
     let pending = if spark_layers.is_empty() { None } else {
@@ -239,7 +239,7 @@ pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, devi
             let local = if local_layers.is_empty() {None} else {
                 let tensors = catalog.fp8().context("MiniMax native expert catalog missing")?.for_coordinator();
                 Some(crate::shared::experts::fp8::Fp8Experts::load(library, &tensors, package,
-                    local_layers, 1, 0, sizing.rows, usize::try_from(available)?)?)
+                    local_layers, 1, 0, sizing.unit_rows, usize::try_from(available)?)?)
             };
             Ok((execution, local))
         })
@@ -258,7 +258,7 @@ pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, devi
         Some(&first) => {
             cuteafd_transport::worker_selection::require_peer_clients(peers, endpoint, 1)?;
             Some(super::routed::Spark::connect(library_owner, device, SparkWorld::canonical(peers.len())?, peers,
-                sizing.rows, config, first, request, sizing.lanes)?)
+                sizing.unit_rows, config, first, request, sizing.waves)?)
         }
     };
     let routed = if local.is_none() && spark.is_none() {None} else {Some(Routed::new(local, spark)?)};
@@ -280,12 +280,17 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     super::routed::require_device_landing(&library, args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
-    let (rows, sequences, lanes) = (args.prefill_rows as usize, args.max_sequences as usize, args.prefill_waves);
-    let chunk = prefill_lanes::lane_capacity(lanes, rows, cuteafd_loader::families::minimax_m3::cache::PAGE_ROWS as usize);
+    let (rows, sequences) = (args.prefill_rows as usize, args.max_sequences as usize);
+    // The prefill shape the launch resolved (the plan's units): `--prefill-waves` units of
+    // `--prefill-rows` in flight. Head rows follow once the drafter's block is known.
+    let mut sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS),
+        sequences, context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context},
+        spark_ranks: args.peers.len(), logit_rows: 0, waves: args.prefill_waves };
+    let span = sizing.slot_rows();
     let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::plan::families::minimax::admission::default_draft_rings(
         sequences, rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS)));
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
-    let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,chunk)).transpose()?;
+    let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,span)).transpose()?;
     let dflash=args.draft.as_deref().map(|snapshot| -> Result<_> {
         let head = checkpoint.tensors.iter().find(|t| t.meta.name == "language_model.lm_head.weight")
             .context("MiniMax lm_head header missing")?;
@@ -299,11 +304,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         (None,Some(c)) => (c.bytes,c.slots,c.staging),
         (None,None) => (0,0,0),
     };
-    let host_landing = super::routed::host_landing(&library)?;
-    let sizing = RuntimeSizing { rows, decode_rows: rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS), sequences,
-        context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context}, spark_ranks: args.peers.len(),
-        logit_rows: RuntimeSizing::head_rows(chunk, args.full_prefill_logits, draft_layout.as_ref().map_or(0, |l| l.sequences * 7)),
-        lanes, host_landing };
+    sizing.logit_rows = RuntimeSizing::head_rows(span, args.full_prefill_logits, draft_layout.as_ref().map_or(0, |l| l.sequences * 7));
+    let sizing = sizing;
     let headroom = (args.headroom_gib * (1u64 << 30) as f64) as u64;
     let manifest = cuteafd_loader::plan::checkpoint::read_json(&args.manifest)?;
     let (package, local_package) = admission::local_package(&args.native_lib)?;
@@ -358,7 +360,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let experts = routed.context("MiniMax serving admitted no routed expert owner")?;
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
-        experts: RefCell::new(experts), rows: chunk, vocabulary: cfg.vocab_size, expander,
+        experts: RefCell::new(experts), rows: span, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
         rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits,
         trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?),
@@ -375,7 +377,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
-        lane_rows=sizing.rows, prefill_waves=lanes, chunk_rows=chunk, logit_rows=sizing.logit_rows, draft_rings,
+        unit_rows=sizing.unit_rows, prefill_waves=sizing.waves, span_rows=span, logit_rows=sizing.logit_rows, draft_rings,
         speculator=%args.speculator, draft_bytes,
         "MiniMax native target; decode runs eagerly, prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator!="off" {

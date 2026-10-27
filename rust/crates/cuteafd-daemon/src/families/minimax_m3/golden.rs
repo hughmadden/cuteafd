@@ -629,9 +629,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     programs.load_matching(|name| name.starts_with("minimax_"))?;
     let context = windows.iter().map(|w| w.tokens.len()).max().unwrap().div_ceil(64) * 64;
     ensure!(!args.check_prefix || windows[0].tokens.len() >= 66, "prefix qualification needs 66 tokens in first window");
-    let sizing = admission::RuntimeSizing {rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
-        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize, lanes:1,
-        host_landing:!args.peers.is_empty() && super::routed::host_landing(&library)?};
+    let sizing = admission::RuntimeSizing {unit_rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
+        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize, waves:1};
     let (package, local_package) = super::admission::local_package(native)?;
     // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = library.cuda_memory_info()?.0 as u64;
@@ -658,7 +657,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             package: &package, embed: EmbedPlacement::Gpu, available, draft: None })?;
     let experts: Box<dyn ExpertExecutor<'_>> = match routed { Some(routed) => Box::new(routed), None => Box::new(DenseOnly) };
     let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids:token_ids, embedded, experts,
-        last_layer:args.last_layer, rows:sizing.rows};
+        last_layer:args.last_layer, rows:sizing.unit_rows};
     if args.check_prefix {check_prefix(&mut runner, &windows[0].tokens)?;}
     let mut results = Vec::new();
     for window in &windows {

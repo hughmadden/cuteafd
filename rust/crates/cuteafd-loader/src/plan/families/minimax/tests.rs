@@ -179,8 +179,8 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     // Drafting verifies up to eight rows per ring: rows 1..=64 are recorded instead of 1..=16.
     let graphs = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
         .filter(|i| ["graphs", crate::placement::inventory::GRAPH_GROWTH].contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
-    let sizing = |sequences| admission::RuntimeSizing { rows: 256, decode_rows: 64, sequences, context: 1 << 20,
-        spark_ranks: 3, logit_rows: 64, lanes: 2, host_landing: false };
+    let sizing = |sequences| admission::RuntimeSizing { unit_rows: 256, decode_rows: 64, sequences, context: 1 << 20,
+        spark_ranks: 3, logit_rows: 64, waves: 2 };
     assert_eq!(graphs(&off_rtx), admission::decode_graphs(sizing(16), 0).unwrap().inventory.bytes(0));
     assert_eq!(graphs(&on_rtx), admission::decode_graphs(sizing(16), draft.slots).unwrap().inventory.bytes(0));
     // A DSpark step projects its sequences' drafts through the target head: sixteen drafting

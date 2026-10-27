@@ -63,9 +63,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }).transpose()?;
     // DFlash2 projects its drafts through its own logits; DSpark through the target's.
     let draft_rows = draft.as_ref().map_or(0, |d| d.sequences * 7);
-    let sizing = RuntimeSizing { rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences, context: if opts.context_tokens == 0 {
+    let sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences, context: if opts.context_tokens == 0 {
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks(),
-        logit_rows: RuntimeSizing::head_rows(span, opts.full_prefill_logits, draft_rows), lanes, host_landing: false };
+        logit_rows: RuntimeSizing::head_rows(span, opts.full_prefill_logits, draft_rows), waves: lanes };
     sizing.validate(cfg)?;
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)

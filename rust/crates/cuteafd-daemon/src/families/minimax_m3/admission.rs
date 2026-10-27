@@ -114,8 +114,8 @@ mod tests {
     #[test]
     fn minimax_spark_model_seals_one_endpoint_and_a_slot_per_wave() -> Result<()> {
         for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
-            let sizing = RuntimeSizing { rows, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
-                logit_rows: 64, lanes, host_landing: false };
+            let sizing = RuntimeSizing { unit_rows: rows, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
+                logit_rows: 64, waves: lanes };
             let model = spark_model(sizing)?;
             assert_eq!(model.endpoints, [sizing.spark_endpoint()?]);
             assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (rows as u32, rows as u32, lanes as u8));
@@ -132,8 +132,8 @@ mod tests {
     fn minimax_extend_launches_cover_every_unit_cut() -> Result<()> {
         use crate::shared::prefill_pipeline::prefill_units;
         for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (1024, 2), (256, 2)] {
-            let sizing = RuntimeSizing { rows, decode_rows: 64, sequences: 1, context: 1 << 20, spark_ranks: 4,
-                logit_rows: 64, lanes, host_landing: false };
+            let sizing = RuntimeSizing { unit_rows: rows, decode_rows: 64, sequences: 1, context: 1 << 20, spark_ranks: 4,
+                logit_rows: 64, waves: lanes };
             let bound = admission::extend_launches(sizing, 1024);
             for span in (1..=sizing.slot_rows()).step_by(37).chain([sizing.slot_rows()]) {
                 let units = prefill_units(span, rows, lanes, 256)?;
@@ -188,8 +188,8 @@ mod tests {
         let lanes = admission::prefill_shape(256, 0, 3)?.waves as usize;
         assert_eq!(lanes, 2);
         let request = Request {
-            sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
-                lanes, host_landing: false },
+            sizing: RuntimeSizing { unit_rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
+                waves: lanes },
             kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
             spark_budget: cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0,
             headroom: 0, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
@@ -262,9 +262,9 @@ mod tests {
             // serve-minimax sizes DFlash2 with the planner's own function.
             let draft = dflash2.then(|| DflashMemory::new(&testing::minimax_dflash2_config(), rings, arch.sms.into(),
                 GlmDraftRepresentation::Fp8Only, Qwen4KvCache::Fp8)).transpose()?;
-            let sizing = RuntimeSizing { rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences,
+            let sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences,
                 context: cfg.max_position as u64, spark_ranks: 2,
-                logit_rows: RuntimeSizing::head_rows(shape.slot_rows() as usize, false, 0), lanes, host_landing: false };
+                logit_rows: RuntimeSizing::head_rows(shape.slot_rows() as usize, false, 0), waves: lanes };
             let request = Request { sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
                 spark_budget: admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0, headroom,
                 draft_bytes: draft.map_or(0, |d| d.bytes), draft_rings: draft.map_or(0, |d| d.slots),
