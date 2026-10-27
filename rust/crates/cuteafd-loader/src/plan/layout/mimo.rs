@@ -287,7 +287,7 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     options: &LayoutOptions, ranks: usize, spark_ranks: usize, rows: u64)
     -> Result<(Vec<Option<crate::placement::ExpertCost>>, u64, [u64; 2], crate::placement::Onboard)> {
     use crate::placement::{Bytes2, ExpertCost, Onboard};
-    use crate::placement::families::mimo_v2::{expert_layer_bytes, exact_package, package_directory, package_manifest};
+    use crate::placement::{families::mimo_v2::{expert_layer_bytes, exact_package, package_directory}, inventory::package_manifest};
     use crate::formats::fp8_experts::Slicing;
     let onboard = options.onboard.unwrap_or_else(|| options.local_expert_layers
         .map(Onboard::Layers).unwrap_or(Onboard::Auto));
