@@ -1,6 +1,6 @@
 use super::*;
 use crate::placement::inventory::PRO_TOTAL_BYTES;
-use crate::plan::{self, layout, testing, ExpertPlacement, PlanOptions, Status};
+use crate::plan::{layout, testing, ExpertPlacement, PlanOptions, Status};
 use cuteafd_core::memory_layout::DeviceKind;
 
 fn snapshot(vision: bool, draft: bool) -> tempfile::TempDir {
@@ -21,7 +21,7 @@ fn with_layout(rtx: u64, ranks: usize) -> PlanOptions {
 #[test]
 fn release_headers_satisfy_the_contract() {
     let dir = snapshot(true, true);
-    let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+    let report = testing::plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("minimax_m3"));
     assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
     assert!(report.config_error.is_none(), "{:?}", report.config_error);
@@ -75,7 +75,7 @@ fn drifted_headers_are_named() {
         if tensor.0.ends_with(".experts.7.w2.weight_scale") { tensor.1 = "U8"; }
     }
     testing::write_safetensors(&shard, &tensors);
-    let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+    let report = testing::plan(dir.path(), &PlanOptions::default()).unwrap();
     let experts = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
     assert_eq!(experts.rejected, 1);
     assert!(experts.rejections[0].tensor.contains("layers.4.block_sparse_moe.experts.7.w2"), "{:?}", experts.rejections);
@@ -94,7 +94,7 @@ fn vision_uses_encoder_owner_and_reserves_weights_and_scratch() {
         (layout.workspace_manifest, layout.native_mtp_layers, layout.prefill_rows, layout.concurrency) =
             (Some(programs.clone()), 0, 256, 16);
         options.vision = mode;
-        let report = plan::plan(dir.path(), &options).unwrap();
+        let report = testing::plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{mode:?}: {:?}", report.hints);
         let encoder = report.encoder.as_ref().unwrap();
         assert_eq!(encoder.kind, expected);
@@ -126,7 +126,7 @@ fn native_manifest_uses_shared_allocation_ledger() {
     layout.concurrency = 16;
     layout.pool_tokens = Some(16384);
     layout.native_mtp_layers = 0;
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(report.placement_supported, "{:?}", report.hints);
     assert!(report.wip_launchable() && !report.executable(), "{:?}", report.hints);
     let memory = report.memory_layout.as_ref().unwrap();
@@ -140,11 +140,11 @@ fn native_manifest_uses_shared_allocation_ledger() {
     assert_eq!(item("MiniMax scratch").bytes, 134_799_872);
     assert!(rtx.used_bytes() <= PRO_TOTAL_BYTES);
     options.layout.as_mut().unwrap().minimax_kv = crate::families::qwen4::Qwen4KvCache::Bf16;
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("BF16 KV")));
     options.layout.as_mut().unwrap().minimax_kv = crate::families::qwen4::Qwen4KvCache::Fp8;
     options.layout.as_mut().unwrap().rtx_bytes.push(PRO_TOTAL_BYTES);
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("two-GPU")));
 }
 
@@ -163,10 +163,10 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     layout.pool_tokens = Some(16384);
     layout.physical_sms = Some(188);
     layout.native_mtp_layers = 0;
-    let off = plan::plan(dir.path(), &options).unwrap();
+    let off = testing::plan(dir.path(), &options).unwrap();
     assert!(off.placement_supported, "{:?}", off.hints);
     options.layout.as_mut().unwrap().native_mtp_layers = 5;
-    let on = plan::plan(dir.path(), &options).unwrap();
+    let on = testing::plan(dir.path(), &options).unwrap();
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
     // Sixteen sequences each hold a context ring (at most 64 decode rows / 2); the taps hold a
@@ -199,20 +199,20 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     assert!(off.memory_layout.as_ref().unwrap().notes.iter().all(|n| !n.contains("drafter context rings")));
     assert!(off.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.ends_with("speculation off")));
     options.layout.as_mut().unwrap().physical_sms = Some(170);
-    let smaller = plan::plan(dir.path(), &options).unwrap();
+    let smaller = testing::plan(dir.path(), &options).unwrap();
     assert!(smaller.placement_supported, "{:?}", smaller.hints);
     // The SM-sized draft attention arena: 532,480 bytes more per drafting sequence at 188 SMs.
     assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 16 * 532_480);
     // A unit below a KV page is no prefill shape at all (the drafter's taps would need seven rows).
     options.layout.as_mut().unwrap().prefill_rows = 6;
     options.layout.as_mut().unwrap().concurrency = 1;
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported);
     assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax prefill shape")), "{:?}", refused.hints);
     options.layout.as_mut().unwrap().prefill_rows = 256;
     options.layout.as_mut().unwrap().concurrency = 16;
     options.layout.as_mut().unwrap().drafter_bytes = 1;
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported);
     assert!(refused.hints.iter().any(|h| h.what.contains("external drafter")), "{:?}", refused.hints);
 }
@@ -226,7 +226,7 @@ fn native_dspark_requires_a_bundled_checkpoint() {
     let layout = options.layout.as_mut().unwrap();
     layout.workspace_manifest = Some(programs);
     layout.native_mtp_layers = 5;
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported);
     assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax bundled DSpark")), "{:?}", refused.hints);
 }
@@ -237,7 +237,7 @@ fn a_missing_native_manifest_is_refused() {
     let mut options = with_layout(PRO_TOTAL_BYTES, 3);
     options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("missing-PROGRAMS.json"));
     options.layout.as_mut().unwrap().native_mtp_layers = 0;
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(!report.placement_supported);
     assert!(report.memory_layout.unwrap().devices.is_empty());
     assert!(report.hints.iter().any(|h| h.what.contains("PROGRAMS.json")));
@@ -265,7 +265,7 @@ fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
     layout.prefill_rows = 1024;
     layout.concurrency = 64;
     layout.spark_allocation_budget_bytes = Some(108 << 30);
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(report.wip_launchable(), "{:?}", report.hints);
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(memory.notes.iter().any(|n| n.starts_with("3 routed layers on the RTX")), "{:?}", memory.notes);
@@ -290,7 +290,7 @@ fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     layout.workspace_manifest = Some(programs);
     layout.native_mtp_layers = 0;
     layout.concurrency = 64;
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(report.wip_launchable(), "{:?}", report.hints);
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "{:?}", memory.notes);
@@ -321,7 +321,7 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     layout.concurrency = 64;
     // A 108 GiB Spark budget, so TP2 onboards layers (the load peak takes three).
     layout.spark_allocation_budget_bytes = Some(108 << 30);
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(report.wip_launchable(), "{:?}", report.hints);
     assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
     let memory = report.memory_layout.as_ref().unwrap();
@@ -333,12 +333,12 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     // more per-row buffers than two 1024-row waves.
     options.layout.as_mut().unwrap().prefill_rows = 4096;
     options.layout.as_mut().unwrap().prefill_lanes = 1;
-    let wide = plan::plan(dir.path(), &options).unwrap();
+    let wide = testing::plan(dir.path(), &options).unwrap();
     assert!(wide.wip_launchable(), "{:?}", wide.hints);
     assert!(wide.memory_layout.as_ref().unwrap().pool_tokens < memory.pool_tokens);
     options.layout.as_mut().unwrap().prefill_rows = 1024;
     options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.fits && !refused.placement_supported);
     assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax allocation needs")));
 }
@@ -371,7 +371,7 @@ fn spark_intake_is_every_waves_return_slots_on_the_gpu() {
         let layout = options.layout.as_mut().unwrap();
         (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (rows, waves, 0);
         (layout.concurrency, layout.context_tokens, layout.pool_tokens) = (16, 65536, Some(65536));
-        let report = plan::plan(dir.path(), &options).unwrap();
+        let report = testing::plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{:?}", report.hints);
         assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_transports),
             (Some(rows), Some(waves), Some(rows * waves), Some(1)));
@@ -393,13 +393,13 @@ fn rtx_5090_is_refused_by_name() {
     for ranks in [2, 3, 4, 6] {
         let mut options = native_options(dir.path(), ranks);
         (options.layout.as_mut().unwrap().rtx_bytes, options.layout.as_mut().unwrap().native_mtp_layers) = (vec![RTX_5090], 0);
-        let report = plan::plan(dir.path(), &options).unwrap();
+        let report = testing::plan(dir.path(), &options).unwrap();
         assert!(!report.placement_supported && !report.wip_launchable() && named(&report), "{:?}", report.hints);
         options.layout.as_mut().unwrap().rtx_bytes = vec![PRO_TOTAL_BYTES];
-        let pro = plan::plan(dir.path(), &options).unwrap();
+        let pro = testing::plan(dir.path(), &options).unwrap();
         assert!(pro.wip_launchable() && !named(&pro), "{:?}", pro.hints);
     }
-    let inventory = plan::plan(dir.path(), &PlanOptions { coordinator_budget_bytes: RTX_5090,
+    let inventory = testing::plan(dir.path(), &PlanOptions { coordinator_budget_bytes: RTX_5090,
         placement: ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
     assert!(named(&inventory), "{:?}", inventory.hints);
 }
@@ -424,7 +424,7 @@ fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
         let layout = options.layout.as_mut().unwrap();
         (layout.native_mtp_layers, layout.concurrency) = (0, 64);
         layout.minimax_drafter_snapshot = Some(drafter.path().to_path_buf());
-        let report = plan::plan(dir.path(), &options).unwrap();
+        let report = testing::plan(dir.path(), &options).unwrap();
         assert!(report.wip_launchable(), "TP{ranks}: {:?}", report.hints);
         assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_transports),
             (Some(unit), Some(waves), Some(unit * waves), Some(1)), "TP{ranks}");
@@ -465,7 +465,7 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(false, true);
     let options = native_options(dir.path(), 4);
-    let baseline = plan::plan(dir.path(), &options).unwrap();
+    let baseline = testing::plan(dir.path(), &options).unwrap();
     assert!(baseline.placement_supported, "{:?}", baseline.hints);
     // One sequence of 256-row prefill chunks: what C1 serving needs, DSpark kept.
     let c1 = |options: &mut PlanOptions| {
@@ -474,13 +474,13 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
     };
     let mut sized = options.clone();
     c1(&mut sized);
-    let sized = plan::plan(dir.path(), &sized).unwrap();
+    let sized = testing::plan(dir.path(), &sized).unwrap();
     assert!(sized.placement_supported, "{:?}", sized.hints);
     assert_eq!(sized.prefill_unit_rows, Some(256));
     assert!(sized.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 1")));
     let mut mapped = options.clone();
     mapped.layout.as_mut().unwrap().host_embedding = true;
-    let host = plan::plan(dir.path(), &mapped).unwrap();
+    let host = testing::plan(dir.path(), &mapped).unwrap();
     assert!(host.placement_supported, "{:?}", host.hints);
     let embedding = 200064 * 6144 * 2;
     assert_eq!(host.bytes_by_owner["host-mapped embedding"], embedding);
@@ -492,7 +492,7 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
         let mut combined = native_options(dir.path(), ranks);
         c1(&mut combined);
         combined.layout.as_mut().unwrap().host_embedding = true;
-        let report = plan::plan(dir.path(), &combined).unwrap();
+        let report = testing::plan(dir.path(), &combined).unwrap();
         assert!(report.placement_supported, "TP{ranks}: {:?}", report.hints);
         assert!(pool(&report) > 0);
         let memory = report.memory_layout.as_ref().unwrap();
@@ -513,22 +513,22 @@ fn minimax_draft_context_slots_honor_explicit_shapes() {
     layout.prefill_rows = 512;
     layout.concurrency = 4;
     layout.draft_context_slots = Some(4);
-    let report = plan::plan(dir.path(), &options).unwrap();
+    let report = testing::plan(dir.path(), &options).unwrap();
     assert!(report.placement_supported, "{:?}", report.hints);
     assert_eq!(report.prefill_unit_rows, Some(512));
     assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 4")));
     // Four sequences default to four rings (64 decode rows hold four drafting requests and more).
     options.layout.as_mut().unwrap().draft_context_slots = None;
-    let derived = plan::plan(dir.path(), &options).unwrap();
+    let derived = testing::plan(dir.path(), &options).unwrap();
     assert_eq!(derived.memory_layout.as_ref().unwrap().pool_tokens, report.memory_layout.as_ref().unwrap().pool_tokens);
     assert!(derived.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.starts_with("4 drafter context rings")));
     options.layout.as_mut().unwrap().draft_context_slots = Some(1);
-    let single = plan::plan(dir.path(), &options).unwrap();
+    let single = testing::plan(dir.path(), &options).unwrap();
     assert!(single.placement_supported, "{:?}", single.hints);
     let pool = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().pool_tokens;
     assert!(pool(&single) > pool(&report), "fewer context rings leave more pool");
     options.layout.as_mut().unwrap().draft_context_slots = Some(5);
-    let refused = plan::plan(dir.path(), &options).unwrap();
+    let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("draft context slots")));
 }
 
@@ -544,7 +544,7 @@ fn tp6_holds_every_routed_layer_in_six_equal_slices() {
         options.vision = MediaMode::Auto;
         let layout = options.layout.as_mut().unwrap();
         (layout.rtx_bytes, layout.physical_sms, layout.native_mtp_layers) = (vec![PRO_TOTAL_BYTES], Some(188), 0);
-        plan::plan(dir.path(), &options).unwrap()
+        testing::plan(dir.path(), &options).unwrap()
     };
     let (tp4, tp6) = (planned(4), planned(6));
     assert!(tp6.wip_launchable(), "{:?}", tp6.hints);

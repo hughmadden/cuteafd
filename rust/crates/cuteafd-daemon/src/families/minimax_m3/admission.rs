@@ -66,7 +66,7 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value, local
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
+    use cuteafd_loader::plan::{layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
 
     fn manifest() -> serde_json::Value {
         serde_json::json!({"programs":admission::PROGRAM_NAMES.iter().map(|suffix| {
@@ -131,7 +131,7 @@ mod tests {
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
         let path = dir.path().join("PROGRAMS.json");
         std::fs::write(&path, manifest().to_string())?;
-        let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks },
+        let report = testing::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks },
             layout: Some(LayoutOptions { workspace_manifest: Some(path), concurrency: 16, context_tokens: 4096,
                 pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, ..Default::default() }),
             ..Default::default() })?;
@@ -284,7 +284,7 @@ mod tests {
         std::fs::write(dir.path().join("fp8/fp8-minimax-nvfp4a4/manifest.json"), package.to_string())?;
         let options = LayoutOptions { workspace_manifest: Some(path), prefill_rows: 256, concurrency: 16,
             context_tokens: 4096, pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, host_embedding, ..Default::default() };
-        let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 3 },
+        let report = testing::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 3 },
             layout: Some(options.clone()), ..Default::default() })?;
         ensure!(report.placement_supported, "{:?}", report.hints);
         let memory = report.memory_layout.as_ref().unwrap();
@@ -354,7 +354,7 @@ mod tests {
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let arch = ArchContext::coordinator(rtx, None);
         for dflash2 in [false, true] {
-            let plan_with = |vision| plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 2 },
+            let plan_with = |vision| testing::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 2 },
                 vision, layout: Some(LayoutOptions { rtx_bytes: vec![rtx], workspace_manifest: Some(path.clone()),
                     concurrency: sequences as u64, headroom_bytes: headroom, native_mtp_layers: 0,
                     minimax_drafter_snapshot: dflash2.then(|| drafter.path().to_path_buf()), ..Default::default() }),
