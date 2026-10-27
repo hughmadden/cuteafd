@@ -7,7 +7,7 @@ use crate::shared::{memory::device::{Allocation, Device}, placement::SparkAdmiss
 use anyhow::{Context, Result};
 use cuteafd_core::ExpertGeometry;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    plan::{checkpoint::Checkpoint, MediaMode}, placement::SparkWorkingSet, serving_capacity::prefill_lanes};
+    plan::{checkpoint::Checkpoint, MediaMode}, placement::SparkWorkingSet, serving_capacity::prefill_waves};
 use cuteafd_transport::{expert::SparkWorld, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
@@ -31,9 +31,9 @@ pub(crate) struct ServeArgs {
     kv_cache: Qwen4KvCache,
     #[arg(long, default_value_t = 0)]
     max_context: u64,
-    /// Rows of one prefill unit: one Spark wave, and the most rows a program launch takes.
-    #[arg(long, alias = "prefill-batch-tokens", alias = "prefill-lane-rows", default_value_t = 4096,
-        value_parser = clap::value_parser!(u32).range(1..=4096))]
+    /// Rows of one prefill unit: one Spark wave, and the most rows a program launch takes. Several waves
+    /// need whole 64-row pages (the plan's unit shape).
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: u32,
     #[arg(long, default_value = "auto")]
     rtx_expert_layers: String,
@@ -72,11 +72,11 @@ pub(crate) struct ServeArgs {
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
-    /// Spark waves a prefill chunk keeps in flight (1 to 4): the chunk runs in up to this many
-    /// lanes of --prefill-rows rows, each lane's routed wave in flight on the one Spark link while
-    /// the other lanes' GPU layers run. --prefill-lanes is a deprecated alias.
-    #[arg(long, alias = "prefill-lanes", default_value_t = prefill_lanes::DEFAULT_PREFILL_LANES,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_lanes::MAX_PREFILL_LANES as u64))]
+    /// Spark waves a prefill call keeps in flight (1 to 4): a call of up to this many units of
+    /// --prefill-rows rows runs on the shared executor, each unit's routed wave in flight on the one
+    /// Spark link while other units' GPU layers run. The launcher passes the plan's resolved shape.
+    #[arg(long, default_value_t = 2,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_waves::MAX_WAVES))]
     prefill_waves: usize,
     /// Project every prefill row's logits (prefill-shaped probe scoring);
     /// otherwise prefill projects only the rows a request needs.
@@ -458,19 +458,22 @@ mod tests {
         assert!(parse("0").is_err() && parse("8").is_err());
     }
 
-    /// `--prefill-waves` is the waves the one Spark link keeps in flight (a lane each, today);
-    /// `--prefill-lanes` stays a deprecated alias of it.
+    /// `--prefill-waves` is the waves the one Spark link keeps in flight (1 to 4, the plan's shape with
+    /// `--prefill-rows`); the lane flags and their aliases are gone.
     #[test]
-    fn minimax_prefill_waves_take_the_deprecated_lane_alias() {
+    fn minimax_prefill_waves_take_one_to_four_without_lane_aliases() {
         let waves = |extra: &[&str]| match crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot",
             "/model", "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2"].into_iter().chain(extra.iter().copied())) {
             Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) => Some((a.prefill_rows, a.prefill_waves)),
             _ => None,
         };
-        assert_eq!(waves(&[]), Some((4096, prefill_lanes::DEFAULT_PREFILL_LANES)));
+        assert_eq!(waves(&[]), Some((4096, 2)));
         assert_eq!(waves(&["--prefill-rows", "2048", "--prefill-waves", "3"]), Some((2048, 3)));
-        assert_eq!(waves(&["--prefill-lanes", "1"]), Some((4096, 1)));
+        assert_eq!(waves(&["--prefill-rows", "2752", "--prefill-waves", "4"]), Some((2752, 4)));
         for refused in ["0", "5"] { assert_eq!(waves(&["--prefill-waves", refused]), None, "{refused} waves"); }
+        for gone in ["--prefill-lanes", "--prefill-batch-tokens", "--prefill-lane-rows"] {
+            assert_eq!(waves(&[gone, "2"]), None, "{gone}");
+        }
     }
 
     #[test]
