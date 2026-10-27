@@ -202,6 +202,12 @@ impl<'a> WindowWave<'_, 'a> {
         ensure!(self.pending_commit.as_ref().unwrap().accepted == accepted, "queued window acceptance changed");
         ensure!(direct || self.poll_commit()?, "window commit incomplete");
         let pending = self.pending_commit.take().unwrap();
+        // Device-ordered: the write is queued, not complete. Remember its
+        // leases until a later commit (after the unit's drain) settles them.
+        self.unsettled.clear();
+        if direct && crate::shared::memory::chain::deferred() {
+            self.unsettled.extend(pending.prepared.chunks.iter().map(|c| c.lease));
+        }
         for (c, end) in pending.prepared.chunks.iter().zip(&pending.ends) {
             state.slots[c.lease.slot].end = *end;
             state.slots[c.lease.slot].version += 1;
@@ -210,7 +216,15 @@ impl<'a> WindowWave<'_, 'a> {
     }
     /// Drain before returning write slots to the bank; revoke any touched request.
     pub fn abort_commit(&mut self, state: &mut WindowState<'_>) -> Result<()> {
-        if self.pending_commit.is_none() { return Ok(()); }
+        if self.pending_commit.is_none() {
+            // A device-ordered direct commit already advanced the host ends:
+            // drain its queued write and revoke the leases (hunt C #2).
+            if self.unsettled.is_empty() { return Ok(()); }
+            let drained = self.synchronize();
+            let leases = std::mem::take(&mut self.unsettled);
+            let live = leases.into_iter().filter(|&l| state.validate(l).is_ok()).collect::<Vec<_>>();
+            return drained.and(state.invalidate(&live));
+        }
         let mut drained = self.synchronize();
         if let Some(stream) = self.pending_commit.as_ref().unwrap().external {
             drained = drained.and(unsafe { self.stream.library.cuda_stream_synchronize(stream) });

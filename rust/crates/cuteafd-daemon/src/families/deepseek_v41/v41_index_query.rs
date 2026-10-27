@@ -418,12 +418,11 @@ impl IndexQueryWave<'_, '_> {
             let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream.library.cuda_stream_query(self.stream.raw)? } { return Ok(false); }
             if capture {
+                // The cold shape already ran eagerly (enqueue_query): record
+                // the graph for later calls without launching it again
+                // (hunt C #3; as the window and attention query do).
                 unsafe { self.capture_ready(rows)?; }
-                let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows)
-                    .context("queued index graph missing")?.0;
                 self.pending.as_mut().unwrap().2 = false;
-                unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw)?; }
-                if !chained { return Ok(false); }
             }
             if chained { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; } }
             self.pending = None;

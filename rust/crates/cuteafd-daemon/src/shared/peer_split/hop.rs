@@ -81,13 +81,19 @@ impl<'a> DirectInputHop<'a> {
         );
         validate_direct_input_extent(self.contract, sources.iter().map(|source| source.bytes))?;
         let device = self.destination.device;
-        if let Some(sm) = self.sm.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
-            // The SM copy follows the chain head (the producers on the source
-            // GPU) on the device and becomes the new head: no host wait.
+        if crate::shared::memory::chain::deferred() {
+            // The copy follows the chain head (the producers on the source GPU)
+            // on the device and becomes the new head: no host wait. Copy
+            // engines by default (#815): this stream waits on events only.
+            let sm = self.sm.as_ref().filter(|_| crate::shared::memory::device::sm_peer_copy());
             return device.run(|| unsafe {
                 crate::shared::memory::chain::join(device.library, self.destination.raw)?;
                 for (source, destination) in sources.into_iter().zip(destinations) {
-                    sm.launch(destination, source, source.bytes, self.destination.raw)?;
+                    match sm {
+                        Some(sm) => sm.launch(destination, source, source.bytes, self.destination.raw)?,
+                        None => device.library.copy_peer_async(destination, source, source.bytes,
+                            self.destination.raw)?,
+                    }
                 }
                 crate::shared::memory::chain::finish(device.library, self.destination.raw)
             });

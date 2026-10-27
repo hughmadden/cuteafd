@@ -205,6 +205,10 @@ impl<'a> CompressorWave<'_, 'a> {
         ensure!(self.pending_commit.as_ref().unwrap().accepted == accepted, "queued source acceptance changed");
         ensure!(direct || self.poll_commit()?, "source commit incomplete");
         let pending = self.pending_commit.take().unwrap();
+        self.unsettled.clear();
+        if direct && crate::shared::memory::chain::deferred() {
+            self.unsettled.extend(pending.prepared.chunks.iter().map(|c| c.lease.slot));
+        }
         state.index.apply(pending.plan);
         for (chunk, &count) in pending.prepared.chunks.iter().zip(accepted) {
             state.slots[chunk.lease.slot].end = chunk.position + u64::from(count);
@@ -213,7 +217,19 @@ impl<'a> CompressorWave<'_, 'a> {
         Ok(pending.completed)
     }
     pub fn abort_commit(&mut self, state: &mut CompressorState<'_>) -> Result<()> {
-        if self.pending_commit.is_none() { return Ok(()); }
+        if self.pending_commit.is_none() {
+            // A device-ordered direct commit already advanced the host ends:
+            // drain its queued write and revoke the slots (hunt C #2).
+            if self.unsettled.is_empty() { return Ok(()); }
+            let drained = self.synchronize();
+            let mut revoked = Ok(());
+            for slot in std::mem::take(&mut self.unsettled) {
+                if state.slots[slot].request.take().is_some() {
+                    if let Err(error) = state.index.release(slot) { revoked = Err(error); }
+                }
+            }
+            return drained.and(revoked);
+        }
         let drained = self.synchronize();
         let pending = self.pending_commit.take().unwrap();
         let slots = pending.prepared.chunks.iter().map(|c| c.lease.slot).collect::<Vec<_>>();

@@ -309,7 +309,8 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let captured = unsafe { self.weights.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                // SAFETY: eager warmup drained all users; this capture has not launched.
+                // SAFETY: this capture has not launched; a graph the insert
+                // retires had its launches drained by the caller (`would_retire`).
                 if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
                     // SAFETY: the rejected graph has no queued launches.
                     unsafe { self.weights.library.cuda_graph_exec_destroy(graph)?; }
@@ -364,11 +365,12 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         if cold && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
             && !crate::shared::decode_graph::census::eager("layer_row") {
-            self.stream.wait().await?;
-            unsafe { self.capture_ready(gathered.rows)?; }
-            let graph = self.graphs.get(gathered.rows).context("engram graph missing after capture")?;
-            let launched = unsafe { self.weights.library.cuda_graph_launch(graph, self.stream.raw) };
-            if let Err(error) = launched { self.synchronize()?; return Err(error); }
+            // The cold shape already ran eagerly above: record the graph for
+            // later calls without a second launch (hunt C #3). Only when the
+            // insert retires another graph must its queued launches drain
+            // first (a rare new large shape), so the host waits only then.
+            if self.graphs.would_retire(gathered.rows) { self.stream.wait().await?; }
+            if let Err(error) = unsafe { self.capture_ready(gathered.rows) } { self.synchronize()?; return Err(error); }
         }
         let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.output.buffer,
             gathered.rows * 40960, self.stream.raw) };

@@ -385,6 +385,7 @@ impl<'a> CompressorWeights<'a> {
             ready: None,
             pending_query: None,
             pending_commit: None,
+            unsettled: Vec::new(),
             replica: None,
             commit_staging: HostAllocation::new(self.library, rows*4+256)?,
             commit_destinations: HostAllocation::new(self.library, rows * 8)?,
@@ -555,6 +556,9 @@ pub(crate) struct CompressorWave<'w, 'a> {
     ready: Option<Prepared>,
     pending_query: Option<(Prepared, bool)>,
     pending_commit: Option<PendingCommit>,
+    /// Slots a device-ordered direct commit advanced before its queued write
+    /// completed (see `WindowWave::unsettled`, hunt C #2).
+    unsettled: Vec<usize>,
     replica: Option<(std::rc::Rc<SourceReplica<'a>>,
         crate::shared::memory::peer_publication::PeerPublication<'a>)>,
     commit_staging: HostAllocation<'a>,

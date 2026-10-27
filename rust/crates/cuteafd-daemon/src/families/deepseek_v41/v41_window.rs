@@ -325,6 +325,7 @@ impl<'a> WindowWeights<'a> {
             ready: None,
             pending_query: None,
             pending_commit: None,
+            unsettled: Vec::new(),
             replica: None,
         };
         Ok(value)
@@ -451,6 +452,10 @@ pub(crate) struct WindowWave<'w, 'a> {
     ready: Option<Prepared>,
     pending_query: Option<(Prepared, bool)>,
     pending_commit: Option<PendingCommit>,
+    /// Leases a device-ordered direct commit advanced on the host before its
+    /// queued write completed: abort drains and revokes them (hunt C #2);
+    /// the next commit (after the unit's drain) settles them.
+    unsettled: Vec<WindowLease>,
     replica: Option<(std::rc::Rc<replica::WindowReplica<'a>>,
         crate::shared::memory::peer_publication::PeerPublication<'a>)>,
 }
