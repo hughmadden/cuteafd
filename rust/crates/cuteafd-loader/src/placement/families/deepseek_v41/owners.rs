@@ -165,16 +165,18 @@ impl<'a> NativePrograms<'a> {
             + if splits > 1 { align(splits * rows.min(64) * n * 4) } else { 0 })
     }
 
-    /// Target/prefill lanes, excluding conditional local expert/TP2 FFN arenas,
-    /// weights, cache/prefix banks, vision, and decoder-owned Spark transports.
-    /// Both physical lanes remain allocated even at concurrency one.
-    pub fn target(&self, rows: u64, ranks: usize, fp8_head: bool,
+    /// Target passes, excluding conditional local expert/TP2 FFN arenas,
+    /// weights, cache/prefix banks, vision, and Spark transports: the two
+    /// decode lanes (allocated even at concurrency one), which are also
+    /// prefill slots 0 and 1, plus one pass per further prefill slot (`slots`
+    /// units in flight on the shared executor, at least two).
+    pub fn target(&self, rows: u64, ranks: usize, slots: usize, fp8_head: bool,
         window_batch: bool) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2)
+        ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2) && (2..=4).contains(&slots)
             && (!window_batch || ranks == 1), "invalid V4.1 target owner geometry");
         let mut out = Vec::new();
         for rank in 0..ranks {
-            for lane in 0..2 {
+            for lane in 0..slots {
                 let add = |out: &mut Vec<Demand>, group: &str, bytes| out.push(Demand::new(
                     rank as u8, Category::Workspace, format!("lane {lane} {group}"), bytes, Basis::Formula));
                 let query = 4 + rows * (10240 + 2560 + 2560 + 65536 + 8 + 256)
@@ -417,8 +419,8 @@ mod tests {
         let manifest = manifest();
         let programs = NativePrograms::new(&manifest, 188)?;
         for ranks in [1, 2] {
-            let narrow = programs.target(256, ranks, false, ranks == 1)?;
-            let wide = programs.target(1024, ranks, false, ranks == 1)?;
+            let narrow = programs.target(256, ranks, 2, false, ranks == 1)?;
+            let wide = programs.target(1024, ranks, 2, false, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 assert_eq!(owner(&narrow, rank, "lane 0 target head"),
                     owner(&wide, rank, "lane 1 target head"));
@@ -436,7 +438,7 @@ mod tests {
             }
             assert!(wide.iter().all(|d| d.category == Category::Workspace));
             assert!(!wide.iter().any(|d| d.gpu != 0 && d.group.ends_with("engram")));
-            let fp8 = programs.target(1024, ranks, true, ranks == 1)?;
+            let fp8 = programs.target(1024, ranks, 2, true, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 for lane in 0..2 {
                     let group = format!("lane {lane} target head");
@@ -444,12 +446,12 @@ mod tests {
                 }
             }
         }
-        assert!(programs.target(0, 1, true, false).is_err());
-        assert!(programs.target(4097, 2, true, false).is_err());
-        assert!(programs.target(256, 3, true, false).is_err());
-        assert!(programs.target(256, 2, true, true).is_err());
-        let off = programs.target(1024, 1, false, false)?;
-        let on = programs.target(1024, 1, false, true)?;
+        assert!(programs.target(0, 1, 2, true, false).is_err());
+        assert!(programs.target(4097, 2, 2, true, false).is_err());
+        assert!(programs.target(256, 3, 2, true, false).is_err());
+        assert!(programs.target(256, 2, 2, true, true).is_err());
+        let off = programs.target(1024, 1, 2, false, false)?;
+        let on = programs.target(1024, 1, 2, false, true)?;
         assert_eq!(on.iter().map(|d| d.bytes).sum::<u64>()
             - off.iter().map(|d| d.bytes).sum::<u64>(), 2 * 340480);
         for rows in [1, 80, 256, 1024, 4096] {

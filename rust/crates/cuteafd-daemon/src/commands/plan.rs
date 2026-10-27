@@ -368,7 +368,6 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     let report = input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?;
     if args.json || args.deployment {
         if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
-        if let Some(selection) = &report.prefill_selection { eprintln!("{selection}"); }
     }
     if args.deployment {
         use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};

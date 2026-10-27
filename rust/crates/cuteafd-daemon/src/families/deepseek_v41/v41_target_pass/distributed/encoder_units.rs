@@ -246,30 +246,30 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
 
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     /// Encoder prefill of `chunks` (one prompt) as row units on the shared
-    /// executor, `waves` in flight: slot k is `[self, other][k]` with its link.
+    /// executor, one unit per slot in flight: slot k is `slots[k]` with its link.
     /// # Safety
     /// Passes and transports have independent mutable storage and the same model,
     /// placement and capacity. Poll on one CUDA-owning executor thread.
-    pub(crate) async unsafe fn execute_encoder_units(&mut self, other: &mut Self, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], transports: [&mut DeviceOwner<'a, NativeTp4Wave<'a>>; 2],
+    pub(crate) async unsafe fn execute_encoder_units(slots: Vec<(&mut Self, &mut DeviceOwner<'a, NativeTp4Wave<'a>>)>,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]],
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, keep_running: &dyn Fn() -> bool,
-        before_unit: &dyn Fn() -> Result<()>, waves: usize) -> Result<()> {
-        ensure!((1..=2).contains(&waves), "encoder unit owner count differs");
-        ensure!(self.state == State::Idle && other.state == State::Idle, "distributed encoder lane still in use");
-        ensure!(self.resources.map == other.resources.map, "distributed encoder lane placement differs");
-        self.set_attention_decode(false);
-        other.set_attention_decode(false);
+        before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        let waves = slots.len();
+        ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
+        ensure!(slots.iter().all(|(pass, _)| pass.state == State::Idle), "distributed encoder lane still in use");
+        ensure!(slots.iter().all(|(pass, _)| pass.resources.map == slots[0].0.resources.map),
+            "distributed encoder lane placement differs");
         let mut units = super::super::encoder_units::encoder_units(chunks)?;
         for unit in &mut units { unit.slot = unit.index % waves; }
-        let [first, second] = transports;
         for layer in 0..20 {
-            ensure!(first.has_local_layer(layer) == second.has_local_layer(layer), "encoder slot expert placement differs");
+            ensure!(slots.iter().all(|(_, transport)| transport.has_local_layer(layer) == slots[0].1.has_local_layer(layer)),
+                "encoder slot expert placement differs");
         }
         let mut hooks = UnitHooks {
-            slots: vec![
-                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now() },
-                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now() },
-            ],
+            slots: slots.into_iter().map(|(pass, transport)| {
+                pass.set_attention_decode(false);
+                UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now() }
+            }).collect(),
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit, complete: false,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;

@@ -68,23 +68,25 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let mut exl3_modules = [None, None];
+    // One target pass per decode lane and per further prefill slot (k = 2..4).
+    let slots = usize::from(args.prefill_waves).max(2);
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
         if compressed {
-            exl3_modules[gpu as usize] = Some(admission::preload_exl3(&lib, &exl3_directory, capacity, 2)?);
+            exl3_modules[gpu as usize] = Some(admission::preload_exl3(&lib, &exl3_directory, capacity, 2, slots)?);
         }
         Ok(())
     })?;
     memory_checkpoint("after native preload")?;
-    let [mut decode_modules, mut prefill_modules] = [0, 1].map(|_| [None, None]);
+    // Per target pass, each GPU's admitted EXL3 modules (None without EXL3).
+    let mut lane_modules = (0..slots).map(|_| [None, None]).collect::<Vec<_>>();
     for (rank, modules) in exl3_modules.into_iter().enumerate() {
-        if let Some([decode, prefill]) = modules {
-            decode_modules[rank] = Some(decode);
-            prefill_modules[rank] = Some(prefill);
+        for (slot, modules) in modules.into_iter().flatten().enumerate() {
+            lane_modules[slot][rank] = Some(modules);
         }
     }
-    let mut lane_modules = [decode_modules, prefill_modules].into_iter();
+    let mut lane_modules = lane_modules.into_iter();
     let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
@@ -271,11 +273,19 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // TP2 expert workspaces remain full capacity on both GPUs and lanes.
     let mut second = make_pass(80).context("constructing second distributed target lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    // Prefill slots beyond the two lanes are encoder-only like lane 1.
+    let mut extra_passes = (2..slots).map(|_| -> Result<_> {
+        let mut slot = make_pass(80).context("constructing distributed prefill slot")?;
+        if args.tp2_attention { slot.enable_dual_attention()?; }
+        Ok(slot)
+    }).collect::<Result<Vec<_>>>()?;
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
+    for slot in &mut extra_passes { slot.install_attention_plan(attention_plan)?; }
     if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
         pass.enable_l2_prefetch(budget)?;
         second.enable_l2_prefetch(budget)?;
+        for slot in &mut extra_passes { slot.enable_l2_prefetch(budget)?; }
     }
     memory_checkpoint("second target lane")?;
     // dSpark is admitted before it exists (#65): plan every retained owner from
@@ -314,11 +324,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, (2 * wave_bytes) as u64)?;
+        2, (slots * wave_bytes) as u64)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
-    let pool=admission::resolve_with_owners(&args,&memory,expert_demands,(2*per_lane) as u64,&[0; 2],
+    let pool=admission::resolve_with_owners(&args,&memory,expert_demands,(slots*per_lane) as u64,&[0; 2],
         minimum_expert_layers,&deferred,&draft_load,dspark_inventory.as_ref())?;
     // The loaders re-check the admitted load phase (their own conservative
     // peak is part of it); retained owners are the Movable's exact bytes.
@@ -363,9 +373,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("draft runtime and marks")?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
+    for slot in &mut extra_passes { slot.bind_execution_plan(&pool.placement)?; }
     let expert_layers=pool.placement.onboard_layers;
     let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
-    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);
+    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((slots*per_lane) as u64) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
     let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity,
@@ -409,11 +420,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let lanes = crate::shared::serve::lanes::LaneSet::default();
-    let [mut transport, mut second_transport] = lanes.try_map(|lane| {
+    let mut make_transport = |lane: usize| -> Result<_> {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
             let roce = super::spark_transport(&args.peers, capacity, timing, spark_world,
-                u32::try_from(lane.index())?)?;
+                u32::try_from(lane)?)?;
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
@@ -423,7 +434,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
         Ok(transport)
-    })?;
+    };
+    let [mut transport, mut second_transport] = lanes.try_map(|lane| make_transport(lane.index()))?;
+    let extra_transports = (2..slots).map(&mut make_transport).collect::<Result<Vec<_>>>()?;
+    let mut extra = extra_passes.into_iter().zip(extra_transports).collect::<Vec<_>>();
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     // Allocation must consume exactly the admitted pages; do not run a second
@@ -439,7 +453,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let token_map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
     let rows = capacity as usize;
     let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, rows,
-        2 * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024,
+        slots * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024,
             cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
     cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
     let mut requests = if args.tp2_attention {
@@ -447,6 +461,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
+    for (slot, _) in &mut extra { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
@@ -459,7 +474,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
-        &mut transport, &mut second_transport, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
+        &mut transport, &mut second_transport, &mut extra, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
 }
 
 

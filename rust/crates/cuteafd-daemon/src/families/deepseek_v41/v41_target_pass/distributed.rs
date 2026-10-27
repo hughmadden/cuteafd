@@ -1478,17 +1478,7 @@ mod tests {
                     .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
                 if interleaved {
                     runtime.block_on(unsafe {
-                        pass.execute_encoder_units(
-                            &mut other,
-                            &mut requests,
-                            lease,
-                            &chunks,
-                            [&mut transport, &mut other_transport],
-                            &mut suffix,
-                            &|| true,
-                            &|| Ok(()),
-                            2,
-                        )
+                        DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(()))
                     })?;
                 } else {
                     for chunk in &chunks {
@@ -1654,20 +1644,10 @@ mod tests {
             .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
         let calls = std::cell::Cell::new(0);
         let result = runtime.block_on(unsafe {
-            pass.execute_encoder_units(
-                &mut other,
-                &mut requests,
-                lease,
-                &[&prompt[..3], &prompt[3..]],
-                [&mut transport, &mut other_transport],
-                &mut cancelled_suffix,
-                &|| {
+            DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &|| {
                     calls.set(calls.get() + 1);
                     calls.get() < 12
-                },
-                &|| Ok(()),
-                2,
-            )
+                }, &|| Ok(()))
         });
         assert!(result.is_err(), "disconnected encoder units succeeded");
         assert!(requests.cache().request_id(lease).is_err());

@@ -1102,7 +1102,7 @@ count_args+=(--embedding-placement "$EMBEDDING")
 count_prefill=0
 ((RELEASE_PREFILL_EXPLICIT == 0)) || count_prefill="$PREFILL_BATCH_TOKENS"
 v41_prefill_waves="$(get PREFILL_WAVES)"
-[[ -z "$v41_prefill_waves" || "$v41_prefill_waves" =~ ^[12]$ ]] || release_die "PREFILL_WAVES must be 1 or 2 for DeepSeek V4.1"
+[[ -z "$v41_prefill_waves" || "$v41_prefill_waves" =~ ^[1-4]$ ]] || release_die "PREFILL_WAVES must be 1 to 4 for DeepSeek V4.1"
 [[ -z "$v41_prefill_waves" ]] || count_args+=(--prefill-waves "$v41_prefill_waves")
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
 ((topology_explicit == 0)) || count_args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")

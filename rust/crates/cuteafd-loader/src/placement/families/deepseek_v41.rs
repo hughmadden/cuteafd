@@ -261,15 +261,20 @@ pub fn expert_cost(
 
 /// Exact conditional expert owners: immutable checkpoint residency and two
 /// independent serving lanes. Fixed target lanes stay in the baseline.
+/// Expert costs per layer and the RTX expert workspace for `lanes` target
+/// passes (two decode lanes plus any further prefill slot), each with its own
+/// local or TP2 expert wave.
 pub fn expert_inventory(
     catalog: &crate::OfficialV41Catalog,
     programs: &std::path::Path,
     rows: u64,
     gpus: usize,
     sms: u32,
+    lanes: usize,
 ) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
     use anyhow::{ensure, Context};
     ensure!(matches!(gpus, 1 | 2), "V4.1 supports one or two RTX owners");
+    ensure!((2..=4).contains(&lanes), "V4.1 runs two to four target passes");
     let shape = catalog.routed_experts();
     ensure!(
         shape.layers == 40 && shape.hidden == 5120,
@@ -391,7 +396,7 @@ pub fn expert_inventory(
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((
         experts,
-        lane.checked_mul(2).context("V4.1 serving lanes overflow")?,
+        lane.checked_mul(lanes as u64).context("V4.1 serving lanes overflow")?,
     ))
 }
 

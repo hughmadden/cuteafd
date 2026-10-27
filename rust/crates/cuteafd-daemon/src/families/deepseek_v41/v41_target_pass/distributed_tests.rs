@@ -178,8 +178,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             let chunks = [&tokens[..65], &tokens[65..]];
             let mut suffix = EncoderSuffix::new(&lib, 130, EncoderSuffix::device_bytes(130)?)?;
             {
-                let mut pending = Box::pin(unsafe { pass.execute_encoder_units(&mut other, &mut requests, lease,
-                    &chunks, [&mut transport, &mut second_transport], &mut suffix, &|| true, &|| Ok(()), 2) });
+                let mut pending = Box::pin(unsafe { TargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)], &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(())) });
                 runtime.block_on(std::future::poll_fn(|cx| {
                     assert!(pending.as_mut().poll(cx).is_pending(), "expected a live encoder suspension");
                     std::task::Poll::Ready(())
@@ -203,8 +202,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                     // One wave (units in sequence) and two waves (one layer apart).
                     let chunks: Vec<_> = [&tokens[..left], &tokens[left..left + right], &tokens[left + right..]]
                         .into_iter().filter(|c| !c.is_empty()).collect();
-                    runtime.block_on(unsafe { pass.execute_encoder_units(&mut other, &mut requests, lease, &chunks,
-                        [&mut transport, &mut second_transport], &mut suffix, &|| true, &|| Ok(()), mode) })?;
+                    runtime.block_on(unsafe { TargetPass::execute_encoder_units({ let mut slots = vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)]; slots.truncate(mode); slots }, &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(())) })?;
                 } else {
                     for chunk in [&tokens[..left], &tokens[left..left + right], &tokens[left + right..]] {
                         if chunk.is_empty() { continue; }
@@ -239,9 +237,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.begin_encoder(lease, 175)?;
             let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
             {
-                let mut pending = Box::pin(unsafe { pass.execute_encoder_units(&mut other,
-                    &mut requests, lease, &chunks, [&mut transport, &mut second_transport],
-                    &mut suffix, &|| true, &|| Ok(()), 2) });
+                let mut pending = Box::pin(unsafe { TargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)], &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(())) });
                 runtime.block_on(std::future::poll_fn(|cx| {
                     assert!(pending.as_mut().poll(cx).is_pending());
                     std::task::Poll::Ready(())
@@ -259,8 +255,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.begin_encoder(lease, 175)?;
             let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
             if streaming {
-                runtime.block_on(unsafe { pass.execute_encoder_units(&mut other, &mut requests,
-                    lease, &chunks, [&mut transport, &mut second_transport], &mut suffix, &|| true, &|| Ok(()), 2) })?;
+                runtime.block_on(unsafe { TargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)], &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(())) })?;
             } else {
                 for chunk in chunks {
                     let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,

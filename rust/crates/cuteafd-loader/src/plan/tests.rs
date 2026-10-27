@@ -364,7 +364,12 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
     let v41 = tempfile::tempdir().unwrap();
     write_v41_snapshot(v41.path());
     let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
-    for (dir, marker) in [(v41, "#744"), (mimo, "#671 / #709")] {
+    for ranks in 0..=8 {
+        let options = wave_plan_options(v41.path(), ranks);
+        let rendered = render(&plan(v41.path(), &options).unwrap());
+        assert!(rendered.contains("prefill shape: ") && !rendered.contains("family executor"), "{rendered}");
+    }
+    for (dir, marker) in [(mimo, "#671 / #709")] {
         for ranks in 0..=8 {
             let options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
@@ -937,11 +942,12 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
                         let ingress = if nvfp4 { cuteafd_core::SparkIngress::Bf16 }
                             else { cuteafd_core::SparkIngress::Fp8K32 };
-                        // Rings at the resolved unit, as the runtime transports open them.
+                        // Rings at the resolved unit, one link per target pass (two decode
+                        // lanes plus each further prefill slot), as serve opens them.
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
                             capacity: report.prefill_unit_rows.unwrap() as u32,
                             ingress
-                        }; 2];
+                        }; report.prefill_waves.unwrap().max(2) as usize];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
                                 max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
@@ -953,7 +959,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             || item.group.starts_with("TP2 expert layer halves")).unwrap();
                         let (costs, workspace) = crate::placement::families::deepseek_v41::expert_inventory(
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
-                            options.layout.as_ref().unwrap().prefill_rows.max(2048), gpus, 188).unwrap();
+                            report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap().max(2) as usize).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
@@ -3516,7 +3522,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
         prefill_rows: 0, ..options.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
     let explicit_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        prefill_rows: 2048, ..default_prefill.layout.as_ref().unwrap().clone()
+        prefill_rows: 2752, prefill_waves: 3, ..default_prefill.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
     assert_eq!(plan(dir.path(), &default_prefill).unwrap().memory_layout,
         plan(dir.path(), &explicit_prefill).unwrap().memory_layout);
@@ -3527,29 +3533,38 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
 }
 
 #[test]
-fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
+fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
+    // TJ 2026-10-27: the reserve is sized first, the largest that fits the
+    // card (8192, else a multiple of 768 rows), split into k units; the pool
+    // takes what remains. Only an explicit pin changes the shape.
+    use crate::serving_capacity::prefill_waves::{reserve_unit_rows, RESERVE_STEP_ROWS};
     let dir = strict_v41_snapshot(false);
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
-        // Full official fixed owners plus an independent external draft budget
-        // leave room for the 1024-row lane, but not the 2048-row lane.
-        drafter_bytes: 4 << 30, prefill_rows: 0,
-        ..Default::default()
-    }), ..sparks(4) };
-    let automatic = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
-    assert!(automatic.executable(), "{}", render(&automatic));
-    assert_eq!(automatic.prefill_span_rows, Some(1024));
-    assert!(automatic.prefill_selection.as_ref().unwrap().contains("selected 1024"));
-    assert!(automatic.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
-    let explicit = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        prefill_rows: 2048, ..options.layout.unwrap()
-    }), ..sparks(4) };
-    let refused = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
-    assert!(!refused.executable());
-    assert_eq!(refused.prefill_span_rows, Some(2048));
-    assert!(refused.prefill_selection.is_none());
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")));
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));
+        drafter_bytes: 4 << 30, prefill_rows: 0, ..Default::default() };
+    let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], ..layout.clone() }), ..sparks(4) };
+    let roomy = plan_spark_count(dir.path(), &roomy, 6, Some(4)).unwrap();
+    assert!(roomy.executable(), "{}", render(&roomy));
+    assert_eq!((roomy.prefill_reserve_rows, roomy.prefill_unit_rows, roomy.prefill_waves), (Some(8192), Some(2752), Some(3)));
+    let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
+    let capped = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(capped.executable(), "{}", render(&capped));
+    let reserve = capped.prefill_reserve_rows.unwrap();
+    assert_eq!(capped.prefill_waves, Some(3));
+    assert_eq!(capped.prefill_unit_rows, Some(reserve_unit_rows(reserve, 3)), "{}", render(&capped));
+    if reserve < 8192 {
+        assert_eq!(reserve % RESERVE_STEP_ROWS, 0);
+        // The next larger reserve does not fit: the cap is the largest.
+        let larger = reserve + RESERVE_STEP_ROWS;
+        let pinned = PlanOptions { layout: Some(layout::LayoutOptions {
+            prefill_rows: if larger >= 8192 { 2752 } else { larger / 3 }, prefill_waves: 3, ..layout.clone() }), ..sparks(4) };
+        assert!(!plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap().executable());
+    }
+    // An explicit pin keeps its shape whether or not it fits.
+    let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
+    let pinned = plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap();
+    assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_reserve_rows), (Some(1024), Some(2), None));
+    assert!(pinned.executable(), "{}", render(&pinned));
 }
 
 #[test]

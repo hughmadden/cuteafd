@@ -321,30 +321,30 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
 
 
+    /// Encoder prefill of one prompt's `chunks` on the shared executor, one
+    /// unit per slot in flight: slot k is `slots[k]`, a target pass with its
+    /// Spark link (the two decode lanes' passes, then any further prefill slot).
     /// # Safety
-    /// Both slots retain their independent lane/TP2/shared/output storage until
+    /// Every slot retains its independent lane/TP2/shared/output storage until
     /// completion or drained cancellation. Decode is idle during this span.
     pub(crate) async unsafe fn execute_encoder_units(
-        &mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
-        chunks: &[&[u32]], transports: [&mut NativeTp4Wave<'a>; 2],
-        suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
-        before_unit: &dyn Fn() -> Result<()>, waves: usize,
+        slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, requests: &mut Requests<'a>, lease: CacheLease,
+        chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
+        before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        ensure!((1..=2).contains(&waves), "encoder unit owner count differs");
-        self.set_attention_decode(false);
-        other.set_attention_decode(false);
+        let waves = slots.len();
+        ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         let mut units = encoder_units(chunks)?;
         for unit in &mut units { unit.slot = unit.index % waves; }
-        let [first, second] = transports;
         for layer in 0..20 {
-            ensure!(first.has_local_layer(layer) == second.has_local_layer(layer),
+            ensure!(slots.iter().all(|(_, transport)| transport.has_local_layer(layer) == slots[0].1.has_local_layer(layer)),
                 "encoder slot expert placement differs");
         }
         let mut hooks = UnitHooks {
-            slots: vec![
-                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now() },
-                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now() },
-            ],
+            slots: slots.into_iter().map(|(pass, transport)| {
+                pass.set_attention_decode(false);
+                UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now() }
+            }).collect(),
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await

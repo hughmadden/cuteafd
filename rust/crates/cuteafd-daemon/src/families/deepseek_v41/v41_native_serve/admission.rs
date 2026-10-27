@@ -11,9 +11,10 @@ fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, wave
     // The shared ladder: the unit's covering export, `waves` units buffered.
     let executions = admit_family("deepseek_v41", &SparkBackend::for_catalog(catalog)?.exports(), None,
         u64::from(capacity), u64::from(waves))?;
-    // One endpoint per link: the decode transport and the prefill transport.
+    // One endpoint per link: one per target pass (two decode lanes, then each
+    // further prefill slot).
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2],
+        vec![SparkEndpoint { ring_depth: None, capacity, ingress }; usize::from(waves).max(2)],
         crate::shared::placement::spark_rings(64 << 20)?, executions)?;
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)
@@ -41,7 +42,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         return Ok(None);
     }
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
-        rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
+        rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: u64::from(args.prefill_waves).max(2) };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
         spark_model(catalog, capacity, args.prefill_waves, catalog.nvfp4().is_some())?)?))
@@ -178,7 +179,9 @@ pub(super) fn admit_startup(
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
-    let mut target = programs.target(u64::from(capacity), 1,
+    // Every target pass serve allocates: two decode lanes plus each further prefill slot.
+    let passes = usize::from(args.prefill_waves).max(2);
+    let mut target = programs.target(u64::from(capacity), 1, passes,
         crate::families::deepseek_v41::v41_tensors::fp8_head()
             == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
         BackboneExecution::window_batch_enabled())?;
@@ -194,7 +197,7 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
+        passes as u64 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
@@ -328,8 +331,9 @@ pub(super) fn local_workspace(
     } else {
         LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some())?
     };
+    // One local expert wave per target pass (two decode lanes, more prefill slots).
     Ok(lane
-        .checked_mul(2)
+        .checked_mul(usize::from(args.prefill_waves).max(2))
         .context("local serving lanes overflow")? as u64)
 }
 
@@ -606,13 +610,13 @@ pub(super) fn admission_memory(
 /// Weight and scratch allocations happen only after the resulting admission.
 pub(super) fn preload_exl3<'a>(
     lib: &'a cuteafd_ffi::NativeLibrary, directory: &std::path::Path,
-    capacity: u32, ranks: usize,
-) -> Result<[Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>; 2]> {
+    capacity: u32, ranks: usize, lanes: usize,
+) -> Result<Vec<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>> {
     use crate::shared::experts::exl3::execution::{Exl3InputFormat, Exl3Modules, Exl3ReductionPlan};
     let capacities = families::deepseek_v41::exl3_capacities(capacity as u64, ranks == 1)?;
     let directories: Vec<_> = capacities.iter().map(|capacity| directory.join(format!("m{capacity}"))).collect();
     Exl3ReductionPlan::new(&directories)?;
-    let mut lanes = [Vec::new(), Vec::new()];
+    let mut lanes = (0..lanes).map(|_| Vec::new()).collect::<Vec<_>>();
     for lane in &mut lanes {
         for directory in &directories {
             // SAFETY: operator-selected pinned native exports, owned on the current device.
@@ -737,10 +741,10 @@ mod admission_tests {
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
                 let fixed = owners::TargetOwners::new(weights,
-                    programs.target(256, ranks, true, ranks == 1)?, ranks,
+                    programs.target(256, ranks, 2, true, ranks == 1)?, ranks,
                     2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
-                    &catalog, &manifest, 256, ranks, 188)?;
+                    &catalog, &manifest, 256, ranks, 188, 2)?;
                 // Deliberately synthetic pre-weight inventory, independent of
                 // planner output. This is not a CUDA sample or ready-parity gate.
                 let memory = vec![(80usize << 30, 96usize << 30); ranks];

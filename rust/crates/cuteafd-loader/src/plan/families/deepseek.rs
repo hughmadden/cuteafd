@@ -19,9 +19,9 @@ pub struct DeepSeek {
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
     /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
     decode_rows: u32,
-    /// In-flight prefill units the executor holds (V4.1: one target pass per slot).
+    /// In-flight prefill units the executor holds.
     max_waves: u64,
-    /// Measured starting unit (V4.1: its CED chunk, 2048 rows).
+    /// Measured starting unit, when a kernel needs one.
     initial_unit_rows: Option<u64>,
 }
 
@@ -29,16 +29,16 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
-    // Two units in flight, one layer apart: the measured depth of its earlier
-    // two-lane CED executor at every topology (#668, #815).
+    // The shared default (TJ 2026-10-27): three units of 2752 rows in the
+    // 8192-row reserve, one layer apart; the shape never shrinks for KV.
     prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
-        waves: 2, reference_ranks: 4, larger_topology_waves: 2,
-        source: "https://github.com/tpurtell/cuteafd/issues/668; V4.1 two in-flight CED units at TP4 and TP6",
+        waves: 3, reference_ranks: 4, larger_topology_waves: 3,
+        source: "TJ 2026-10-27: V4.1 takes the shared 3 x 2752 default like every shared-executor family (#815, #744)",
     },
     decode_lanes: crate::plan::decode_lanes::LaneSupport::FixedTwo,
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
-    max_waves: 2,
-    initial_unit_rows: Some(2048),
+    max_waves: crate::serving_capacity::prefill_waves::MAX_WAVES,
+    initial_unit_rows: None,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",

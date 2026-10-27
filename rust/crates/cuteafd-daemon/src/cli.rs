@@ -1127,7 +1127,7 @@ pub(crate) struct NativeServeArgs {
 
     /// Prefill units in flight on the shared executor (the deployment's
     /// prefill_waves): one target pass and Spark link per slot.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: u8,
 
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
