@@ -61,13 +61,14 @@ pub enum ScaleEncoding {
     E4m3,
 }
 
-/// How a scale applies. Every checkpoint layout this build knows multiplies
-/// (`w = q * s`), including HF's `weight_scale_inv` (named for the
-/// quantizer's division); a divisor layout would get its own variant.
+/// How a scale applies. Block scales multiply (`w = q * s`), including HF's
+/// `weight_scale_inv` (named for the quantizer's division); compressed-tensors
+/// NVFP4 global scales divide (`w = q * s / g`, vLLM inverts them at load).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScaleDirection {
     Multiply,
+    Divide,
 }
 
 /// How the scale grid tiles the weight's rows.
@@ -97,11 +98,17 @@ pub struct BlockScale {
     pub grid: Vec<usize>,
 }
 
-/// A FP4 operand's per-tensor second-level scale (ModelOpt `weight_scale_2`)
-/// or static activation scale (`input_scale`).
+/// A FP4 operand's per-tensor second-level scale (ModelOpt `weight_scale_2`,
+/// compressed-tensors `weight_global_scale`) or static activation scale
+/// (`input_scale`, `input_global_scale`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TensorScale {
     pub encoding: ScaleEncoding,
+    pub direction: ScaleDirection,
+}
+
+impl TensorScale {
+    pub fn multiply(encoding: ScaleEncoding) -> Self { Self { encoding, direction: ScaleDirection::Multiply } }
 }
 
 /// One logical weight as the checkpoint stores it.
@@ -426,7 +433,7 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     if let Some(input) = get("input_scale") {
         let encoding = scale_encoding(&input.dtype)
             .ok_or_else(|| malformed(&input.name, format!("input_scale dtype {}", dtype_label(&input.dtype))))?;
-        operand.input_scale = Some(TensorScale { encoding });
+        operand.input_scale = Some(TensorScale::multiply(encoding));
     }
     operand.companions = companions;
     if operand.scale.is_none() && !matches!(operand.encoding, Encoding::E4m3 | Encoding::E5m2 | Encoding::E2m1) {
@@ -530,7 +537,7 @@ fn fp4(members: &BTreeMap<String, &CheckpointTensor>, weight: &crate::Safetensor
             malformed(&global.name, format!("weight_scale_2 must be one value, found {} {:?}",
                 dtype_label(&global.dtype), global.shape))
         })?;
-        operand.global_scale = Some(TensorScale { encoding });
+        operand.global_scale = Some(TensorScale::multiply(encoding));
     }
     Ok(operand)
 }
