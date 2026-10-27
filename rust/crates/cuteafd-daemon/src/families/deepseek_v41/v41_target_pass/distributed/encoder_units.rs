@@ -47,7 +47,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let prepared = prepared.into_unit().await?;
         // Publish this layer's window now (as one RTX does): the next unit
         // attends it before this unit lands its FFN.
-        if crate::shared::memory::chain::deferred() {
+        if crate::shared::memory::chain::deferred() && !super::super::encoder_units::diag_host("window") {
             // Device-ordered (#815 option (i)): a chained direct commit after the attention.
             requests.borrow_mut().publish_distributed_unit_window(batch, &mut self.resources.execution, layer)?;
         } else {
@@ -232,12 +232,14 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         // attention orders after the previous unit's publication of this layer;
         // its window and source publications are chained direct commits.
         crate::shared::spark_waves::healthy()?;
-        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
+        let diag = super::super::encoder_units::diag_host("attention");
+        let chain = if diag { None } else { unit_chain(self.slots[unit.slot].pass)? };
+        let Some(chain) = chain else {
             // Host-ordered TP2 peer transfers keep the established host order.
             if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
             return self.attention_inner(layer, unit).await;
         };
-        let event = self.previous_publication(unit, layer);
+        let event = if super::super::encoder_units::diag_host("depend") { None } else { self.previous_publication(unit, layer) };
         chain.scope(async {
             super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
             self.attention_inner(layer, unit).await?;
@@ -260,12 +262,14 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         // Device-ordered (#815 option (i)): the suffix capture and the
         // boundary source publication chain behind the unit's last layer.
         crate::shared::spark_waves::healthy()?;
-        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
+        let diag = super::super::encoder_units::diag_host("end");
+        let chain = if diag { None } else { unit_chain(self.slots[unit.slot].pass)? };
+        let Some(chain) = chain else {
             if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
             return self.end_unit_inner(unit).await;
         };
         let boundary = super::super::encoder_units::BOUNDARY;
-        let event = self.previous_publication(unit, boundary);
+        let event = if super::super::encoder_units::diag_host("depend") { None } else { self.previous_publication(unit, boundary) };
         chain.scope(async {
             super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
             self.end_unit_inner(unit).await?;

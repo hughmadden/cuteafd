@@ -77,6 +77,17 @@ pub(super) fn order_after(library: &cuteafd_ffi::NativeLibrary, event: Option<*m
     // SAFETY: a live event recorded by the previous unit's chain.
     unsafe { crate::shared::memory::chain::depend(library, event) }
 }
+/// Temporary bisect switches for the 2-RTX (i) fidelity break (#815); removed
+/// with the fix. `CUTEAFD_DIAG_V41_UNIT_HOST` is a comma list of: attention
+/// (drain before attention, host order), source (enqueue-and-poll source
+/// publication), window (enqueue-and-poll window publication), end (drain and
+/// cooperative suffix capture at the unit's end), depend (skip cross-slot waits).
+pub(crate) fn diag_host(part: &str) -> bool {
+    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PARTS.get_or_init(|| std::env::var("CUTEAFD_DIAG_V41_UNIT_HOST").unwrap_or_default()
+        .split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect())
+        .iter().any(|p| p == part)
+}
 /// The slot that ran the unit before `unit`, when it is another slot.
 pub(super) fn previous_slot(unit: &Unit, waves: usize) -> Option<usize> {
     unit.index.checked_sub(1).map(|index| index % waves).filter(|&slot| slot != unit.slot)

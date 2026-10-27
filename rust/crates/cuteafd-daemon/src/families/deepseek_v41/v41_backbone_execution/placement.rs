@@ -58,7 +58,8 @@ impl PendingPlacedProduction<'_, '_, '_, '_> {
             return Ok(false);
         }
         if let Some(i) = self.source {
-            if !self.source_published && crate::shared::memory::chain::deferred() {
+            if !self.source_published && crate::shared::memory::chain::deferred()
+                && !crate::families::deepseek_v41::v41_target_pass::diag_host("source") {
                 // Device-ordered prefill units (#815 option (i)): a chained
                 // direct commit, ordered after the producer on the device.
                 bank.publish_encoder_source(batch, self.layer, &mut self.waves.sources[i])?;
