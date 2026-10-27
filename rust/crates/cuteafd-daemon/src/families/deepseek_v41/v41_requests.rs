@@ -546,6 +546,26 @@ impl<'a> Requests<'a> {
             }
         }
     }
+    /// [`Self::poll_engram`] without applying: the gathered rows for the
+    /// caller's cooperative (chain-ordered) gate.
+    pub fn poll_engram_rows(&self, batch: &mut RequestBatch, upload: &mut EngramDeviceRows<'_>,
+        lane: &BackboneLane<'_, '_>) -> Result<Option<crate::families::deepseek_v41::v41_engram::EngramDeviceView>> {
+        self.validate(batch)?;
+        let (pending_layer, positions) = lane.pending_engram()?;
+        let layer = cuteafd_core::ENGRAM_LAYERS.iter().position(|&l| l as usize == pending_layer)
+            .context("prepared layer has no engram")?;
+        ensure!(positions == batch.cache.positions(), "engram lane positions differ");
+        let histories = if batch.prepared.is_empty() {
+            batch.leases.iter().map(|&l| Ok(&self.request(l)?.history)).collect::<Result<Vec<_>>>()?
+        } else {
+            batch.prepared.iter().map(|cursor| cursor.history()).collect()
+        };
+        match upload.poll_wave(&self.pipeline, batch.engram.as_mut().context("decoder replay has no engram work")?, &histories, layer)? {
+            EngramUploadPoll::Pending => Ok(None),
+            EngramUploadPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
+            EngramUploadPoll::Ready(rows) => Ok(Some(rows)),
+        }
+    }
     /// Poll only the I/O gather under the shared request borrow. The returned
     /// lease owns its staging so GPU upload/gating can finish outside that borrow.
     pub fn poll_engram_gather(&self, batch: &mut RequestBatch,

@@ -48,19 +48,6 @@ struct UnitSlot<'s, 'w, 'a> {
     batch: Option<RequestBatch>,
     prepared: Option<UnitPreparedLayer>,
     started: Instant,
-    /// Recorded after this slot's unit published a layer's KV (its attention
-    /// hook); the next unit's attention orders after it on the device.
-    published: Option<OwnedEvent<'a>>,
-}
-/// An ordering event owned by a unit slot.
-struct OwnedEvent<'a> { library: &'a cuteafd_ffi::NativeLibrary, raw: *mut std::ffi::c_void }
-impl Drop for OwnedEvent<'_> {
-    fn drop(&mut self) {
-        // SAFETY: created by this owner; slots drain their chains before drop.
-        if let Err(error) = unsafe { self.library.cuda_event_destroy(self.raw) } {
-            tracing::error!(%error, "destroying prefill unit event");
-        }
-    }
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
@@ -130,17 +117,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         Ok(())
     }
     async fn attention_inner(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        // Unit k+1 attends layer L after unit k published L (the schedule's
-        // order on the host); on the device it follows that publication.
-        if let Some(previous) = unit.index.checked_sub(1) {
-            let other = (unit.slot + self.slots.len() - 1) % self.slots.len();
-            if previous % self.slots.len() == other && other != unit.slot {
-                if let Some(event) = &self.slots[other].published {
-                    // SAFETY: a live event on this device, recorded by the predecessor's chain.
-                    unsafe { crate::shared::memory::chain::depend(event.library, event.raw)?; }
-                }
-            }
-        }
         let slot = &mut self.slots[unit.slot];
         ensure!((self.keep_running)(), "client disconnected");
         ensure!(slot.prepared.is_none(), "encoder attention still pending");
@@ -161,10 +137,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
             )?
         };
         slot.prepared = Some(prepared.into_unit().await?);
-        if let Some(event) = &slot.published {
-            // SAFETY: a live event on this chain's device.
-            unsafe { crate::shared::memory::chain::record_into(event.library, event.raw)?; }
-        }
         Ok(())
     }
     async fn local_ffn_inner(&mut self, _layer: usize, unit: &Unit) -> Result<()> {
@@ -289,8 +261,14 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         chain.scope(self.begin_unit_inner(unit)).await
     }
     async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        let chain = self.slots[unit.slot].pass.unit_chain()?;
-        chain.scope(self.attention_inner(layer, unit)).await
+        // The unit's previous layer (its landing, reduce and mHC, queued by the
+        // last hooks without a host wait) completes here, while the other unit's
+        // wave is on the Sparks. The attention and its KV publication then run
+        // unchained, completing on the host as before, so the next unit's
+        // attention (a later hook) reads published KV.
+        self.slots[unit.slot].pass.drain_chain()?;
+        crate::shared::spark_waves::healthy()?;
+        self.attention_inner(layer, unit).await
     }
     async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let chain = self.slots[unit.slot].pass.unit_chain()?;
@@ -330,13 +308,15 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         batch: &mut RequestBatch, layer: usize) -> Result<()> {
         if layer == 0 { return Ok(()); }
         self.resources.lane.advance()?;
+        // The cooperative forms join the unit's chain (its previous layer's
+        // mHC output is not complete on the host).
         if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
             batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
-            ensure!(unsafe { requests.borrow().poll_engram(batch, &mut self.resources.upload,
-                &mut self.resources.gates[gate], &mut self.resources.lane)? },
-                "engram gather wait returned pending");
+            let rows = requests.borrow().poll_engram_rows(batch, &mut self.resources.upload, &self.resources.lane)?
+                .context("engram gather wait returned pending")?;
+            unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
         }
-        unsafe { self.resources.lane.begin_prepared()?; }
+        unsafe { self.resources.lane.begin_prepared_cooperative().await?; }
         Ok(())
     }
 
@@ -360,16 +340,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             ensure!(first.has_local_layer(layer) == second.has_local_layer(layer),
                 "encoder slot expert placement differs");
         }
-        let library = self.resources.upload.library();
-        let event = || -> Result<OwnedEvent<'a>> {
-            Ok(OwnedEvent { library, raw: library.cuda_event_create_ordering()? })
-        };
         let mut hooks = UnitHooks {
             slots: vec![
-                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now(),
-                    published: Some(event()?) },
-                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now(),
-                    published: Some(event()?) },
+                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now() },
+                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now() },
             ],
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
         };

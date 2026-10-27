@@ -210,8 +210,12 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         scoped(chain, self.begin_unit_inner(unit)).await
     }
     async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        let chain = unit_chain(self.slots[unit.slot].pass)?;
-        scoped(chain, self.attention_inner(layer, unit)).await
+        // As on one RTX: the unit's previous layer completes here while the
+        // other unit's wave is out; the attention and KV publication run
+        // unchained, in their established host order.
+        if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+        crate::shared::spark_waves::healthy()?;
+        self.attention_inner(layer, unit).await
     }
     async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let chain = unit_chain(self.slots[unit.slot].pass)?;

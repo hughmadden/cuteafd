@@ -179,6 +179,11 @@ impl<'a> WindowWave<'_, 'a> {
     pub fn commit(&mut self, state: &mut WindowState<'_>, accepted: &[u32]) -> Result<()> {
         let direct = self.pending_commit.is_none();
         if direct {
+            // A direct (prompt publication) commit inside a device-ordered
+            // chain follows every chained reader of the private wave (#815
+            // units); outside a chain they already completed (no-op).
+            // SAFETY: this wave's live stream on the chain's device.
+            unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
             let launched = unsafe { self.enqueue_commit(state, accepted) };
             if let Err(error) = launched.and(self.synchronize()) {
                 self.abort_commit(state)?;
