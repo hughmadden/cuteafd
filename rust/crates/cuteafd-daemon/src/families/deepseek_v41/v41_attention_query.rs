@@ -816,6 +816,29 @@ mod guarded_scratch_tests {
         let chains = [StageChain::on_devices(&library, &devices)?, StageChain::on_devices(&library, &devices)?];
         for chain in &chains { chain.set_device_order(true); }
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        // Warm every kernel and copy path ungated first: with lazy module
+        // loading, a first launch inside the gated interval loads its module,
+        // which synchronizes the context behind the gated stream and hangs.
+        // The private run is also the expected value.
+        let want = {
+            let mut private = weights.wave(unit, usize::MAX)?;
+            library.copy_h2d(private.input(), &input(0))?;
+            let expected = unsafe { private.execute_tokens(&tokens(0))? };
+            let mut want = vec![0; rotated_bytes];
+            library.copy_d2h(&mut want, expected.rotated)?;
+            want
+        };
+        for (seed, slot) in slots.iter_mut().enumerate() {
+            let source = sources[seed].buffer;
+            unsafe { slot.execute_tokens_prepared(&tokens(seed), |stream, destination| {
+                library.copy_d2d_async(destination, source, source.bytes, stream)
+            })?; }
+        }
+        reader.device.run(|| unsafe {
+            library.copy_peer_async(copy.buffer, shared.buffers[3].as_ref().unwrap().buffer, rotated_bytes, reader.raw)?;
+            library.cuda_stream_synchronize(reader.raw)
+        })?;
+        unsafe { library.cuda_stream_synchronize(shared.stream.raw)?; }
         let reader_gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&library, reader.raw)? };
         // Unit A: query, then its fork reader (gated), joined into A's chain, release.
         runtime.block_on(chains[0].handle().scope(async {
@@ -846,12 +869,6 @@ mod guarded_scratch_tests {
         reader.device.run(|| unsafe { library.cuda_stream_synchronize(reader.raw) })?;
         let mut got = vec![0; rotated_bytes];
         reader.device.run(|| library.copy_d2h(&mut got, copy.buffer))?;
-        library.cuda_set_device(0)?;
-        let mut private = weights.wave(unit, usize::MAX)?;
-        library.copy_h2d(private.input(), &input(0))?;
-        let expected = unsafe { private.execute_tokens(&tokens(0))? };
-        let mut want = vec![0; rotated_bytes];
-        library.copy_d2h(&mut want, expected.rotated)?;
         assert_eq!(got, want, "unit B overwrote shared query outputs before unit A's fork reader joined");
         Ok(())
     }
