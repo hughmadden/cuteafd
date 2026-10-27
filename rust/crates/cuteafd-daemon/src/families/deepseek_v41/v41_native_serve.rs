@@ -399,7 +399,10 @@ fn worker(
     let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
     // Both Engram layers retain their staging leases until consumed. Reserve
     // both layers for both active lanes so the second lane can gather early.
-    let gather_slots = slots * cuteafd_core::ENGRAM_LAYERS.len();
+    // One wave per in-flight slot plus the next unit's prefetched wave
+    // (`Requests::prefetch_encoder`): without its tickets the prefetch can
+    // hold the gather slots an in-flight unit's layer-14 gather waits for.
+    let gather_slots = (slots + 1) * cuteafd_core::ENGRAM_LAYERS.len();
     let pipeline =
         unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, rows, gather_slots, rows * 64 * 1024,
             cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
