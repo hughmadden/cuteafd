@@ -649,14 +649,15 @@ pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
 /// Largest transient BF16 source retained while packing one draft projection.
 pub fn drafter_staging(snapshot: &std::path::Path, slots: usize, sequences: usize,
     bf16: bool) -> anyhow::Result<u64> {
-    use crate::families::glm5::draft_representation::{draft_geometry, GlmDraftCapacity,
+    use crate::families::glm5::draft_representation::{draft_geometry, draft_window, GlmDraftCapacity,
         GlmDraftRepresentation, GlmDraftRuntimeLayout};
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     let (geometry, block) = draft_geometry(&config)?;
-    let capacity = GlmDraftCapacity::new(slots, sequences, usize::try_from(block)?)?;
+    let ring = draft_window(&config)?;
+    let capacity = GlmDraftCapacity::with_ring(slots, sequences, usize::try_from(block)?, ring)?;
     Ok(GlmDraftRuntimeLayout::new(geometry,
         if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only },
-        capacity, 2048)?.weights.max_load_staging)
+        capacity, usize::try_from(ring)?)?.weights.max_load_staging)
 }
 
 pub fn manifest_scratch(cfg: &GlmDsaConfig, split: bool, manifest: &serde_json::Value)
