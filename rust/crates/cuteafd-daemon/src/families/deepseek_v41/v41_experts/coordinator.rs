@@ -376,6 +376,38 @@ impl<'a> NativeTp4Wave<'a> {
             stream: &self.stream, link: &mut self.link, output: self.output.buffer, ready_rows: &mut self.ready_rows,
             tp2: self.tp2.as_deref_mut() })
     }
+    /// [`Self::dispatch_ffn`] for a prefill unit on the shared executor: the
+    /// returned ticket owns nothing borrowed, so the unit's later land hook
+    /// collects it after other units' hooks ran ([`Self::collect_unit`]).
+    ///
+    /// # Safety
+    /// As [`Self::dispatch_ffn`].
+    pub(crate) unsafe fn dispatch_unit(&mut self,
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+        router_stream: *mut std::ffi::c_void, placement: u64,
+        rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativeUnitFfn> {
+        let pending = unsafe { self.dispatch_ffn(routed, router_stream, placement, rows)? };
+        Ok(NativeUnitFfn { ticket: pending.ticket, binding: pending.binding, layer: pending.layer,
+            rows: pending.rows, owner: self.output.buffer.ptr as usize })
+    }
+    /// Lands a unit's wave (waves land in dispatch order: the executor's FIFO)
+    /// and reduces it with its `shared` values.
+    ///
+    /// # Safety
+    /// `shared` holds the unit's completed shared contribution for exactly this
+    /// wave's rows and stays unchanged until the reduce completes.
+    pub(crate) async unsafe fn collect_unit(&mut self, unit: NativeUnitFfn, shared: CuteafdDeviceBuffer)
+        -> Result<NativeFfnOutput<'_>> {
+        ensure!(unit.owner == self.output.buffer.ptr as usize, "prefill unit ticket belongs to another transport");
+        ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= unit.rows as usize * 10240,
+            "prefill unit shared contribution differs from its wave");
+        let mut values = shared;
+        values.bytes = unit.rows as usize * 10240;
+        let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
+            library: self.library, stream: &self.stream, link: &mut self.link, output: self.output.buffer,
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() };
+        unsafe { pending.finish_values(values, None).await }
+    }
     /// Borrowed device view; never free it or retain it across wave reuse/drop.
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {
         let rows = self
@@ -407,6 +439,17 @@ impl NativeFfnOutput<'_> {
     pub fn binding(&self) -> crate::families::deepseek_v41::v41_attention_binding::QueryBinding {
         self.binding
     }
+}
+
+/// A prefill unit's wave between its send and land hooks: owned, so no
+/// transport borrow survives a hook. Dropping it unlanded leaves the wave
+/// outstanding; the pass fails and resets the link after its streams drain.
+pub(crate) struct NativeUnitFfn {
+    ticket: crate::shared::spark_waves::WaveTicket,
+    binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
+    layer: usize,
+    rows: u32,
+    owner: usize,
 }
 
 /// A remote layer's wave on the exchange, borrowed until its reduction is

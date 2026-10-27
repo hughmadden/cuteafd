@@ -33,8 +33,7 @@ mod distributed;
 pub(crate) use distributed::DistributedTargetPass;
 mod verification;
 pub(crate) use verification::VerificationTarget;
-mod encoder_pair;
-mod encoder_stream;
+mod encoder_units;
 pub(crate) use taps::{TargetTapWave, TargetTaps};
 
 /// Target cache publication used by the independent scheduler's queued dSpark
