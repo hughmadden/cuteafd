@@ -9,8 +9,8 @@
 
 use super::prefill_waves::{unit_rows, MAX_WAVES};
 
-/// A trial depth replaces the current one only if its period per row is
-/// lower by this share (hysteresis against noise).
+/// A depth replaces the current one only if its ratio is lower by this
+/// share (hysteresis against noise).
 pub const MARGIN: f64 = 0.01;
 
 /// The Sparks' measured cost of one prefill call at one depth: per rank, the
@@ -51,11 +51,16 @@ impl PrefillPace {
     /// Where the waits point (latest sample): `Some(false)` at fewer, wider
     /// units (the Sparks wait on the coordinator), `Some(true)` at more units
     /// (the coordinator waits on the Sparks); the larger share wins.
+    /// When both fire, the larger must beat the other by [`SIGNAL_FACTOR`]
+    /// or [`SIGNAL_GAP`]; a tie points nowhere.
     pub fn direction(&self) -> Option<bool> {
         let idle = self.idle_share().unwrap_or(0.0);
         let reply = self.reply_wait_share().unwrap_or(0.0);
+        let beats = |a: f64, b: f64| a >= SIGNAL_FACTOR * b || a - b >= SIGNAL_GAP;
         match (idle > IDLE_HIGH, reply > REPLY_WAIT_HIGH) {
-            (true, true) => Some(reply > idle),
+            (true, true) if beats(reply, idle) => Some(true),
+            (true, true) if beats(idle, reply) => Some(false),
+            (true, true) => None,
             (true, false) => Some(false),
             (false, true) => Some(true),
             (false, false) => None,
@@ -91,7 +96,7 @@ pub fn candidates(slots: u64, unit_cap: u64) -> Vec<u64> {
 
 /// Where a call starts. Fewer, wider units (a lower depth) only at an
 /// opening call, where nothing is in flight; more units at any call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Boundary {
     /// A prefill's first call (the decode→prefill transition).
     Opening,
@@ -107,7 +112,10 @@ pub struct Decision {
     pub waves: u64,
     pub unit_rows: u64,
     pub boundary: Boundary,
-    /// A running call whose depth differs from the previous call's: never a sample.
+    /// A reference call: an opening at row 0 of at least [`REFERENCE_SHARE`]
+    /// of a full call. Only reference calls are evidence.
+    pub reference: bool,
+    /// A running call whose depth differs from the previous call's.
     pub transition: bool,
     pub reason: &'static str,
 }
@@ -119,11 +127,13 @@ pub struct Sample {
     pub waves: u64,
     pub rows: u64,
     pub boundary: Boundary,
-    /// Whether it counts as evidence for its depth.
+    /// Whether it counts as evidence (a reference call that ran its depth in full).
     pub counted: bool,
     pub period_us: Option<f64>,
     pub idle_share: Option<f64>,
     pub reply_wait_share: Option<f64>,
+    /// Its period over the current depth's band mean (a trial's measured ratio).
+    pub ratio: Option<f64>,
 }
 
 /// Spark idle share above which the Sparks wait on the coordinator: the
@@ -132,55 +142,77 @@ pub const IDLE_HIGH: f64 = 0.05;
 /// Coordinator reply-wait share above which it waits on the Sparks: the
 /// signal points at more units.
 pub const REPLY_WAIT_HIGH: f64 = 0.05;
-/// A call is a sample when its rows reach this share of the smallest unit.
-pub const SAMPLE_SHARE: f64 = 0.6;
-/// Recent periods kept per depth and boundary class.
-const HISTORY: usize = 2;
-/// A sample expires after this many prefill calls of any size (one global
-/// clock): an expired depth has no evidence again.
-pub const EXPIRY_CALLS: u64 = 15;
+/// When both waits fire, the larger must exceed the smaller by this factor
+/// or by [`SIGNAL_GAP`] to pick a direction; otherwise it is a tie.
+pub const SIGNAL_FACTOR: f64 = 1.5;
+pub const SIGNAL_GAP: f64 = 0.10;
+/// A reference call is an opening at row 0 with at least this share of a full call's rows.
+pub const REFERENCE_SHARE: f64 = 0.9;
+/// Reference samples of the current depth kept for its noise band.
+pub const BAND_SAMPLES: usize = 4;
+/// The band: `BAND_SPREAD` times the samples' spread, within [`BAND_MIN`, `BAND_MAX`].
+pub const BAND_MIN: f64 = 0.015;
+pub const BAND_MAX: f64 = 0.05;
+pub const BAND_SPREAD: f64 = 1.5;
+/// Consecutive same-direction out-of-band reference calls that mean the
+/// current depth's period changed.
+pub const CHANGE_CALLS: usize = 2;
+/// Backstop: reference calls at the current depth before its neighbours are
+/// re-tested without a change; doubles after each re-test that confirms the
+/// old ratios, resets on any change.
+pub const BACKSTOP_FIRST: u64 = 64;
+pub const BACKSTOP_MAX: u64 = 1 << 16;
+/// A dispatched trial unreported after this many calls is forgotten.
+const STALE_CALLS: u64 = 16;
 
-/// The last `HISTORY` periods of one depth and class with the call that
-/// measured each, newest replacing oldest.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Recent { samples: [(f64, u64); HISTORY], count: usize, next: usize }
-
-impl Recent {
-    fn push(&mut self, period: f64, call: u64) {
-        self.samples[self.next] = (period, call);
-        self.next = (self.next + 1) % HISTORY;
-        self.count = (self.count + 1).min(HISTORY);
-    }
-    fn fresh(&self, now: u64) -> impl Iterator<Item = (f64, u64)> + '_ {
-        self.samples[..self.count].iter().copied().filter(move |(_, at)| now.saturating_sub(*at) < EXPIRY_CALLS)
-    }
-    /// The mean of the samples still fresh at call `now`.
-    fn mean(&self, now: u64) -> Option<f64> {
-        let (sum, n) = self.fresh(now).fold((0.0, 0), |(sum, n), (period, _)| (sum + period, n + 1));
-        (n > 0).then(|| sum / n as f64)
-    }
-    /// The newest fresh sample.
-    fn newest(&self, now: u64) -> Option<f64> {
-        self.fresh(now).max_by_key(|&(_, at)| at).map(|(period, _)| period)
-    }
+/// The noise band (a share of the mean) of a depth's recent reference periods.
+fn band_width(samples: &[f64]) -> f64 {
+    if samples.len() < 2 { return BAND_MIN; }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let (lo, hi) = samples.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+    (BAND_SPREAD * (hi - lo) / mean).clamp(BAND_MIN, BAND_MAX)
 }
 
-/// Chooses each prefill call's depth (#762; TJ 2026-10-27). A sample is one
-/// call: its own wall period per prompt row, counted for the depth it ran
-/// unless it is a transition call or under 60% of the smallest unit. Each
-/// depth keeps its last two samples per class (opening, running); a sample
-/// expires after 15 calls of any size.
+/// The controller's persisted evidence (#762): every depth's period as a
+/// ratio to the current depth's, the current depth's band samples and the
+/// backstop. Versioned by the caller's cache key.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Evidence {
+    /// The current depth.
+    pub waves: u64,
+    /// (depth, period ratio to the current depth), the current depth at 1.
+    pub ratios: Vec<(u64, f64)>,
+    /// The current depth's recent reference periods (µs per row), oldest first.
+    pub band: Vec<f64>,
+    /// Reference calls at the current depth since its neighbours were last measured.
+    pub since_test: u64,
+    /// Reference calls the backstop waits before re-testing the neighbours.
+    pub backstop: u64,
+}
+
+/// Chooses each prefill call's depth from relative evidence (#762 round F;
+/// TJ 2026-10-27: measured real time per row; a direction signal only where
+/// there is no evidence; downsize at any call, upsize only at an opening).
 ///
-/// At each call: the latest sample at the current depth points at a
-/// neighbour (Spark idle → fewer, wider units; coordinator reply-wait → more
-/// units). When the boundary allows that direction (fewer units only at an
-/// opening call) and the neighbour has no fresh evidence at all, the
-/// call steps there once to measure it. Otherwise it runs the best fresh
-/// depth the boundary allows: at an opening call by the mean of recent
-/// opening calls (all start at context 0), at a running call by each depth's
-/// newest running call (adjacent calls of one prompt), falling back to the
-/// opening calls when the current depth has no running sample yet. A depth
-/// without comparable evidence holds until measured. No other exploration.
+/// - **Evidence** is each depth's period as a ratio to the current depth's,
+///   measured at matched position: only *reference calls* (an opening at row
+///   0 of at least 90% of a full call) count, so a trial and the current
+///   depth's band are the same shape. Ratios don't drift with context or
+///   power; absolutes do.
+/// - **Calibration** (before readiness, or loaded from the persisted
+///   evidence) measures every candidate once, so every depth has evidence.
+/// - **Re-test on change, no expiry:** the current depth keeps its last four
+///   reference periods; two consecutive reference calls outside their noise
+///   band, in the same direction, re-base the band and re-test each
+///   neighbour once (one per reference call). A backstop re-tests after
+///   [`BACKSTOP_FIRST`] quiet reference calls, doubling after each re-test
+///   that confirms the old ratios.
+/// - **Choice:** each call runs the depth with the lowest ratio among those
+///   its boundary allows, with 1% hysteresis.
+/// - **Signals** (Spark idle → fewer, wider units; coordinator reply-wait →
+///   more units) only trigger a trial toward a neighbour with no evidence,
+///   and only when one beats the other by a margin; a tie means no trial.
+///
 /// Pinned controllers never move (explicit PREFILL_WAVES, benchmarks, goldens).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaveControl {
@@ -188,15 +220,34 @@ pub struct WaveControl {
     unit_cap: u64,
     pinned: bool,
     candidates: Vec<u64>,
-    /// Per depth: [opening, running] evidence.
-    recent: [[Recent; 2]; MAX_WAVES as usize],
-    /// The newest counted sample: (call, depth, direction).
-    latest: Option<(u64, u64, Option<bool>)>,
-    /// Prefill calls started so far (every size): the expiry clock.
+    /// Per depth: its period over the current depth's (the current at 1).
+    ratios: [Option<f64>; MAX_WAVES as usize],
+    /// The current depth's recent reference periods, oldest first.
+    band: Vec<f64>,
+    /// Consecutive out-of-band reference periods at the current depth (same direction).
+    outside: Vec<f64>,
+    /// Depths to measure at the next reference calls, in order.
+    trials: Vec<u64>,
+    /// Trials dispatched whose record has not arrived: (call, depth).
+    in_flight: Vec<(u64, u64)>,
+    /// Ratios before the running re-test round (to judge confirmation), and
+    /// whether the round was triggered by a change.
+    round: Option<([Option<f64>; MAX_WAVES as usize], bool)>,
+    since_test: u64,
+    backstop: u64,
+    /// Calibration in progress: the remaining forced depths (warm first).
+    calibrating: Option<Vec<(u64, bool)>>,
+    /// The latest reference sample's direction at the current depth.
+    direction: Option<bool>,
+    /// The last call's depth: a running call may only deepen from it.
+    last: u64,
+    /// The calibration warm call (never evidence).
+    warm: Option<u64>,
+    /// Evidence changed since the last [`Self::evidence`] read.
+    dirty: bool,
+    /// Prefill calls started so far.
     calls: u64,
 }
-
-fn class(boundary: Boundary) -> usize { match boundary { Boundary::Opening => 0, Boundary::Running => 1 } }
 
 impl WaveControl {
     /// Start at the planner's estimate `initial`, moved to the deepest depth
@@ -208,8 +259,11 @@ impl WaveControl {
         let k = if pinned { initial } else {
             *candidates.iter().find(|&&k| k >= initial).expect("max is a candidate")
         };
-        Self { k, unit_cap, pinned, candidates, recent: [[Recent::default(); 2]; MAX_WAVES as usize], latest: None,
-            calls: 0 }
+        let mut ratios = [None; MAX_WAVES as usize];
+        ratios[(k - 1) as usize] = Some(1.0);
+        Self { k, unit_cap, pinned, candidates, ratios, band: Vec::new(), outside: Vec::new(), trials: Vec::new(),
+            in_flight: Vec::new(), round: None, since_test: 0, backstop: BACKSTOP_FIRST, calibrating: None,
+            direction: None, last: k, warm: None, dirty: false, calls: 0 }
     }
     /// The wave count of the next prefill call.
     pub fn waves(&self) -> u64 { self.k }
@@ -217,80 +271,240 @@ impl WaveControl {
     pub fn unit_rows(&self) -> u64 { unit_for(self.k, self.unit_cap) }
     pub fn pinned(&self) -> bool { self.pinned }
     pub fn candidates(&self) -> &[u64] { &self.candidates }
+    /// Every candidate's ratio to the current depth (None: no evidence).
+    pub fn ratios(&self) -> Vec<(u64, Option<f64>)> {
+        self.candidates.iter().map(|&j| (j, self.ratios[(j - 1) as usize])).collect()
+    }
+    /// Whether the controller can move at all (unpinned, more than one candidate).
+    pub fn adaptive(&self) -> bool { !self.pinned && self.candidates.len() > 1 }
+    /// Whether every candidate has evidence.
+    pub fn calibrated(&self) -> bool { self.candidates.iter().all(|&j| self.ratios[(j - 1) as usize].is_some()) }
+
+    /// Starts calibration: the next calls run one warm call at the current
+    /// depth (not evidence), then one reference call at each candidate, the
+    /// current depth first. The caller makes each a reference call.
+    pub fn calibrate(&mut self) -> usize {
+        if !self.adaptive() { return 0; }
+        let mut plan = vec![(self.k, false), (self.k, true)];
+        plan.extend(self.candidates.iter().filter(|&&j| j != self.k).map(|&j| (j, true)));
+        let calls = plan.len();
+        self.calibrating = Some(plan);
+        calls
+    }
+    /// Ends calibration once every call reported: runs the best measured depth.
+    pub fn finish_calibration(&mut self) -> &'static str {
+        // Calibration calls still in flight stay trials: a late pace records
+        // (or, after a switch, re-queues) its depth.
+        self.calibrating = None;
+        self.trials.clear();
+        self.round = None;
+        self.since_test = 0;
+        match self.best(Boundary::Opening) {
+            Some(j) if j != self.k => { self.switch(j); "calibrated: switched" }
+            _ => "calibrated: held",
+        }
+    }
+
+    /// The persisted evidence, and whether it changed since the last read.
+    pub fn evidence(&mut self) -> (Evidence, bool) {
+        let dirty = std::mem::take(&mut self.dirty);
+        (Evidence { waves: self.k, ratios: self.candidates.iter()
+            .filter_map(|&j| self.ratios[(j - 1) as usize].map(|r| (j, r))).collect(),
+            band: self.band.clone(), since_test: self.since_test, backstop: self.backstop }, dirty)
+    }
+    /// Restores persisted evidence; refuses evidence that does not fit these candidates.
+    pub fn restore(&mut self, evidence: &Evidence) -> Result<(), &'static str> {
+        if self.pinned { return Err("pinned"); }
+        if !self.candidates.contains(&evidence.waves) { return Err("current depth is not a candidate"); }
+        let mut ratios = [None; MAX_WAVES as usize];
+        for &(j, r) in &evidence.ratios {
+            if !self.candidates.contains(&j) || !(r.is_finite() && r > 0.0) { return Err("ratio outside the candidates"); }
+            ratios[(j - 1) as usize] = Some(r);
+        }
+        if ratios[(evidence.waves - 1) as usize].is_none_or(|r| (r - 1.0).abs() > 1e-9) {
+            return Err("current depth's ratio is not 1");
+        }
+        if evidence.band.len() > BAND_SAMPLES || evidence.band.iter().any(|p| !(p.is_finite() && *p > 0.0))
+            || !(BACKSTOP_FIRST..=BACKSTOP_MAX).contains(&evidence.backstop) {
+            return Err("band or backstop out of range");
+        }
+        self.k = evidence.waves;
+        self.last = evidence.waves;
+        self.ratios = ratios;
+        self.band = evidence.band.clone();
+        self.since_test = evidence.since_test.min(evidence.backstop);
+        self.backstop = evidence.backstop;
+        self.outside.clear();
+        self.trials.clear();
+        Ok(())
+    }
 
     fn neighbour(&self, k: u64, up: bool) -> Option<u64> {
         let at = self.candidates.iter().position(|&j| j == k)?;
         if up { self.candidates.get(at + 1).copied() } else { at.checked_sub(1).map(|i| self.candidates[i]) }
     }
+    fn ratio(&self, j: u64) -> Option<f64> { self.ratios[(j - 1) as usize] }
+    /// The shallowest depth a call at `boundary` may run: any at an
+    /// opening, at least the previous call's at a running call.
+    fn floor(&self, boundary: Boundary) -> u64 { if boundary == Boundary::Opening { 1 } else { self.last } }
 
-    fn evidence(&self, k: u64, boundary: Boundary, now: u64) -> Option<f64> {
-        let recent = &self.recent[(k - 1) as usize][class(boundary)];
-        match boundary { Boundary::Opening => recent.mean(now), Boundary::Running => recent.newest(now) }
+    /// The allowed depth with the lowest ratio, if it beats the current by MARGIN.
+    fn best(&self, boundary: Boundary) -> Option<u64> {
+        let floor = self.floor(boundary);
+        let (j, r) = self.candidates.iter().filter(|&&j| j >= floor)
+            .filter_map(|&j| self.ratio(j).map(|r| (j, r))).min_by(|a, b| a.1.total_cmp(&b.1))?;
+        (j != self.k && r < 1.0 - MARGIN).then_some(j)
     }
 
-    /// A call of `boundary` starts: returns its depth and id.
-    pub fn next(&mut self, boundary: Boundary) -> Decision {
+    /// Makes `j` the current depth: ratios re-based on it, a fresh band.
+    fn switch(&mut self, j: u64) {
+        if let Some(base) = self.ratio(j) {
+            for r in self.ratios.iter_mut().flatten() { *r /= base; }
+        }
+        self.ratios[(j - 1) as usize] = Some(1.0);
+        self.k = j;
+        self.band.clear();
+        self.outside.clear();
+        self.direction = None;
+        self.dirty = true;
+    }
+
+    /// A call starts: `boundary` and whether it is a reference call (an
+    /// opening at row 0 with at least 90% of a full call's rows). Returns
+    /// its depth and id.
+    pub fn next(&mut self, boundary: Boundary, reference: bool) -> Decision {
         self.calls += 1;
-        let (now, previous) = (self.calls, self.k);
-        let reason = if self.pinned { "pinned" } else { self.decide(boundary, now) };
-        Decision { call: now, waves: self.k, unit_rows: self.unit_rows(), boundary,
-            transition: boundary == Boundary::Running && self.k != previous, reason }
+        let now = self.calls;
+        let reference = reference && boundary == Boundary::Opening;
+        let (waves, reason) = if self.pinned { (self.k, "pinned") } else { self.decide(boundary, reference, now) };
+        let previous = std::mem::replace(&mut self.last, waves);
+        Decision { call: now, waves, unit_rows: unit_for(waves, self.unit_cap), boundary, reference,
+            transition: boundary == Boundary::Running && waves != previous, reason }
     }
 
-    fn decide(&mut self, boundary: Boundary, now: u64) -> &'static str {
-        let k = self.k;
-        let allowed = |j: u64| boundary == Boundary::Opening || j >= k;
-        // The latest sample at this depth points at a neighbour (none past
-        // the end of the candidates: the other signal covers the other way).
-        let direction = self.latest.filter(|&(at, depth, _)| depth == k && now.saturating_sub(at) < EXPIRY_CALLS)
-            .and_then(|(_, _, up)| up);
-        let pointed = direction.and_then(|up| self.neighbour(k, up)).filter(|&j| allowed(j));
-        // A trial only where the neighbour has no fresh evidence in either class.
-        let unmeasured = |j: u64| [Boundary::Opening, Boundary::Running].iter()
-            .all(|&class| self.evidence(j, class, now).is_none());
-        if let Some(j) = pointed.filter(|&j| unmeasured(j)) {
-            self.k = j;
-            return if j < k { "Sparks wait: measure fewer, wider units" } else { "coordinator waits: measure more units" };
+    fn decide(&mut self, boundary: Boundary, reference: bool, now: u64) -> (u64, &'static str) {
+        // A trial whose pace never arrived (dropped by the executor) is forgotten.
+        self.in_flight.retain(|&(call, _)| now.saturating_sub(call) <= STALE_CALLS);
+        if let Some(plan) = &mut self.calibrating {
+            // Calibration calls run their forced depth (the caller makes them reference calls).
+            if !plan.is_empty() {
+                let (j, counted) = plan.remove(0);
+                if counted { if j != self.k { self.in_flight.push((now, j)); } } else { self.warm = Some(now); }
+                return (j, if counted { "calibrate" } else { "calibrate: warm" });
+            }
+            return (self.k, "calibrate: done");
         }
-        // Compare in the class where the current depth has evidence: a
-        // running call by adjacent running calls, or (right after an opening
-        // trial) by the opening calls; an opening call only by opening calls.
-        let classes: &[Boundary] = match boundary {
-            Boundary::Opening => &[Boundary::Opening],
-            Boundary::Running => &[Boundary::Running, Boundary::Opening],
-        };
-        let best = |class: Boundary| self.candidates.iter().filter(|&&j| allowed(j))
-            .filter_map(|&j| self.evidence(j, class, now).map(|p| (j, p)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        for &class in classes {
-            let Some(current) = self.evidence(k, class, now) else { continue };
-            return match best(class) {
-                Some((j, p)) if j != k && p < (1.0 - MARGIN) * current => { self.k = j; "best fresh period" }
-                _ => "hold",
-            };
+        // A pending trial runs at the next reference call (an opening: both
+        // directions allowed), once the current depth has a band to compare to.
+        if reference && !self.band.is_empty() {
+            while let Some(j) = self.trials.first().copied() {
+                self.trials.remove(0);
+                if j != self.k && self.candidates.contains(&j) {
+                    self.in_flight.push((now, j));
+                    return (j, "re-test");
+                }
+            }
+            // A signal only toward a neighbour with no evidence, and only one
+            // that beats the other wait by the margin (a tie: no trial).
+            if let Some(j) = self.direction.and_then(|up| self.neighbour(self.k, up))
+                .filter(|&j| self.ratio(j).is_none() && !self.in_flight.iter().any(|&(_, d)| d == j)) {
+                self.in_flight.push((now, j));
+                return (j, if j < self.k { "Sparks wait: measure fewer, wider units" }
+                    else { "coordinator waits: measure more units" });
+            }
         }
-        // No evidence for the current depth in any comparable class (a trial
-        // not yet reported, or a depth reached mid-prompt at its first
-        // opening call): hold it, so it is measured.
-        "hold"
+        let floor = self.floor(boundary);
+        if self.k < floor {
+            // A running call after a deeper trial: the prompt stays at least
+            // that deep (fewer units only at an opening); the best such depth.
+            let deeper = self.candidates.iter().filter(|&&j| j >= floor)
+                .filter_map(|&j| self.ratio(j).map(|r| (j, r))).min_by(|a, b| a.1.total_cmp(&b.1))
+                .map_or(floor, |(j, _)| j);
+            return (deeper, "running: no wider than the previous call");
+        }
+        match self.best(boundary) {
+            Some(j) => { self.switch(j); (j, "best ratio") }
+            None => (self.k, "hold"),
+        }
     }
 
     /// A finished call reports its pace (in any order, any time after it ran).
-    pub fn record(&mut self, decision: &Decision, rows: u64, pace: &PrefillPace) -> Sample {
-        let smallest = self.candidates.iter().map(|&k| unit_for(k, self.unit_cap)).min().unwrap_or(1);
-        let counted = !self.pinned && !decision.transition && pace.wall_us > 0
-            && rows as f64 >= SAMPLE_SHARE * smallest as f64 && self.candidates.contains(&decision.waves);
+    /// `full_rows` is a full call's rows (the reference threshold's base).
+    pub fn record(&mut self, decision: &Decision, rows: u64, full_rows: u64, pace: &PrefillPace) -> Sample {
+        let trial = self.in_flight.iter().position(|&(call, _)| call == decision.call)
+            .map(|at| self.in_flight.remove(at).1);
+        let warm = self.warm.is_some_and(|call| call == decision.call);
+        let counted = !self.pinned && !warm && decision.reference && pace.wall_us > 0
+            && rows as f64 >= REFERENCE_SHARE * full_rows as f64 && self.candidates.contains(&decision.waves);
+        let period = (pace.wall_us as f64) / rows.max(1) as f64;
         let mut sample = Sample { call: decision.call, waves: decision.waves, rows, boundary: decision.boundary, counted,
-            period_us: None, idle_share: pace.idle_share(), reply_wait_share: pace.reply_wait_share() };
-        if counted {
-            let recent = &mut self.recent[(decision.waves - 1) as usize][class(decision.boundary)];
-            recent.push(pace.wall_us as f64 / rows as f64, decision.call);
-            sample.period_us = Some(pace.wall_us as f64 / rows as f64);
-            if self.latest.is_none_or(|(at, _, _)| at < decision.call) {
-                self.latest = Some((decision.call, decision.waves, pace.direction()));
-            }
+            period_us: counted.then_some(period), idle_share: pace.idle_share(),
+            reply_wait_share: pace.reply_wait_share(), ratio: None };
+        if !counted { return sample; }
+        let j = decision.waves;
+        if j == self.k {
+            self.direction = pace.direction();
+            sample.ratio = Some(self.observe(period));
+        } else if !self.band.is_empty() {
+            // A trial at matched position: its ratio to the current depth's band mean.
+            let ratio = period / (self.band.iter().sum::<f64>() / self.band.len() as f64);
+            self.ratios[(j - 1) as usize] = Some(ratio);
+            sample.ratio = Some(ratio);
+            self.dirty = true;
+            if trial.is_some() { self.close_round(); }
+        } else if trial.is_some() {
+            // No band to compare against yet (the depth just switched): measure it again later.
+            self.trials.insert(0, j);
+            sample.counted = false;
         }
         sample
+    }
+
+    /// A reference period at the current depth: the band, or a change.
+    fn observe(&mut self, period: f64) -> f64 {
+        let mean = if self.band.is_empty() { period } else { self.band.iter().sum::<f64>() / self.band.len() as f64 };
+        let width = band_width(&self.band);
+        let side = if period > mean * (1.0 + width) { 1 } else if period < mean * (1.0 - width) { -1 } else { 0 };
+        self.dirty = true;
+        if self.band.len() >= 2 && side != 0 {
+            let same = self.outside.last().is_none_or(|&last| (last > mean) == (side > 0));
+            if !same { self.outside.clear(); }
+            self.outside.push(period);
+            if self.outside.len() >= CHANGE_CALLS {
+                // The current depth's period moved: re-base and re-test its neighbours.
+                self.band = std::mem::take(&mut self.outside);
+                self.start_round(true);
+            }
+            return period / mean;
+        }
+        self.outside.clear();
+        self.band.push(period);
+        if self.band.len() > BAND_SAMPLES { self.band.remove(0); }
+        self.since_test += 1;
+        if self.since_test >= self.backstop && self.trials.is_empty() && self.round.is_none() {
+            self.start_round(false);
+        }
+        period / mean
+    }
+
+    fn start_round(&mut self, changed: bool) {
+        self.trials = [false, true].iter().filter_map(|&up| self.neighbour(self.k, up)).collect();
+        self.since_test = 0;
+        if self.trials.is_empty() { return; }
+        self.round = Some((self.ratios, changed));
+    }
+
+    /// A re-test reported: once the round's trials are all in, the backstop
+    /// doubles if it confirmed the old ratios, else resets.
+    fn close_round(&mut self) {
+        if !self.trials.is_empty() || !self.in_flight.is_empty() { return; }
+        let Some((before, changed)) = self.round.take() else { return };
+        let width = band_width(&self.band).max(0.02);
+        let confirmed = !changed && self.candidates.iter().all(|&j| match (before[(j - 1) as usize], self.ratio(j)) {
+            (Some(old), Some(new)) => (new / old - 1.0).abs() <= width,
+            _ => true,
+        });
+        self.backstop = if confirmed { (self.backstop * 2).min(BACKSTOP_MAX) } else { BACKSTOP_FIRST };
     }
 }
 
@@ -298,235 +512,313 @@ impl WaveControl {
 mod tests {
     use super::*;
 
-    /// One call of `rows` rows through a k-deep pipeline at context `at`:
-    /// each unit of `u` rows costs the Sparks B = s(u)·u and the coordinator
-    /// T = τ(u)·u·(1 + rise·at/65536) (attention grows with context). With k
-    /// units circulating one completes per max(B, T, (T + B) / k); the Sparks
-    /// idle and the coordinator waits on replies for the rest of each period,
-    /// and the call adds one fill.
-    fn pace(k: u64, u: u64, rows: u64, at: u64, (s, tau, rise): (f64, f64, f64)) -> PrefillPace {
-        let (b, t) = (s * u as f64, tau * u as f64 * (1.0 + rise * at as f64 / 65536.0));
-        let period = b.max(t).max((t + b) / k as f64);
-        let units = rows.div_ceil(u) as f64;
-        let wall = units * period + (t + b - period).max(0.0);
-        PrefillPace { rows, ranks: vec![((units * b) as u64, (units * (period - b)) as u64); 6], wall_us: wall as u64,
-            reply_wait_us: Some((units * (period - t)) as u64) }
+    /// A depth's measured behaviour: (µs per row of a full opening call,
+    /// Spark idle share, coordinator reply-wait share, context rise: the
+    /// period's growth over a 64K prompt).
+    type Profile = (f64, f64, f64, f64);
+
+    /// One call of `rows` rows at context `at`: the full-call period grown
+    /// with context; a short call pays more fill per row (GLM's 4875-row
+    /// opening ran 325 µs/row against 283 for a full one); `scale`
+    /// multiplies the wall (power, noise).
+    fn pace(unit: u64, rows: u64, at: u64, (period, idle, reply, rise): Profile, scale: f64) -> PrefillPace {
+        let per_row = period * (1.0 + rise * at as f64 / 65536.0);
+        let fill = 0.4 * period * unit.min(rows) as f64 * (FULL - rows.min(FULL)) as f64 / FULL as f64;
+        let wall = (per_row * rows as f64 + fill) * scale;
+        let busy = wall * (1.0 - idle);
+        PrefillPace { rows, ranks: vec![(busy as u64, (wall * idle) as u64); 6], wall_us: wall as u64,
+            reply_wait_us: Some((wall * reply) as u64) }
     }
 
-    /// One call as run: its depth, boundary, transition flag and wall time.
+    /// One call as run.
     #[derive(Debug, Clone, Copy)]
-    struct Ran { k: u64, opening: bool, transition: bool, wall: u64 }
+    struct Ran { k: u64, opening: bool, reference: bool, transition: bool, reason: &'static str }
 
-    /// Runs prompts of the given lengths (each cut into `call_rows` calls)
-    /// through the controller, each call reported before the next starts;
-    /// `profile(u, prompt)` gives (s, τ, rise). Returns every call.
-    fn run(control: &mut WaveControl, prompts: &[u64], profile: impl Fn(u64, usize) -> (f64, f64, f64)) -> Vec<Ran> {
-        let call = call_rows(4, 4096);
+    const FULL: u64 = 8192;
+
+    /// Runs prompts (each cut into full calls) through the controller, each
+    /// call reported before the next starts. `profile(k, prompt)` gives the
+    /// depth's behaviour; `scale(call)` the wall factor of the n-th call.
+    fn run(control: &mut WaveControl, prompts: &[u64], profile: impl Fn(u64, usize) -> Profile,
+        scale: impl Fn(usize) -> f64) -> Vec<Ran> {
         let mut trace = Vec::new();
         for (prompt, &length) in prompts.iter().enumerate() {
             let mut at = 0;
             while at < length {
-                let rows = call.min(length - at);
+                let rows = FULL.min(length - at);
                 let boundary = if at == 0 { Boundary::Opening } else { Boundary::Running };
-                let decision = control.next(boundary);
-                let unit = decision.unit_rows;
-                let pace = pace(decision.waves, unit, rows, at, profile(unit, prompt));
-                control.record(&decision, rows, &pace);
-                trace.push(Ran { k: decision.waves, opening: at == 0, transition: decision.transition, wall: pace.wall_us });
+                let reference = at == 0 && rows as f64 >= REFERENCE_SHARE * FULL as f64;
+                let decision = control.next(boundary, reference);
+                let pace = pace(decision.unit_rows, rows, at, profile(decision.waves, prompt), scale(trace.len()));
+                control.record(&decision, rows, FULL, &pace);
+                trace.push(Ran { k: decision.waves, opening: at == 0, reference: decision.reference,
+                    transition: decision.transition, reason: decision.reason });
                 at += rows;
             }
         }
         trace
     }
+    /// Startup calibration: full reference calls at context 0, then the choice.
+    fn calibrate(control: &mut WaveControl, profile: impl Fn(u64) -> Profile) -> Vec<u64> {
+        let calls = control.calibrate();
+        let mut depths = Vec::new();
+        for _ in 0..calls {
+            let decision = control.next(Boundary::Opening, true);
+            control.record(&decision, FULL, FULL, &pace(decision.unit_rows, FULL, 0, profile(decision.waves), 1.0));
+            depths.push(decision.waves);
+        }
+        control.finish_calibration();
+        depths
+    }
     fn depths(trace: &[Ran]) -> Vec<u64> { trace.iter().map(|ran| ran.k).collect() }
+    fn quiet(_: usize) -> f64 { 1.0 }
+    /// ±0.75% deterministic noise (cards E: full openings at one depth
+    /// spread 1.2–1.6% peak to peak, e.g. GLM 3 x 2752 282.0–285.4 µs/row).
+    fn noisy(call: usize) -> f64 { 1.0 + 0.0075 * (((call * 2654435761) % 201) as f64 / 100.0 - 1.0) }
 
-    /// The cards' GLM K4 / Kimi BF16 figures (rw762-cards-a, per layer-wave
-    /// µs per row: Spark busy, and a coordinator turnaround reproducing each
-    /// depth's measured period and Spark idle) and Step FP8's A8-wire unit
-    /// runs (#802: 3 x 2752 delivered 2720 tok/s at 8K, 4 x 2048 2483,
-    /// 2 x 4096 2347): 3 x 2752 is best. Kimi's coordinator cost rises 4x
-    /// over a 64K prompt (rw762-cards-d: 526 → 2105 µs/row per call).
-    fn measured(family: &str) -> impl Fn(u64, usize) -> (f64, f64, f64) + Copy {
-        let family = match family { "glm" => 0, "kimi" => 1, _ => 2 };
-        move |unit: u64, _| match (family, unit) {
-            (0, 4096) => (3.36, 4.90, 0.0), (0, 2752) => (3.71, 4.00, 0.0), (0, _) => (3.90, 4.34, 0.0),
-            (1, 4096) => (4.45, 6.19, 3.0), (1, 2752) => (4.97, 5.90, 3.0), (1, _) => (5.40, 6.65, 3.0),
-            (_, 4096) => (350.0, 426.1, 0.1), (_, 2752) => (367.6, 300.0, 0.1), (_, _) => (380.0, 402.7, 0.1),
+    /// Cards E opening calls (rw762-cards-e coordinator logs, 2 RTX + 6
+    /// Sparks): every family's best is 3 x 2752, and at 3 both waits fire
+    /// (GLM reply-wait 0.42 over idle 0.07; Step 0.29 and 0.29). GLM's
+    /// 2 x 4096 was not run in E (estimated from WS/W3 cards). Kimi's running
+    /// calls slow ~3x over a 64K prompt; Step's ~14%; GLM's ~4%.
+    fn measured(family: &str) -> fn(u64) -> Profile {
+        match family {
+            "glm" => |k| match k { 2 => (300.0, 0.15, 0.30, 0.04), 3 => (283.0, 0.071, 0.42, 0.04),
+                _ => (305.4, 0.074, 0.45, 0.04) },
+            "kimi" => |k| match k { 2 => (552.8, 0.27, 0.11, 3.0), 3 => (515.0, 0.125, 0.003, 3.0),
+                _ => (535.3, 0.083, 0.066, 3.0) },
+            _ => |k| match k { 2 => (390.3, 0.463, 0.414, 0.14), 3 => (362.0, 0.286, 0.29, 0.14),
+                _ => (376.8, 0.194, 0.326, 0.14) },
         }
     }
-
-    /// Spark-bound: the superseded BF16-input Step kernel, where 2048-row
-    /// units cost the Sparks far less per row than wider ones.
-    fn cliff(unit: u64) -> (f64, f64, f64) { (match unit { 4096 => 5.1, 2752 => 6.0, _ => 4.1 }, 2.0, 0.0) }
-    /// Coordinator-bound: a fixed per-unit coordinator cost, cheaper per row in wider units.
-    fn bound(unit: u64) -> (f64, f64, f64) { (1.5, 1.0 + 4_000.0 / unit as f64, 0.0) }
-    /// A mix of 8K and 64K prompts.
-    fn mixed(prompts: usize) -> Vec<u64> { (0..prompts).map(|p| if p % 3 == 2 { 65536 } else { 8192 }).collect() }
+    /// Spark-bound: more, smaller units win; the coordinator waits on replies.
+    fn cliff(k: u64) -> Profile { match k { 2 => (420.0, 0.0, 0.30, 0.0), 3 => (380.0, 0.0, 0.20, 0.0), _ => (340.0, 0.0, 0.10, 0.0) } }
+    /// Coordinator-bound: fewer, wider units win; the Sparks idle.
+    fn bound(k: u64) -> Profile { match k { 2 => (300.0, 0.10, 0.0, 0.0), 3 => (330.0, 0.25, 0.0, 0.0), _ => (360.0, 0.35, 0.0, 0.0) } }
+    /// A mix of short, 8K and 64K prompts.
+    fn mixed(prompts: usize) -> Vec<u64> {
+        (0..prompts).map(|p| match p % 4 { 0 => 900, 1 | 2 => 8192, _ => 65536 }).collect()
+    }
 
     #[test]
-    fn measured_glm_kimi_and_step_figures_settle_on_three_by_2752() {
-        for family in ["glm", "kimi", "step"] {
-            // From the planner's estimate (3) or the deepest depth.
-            for start in 3..=4 {
+    fn calibration_measures_every_depth_and_picks_the_best() {
+        for (family, best) in [("glm", 3), ("kimi", 3), ("step", 3)] {
+            for start in [2, 3, 4] {
                 let mut control = WaveControl::new(start, 4, 4096, false);
-                let prompts = mixed(60);
-                let trace = run(&mut control, &prompts, measured(family));
-                let mut fixed = WaveControl::new(3, 4, 4096, true);
-                let wall = |trace: &[Ran]| trace[8..].iter().map(|ran| ran.wall as f64).sum::<f64>();
-                let cost = wall(&trace) / wall(&run(&mut fixed, &prompts, measured(family)));
-                eprintln!("{family} start {start}: adaptive/static-3 wall {cost:.4}");
-                // Settled on 3: most of the last prompts open at 3 (one may be a trial).
-                let opened: Vec<u64> = trace.iter().filter(|ran| ran.opening).map(|ran| ran.k).collect();
-                assert!(opened[opened.len() - 4..].iter().filter(|&&k| k == 3).count() >= 3,
-                    "{family} start {start}: {:?}", depths(&trace));
-                // Away from 3 only to measure a neighbour, each after an expiry:
-                // a wider trial is one opening call; a narrower one (a running
-                // call may only deepen) lasts at most to its prompt's end and
-                // one more opening call (eight 8K calls of a 64K prompt + 1).
-                let (mut entries, mut away) = (0, 0);
-                for pair in trace[8..].windows(2) {
-                    if pair[1].k != 3 && pair[0].k == 3 { entries += 1; }
-                    away = if pair[1].k == 3 { 0 } else { away + 1 };
-                    assert!(away <= 9, "{family}: {:?}", depths(&trace));
-                }
-                assert!(entries <= 2 * trace.len() / EXPIRY_CALLS as usize + 2, "{family} start {start}: {:?}",
-                    depths(&trace));
-                assert!(cost < 1.06, "{family} start {start}: {cost}");
+                let ran = calibrate(&mut control, measured(family));
+                // One warm call at the start depth, then each depth once.
+                assert_eq!(ran.len(), 4, "{family}: {ran:?}");
+                assert_eq!(ran[..2], [start, start]);
+                assert!(control.calibrated(), "{family}: {:?}", control.ratios());
+                assert_eq!(control.waves(), best, "{family} start {start}: {:?}", control.ratios());
             }
         }
-    }
-
-    #[test]
-    fn a_coordinator_bound_optimum_with_no_reply_wait_holds_without_a_costly_excursion() {
-        // GLM at 3 x 2752: the Sparks idle 7% (pointing at fewer, wider units),
-        // the coordinator never waits on replies. 2 x 4096 measures worse, so 3
-        // holds; each re-measure of 2 (after its evidence expires) costs one
-        // opening call, never a whole long prompt.
         let mut control = WaveControl::new(3, 4, 4096, false);
-        let trace = run(&mut control, &mixed(60), measured("glm"));
-        let trials: Vec<&Ran> = trace.iter().filter(|ran| ran.k == 2).collect();
-        assert!(!trials.is_empty() && trials.iter().all(|ran| ran.opening), "{:?}", depths(&trace));
-        assert!(trials.len() <= trace.len() / EXPIRY_CALLS as usize + 1, "{} trials: {:?}", trials.len(), depths(&trace));
-        assert!(trace.iter().all(|ran| ran.k != 4), "nothing points at more units: {:?}", depths(&trace));
-        // Every call after a trial returns to 3 at once (the trial is never held).
-        for pair in trace.windows(2) {
-            if pair[0].k == 2 { assert_eq!(pair[1].k, 3, "{:?}", depths(&trace)); }
-        }
-    }
-
-    #[test]
-    fn a_spark_bound_pipeline_steps_to_more_windows_inside_a_long_prompt() {
-        // Starting at 3, the coordinator waits on the Sparks: the second call
-        // of the first 64K prompt already runs 4 x 2048 (a transition call),
-        // and the depth stays at 4 for the rest of the prompt and after.
-        let mut control = WaveControl::new(3, 4, 4096, false);
-        let trace = run(&mut control, &[65536; 6], |unit, _| cliff(unit));
-        assert_eq!(depths(&trace[..3]), [3, 4, 4], "{:?}", depths(&trace));
-        assert!(trace[1].transition && !trace[2].transition);
-        assert!(trace[8..].iter().all(|ran| ran.k == 4), "{:?}", depths(&trace));
+        calibrate(&mut control, cliff);
         assert_eq!(control.waves(), 4);
-    }
-
-    #[test]
-    fn a_coordinator_bound_pipeline_widens_only_at_an_opening_call() {
-        let mut control = WaveControl::new(4, 4, 4096, false);
-        let trace = run(&mut control, &[65536; 8], |unit, _| bound(unit));
-        for pair in trace.windows(2) {
-            assert!(pair[1].k >= pair[0].k || pair[1].opening, "widened mid-prompt: {:?}", depths(&trace));
-        }
-        // The whole first prompt runs at 4; the next opening widens to 3, then 2.
-        assert!(trace[..8].iter().all(|ran| ran.k == 4), "{:?}", depths(&trace));
-        assert_eq!(control.waves(), 2, "{:?}", depths(&trace));
-    }
-
-    #[test]
-    fn transition_calls_are_never_samples() {
         let mut control = WaveControl::new(3, 4, 4096, false);
-        let opening = control.next(Boundary::Opening);
-        let spark_bound = pace(3, 2752, 8192, 0, cliff(2752));
-        assert!(control.record(&opening, 8192, &spark_bound).counted);
-        let transition = control.next(Boundary::Running);
-        assert!(transition.transition && transition.waves == 4, "{transition:?}");
-        let sample = control.record(&transition, 8192, &pace(4, 2048, 8192, 8192, cliff(2048)));
-        assert!(!sample.counted && sample.period_us.is_none());
-        // The next call at 4 is the first sample for 4.
-        let steady = control.next(Boundary::Running);
-        assert!(!steady.transition && steady.waves == 4);
-        assert!(control.record(&steady, 8192, &pace(4, 2048, 8192, 16384, cliff(2048))).counted);
-        // A depth change at an opening call is a sample (nothing in flight).
-        let mut control = WaveControl::new(3, 4, 4096, false);
-        let first = control.next(Boundary::Opening);
-        control.record(&first, 8192, &pace(3, 2752, 8192, 0, bound(2752)));
-        let trial = control.next(Boundary::Opening);
-        assert!(trial.waves == 2 && !trial.transition);
-        assert!(control.record(&trial, 8192, &pace(2, 4096, 8192, 0, bound(4096))).counted);
-    }
-
-    #[test]
-    fn a_depth_switch_costs_no_more_than_the_depths_own_calls() {
-        // The first call at a new depth (after a switch) costs the same as
-        // later calls at that depth and context: no first-use penalty, and a
-        // trial costs one call, not a whole prompt.
-        let mut control = WaveControl::new(3, 4, 4096, false);
-        let trace = run(&mut control, &[8192; 10], |unit, _| bound(unit));
-        let at = |k: u64| trace.iter().filter(|ran| ran.k == k).map(|ran| ran.wall).collect::<Vec<_>>();
-        for k in [2, 3] {
-            let walls = at(k);
-            assert!(walls.windows(2).all(|w| w[0] == w[1]), "k {k}: {walls:?}");
-        }
-        let mut control = WaveControl::new(3, 4, 4096, false);
-        let trace = run(&mut control, &mixed(30), measured("kimi"));
-        // Kimi's 64K prompts: a trial at 2 is one opening call; the rest of the
-        // prompt runs the chosen depth.
-        let mut runs = Vec::new();
-        for ran in &trace {
-            match runs.last_mut() { Some((k, n)) if *k == ran.k => *n += 1, _ => runs.push((ran.k, 1)) }
-        }
-        assert!(runs.iter().filter(|(k, _)| *k == 2).all(|&(_, n)| n == 1), "{runs:?}");
-    }
-
-    #[test]
-    fn a_workload_shift_reconverges_within_an_expiry_period() {
-        // First Spark-bound (best 4), then coordinator-bound (best 2): the old
-        // evidence expires and the waits lead the controller down.
-        let shift = 20;
-        let profile = |unit: u64, prompt: usize| if prompt < shift { cliff(unit) } else { bound(unit) };
-        let mut control = WaveControl::new(3, 4, 4096, false);
-        let trace = run(&mut control, &[8192; 20 + 3 * EXPIRY_CALLS as usize], profile);
-        assert_eq!(trace[shift - 1].k, 4, "{:?}", depths(&trace));
-        let first = trace[shift..].iter().position(|ran| ran.k == 2).expect("reaches 2");
-        assert!(first <= EXPIRY_CALLS as usize, "{:?}", depths(&trace));
+        calibrate(&mut control, bound);
         assert_eq!(control.waves(), 2);
+        // A pinned or single-candidate controller never calibrates.
+        assert_eq!(WaveControl::new(3, 4, 4096, true).calibrate(), 0);
+        assert_eq!(WaveControl::new(4, 4, 2048, false).calibrate(), 0);
     }
 
     #[test]
-    fn evidence_expires_and_small_calls_and_pins_hold() {
-        // Without a signal (both waits between the thresholds) nothing is re-measured.
-        let quiet = |unit: u64, _| match unit { 4096 => (3.36, 3.36, 0.0), 2752 => (3.0, 3.06, 0.0), _ => (3.9, 3.9, 0.0) };
+    fn the_measured_optimum_holds_with_both_signals_firing() {
+        // GLM, Kimi and Step at 3 x 2752: idle and (GLM, Step) reply-wait both
+        // fire, but 4 and 2 have evidence that they lose. After calibration no
+        // call runs off 3 in a card-sized run (60 mixed prompts with noise)...
+        for family in ["glm", "kimi", "step"] {
+            let profile = measured(family);
+            let probe = pace(2752, FULL, 0, profile(3), 1.0);
+            assert!(probe.idle_share().unwrap() > IDLE_HIGH, "{family}: {probe:?}");
+            let mut control = WaveControl::new(3, 4, 4096, false);
+            calibrate(&mut control, profile);
+            let trace = run(&mut control, &mixed(60), |k, _| profile(k), noisy);
+            let off: Vec<_> = trace.iter().enumerate().filter(|(_, ran)| ran.k != 3).collect();
+            assert!(off.is_empty(), "{family}: {off:?}");
+            // ...and over 2,000 prompts it leaves 3 only for backstop re-tests,
+            // each confirming the old ratios (so their interval doubles): a
+            // deeper re-test opening a 64K prompt holds to that prompt's end.
+            let mut control = WaveControl::new(3, 4, 4096, false);
+            calibrate(&mut control, profile);
+            let trace = run(&mut control, &mixed(2000), |k, _| profile(k), noisy);
+            let rounds = trace.iter().filter(|ran| ran.reason == "re-test" && ran.k == 2).count();
+            let off = trace.iter().filter(|ran| ran.k != 3).count();
+            assert!((1..=4).contains(&rounds) && off <= rounds * 9, "{family}: {rounds} rounds, {off} off");
+            assert!(trace.iter().filter(|ran| ran.k != 3).all(|ran| ran.reason == "re-test"
+                || ran.reason.starts_with("running")), "{family}");
+        }
+    }
+
+    #[test]
+    fn a_quiet_run_of_sixty_calls_never_re_tests() {
+        for profile in [measured("glm"), measured("step")] {
+            let mut control = WaveControl::new(3, 4, 4096, false);
+            calibrate(&mut control, profile);
+            let trace = run(&mut control, &[8192; 60], |k, _| profile(k), noisy);
+            assert!(trace.iter().all(|ran| ran.k == 3 && ran.reason == "hold"), "{:?}", depths(&trace));
+        }
+    }
+
+    #[test]
+    fn single_call_dips_do_not_trigger_a_re_test() {
+        // A power-capped call (2x) every 7th call: never two in a row.
         let mut control = WaveControl::new(3, 4, 4096, false);
-        let trace = run(&mut control, &[8192; 60], quiet);
+        calibrate(&mut control, measured("glm"));
+        let trace = run(&mut control, &[8192; 50], |k, _| measured("glm")(k),
+            |call| if call % 7 == 3 { 2.0 } else { noisy(call) });
         assert!(trace.iter().all(|ran| ran.k == 3), "{:?}", depths(&trace));
-        // Calls below 60% of the smallest unit (2048) are not samples, but advance the clock.
-        let mut control = WaveControl::new(4, 4, 4096, false);
-        let trace = run(&mut control, &[1000; 20], |unit, _| bound(unit));
-        assert!(trace.iter().all(|ran| ran.k == 4), "{:?}", depths(&trace));
-        let mut pinned = WaveControl::new(2, 4, 4096, true);
-        let trace = run(&mut pinned, &mixed(20), |unit, _| cliff(unit));
-        assert!(trace.iter().all(|ran| ran.k == 2), "{:?}", depths(&trace));
-        let decision = control.next(Boundary::Opening);
-        assert!(!control.record(&decision, 8192, &PrefillPace::default()).counted);
     }
 
     #[test]
-    fn the_larger_wait_share_picks_the_direction() {
+    fn a_step_change_in_the_current_depth_re_tests_its_neighbours() {
+        // After 20 calls the current depth (3 x 2752) slows 15% (a kernel or
+        // power change at that unit only): the controller re-tests 2 and 4
+        // once each and moves to the new best.
+        let shift = 20;
+        let profile = move |k: u64, prompt: usize| {
+            let (period, idle, reply, rise) = measured("glm")(k);
+            if prompt >= shift && k == 3 { (period * 1.15, idle, reply, rise) } else { (period, idle, reply, rise) }
+        };
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("glm"));
+        let trace = run(&mut control, &[8192; 40], profile, quiet);
+        assert!(trace[..shift].iter().all(|ran| ran.k == 3), "{:?}", depths(&trace));
+        let tests: Vec<_> = trace.iter().filter(|ran| ran.reason == "re-test").map(|ran| ran.k).collect();
+        assert_eq!(tests, [2, 4], "{:?}", depths(&trace));
+        // GLM's 2 x 4096 (300 µs/row) now beats 4 x 2048 (305) and 3 (325): it moves to 2.
+        assert!(trace[shift + 6..].iter().all(|ran| ran.k == 2), "{:?}", depths(&trace));
+        // A uniform slowdown (every depth, e.g. power) re-tests once but stays at 3.
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("glm"));
+        let trace = run(&mut control, &[8192; 40], |k, _| measured("glm")(k),
+            |call| if call >= shift { 1.2 } else { 1.0 });
+        let tests = trace.iter().filter(|ran| ran.reason == "re-test").count();
+        assert_eq!(tests, 2, "{:?}", depths(&trace));
+        assert!(trace.iter().filter(|ran| ran.reason != "re-test").all(|ran| ran.k == 3), "{:?}", depths(&trace));
+    }
+
+    #[test]
+    fn the_backstop_re_tests_after_quiet_reference_calls_and_doubles() {
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("step"));
+        let trace = run(&mut control, &[8192; 400], |k, _| measured("step")(k), quiet);
+        let at: Vec<usize> = trace.iter().enumerate().filter(|(_, ran)| ran.reason == "re-test").map(|(i, _)| i).collect();
+        // The first round after 64 quiet reference calls (two trials), the next after 128 more.
+        assert_eq!(at.len(), 4, "{at:?}");
+        assert!(at[0] >= BACKSTOP_FIRST as usize && at[2] - at[0] >= 2 * BACKSTOP_FIRST as usize, "{at:?}");
+        assert!(trace.iter().filter(|ran| ran.reason != "re-test").all(|ran| ran.k == 3));
+    }
+
+    #[test]
+    fn signals_trigger_only_toward_a_depth_without_evidence_and_ties_are_no_trial() {
+        // Uncalibrated (calibration skipped): GLM's reply-wait (0.42) beats idle
+        // (0.07), so the first full opening measures 4, which loses: 3 holds.
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        let trace = run(&mut control, &[8192; 12], |k, _| measured("glm")(k), quiet);
+        assert_eq!(depths(&trace)[..3], [3, 4, 3], "{:?}", depths(&trace));
+        assert!(trace[3..].iter().all(|ran| ran.k == 3), "{:?}", depths(&trace));
+        // Step's waits tie (0.29 vs 0.29): no trial, 3 holds unmeasured neighbours.
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        let trace = run(&mut control, &[8192; 30], |k, _| measured("step")(k), quiet);
+        assert!(trace.iter().all(|ran| ran.k == 3), "{:?}", depths(&trace));
+        // Calibrated, both signals firing never trigger a trial.
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("glm"));
+        let trace = run(&mut control, &[8192; 30], |k, _| measured("glm")(k), quiet);
+        assert!(trace.iter().all(|ran| ran.k == 3), "{:?}", depths(&trace));
+    }
+
+    #[test]
+    fn the_larger_wait_share_must_beat_the_other_by_the_margin() {
         let p = |idle: u64, reply: u64| PrefillPace { rows: 100, ranks: vec![(1000 - idle, idle)], wall_us: 1000,
             reply_wait_us: Some(reply) };
         assert_eq!(p(100, 0).direction(), Some(false));
         assert_eq!(p(0, 100).direction(), Some(true));
-        assert_eq!(p(100, 200).direction(), Some(true));
-        assert_eq!(p(200, 100).direction(), Some(false));
+        assert_eq!(p(70, 420).direction(), Some(true));
+        assert_eq!(p(300, 100).direction(), Some(false));
+        // Within 1.5x and 0.10 of each other: a tie.
+        assert_eq!(p(290, 290).direction(), None);
+        assert_eq!(p(100, 140).direction(), None);
         assert_eq!(p(20, 20).direction(), None);
         assert_eq!(PrefillPace { reply_wait_us: None, ..p(20, 0) }.direction(), None);
+    }
+
+    #[test]
+    fn running_calls_deepen_with_the_evidence_and_widen_only_at_openings() {
+        // Coordinator-bound start at 4 with calibration: the next opening
+        // widens to 2; a running call never widens past the previous call.
+        let mut control = WaveControl::new(4, 4, 4096, false);
+        calibrate(&mut control, bound);
+        assert_eq!(control.waves(), 2);
+        let trace = run(&mut control, &[65536; 4], |k, _| bound(k), quiet);
+        for pair in trace.windows(2) {
+            assert!(pair[1].k >= pair[0].k || pair[1].opening, "widened mid-prompt: {:?}", depths(&trace));
+        }
+        assert!(trace.iter().all(|ran| ran.k == 2), "{:?}", depths(&trace));
+        // Evidence that a deeper depth wins moves a running call deeper (a
+        // transition call), and later openings stay there.
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("glm"));
+        let evidence = Evidence { waves: 3, ratios: vec![(2, 1.1), (3, 1.0), (4, 0.9)], band: vec![282.0; 4],
+            since_test: 0, backstop: BACKSTOP_FIRST };
+        control.restore(&evidence).unwrap();
+        let decision = control.next(Boundary::Running, false);
+        assert!(decision.waves == 4 && decision.transition, "{decision:?}");
+    }
+
+    #[test]
+    fn short_and_running_calls_are_logged_but_never_evidence() {
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("kimi"));
+        let before = control.ratios();
+        // Kimi's running calls slow 4x with context, and short prompts are
+        // slow per row: neither moves the evidence.
+        let trace = run(&mut control, &[65536, 900, 4000, 65536], |k, _| measured("kimi")(k), quiet);
+        assert!(trace.iter().all(|ran| ran.k == 3), "{:?}", depths(&trace));
+        assert_eq!(control.ratios(), before);
+        assert_eq!(trace.iter().filter(|ran| ran.reference).count(), 2);
+        let decision = control.next(Boundary::Opening, true);
+        assert!(!control.record(&decision, 4000, FULL, &pace(2752, 4000, 0, measured("kimi")(3), 1.0)).counted);
+        let decision = control.next(Boundary::Opening, true);
+        assert!(!control.record(&decision, FULL, FULL, &PrefillPace::default()).counted);
+        // Pins never move and never count.
+        let mut pinned = WaveControl::new(2, 4, 4096, true);
+        let trace = run(&mut pinned, &mixed(20), |k, _| cliff(k), quiet);
+        assert!(trace.iter().all(|ran| ran.k == 2 && !ran.transition), "{:?}", depths(&trace));
+    }
+
+    #[test]
+    fn evidence_round_trips_and_mismatched_evidence_is_refused() {
+        let mut control = WaveControl::new(3, 4, 4096, false);
+        calibrate(&mut control, measured("glm"));
+        run(&mut control, &[8192; 5], |k, _| measured("glm")(k), quiet);
+        let (evidence, dirty) = control.evidence();
+        assert!(dirty && !control.evidence().1);
+        let json = serde_json::to_string(&evidence).unwrap();
+        let mut restored = WaveControl::new(4, 4, 4096, false);
+        restored.restore(&serde_json::from_str(&json).unwrap()).unwrap();
+        assert!(restored.calibrated());
+        assert_eq!(restored.waves(), control.waves());
+        for ((j, a), (i, b)) in restored.ratios().into_iter().zip(control.ratios()) {
+            assert!(j == i && (a.unwrap() - b.unwrap()).abs() < 1e-12);
+        }
+        // Restored, it runs the same depths as the original.
+        let a = run(&mut control, &mixed(20), |k, _| measured("glm")(k), quiet);
+        let b = run(&mut restored, &mixed(20), |k, _| measured("glm")(k), quiet);
+        assert_eq!(depths(&a), depths(&b));
+        let bad = |edit: fn(&mut Evidence)| { let mut e = evidence.clone(); edit(&mut e);
+            WaveControl::new(3, 4, 4096, false).restore(&e).is_err() };
+        assert!(bad(|e| e.waves = 1));
+        assert!(bad(|e| e.ratios.push((1, 1.2))));
+        assert!(bad(|e| e.ratios[0].1 = f64::NAN));
+        assert!(bad(|e| e.ratios.retain(|&(j, _)| j != e.waves)));
+        assert!(bad(|e| e.band = vec![1.0; 9]));
+        assert!(bad(|e| e.backstop = 0));
+        assert!(WaveControl::new(3, 4, 2752, false).restore(&evidence).is_err());
+        assert!(WaveControl::new(3, 4, 4096, true).restore(&evidence).is_err());
     }
 
     #[test]

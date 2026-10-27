@@ -340,7 +340,9 @@ fn with_backend<T>(args: &ServeArgs,
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
-            usize::from(args.prefill_slots), args.prefill_rows as usize, args.prefill_slots == args.prefill_waves)?)?;
+            usize::from(args.prefill_slots), args.prefill_rows as usize, args.prefill_slots == args.prefill_waves)?)?
+        .with_identity(crate::shared::prefill_depth::DeploymentIdentity::new(&library, &args.peers,
+            format!("tp{}-split{}", args.peers.len(), args.split_device.is_some())));
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,

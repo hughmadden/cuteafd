@@ -25,12 +25,19 @@ pub(crate) struct KimiBackend<'e, 'a> {
     geometry: scheduler::Geometry,
     steady_census: Cell<bool>,
     origins: RefCell<Vec<usize>>,
+    /// The deployment's identity for the prefill depth calibration key (#762).
+    identity: Option<crate::shared::prefill_depth::DeploymentIdentity>,
 }
 
 impl<'e, 'a> KimiBackend<'e, 'a> {
     pub(crate) fn new(engine: &'e Engine<'a>) -> Result<Self> {
         Ok(Self { engine, profile: RefCell::new([0.0; 2]), geometry: engine.geometry()?,
-            steady_census: Cell::new(false), origins: RefCell::new(vec![0; engine.geometry()?.slots]) })
+            steady_census: Cell::new(false), origins: RefCell::new(vec![0; engine.geometry()?.slots]), identity: None })
+    }
+    /// Calibrates the adaptive prefill depth before readiness, keyed by `identity` (#762).
+    pub(crate) fn with_identity(mut self, identity: crate::shared::prefill_depth::DeploymentIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 }
 
@@ -228,6 +235,10 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn probe_end(&self) { self.engine.probe_end(); }
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
         self.engine.probe_finish(observe)
+    }
+    fn prefill_depth(&self) -> Option<(&crate::shared::prefill_depth::PrefillDepth,
+        crate::shared::prefill_depth::DeploymentIdentity)> {
+        Some((self.engine.prefill_depth(), self.identity.clone()?))
     }
 }
 

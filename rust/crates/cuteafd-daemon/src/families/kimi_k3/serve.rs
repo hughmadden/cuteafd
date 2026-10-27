@@ -137,7 +137,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
             })?;
             crate::shared::memory_report::release_load_staging(&library);
-            let backend = KimiBackend::new(&loaded.engine)?;
+            let backend = KimiBackend::new(&loaded.engine)?.with_identity(
+                crate::shared::prefill_depth::DeploymentIdentity::new(&library, &worker_args.peers, "tp2-head-split"));
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device)?;

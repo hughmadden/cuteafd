@@ -149,6 +149,8 @@ pub(super) struct Step5Backend<'e, 'a> {
     /// Prefill units: the admitted unit and slots, and the runtime depth (#762).
     prefill: (usize, usize),
     depth: Option<crate::shared::prefill_depth::PrefillDepth>,
+    /// The deployment's identity for the prefill depth calibration key (#762).
+    identity: Option<crate::shared::prefill_depth::DeploymentIdentity>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -181,7 +183,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false, prefill: (rows, 1), depth: None })
+            full_prefill_logits: false, prefill: (rows, 1), depth: None, identity: None })
     }
 
     /// Prefill units: `depth`'s admitted slots of its unit cut from the
@@ -196,6 +198,12 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         Ok(self)
     }
 
+
+    /// Calibrates the adaptive prefill depth before readiness, keyed by `identity` (#762).
+    pub(super) fn with_identity(mut self, identity: crate::shared::prefill_depth::DeploymentIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
 
     /// The head was admitted at chunk width: all-row prefill scoring is served.
     pub(super) fn with_full_prefill_logits(mut self, enabled: bool) -> Self {
@@ -278,11 +286,11 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             let (key, start) = (descriptors[0].sequence, descriptors[0].base);
             let next = match self.execution.with_link(|link| {
                 depth.report(link.exchange()?.take_prefill()?);
-                let next = depth.start(key, start);
+                let next = depth.start(key, start, first_row);
                 link.set_geometry(next.waves, next.unit_rows)?;
                 link.exchange()?.begin_prefill(next.call)?;
                 Ok(next)
-            })? { Some(next) => next, None => depth.start(key, start) };
+            })? { Some(next) => next, None => depth.start(key, start, first_row) };
             let units = crate::shared::prefill_pipeline::prefill_units(first_row, next.unit_rows, next.waves, 64)?
                 .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index,
                     sequence: 0, rows, layers: 0..92, slot: index % next.waves, barrier: false }).collect::<Vec<_>>();
@@ -517,6 +525,10 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn probe_begin(&self, _rows: usize) {}
     fn probe_end(&self) {}
     fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn prefill_depth(&self) -> Option<(&crate::shared::prefill_depth::PrefillDepth,
+        crate::shared::prefill_depth::DeploymentIdentity)> {
+        Some((self.depth.as_ref()?, self.identity.clone()?))
+    }
 }
 
 #[cfg(test)]

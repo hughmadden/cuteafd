@@ -221,6 +221,9 @@ impl<'a> Engine<'a> {
             hops, peer, exchange_streams, prefill })
     }
 
+    /// The runtime prefill depth controller (#762).
+    pub(crate) fn prefill_depth(&self) -> &crate::shared::prefill_depth::PrefillDepth { &self.depth }
+
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
         let mut prefix = self.prefix.try_borrow_mut()?;
         if let Some(prefix) = prefix.as_ref() { return Ok(prefix.clone()); }
@@ -398,7 +401,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = if unit_call {
-                let depth = routed[0].start_prefill(&self.depth, metadata[0].slot as u64, metadata[0].start)?;
+                let depth = routed[0].start_prefill(&self.depth, metadata[0].slot as u64, metadata[0].start, rows)?;
                 let units = self.prefill_units(rows, depth)?;
                 let ran = self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &units, depth.waves, &metadata[0], pool,
@@ -598,7 +601,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = if unit_call {
                 let depth = routed[0].start_prefill(&self.depth, sequences[0][0].slot as u64,
-                    sequences[0][0].start)?;
+                    sequences[0][0].start, rows[0])?;
                 let units = self.prefill_units(rows[0], depth)?;
                 let ran = self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &units, depth.waves, &sequences[0][0], pool, None);

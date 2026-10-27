@@ -935,9 +935,12 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Whether a Spark prefill runs as lanes (a lane transport, every layer resident).
-    fn pipelined(&self) -> bool {
+    pub(crate) fn pipelined(&self) -> bool {
         self.prefill_lanes > 1 && self.weights.layers.len() == self.cfg.layers && self.prefill_link.borrow().is_some()
     }
+
+    /// The runtime prefill depth controller (#762).
+    pub(crate) fn prefill_depth(&self) -> &crate::shared::prefill_depth::PrefillDepth { &self.depth }
 
     /// Longest chunk one prefill call takes, bounded by the shared admitted span:
     /// whole units at every depth the controller may choose (#762).
@@ -990,7 +993,7 @@ impl<'a> GlmEngine<'a> {
             // A prefill call boundary (#762): finished calls' paces, this
             // call's depth (a sequence's first page keys it), the link re-cut.
             let key = placement.pages.first().map_or(u64::MAX, |&page| u64::from(page));
-            let depth = self.start_prefill(link, key, start)?;
+            let depth = self.start_prefill(link, key, start, t)?;
             let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
                 MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
@@ -1364,10 +1367,10 @@ impl<'a> GlmEngine<'a> {
     /// wait) to the depth controller, this call's depth (sequence `key` from
     /// row `start`), the link re-cut to it at rest, and this call's waves
     /// flagged as its own.
-    fn start_prefill(&self, link: &mut SparkLink<'_>, key: u64, start: usize)
+    fn start_prefill(&self, link: &mut SparkLink<'_>, key: u64, start: usize, rows: usize)
         -> Result<crate::shared::prefill_depth::Depth> {
         self.depth.report(link.exchange()?.take_prefill()?);
-        let next = self.depth.start(key, start);
+        let next = self.depth.start(key, start, rows);
         ensure!(next.waves <= link.slots() && next.unit_rows <= self.prefill_rows,
             "prefill depth {next:?} outside the link's {} admitted slots", link.slots());
         link.set_geometry(next.waves, next.unit_rows)?;
