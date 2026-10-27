@@ -732,9 +732,13 @@ mod tests {
             )
         })?;
         let workspace = PlacedProducerWaves::device_bytes(&lib, placement, 16)?;
+        // Placed: each GPU that owns window layers keeps its own producer
+        // scratch; the single-GPU execution keeps one.
+        let window_gpus = (0..2).filter(|&gpu| (0..40).any(|layer| placement.attention(layer).unwrap().min(1) == gpu)).count();
+        let scratch = crate::families::deepseek_v41::v41_window::WindowStorage::scratch_bytes(&lib, 16)?;
         assert_eq!(
             workspace.iter().sum::<usize>(),
-            BackboneExecution::workspace_bytes(&lib, 16)?
+            BackboneExecution::workspace_bytes(&lib, 16)? + (window_gpus - 1) * scratch
         );
         let mut placed = PlacedProducerWaves::new(&weights, 16, workspace)?;
         for layer in 0..40 {
