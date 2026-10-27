@@ -1198,15 +1198,10 @@ wip_remote_export() {
 # configured GPU, held only for the export). A one-off container on
 # that GPU (the WIP container is bound to COORDINATOR_GPU), admitted by the
 # host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
-# CUTEAFD_WIP_EXPORT_GPUS names the GPUs; by default the host's GPU 1 then GPU 0
-# (the serving coordinator takes GPU 0), whichever of them it has.
 wip_capped_export() {
-  local status=0 gpus="${CUTEAFD_WIP_EXPORT_GPUS:-}"
-  [[ -n "$gpus" ]] || gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | cut -d, -f1 |
-    tr -d ' ' | grep -xE '[01]' | sort -r | paste -sd, -)" || true
-  [[ -n "$gpus" ]] || { echo "WIP coordinator export: no local GPU 0 or 1 for a capped export; next mode" >&2; return 75; }
+  local status=0
   CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
-    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "$gpus" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" -- \
+    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" -- \
     bash -c "$(declare -f wip_capped_export_on release_gpu_device_args cuteafd_cdi_require cuteafd_cdi_gpu_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
     status=$?
   ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }

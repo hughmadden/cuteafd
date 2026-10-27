@@ -38,17 +38,6 @@ pub fn family_title(family: &str) -> &str {
     }
 }
 
-/// The internal reference set (`CUTEAFD_FIDELITY_INTERNAL`) a report's fidelity was scored
-/// against, if any: data that exists only on our hosts, so no published card or index may cite it.
-pub fn internal_fidelity_set(report: &Report) -> Option<String> {
-    let internal = |dataset: &serde_json::Value| (dataset["internal"] == true)
-        .then(|| dataset["config"].as_str().unwrap_or(crate::fidelity_dataset::INTERNAL).to_owned());
-    report.baseline.as_ref().and_then(|b| b.quality.check("fidelity")).and_then(|c| c.metrics.get("dataset"))
-        .and_then(internal)
-        .or_else(|| ["fidelity", "fidelity_full"].iter()
-            .find_map(|id| report.panel(id).and_then(|p| p.latest()).and_then(|v| internal(&v["dataset"]))))
-}
-
 /// Every `benchmarks/*/*/report.json` under `root`.
 pub fn scan(root: &Path) -> Result<Vec<Placed>> {
     let mut placed = Vec::new();
@@ -62,10 +51,6 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
             }
             let text = std::fs::read_to_string(&path)?;
             let mut report: Report = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
-            if let Some(set) = internal_fidelity_set(&report) {
-                bail!("{}: its fidelity was scored against the internal reference set {set}, which exists only on \
-                    our hosts; internal-set reports stay out of benchmarks/", path.display());
-            }
             // Publish under the rule in force now, not the one the report was
             // written under: a stored status is data, and the checkpoint's own
             // numerics decide whether absolute fidelity was a gate.
@@ -869,30 +854,6 @@ mod tests {
         p.report.server.configuration.settings.push(crate::report::Setting {
             name: name.into(), value: Some(value.into()), default: None, source: "publication".into(),
         });
-    }
-
-    #[test]
-    fn reports_scored_against_an_internal_set_stay_out_of_benchmarks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("benchmarks/minimax_m3/2026-10-26-smoke-internal");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut report = crate::sample::report(true);
-        assert_eq!(internal_fidelity_set(&report), None);
-        std::fs::write(dir.join("report.json"), serde_json::to_string(&report).unwrap()).unwrap();
-        assert_eq!(scan(tmp.path()).unwrap().len(), 1);
-        let check = report.baseline.as_mut().unwrap().quality.checks.iter_mut().find(|c| c.id == "fidelity").unwrap();
-        check.set("dataset", serde_json::json!({"repository":"internal", "internal":true, "config":"minimax_m3-v3"}));
-        assert_eq!(internal_fidelity_set(&report).as_deref(), Some("minimax_m3-v3"));
-        std::fs::write(dir.join("report.json"), serde_json::to_string(&report).unwrap()).unwrap();
-        let error = scan(tmp.path()).unwrap_err().to_string();
-        assert!(error.contains("internal reference set minimax_m3-v3"), "{error}");
-        // The full fidelity panel's record names its dataset too.
-        let mut panel_only = crate::sample::full_report();
-        assert_eq!(internal_fidelity_set(&panel_only), None);
-        let panel = panel_only.panels.iter_mut().find(|p| p.id == "fidelity").unwrap();
-        let record = panel.partial.as_mut().or(panel.passes.last_mut()).unwrap();
-        record["dataset"] = serde_json::json!({"internal":true, "config":"minimax_m3-v3"});
-        assert_eq!(internal_fidelity_set(&panel_only).as_deref(), Some("minimax_m3-v3"));
     }
 
     /// A DeepSeek V4.1 card on `gpus` RTX with an optional marker.

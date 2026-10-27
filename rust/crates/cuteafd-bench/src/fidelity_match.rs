@@ -50,37 +50,6 @@ pub fn official(model: &str) -> Option<&'static Publication> {
     PUBLICATIONS.iter().find(|p| p.siblings.contains(&model))
 }
 
-/// Internal reference sets on this host: staged config directories (the packager's
-/// `<config>/` with its manifest.json), separated like PATH. One resolves only the exact name of
-/// its root checkpoint and never shadows a published dataset; runs record it as internal, so a
-/// public card cannot cite it.
-pub const INTERNAL_ENV: &str = "CUTEAFD_FIDELITY_INTERNAL";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Internal {
-    pub dir: PathBuf,
-    pub config: String,
-    pub root: String,
-    pub manifest_sha256: String,
-}
-
-/// The internal sets `CUTEAFD_FIDELITY_INTERNAL` names; none when it is unset.
-pub fn internal_configs() -> Result<Vec<Internal>> {
-    let Some(value) = std::env::var_os(INTERNAL_ENV) else { return Ok(Vec::new()) };
-    std::env::split_paths(&value).filter(|dir| !dir.as_os_str().is_empty()).map(|dir| internal_config(&dir)).collect()
-}
-
-pub fn internal_config(dir: &Path) -> Result<Internal> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(dir.join("manifest.json"))
-        .with_context(|| format!("{INTERNAL_ENV}: no manifest.json in {}", dir.display()))?;
-    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let config = manifest["config"].as_str().context("internal set manifest names no config")?;
-    let root = manifest["root_checkpoint"]["id"].as_str().context("internal set manifest names no root checkpoint")?;
-    Ok(Internal { dir: dir.into(), config: config.into(), root: root.into(),
-        manifest_sha256: format!("{:x}", Sha256::digest(&bytes)) })
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
     pub reference_match: String,
@@ -95,12 +64,6 @@ impl Resolution {
     fn new(how: &str, p: &Publication, chains: Vec<Vec<String>>) -> Self {
         Self { reference_match: how.into(), reference_root: p.root.into(), text_checkpoint: None,
             resolved_chain: chains, revision: p.revision.into(), config: p.config.into() }
-    }
-    /// An internal set has no published revision: its manifest's sha256 stands in.
-    fn internal(set: &Internal) -> Self {
-        Self { reference_match: "internal".into(), reference_root: set.root.clone(), text_checkpoint: None,
-            resolved_chain: vec![vec![set.root.clone()]], revision: set.manifest_sha256.clone(),
-            config: set.config.clone() }
     }
 }
 
@@ -225,11 +188,6 @@ fn walk(model: &str, snapshot: Option<&Path>, hub: &Path, depth: usize,
 }
 
 pub fn resolve_in(model: &str, snapshot: Option<&Path>, hub: &Path) -> Result<Resolution> {
-    resolve_with(model, snapshot, hub, &[])
-}
-
-/// [`resolve_in`] that also knows this host's internal sets.
-pub fn resolve_with(model: &str, snapshot: Option<&Path>, hub: &Path, internal: &[Internal]) -> Result<Resolution> {
     let local = served_snapshot(hub, model, snapshot);
     if let Some(path) = &local {
         ensure!(path.is_dir(), "base_model unknown for {model}: served snapshot {} is not available locally", path.display());
@@ -243,12 +201,6 @@ pub fn resolve_with(model: &str, snapshot: Option<&Path>, hub: &Path, internal: 
     }
     if let Some(root) = official_root(model) {
         ensure!(official(root).is_some(), "no published fidelity dataset for official root {root}");
-    }
-    // An internal set answers only for the exact checkpoint it was built from.
-    if official(model).is_none() {
-        if let Some(set) = internal.iter().find(|set| set.root == model) {
-            return Ok(Resolution::internal(set));
-        }
     }
     // A malformed/present ancestry must not silently fall back to a name.
     if card.as_ref().is_some_and(|c| c.base_model.is_some() || c.base_model_relation.is_some()) {
@@ -280,7 +232,7 @@ pub fn served_snapshot_path(model: &str, snapshot: Option<&Path>) -> Option<Path
 }
 
 pub fn resolve(model: &str, snapshot: Option<&Path>) -> Result<Resolution> {
-    resolve_with(model, snapshot, &hub(), &internal_configs()?)
+    resolve_in(model, snapshot, &hub())
 }
 
 /// `model` and every `base_model` ancestor its local model cards name, nearest
@@ -402,40 +354,6 @@ mod tests {
         }
         let original = resolve_in("deepseek-ai/DeepSeek-V4.1-Flash", None, hub).unwrap();
         assert_eq!((original.reference_root.as_str(), original.config.as_str()), ("deepseek-ai/DeepSeek-V4.1-Flash", dataset::CONFIG));
-    }
-
-    #[test]
-    fn internal_sets_answer_only_their_exact_root_and_never_shadow_a_publication() {
-        let tmp = tempfile::tempdir().unwrap(); let hub = tmp.path();
-        let set = Internal { dir: hub.join("minimax_m3-test"), config: "minimax_m3-test".into(),
-            root: "MiniMaxAI/MiniMax-M3.1-Flash".into(), manifest_sha256: "a".repeat(64) };
-        let r = resolve_with(&set.root, None, hub, std::slice::from_ref(&set)).unwrap();
-        assert_eq!((r.reference_match.as_str(), r.reference_root.as_str(), r.config.as_str(), r.revision.as_str()),
-            ("internal", set.root.as_str(), "minimax_m3-test", set.manifest_sha256.as_str()));
-        assert_eq!(r.resolved_chain, vec![vec![set.root.clone()]]);
-        // Without the set the checkpoint has no reference, and no other name borrows it.
-        assert!(resolve_in(&set.root, None, hub).is_err());
-        for other in ["MiniMaxAI/MiniMax-M3.1-Flash-NVFP4", "someone/MiniMax-M3.1-Flash"] {
-            assert!(resolve_with(other, None, hub, std::slice::from_ref(&set)).is_err(), "{other}");
-        }
-        // A published checkpoint keeps its pinned publication whatever an internal set claims.
-        let claim = Internal { root: "zai-org/GLM-5.3-Flash".into(), ..set.clone() };
-        assert_eq!(resolve_with("zai-org/GLM-5.3-Flash", None, hub, &[claim]).unwrap().config, dataset::GLMF_CONFIG);
-    }
-
-    #[test]
-    fn internal_config_reads_name_root_and_manifest_hash() {
-        use sha2::{Digest, Sha256};
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("minimax_m3-test");
-        assert!(internal_config(&dir).unwrap_err().to_string().contains("no manifest.json"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("manifest.json"), br#"{"config":"minimax_m3-test"}"#).unwrap();
-        assert!(internal_config(&dir).unwrap_err().to_string().contains("root checkpoint"));
-        let bytes = br#"{"config":"minimax_m3-test","root_checkpoint":{"id":"MiniMaxAI/MiniMax-M3.1-Flash"}}"#;
-        std::fs::write(dir.join("manifest.json"), bytes).unwrap();
-        assert_eq!(internal_config(&dir).unwrap(), Internal { dir: dir.clone(), config: "minimax_m3-test".into(),
-            root: "MiniMaxAI/MiniMax-M3.1-Flash".into(), manifest_sha256: format!("{:x}", Sha256::digest(bytes)) });
     }
 
     #[test]

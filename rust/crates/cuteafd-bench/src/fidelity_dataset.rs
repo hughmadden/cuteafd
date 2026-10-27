@@ -317,34 +317,6 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
 }
 
-/// The repository runs record for an internal set: it has no public home or revision.
-pub const INTERNAL: &str = "internal";
-
-/// An internal set staged by package-reference-only-fidelity.py (fidelity_match::INTERNAL_ENV),
-/// held to the same checks as a published one: the manifest's format, every file's checksum, the
-/// qualification and its label. A package index beside it must name the same manifest.
-pub fn load_internal(dir: &Path) -> Result<(Reference, String, Value)> {
-    let bytes = std::fs::read(dir.join("manifest.json"))?;
-    let manifest: Value = serde_json::from_slice(&bytes)?;
-    let config = manifest["config"].as_str().filter(|c| component(c)).context("internal set config name")?;
-    ensure!(dir.file_name().is_some_and(|name| name == config), "internal set directory is not named {config}");
-    if let Some(index) = dir.parent().map(|parent| parent.join("config-entry.json")).filter(|path| path.is_file()) {
-        let entry: Value = serde_json::from_slice(&std::fs::read(index)?)?;
-        ensure!(entry["name"] == config && entry["sha256"] == digest(&bytes), "internal set manifest differs from its package index");
-    }
-    let reference = load(dir, &manifest)?;
-    let qualification: Value = serde_json::from_slice(&checked(dir, "qualification.json",
-        manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
-    let label = qualification_label(&qualification, &manifest)?;
-    let mut identity = json!({"repository":INTERNAL, "internal":true, "config":config, "manifest_sha256":digest(&bytes),
-        "qualification":label, "root_checkpoint":manifest["root_checkpoint"],
-        "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])});
-    if let Some(exception) = qualification.get("generated_floor_exception") {
-        identity["generated_floor_exception"] = exception.clone();
-    }
-    Ok((reference, digest(&bytes), identity))
-}
-
 fn tensor<'a>(bytes: &'a [u8], name: &str, dtype: &str, shape: &[usize]) -> Result<&'a [u8]> {
     ensure!(bytes.len() >= 8, "truncated safetensors prefix");
     let n = u64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -1128,13 +1100,6 @@ mod tests {
                 "path":format!("{config}/manifest.json"), "sha256":digest(&manifest_bytes)}]})).unwrap()).unwrap();
             let (_, _, identity) = download(&ureq::Agent::new(), cache.path(), "owner/repo", &revision, config).unwrap();
             assert_eq!(identity["qualification"], expected);
-            // The same staged config as an internal set: the checks of a publication, no repository.
-            let (internal, hash, identity) = load_internal(&root).unwrap();
-            assert_eq!((internal.windows.len(), hash), (64, digest(&manifest_bytes)));
-            assert_eq!(identity["repository"], INTERNAL);
-            assert_eq!((identity["internal"].as_bool(), identity["config"].as_str()), (Some(true), Some(config)));
-            assert_eq!(identity["qualification"], expected);
-            assert_eq!(identity["generated_floor_exception"], qualification["generated_floor_exception"]);
         }
     }
 
@@ -1353,25 +1318,6 @@ mod tests {
         assert!(load(&root,&manifest).unwrap_err().to_string().contains("unqualified"));
         std::fs::write(root.join("windows.json"), b"corrupt").unwrap();
         assert!(load(&root,&manifest).unwrap_err().to_string().contains("checksum"));
-    }
-
-    #[test]
-    fn internal_sets_are_named_for_their_config_and_match_their_package_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = br#"{"config":"minimax_m3-test"}"#;
-        let renamed = tmp.path().join("package/other-name");
-        std::fs::create_dir_all(&renamed).unwrap();
-        std::fs::write(renamed.join("manifest.json"), manifest).unwrap();
-        assert!(load_internal(&renamed).unwrap_err().to_string().contains("not named minimax_m3-test"));
-        let dir = tmp.path().join("package/minimax_m3-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
-        let index = tmp.path().join("package/config-entry.json");
-        std::fs::write(&index, serde_json::to_vec(&json!({"name":"minimax_m3-test","sha256":"0".repeat(64)})).unwrap()).unwrap();
-        assert!(load_internal(&dir).unwrap_err().to_string().contains("differs from its package index"));
-        std::fs::write(&index, serde_json::to_vec(&json!({"name":"minimax_m3-test","sha256":digest(manifest)})).unwrap()).unwrap();
-        // The index agrees, and the manifest still has to be a reference dataset.
-        assert!(load_internal(&dir).unwrap_err().to_string().contains("unsupported dataset format"));
     }
 
     #[test]

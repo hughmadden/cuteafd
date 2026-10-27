@@ -72,38 +72,13 @@ def test_capped_export_runs_only_on_a_gpu_whose_lock_it_holds_and_is_watched():
     capped = _function('wip_capped_export')
     # Fair wait is bounded; held GPU selection happens inside placement.
     assert 'wip_hwlock' not in capped
-    assert 'export-placement.py" hold --gpus "$gpus"' in capped and '${CUTEAFD_WIP_EXPORT_GPUS:-}' in capped
+    assert 'export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}"' in capped
     assert '--wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}"' in capped
     on = _function('wip_capped_export_on')
     assert 'CUTEAFD_EXPORT_GPU' in on and 'memory.free' not in on and 'sort -t,' not in on
     assert '"$placement" admit' in on and 'watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id"' in on
     remote = _function('wip_remote_export')
     assert 'wip_hwlock' not in remote and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in remote
-
-
-@pytest.mark.parametrize('visible,setting,expected', [
-    ('0', '', '0'),           # a single-GPU coordinator
-    ('0\n1', '', '1,0'),      # the two-card default, unchanged
-    ('0\n1\n2', '', '1,0'),   # export locks exist for GPUs 0 and 1 only
-    ('0\n1', '0', '0'),       # an explicit list wins
-    ('', '', None),            # no GPU: the next export mode, no queued turn
-])
-def test_capped_export_gpus_follow_the_hosts_visible_gpus(tmp_path, visible, setting, expected):
-    trace = tmp_path / 'trace'
-    script = f"""
-nvidia-smi() {{ [[ "$1" == --query-gpu=index ]] && printf '%b\\n' {visible!r}; }}
-python3() {{ echo "python3 $*" >> {trace}; }}
-repo_root=/repo
-{_function('wip_capped_export')}
-CUTEAFD_WIP_EXPORT_GPUS={setting!r} wip_capped_export docker exec c
-"""
-    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
-    calls = trace.read_text() if trace.exists() else ''
-    if expected is None:
-        assert result.returncode == 75 and 'no local GPU 0 or 1' in result.stderr and calls == ''
-    else:
-        assert result.returncode == 0, result.stderr
-        assert f'export-placement.py hold --gpus {expected} --wait' in calls, calls
 
 
 def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():

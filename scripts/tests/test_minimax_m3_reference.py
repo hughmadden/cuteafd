@@ -485,19 +485,27 @@ def test_bf16_diagnostic_golden_is_never_a_reference(snapshot, tmp_path, monkeyp
         golden.write_reference_meta(out, revision)
 
 
-def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test", agentic_gen=512, exception_reason=None):
+def standard_split():
+    """The consumer's sealed standard-v2 halves, read as the packager reads them."""
+    import re
+    source = (ROOT / "rust/crates/cuteafd-bench/src/fidelity_dataset.rs").read_text()
+    return {name: re.findall(r'"([a-e][0-9]{2}|legacy)"', re.search(
+        r"pub const STANDARD_" + name.upper() + r":[^=]+=\s*\[(.*?)\];", source, re.S).group(1))
+        for name in ("decode", "prefill")}
+
+
+def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test", agentic_gen=512):
     """golden.py, make-fidelity-reference.py, validate-fidelity-dataset.py --seal and the packager
     over a sealed-split set of 64 own-text windows on a tiny release-shaped checkpoint. Agentic
-    windows score agentic_gen generated rows; exception_reason packages under a floor exception."""
+    windows score agentic_gen generated rows."""
     import importlib.util
     from types import SimpleNamespace
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
-    from fidelity_windows import set_hash, standard_split
+    from fidelity_windows import set_hash
     from families.minimax_m3 import golden
     revision = make_snapshot(tmp_path / ("5" * 40), vocab=1100)
     Tokenizer(WordLevel({str(i): i for i in range(1100)}, unk_token="0")).save(str(revision / "tokenizer.json"))
-    (revision / "LICENSE").write_text("SAMPLE CHECKPOINT LICENSE\nKeep this notice with every copy.\n")
     monkeypatch.setattr(model, "REVISION", revision.name)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 1))
     monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE", "reference:test")
@@ -532,30 +540,19 @@ def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test", agentic_gen
     (root / "reference-validation.json").write_text(json.dumps(validation, indent=2) + "\n")
     package = tmp_path / "package"
     packager = tools["package-reference-only-fidelity"]
-    exception = None
-    if exception_reason is not None:
-        from fidelity_windows import FLOOR_EXCEPTION_SCHEMA, standard_generated_rows
-        rows = standard_generated_rows(manifest)
-        exception = dict(schema=FLOOR_EXCEPTION_SCHEMA, set_sha256=manifest["set_sha256"], floor=6500,
-                         measured={h: rows[f"{h}_generated_positions"] for h in ("decode", "prefill")},
-                         reason=exception_reason)
-        with pytest.raises(ValueError, match="10,000 scored generated rows per half"):
-            packager.package(root, tmp_path / "refused", config, revision / "tokenizer.json", ROOT / "LICENSE")
-    index = packager.package(root, package, config, revision / "tokenizer.json", ROOT / "LICENSE",
-                             revision / "LICENSE", exception)
+    index = packager.package(root, package, config, revision / "tokenizer.json", ROOT / "LICENSE")
     return package, index, revision
 
 
-def test_minimax_reference_packages_end_to_end_with_its_checkpoint_licence(tmp_path, monkeypatch):
+def test_minimax_reference_packages_end_to_end(tmp_path, monkeypatch):
     import hashlib
     from families.minimax_m3 import golden
     package, index, revision = package_minimax(tmp_path, monkeypatch)
     config = package / index["name"]
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-    assert (config / "CHECKPOINT_LICENSE").read_bytes() == (revision / "LICENSE").read_bytes()
     assert (config / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
     manifest = json.loads((config / "manifest.json").read_bytes())
-    assert manifest["licence_files"] == [dict(path=name, sha256=digest(config / name)) for name in ("LICENSE", "CHECKPOINT_LICENSE")]
+    assert manifest["licence_files"] == [dict(path="LICENSE", sha256=digest(config / "LICENSE"))]
     assert manifest["root_checkpoint"] == {"id": model.CHECKPOINT, "revision": revision.name}
     assert len(manifest["files"]) == 64 and index["sha256"] == digest(config / "manifest.json")
     provenance = json.loads((config / "qualification.json").read_bytes())["reference_provenance"]
@@ -563,24 +560,6 @@ def test_minimax_reference_packages_end_to_end_with_its_checkpoint_licence(tmp_p
     assert provenance["source_pin"]["revision"] == revision.name and provenance["attention"] == "eager"
     card = (config / "README.md").read_text()
     assert f"Official root ({golden.ROOT_PRECISION}): `{model.CHECKPOINT}` at `{revision.name}`." in card
-    assert "reproduced verbatim in CHECKPOINT_LICENSE." in card
-
-
-def test_set_below_the_new_set_floor_packages_only_under_its_recorded_exception(tmp_path, monkeypatch):
-    reason = "Agentic turns end after brief reasoning; owner decision, internal use."
-    package, index, revision = package_minimax(tmp_path, monkeypatch, agentic_gen=100, exception_reason=reason)
-    config = package / index["name"]
-    qualification = json.loads((config / "qualification.json").read_bytes())
-    exception = qualification["generated_floor_exception"]
-    measured = {"decode": 13 * 100 + 14 * 512, "prefill": 13 * 100 + 13 * 512}
-    assert exception["measured"] == measured and exception["floor"] == exception["loader_floor"] == 6500
-    assert exception["default_floor"] == 10000 and exception["reason"] == reason
-    assert qualification["standard_generated_rows"]["prefill_generated_positions"] == measured["prefill"]
-    panel = json.loads((config / "windows.json").read_bytes())
-    assert panel["publication_provenance"]["generated_floor_exception"] == exception
-    card = (config / "README.md").read_text()
-    assert "Packaged under a recorded exception to the 10,000-row new-set floor" in card and reason in card
-    assert not (tmp_path / "refused").exists() or not any((tmp_path / "refused").rglob("manifest.json"))
 
 
 def test_cache_e4m3_rounds_ties_even_saturates_and_preserves_sign():

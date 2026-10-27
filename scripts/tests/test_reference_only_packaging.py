@@ -117,24 +117,6 @@ def test_public_panel_preserves_tokens_and_generation_identity_not_deployment():
         packager.public_panel(source)
 
 
-def test_public_panel_reduces_each_engine_generated_window_server_to_its_identity():
-    server = dict(build=dict(commit='b' * 40), family='minimax_m3', model='MiniMaxAI/model', snapshot='/checkpoint',
-                  settings=[dict(name='listen', value='192.0.2.10:18117'), dict(name='peers', value='192.0.2.11:19117')])
-    window = dict(tokens=[1, 2], roles=['ctx', 'gen'], score_from=1,
-                  provenance=dict(prompt_sha256='c' * 64, engine='minimax_m3', server=server, generated_tokens=1))
-    legacy = dict(tokens=[3, 4], roles=['ctx', 'ctx'], score_from=1, provenance=dict(path='anchor.json', sha256='d' * 64))
-    source = dict(set_sha256='sealed', windows=[window, legacy], generation_server=server)
-    public = packager.public_panel(source)
-    identity = dict(build=dict(commit='b' * 40), family='minimax_m3', model='MiniMaxAI/model')
-    assert public['generation_server'] == identity
-    assert public['windows'][0]['provenance'] == {**window['provenance'], 'server': identity}
-    assert public['windows'][1] == legacy
-    for got, original in zip(public['windows'], source['windows']):
-        assert {k: got[k] for k in ('tokens', 'roles', 'score_from')} == {k: original[k] for k in ('tokens', 'roles', 'score_from')}
-    assert '192.0.2.' not in repr(public['windows'])
-    assert source['windows'][0]['provenance']['server'] is server and 'settings' in server
-
-
 def test_seal_paths_cannot_escape(tmp_path):
     for value in ('../secret', '/secret', '.'):
         with pytest.raises(ValueError):
@@ -222,30 +204,6 @@ def test_new_sets_need_ten_thousand_generated_rows_per_half():
             packager.require_new_set_generated_rows(rows(decode, prefill))
 
 
-def test_floor_exception_needs_this_set_its_measured_counts_a_reason_and_the_loader_floor():
-    from fidelity_windows import FLOOR_EXCEPTION_SCHEMA, generated_floor_exception, loader_generated_min
-    rows = dict(decode_generated_positions=9981, prefill_generated_positions=7804)
-    record = dict(schema=FLOOR_EXCEPTION_SCHEMA, set_sha256='s' * 64, floor=6500,
-                  measured=dict(decode=9981, prefill=7804), reason=' Terse agentic turns; internal use. ')
-    assert loader_generated_min() == 6500
-    assert generated_floor_exception(record, rows, 's' * 64) == dict(
-        schema=FLOOR_EXCEPTION_SCHEMA, set_sha256='s' * 64, floor=6500, loader_floor=6500, default_floor=10000,
-        measured=dict(decode=9981, prefill=7804), reason='Terse agentic turns; internal use.')
-    for change, message in ((dict(set_sha256='t' * 64), 'does not name this set'),
-                            (dict(schema='other'), 'does not name this set'),
-                            (dict(reason='  '), 'needs a reason'), (dict(reason=None), 'needs a reason'),
-                            (dict(floor=6499), 'must lie in'), (dict(floor=10000), 'must lie in'),
-                            (dict(floor=6500.0), 'must lie in'), (dict(floor=8000), 'fewer than'),
-                            (dict(measured=dict(decode=9981, prefill=7805)), 'granted for'),
-                            (dict(measured=None), 'granted for'),
-                            (dict(reason='key ghp_' + 'a' * 30), 'credential')):
-        with pytest.raises(ValueError, match=message):
-            generated_floor_exception({**record, **change}, rows, 's' * 64)
-    clears = dict(decode_generated_positions=10000, prefill_generated_positions=12000)
-    with pytest.raises(ValueError, match='needs no exception'):
-        generated_floor_exception({**record, 'measured': dict(decode=10000, prefill=12000)}, clears, 's' * 64)
-
-
 def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     # Dense/Step-5 goldens record no root arithmetic: their cards keep the original text byte for byte.
     assert packager.root_description({}, {'reference_snapshot': {'precision': 'official BF16'}}) == (
@@ -276,17 +234,6 @@ def test_sealed_f32_arithmetic_supplies_precision_without_mutating_panel():
             packager.root_description(changed, panel)
     with pytest.raises(ValueError, match='missing reference precision'):
         packager.root_description({'root_arithmetic': {'arithmetic': 'unknown', 'source': 'unknown'}}, panel)
-
-
-def test_own_text_golden_states_its_root_precision_and_a_set_snapshot_still_comes_first():
-    meta = {'root_arithmetic': {'arithmetic': 'Decoder layer by layer.', 'source': 'decoder pins',
-                                'precision': 'official NVFP4 experts + MXFP8 dense'}}
-    assert packager.root_description(meta, {}) == (
-        'root (official NVFP4 experts + MXFP8 dense)', 'Decoder layer by layer.', 'decoder pins')
-    assert packager.reference_precision(meta, {'reference_snapshot': {'precision': 'from the set'}}) == 'from the set'
-    for blank in ('', '  ', None):
-        with pytest.raises(ValueError, match='missing reference precision'):
-            packager.reference_precision({'root_arithmetic': {**meta['root_arithmetic'], 'precision': blank}}, {})
 
 
 def test_reference_role_metrics_and_card_explain_aggregate_nll():

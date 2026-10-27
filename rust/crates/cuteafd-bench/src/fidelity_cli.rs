@@ -216,16 +216,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     let mut selection = if explicit { resolved.ok() } else { Some(resolved?) };
     let publication = selection.as_ref().map(|s| (s.revision.as_str(), s.config.as_str()))
         .or_else(|| explicit.then(|| crate::fidelity_dataset::default_publication(model)).flatten());
-    let internal = selection.as_ref().filter(|s| !explicit && s.reference_match == "internal")
-        .map(|s| (s.config.clone(), s.revision.clone()));
-    let (reference, digest, mut dataset_identity) = if let Some((config, manifest_sha256)) = internal {
-        // The set this host staged, read again so the run scores exactly the manifest it resolved.
-        let set = crate::fidelity_match::internal_configs()?.into_iter()
-            .find(|set| set.config == config && set.manifest_sha256 == manifest_sha256)
-            .context("internal fidelity set changed since it was resolved")?;
-        let (reference, digest, identity) = crate::fidelity_dataset::load_internal(&set.dir)?;
-        (reference, digest, Some(identity))
-    } else if let Some((repo, commit, config)) = dataset_source_with(args, publication)? {
+    let (reference, digest, mut dataset_identity) = if let Some((repo, commit, config)) = dataset_source_with(args, publication)? {
         crate::fidelity_dataset::ensure_valid_publication(repo, commit, config)?;
         // CUTEAFD_FIDELITY_CACHE lets a serving container share the host's verified cache.
         let cache = args.dataset_cache.clone()
@@ -742,32 +733,6 @@ mod tests {
             "expect":{"top1_min":0.93,"kl_max":0.05}})).unwrap();
         assert!(validate_served_reference(&glm, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", true).is_ok());
         assert!(validate_served_reference(&glm, quant, true).is_err());
-    }
-
-    #[test]
-    #[ignore = "requires a locally staged internal set (CUTEAFD_REFERENCE_ONLY_CONFIGS); sets process environment"]
-    fn internal_set_resolves_loads_and_reaches_the_first_probe() {
-        let dir = std::env::split_paths(&std::env::var_os("CUTEAFD_REFERENCE_ONLY_CONFIGS").unwrap()).next().unwrap();
-        let set = crate::fidelity_match::internal_config(&dir).unwrap();
-        // The served checkpoint's own config picks the precision tier; a release-shaped one stands in.
-        let hub = tempfile::tempdir().unwrap();
-        let repo = hub.path().join(format!("models--{}", set.root.replace('/', "--")));
-        std::fs::create_dir_all(repo.join("snapshots/abc")).unwrap();
-        std::fs::create_dir_all(repo.join("refs")).unwrap();
-        std::fs::write(repo.join("refs/main"), "abc").unwrap();
-        std::fs::write(repo.join("snapshots/abc/config.json"),
-            r#"{"quantization_config":{"quant_method":"mxfp8","moe_quant_algo":"NVFP4"}}"#).unwrap();
-        std::env::set_var("HF_HUB_CACHE", hub.path());
-        let dump = tempfile::tempdir().unwrap();
-        let args = parse(&["--dump-dir", dump.path().to_str().unwrap()]);
-        let probe = |request: Value| -> Result<Value> {
-            bail!("first probe of {} prompt tokens", request["spec"]["prompt_ids"].as_array().unwrap().len())
-        };
-        let unset = run_with(&args, &set.root, &json!({}), probe, |_, _, _| {}).unwrap_err();
-        assert!(unset.to_string().contains("no verified published fidelity config"), "{unset:#}");
-        std::env::set_var(crate::fidelity_match::INTERNAL_ENV, &dir);
-        let error = run_with(&args, &set.root, &json!({}), probe, |_, _, _| {}).unwrap_err();
-        assert!(error.to_string().starts_with("first probe of "), "{error:#}");
     }
 
     #[test]
