@@ -192,11 +192,13 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
     assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
     command = dict(flag_values(coordinator["command"]))
     for flag, value in {"--rtx-gpus": "1", "--spark-tp": "4", "--spark-ep": "1",
-                        "--prefill-batch-tokens": "1024", "--max-context-tokens": "1048576"}.items():
+                        "--max-context-tokens": "1048576"}.items():
         assert command[flag] == value
     assert len(containers) == 5
     for plan in result["plans"]:
         assert plan[plan.index("--coordinator-gpu-budget-gib") + 1] == "31.8"
+        # The planner sizes the reserve: the card pins no prefill rows (0 = automatic).
+        assert plan[plan.index("--prefill-rows") + 1] == "0"
 
 
 def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> None:
