@@ -772,7 +772,10 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     cmd = ['docker', 'run', '--rm', '--init', '--name', container_name(state['task'], name),
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
            *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
-           '--ulimit', 'memlock=-1:-1']
+           '--ulimit', 'memlock=-1:-1',
+           # The serving coordinator's profile (run-family.sh): mapped Engram/PLE
+           # tables gather through io_uring instead of the mmap fallback.
+           '--security-opt', f"seccomp={REPO / 'docker/seccomp-code-bench.json'}"]
     if state.get('memory'):  # cap the coordinator container's host memory, swap equally
         cmd += ['--memory', str(state['memory']), '--memory-swap', str(state['memory'])]
     if state.get('sparks') or state.get('rdma'):
