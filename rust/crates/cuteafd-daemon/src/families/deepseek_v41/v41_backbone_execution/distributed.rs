@@ -323,6 +323,18 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
         self.publication = Some((batch.identity(), layer));
         unsafe { bank.enqueue_encoder_window(batch, layer, &mut self.producers.windows[layer]) }
     }
+    /// Device-ordered prefill units (#815 option (i)): publish layer `layer`'s
+    /// window as a chained direct commit right after its queued attention, no
+    /// host wait; the next unit's attention orders after it by the unit's
+    /// publication event.
+    pub fn publish_unit_window(&mut self, bank: &mut BackboneCache<'_>, batch: &CacheBatch, layer: usize) -> Result<()> {
+        ensure!(crate::shared::memory::chain::deferred(), "chained window publication needs a device-ordered scope");
+        ensure!(batch.is_reserved() && batch.stage() == CacheStage::Encoder && self.publication.is_none()
+            && self.progress.invalid && self.progress.batch == Some(batch.identity())
+            && layer < 20 && self.progress.next == layer,
+            "unit window publication requires this layer's queued attention");
+        bank.publish_encoder_window(batch, layer, &mut self.producers.windows[layer])
+    }
     pub fn poll_encoder_publication(&self) -> Result<bool> {
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;
         let (_, layer) = self.publication.context("encoder publication absent")?;

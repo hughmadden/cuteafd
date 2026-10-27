@@ -11,6 +11,77 @@ use crate::shared::prefill_pipeline::{run_prefill_units_async, AsyncPrefillHooks
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
 
+/// Encoder layers 0..20 publish at attention; the boundary (source 20, the
+/// ratio-two carry the next unit's boundary reads) publishes at the unit's end.
+pub(super) const BOUNDARY: usize = 20;
+/// One ordering event per encoder layer and the boundary, recorded after a unit's publication
+/// of that layer. The next unit's attention at the layer waits on it on the
+/// device: it reads the request's window ring and sources that publication
+/// wrote, and its own publication overwrites that ring after its attention.
+pub(super) struct PublishedLayers<'a> {
+    pub(super) library: &'a cuteafd_ffi::NativeLibrary,
+    pub(super) events: Vec<*mut std::ffi::c_void>,
+    pub(super) recorded: Vec<bool>,
+}
+impl<'a> PublishedLayers<'a> {
+    pub(super) fn new(library: &'a cuteafd_ffi::NativeLibrary) -> Result<Self> {
+        let device = library.cuda_get_device()?;
+        Self::on_devices(library, |_| Ok(device))
+    }
+    /// Each layer's event on the GPU that publishes it (its attention GPU; the
+    /// boundary's is layer 20's): a chain records it on its head device.
+    pub(super) fn on_devices(library: &'a cuteafd_ffi::NativeLibrary,
+        device: impl Fn(usize) -> Result<i32>) -> Result<Self> {
+        let previous = library.cuda_get_device()?;
+        let mut events = Vec::with_capacity(BOUNDARY + 1);
+        for layer in 0..=BOUNDARY {
+            let created = device(layer).and_then(|gpu| { library.cuda_set_device(gpu)?; Ok(library.cuda_event_create_ordering()?) });
+            match created {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    // SAFETY: created above and never recorded.
+                    for event in events { unsafe { let _ = library.cuda_event_destroy(event); } }
+                    let _ = library.cuda_set_device(previous);
+                    return Err(error);
+                }
+            }
+        }
+        library.cuda_set_device(previous)?;
+        Ok(Self { library, events, recorded: vec![false; BOUNDARY + 1] })
+    }
+}
+impl Drop for PublishedLayers<'_> {
+    fn drop(&mut self) {
+        for &event in &self.events {
+            // SAFETY: owned here; the slots' chains drain before the hooks drop.
+            if let Err(error) = unsafe { self.library.cuda_event_destroy(event) } {
+                tracing::error!(%error, "destroying prefill unit publication event");
+            }
+        }
+    }
+}
+impl PublishedLayers<'_> {
+    /// Inside a chain scope: record this slot's publication of `layer`.
+    pub(super) fn record(&mut self, layer: usize) -> Result<()> {
+        // SAFETY: the slot's own event; the chain records on its head device.
+        self.recorded[layer] = unsafe { crate::shared::memory::chain::record_into(self.library, self.events[layer])? };
+        Ok(())
+    }
+    pub(super) fn event(&self, layer: usize) -> Option<*mut std::ffi::c_void> {
+        self.recorded[layer].then(|| self.events[layer])
+    }
+}
+/// Inside a chain scope: later stages follow `event` (another slot's publication).
+pub(super) fn order_after(library: &cuteafd_ffi::NativeLibrary, event: Option<*mut std::ffi::c_void>) -> Result<()> {
+    let Some(event) = event else { return Ok(()) };
+    // SAFETY: a live event recorded by the previous unit's chain.
+    unsafe { crate::shared::memory::chain::depend(library, event) }
+}
+/// The slot that ran the unit before `unit`, when it is another slot.
+pub(super) fn previous_slot(unit: &Unit, waves: usize) -> Option<usize> {
+    unit.index.checked_sub(1).map(|index| index % waves).filter(|&slot| slot != unit.slot)
+}
+
 pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
     ensure!(!chunks.is_empty(), "empty encoder unit span");
     let mut start = 0;
@@ -48,6 +119,9 @@ struct UnitSlot<'s, 'w, 'a> {
     batch: Option<RequestBatch>,
     prepared: Option<UnitPreparedLayer>,
     started: Instant,
+    /// Per encoder layer: recorded on the device after this slot's unit
+    /// published that layer's window and source KV (its attention hook).
+    published: PublishedLayers<'a>,
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
@@ -60,6 +134,12 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
 }
 impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
+        // Device-ordered units leave queued work on every slot's chain (and
+        // cross-slot waits on publication events): drain them all before any
+        // batch, cache slot or event is released.
+        for slot in &self.slots {
+            crate::shared::decode_graph::fatal_drain(slot.pass.drain_chain(), "cancelled prefill unit chain");
+        }
         for slot in &mut self.slots {
             if let Some(mut batch) = slot.batch.take() {
                 self.requests.borrow_mut().revoke_batch(&mut batch);
@@ -71,6 +151,17 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
     }
 }
 impl<'a> UnitHooks<'_, '_, '_, 'a> {
+    /// The previous unit's publication event for `layer`, when that unit ran
+    /// in another slot (one slot runs its units in order).
+    fn previous_publication(&self, unit: &Unit, layer: usize) -> Option<*mut std::ffi::c_void> {
+        self.slots[previous_slot(unit, self.slots.len())?].published.event(layer)
+    }
+    fn order_after(&self, unit: &Unit, event: Option<*mut std::ffi::c_void>) -> Result<()> {
+        order_after(self.slots[unit.slot].pass.library()?, event)
+    }
+    fn record_publication(&mut self, unit: &Unit, layer: usize) -> Result<()> {
+        self.slots[unit.slot].published.record(layer)
+    }
     async fn begin_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         ensure!(
@@ -209,7 +300,8 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         let slot = &mut self.slots[unit.slot];
         ensure!((self.keep_running)(), "client disconnected");
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
-        self.suffix.capture(&slot.pass.resources.lane.output()?)?;
+        // SAFETY: the lane's output stays live until the unit's commit drains its chain.
+        unsafe { self.suffix.capture_chained(&slot.pass.resources.lane.output()?, slot.pass.resources.lane.finish_stream())?; }
         slot.pass.resources.lane.advance()?;
         // SAFETY: encoder output is complete and this batch owns its source-20 proposal.
         unsafe {
@@ -261,14 +353,20 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         chain.scope(self.begin_unit_inner(unit)).await
     }
     async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        // The unit's previous layer (its landing, reduce and mHC, queued by the
-        // last hooks without a host wait) completes here, while the other unit's
-        // wave is on the Sparks. The attention and its KV publication then run
-        // unchained, completing on the host as before, so the next unit's
-        // attention (a later hook) reads published KV.
-        self.slots[unit.slot].pass.drain_chain()?;
+        // Device-ordered (#815 option (i)): no host wait. The attention first
+        // orders after the previous unit's publication of this layer (another
+        // slot's chain): it reads that unit's window ring rows and sources, and
+        // this unit's publication later overwrites the ring. Its source and
+        // window publications are chained direct commits; the layer's event
+        // records after them for the next unit.
         crate::shared::spark_waves::healthy()?;
-        self.attention_inner(layer, unit).await
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        let event = self.previous_publication(unit, layer);
+        chain.scope(async {
+            self.order_after(unit, event)?;
+            self.attention_inner(layer, unit).await?;
+            self.record_publication(unit, layer)
+        }).await
     }
     async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let chain = self.slots[unit.slot].pass.unit_chain()?;
@@ -283,13 +381,17 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         chain.scope(self.land_experts_inner(layer, unit, ticket)).await
     }
     async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
-        // The suffix capture copies the encoder output synchronously: the
-        // unit's chained layers complete first (once per unit). The boundary
-        // publication then chains again.
-        self.slots[unit.slot].pass.drain_chain()?;
+        // Device-ordered (#815 option (i)): the suffix capture and the
+        // boundary (source 20) publication chain behind the unit's last layer;
+        // the unit's commit drains once.
         crate::shared::spark_waves::healthy()?;
         let chain = self.slots[unit.slot].pass.unit_chain()?;
-        chain.scope(self.end_unit_inner(unit)).await
+        let event = self.previous_publication(unit, BOUNDARY);
+        chain.scope(async {
+            self.order_after(unit, event)?;
+            self.end_unit_inner(unit).await?;
+            self.record_publication(unit, BOUNDARY)
+        }).await
     }
     async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
         // The unit's chained work completes before its commit reads it; a
@@ -343,8 +445,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let mut hooks = UnitHooks {
             slots: slots.into_iter().map(|(pass, transport)| {
                 pass.set_attention_decode(false);
-                UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now() }
-            }).collect(),
+                Ok(UnitSlot { published: PublishedLayers::new(pass.library()?)?, pass, transport,
+                    batch: None, prepared: None, started: Instant::now() })
+            }).collect::<Result<Vec<_>>>()?,
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await

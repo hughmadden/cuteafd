@@ -1103,6 +1103,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(self.phase == Phase::SharedReady, "test FFN phase differs");
         unsafe { self.block.check_queued_finish(binding, result).await }
     }
+    /// The stream carrying this lane's mHC FFN finish (the block's output).
+    pub(crate) fn finish_stream(&self) -> *mut std::ffi::c_void { self.block.finish_stream() }
     pub fn output(&self) -> Result<BlockOutput<'_>> {
         ensure!(
             self.phase == Phase::Complete,

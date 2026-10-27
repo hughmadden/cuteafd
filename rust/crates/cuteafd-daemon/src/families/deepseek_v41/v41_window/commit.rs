@@ -185,7 +185,15 @@ impl<'a> WindowWave<'_, 'a> {
             // SAFETY: this wave's live stream on the chain's device.
             unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
             let launched = unsafe { self.enqueue_commit(state, accepted) };
-            if let Err(error) = launched.and(self.synchronize()) {
+            // Device-ordered prefill units (#815 option (i)) record the chain
+            // head instead of a host wait: every later reader of this window's
+            // published rows joins it (the same unit's later stages, and the
+            // next unit through its publication event). Its host staging is
+            // this pass's own and is reused only after the unit's drained commit.
+            let completed = if crate::shared::memory::chain::deferred() {
+                unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) }
+            } else { self.synchronize() };
+            if let Err(error) = launched.and(completed) {
                 self.abort_commit(state)?;
                 return Err(error);
             }

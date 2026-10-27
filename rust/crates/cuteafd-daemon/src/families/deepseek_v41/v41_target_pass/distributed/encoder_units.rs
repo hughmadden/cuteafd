@@ -47,10 +47,15 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let prepared = prepared.into_unit().await?;
         // Publish this layer's window now (as one RTX does): the next unit
         // attends it before this unit lands its FFN.
-        unsafe { requests.with_requests(|r| self.resources.execution
-            .enqueue_unit_window_publication(r.cache(), batch.cache()?, layer))?; }
-        while !self.resources.execution.poll_encoder_publication()? { tokio::task::yield_now().await; }
-        requests.borrow_mut().finish_distributed_encoder_publication(batch, &mut self.resources.execution)?;
+        if crate::shared::memory::chain::deferred() {
+            // Device-ordered (#815 option (i)): a chained direct commit after the attention.
+            requests.borrow_mut().publish_distributed_unit_window(batch, &mut self.resources.execution, layer)?;
+        } else {
+            unsafe { requests.with_requests(|r| self.resources.execution
+                .enqueue_unit_window_publication(r.cache(), batch.cache()?, layer))?; }
+            while !self.resources.execution.poll_encoder_publication()? { tokio::task::yield_now().await; }
+            requests.borrow_mut().finish_distributed_encoder_publication(batch, &mut self.resources.execution)?;
+        }
         Ok(prepared)
     }
 
@@ -71,6 +76,8 @@ struct UnitSlot<'s, 'w, 'a> {
     batch: Option<RequestBatch>,
     prepared: Option<UnitPreparedLayer>,
     started: Instant,
+    /// As on one RTX: this slot's per-layer publication events.
+    published: super::super::encoder_units::PublishedLayers<'a>,
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
@@ -85,6 +92,13 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
 }
 impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
+        // Device-ordered units leave queued work (and cross-slot waits) on
+        // every slot's chain: drain them all before any storage is released.
+        for slot in &self.slots {
+            if slot.pass.chain.is_some() {
+                crate::shared::decode_graph::fatal_drain(slot.pass.drain_chain(), "cancelled prefill unit chain");
+            }
+        }
         // A failed or cancelled prefill revokes the whole request (its later
         // units' reservations included) after each slot's work drained.
         let mut requests = self.requests.borrow_mut();
@@ -107,6 +121,10 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
     }
 }
 impl<'a> UnitHooks<'_, '_, '_, 'a> {
+    fn previous_publication(&self, unit: &Unit, layer: usize) -> Option<*mut std::ffi::c_void> {
+        let slot = super::super::encoder_units::previous_slot(unit, self.slots.len())?;
+        self.slots[slot].published.event(layer)
+    }
     async fn begin_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         ensure!((self.keep_running)(), "client disconnected");
         (self.before_unit)()?;
@@ -210,12 +228,21 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         scoped(chain, self.begin_unit_inner(unit)).await
     }
     async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        // As on one RTX: the unit's previous layer completes here while the
-        // other unit's wave is out; the attention and KV publication run
-        // unchained, in their established host order.
-        if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+        // As on one RTX (#815 option (i)): device-ordered, no host wait. The
+        // attention orders after the previous unit's publication of this layer;
+        // its window and source publications are chained direct commits.
         crate::shared::spark_waves::healthy()?;
-        self.attention_inner(layer, unit).await
+        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
+            // Host-ordered TP2 peer transfers keep the established host order.
+            if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+            return self.attention_inner(layer, unit).await;
+        };
+        let event = self.previous_publication(unit, layer);
+        chain.scope(async {
+            super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
+            self.attention_inner(layer, unit).await?;
+            self.slots[unit.slot].published.record(layer)
+        }).await
     }
     async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let chain = unit_chain(self.slots[unit.slot].pass)?;
@@ -230,11 +257,20 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         scoped(chain, self.land_experts_inner(layer, unit, ticket)).await
     }
     async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
-        // The suffix capture and decoder-source production run unchained after
-        // the unit's chained layers completed (once per unit).
-        if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+        // Device-ordered (#815 option (i)): the suffix capture and the
+        // boundary source publication chain behind the unit's last layer.
         crate::shared::spark_waves::healthy()?;
-        self.end_unit_inner(unit).await
+        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
+            if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
+            return self.end_unit_inner(unit).await;
+        };
+        let boundary = super::super::encoder_units::BOUNDARY;
+        let event = self.previous_publication(unit, boundary);
+        chain.scope(async {
+            super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
+            self.end_unit_inner(unit).await?;
+            self.slots[unit.slot].published.record(boundary)
+        }).await
     }
     async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
         if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
@@ -265,11 +301,15 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             ensure!(slots.iter().all(|(_, transport)| transport.has_local_layer(layer) == slots[0].1.has_local_layer(layer)),
                 "encoder slot expert placement differs");
         }
+        let map = slots[0].0.resources.map;
+        let library = slots[0].0.resources.lanes[0].device.library;
         let mut hooks = UnitHooks {
             slots: slots.into_iter().map(|(pass, transport)| {
                 pass.set_attention_decode(false);
-                UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now() }
-            }).collect(),
+                let published = super::super::encoder_units::PublishedLayers::on_devices(library,
+                    |layer| Ok(pass.resources.lanes[map.attention(layer)?].device.id))?;
+                Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published })
+            }).collect::<Result<Vec<_>>>()?,
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit, complete: false,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;

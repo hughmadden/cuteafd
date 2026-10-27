@@ -9,6 +9,15 @@ impl Requests<'_> {
         unsafe { pending.poll_encoder(&mut self.cache, batch.cache()?) }
     }
 
+    /// Device-ordered prefill units: publish `layer`'s window as a chained
+    /// direct commit (see `DistributedExecution::publish_unit_window`).
+    pub fn publish_distributed_unit_window(&mut self, batch: &RequestBatch,
+        execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>,
+        layer: usize) -> Result<()> {
+        self.validate(batch)?;
+        execution.publish_unit_window(&mut self.cache, batch.cache()?, layer)
+    }
+
     pub fn finish_distributed_encoder_publication(&mut self, batch: &RequestBatch,
         execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>) -> Result<()> {
         self.validate(batch)?;

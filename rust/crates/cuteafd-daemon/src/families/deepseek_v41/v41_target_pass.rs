@@ -180,6 +180,10 @@ impl<'a, R> Pass<'a, R> {
         chain.set_device_order(true);
         Ok(chain.handle())
     }
+    /// The pass's native library (its stage chain's).
+    pub(super) fn library(&self) -> Result<&'a cuteafd_ffi::NativeLibrary> {
+        Ok(self.chain.as_ref().context("prefill units need the stage chain (CUTEAFD_STAGE_CHAIN)")?.library())
+    }
     pub(super) fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
         chain.drain_bounded(Duration::from_secs(60))

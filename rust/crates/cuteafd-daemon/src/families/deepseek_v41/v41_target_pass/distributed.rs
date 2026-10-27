@@ -808,7 +808,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let device = self.resources.lanes[gpu].device;
         ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
         let output = self.resources.lanes[gpu].output()?;
-        device.future(unsafe { suffix.get_mut().capture_cooperative(&output, &self.resources.suffix_stream) }).await?;
+        if crate::shared::memory::chain::deferred() {
+            // Device-ordered prefill units (#815 option (i)): no host wait;
+            // the unit's commit drains the chain before the suffix is read.
+            let stream = self.resources.suffix_stream.raw;
+            device.run(|| unsafe { suffix.get_mut().capture_chained(&output, stream) })?;
+        } else {
+            device.future(unsafe { suffix.get_mut().capture_cooperative(&output, &self.resources.suffix_stream) }).await?;
+        }
         if stage == CacheStage::Encoder {
             unsafe { self.advance(20).await?; }
             let gpu = self.resources.map.attention(20)?;
