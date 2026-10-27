@@ -34,10 +34,8 @@ pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, bu
     ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
     let handshake = EncoderHandshake::for_tower(&spec, id, &processor, config.plan_hash);
-    let minimax = spec.image_family() == cuteafd_loader::media::ImageFamily::Minimax;
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
-    let start = if minimax { EncoderServer::start_minimax } else { EncoderServer::start };
-    let server = start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
+    let server = EncoderServer::start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(address = %server.address, sm, admitted_bytes = ledger.total_bytes(), "vision encoder ready");
     Ok((server, ledger.total_bytes()))

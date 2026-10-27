@@ -268,7 +268,7 @@ impl Family for MiniMaxM3 {
                     scales unchanged).".into(),
             }),
             Component::Vision => Some(Hint {
-                what: "MiniMax M3 images and video run through the bundled tower on the RTX or a Spark rank".into(),
+                what: "MiniMax M3 images run through the bundled tower on the RTX or a Spark rank".into(),
                 how: "Build with the D80 vision attention export; qualify the tower with python/tools/qualify/minimax_m3/qualify-vision.py and the served path with scripts/qualify/minimax_m3/qualify-native-vision.py.".into(),
             }),
             Component::Speculator => Some(Hint {

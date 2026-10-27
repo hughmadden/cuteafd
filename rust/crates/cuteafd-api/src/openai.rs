@@ -283,7 +283,6 @@ pub struct NativeRequest {
     /// Generic-family media, in template order. V4.1 only uses `images`.
     pub media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     pub audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
-    pub videos: Vec<Arc<cuteafd_loader::media::minimax::PreparedVideoSegment>>,
     pub max_tokens: usize,
     /// Resolved target-sampling parameters. `TargetSamplingParams::greedy()`
     /// keeps the legacy device-argmax route; anything else selects from the
@@ -1162,7 +1161,6 @@ impl Submitter {
         let job = NativeRequest {
             prefix_cache_source: prefix_cache_source.clone(),
             audio: prepared.audio,
-            videos: Vec::new(),
             media: prepared.media,
             prompt,
             literal_spans,

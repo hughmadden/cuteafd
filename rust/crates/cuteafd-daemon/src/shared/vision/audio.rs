@@ -241,8 +241,7 @@ mod tests {
         let invalid = service
             .submit(EncodeJob {
                 rgb: Arc::from([]),
-                grid: [1, 0, 0],
-                video: false,
+                grid: [0, 0],
                 lut: Arc::new([0.0; 768]),
                 output: vec![],
             })

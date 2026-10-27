@@ -310,13 +310,6 @@ extern "C" int32_t cuteafd_vision_rmsnorm_bf16(const float* x,const float* w,uin
   if(!x||!w||!y||rows<=0||dim<=0||dim>16384||eps<=0)return cudaErrorInvalidValue;
   rmsnorm_bf16_kernel<<<rows,256,0,static_cast<cudaStream_t>(stream)>>>(x,w,y,dim,eps);return cudaGetLastError();
 }
-extern "C" int32_t cuteafd_vision_encode_frames(void* owner,const uint8_t* rgb,uint64_t rgb_bytes,
-  const float* lut,int32_t gt,int32_t gh,int32_t gw,uint16_t* output,uint64_t output_bytes) {
-  if(!owner)return cudaErrorInvalidValue;
-  auto* o=static_cast<Owner*>(owner);
-  if(o->spec.abi_version!=3 || o->spec.reserved!=4)return cudaErrorInvalidValue;
-  return encode_minimax(o,rgb,rgb_bytes,lut,gt,gh,gw,false,output,output_bytes,nullptr,nullptr);
-}
 extern "C" int32_t cuteafd_vision_layernorm_bf16(const float* x,const float* w,const float* bias,uint16_t* y,int32_t rows,int32_t dim,float eps,void* stream) {
   if(!x||!w||!y||rows<=0||dim<=0||dim>16384||eps<=0)return cudaErrorInvalidValue;
   layernorm_bf16_kernel<<<rows,256,0,static_cast<cudaStream_t>(stream)>>>(x,w,bias,y,dim,eps);return cudaGetLastError();

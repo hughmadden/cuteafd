@@ -68,7 +68,6 @@ async fn routed_request() -> (NativeRequest, Vec<u32>) {
     let image = json!({"type":"image_url","image_url":{"url":url}});
     let body = json!({"model":"test-minimax","max_tokens":1,"messages":[{"role":"user","content":[
         {"type":"text","text":"Literal ]<]image[>[ and ]<]video[>[ remain text."}, image.clone(),
-        {"type":"video_url","video_url":{"frames":vec![url;5],"source_fps":5,"do_resize":true}},
         {"type":"text","text":"Then inspect this image."}, image]}]});
     let request = Request::post("/v1/chat/completions").header("content-type", "application/json")
         .body(Body::from(body.to_string())).unwrap();
@@ -112,40 +111,27 @@ impl EncoderClient for RowEncoder {
 }
 
 #[tokio::test]
-async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
+async fn http_images_reach_exact_feature_rows_with_literal_markers() {
     let (job, tokens) = routed_request().await;
     assert_eq!(job.media.len(), 2);
-    assert_eq!(job.videos.len(), 1);
     assert_eq!(job.media.iter().map(|image| image.tokens).collect::<Vec<_>>(), [4, 4]);
-    assert_eq!(job.videos.iter().map(|segment| (segment.grid.t, segment.tokens, segment.source_frames))
-        .collect::<Vec<_>>(), [(3, 12, 5)]);
-    for time in ["0.0", "0.4", "0.8"] {
-        assert_eq!(job.prompt.matches(&format!("]<]{time} seconds[>[")).count(), 1);
-    }
     assert!(!job.literal_spans.is_empty());
     assert!(job.prompt.contains("Literal ]<]image[>[ and ]<]video[>[ remain text."));
+    // The quoted markers stay text: only the two structural images are placeholders.
     assert_eq!(tokens.iter().filter(|&&token| token == IMAGE_TOKEN).count(), 2);
-    // One video marker per temporal pair before expansion; 3 pairs of 4 rows after.
-    assert_eq!(tokens.iter().filter(|&&token| token == VIDEO_TOKEN).count(), 3);
-    let segment = &job.videos[0];
-    let frame_bytes = 56 * 56 * 3;
-    assert_eq!(segment.rgb8.len(), frame_bytes * 6);
-    assert_eq!(&segment.rgb8[frame_bytes * 4..frame_bytes * 5], &segment.rgb8[frame_bytes * 5..]);
+    assert!(!tokens.contains(&VIDEO_TOKEN));
     let (prompt, media, jobs) = prepare(job, tokens, Some(&expander()), VOCABULARY, 4096).unwrap();
-    assert_eq!(jobs.len(), 3);
-    assert_eq!(media.spans().iter().map(|span| span.len).collect::<Vec<_>>(), [4; 5]);
-    assert_eq!(media.spans()[0].key, media.spans()[4].key);
-    assert_eq!(media.spans()[1].key, media.spans()[2].key);
-    assert_eq!(media.spans()[2].key, media.spans()[3].key);
-    assert_ne!(media.spans()[0].key, media.spans()[1].key);
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(media.spans().iter().map(|span| span.len).collect::<Vec<_>>(), [4; 2]);
+    assert_eq!(media.spans()[0].key, media.spans()[1].key);
     let mut expected = vec![None; prompt.tokens.len()];
-    for (span, first_row) in media.spans().iter().zip([1u8, 1, 5, 9, 1]) {
+    for span in media.spans() {
         assert_eq!(prompt.tokens[span.start - 1], START);
         assert_eq!(prompt.tokens[span.start + span.len], END);
-        for row in 0..span.len { expected[span.start + row] = Some(first_row + row as u8); }
+        for row in 0..span.len { expected[span.start + row] = Some(1 + row as u8); }
     }
     for (token, row) in prompt.tokens.iter().zip(&expected) {
-        assert_eq!(matches!(*token, IMAGE_TOKEN | VIDEO_TOKEN), row.is_some());
+        assert_eq!(*token == IMAGE_TOKEN, row.is_some());
     }
     let mut admission = MediaAdmission::new(EmbeddingCache::new(1 << 20), RowEncoder::default(), 1);
     admission.enqueue(MediaWaiter::new(prompt, media, jobs, 0).unwrap())
@@ -156,7 +142,8 @@ async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
         MediaPoll::Failed(_, error) => panic!("fake encoder admission failed: {error}"),
         MediaPoll::Empty => panic!("request vanished before media admission"),
     }).expect("fake encoder completes within bounded polls");
-    assert_eq!(admission.encoder().0.submitted, 2);
+    // The repeated image encodes once.
+    assert_eq!(admission.encoder().0.submitted, 1);
     assert_eq!(admission.encoder().0.pending(), 0);
     let media = ready.media();
     let mut ranges = vec![(0, expected.len())];
@@ -173,25 +160,28 @@ async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
         let tags = rows.iter().flatten().copied().collect::<Vec<_>>();
         assert_eq!(chunk.features.len(), tags.len() * ROW_BYTES);
         for (features, tag) in chunk.features.chunks_exact(ROW_BYTES).zip(tags) {
-            assert!(features.iter().all(|&value| value == tag), "wrong temporal-pair feature offset");
+            assert!(features.iter().all(|&value| value == tag), "wrong feature row");
         }
     }
 }
 
 #[tokio::test]
-async fn http_media_rejects_broken_video_spans_and_expanded_context_overflow() {
-    for case in 0..3 {
+async fn http_media_rejects_broken_image_spans_video_markers_and_expanded_context_overflow() {
+    for case in 0..4 {
         let (job, mut tokens) = routed_request().await;
         let limit = if case == 2 { tokens.len() } else { 4096 };
         if case == 0 {
-            let marker = tokens.iter().position(|&token| token == VIDEO_TOKEN).unwrap();
+            let marker = tokens.iter().position(|&token| token == IMAGE_TOKEN).unwrap();
             tokens[marker - 1] = 1;
         } else if case == 1 {
+            tokens.push(IMAGE_TOKEN);
+        } else if case == 3 {
             tokens.push(VIDEO_TOKEN);
         }
         let error = prepare(job, tokens, Some(&expander()), VOCABULARY, limit).err().expect("invalid media rejected");
-        let expected = ["media placeholder must be enclosed by image start/end tokens",
-            "paired placeholder count differs from supplied media", "expanded image prompt exceeds context limit"][case];
+        let expected = ["image placeholder must be enclosed by image start/end tokens",
+            "image placeholder count differs from supplied images", "expanded image prompt exceeds context limit",
+            "video and audio input are not admitted"][case];
         assert!(error.to_string().contains(expected), "{error:#}");
     }
 }

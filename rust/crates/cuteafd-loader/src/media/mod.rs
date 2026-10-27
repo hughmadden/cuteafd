@@ -11,7 +11,7 @@ pub use cuteafd_core::{ImageKey, MediaSpan};
 pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-pub use spans::{ExpandedMediaPrompt, PairedMedia, SpanExpander};
+pub use spans::{ExpandedMediaPrompt, SpanExpander};
 use std::{path::Path, sync::Arc};
 
 #[derive(Debug, thiserror::Error)]

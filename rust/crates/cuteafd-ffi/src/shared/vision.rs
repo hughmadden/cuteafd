@@ -126,9 +126,6 @@ type Encode = unsafe extern "C" fn(
     Option<Observer>,
     *mut c_void,
 ) -> i32;
-type EncodeFrames = unsafe extern "C" fn(
-    *mut c_void, *const u8, u64, *const f32, i32, i32, i32, *mut u16, u64,
-) -> i32;
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut VisionLedger) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
 
@@ -136,7 +133,6 @@ pub struct NativeVision {
     _library: Library,
     owner: *mut c_void,
     encode: Encode,
-    encode_frames: Option<EncodeFrames>,
     ledger: Ledger,
     destroy: Destroy,
     max_tokens: usize,
@@ -188,9 +184,6 @@ impl NativeVision {
             let mut result = Self {
                 owner: std::ptr::null_mut(),
                 encode: *library.get::<Encode>(b"cuteafd_vision_encode")?,
-                encode_frames: if spec.abi_version == 3 && spec.reserved == 4 {
-                    Some(*library.get::<EncodeFrames>(b"cuteafd_vision_encode_frames")?)
-                } else { None },
                 ledger: *library.get::<Ledger>(b"cuteafd_vision_get_ledger")?,
                 destroy: *library.get::<Destroy>(b"cuteafd_vision_destroy")?,
                 _library: library,
@@ -213,37 +206,19 @@ impl NativeVision {
         }
     }
     /// Encode into caller-owned output. No Rust or CUDA allocation in this call.
-    /// `grid` is `[t, h, w]`: a still image (`t = 1`, one RGB8 frame) or, on the MiniMax
-    /// ABI 3 tower, a video segment of `t` temporal pairs (`2t` frames; the processor
-    /// repeats an odd final frame). The LUT is normalized FP32 `[channel][rgb8]`, with
-    /// reference operation order.
+    /// The LUT is normalized FP32 `[channel][rgb8]`, with reference operation order.
     pub fn encode_into(
         &mut self,
         rgb: &[u8],
-        grid: [usize; 3],
-        video: bool,
+        grid: [usize; 2],
         lut: &[f32; 768],
         output: &mut [u16],
     ) -> Result<(), VisionError> {
-        if video {
-            let encode = self.encode_frames.ok_or(VisionError::InvalidInput(
-                "temporal vision encoding requires MiniMax ABI 3",
-            ))?;
-            validate_frames(grid, rgb.len(), output.len(), self.max_tokens, self.output_width)?;
-            // SAFETY: checked contiguous host extents remain live through synchronous
-            // encode. The owner drains its stream on every return before reuse.
-            return check(unsafe {
-                encode(self.owner, rgb.as_ptr(), rgb.len() as u64, lut.as_ptr(),
-                    grid[0] as i32, grid[1] as i32, grid[2] as i32,
-                    output.as_mut_ptr(), std::mem::size_of_val(output) as u64)
-            });
-        }
-        let [t, h, w] = grid;
+        let [h, w] = grid;
         let patches = h
             .checked_mul(w)
             .ok_or(VisionError::InvalidInput("vision grid overflow"))?;
-        if t != 1
-            || h < 2
+        if h < 2
             || w < 2
             || h % 2 != 0
             || w % 2 != 0
@@ -278,24 +253,6 @@ impl NativeVision {
         check(unsafe { (self.ledger)(self.owner, &mut ledger) })?;
         Ok(ledger)
     }
-}
-fn validate_frames(
-    grid: [usize; 3], rgb_bytes: usize, output_elements: usize, max_tokens: usize, output_width: usize,
-) -> Result<(), VisionError> {
-    let [t, h, w] = grid;
-    let patches = match (u32::try_from(t), u32::try_from(h), u32::try_from(w)) {
-        (Ok(t), Ok(h), Ok(w)) => cuteafd_core::media::video_segment_patches([t, h, w]),
-        _ => None,
-    }.and_then(|n| usize::try_from(n).ok())
-        .ok_or(VisionError::InvalidInput("vision temporal grid is not a video segment"))?;
-    if h > i32::MAX as usize || w > i32::MAX as usize
-        || patches > max_tokens.saturating_mul(4)
-        || patches.checked_mul(2 * 14 * 14 * 3) != Some(rgb_bytes)
-        || (patches / 4).checked_mul(output_width) != Some(output_elements)
-    {
-        return Err(VisionError::InvalidInput("vision temporal RGB/grid/output extent mismatch"));
-    }
-    Ok(())
 }
 impl Drop for NativeVision {
     fn drop(&mut self) {
@@ -426,21 +383,6 @@ fn validate_injection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn minimax_video_extents_include_both_frames_and_all_temporal_rows() {
-        let rgb = 4 * 28 * 56 * 3;
-        assert!(validate_frames([2, 2, 4], rgb, 4 * 6144, 4, 6144).is_ok());
-        assert!(validate_frames([1, 2, 4], rgb / 2, 2 * 6144, 4, 6144).is_ok());
-        assert!(validate_frames([2, 2, 4], rgb / 2, 4 * 6144, 4, 6144).is_err());
-        assert!(validate_frames([2, 2, 4], rgb, 2 * 6144, 4, 6144).is_err());
-        assert!(validate_frames([2, 2, 4], rgb, 4 * 6144, 3, 6144).is_err());
-        // Up to four temporal patches (eight frames) form one segment.
-        assert!(validate_frames([4, 2, 4], rgb * 2, 8 * 6144, 8, 6144).is_ok());
-        assert!(validate_frames([5, 2, 4], rgb * 5 / 2, 10 * 6144, 10, 6144).is_err());
-        for grid in [[0, 2, 4], [3, 2, 4], [2, 3, 4], [2, usize::MAX, 4]] {
-            assert!(validate_frames(grid, rgb, 4 * 6144, 4, 6144).is_err());
-        }
-    }
     #[test]
     fn injection_rejects_bad_extents_and_devices_before_launch() {
         let buffer = crate::CuteafdDeviceBuffer {

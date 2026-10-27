@@ -1,12 +1,11 @@
 //! Bundled MiniMax processors at release revision 54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e.
 //! The executable processors use smart resize, not the legacy grid-pinpoint fields.
-use super::{ImageGrid, ImageKey, MediaError, ProcessorConfig, Result, SpanExpander};
-use std::{path::Path, sync::Arc};
+use super::{MediaError, ProcessorConfig, Result, SpanExpander};
+use std::path::Path;
 
 pub const IMAGE_TOKEN: u32 = 200_025;
 pub const VIDEO_TOKEN: u32 = 200_026;
-/// Token capacity of the loaded tower (16,384 patches of scratch); one video segment
-/// must fit it whatever the image detail cap is.
+/// Token capacity of the loaded tower (16,384 patches of scratch).
 pub const ENCODER_TOKENS: usize = 4096;
 pub const PROCESSOR_SOURCES: [(&str, &str); 3] = [
     ("image_processor.py", "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994"),
@@ -42,17 +41,6 @@ pub fn span_expander(snapshot: &Path, vocabulary: u32) -> Result<SpanExpander> {
         "vision_start_token_id": id("]<]start of image[>[")?,
         "vision_end_token_id": id("]<]end of image[>[")?,
     }), vocabulary)
-}
-
-/// A bounded tower invocation. RGB frames are contiguous HWC, with the final
-/// frame repeated for an odd frame count; `grid.t` counts temporal patch pairs.
-#[derive(Debug, Clone)]
-pub struct PreparedVideoSegment {
-    pub key: ImageKey,
-    pub grid: ImageGrid,
-    pub rgb8: Arc<[u8]>,
-    pub tokens: usize,
-    pub source_frames: usize,
 }
 
 #[cfg(test)]
