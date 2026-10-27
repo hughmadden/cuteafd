@@ -357,7 +357,11 @@ macro_rules! drive_prefill_units {
         let steps = prefill_schedule(&routes, $units, $waves)?;
         let mut tickets: Vec<Option<(usize, H::Ticket)>> = (0..$units.len()).map(|_| None).collect();
         let mut outstanding = std::collections::VecDeque::new();
+        let timed = tracing::enabled!(target: "cuteafd::prefill_hooks", tracing::Level::DEBUG);
         for step in steps {
+            // Per-hook host time (RUST_LOG=cuteafd::prefill_hooks=debug): how long
+            // the issuing thread spends inside each hook, the drains included.
+            let started = timed.then(std::time::Instant::now);
             match step {
                 Step::Begin { unit } => $hooks.begin_unit(&$units[unit])$(.$await)??,
                 Step::Attention { layer, unit } => $hooks.attention(layer, &$units[unit])$(.$await)??,
@@ -375,6 +379,19 @@ macro_rules! drive_prefill_units {
                 }
                 Step::End { unit } => $hooks.end_unit(&$units[unit])$(.$await)??,
                 Step::Commit { unit } => $hooks.commit_unit(&$units[unit])$(.$await)??,
+            }
+            if let Some(started) = started {
+                let (kind, unit, layer) = match step {
+                    Step::Begin { unit } => ("begin", unit, None),
+                    Step::Attention { layer, unit } => ("attention", unit, Some(layer)),
+                    Step::Local { layer, unit } => ("local", unit, Some(layer)),
+                    Step::Send { layer, unit } => ("send", unit, Some(layer)),
+                    Step::Land { layer, unit } => ("land", unit, Some(layer)),
+                    Step::End { unit } => ("end", unit, None),
+                    Step::Commit { unit } => ("commit", unit, None),
+                };
+                tracing::debug!(target: "cuteafd::prefill_hooks", kind, unit, layer, slot = $units[unit].slot,
+                    host_us = started.elapsed().as_micros() as u64, "prefill hook");
             }
         }
         anyhow::ensure!(outstanding.is_empty(), "prefill finished with waves outstanding");
