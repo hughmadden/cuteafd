@@ -1288,6 +1288,26 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, ['v41-flash-sim5090'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert card['gpus'] == [0]
+    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
+    assert values['MODEL_ID'] == 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
+    expected = {
+        'RTX_GPUS': '1', 'COORDINATOR_GPU': '0',
+        'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
+        'MAX_CONTEXT_TOKENS': '1048576', 'PREFILL_BATCH_TOKENS': '1024',
+        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
+    }
+    assert {key: values[key] for key in expected} == expected
+    assert [values[f'SPARK_{rank}_HOST'] for rank in range(4)] == card['sparks']
+    entries = json.loads((kit / 'matrix-gate.json').read_text())['entries']
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
 def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
     # A card pinned to GPU0 (GPU1 held by another session) stages its WIP build
     # container on GPU0 too; without the key the default stays GPU1.
