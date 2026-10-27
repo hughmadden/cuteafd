@@ -484,17 +484,6 @@ release_prepare_api_key() {
   fi
 }
 
-# The base URL this host reaches a server listening on ADDR (HOST:PORT) at: the
-# bound address itself, or loopback when ADDR binds every address (0.0.0.0, ::).
-release_local_api_url() {
-  local host="${1%:*}" port="${1##*:}"
-  case "$host" in
-    ""|0.0.0.0) host=127.0.0.1 ;;
-    "::"|"[::]") host="[::1]" ;;
-  esac
-  printf 'http://%s:%s' "$host" "$port"
-}
-
 release_api_curl() {
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     # Keep the key out of argv/process listings. Health probes do not need it.
@@ -983,25 +972,12 @@ release_validate_coordinator_gpu_budget() {
 # value-safety check stay in force while launch-only topology/readiness
 # requirements are skipped. A launch-incomplete but syntactically valid file
 # can therefore clean every host it names.
-# The namespace mount (CUTEAFD_NAMESPACE_ROOT, default /mnt/sparknest) and the
-# Hugging Face home every launch reads checkpoints from: HF_HOME, else the
-# namespace's hf-home. Family detection and the launch share these.
-release_namespace_root() {
-  readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}"
-}
-release_launch_hf_home() {
-  printf '%s' "${HF_HOME:-$(release_namespace_root)/hf-home}"
-}
-
 # The family of the checkpoint a config names (scripts/lib/checkpoint-family.py
-# on its config.json), found in the hub the launch reads (release_launch_hf_home).
-# KEY=VALUE arguments after the file are run.sh's --set overrides, applied as the
-# launch applies them (later wins). A config without MODEL_ID is DeepSeek V4.1, the
-# release default, whose validation reports a missing snapshot; a MODEL_ID whose
-# snapshot is not in that hub fails here, naming the hub.
+# on its config.json). A config without MODEL_ID, or a snapshot not present
+# here, is DeepSeek V4.1, the release default; its own validation reports a
+# missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" line key value hub dir pair
-  shift
+  local config="$1" model="" revision="" line key value hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -1012,27 +988,15 @@ release_config_family() {
       MODEL_REVISION) revision="$value" ;;
     esac
   done < "$config"
-  for pair in "$@"; do
-    case "$pair" in
-      MODEL_ID=*) model="${pair#*=}" ;;
-      MODEL_REVISION=*) revision="${pair#*=}" ;;
-    esac
-  done
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
-  hub="$(release_launch_hf_home)/hub"
+  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
   dir="$hub/models--${model//\//--}"
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
-  local described="" checkpoint_config=""
-  if [[ -d "$model" && -f "$model/config.json" ]]; then
-    checkpoint_config="$model/config.json"
-  elif [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
-    checkpoint_config="$dir/snapshots/$revision/config.json"
-  else
-    release_die "checkpoint $model${revision:+@$revision} is not in $hub, the hub this launch reads" \
-      "(HF_HOME, else \$CUTEAFD_NAMESPACE_ROOT/hf-home); download it there or point HF_HOME at the hub that holds it"
+  local described=""
+  if [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
+    described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
+      "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
   fi
-  described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "$checkpoint_config" 2>/dev/null)" ||
-    described=""
   # Unrecognized configs stay on the DeepSeek V4.1 path, whose checks name the problem.
   [[ -n "$described" ]] || described=deepseek_v41
   printf '%s\n' "${described%% *}"
@@ -1664,15 +1628,6 @@ release_validate_verbs_device_map() {
   done
 }
 
-# The numeric RDMA tuning values (run.sh --help), when set, are whole numbers: the
-# family launch splices them into each worker's remote command line.
-release_validate_verbs_tuning() {
-  local name
-  for name in CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
-    [[ -z "${!name:-}" || "${!name}" =~ ^[0-9]+$ ]] || release_die "$name must be a whole number, not ${!name}"
-  done
-}
-
 release_expert_hosts_csv() {
   local i lane separator=
   for ((i = 0; i < SPARK_COUNT; i++)); do
@@ -2145,106 +2100,6 @@ release_wip_cp() {
   fi
 }
 
-# release_wip_spark_slot_revision SLOT IMAGE CONTAINER ROOT INSTANCE, on a Spark (shipped
-# with declare -f, with release_wip_cp): the development IMAGE is present (a missing
-# registry image is pulled) and the spark-expert slot's SparkInfer source verifies against
-# its own lock, whose revision it prints. ROOT and INSTANCE take __default__/__none__.
-# Only the check's inputs are copied, into a scratch directory it removes: nothing staged.
-release_wip_spark_slot_revision() {
-  local slot="$1" image="$2" container="$3" root="$4" instance="$5" registry scratch status=0
-  [[ "$instance" != __none__ ]] || instance=
-  [[ "$root" != __default__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
-  if ! docker image inspect "$image" >/dev/null 2>&1; then
-    registry="${image%%/*}"
-    [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] ||
-      { echo "missing local development image $image" >&2; return 1; }
-    docker pull "$image" >&2 || return 1
-  fi
-  scratch="$(mktemp -d)" || return 1
-  local slot_source="slots/$slot/spark-expert/workspace"
-  { release_wip_cp "$container" "$root" "$slot_source/third_party/sparkinfer" "$scratch/" &&
-    release_wip_cp "$container" "$root" "$slot_source/third_party/sparkinfer.lock.json" "$scratch/" &&
-    release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-sparkinfer-source.py" "$scratch/"; } >&2 &&
-    python3 "$scratch/verify-sparkinfer-source.py" --source "$scratch/sparkinfer" \
-      --lock "$scratch/sparkinfer.lock.json" --print-revision || status=1
-  rm -rf -- "$scratch"
-  return "$status"
-}
-
-# A dry run stages into a private layout (RELEASE_PRIVATE_WIP_LAYOUT) and removes it
-# when the launcher exits: re-staging the shared one (rm, then mv) would pull files
-# from under a live server of the same slot and instance.
-release_private_wip_layout() {
-  mkdir -p "$HOME/.cache/cuteafd/wip-run"
-  RELEASE_PRIVATE_WIP_LAYOUT="$(mktemp -d "$HOME/.cache/cuteafd/wip-run/.dry-run.XXXXXX")"
-  trap release_remove_private_wip_layout EXIT
-}
-release_remove_private_wip_layout() {
-  [[ -z "${RELEASE_PRIVATE_WIP_LAYOUT:-}" ]] ||
-    rm -rf -- "$RELEASE_PRIVATE_WIP_LAYOUT" "$RELEASE_PRIVATE_WIP_LAYOUT.tmp"
-}
-
-# The tool_eval panel runs `tool-eval-bench` from PATH. Release images install it from the
-# pinned submodule (docker/Dockerfile.release); the WIP coordinator layout gets the same
-# source, verified against its lock, plus a bin/tool-eval-bench wrapper that runs it from
-# /source with the one dependency the dev image lacks (python-dotenv, pinned wheel below).
-RELEASE_TOOL_EVAL_DOTENV_WHEEL=python_dotenv-1.2.4-py3-none-any.whl
-RELEASE_TOOL_EVAL_DOTENV_URL=https://files.pythonhosted.org/packages/60/d1/38f3a3405989a89ac18390803e70c6ad7c7760da4f9b83cbeca0c44a0c72/python_dotenv-1.2.4-py3-none-any.whl
-RELEASE_TOOL_EVAL_DOTENV_SHA256=42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc
-
-# release_tool_eval_dotenv_wheel: print the cached pinned wheel's path, downloading it once.
-# The hash is checked on every use, not only on download.
-release_tool_eval_dotenv_wheel() {
-  local dir="${CUTEAFD_WHEEL_CACHE:-$HOME/.cache/cuteafd/wheels}/$RELEASE_TOOL_EVAL_DOTENV_SHA256"
-  local wheel="$dir/$RELEASE_TOOL_EVAL_DOTENV_WHEEL"
-  if [[ ! -f "$wheel" ]]; then
-    mkdir -p "$dir" && curl -sSfL --max-time 120 -o "$wheel.part" "$RELEASE_TOOL_EVAL_DOTENV_URL" &&
-      mv "$wheel.part" "$wheel" ||
-      { rm -f "$wheel.part"; release_die "cannot download $RELEASE_TOOL_EVAL_DOTENV_WHEEL for the WIP tool-eval-bench CLI; place it at $wheel"; }
-  fi
-  [[ "$(sha256sum "$wheel" | cut -d' ' -f1)" == "$RELEASE_TOOL_EVAL_DOTENV_SHA256" ]] ||
-    release_die "$wheel does not match its pinned sha256 $RELEASE_TOOL_EVAL_DOTENV_SHA256; delete it to re-download"
-  printf '%s\n' "$wheel"
-}
-
-# release_stage_wip_tool_eval CONTAINER HOST_ROOT SLOT_SOURCE STAGE: a slot built without the
-# tool-eval-bench submodule stages no CLI (the panel reports it unavailable); a slot whose
-# copy does not match the lock fails staging. The sealed slot is only read.
-release_stage_wip_tool_eval() {
-  local container="$1" root="$2" slot_source="$3" stage="$4" wheel
-  local source="$stage/source/third_party/tool-eval-bench"
-  if ! release_wip_cp "$container" "$root" "$slot_source/third_party/tool-eval-bench" "$stage/source/third_party/" 2>/dev/null ||
-    [[ ! -f "$source/pyproject.toml" ]]; then
-    rm -rf "$source"
-    printf 'WIP slot has no tool-eval-bench source: the tool_eval panel will report it unavailable\n' >&2
-    return 0
-  fi
-  release_wip_cp "$container" "$root" "$slot_source/third_party/tool-eval-bench.lock.json" "$stage/source/third_party/" ||
-    release_die "WIP slot has tool-eval-bench source but no third_party/tool-eval-bench.lock.json"
-  release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-tool-eval-source.py" "$stage/source/scripts/build/" ||
-    release_die "WIP slot has tool-eval-bench source but no scripts/build/verify-tool-eval-source.py"
-  # The copy's gitfile points into the slot's module store; drop it and any bytecode so the
-  # lock's content digest is the whole check and only verified source can run.
-  rm -rf "$source/.git"
-  find "$source" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) -prune -exec rm -rf {} +
-  python3 -I "$stage/source/scripts/build/verify-tool-eval-source.py" --require-no-python-cache \
-    --source "$source" --lock "$stage/source/third_party/tool-eval-bench.lock.json" >&2 ||
-    release_die "WIP slot tool-eval-bench source does not match its lock; rebuild the slot with ./wip.sh"
-  wheel="$(release_tool_eval_dotenv_wheel)" || exit $?
-  mkdir -p "$stage/source/tool-eval-deps"
-  python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
-    "$wheel" "$stage/source/tool-eval-deps" || release_die "cannot extract $wheel"
-  cat > "$stage/bin/tool-eval-bench" <<'WRAPPER'
-#!/bin/sh
-# Staged by release_stage_wip_tool_eval: the slot's lock-verified tool-eval-bench source.
-root="${CUTEAFD_WIP_SOURCE_ROOT:-/source}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="$root/third_party/tool-eval-bench/src:$root/tool-eval-deps${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -P -c 'import sys; sys.argv[0] = "tool-eval-bench"; from tool_eval_bench.cli.dispatch import main; sys.exit(main())' "$@"
-WRAPPER
-  chmod 0755 "$stage/bin/tool-eval-bench"
-}
-
 release_stage_wip_layout() {
   local container="$1" slot="$2" role="$3" layout="$4"
   local raw="$layout.tmp/raw" root
@@ -2271,7 +2126,6 @@ release_stage_wip_layout() {
   release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
   python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
     --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
-  [[ "$role" != coordinator ]] || release_stage_wip_tool_eval "$container" "$root" "$slot_source" "$layout.tmp"
   rm -rf "$raw" "$layout"
   mv "$layout.tmp" "$layout"
 }

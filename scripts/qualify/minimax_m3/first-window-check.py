@@ -183,9 +183,25 @@ def runtime_inputs():
         raise ValueError("MINIMAX_URL must be the local HTTP endpoint on MINIMAX_ADDR's port")
 
 
+def api(url):
+    """The serve step's chat reply: one carrying an error, or no text at all, fails it."""
+    import urllib.request
+    request = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "Say hello."}],
+                         "max_tokens": 16, "temperature": 0}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        body = json.load(response)
+    choices = body.get("choices", [])
+    message = choices[0].get("message", {}) if choices else {}
+    if body.get("error") or not (message.get("content") or message.get("reasoning_content")):
+        raise ValueError("API returned an error or empty completion")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "hosts", "locks", "expert-port", "window", "runtime", "budgets"))
+    parser.add_argument("mode", choices=("preflight", "hosts", "locks", "expert-port", "window", "runtime", "budgets",
+                                         "api"))
     parser.add_argument("value")
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--plan", type=Path, help="budgets: the configuration's dry-run deployment")
@@ -201,6 +217,8 @@ def main():
             print(diagnostic_window(Path(args.value)))
         elif args.mode == "runtime":
             runtime_inputs()
+        elif args.mode == "api":
+            api(args.value)
         elif args.mode == "budgets":
             # Workers get the plan's Spark budget, as run.sh gives them: the configured
             # SPARK_DEVICE_BUDGET_BYTES, else the family default. The golden gets the configured

@@ -184,55 +184,6 @@ def test_public_launcher_resolves_family_from_selected_namespace(tmp_path: Path)
     assert "--family glm5_flash" in result.stdout
 
 
-MINIMAX = {"model_type": "minimax_m3_vl", "text_config": {
-    "model_type": "minimax_m3", "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
-
-
-def test_family_detection_reads_the_hub_the_launch_reads(tmp_path: Path) -> None:
-    """Without HF_HOME the launch reads CUTEAFD_NAMESPACE_ROOT/hf-home (default
-    /mnt/sparknest); detection used ~/.cache/huggingface and took a stale copy there
-    (or nothing, which meant DeepSeek V4.1) for the checkpoint's family."""
-    namespace, home = tmp_path / "namespace", tmp_path / "home"
-    model = "MiniMaxAI/MiniMax-M3.1-Flash"
-    _snapshot(namespace / "hf-home", model, MINIMAX)
-    _snapshot(home / ".cache" / "huggingface", model, {"model_type": "deepseek_v41"})
-    config = tmp_path / "minimax.config"
-    config.write_text(f"MODEL_ID={model}\n")
-    env = {key: value for key, value in os.environ.items() if key != "HF_HOME"}
-    env.update(HOME=str(home), CUTEAFD_NAMESPACE_ROOT=str(namespace))
-    script = (f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; '
-              'release_config_family "$1"; printf "%s\\n" "$(release_launch_hf_home)"')
-    result = subprocess.run(["bash", "-c", script, "_", str(config)], env=env, capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["minimax_m3", str(namespace / "hf-home")]
-
-
-def test_family_detection_refuses_a_checkpoint_the_launch_hub_lacks(tmp_path: Path) -> None:
-    repo, hf = _repo(tmp_path), tmp_path / "hf"
-    (hf / "hub").mkdir(parents=True)
-    config = repo / "minimax.config"
-    config.write_text("MODEL_ID=MiniMaxAI/MiniMax-M3.1-Flash\n")
-    result = _run(repo, hf, "--config", str(config), "--dry-run")
-    assert result.returncode == 2
-    assert f"checkpoint MiniMaxAI/MiniMax-M3.1-Flash is not in {hf / 'hub'}" in result.stderr
-    assert "run-family" not in result.stdout, "no fallback to the DeepSeek V4.1 launch"
-    # The release default (no MODEL_ID) is still DeepSeek V4.1, whose own checks name a missing snapshot.
-    config.write_text("CONCURRENCY=4\n")
-    result = _run(repo, hf, "--config", str(config), "--dry-run")
-    assert result.returncode == 0 and "--family deepseek_v41" in result.stdout, result.stderr
-
-
-def test_family_detection_follows_the_launch_model_override(tmp_path: Path) -> None:
-    repo, hf = _repo(tmp_path), tmp_path / "hf"
-    _snapshot(hf, "zai-org/GLM-5.3-Flash", GLMF_TWO_LAYER)
-    config = repo / "other.config"
-    config.write_text("MODEL_ID=not/downloaded\n")
-    result = _run(repo, hf, "--config", str(config), "--set", "MODEL_ID=zai-org/GLM-5.3-Flash", "--dry-run")
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == (f"run-family --config {config} --family glm5_flash "
-                             "--set MODEL_ID=zai-org/GLM-5.3-Flash --dry-run\n")
-
-
 def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> None:
     """run.sh is the same thin dispatcher for DeepSeek V4.1 (#82)."""
     repo, hf = _repo(tmp_path), tmp_path / "hf"
@@ -911,12 +862,6 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    # STUB_SSH_FAIL fails the remote commands that contain it; a slot check answers
-                                    # STUB_SLOT_SPARKINFER_<host>, else STUB_SLOT_SPARKINFER, else the stub pin.
-                                    ('[[ -z "${STUB_SSH_FAIL:-}" || "$*" != *"$STUB_SSH_FAIL"* ]] || exit 1\n'
-                                     'case "$*" in *release_wip_spark_slot_revision*) v="STUB_SLOT_SPARKINFER_$1"; '
-                                     'echo "${!v:-${STUB_SLOT_SPARKINFER:-test-pin}}" ;; esac\n'
-                                     if tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
@@ -965,8 +910,7 @@ exec python3 -c "$code" "$@"
 '''
             (bin_dir / tool).write_text(stub)
         (bin_dir / tool).chmod(0o755)
-    (bin_dir / "curl").write_text('#!/usr/bin/env bash\n[[ -z "${STUB_CURL_FAIL:-}" ]] || exit 22\n'
-                                  'printf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
+    (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
     (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo ' + str(gpu_total_mib) +
                                          ' ;; *memory.free*) echo ' + str(gpu_free_mib) +
@@ -1389,75 +1333,6 @@ def test_the_wip_slot_root_a_card_config_names_launches_every_family(tmp_path):
     assert "unused configuration key" not in result.stderr
     stages = [line for line in result.stderr.splitlines() if line.startswith("ssh h0 bash -s -- slot-test")]
     assert any(str(root) in line for line in stages), "\n".join(stages)
-
-
-@pytest.mark.parametrize("escapes", [False, True])
-def test_launch_and_stop_take_the_same_wip_roots(tmp_path, escapes):
-    # One check (release_validate_wip_root) for both: a root reached through a link out of
-    # the build cache is refused by the launch as stop.sh refuses it, before anything starts.
-    builds = tmp_path / "home" / ".cache" / "cuteafd" / "builds"
-    builds.mkdir(parents=True)
-    root = builds / "wip-link"
-    if escapes:
-        (tmp_path / "elsewhere").mkdir()
-        root.symlink_to(tmp_path / "elsewhere")
-    result = _family_launch_result(
-        tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
-        f"SPECULATOR=off\nVISION=off\nAUDIO=off\nWIP_ROOT={root}\n", extra_args=("--wip", "slot-test"))
-    # stop.sh's own first step on the same file (the rest of stop.sh would touch real containers).
-    assert 'release_load_config "$config" stop' in (ROOT / "stop.sh").read_text()
-    script = f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; release_load_config "$1" stop'
-    stop = subprocess.run(["bash", "-c", script, "_", str(tmp_path / "repo" / "f.config")],
-                          env={**os.environ, "HOME": str(tmp_path / "home")}, capture_output=True, text=True, timeout=60)
-    refusal = "WIP_ROOT resolves outside"
-    assert (refusal in result.stderr, refusal in stop.stderr) == (escapes, escapes), (result.stderr, stop.stderr)
-    if escapes:
-        assert result.returncode == 2 and stop.returncode == 2
-        assert "docker cp" not in result.stderr and "docker run" not in result.stderr
-    else:
-        assert result.returncode == 0 and stop.returncode == 0, (result.stderr, stop.stderr)
-
-
-@pytest.mark.parametrize("case", ["verified", "pulled", "missing-image", "missing-slot", "unverified"])
-def test_wip_spark_slot_check_verifies_the_slot_source_without_staging(tmp_path, case):
-    """The check a WIP launch runs on every Spark before --restart stops anything, shipped
-    as `ssh HOST "$(declare -f release_wip_cp release_wip_spark_slot_revision); ..."`."""
-    home, scratch, bin_dir = tmp_path / "home", tmp_path / "scratch", tmp_path / "bin"
-    for directory in (home, scratch, bin_dir):
-        directory.mkdir()
-    workspace = home / ".cache/cuteafd/builds/wip-own/slots/s1/spark-expert/workspace"
-    if case != "missing-slot":
-        (workspace / "third_party/sparkinfer").mkdir(parents=True)
-        (workspace / "third_party/sparkinfer/b12x.py").write_text("source")
-        (workspace / "third_party/sparkinfer.lock.json").write_text('{"revision": "' + "a" * 40 + '"}')
-        (workspace / "scripts/build").mkdir(parents=True)
-        # The slot's own verifier: the source must match before it prints the lock's revision.
-        (workspace / "scripts/build/verify-sparkinfer-source.py").write_text(
-            "import json, sys\nargs = sys.argv\n"
-            "ok = open(args[args.index('--source') + 1] + '/b12x.py').read() == 'source'\n"
-            "sys.exit('source does not match the lock') if not ok else print(json.load(open(args[args.index('--lock') + 1]))['revision'])\n")
-        if case == "unverified":
-            (workspace / "third_party/sparkinfer/b12x.py").write_text("edited")
-    log = tmp_path / "docker.log"
-    # Only present-dev:tc is in the local image store; a registry image pulls; no WIP container.
-    (bin_dir / "docker").write_text(f'#!/usr/bin/env bash\necho "$*" >> {log}\n'
-        'case "$1" in image) [[ "$3" == present-dev:tc ]] ;; container) exit 1 ;; *) exit 0 ;; esac\n')
-    (bin_dir / "docker").chmod(0o755)
-    image = {"pulled": "registry.example/dev:tc", "missing-image": "absent-dev:tc"}.get(case, "present-dev:tc")
-    script = (f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; '
-              'bash -c "$(declare -f release_wip_cp release_wip_spark_slot_revision); '
-              'release_wip_spark_slot_revision \\"\\$@\\"" _ "$@"')
-    result = subprocess.run(["bash", "-c", script, "_", "s1", image, "cuteafd-spark-expert-wip-own", "__default__", "own"],
-                            env={**os.environ, "HOME": str(home), "TMPDIR": str(scratch), "PATH": f"{bin_dir}:{os.environ['PATH']}"},
-                            capture_output=True, text=True, timeout=60)
-    if case in ("verified", "pulled"):
-        assert result.returncode == 0 and result.stdout == "a" * 40 + "\n", result.stderr
-    else:
-        assert result.returncode == 1 and result.stdout == "", result.stdout
-    assert ("missing local development image" in result.stderr) == (case == "missing-image")
-    assert ("pull registry.example/dev:tc" in log.read_text()) == (case == "pulled")
-    # Only a scratch copy, removed again; no serving layout.
-    assert list(scratch.iterdir()) == [] and not (home / ".cache/cuteafd/wip-run").exists()
 
 
 def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
@@ -3620,35 +3495,6 @@ def test_rdma_device_map_is_not_set_unless_given(tmp_path):
     assert "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP" not in result.stderr
 
 
-@pytest.mark.parametrize("model_config,model,serve", [(_GLMF, "test/glmf", "cuteafd serve-glmf"),
-    ({"model_type": "minimax_m3_vl", "text_config": {"model_type": "minimax_m3", "num_hidden_layers": 60,
-      "moe_layer_freq": [0] * 3 + [1] * 57}}, "MiniMaxAI/MiniMax-M3.1-Flash", "cuteafd serve-minimax")])
-def test_rdma_tuning_reaches_both_roles_of_every_family_as_run_sh_documents(tmp_path, model_config, model, serve):
-    assert "reach both roles of every family only when set" in (ROOT / "run.sh").read_text()
-    keys = "VISION=off\nAUDIO=off\n" + ("SPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n" if "MiniMax" in model else "")
-    tuning = {"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "10.0.0.1=rocep1s0f1",
-              "CUTEAFD_VERBS_APP_IB_PORT_NUM": "2", "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": "3"}
-    result = _family_launch_result(tmp_path, model_config, model, keys, extra_env=tuning,
-                                   encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30})
-    assert result.returncode == 0, result.stderr
-    lines = result.stderr.splitlines()
-    workers = [line for line in lines if "docker run -d --name cuteafd-spark-expert-" in line]
-    coordinator = next(line for line in lines if serve in line)
-    assert workers
-    for name, value in tuning.items():
-        assert all(f"-e {name}={value}" in worker for worker in workers), workers
-        assert f"-e {name}={value}" in coordinator, coordinator
-    # Unset, nothing is forwarded; a value that is not a whole number stops the launch first.
-    unset = _family_launch_result(tmp_path / "unset", model_config, model, keys,
-        extra_env={name: "" for name in tuning}, encoder_plan={"placement_supported": True, "fits": True,
-                                                               "spark_budget_bytes": 108 << 30})
-    assert unset.returncode == 0 and not any(name in unset.stderr for name in tuning), unset.stderr
-    for name in ("CUTEAFD_VERBS_APP_IB_PORT_NUM", "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"):
-        bad = _family_launch_result(tmp_path / name, model_config, model, keys, extra_env={name: "1; reboot"})
-        assert bad.returncode == 2 and f"{name} must be a whole number" in bad.stderr
-        assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in bad.stderr.splitlines())
-
-
 def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
     result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "10.0.0.1=dev x"})
@@ -3863,24 +3709,6 @@ def test_family_plan_charges_the_speculator_this_launch_serves(tmp_path, keys, e
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert f"--speculator {expected}" in plan
-
-
-@pytest.mark.parametrize("addr,url", [
-    ("0.0.0.0:8000", "http://127.0.0.1:8000"), ("[::]:8000", "http://[::1]:8000"), (":::8000", "http://[::1]:8000"),
-    ("10.0.0.9:8123", "http://10.0.0.9:8123"), ("[fd00::9]:8123", "http://[fd00::9]:8123"),
-    ("localhost:9000", "http://localhost:9000")])
-def test_readiness_polls_the_bound_address(addr: str, url: str) -> None:
-    script = f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; release_local_api_url "$1"'
-    result = subprocess.run(["bash", "-c", script, "_", addr], capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0 and result.stdout == url, result.stderr
-
-
-def test_v41_polls_a_lan_bound_api_where_it_listens(tmp_path: Path) -> None:
-    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"}, "deepseek-ai/DeepSeek-V4.1-Flash",
-        "MODEL_REVISION=\nSPECULATOR=off\nVISION=off\nRTX_GPUS=1\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
-        "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\nADDR=10.0.0.9:8000\n")
-    assert result.returncode == 0, result.stderr
-    assert "CUTEAFD native API is ready at http://10.0.0.9:8000/v1/" in result.stdout
 
 
 @pytest.mark.parametrize("value,enabled", [("dspark", True), ("off", False)])

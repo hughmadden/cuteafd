@@ -12,7 +12,7 @@ launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
-namespace_root="$(release_namespace_root)"
+namespace_root="$(readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}")"
 namespace_hf_home="$namespace_root/hf-home"
 if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" ]]; then
   export HF_HOME="$namespace_hf_home"
@@ -961,7 +961,7 @@ for tool in docker ssh curl jq ss nvidia-smi sha256sum python3; do release_need 
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
 docker image inspect "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 ||
   release_die "coordinator image is missing: $COORDINATOR_DOCKER_INFERENCE (pull the published pair, or build it with a config whose COORDINATOR_DOCKER_INFERENCE names this tag)"
-hf_home="$(release_launch_hf_home)"
+hf_home="${HF_HOME:-$namespace_root/hf-home}"
 release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
@@ -1075,7 +1075,6 @@ if [[ -n "$wip_slot" ]]; then
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
-  ((dry_run == 0)) || { release_private_wip_layout; wip_layout="$RELEASE_PRIVATE_WIP_LAYOUT"; }
   release_ensure_dev_image "$COORDINATOR_DOCKER_INFERENCE"
   release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   engine_commit="wip-$wip_slot-$(sha256sum "$wip_layout/lib/libcuteafd_native.so" | cut -c1-12)"
@@ -1165,7 +1164,7 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" "${dry_run:-0}" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
@@ -1173,7 +1172,6 @@ wip_spark_container="${9:-cuteafd-spark-expert-wip}"
 wip_layout_slot="${10:-$wip_slot}"
 wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
 namespace_root="${13:-/mnt/sparknest}"
-dry_run="${14:-0}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
@@ -1210,12 +1208,6 @@ if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
 fi
 if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
-  if [[ "$dry_run" == 1 ]]; then
-    # A dry run stages a private copy: a live worker may mount the shared layout.
-    mkdir -p "$HOME/.cache/cuteafd/wip-run"
-    layout="$(mktemp -d "$HOME/.cache/cuteafd/wip-run/.dry-run.XXXXXX")"
-    trap 'rm -rf -- "$layout" "$layout.tmp"' EXIT
-  fi
   rm -rf "$layout.tmp" && mkdir -p "$layout.tmp/raw"
   wip_cp "slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
     die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container or $wip_root_arg"
@@ -1237,6 +1229,7 @@ if [[ "$wip_slot" != __none__ ]]; then
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
 fi
 if [[ "$exl3" == true && "$wip_slot" != __none__ ]]; then
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   if [ -f "$layout/lib/exl3/exl3-$exl3_family/manifest.json" ]; then cat "$layout/lib/exl3/exl3-$exl3_family/manifest.json"; else cat "$layout/lib/exl3/manifest.json"; fi
 elif [[ "$exl3" == true ]]; then
   docker run --rm --network none --entrypoint /bin/sh "$image" -c \
@@ -1595,7 +1588,7 @@ for i in "${!hosts[@]}"; do
 done
 
 start_coordinator
-api_url="$(release_local_api_url "$ADDR")"
+api_url="http://127.0.0.1:${ADDR##*:}"
 until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
   release_api_advertises_native_model "$api_url" "$RELEASE_NATIVE_API_MODEL_ID"; do
   [[ "$(docker inspect -f '{{.State.Status}}' "$coordinator" 2>/dev/null)" == running ]] || { docker logs --tail 200 "$coordinator" >&2 || true; release_die "native coordinator exited during startup"; }
@@ -1629,7 +1622,7 @@ instance="$(get INSTANCE)"
 coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 model="$(get MODEL_ID)"
 revision="$(get MODEL_REVISION)"
-hf_home="$(release_launch_hf_home)"
+hf_home="${HF_HOME:-$namespace_root/hf-home}"
 hub="$(readlink -f "$hf_home/hub")"
 root="$hub/models--${model//\//--}"
 [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
@@ -1724,7 +1717,6 @@ fi
 # none and serves text only.
 # Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
 release_validate_verbs_device_map
-release_validate_verbs_tuning
 audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
 # An explicit count or host list is exact. Unspecified means the entire inventory.
@@ -1797,18 +1789,14 @@ if [[ -n "$wip_slot" ]]; then
   # The WIP root the slot was staged under: the environment wins, else the
   # config (as V4.1's release_load_config reads it), else the default layout.
   WIP_ROOT="${WIP_ROOT:-$(get WIP_ROOT)}"
-  # The check stop.sh and the V4.1 launch apply, so a root this launch takes can be stopped.
-  release_validate_wip_root
   release_wip_slot_instance "$wip_slot"
   release_wip_serving_layout "$instance"
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
-  # Progress and the slot's source check go to stderr: a dry run's stdout is its deployment JSON.
-  release_ensure_dev_image "$coordinator_image" >&2
+  release_ensure_dev_image "$coordinator_image"
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
-  ((dry_run == 0)) || { release_private_wip_layout; wip_layout="$RELEASE_PRIVATE_WIP_LAYOUT"; }
-  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout" >&2
+  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -v "$wip_layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
@@ -2890,7 +2878,6 @@ audio_encoder_hash=""
   elif [[ "$selected_ranks" != "$ranks" ]]; then
     # Re-resolve count-dependent MTP, ingress and local flags before launching.
     export SPARK_COUNT="$selected_ranks"
-    release_remove_private_wip_layout # exec runs no EXIT trap; the next run stages its own
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
   deployment_peer_csv="$(jq -er '.peers | join(",")' <<<"$plan_json")"
@@ -2936,7 +2923,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py" >&2; then
+    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
       echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
       exit 2
     fi
@@ -3010,31 +2997,9 @@ for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
 done
 peers=()
 [[ -z "$deployment_peer_csv" ]] || IFS=, read -r -a peers <<<"$deployment_peer_csv"
-# A WIP launch needs its slot and development image on every Spark: checked here, before a
-# --restart stops anything (and by a dry run), from a scratch copy of the slot's SparkInfer
-# source. The Sparks must agree on that source; another pin than this checkout's is a warning,
-# since a slot carries its own verified SparkInfer.
-if [[ -n "$wip_slot" ]] && ((ranks > 0)); then
-  pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
-    --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
-  slot_sparkinfer="" slot_sparkinfer_host=""
-  for ((rank = 0; rank < ranks; rank++)); do
-    host="$(get "SPARK_${rank}_HOST")"
-    slot_revision="$(ssh "$host" "$(declare -f release_wip_cp release_wip_spark_slot_revision); release_wip_spark_slot_revision $(printf '%q ' "$wip_slot" "$spark_image" "$wip_spark_container" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}")")" &&
-      [[ -n "$slot_revision" ]] ||
-      release_die "$host: WIP slot $wip_slot or the image $spark_image is missing or unverified (build the slot with ./wip.sh --slot $wip_slot)"
-    [[ -z "$slot_sparkinfer" || "$slot_revision" == "$slot_sparkinfer" ]] ||
-      release_die "WIP slot $wip_slot carries SparkInfer $slot_sparkinfer on $slot_sparkinfer_host but $slot_revision on $host; rebuild it with ./wip.sh --slot $wip_slot"
-    slot_sparkinfer="$slot_revision" slot_sparkinfer_host="$host"
-  done
-  [[ "$slot_sparkinfer" == "$pinned_sparkinfer" ]] ||
-    echo "warning: WIP slot $wip_slot carries SparkInfer $slot_sparkinfer; this checkout pins $pinned_sparkinfer" \
-      "(./wip.sh --slot $wip_slot rebuilds it from this checkout)" >&2
-fi
 if ((dry_run)); then
   # No serving container, restart or remote staging below this point is allowed
   # during validation. Runtime-only proofs (including audio exports) stay pending.
-  # The deployment JSON is the whole of stdout; notes went to stderr.
   printf '%s\n' "$deployment_json"
   exit 0
 fi
@@ -3072,53 +3037,43 @@ if [[ "$restart" == 1 ]]; then
     fi
   done
 fi
-# A launch that fails from here removes what it started, as DeepSeek V4.1's does: the
-# workers whose start returned and the coordinator once it runs. A container this launch
-# did not create (a name another deployment holds) is never touched.
-started_workers=() coordinator_started=0
-remove_failed_launch() {
-  ((coordinator_started == 0)) || docker rm -f "$coordinator_name" >/dev/null || true
-  local host
-  for host in ${started_workers[@]+"${started_workers[@]}"}; do
-    ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$port >/dev/null 2>&1 || true" || true
-  done
-}
-trap remove_failed_launch EXIT
 shared_coordinator_env_args
 shared_thermal_args
-# The optional RDMA tuning (run.sh --help) reaches the coordinator and every worker when it is
-# set, as on DeepSeek V4.1. CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...; each
-# process picks the entry for its own fabric address): without it each opens its first RDMA
-# device, which need not carry the fabric address (GB10 exposes several RDMA functions per
-# port). CUTEAFD_VERBS_APP_IB_PORT_NUM and CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES are
-# whole numbers (release_validate_verbs_tuning).
+# CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...; each process picks the entry
+# for its own fabric address) reaches the coordinator and every worker when it is set. Without
+# it each opens its first RDMA device, which need not carry the fabric address (GB10 exposes
+# several RDMA functions per port).
 device_map="${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}"
-rdma_worker_env="" rdma_args=()
+device_map_env="" device_map_args=()
 if [[ -n "$device_map" ]]; then
   [[ "$device_map" =~ ^[A-Za-z0-9.:=,_-]+$ ]] ||
     { echo "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP must be local-ip=device[,local-ip=device...]" >&2; exit 2; }
-  rdma_worker_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
-  rdma_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
+  device_map_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
+  device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
 fi
-for rdma_name in CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
-  [[ -n "${!rdma_name:-}" ]] || continue
-  rdma_worker_env+="${rdma_worker_env:+ }-e $rdma_name=${!rdma_name}"
-  rdma_args+=(-e "$rdma_name=${!rdma_name}")
-done
 if [[ -n "$wip_slot" ]]; then
-  # Stage the slot checked above into each Spark's serving layout (its old workers are gone).
+  # The slot must exist everywhere before anything starts, and the development images must
+  # carry the SparkInfer revision this checkout pins.
+  pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
+    --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" bash -s -- "$wip_slot" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
+    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
 set -euo pipefail
-slot="$1" container="$2" layout_slot="$3"
-wip_root_arg="${4:-__default__}"; wip_instance_arg="${5:-__none__}"
+slot="$1" image="$2" pinned="$3"
+container="$4" layout_slot="$5"
+wip_root_arg="${6:-__default__}"; wip_instance_arg="${7:-__none__}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
   if docker container inspect "$container" >/dev/null 2>&1; then docker cp "$container:/wip/$1" "$2"
   else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
 }
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  registry="${image%%/*}"
+  [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || { echo "missing local dev image $image" >&2; exit 1; }
+  docker pull "$image"
+fi
 layout="$HOME/.cache/cuteafd/wip-run/$layout_slot" raw="$HOME/.cache/cuteafd/wip-run/$layout_slot.tmp/raw"
 rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
 wip_cp "slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
@@ -3140,7 +3095,6 @@ STAGE
       { echo "$host: WIP slot $wip_slot is not staged (build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }
   done
 fi
-worker_pids=() worker_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   encoder_args=""
@@ -3162,23 +3116,13 @@ for ((rank = 0; rank < ranks; rank++)); do
   ((${#spark_profile_wrapper[@]} == 0)) || worker_wrapper="$(printf '%q ' "${spark_profile_wrapper[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
   ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $rdma_worker_env$worker_profile \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v $(printf %q "$namespace_root:$namespace_root:ro") '$spark_image' \
     ${worker_wrapper}cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
-  worker_pids+=("$!") worker_hosts+=("$host")
 done
-worker_failed=0
-for index in "${!worker_pids[@]}"; do
-  if wait "${worker_pids[index]}"; then
-    started_workers+=("${worker_hosts[index]}")
-  else
-    echo "${worker_hosts[index]}: the expert worker did not start" >&2
-    worker_failed=1
-  fi
-done
-((worker_failed == 0)) || exit 1
+wait
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   # A placement worker bootstraps after media admission and waits for the
@@ -3230,15 +3174,14 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
-  "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${rdma_args[@]}" \
+  "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
-coordinator_started=1
-url="$(release_local_api_url "$addr")"
+url="http://127.0.0.1:${addr##*:}"
 ready_deadline=$((SECONDS + 900))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do
   if (( SECONDS >= ready_deadline )); then
@@ -3250,7 +3193,6 @@ until curl --max-time 5 -sf "$url/health" >/dev/null; do
     { echo "coordinator exited:" >&2; docker logs --tail 30 "$coordinator_name" >&2; exit 1; }
   sleep 2
 done
-trap - EXIT
 echo "API ready at $url/v1/ ($(release_api_curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
 
 if ((console_supported)); then release_print_console_link "http://$(hostname):${addr##*:}"; fi

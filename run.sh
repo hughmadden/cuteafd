@@ -39,7 +39,7 @@ container-name characters, [A-Za-z0-9_.-].
   --wip SLOT                     serve a ./wip.sh slot's artifacts in the dev images
   --restart                     replace this instance's deployment
   --all                         with --restart, sweep worker ports on selected hosts
-  --dry-run                     validate a launch without starting serving containers
+  --dry-run                     validate a DeepSeek V4.1 launch without changing services
 
 DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
 CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
@@ -50,7 +50,7 @@ TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
 (--listen, --rtx-gpus, --concurrency, --kv-pool-size, --memory-reservation,
 --prefix-cache-entries, --dspark-draft-limit, --tp2-*, ...) are these keys.
 
-Optional RDMA tuning env values reach both roles of every family only when set:
+Optional RDMA tuning env values are forwarded to both roles only when set:
   CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
   CUTEAFD_VERBS_APP_IB_PORT_NUM, CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES.
 This is how a multi-homed six-rank launch pins the rail per host.
@@ -67,7 +67,6 @@ EOF
 
 config="$repo_root/cuteafd.config"
 family_args=()
-set_pairs=() # --set MODEL_ID/MODEL_REVISION pick the checkpoint, so detection sees every --set
 # The former DeepSeek V4.1 options, as the configuration keys they set.
 legacy_key() {
   case "$1" in
@@ -84,7 +83,7 @@ legacy_key() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?$1 requires FILE}"; shift 2 ;;
-    --set) family_args+=(--set "${2:?$1 requires KEY=VALUE}"); set_pairs+=("$2"); shift 2 ;;
+    --set) family_args+=(--set "${2:?$1 requires KEY=VALUE}"); shift 2 ;;
     --embedding-placement) family_args+=(--embedding-placement "${2:?$1 requires host or gpu}"); shift 2 ;;
     --wip) family_args+=(--wip "${2:?$1 requires SLOT}"); shift 2 ;;
     --rotate-console-secret) exec "$repo_root/scripts/launch/console-secret.sh" rotate ;;
@@ -104,5 +103,5 @@ done
 if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" ]]; then
   export HF_HOME="$(readlink -f "$CUTEAFD_NAMESPACE_ROOT")/hf-home"
 fi
-family="$(release_config_family "$config" ${set_pairs[@]+"${set_pairs[@]}"})"
+family="$(release_config_family "$config")"
 exec "$repo_root/scripts/launch/run-family.sh" --config "$config" --family "$family" ${family_args[@]+"${family_args[@]}"}

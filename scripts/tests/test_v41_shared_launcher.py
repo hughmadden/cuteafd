@@ -170,28 +170,6 @@ def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, 
         assert args[args.index("--mapped-scale-preload-gib") + 1] == cap
 
 
-def test_wip_dry_run_stages_only_private_layouts(tmp_path, monkeypatch) -> None:
-    """--dry-run --wip stages the slot on the coordinator and every Spark (the preflight
-    reads the staged artifacts) into private copies it removes: the shared layout of that
-    slot and instance may be mounted by a live server."""
-    import contextlib
-    import v41_launch_capture as capture_module
-    root = tmp_path / "capture"
-
-    @contextlib.contextmanager
-    def kept(dir=None):
-        root.mkdir()
-        yield str(root)
-
-    monkeypatch.setattr(capture_module.tempfile, "TemporaryDirectory", kept)
-    result = capture_module.capture(ROOT, KIT_CARDS[0], dry_run=True)
-    assert result["containers"] == [] and len(result["plans"]) == 1
-    assert "/wip-run/.dry-run." in " ".join(result["plans"][0])
-    hosts = sorted(path.name for path in (root / "hosts").iterdir())
-    assert len(hosts) > 1
-    assert [str(path.relative_to(root)) for path in root.glob("hosts/*/.cache/cuteafd/wip-run/*")] == []
-
-
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
     examples = {p.stem for p in (ROOT / "examples" / "configs").glob("deepseek-v41-*.config")}
     assert examples <= set(CASES)
@@ -325,10 +303,7 @@ def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeyp
     config = example_config("deepseek-v41-mxfp4-max", tmp_root)
     config.write_text(config.read_text() + "V41_FP8_HEAD=bf16\n")
     env = {**os.environ, "HOME": str(tmp_root), "PATH": "/usr/bin:/bin"}
-    # The checkpoint the example names: family detection reads its config.json first.
-    values = dict(line.split("=", 1) for line in config.read_text().splitlines() if line.startswith("MODEL_"))
-    hf = (tmp_root / "hf" / "hub" / f"models--{values['MODEL_ID'].replace('/', '--')}" / "snapshots"
-          / values["MODEL_REVISION"])
+    hf = tmp_root / "hf" / "hub" / "models--deepseek-ai--DeepSeek-V4.1-Flash" / "snapshots" / "dba1be0a40aa45a94ad051997016db3960a90277"
     hf.mkdir(parents=True, exist_ok=True)
     (hf / "config.json").write_text('{"model_type": "deepseek_v41"}')
     env["HF_HOME"] = str(tmp_root / "hf")

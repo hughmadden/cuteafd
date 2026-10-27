@@ -33,7 +33,8 @@ Required environment:
 Run-only environment:
   MINIMAX_BUILD_SEED    Explicit member of the selected TP4 rank list.
   MINIMAX_URL           API URL matching MINIMAX_ADDR; use an unused local port.
-  MINIMAX_ADDR          Server listen address on that unused port.
+  MINIMAX_ADDR          Server listen address on that unused port: loopback or every
+                       address, where the launcher's readiness poll reaches it.
 Optional: MINIMAX_PYTHON, MINIMAX_TIMEOUT (default 7200 seconds per step),
 MINIMAX_LOCK_WAIT (default 21600 seconds). No dependencies are installed.
 Prepare the reference with python/reference/families/minimax_m3/golden.py
@@ -87,6 +88,7 @@ schedule() {
       step "$selected: TP$tp serve and api-smoke" 'HTTP success; nonempty completion; no API error; owned containers stopped before lock release'
       show run.sh --wip qualification --config "CONFIG_DIR/minimax-m31-flash-nvfp4-$selected-tp$tp.config"
       show scripts/qualify/api-smoke.sh URL MiniMaxAI/MiniMax-M3.1-Flash
+      show scripts/qualify/minimax_m3/first-window-check.py api URL
     done
   done
   printf '\nFull goldens gate the model; subset diagnostics do not establish full-model fidelity.\n'
@@ -136,6 +138,7 @@ if [[ "$internal" == serve ]]; then
   # run.sh returns once /health answers, or fails.
   "$root/run.sh" --wip qualification --config "$stage_config"
   "$root/scripts/qualify/api-smoke.sh" "$MINIMAX_URL" MiniMaxAI/MiniMax-M3.1-Flash
+  "$python" "$checks" api "$MINIMAX_URL"
   exit 0
 fi
 
