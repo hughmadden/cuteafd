@@ -68,7 +68,7 @@ impl Backend for Fake {
 }
 
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
-    Job { sequence, slot, rows: 1, prefill: false, consumed: vec![(slot, consumed)], slice: (slot * 64, 64), sent: Instant::now(),
+    Job { sequence, slot, rows: 1, prefill: None, consumed: vec![(slot, consumed)], slice: (slot * 64, 64), sent: Instant::now(),
         source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
             build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
 }
@@ -688,18 +688,20 @@ fn prefill_accumulator_skips_each_ranks_first_unit() {
         pace
     };
     sums.add(2048, &wave(9_000, 5_000));
-    assert_eq!(sums.finish().rows, 0, "the first unit's idle is the decode boundary");
+    assert_eq!(sums.finish(None).rows, 0, "the first unit's idle is the call boundary");
     sums.add(2048, &wave(8_000, 100));
     sums.add(1024, &wave(4_000, 0));
-    let pace = sums.finish();
+    let pace = sums.finish(None);
     assert_eq!(pace.rows, 3072);
     assert_eq!(pace.ranks, vec![(12_000, 100), (12_002, 102)]);
     sums.add(64, &RankPace::default());
-    assert_eq!(sums.finish(), pace, "a wave without reports adds nothing");
+    assert_eq!(sums.finish(None).ranks, pace.ranks, "a wave without reports adds nothing");
+    assert_eq!(sums.finish(None).rows, pace.rows);
 }
 
-/// The worker adds a prefill wave's reported pace before publishing its
-/// landing, and only for waves flagged as prefill.
+/// The worker adds a prefill wave's reported pace to its own call before
+/// publishing its landing, and only for waves of a prefill call: two calls'
+/// waves never mix (#762, per-call samples).
 #[test]
 fn worker_sums_prefill_wave_pace_before_publishing_landed() -> Result<()> {
     struct Paced { world: Arc<World>, polls: usize }
@@ -722,28 +724,33 @@ fn worker_sums_prefill_wave_pace_before_publishing_landed() -> Result<()> {
         let mut backend = Paced { world: world.clone(), polls: 0 };
         let link = &link;
         let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, link));
-        for (sequence, prefill) in [(1, false), (2, true), (3, true), (4, true), (5, false)] {
+        for (sequence, prefill) in [(1, None), (2, Some(7)), (3, Some(7)), (4, Some(7)), (5, Some(8)), (6, Some(8)),
+            (7, None)] {
             let mut job = job(sequence, (sequence as usize) % 2, 0);
             job.rows = 100;
             job.prefill = prefill;
             world.store(Counter::Staged(job.slot), sequence);
             jobs.send(Command::Wave(job)).unwrap();
             wait(&world, Counter::Landed, sequence)?;
-            if prefill {
+            if let Some(call) = prefill {
                 // Visible as soon as the landing is.
-                assert!(link.prefill().seen[0]);
+                assert!(link.prefill().iter().any(|(id, sums)| *id == call && sums.seen[0]));
             }
         }
         drop(jobs);
         worker.join().unwrap().0
     })?;
-    // Wave 2 is rank 0's first prefill unit; waves 3 and 4 count.
-    // No begin_prefill here: the call's wall time is unknown (0).
-    assert_eq!(link.prefill().finish(),
-        cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: 200, ranks: vec![(7_000, 70)], wall_us: 0 });
-    let mut timed = PrefillAccumulator { began: Some(std::time::Instant::now()), ..Default::default() };
+    // Call 7: wave 2 is rank 0's first unit; waves 3 and 4 count. Call 8:
+    // wave 5 is its first, wave 6 counts. Without a start the wall time is 0.
+    let first = link.take_prefill(7).finish(None);
+    assert_eq!((first.rows, first.ranks, first.wall_us), (200, vec![(7_000, 70)], 0));
+    let second = link.take_prefill(8).finish(None);
+    assert_eq!((second.rows, second.ranks), (100, vec![(6_000, 60)]));
+    assert!(link.prefill().is_empty(), "taken calls are gone");
+    let start = std::time::Instant::now();
     std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut timed = PrefillAccumulator::default();
     timed.add(100, &[Some((10, 1)), None, None, None, None, None, None, None]);
-    assert!(timed.finish().wall_us >= 2_000, "the call's wall time runs from begin to its last landing");
+    assert!(timed.finish(Some(start)).wall_us >= 2_000, "the call's wall time runs from its start to its last landing");
     Ok(())
 }

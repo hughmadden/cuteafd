@@ -290,31 +290,50 @@ and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
   that unit as `prefill_unit_rows`, starts at the estimate's depth cut from it
   (`wave_control::unit_for`; 3 × 2752 at six Sparks), and spans
   `reserve_rows(4, 4096)` = 8256 rows
-  ([loader/serving_capacity/wave_control.rs:49](../../rust/crates/cuteafd-loader/src/serving_capacity/wave_control.rs#L49)).
+  ([loader/serving_capacity/wave_control.rs:72](../../rust/crates/cuteafd-loader/src/serving_capacity/wave_control.rs#L72)).
   The controller can then run any depth from 2 to 4.
-- **At each decode→prefill transition** the engine reports the previous call's
-  Spark pace to its `PrefillDepth`
-  ([daemon/shared/prefill_depth.rs:19](../../rust/crates/cuteafd-daemon/src/shared/prefill_depth.rs#L19)).
-  The pace is busy and idle time per unit, measured on the Spark prefill owner
-  and returned in the reply header, plus the call's host wall time from its
-  start to its last wave's landing. It is read without a host wait.
-  `WaveControl` (`wave_control.rs`) treats every prefill call of at least 60%
-  of the smallest unit as a sample of its overall period per prompt row
-  (wall / rows) for the depth it ran, and keeps each depth's last two
-  samples. A sample expires after 15 prefill calls of any size. After each
-  call it runs the depth with the best fresh period. The one exception: if the
-  Sparks' idle share points at a neighbouring depth that has no fresh
-  evidence, it steps once that way to measure it. Above 5% idle points at
-  fewer, wider units; below 1% points at more units. There is no other
-  exploration. The engine then takes that depth, re-cuts the prefill link's
-  return slots at rest, and brackets the call. GLM 5 does this in
-  `start_prefill`
-  ([daemon/families/glm5/engine.rs:1366](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1366)),
+- **At each prefill call** (one window cycle) the engine reports every
+  finished call's pace to its `PrefillDepth`
+  ([daemon/shared/prefill_depth.rs:27](../../rust/crates/cuteafd-daemon/src/shared/prefill_depth.rs#L27))
+  and takes this call's depth. A finished call's pace is read without a host
+  wait, as soon as its last wave has landed (`Waves::take_prefill`,
+  [daemon/shared/spark_waves.rs:1093](../../rust/crates/cuteafd-daemon/src/shared/spark_waves.rs#L1093)).
+  Each call's waves sum into the call's own accumulator. A pace has three parts:
+  - the call's own wall time, from its start (or the previous call's last
+    landing, if later) to its last landing;
+  - the Sparks' busy and idle time per unit, from the reply header;
+  - the coordinator's reply wait: GPU timing events around the consuming
+    stream's wait in `Waves::land`
+    ([spark_waves.rs:957](../../rust/crates/cuteafd-daemon/src/shared/spark_waves.rs#L957)).
+- **Samples.** `WaveControl`
+  ([wave_control.rs:186](../../rust/crates/cuteafd-loader/src/serving_capacity/wave_control.rs#L186))
+  counts each call as a sample of its period per prompt row (wall / rows) for
+  the depth it ran. Two kinds of call are not samples: transition calls (a
+  running call whose depth changed) and calls under 60% of the smallest unit.
+  A call is *opening* (a prefill's first) or *running* (it continues the same
+  sequence where the previous call ended). Each depth keeps its last two
+  samples per class, and a sample expires after 15 calls of any size.
+- **Decisions.** Widening (fewer units) happens only at an opening call;
+  deepening (more units) can happen at any call, in place. The latest sample
+  at the current depth points at a neighbour: Spark idle above 5% means fewer,
+  wider units; coordinator reply wait above 5% means more units; if both
+  fire, the larger share wins. The call steps there once to measure it if the
+  boundary allows that direction and the neighbour has no fresh evidence.
+  Otherwise it runs the best fresh depth with a 1% margin: at an opening call
+  by the mean of recent opening calls, all of which start at context 0; at a
+  running call by each depth's newest running call (adjacent calls of one
+  prompt). There is no other exploration.
+- **Caveat.** On a model whose per-call cost rises with context (Kimi), a
+  mid-prompt trial's sample comes two calls after its reference, so the trial
+  tends to lose. Kimi's depths tie at long context, so the loss is cheap.
+- **Wiring.** The engine re-cuts the prefill link's return slots at rest and
+  brackets the call: GLM 5 in `start_prefill`
+  ([daemon/families/glm5/engine.rs:1367](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1367)),
   Kimi in `RoutedLane::start_prefill`
   ([daemon/families/kimi_k3/spark.rs:140](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/spark.rs#L140)),
   and Step in its backend's prefill path
-  ([daemon/families/step5/backend.rs:278](../../rust/crates/cuteafd-daemon/src/families/step5/backend.rs#L278)).
-- **One call** is `call_rows` (`wave_control.rs:60`): the smallest
+  ([daemon/families/step5/backend.rs:275](../../rust/crates/cuteafd-daemon/src/families/step5/backend.rs#L275)).
+- **One call** is `call_rows` (`wave_control.rs:80`): the smallest
   k × unit over the candidate depths, 8192 rows at U = 4096. Every depth
   therefore cuts whole units.
 - **Storage never changes.** Every depth's slots are views at

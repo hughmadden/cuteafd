@@ -133,17 +133,19 @@ impl<'a> RoutedLane<'a> {
         self.set_depth(1, self.capacity)
     }
 
-    /// The decode→prefill transition (#762): reports the previous prefill
-    /// call's Spark pace to `depth` (when its waves have landed on the host;
-    /// no wait), re-cuts the return slots to the next depth and starts
-    /// summing this call's waves. Returns the depth this call runs.
-    pub(crate) fn start_prefill(&mut self, depth: &crate::shared::prefill_depth::PrefillDepth)
-        -> Result<crate::shared::prefill_depth::Depth> {
+    /// A prefill call boundary (#762): reports every finished prefill call's
+    /// pace to `depth` (no host wait), takes this call's depth (sequence
+    /// `key` from row `start`), re-cuts the return slots to it at rest and
+    /// starts summing this call's waves. Returns the depth this call runs.
+    pub(crate) fn start_prefill(&mut self, depth: &crate::shared::prefill_depth::PrefillDepth, key: u64,
+        start: usize) -> Result<crate::shared::prefill_depth::Depth> {
+        let stream = self.stream.device;
         let exchange = self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?;
-        let pace = exchange.take_prefill();
-        let next = depth.begin(pace);
+        depth.report(stream.run(|| exchange.take_prefill())?);
+        let next = depth.start(key, start);
         self.set_depth(next.waves, next.unit_rows)?;
-        self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?.begin_prefill()?;
+        let exchange = self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?;
+        stream.run(|| exchange.begin_prefill(next.call))?;
         Ok(next)
     }
 

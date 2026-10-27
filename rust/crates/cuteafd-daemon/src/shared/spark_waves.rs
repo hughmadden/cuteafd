@@ -180,9 +180,9 @@ pub(crate) struct Job {
     sequence: u32,
     slot: usize,
     rows: usize,
-    /// Sent between [`Waves::begin_prefill`] and [`Waves::end_prefill`]: its
-    /// ranks' reported unit pace counts towards the call's [`PrefillPace`].
-    prefill: bool,
+    /// The prefill call it belongs to ([`Waves::begin_prefill`]): its ranks'
+    /// reported unit pace counts towards that call's [`PrefillPace`].
+    prefill: Option<u64>,
     source: Source,
     /// The use counts the worker waits for before posting (planes free): the
     /// slot's own last use, or after a re-cut every slot's ([`SlotGeometry::fences`]).
@@ -220,22 +220,21 @@ pub(crate) struct LinkPace {
     round_trip_us: AtomicU32,
     idle_us: AtomicU32,
     waves: AtomicU32,
-    /// The current prefill call's Spark-reported unit pace (#762), filled by
-    /// the worker before it publishes each prefill wave's landing.
-    prefill: std::sync::Mutex<PrefillAccumulator>,
+    /// Per prefill call not yet taken, its Spark-reported unit pace (#762),
+    /// filled by the worker before it publishes each prefill wave's landing.
+    prefill: std::sync::Mutex<Vec<(u64, PrefillAccumulator)>>,
 }
 
 /// Sums each rank's reported unit busy/idle microseconds over one prefill
 /// call. A rank's first reported unit of the call is skipped: its idle gap is
-/// the decode→prefill boundary, not the pipeline's turnaround.
+/// the call boundary, not the pipeline's turnaround.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct PrefillAccumulator {
     rows: u64,
     ranks: [(u64, u64); cuteafd_core::MAX_SPARK_WORLD],
     seen: [bool; cuteafd_core::MAX_SPARK_WORLD],
     world: usize,
-    /// The call's host start ([`Waves::begin_prefill`]) and its last wave's landing.
-    began: Option<std::time::Instant>,
+    /// When the call's latest wave landed on the host.
     landed: Option<std::time::Instant>,
 }
 
@@ -255,14 +254,16 @@ impl PrefillAccumulator {
         }
         if counted { self.rows += rows as u64; }
     }
-    /// The call's pace (empty when no rank reported past its first unit).
-    pub(crate) fn finish(&self) -> cuteafd_loader::serving_capacity::wave_control::PrefillPace {
-        let wall_us = match (self.began, self.landed) {
-            (Some(began), Some(landed)) => landed.saturating_duration_since(began).as_micros() as u64,
+    /// The call's pace (empty when no rank reported past its first unit),
+    /// its wall time running from `start` to its last landing.
+    pub(crate) fn finish(&self, start: Option<std::time::Instant>)
+        -> cuteafd_loader::serving_capacity::wave_control::PrefillPace {
+        let wall_us = match (start, self.landed) {
+            (Some(start), Some(landed)) => landed.saturating_duration_since(start).as_micros() as u64,
             _ => 0,
         };
         cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: self.rows,
-            ranks: self.ranks[..self.world].to_vec(), wall_us }
+            ranks: self.ranks[..self.world].to_vec(), wall_us, reply_wait_us: None }
     }
 }
 
@@ -280,9 +281,23 @@ impl LinkPace {
         if let Some(idle) = idle { Self::add(&self.idle_us, idle * 1e6, first); }
         self.waves.fetch_add(1, Ordering::Relaxed);
     }
-    fn prefill(&self) -> std::sync::MutexGuard<'_, PrefillAccumulator> {
+    fn prefill(&self) -> std::sync::MutexGuard<'_, Vec<(u64, PrefillAccumulator)>> {
         // A panic while holding it leaves plain counters; keep using them.
         self.prefill.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Adds one landed wave of prefill call `call`.
+    fn add_prefill(&self, call: u64, rows: usize, ranks: &RankPace) {
+        let mut calls = self.prefill();
+        let at = match calls.iter().position(|(id, _)| *id == call) {
+            Some(at) => at,
+            None => { calls.push((call, PrefillAccumulator::default())); calls.len() - 1 }
+        };
+        calls[at].1.add(rows, ranks);
+    }
+    /// Removes and returns call `call`'s sums.
+    fn take_prefill(&self, call: u64) -> PrefillAccumulator {
+        let mut calls = self.prefill();
+        calls.iter().position(|(id, _)| *id == call).map(|at| calls.remove(at).1).unwrap_or_default()
     }
     /// (mean round trip, mean idle gap) in microseconds, and the waves seen.
     pub(crate) fn sample(&self) -> (u32, u32, u32) {
@@ -315,7 +330,7 @@ struct Inflight<W> {
     sequence: u32,
     slot: usize,
     rows: usize,
-    prefill: bool,
+    prefill: Option<u64>,
     slice: (usize, usize),
     wave: W,
     posted: Instant,
@@ -437,7 +452,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 if let Some(ranks) = backend.poll(&mut front.wave, front.slice, front.rows)? {
                     let mut done = inflight.pop_front().expect("front wave");
                     // Before `landed`: the engine reads the call's pace after it.
-                    if done.prefill { link.prefill().add(done.rows, &ranks); }
+                    if let Some(call) = done.prefill { link.add_prefill(call, done.rows, &ranks); }
                     done.times.received = done.posted.elapsed().as_secs_f64();
                     Pace::add(&mut pace.round_trip, done.times.received);
                     last_landed = Instant::now();
@@ -718,15 +733,31 @@ pub(crate) struct Waves<'a> {
     row_bytes: usize,
     next_slot: usize,
     sequence: u32,
-    outstanding: VecDeque<(u32, usize)>,
+    /// Per outstanding wave: sequence, slot and the prefill call it belongs to.
+    outstanding: VecDeque<(u32, usize, Option<u64>)>,
     /// The workers' installed grouping, fixed at bootstrap.
     grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
-    /// Waves sent now belong to a prefill call ([`Self::begin_prefill`]).
-    prefill: bool,
-    /// The last prefill call's final wave, until its pace is taken.
-    prefill_last: Option<u32>,
+    /// The prefill call waves sent now belong to ([`Self::begin_prefill`]).
+    prefill: Option<u64>,
+    /// Prefill calls whose pace is not yet taken, oldest first.
+    calls: VecDeque<PendingCall>,
+    /// When the last taken prefill call's last wave landed.
+    last_landed: Option<Instant>,
+    /// Reply-wait timing events (start, end) free for reuse, on `event_device`.
+    free_events: Vec<(*mut c_void, *mut c_void)>,
+    event_device: Option<i32>,
     /// The worker's always-on round-trip and Spark idle means (#762).
     pace: std::sync::Arc<LinkPace>,
+}
+
+/// One prefill call until its pace is taken (#762).
+struct PendingCall {
+    id: u64,
+    began: Instant,
+    /// The call's last wave, once it stopped sending.
+    last: Option<u32>,
+    /// Per landed wave: timing events around the consuming stream's wait.
+    waits: Vec<(*mut c_void, *mut c_void)>,
 }
 
 impl<'a> Waves<'a> {
@@ -791,7 +822,7 @@ impl<'a> Waves<'a> {
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, cut_at: 0, sequence: 0,
             outstanding: VecDeque::new(), grouping, pace,
-            prefill: false, prefill_last: None })
+            prefill: None, calls: VecDeque::new(), last_landed: None, free_events: Vec::new(), event_device: None })
     }
 
     /// Re-cuts the reserve into `waves` return slots of `rows` rows for the
@@ -893,7 +924,7 @@ impl<'a> Waves<'a> {
         self.jobs.as_ref().context("Spark exchange stopped")?.send(Command::Wave(job))
             .map_err(|_| WaveError::Lost(sequence))?;
         self.sequence = sequence;
-        self.outstanding.push_back((sequence, slot));
+        self.outstanding.push_back((sequence, slot, self.prefill));
         self.next_slot = (slot + 1) % cut.waves;
         Ok(WaveTicket { sequence, slot, rows })
     }
@@ -924,11 +955,24 @@ impl<'a> Waves<'a> {
     /// waits on the host. Mark the planes read with [`Self::consumed`] after
     /// the reduce, or reduce with [`Self::reduce`].
     pub(crate) fn land(&mut self, ticket: WaveTicket, stream: *mut c_void) -> Result<()> {
-        let (expected, slot) = self.outstanding.pop_front().ok_or(WaveError::Lost(ticket.sequence))?;
+        let (expected, slot, call) = self.outstanding.pop_front().ok_or(WaveError::Lost(ticket.sequence))?;
         ensure!(expected == ticket.sequence && slot == ticket.slot,
             WaveError::Order { expected, found: ticket.sequence });
-        // SAFETY: as `submit`'s waits.
-        unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)? };
+        // A prefill wave times the consuming stream's wait on its reply (#762).
+        let timed = match call { Some(call) => Some((call, self.wait_events()?)), None => None };
+        // SAFETY: as `submit`'s waits; the events are live events of the
+        // current device (the stream's), retained until queried complete.
+        unsafe {
+            if let Some((_, (start, _))) = timed { self.library.cuda_event_record(start, stream)?; }
+            self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)?;
+            if let Some((_, (_, end))) = timed { self.library.cuda_event_record(end, stream)?; }
+        }
+        if let Some((call, events)) = timed {
+            match self.calls.iter_mut().find(|pending| pending.id == call) {
+                Some(pending) => pending.waits.push(events),
+                None => self.free_events.push(events),
+            }
+        }
         let cut = self.geometry.cut();
         ensure!(ticket.rows <= cut.rows, "Spark wave of {} rows lands past its {}-row planes", ticket.rows, cut.rows);
         if let Some(alias) = self.landing_alias {
@@ -1020,43 +1064,96 @@ impl<'a> Waves<'a> {
     /// Return slots of the current cut.
     pub(crate) fn waves(&self) -> usize { self.geometry.cut().waves }
 
-    /// Starts a prefill call (#762): every wave sent until
-    /// [`Self::end_prefill`] reports its ranks' measured unit pace. Clears the
-    /// previous call's sums. Call with no wave outstanding.
-    pub(crate) fn begin_prefill(&mut self) -> Result<()> {
+    /// Starts prefill call `call` (#762): every wave sent until
+    /// [`Self::stop_prefill`] reports its ranks' measured unit pace and its
+    /// consuming stream's reply wait under that call. Call with no wave
+    /// outstanding.
+    pub(crate) fn begin_prefill(&mut self, call: u64) -> Result<()> {
         ensure!(self.outstanding.is_empty(), "a prefill call begins with no Spark wave outstanding");
-        *self.pace.prefill() = PrefillAccumulator { began: Some(std::time::Instant::now()), ..Default::default() };
-        self.prefill = true;
-        self.prefill_last = None;
-        Ok(())
-    }
-
-    /// Ends the prefill call and returns its Spark pace: per rank, the summed
-    /// busy and idle microseconds the workers measured on their prefill owner
-    /// for every unit after that rank's first in the call, and the prompt rows
-    /// those units carried. Every wave of the call must have landed on the
-    /// host (`landed`, e.g. after the consuming stream drained); waves still
-    /// outstanding are refused rather than silently missing from the sums.
-    pub(crate) fn end_prefill(&mut self) -> Result<cuteafd_loader::serving_capacity::wave_control::PrefillPace> {
         self.stop_prefill();
-        self.take_prefill().context("a prefill call's pace is read only after its waves landed")
+        self.prefill = Some(call);
+        self.calls.push_back(PendingCall { id: call, began: Instant::now(), last: None, waits: Vec::new() });
+        Ok(())
     }
 
     /// Stops flagging waves as the prefill call's (its last wave was sent);
     /// its waves may still be in flight. Later waves (decode) are not summed.
     pub(crate) fn stop_prefill(&mut self) {
-        if std::mem::replace(&mut self.prefill, false) { self.prefill_last = Some(self.sequence); }
+        let Some(call) = self.prefill.take() else { return };
+        let sequence = self.sequence;
+        if let Some(pending) = self.calls.iter_mut().find(|pending| pending.id == call) { pending.last = Some(sequence); }
     }
 
-    /// The last prefill call's Spark pace once its last wave landed on the
-    /// host (the worker sums a wave before publishing its landing). Read at
-    /// the next decode→prefill transition, without any host wait: `None`
-    /// when the host has not seen that landing yet (the sample is skipped).
-    pub(crate) fn take_prefill(&mut self) -> Option<cuteafd_loader::serving_capacity::wave_control::PrefillPace> {
-        let last = self.prefill_last?;
-        if !reached(self.words.load(Counter::Landed), last) { return None; }
-        self.prefill_last = None;
-        Some(self.pace.prefill().finish())
+    /// Every finished prefill call's pace, oldest first, without any host
+    /// wait: a call is finished once its last wave landed on the host (the
+    /// worker sums a wave before publishing its landing) and its stream
+    /// passed every reply wait. Unfinished calls stay for a later take.
+    /// A call's wall time runs from its start, or the previous call's last
+    /// landing when later, to its own last landing.
+    pub(crate) fn take_prefill(&mut self)
+        -> Result<Vec<(u64, cuteafd_loader::serving_capacity::wave_control::PrefillPace)>> {
+        let mut taken = Vec::new();
+        while let Some(front) = self.calls.front() {
+            let Some(last) = front.last else { break };
+            if !reached(self.words.load(Counter::Landed), last) { break; }
+            let Some(reply_wait_us) = self.reply_wait_us(&front.waits)? else { break };
+            let call = self.calls.pop_front().expect("front call");
+            self.free_events.extend(call.waits.iter().copied());
+            let sums = self.pace.take_prefill(call.id);
+            let start = self.last_landed.map_or(call.began, |landed| landed.max(call.began));
+            let mut pace = sums.finish(Some(start));
+            pace.reply_wait_us = (!call.waits.is_empty()).then_some(reply_wait_us);
+            if let Some(landed) = sums.landed { self.last_landed = Some(landed); }
+            taken.push((call.id, pace));
+        }
+        Ok(taken)
+    }
+
+    /// A free (start, end) timing event pair on the current device.
+    fn wait_events(&mut self) -> Result<(*mut c_void, *mut c_void)> {
+        let device = self.library.cuda_get_device()?;
+        ensure!(self.event_device.is_none_or(|owner| owner == device),
+            "reply-wait events of one Spark link stay on one device");
+        self.event_device = Some(device);
+        if let Some(events) = self.free_events.pop() { return Ok(events); }
+        Ok((self.library.cuda_event_create()?, self.library.cuda_event_create()?))
+    }
+
+    /// Destroys every reply-wait event (the link's owner drained its streams;
+    /// CUDA releases an event still pending once it completes).
+    fn destroy_events(&mut self) {
+        let mut events: Vec<_> = self.free_events.drain(..).collect();
+        for call in self.calls.drain(..) { events.extend(call.waits); }
+        let Some(device) = self.event_device else { return };
+        let library = self.library;
+        let destroyed = (|| -> Result<()> {
+            let previous = library.cuda_get_device()?;
+            library.cuda_set_device(device)?;
+            for (start, end) in events {
+                // SAFETY: events this link created on `device` and no longer records.
+                unsafe { library.cuda_event_destroy(start)?; library.cuda_event_destroy(end)?; }
+            }
+            library.cuda_set_device(previous)
+        })();
+        if let Err(error) = destroyed { tracing::error!(%error, "destroying Spark reply-wait events"); }
+    }
+
+    /// Summed µs between each pair, or None while any end has not completed.
+    fn reply_wait_us(&self, waits: &[(*mut c_void, *mut c_void)]) -> Result<Option<u64>> {
+        let Some(device) = self.event_device.filter(|_| !waits.is_empty()) else { return Ok(Some(0)) };
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(device)?;
+        let result = (|| {
+            let mut total = 0.0f64;
+            for &(start, end) in waits {
+                // SAFETY: live events of this link, created and recorded on `device`.
+                if !unsafe { self.library.cuda_event_query(end)? } { return Ok(None); }
+                total += f64::from(unsafe { self.library.cuda_event_elapsed_ms(start, end)? });
+            }
+            Ok(Some((total * 1e3) as u64))
+        })();
+        self.library.cuda_set_device(previous)?;
+        result
     }
 
     /// Stops the worker and returns the transport (after a failure, with its
@@ -1105,6 +1202,7 @@ impl Drop for Waves<'_> {
                 self.library.quarantine_module_after_failed_drain();
             }
         }
+        self.destroy_events();
     }
 }
 

@@ -987,9 +987,10 @@ impl<'a> GlmEngine<'a> {
             ensure!(start + t <= self.max_context, "prefill of {t} rows at {start} exceeds the context");
             let mut link = self.prefill_link.borrow_mut();
             let link = link.as_mut().context("GLM prefill units need the prefill link")?;
-            // The decode->prefill transition (#762): the previous call's pace,
-            // this call's depth, the link re-cut to it.
-            let depth = self.start_prefill(link)?;
+            // A prefill call boundary (#762): finished calls' paces, this
+            // call's depth (a sequence's first page keys it), the link re-cut.
+            let key = placement.pages.first().map_or(u64::MAX, |&page| u64::from(page));
+            let depth = self.start_prefill(link, key, start)?;
             let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
                 MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
@@ -997,7 +998,7 @@ impl<'a> GlmEngine<'a> {
                 lanes.push(self.prefill_tables(placement, start + rows.start, rows.len())?);
                 chunks.push(&tokens[rows]);
             }
-            self.depth.ran(lanes.len(), t);
+            self.depth.ran(depth, lanes.len(), t);
             let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
             let logits = self.step_lanes(&lanes, &chunks, depth, logit_rows, link, runtime);
             // The call's last wave is sent: later waves are not its.
@@ -1359,17 +1360,18 @@ impl<'a> GlmEngine<'a> {
         Ok(std::cell::Ref::map(self.prefill_slots.borrow(), |views| &views[depth - 1][..]))
     }
 
-    /// The decode->prefill transition (#762): the previous pipelined call's
-    /// Spark pace (when its last wave has landed on the host; no wait) to the
-    /// depth controller, the next depth, the link re-cut to it at rest, and
-    /// this call's waves flagged as the prefill's.
-    fn start_prefill(&self, link: &mut SparkLink<'_>) -> Result<crate::shared::prefill_depth::Depth> {
-        let pace = link.exchange()?.take_prefill();
-        let next = self.depth.begin(pace);
+    /// A prefill call boundary (#762): every finished call's pace (no host
+    /// wait) to the depth controller, this call's depth (sequence `key` from
+    /// row `start`), the link re-cut to it at rest, and this call's waves
+    /// flagged as its own.
+    fn start_prefill(&self, link: &mut SparkLink<'_>, key: u64, start: usize)
+        -> Result<crate::shared::prefill_depth::Depth> {
+        self.depth.report(link.exchange()?.take_prefill()?);
+        let next = self.depth.start(key, start);
         ensure!(next.waves <= link.slots() && next.unit_rows <= self.prefill_rows,
             "prefill depth {next:?} outside the link's {} admitted slots", link.slots());
         link.set_geometry(next.waves, next.unit_rows)?;
-        link.exchange()?.begin_prefill()?;
+        link.exchange()?.begin_prefill(next.call)?;
         Ok(next)
     }
 
