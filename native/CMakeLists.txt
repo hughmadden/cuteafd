@@ -57,6 +57,7 @@ option(CUTEAFD_ENABLE_GLMF_AOT "Build the GLM 5.3 Flash coordinator programs (sa
 option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_QWEN_DENSE_AOT "Build dense Qwen 3.5/3.8 BF16 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_STEP5_AOT "Build Step-5 coordinator programs (same table as DeepSeek V4)" OFF)
+option(CUTEAFD_ENABLE_MINIMAX_AOT "Build MiniMax M3 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_KIMIK3_AOT "Build Kimi K3 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_EXLR8_AOT "Build the EXLR8 programs into the program table (SM120: shared-expert K1 and rotated glue beside the family programs; SM121: routed K1 serving alone)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING
@@ -240,7 +241,7 @@ if(CUTEAFD_EXPERT_FAMILIES MATCHES ":(fp8|nvfp4)" OR "step5:bf16" IN_LIST CUTEAF
 endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT OR CUTEAFD_ENABLE_VISION_ATTENTION_AOT OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
    CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_V41_FP8_AOT OR CUTEAFD_ENABLE_V41_ATTENTION_AOT OR CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR
-   CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
+   CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
   set(CUTEAFD_BUILD_SPARKINFER_AOT ON)
 endif()
 if(CUTEAFD_BUILD_SPARKINFER_AOT)
@@ -345,6 +346,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/deepseek_v4/cuda/dsv4_dspark.cu
     families/glm5/cuda/glm_dflash.cu
     families/glm5_flash/cuda/glmf_dspark.cu
+    families/minimax_m3/cuda/minimax_index_stage.cu
     families/glm5/cuda/glm_mla_prefill.cu
     shared/cuda/vocab_head_rows.cu
     families/mimo_v2/cuda/mimo_dflash.cu
@@ -420,7 +422,7 @@ endif()
 if(CUTEAFD_FP8_EXPERT_FAMILIES)
   include(cmake/shared/fp8_moe.cmake)
 endif()
-if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)
   include(cmake/shared/dsv4_programs.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT)
@@ -491,7 +493,7 @@ if(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
   add_dependencies(cuteafd_native ${CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS})
   target_include_directories(cuteafd_native PRIVATE ${CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS})
 endif()
-if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)
   add_dependencies(cuteafd_native cuteafd_dsv4_programs_export)
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_DSV4_DIR}")
   # Whole archive: the table in dsv4_programs.cc names every program symbol.
@@ -689,6 +691,16 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE CUDA::cudart CUDA::cublas)
   add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
   set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  # CPU-only MiniMax tower admission; its stub attention owner aborts if admission reaches it.
+  add_executable(cuteafd_vision_minimax_contract_selftest tests/vision_minimax_contract_selftest.cc
+    shared/cuda/vision_runtime.cu)
+  set_target_properties(cuteafd_vision_minimax_contract_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_compile_definitions(cuteafd_vision_minimax_contract_selftest PRIVATE CUTEAFD_HAVE_VISION_ATTENTION_AOT=1)
+  target_include_directories(cuteafd_vision_minimax_contract_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+  target_link_libraries(cuteafd_vision_minimax_contract_selftest PRIVATE CUDA::cudart CUDA::cublas)
+  add_test(NAME cuteafd_vision_minimax_contract_selftest COMMAND cuteafd_vision_minimax_contract_selftest)
+  set_tests_properties(cuteafd_vision_minimax_contract_selftest PROPERTIES TIMEOUT 30)
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
   # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with

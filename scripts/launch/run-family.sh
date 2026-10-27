@@ -188,9 +188,8 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
-  # Kimi K3 and Step-5 (WIP slots only): the shared serve contract and Spark
-  # workers, no media or family modes yet; Step-5 takes an opt-in MTP depth.
-  if [[ "$1" == kimi_k3 || "$1" == step5 ]]; then
+  # Shared coordinator/Spark controls; family-specific modes follow below.
+  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == minimax_m3 ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
 SPARK_EXPERT_DOCKER_INFERENCE
@@ -227,6 +226,9 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS
+    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES MEDIA_CACHE_BYTES \
+      VISION_REPLICAS HOST_CACHE_STORE SPECULATOR_DRAFTS DRAFT_POLICY DRAFT_ROW_COST \
+      SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_FP8 DRAFT_KV_CACHE SPECULATION_TRACE
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -394,7 +396,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|qwen4|deepseek_v4) echo units ;;
+    step5|kimi_k3|qwen4|deepseek_v4|minimax_m3) echo units ;;
     glm5|glm5_flash) echo units-span ;;
     *) echo legacy ;;
   esac
@@ -569,8 +571,10 @@ if [[ -n "$probe_root" ]]; then
 fi
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
-# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
-# scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
+# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and the shared Qwen scheduler's
+# families; read by scripts/qualify/glm5/glm-draft-trace.py and
+# qualify/qwen4/qwen4-draft-trace.py). Selector drafters (MiniMax DFlash2) add the
+# draft_confidence records scripts/bench/calibrate-draft-confidence.py fits.
 shared_trace_args() {
 trace_args=()
 # Optional diagnostic length rule; production selection uses resource prices.
@@ -1634,6 +1638,31 @@ read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
+# Push images copy scalar expert scales unchanged: compressed-tensors NVFP4 experts, whose global
+# scales are divisors, load from mounted checkpoints (the loader stages their reciprocals).
+if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]] && python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config") or (c.get("text_config") or {}).get("quantization_config") or {}; sys.exit(q.get("moe_quant_format") != "nvfp4-pack-quantized")' "$snapshot/config.json"; then
+  release_die "compressed-tensors NVFP4 experts require mount-loaded Spark experts; push loading does not support divisor scales"
+fi
+if [[ "$family" == minimax_m3 ]]; then
+  minimax_kv_cache="$(get KV_CACHE fp8)"
+  case "$minimax_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  minimax_host_store="$(get HOST_CACHE_STORE on-evict)"
+  case "$minimax_host_store" in on-evict|on-retain) ;; *) release_die "HOST_CACHE_STORE must be on-evict or on-retain" ;; esac
+  minimax_local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$minimax_local_layers" == auto || "$minimax_local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "MiniMax RTX_EXPERT_LAYERS must be auto or a fixed routed-layer count"
+  case "$(get SPECULATOR dflash2)" in off|dspark|dflash2) ;; *) release_die "MiniMax supports SPECULATOR=dspark, dflash2 or off" ;; esac
+  [[ "$(get SPECULATOR dflash2)" == dflash2 || -z "$(get SPECULATOR_MODEL_ID)$(get SPECULATOR_MODEL_REVISION)$(get SPECULATOR_FP8)$(get DRAFT_KV_CACHE)" ]] ||
+    release_die "MiniMax SPECULATOR_MODEL_ID, SPECULATOR_MODEL_REVISION, SPECULATOR_FP8 and DRAFT_KV_CACHE apply to SPECULATOR=dflash2"
+  case "$(get RTX_GPUS auto)" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1 or 2" ;; esac
+  case "$(get COORDINATOR_SPLIT auto)" in auto|off|heads) ;; *) release_die "COORDINATOR_SPLIT must be auto, heads or off" ;; esac
+  minimax_coordinator_gpus="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"
+  [[ "$minimax_coordinator_gpus" =~ ^[0-9]+(,[0-9]+)?$ ]] ||
+    release_die "COORDINATOR_GPUS must name one or two GPU indices"
+  [[ "$(get RTX_GPUS auto)" != 2 && "$minimax_coordinator_gpus" != *,* && "$(get COORDINATOR_SPLIT auto)" != heads ]] ||
+    release_die "MiniMax two-GPU head split is not implemented; select one coordinator GPU"
+  [[ "$(get EMBEDDING gpu)" == gpu ]] || release_die "MiniMax requires EMBEDDING=gpu"
+fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
@@ -1643,8 +1672,8 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # executor exists.
 case "$attention_placement:$family" in
   # Families under qualification run only their recorded automatic placement.
-  auto:kimi_k3|auto:step5) ;;
-  *:kimi_k3|*:step5) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
+  auto:kimi_k3|auto:step5|auto:minimax_m3) ;;
+  *:kimi_k3|*:step5|*:minimax_m3) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
   # K4/P7 qualified explicit layers; context remains the recorded auto default.
   # The planner still requires the selected image's executor and native programs.
@@ -1662,16 +1691,23 @@ case "$family" in
   qwen3_5) serve=serve-qwen35 ;;
   kimi_k3) serve=serve-kimi ;;
   step5) serve=serve-step5 ;;
-  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3 and Step-5 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
+  minimax_m3) serve=serve-minimax ;;
+  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and MiniMax checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
 # in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5 defaults
-# to native MTP depth 3 (SPECULATOR=off disables it).
+# to native MTP depth 3 (SPECULATOR=off disables it). MiniMax M3.1 (#284) is
+# under qualification from WIP slots too, with automatic attention placement;
+# its bundled image tower is in scope, so it keeps VISION.
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
-if ((qualifying)); then
+wip_only=$qualifying
+[[ "$family" != minimax_m3 ]] || wip_only=1
+if ((wip_only)); then
   [[ -n "$wip_slot" ]] || release_die "$family serving is under qualification; run it from a WIP slot (--wip SLOT)"
+fi
+if ((qualifying)); then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
     *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
@@ -1737,6 +1773,21 @@ if [[ "$family" == step5 ]]; then
   [[ "$backend" != local && "$ranks" != 0 ]] ||
     release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"
 fi
+if [[ "$family" == minimax_m3 ]]; then
+  # MiniMax has no local-expert layout. The plan admits the Spark worlds its expert package ships
+  # (plan::experts::spark_worlds) and refuses any other count by name.
+  [[ "$backend" != local && "$ranks" != 0 ]] ||
+    release_die "MiniMax requires Spark experts (a SPARK_COUNT its expert package ships; cuteafd plan names them)"
+  minimax_concurrency="$(get CONCURRENCY 64)"
+  [[ "$minimax_concurrency" =~ ^[1-9][0-9]*$ && "$minimax_concurrency" -le 64 ]] ||
+    release_die "MiniMax CONCURRENCY must be 1..64"
+  # Prefill units (PLAN "Prefill contract", #762): the plan admits slots of the unit on one Spark link
+  # and serve-minimax chooses each call's depth within them at runtime (unset: four 4096-row slots,
+  # starting at the measured depth, two waves at TP2 and three from TP3). PREFILL_WAVES pins the depth.
+  minimax_context="$(get MAX_CONTEXT_TOKENS 0)"
+  [[ "$minimax_context" =~ ^(0|[1-9][0-9]{0,6})$ && "$minimax_context" -le 1048576 ]] ||
+    release_die "MiniMax MAX_CONTEXT_TOKENS must be 0 (automatic) or 1..1048576"
+fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
 # the WIP containers into a release-shaped /opt/cuteafd layout per host (as ./run.sh --wip
@@ -1771,7 +1822,7 @@ if [[ -n "$wip_slot" ]]; then
 fi
 # Families whose serve command lands on its own branch: refuse a slot whose
 # binary predates it before planning or touching any service.
-if ((qualifying)); then
+if ((wip_only)); then
   docker run --rm --network none --mount "type=bind,src=$wip_layout/bin/cuteafd,dst=/opt/cuteafd-serve-probe,readonly" \
     --entrypoint /opt/cuteafd-serve-probe "$coordinator_image" "$serve" --help >/dev/null ||
     release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"
@@ -1825,14 +1876,15 @@ fi
 # release card ran (examples/configs/*.config; scripts/tests/test_example_configs.py
 # keeps the two in step): GLM 5.3 DFlash2; GLM 5.3 Flash its measured best;
 # MiMo V2.6 Flash/Pro MOPD the bundled DFlash; DeepSeek V4 dSpark when the
-# checkpoint carries it; Qwen local EXL3/NVFP4 MTP3; otherwise off.
+# checkpoint carries it; Qwen local EXL3/NVFP4 MTP3; MiniMax M3 DFlash2; otherwise off.
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
-#            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
+#            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2); MiniMax M3:
+#            family_default_drafter's RadixArk draft unless SPECULATOR_MODEL_ID names one;
 #            MiMo V2.6 Flash/Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (Pro needs SPARK_COUNT=6)
 #   mtp      MiMo V2 Flash, Qwen 3.8, Step-5 (opt-in): the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
-#   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
+#   dspark   DeepSeek V4 and MiniMax M3 (their own drafters); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
 # Official Flash MOPD's bundled drafter defaults to single-copy FP8 (measured
 # separately from its checkpoint BF16 target head/O); other MiMo defaults follow
@@ -1846,6 +1898,15 @@ fi
 glm5_flash_speculator() {
   case "$1" in
     *) echo "dflash2 incoai/GLM-5.3-Flash-DFlash2" ;;
+  esac
+}
+# FAMILY:SPECULATOR's own drafter when SPECULATOR_MODEL_ID names none, and the revision it was
+# qualified at, which it keeps unless SPECULATOR_MODEL_REVISION names another. MiniMax's DFlash2
+# draft (RadixArk) states no license: cuteafd links the user's own download and never ships it.
+family_default_drafter() {
+  case "$1" in
+    qwen3_5:dspark) echo "RadixArk/Qwen3.8-27B-DSpark 85ef153be924f17ce4bf62726954eeaa4a73e854" ;;
+    minimax_m3:dflash2) echo "RadixArk/Minimax-M3.1-Flash-Dflash2 923bf1d4b567d5ccb71b0488c6e61b5e4794e92a" ;;
   esac
 }
 # Qualification is for these official checkpoints, not a shape-compatible sibling.
@@ -1865,6 +1926,12 @@ if [[ -z "$speculator" ]]; then
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
     speculator=dflash2 default_drafter=incoai/GLM-5.3-DFlash2
     echo "note: GLM 5.3 drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
+  fi
+  if [[ $speculator == off && $family == minimax_m3 && -z ${cfg[SPECULATOR]+set} ]]; then
+    speculator=dflash2
+    read -r default_drafter _ <<<"$(family_default_drafter minimax_m3:dflash2)"
+    echo "note: MiniMax M3 drafts with DFlash2 ($default_drafter); SPECULATOR=dspark uses the release's" \
+      "bundled drafter, SPECULATOR=off disables speculation" >&2
   fi
   if [[ $speculator == off && $family == glm5_flash ]]; then
     read -r speculator default_drafter <<<"$(glm5_flash_speculator "$model")"
@@ -1902,7 +1969,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
+  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark|minimax_m3:dspark|minimax_m3:dflash2) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -1914,6 +1981,7 @@ profile_bytes="$(release_cuda_total_bytes "$profile_uuid")" || release_die "cann
 profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 [[ "$family" != qwen3_5 ]] || default_concurrency=4
+[[ "$family" != minimax_m3 ]] || default_concurrency="$minimax_concurrency"
 effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
 if [[ "$family" == mimo_v2 ]]; then
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
@@ -1981,16 +2049,25 @@ case "$speculator" in
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
-    [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
-    if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
+    read -r table_drafter table_revision <<<"$(family_default_drafter "$family:$speculator")"
+    [[ -n "$drafter" ]] || drafter="$table_drafter"
+    if [[ $family:$speculator == minimax_m3:dspark ]]; then
+      : # The release owns its bundled drafter.
+    elif [[ $speculator == dspark && $family == deepseek_v4 ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
-      if [[ -z "$draft_revision" && $family:$speculator == qwen3_5:dspark && $drafter == RadixArk/Qwen3.8-27B-DSpark ]]; then
-        draft_revision=85ef153be924f17ce4bf62726954eeaa4a73e854
-      fi
-      draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" ||
-        { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
+      [[ -n "$draft_revision" || "$drafter" != "$table_drafter" ]] || draft_revision="$table_revision"
+      draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" || {
+        if [[ $family == minimax_m3 ]]; then
+          echo "MiniMax DFlash2 needs $drafter${draft_revision:+ at revision $draft_revision}, which cuteafd" \
+            "does not distribute: download it from https://huggingface.co/$drafter" \
+            "(hf download $drafter${draft_revision:+ --revision $draft_revision}), or set SPECULATOR=dspark" \
+            "(the release's bundled drafter) or SPECULATOR=off" >&2
+        elif [[ -n "$default_drafter" ]]; then
+          echo "download it (hf download $drafter) or set SPECULATOR=off" >&2
+        fi
+        exit 1; }
       draft_args=(--draft "$draft_snapshot")
       [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
     elif [[ $family == mimo_v2 ]]; then
@@ -2005,23 +2082,25 @@ case "$speculator" in
     family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
-# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash), for policy A/B runs.
+# (DFlash2 on GLM 5.x, GLM 5.3 Flash, MiMo V2 and MiniMax M3; dSpark on GLM 5.3 Flash and MiniMax M3), for policy A/B runs.
 drafts="$(get SPECULATOR_DRAFTS adaptive)"
 if [[ "$drafts" != adaptive ]]; then
-  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark || $family:$speculator == qwen3_5:dspark) ]] ||
-    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash or dense Qwen)" >&2; exit 2; }
+  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark || $family:$speculator == qwen3_5:dspark || $family:$speculator == minimax_m3:dspark) ]] ||
+    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash, dense Qwen or MiniMax M3)" >&2; exit 2; }
   draft_args+=(--draft-fixed "$drafts")
 fi
-# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
+# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4, MiniMax M3): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
-# live sequences and retained snapshots.
+# live sequences and retained snapshots. MiniMax copies a snapshot to that host memory only when
+# the device evicts it (HOST_CACHE_STORE=on-evict; on-retain copies every snapshot as it is kept).
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|minimax_m3)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
+[[ $family != minimax_m3 || "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-store "$minimax_host_store")
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == minimax_m3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -2117,9 +2196,12 @@ fi
 if [[ "$family" == step5 ]]; then
   family_args+=(--kv-cache "$step5_kv_cache")
 fi
-if ((qualifying)); then
+if ((qualifying)) || [[ "$family" == minimax_m3 ]]; then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+fi
+if [[ "$family" == minimax_m3 ]]; then
+  family_args+=(--kv-cache "$minimax_kv_cache" --rtx-expert-layers "$minimax_local_layers" --speculator "$speculator")
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2162,7 +2244,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
     *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
   esac
 fi
-if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
+if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 || "$family:$speculator" == minimax_m3:dflash2 ]]; then
   draft_kv_cache="$(get DRAFT_KV_CACHE fp8)"
   case "$draft_kv_cache" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--draft-kv-cache "$draft_kv_cache")
@@ -2189,7 +2271,7 @@ if [[ $serve != serve-dsv4 ]]; then
         off) family_args+=(--draft-fp8 false) ;;
         *) echo "MiMo SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
       esac
-    elif [[ $family == glm5 || $family == glm5_flash ]]; then
+    elif [[ $family == glm5 || $family == glm5_flash || $family == minimax_m3 ]]; then
       case "$(get SPECULATOR_FP8 auto)" in
         auto) ;; # The engine default: single-copy FP8 drafter weights.
         on) family_args+=(--draft-fp8 true) ;;
@@ -2226,6 +2308,7 @@ addr="$(get ADDR 0.0.0.0:8000)"
 # family's own (the plan's spark_budget_bytes then reaches every worker).
 budget_default=107374182400
 ((qualifying == 0)) || budget_default=""
+[[ "$family" != minimax_m3 ]] || budget_default=""
 budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
@@ -2607,7 +2690,7 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4|qwen3_5|kimi_k3|step5) ;;
+  qwen4|qwen3_5|kimi_k3|step5|minimax_m3) ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
     selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
@@ -2656,6 +2739,11 @@ audio_encoder_hash=""
   fi
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
+  fi
+  # MiniMax DFlash2: the plan charges the drafter serve-minimax loads (SPECULATOR_FP8=off keeps BF16).
+  if [[ "$family:$speculator" == minimax_m3:dflash2 ]]; then
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
+    [[ "$(get SPECULATOR_FP8 on)" != off ]] || plan_draft_args+=(--minimax-draft-bf16)
   fi
   # Read the effective serve argv, including family modes that enable auto.
   plan_host_cache=0
@@ -2724,7 +2812,12 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
-  if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
+  if [[ "$family" == minimax_m3 ]]; then
+    plan_draft_args+=(--kv-cache "$minimax_kv_cache")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+  fi
+  if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 || "$family:$speculator" == minimax_m3:dflash2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
   if [[ "$family" == glm5 ]]; then
@@ -2818,6 +2911,7 @@ audio_encoder_hash=""
   fi
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"
+  [[ "$family" != minimax_m3 ]] || family_args+=(--spark-budget-bytes "$budget")
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
@@ -2844,7 +2938,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
     fi
   done
 fi
-if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash || "$family" == minimax_m3 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   selected="$(python3 -c '

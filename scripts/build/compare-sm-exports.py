@@ -24,7 +24,7 @@ import time
 
 ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().parents[2])).resolve()
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
-              "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
+              "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52", "minimax")
 CAPACITIES = "1,16,80,256,1024,4096"
 # EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
 EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
@@ -97,6 +97,10 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    # Every layout MiniMax's package ships (coordinator TP1; Spark TP2, TP3, TP4, TP6) at the
+    # package ladder, which holds the decode owner's m80 and the prefill owner's m4096 exports.
+    result.append(("routed-minimax", "package_fp8_moe_aot.py",
+                   ["--geometry", "minimax_nvfp4", "--capacities", CAPACITIES, "--layouts", "tp1,tp2,tp3,tp4,tp6"]))
     result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)

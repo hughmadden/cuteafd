@@ -137,6 +137,68 @@ def test_step5_bf16_alone_enables_package_exporter(tmp_path):
     assert "ENABLED=ON" in result.stderr
 
 
+def test_minimax_nvfp4_layouts_and_info_words():
+    from dataclasses import dataclass, replace
+
+    @dataclass(frozen=True)
+    class Geometry:
+        hidden: int = 6144
+        experts: int = 128
+        top_k: int = 4
+        intermediate: int = 3072
+        tp: int = 1
+        weights: str = "nvfp4"
+        kind: str = "nvfp4a4"
+        activation: str = "swigluoai_uninterleave"
+        projection: str = "bf16"
+        swiglu_limit: float = 7.0
+
+        @property
+        def slice(self):
+            return self.intermediate // self.tp
+
+        def with_tp(self, tp):
+            return replace(self, tp=tp)
+
+    assert package_tool.MINIMAX_ROLE_LAYOUTS == {
+        "spark": ("tp2", "tp3", "tp4", "tp6"), "coordinator": ("tp1",)}
+    for layout, width in [("tp1", 3072), ("tp2", 1536), ("tp3", 1024), ("tp4", 768), ("tp6", 512)]:
+        tp, geometry = package_tool.layout_geometry(Geometry(), layout)
+        assert geometry.slice == width
+        words = package_tool.info_words(geometry, [1, 16, 80, 256, 1024, 4096], False)
+        assert words[:8] == [0x01030405, 6144, width, 128, 4, 3072, tp, 1]
+        assert package_tool.input_kind("spark", geometry.weights) == "bf16"
+        with pytest.raises(ValueError, match="BF16 input"):
+            package_tool.info_words(geometry, [16], True)
+    assert '"minimax_nvfp4"' in TOOL.read_text()
+
+
+def test_minimax_build_entries_and_staging_are_canonical(tmp_path):
+    source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
+    body = source.split("set(CUTEAFD_FP8_MOE_ENTRIES)\n", 1)[1].split(
+        "foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)", 1)[0]
+    script = tmp_path / "entries.cmake"
+    script.write_text('set(CUTEAFD_EXPERT_FAMILIES minimax:nvfp4 glm:nvfp4)\n' + body
+                      + '\nmessage("ENTRIES=${CUTEAFD_FP8_MOE_ENTRIES}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "ENTRIES=minimax:nvfp4;glm:nvfp4;glm:nvfp4a4" in result.stderr
+    branch = source.split('elseif(entry STREQUAL "minimax:nvfp4")', 1)[1].split("elseif(", 1)[0]
+    assert 'set(geometry "minimax_nvfp4")' in branch
+    assert '/fp8/fp8-minimax-nvfp4a4")' in branch
+    for mode in ("wip", "release"):
+        text = (REPO / f"scripts/build/build-{mode}-artifacts.sh").read_text()
+        case = text.split(f'  case "${mode}_family" in\n', 1 if mode == "wip" else 2)[-1].split("  esac", 1)[0]
+        sibling = next(line for line in text.splitlines()
+                       if f'{mode}_packages+=("${{{mode}_package}}a4")' in line)
+        shell = (f'{mode}_family=minimax:nvfp4\ncase "${mode}_family" in\n{case}\nesac\n'
+                 f'{mode}_packages=("${mode}_package")\n{sibling}\n'
+                 f'printf "%s\\n" "${{{mode}_packages[@]}}"\n')
+        result = subprocess.run(["bash", "-c", shell], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == ["fp8-minimax-nvfp4a4"]
+
+
 def test_step5_bf16_bypasses_native_slice_exporter(tmp_path):
     source = REPO / "native/cmake/shared/expert_families.cmake"
     script = tmp_path / "native.cmake"
@@ -571,13 +633,13 @@ def test_cmake_fp8_family_counts_only_apply_to_their_family(tmp_path):
 
 
 @pytest.mark.parametrize("kind,storage", [("fp8", 1), ("mxfp4", 2), ("nvfp4a4", 4), ("bf16", 5)])
-@pytest.mark.parametrize("activation,code", [("silu_bf16_product", 1), ("silu_post_clamp_fp32_product", 2)])
+@pytest.mark.parametrize("activation,code", [("silu_bf16_product", 1), ("silu_post_clamp_fp32_product", 2), ("swigluoai_uninterleave", 3)])
 def test_explicit_activation_info_words(kind, storage, activation, code):
     from types import SimpleNamespace
     g = SimpleNamespace(kind=kind, weights="nvfp4" if kind == "nvfp4a4" else kind,
                         activation=activation, projection="bf16", swiglu_limit=7.0,
                         hidden=4096, slice=256, experts=352, top_k=8, intermediate=1536, tp=6)
-    if kind == "mxfp4" and code == 2:
+    if kind == "mxfp4" and code != 1:
         with pytest.raises(ValueError, match="MXFP4"):
             package_tool.info_words(g, [16], False)
         return

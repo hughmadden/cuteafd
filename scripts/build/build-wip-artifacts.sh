@@ -212,7 +212,7 @@ wip_native_key() {
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
-      grep -vE '^CUTEAFD_WIP_KIMIK3_AOT=OFF$' |
+      grep -vE '^CUTEAFD_WIP_(KIMIK3|MINIMAX)_AOT=OFF$' |
       grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"
@@ -309,6 +309,7 @@ cmake \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_STEP5_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_KIMIK3_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
@@ -372,7 +373,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
   case "$wip_family" in
     *:fp8) wip_package="fp8-${wip_family%%:*}" ;;
     step5:bf16) wip_package="fp8-step5-bf16-weights" ;;
-    step5:nvfp4) wip_package="fp8-step5-nvfp4a4" ;;
+    step5:nvfp4|minimax:nvfp4) wip_package="fp8-${wip_family%%:*}-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
     *) continue ;;
@@ -386,7 +387,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
     [[ ";$bf16_families;" != *";${wip_family%%:*};"* ]] ||
       wip_packages+=("${wip_package}-bf16")
   fi
-  [[ "$wip_family" == *:nvfp4 && "$wip_family" != step5:nvfp4 ]] && wip_packages+=("${wip_package}a4")
+  [[ "$wip_family" == *:nvfp4 && "$wip_family" != step5:nvfp4 && "$wip_family" != minimax:nvfp4 ]] && wip_packages+=("${wip_package}a4")
   # Local Qwen NVFP4 keeps its MTP experts in FP8: CMake builds the TP1 FP8 sibling on the
   # coordinator (fp8_moe.cmake); stage it as release images do.
   [[ "$role" == coordinator && "$wip_family" == qwen4:nvfp4* ]] && wip_packages+=("fp8-qwen4")
@@ -453,7 +454,7 @@ fi
 # A native-cache hit restored the table with the rest of the native outputs.
 if ((${native_hit:-0})); then
   :
-elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
+elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"

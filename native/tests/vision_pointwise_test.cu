@@ -1,4 +1,4 @@
-// Exercise the production Qwen pointwise kernels and casts beyond grid_for's block cap.
+// Exercise the production Qwen/MiniMax pointwise kernels and casts beyond grid_for's block cap.
 #include "../shared/cuda/vision_runtime.cu"
 #include <cstdio>
 #include <vector>
@@ -62,14 +62,22 @@ int main() {
   for(size_t i=0;i<count;++i)if(actual[i]!=3.f) {
     std::fprintf(stderr,"observer cast element %zu was not written: %g\n",i,actual[i]);return 1;
   }
-  // A 1280-wide tower's residual, and the BF16 cast on grid_for's capped grid (its old exact-grid
-  // assumption lost rows).
+  // MiniMax launches: the residual at its 1280 width, the BF16 rounding of the patch
+  // embedding, and the cast feeding the projector (its old exact-grid assumption lost rows).
   CHECK(cudaMemcpy(x.ptr,ones.data(),count*4,cudaMemcpyHostToDevice));
   qwen_residual<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(y.ptr),static_cast<float*>(bias.ptr),count,1280);
   CHECK(cudaGetLastError());CHECK(cudaDeviceSynchronize());
   CHECK(cudaMemcpy(actual.data(),x.ptr,count*4,cudaMemcpyDeviceToHost));
   for(size_t i=0;i<count;++i)if(actual[i]!=4.f) {
-    std::fprintf(stderr,"1280-wide residual element %zu was not written: %g\n",i,actual[i]);return 1;
+    std::fprintf(stderr,"MiniMax residual element %zu was not written: %g\n",i,actual[i]);return 1;
+  }
+  std::vector<float> nudged(count,1.f+1.f/1024);
+  CHECK(cudaMemcpy(x.ptr,nudged.data(),count*4,cudaMemcpyHostToDevice));
+  minimax_round<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),count);
+  CHECK(cudaGetLastError());CHECK(cudaDeviceSynchronize());
+  CHECK(cudaMemcpy(actual.data(),x.ptr,count*4,cudaMemcpyDeviceToHost));
+  for(size_t i=0;i<count;++i)if(actual[i]!=1.f) {
+    std::fprintf(stderr,"MiniMax rounding element %zu was not written: %g\n",i,actual[i]);return 1;
   }
   CHECK(cudaMemcpy(x.ptr,ones.data(),count*4,cudaMemcpyHostToDevice));
   CHECK(cudaMemset(out.ptr,0xff,count*2));
@@ -79,6 +87,6 @@ int main() {
   for(size_t i=0;i<count;++i)if(bits[i]!=0x3f80) {
     std::fprintf(stderr,"BF16 cast element %zu was not written: %04x\n",i,bits[i]);return 1;
   }
-  std::printf("Qwen capped-launch pointwise and cast coverage passed for all %zu elements\n",count);
+  std::printf("Qwen and MiniMax capped-launch pointwise coverage passed for all %zu elements\n",count);
   return 0;
 }

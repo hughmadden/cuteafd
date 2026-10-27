@@ -59,7 +59,7 @@ step S5 unifies this default with the other families'.
 
 ## Families under qualification
 
-These have no release card yet. `run-family.sh` serves them only from a
+Kimi K3 and Step-5 have no release card yet. `run-family.sh` serves them only from a
 `./wip.sh` slot whose binary has the family's serve command (`--wip SLOT`),
 and refuses a release image or an older slot. Text only, no drafter, automatic
 attention placement.
@@ -70,6 +70,29 @@ attention placement.
 | Kimi K3 · EXL3 K2 + K6 core (#273) | [max](kimi-k3-exl3-k6-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 12 routed layers on the RTX, full 1M context, DFlash2 |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
+
+MiniMax-M3.1-Flash uses one RTX PRO 6000 coordinator with native NVFP4 W4A4 experts
+and MXFP8 linears. It is under qualification too: serve it from a `./wip.sh` slot
+whose binary has `serve-minimax` (`--wip SLOT`; `--dry-run` plans the launch
+without starting it). Each file states only what differs from the launcher's
+defaults: the Spark world, and at TP3, TP4 and TP6 no routed layers on the RTX.
+The TP6 example is planned offline and has not run on hardware yet. MiniMax on an
+RTX 5090 is not supported on this engine yet: `cuteafd plan` refuses an RTX
+5090-class coordinator budget by name.
+
+| Coordinator | Spark TP2 | Spark TP3 | Spark TP4 | Spark TP6 |
+| --- | --- | --- | --- | --- |
+| RTX PRO 6000 | [TP2](minimax-m31-flash-nvfp4-pro6000-tp2.config) | [TP3](minimax-m31-flash-nvfp4-pro6000-tp3.config) | [TP4](minimax-m31-flash-nvfp4-pro6000-tp4.config) | [TP6](minimax-m31-flash-nvfp4-pro6000-tp6.config) |
+
+The examples keep the launcher's `VISION=auto` and serve the tower, on the GPU at
+TP2 and on a Spark rank at TP3, TP4 and TP6. Prefill runs on one Spark link within
+the plan's four admitted 4096-row slots: the engine starts at the measured depth (two
+waves at TP2, three from TP3), calibrates every depth before readiness and chooses
+each call's depth at runtime from the Sparks' measured pace (`PREFILL_WAVES` pins it). Speculation is DFlash2 by default, with the
+RadixArk/Minimax-M3.1-Flash-Dflash2 draft on the shared drafter, which cuteafd does
+not distribute: download it beside the release. `SPECULATOR=dspark` runs the
+release's bundled drafter and `SPECULATOR=off` none. Expert loading uses mounted
+checkpoints, and two-GPU head splits are refused.
 
 ## TP x EP layout examples (DeepSeek V4.1)
 
