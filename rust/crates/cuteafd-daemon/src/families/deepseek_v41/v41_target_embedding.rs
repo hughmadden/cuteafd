@@ -5,8 +5,12 @@ use crate::shared::decode_graph::RowGraphs;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
-use crate::shared::memory::{chain, row_window::{RowWindow, MAX_RESERVE_ROWS}};
+use crate::shared::memory::{chain, row_window::{RowWindow, ScratchGuard, MAX_RESERVE_ROWS}};
 
+#[cfg(test)]
+thread_local! {
+    static SKIP_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub(crate) struct TargetEmbedding<'a> {
     pub residual: CuteafdDeviceBuffer,
     pub pre: CuteafdDeviceBuffer,
@@ -15,12 +19,13 @@ pub(crate) struct TargetEmbedding<'a> {
     _owner: PhantomData<&'a ()>,
 }
 
-/// Shared input storage. Row planes: ids (also used on caller streams),
-/// residual and pre (block handoff). Scratch: image_features/image_indices,
-/// consumed on the embedding stream in one hook. Pinned ids/image uploads and
-/// host token/position/ready state stay per slot.
+/// Unit-cap input-hook scratch. Standalone residual/pre and caller-stream ids
+/// are guarded; release after their block reader joins. Direct producers write
+/// residual/pre into the block planes. Image scratch stays on the shared stream.
+/// Pinned uploads and token/position/ready state stay per slot.
 pub(crate) struct TargetEmbeddingStorage<'a> {
     stream: LoadStream<'a>,
+    guard: ScratchGuard<'a>,
     ids: DeviceAllocation<'a>,
     residual: DeviceAllocation<'a>,
     pre: DeviceAllocation<'a>,
@@ -49,6 +54,7 @@ pub(crate) struct TargetEmbeddingWave<'w, 'a> {
     tokens: Vec<u32>,
     positions: Vec<u64>,
     ready: bool,
+    destinations: Option<[CuteafdDeviceBuffer; 2]>,
 }
 impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
@@ -76,9 +82,10 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             && unit <= rows, "invalid embedding storage dimensions");
         Ok(Rc::new(TargetEmbeddingStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            ids: DeviceAllocation::new(library, rows * 4)?,
-            residual: DeviceAllocation::new(library, rows * 40960)?,
-            pre: DeviceAllocation::new(library, rows * 16)?,
+            guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
+            ids: DeviceAllocation::new(library, unit * 4)?,
+            residual: DeviceAllocation::new(library, unit * 40960)?,
+            pre: DeviceAllocation::new(library, unit * 16)?,
             image_features: DeviceAllocation::new(library, unit * 10240)?,
             image_indices: DeviceAllocation::new(library, unit * 4)?, rows, unit,
         }))
@@ -94,7 +101,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             staging: HostAllocation::new(library, capacity * 4)?,
             image_staging: HostAllocation::new(library, capacity * (10240 + 4))?, capacity,
             graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS),
-            tokens: Vec::with_capacity(capacity), positions: Vec::with_capacity(capacity), ready: false,
+            tokens: Vec::with_capacity(capacity), positions: Vec::with_capacity(capacity), ready: false, destinations: None,
         })
     }
     /// Caller drains the slot before selecting its next unit's rows.
@@ -109,8 +116,24 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     }
     fn invalidate(&mut self) {
         self.ready = false;
+        self.destinations = None;
         self.tokens.clear();
         self.positions.clear();
+    }
+    pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
+    #[cfg(test)]
+    pub(crate) fn test_writer(&self, skip: bool) -> *mut std::ffi::c_void {
+        SKIP_ACQUIRE.with(|value| value.set(skip));
+        self.storage.stream.raw
+    }
+    unsafe fn acquire_scratch(&self, stream: *mut std::ffi::c_void) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+        // SAFETY: caller supplies a live writer stream on this storage's device.
+        unsafe { self.storage.guard.acquire(stream) }
+    }
+    fn buffers(&self) -> [CuteafdDeviceBuffer; 2] {
+        self.destinations.unwrap_or([self.storage.residual.buffer, self.storage.pre.buffer])
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
@@ -119,9 +142,9 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         unsafe {
             self.ops.target_embed(
                 self.table.get("embed.weight")?,
-                self.window.apply(self.storage.ids.buffer, 4),
-                self.window.apply(self.storage.residual.buffer, 40960),
-                self.window.apply(self.storage.pre.buffer, 16),
+                self.storage.ids.buffer,
+                self.buffers()[0],
+                self.buffers()[1],
                 rows,
                 self.storage.stream.raw,
             )
@@ -131,7 +154,12 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     /// requests; request ownership remains the scheduler's responsibility.
     /// Retains decode row shapes over the same fixed weights and stable storage.
     pub fn execute(&mut self, tokens: &[u32], positions: &[u64]) -> Result<TargetEmbedding<'_>> {
+        self.execute_to(tokens, positions, None)
+    }
+    fn execute_to(&mut self, tokens: &[u32], positions: &[u64],
+        destinations: Option<[CuteafdDeviceBuffer; 2]>) -> Result<TargetEmbedding<'_>> {
         self.invalidate();
+        self.destinations = destinations;
         let rows = tokens.len();
         ensure!(
             rows > 0
@@ -147,11 +175,12 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         // SAFETY: staging is per slot and is retained until the slot is drained.
         unsafe {
             chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.acquire_scratch(self.storage.stream.raw)?;
             self.storage.stream.library.copy_host_buffer_h2d_async(
-                self.window.apply(self.storage.ids.buffer, 4), self.staging.buffer,
+                self.storage.ids.buffer, self.staging.buffer,
                 rows * 4, self.storage.stream.raw)?;
         }
-        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
+        if self.destinations.is_some() || self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
             || crate::shared::decode_graph::census::eager("layer_row") {
             let launched = unsafe { crate::shared::decode_graph::census::dispatch(
                 self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };
@@ -212,15 +241,17 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         ensure!(!tokens.is_empty() && tokens.len() <= self.capacity && self.window.admits(tokens.len())
             && tokens.iter().all(|&id| id < 129280)
             && destination[0].bytes >= tokens.len()*40960 && destination[1].bytes >= tokens.len()*16
-            && destination.iter().all(|b| b.device_id == self.window.apply(self.storage.ids.buffer, 4).device_id),
+            && destination.iter().all(|b| b.device_id == self.storage.ids.buffer.device_id),
             "invalid direct embedding producer input");
         for (dst, token) in self.staging.bytes_mut().chunks_exact_mut(4).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
         unsafe {
-            self.storage.stream.library.copy_host_buffer_h2d_async(self.window.apply(self.storage.ids.buffer, 4), self.staging.buffer,
+            chain::join(self.storage.stream.library, stream)?;
+            self.acquire_scratch(stream)?;
+            self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.ids.buffer, self.staging.buffer,
                 tokens.len()*4, stream)?;
-            self.ops.target_embed(self.table.get("embed.weight")?, self.window.apply(self.storage.ids.buffer, 4),
+            self.ops.target_embed(self.table.get("embed.weight")?, self.storage.ids.buffer,
                 destination[0], destination[1], tokens.len(), stream)
         }
     }
@@ -228,12 +259,28 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     /// sorted, unique positions within this flattened multi-request batch.
     pub fn execute_with_images(&mut self, tokens: &[u32], positions: &[u64],
         images: &[(usize, &[u8])]) -> Result<TargetEmbedding<'_>> {
+        self.execute_images_to(tokens, positions, images, None)
+    }
+    /// # Safety
+    /// Destinations are this unit's block planes, retained through its chain drain.
+    /// Call release_scratch after the input hook's last reader joins.
+    pub(crate) unsafe fn execute_with_images_into(&mut self, tokens: &[u32], positions: &[u64],
+        images: &[(usize, &[u8])], destinations: [CuteafdDeviceBuffer; 2]) -> Result<TargetEmbedding<'_>> {
+        self.invalidate();
+        ensure!(destinations[0].bytes >= tokens.len() * 40960
+            && destinations[1].bytes >= tokens.len() * 16
+            && destinations.iter().all(|b| b.device_id == self.storage.ids.buffer.device_id),
+            "direct embedding destination extent or device differs");
+        self.execute_images_to(tokens, positions, images, Some(destinations))
+    }
+    fn execute_images_to(&mut self, tokens: &[u32], positions: &[u64],
+        images: &[(usize, &[u8])], destinations: Option<[CuteafdDeviceBuffer; 2]>) -> Result<TargetEmbedding<'_>> {
         self.invalidate();
         ensure!(images.iter().enumerate().all(|(i, (row, bytes))|
             *row < tokens.len() && tokens[*row] == cuteafd_loader::V41_IMAGE_TOKEN_ID
                 && bytes.len() == 10240 && (i == 0 || images[i-1].0 < *row)),
             "invalid target image rows or feature extent");
-        self.execute(tokens, positions)?;
+        self.execute_to(tokens, positions, destinations)?;
         if images.is_empty() { return self.output(); }
         self.ready = false;
         let count = images.len();
@@ -248,12 +295,13 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         indices.bytes = count * 4;
         let launched = (|| unsafe {
             chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.acquire_scratch(self.storage.stream.raw)?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.image_features.buffer,
                 self.image_staging.buffer, count * 10240, self.storage.stream.raw)?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.image_indices.buffer,
                 indices, count * 4, self.storage.stream.raw)?;
             self.storage.stream.library.v41_vision_embed(self.storage.image_features.buffer,
-                self.storage.image_indices.buffer, self.window.apply(self.storage.residual.buffer, 40960),
+                self.storage.image_indices.buffer, self.buffers()[0],
                 count, tokens.len(), self.storage.stream.raw)
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
@@ -264,8 +312,8 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     }
     pub fn output(&self) -> Result<TargetEmbedding<'_>> {
         ensure!(self.ready, "target embeddings unpublished");
-        let mut residual = self.window.apply(self.storage.residual.buffer, 40960);
-        let mut pre = self.window.apply(self.storage.pre.buffer, 16);
+        let mut residual = self.buffers()[0];
+        let mut pre = self.buffers()[1];
         residual.bytes = self.tokens.len() * 40960;
         pre.bytes = self.tokens.len() * 16;
         Ok(TargetEmbedding {

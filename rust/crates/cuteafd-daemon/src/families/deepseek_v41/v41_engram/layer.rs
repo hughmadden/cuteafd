@@ -1,13 +1,17 @@
 //! Native engram projection carriers and fused residual gate ownership.
 use super::EngramDeviceView;
 use std::rc::Rc;
-use crate::shared::memory::{chain, row_window::{RowWindow, MAX_RESERVE_ROWS}};
+use crate::shared::memory::{chain, row_window::{RowWindow, ScratchGuard, MAX_RESERVE_ROWS}};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use crate::shared::decode_graph::RowGraphs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
+#[cfg(test)]
+thread_local! {
+    static SKIP_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(crate) struct EngramLayerWeights<'a> {
     tensors: NativeRtxTensors<'a>,
@@ -73,12 +77,13 @@ impl<'a> EngramLayerWeights<'a> {
     }
 }
 
-/// Shared gate storage. Row planes: output (block handoff), residual,
-/// embeddings and text_mask (public input destinations may be written on other
-/// streams). Scratch: projected, GEMM workspace and alpha, fully consumed on
-/// the gate stream inside one hook. Weight binding/graphs/ready state are per slot.
+/// Unit-cap gate scratch: residual/embeddings/mask, projected, GEMM workspace
+/// and alpha are consumed on the gate stream within the input hook. Output is
+/// guarded scratch: the block copies it on its attention stream in that hook.
+/// Release after that reader joins. Weight bindings/graphs/ready are per slot.
 pub(crate) struct EngramGateStorage<'a> {
     stream: LoadStream<'a>,
+    guard: ScratchGuard<'a>,
     output: DeviceAllocation<'a>,
     residual: DeviceAllocation<'a>,
     embeddings: DeviceAllocation<'a>,
@@ -150,10 +155,11 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let scratch_bytes = kernel.info().scratch_bytes as usize;
         let storage = EngramGateStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            output: DeviceAllocation::new(library, rows * 40960)?,
-            residual: DeviceAllocation::new(library, rows * 40960)?,
-            embeddings: DeviceAllocation::new(library, rows * 24 * 512)?,
-            text_mask: DeviceAllocation::new(library, rows)?,
+            guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
+            output: DeviceAllocation::new(library, unit * 40960)?,
+            residual: DeviceAllocation::new(library, unit * 40960)?,
+            embeddings: DeviceAllocation::new(library, unit * 24 * 512)?,
+            text_mask: DeviceAllocation::new(library, unit)?,
             projected: DeviceAllocation::new(library, unit * 51200)?,
             scratch: DeviceAllocation::new(library, scratch_bytes)?,
             alpha: DeviceAllocation::new(library, 4)?, kernel, rows, unit,
@@ -181,6 +187,18 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.window = window;
         Ok(())
     }
+    pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
+    #[cfg(test)]
+    pub(crate) fn test_writer(&self, skip: bool) -> *mut std::ffi::c_void {
+        SKIP_ACQUIRE.with(|value| value.set(skip));
+        self.storage.stream.raw
+    }
+    fn acquire_scratch(&self) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+        // SAFETY: this storage owns the live writer stream.
+        unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
+    }
     /// Quantize gathered rows by K32, project with native FP8 weights, then gate.
     ///
     /// # Safety
@@ -196,6 +214,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.ready_rows = None;
         let launched = unsafe {
             chain::join(self.weights.library, self.storage.stream.raw)?;
+            self.acquire_scratch()?;
             self.enqueue_inputs(residual, gathered)?;
             self.enqueue(gathered.rows)
         };
@@ -209,9 +228,9 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     /// Never free or retain after this owner drops; finish writes before execution.
     pub fn inputs(&self) -> [CuteafdDeviceBuffer; 3] {
         [
-            self.window.apply(self.storage.residual.buffer, 40960),
-            self.window.apply(self.storage.embeddings.buffer, 12288),
-            self.window.apply(self.storage.text_mask.buffer, 1),
+            self.storage.residual.buffer,
+            self.storage.embeddings.buffer,
+            self.storage.text_mask.buffer,
         ]
     }
     unsafe fn stage_inputs(
@@ -223,6 +242,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         // SAFETY: a block handoff may still be queued on its non-blocking
         // attention stream, even for a private decode gate inside a chain.
         unsafe { chain::join(self.weights.library, self.storage.stream.raw)?;
+            self.acquire_scratch()?;
             self.enqueue_inputs(residual, gathered)?; }
         self.synchronize()
     }
@@ -284,7 +304,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
         unsafe {
             self.storage.kernel.launch(
-                self.window.apply(self.storage.embeddings.buffer, 12288),
+                self.storage.embeddings.buffer,
                 self.weights.tensors.get(&self.weights.names[0])?,
                 self.weights.packed_scales.buffer,
                 self.storage.scratch.buffer,
@@ -294,12 +314,12 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
                 self.storage.stream.raw,
             )?;
             self.weights.library.cuda_engram_gate_bf16_async(
-                self.window.apply(self.storage.residual.buffer, 40960),
+                self.storage.residual.buffer,
                 self.storage.projected.buffer,
                 self.weights.tensors.get(&self.weights.names[2])?,
                 self.weights.tensors.get(&self.weights.names[3])?,
-                Some(self.window.apply(self.storage.text_mask.buffer, 1)),
-                self.window.apply(self.storage.output.buffer, 40960),
+                Some(self.storage.text_mask.buffer),
+                self.storage.output.buffer,
                 i32::try_from(rows)?,
                 self.storage.stream.raw,
             )?;
@@ -385,6 +405,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let cold = graph.is_none();
         let launched = (|| unsafe {
             crate::shared::memory::chain::join(self.weights.library, self.storage.stream.raw)?;
+            self.acquire_scratch()?;
             self.enqueue_inputs(residual, gathered)?;
             crate::shared::decode_graph::census::dispatch(self.weights.library, self.storage.stream.raw, c"layer_row",
                 gathered.rows, graph, || self.enqueue(gathered.rows))
@@ -398,7 +419,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             let launched = unsafe { self.weights.library.cuda_graph_launch(graph, self.storage.stream.raw) };
             if let Err(error) = launched { self.synchronize()?; return Err(error); }
         }
-        let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.window.apply(self.storage.output.buffer, 40960),
+        let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.storage.output.buffer,
             gathered.rows * 40960, self.storage.stream.raw) };
         if let Err(error) = copied { self.synchronize()?; return Err(error); }
         unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await?; }
@@ -442,7 +463,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let rows = self
             .ready_rows
             .context("engram gate output is not complete")?;
-        let mut output = self.window.apply(self.storage.output.buffer, 40960);
+        let mut output = self.storage.output.buffer;
         output.bytes = rows * 4 * 5120 * 2;
         Ok(output)
     }

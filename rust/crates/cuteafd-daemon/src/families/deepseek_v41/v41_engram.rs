@@ -4,18 +4,24 @@ pub(crate) mod placement;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use std::rc::Rc;
-use crate::shared::memory::row_window::{RowWindow, MAX_RESERVE_ROWS};
+use crate::shared::memory::row_window::{RowWindow, ScratchGuard, MAX_RESERVE_ROWS};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{
     EngramGatherPoll, EngramGatherTicket, EngramGatherView, EngramPipeline, EngramWave,
 };
 
-/// Shared gathered-row storage. Row planes: embeddings and text_mask are
-/// consumed by the gate on another stream. Scratch: weights/scales are uploaded
-/// and dequantized entirely on this stream within one hook, at the unit cap.
+#[cfg(test)]
+thread_local! {
+    static SKIP_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Unit-cap input-hook scratch. Embeddings and text_mask are guarded scratch
+/// read by the gate stream; release after that reader joins. Packed weights and
+/// scales are plain scratch uploaded/dequantized on the shared upload stream.
 /// Gather staging (including its two layer regions) and ready state are per slot.
 pub(crate) struct EngramRowsStorage<'a> {
     stream: LoadStream<'a>,
+    guard: ScratchGuard<'a>,
     weights: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
     embeddings: DeviceAllocation<'a>,
@@ -123,10 +129,11 @@ impl<'a> EngramDeviceRows<'a> {
             && unit <= rows, "invalid Engram row storage dimensions");
         Ok(Rc::new(EngramRowsStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
             weights: DeviceAllocation::new(library, unit * 24 * 256)?,
             scales: DeviceAllocation::new(library, unit * 24 * 8)?,
-            embeddings: DeviceAllocation::new(library, rows * 24 * 512)?,
-            text_mask: DeviceAllocation::new(library, rows)?, rows, unit,
+            embeddings: DeviceAllocation::new(library, unit * 24 * 512)?,
+            text_mask: DeviceAllocation::new(library, unit)?, rows, unit,
         }))
     }
     pub(crate) fn on_storage(storage: Rc<EngramRowsStorage<'a>>) -> Result<Self> {
@@ -147,6 +154,18 @@ impl<'a> EngramDeviceRows<'a> {
         self.window = window;
         Ok(())
     }
+    pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
+    #[cfg(test)]
+    pub(crate) fn test_writer(&self, skip: bool) -> *mut std::ffi::c_void {
+        SKIP_ACQUIRE.with(|value| value.set(skip));
+        self.storage.stream.raw
+    }
+    unsafe fn acquire_scratch(&self, stream: *mut std::ffi::c_void) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+        // SAFETY: caller supplies a live writer stream on this storage's device.
+        unsafe { self.storage.guard.acquire(stream) }
+    }
     fn gathered_buffers(&self, gathered: &EngramGatherView<'_>) -> (CuteafdDeviceBuffer, CuteafdDeviceBuffer) {
         let mut scales = self.storage.scales.buffer;
         if gathered.encoding == cuteafd_loader::EngramEncoding::Nvfp4 {
@@ -165,11 +184,11 @@ impl<'a> EngramDeviceRows<'a> {
         let rows = i32::try_from(gathered.rows * 24)?;
         match gathered.encoding {
             cuteafd_loader::EngramEncoding::Fp8 => unsafe {
-                self.library.cuda_engram_dequant_bf16_async(weights, scales, self.window.apply(self.storage.embeddings.buffer, 12288), rows, self.storage.stream.raw)
+                self.library.cuda_engram_dequant_bf16_async(weights, scales, self.storage.embeddings.buffer, rows, self.storage.stream.raw)
             },
             cuteafd_loader::EngramEncoding::Nvfp4 => unsafe {
                 self.library.cuda_engram_nvfp4_dequant_bf16_async(weights, scales, gathered.global_scale,
-                    self.window.apply(self.storage.embeddings.buffer, 12288), rows, self.storage.stream.raw)
+                    self.storage.embeddings.buffer, rows, self.storage.stream.raw)
             },
         }
     }
@@ -243,11 +262,12 @@ impl<'a> EngramDeviceRows<'a> {
         // SAFETY: staging belongs to this slot; all scratch use is on this stream.
         unsafe {
             crate::shared::memory::chain::join(self.library, self.storage.stream.raw)?;
+            self.acquire_scratch(self.storage.stream.raw)?;
             let (weights, scales) = self.gathered_buffers(gathered);
             let mut offset = 0;
             for (destination, bytes) in [(weights, gathered.weights.len()),
                 (scales, gathered.scales.len()),
-                (self.window.apply(self.storage.text_mask.buffer, 1), gathered.text_mask.len())] {
+                (self.storage.text_mask.buffer, gathered.text_mask.len())] {
                 let mut host = staging;
                 host.ptr = host.ptr.cast::<u8>().wrapping_add(offset).cast();
                 host.bytes = bytes;
@@ -278,9 +298,9 @@ impl<'a> EngramDeviceRows<'a> {
     }
     pub fn view(&self) -> Result<EngramDeviceView> {
         let (rows, layer_index) = self.ready.context("engram device rows are not complete")?;
-        let mut embeddings = self.window.apply(self.storage.embeddings.buffer, 12288);
+        let mut embeddings = self.storage.embeddings.buffer;
         embeddings.bytes = rows * 24 * 512;
-        let mut text_mask = self.window.apply(self.storage.text_mask.buffer, 1);
+        let mut text_mask = self.storage.text_mask.buffer;
         text_mask.bytes = rows;
         Ok(EngramDeviceView {
             embeddings,

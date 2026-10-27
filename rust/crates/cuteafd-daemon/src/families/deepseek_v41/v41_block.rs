@@ -214,6 +214,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
                 "block engram layer or rows differ");
             let output = unsafe { gate.execute_captured(self.inputs()[0], gathered) }?;
             self.copy_inputs_ordered(&[output], &[self.inputs()[0]])?;
+            gate.release_scratch()?;
             self.phase = Phase::Prepared(binding, rows, true);
             Ok(())
         })();
@@ -230,6 +231,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         };
         ensure!(gate.layer() == self.layer && gathered.rows == rows, "block engram layer or rows differ");
         unsafe { gate.execute_into_cooperative(self.inputs()[0], gathered).await?; }
+        gate.release_scratch()?;
         self.phase = Phase::Prepared(binding, rows, true);
         Ok(())
     }
@@ -782,22 +784,24 @@ mod input_storage_tests {
                     // SAFETY: publish the gate as the first producer in this chain.
                     unsafe { crate::shared::memory::chain::finish(&library, first[0].attention.stream_raw())?; }
                     for seed in 0..2 {
-                        let embedding = embeddings[seed].execute_with_images(&tokens[seed], &positions[seed], &images(seed))?;
+                        // SAFETY: each block owns a disjoint window until chain drain.
+                        let embedding = unsafe { embeddings[seed].execute_with_images_into(
+                            &tokens[seed], &positions[seed], &images(seed), first[seed].inputs())? };
                         first[seed].initialize_embedding(&embedding)?;
+                        embeddings[seed].release_scratch()?;
                         let [mut residual, mut pre] = first[seed].inputs();
                         residual.bytes = rows * 40960; pre.bytes = rows * 16;
                         let previous = BlockOutput { binding: QueryBinding::new(0)?, residual, pre,
                             layer: 0, tokens: &positions[seed] };
                         next[seed].initialize_previous(&previous)?;
                     }
-                    // Queue both uploads before either cross-stream gate reads it:
-                    // embeddings/masks must be disjoint row planes, not scratch.
+                    // Upload and consume inside one input hook, then release the
+                    // guarded scratch after the block reader has joined.
                     for seed in 0..2 {
                         uploads[seed].upload_cooperative(&gathered(seed)).await?;
-                    }
-                    for seed in 0..2 {
                         // SAFETY: windows and gather staging remain owned through drain.
                         unsafe { next[seed].apply_engram(&mut gates[seed], &uploads[seed].view()?)?; }
+                        uploads[seed].release_scratch()?;
                     }
                     drop(gate);
                     anyhow::Ok(())
@@ -811,18 +815,153 @@ mod input_storage_tests {
                 assert_eq!(read(&[actual.residual, actual.pre])?, read(&[private.residual, private.pre])?);
                 let mut private_upload = EngramDeviceRows::new(&library, unit, usize::MAX)?;
                 let view = private_upload.upload(&gathered(seed))?;
-                let actual = uploads[seed].view()?;
-                assert_eq!(read(&[actual.embeddings, actual.text_mask])?, read(&[view.embeddings, view.text_mask])?);
                 let mut private_gate = EngramGate::new(&weights, unit, usize::MAX)?;
                 // SAFETY: private inputs are complete and remain live through execution.
                 let expected = unsafe { private_gate.execute_captured(private.residual, &view)? };
                 let prepared = next[seed].prepared_input()?;
                 assert_eq!(read(&[prepared.residual, prepared.pre])?, read(&[expected, private.pre])?,
                     "input handoff differs for cycle {cycle}, slot {seed}");
-                assert_eq!(read(&[gates[seed].output()?])?, read(&[expected])?);
             }
             eprintln!("PASS windowed embedding/Engram/block handoffs: cycle={cycle} rows={rows}");
         }
         Ok(())
     }
+    // Each arm holds A's fork reader while an independent chain writes B.
+    // The negative arm must finish B before release, then observe clobber.
+    fn guarded_input_scratch(kind: usize, guarded: bool) -> Result<()> {
+        use crate::shared::memory::{DeviceAllocation, device::{Device, Stream}};
+        // SAFETY: the library outlives every allocation and stream below.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+            &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let names = ["embed.weight".to_owned()];
+        let table = NativeRtxTensors::load(&library, &catalog, &names,
+            NativeRtxTensors::plan(&catalog, &names)?, 1 << 20)?;
+        let weights = crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::load(
+            &library, &catalog, 0, usize::MAX, 1 << 20)?;
+        let (unit, reserve) = (16, 48);
+        let shared_embedding = TargetEmbeddingWave::storage(&library, reserve, unit)?;
+        let shared_upload = EngramDeviceRows::storage(&library, reserve, unit)?;
+        let shared_gate = EngramGate::storage(&library, reserve, unit)?;
+        let mut embeddings = [TargetEmbeddingWave::on_storage(&library, &table, shared_embedding.clone())?,
+            TargetEmbeddingWave::on_storage(&library, &table, shared_embedding)?];
+        let mut uploads = [EngramDeviceRows::on_storage(shared_upload.clone())?,
+            EngramDeviceRows::on_storage(shared_upload)?];
+        let mut gates = [EngramGate::on_storage(&weights, shared_gate.clone())?,
+            EngramGate::on_storage(&weights, shared_gate)?];
+        let widths = [13, 7];
+        let tokens: [Vec<u32>; 2] = std::array::from_fn(|seed| (0..widths[seed])
+            .map(|i| (42 + i * 7919 + seed * 103) as u32 % 129280).collect());
+        let positions: [Vec<u64>; 2] = std::array::from_fn(|seed| (0..widths[seed])
+            .map(|i| (seed * 4096 + i) as u64).collect());
+        let packed: [Vec<u8>; 2] = std::array::from_fn(|seed| vec![0x28 + seed as u8; widths[seed] * 24 * 256]);
+        let scales: [Vec<u8>; 2] = std::array::from_fn(|seed| vec![127; widths[seed] * 24 * 8]);
+        let masks: [Vec<u8>; 2] = std::array::from_fn(|seed| vec![1; widths[seed]]);
+        let gathered = |seed: usize| cuteafd_loader::EngramGatherView {
+            weights: &packed[seed], scales: &scales[seed], text_mask: &masks[seed], rows: widths[seed],
+            layer_index: 0, encoding: cuteafd_loader::EngramEncoding::Fp8, global_scale: 1.0,
+        };
+        // Gate inputs are private and fully prepared before any reader is gated.
+        let mut private_uploads = [EngramDeviceRows::new(&library, unit, usize::MAX)?,
+            EngramDeviceRows::new(&library, unit, usize::MAX)?];
+        let mut residuals = Vec::new();
+        for seed in 0..2 {
+            private_uploads[seed].upload(&gathered(seed))?;
+            let output = embeddings[seed].execute(&tokens[seed], &positions[seed])?;
+            let allocation = DeviceAllocation::new(&library, output.residual.bytes)?;
+            library.copy_d2d(allocation.buffer, output.residual, output.residual.bytes)?;
+            residuals.push(allocation);
+            let window = RowWindow::rows(seed * unit..seed * unit + widths[seed]);
+            embeddings[seed].select_window(window.clone())?;
+            uploads[seed].select_window(window.clone())?;
+            gates[seed].select_window(window)?;
+        }
+        let reader = Stream::new(Device { library: &library, id: library.cuda_get_device()? })?;
+        let stride = if kind == 1 { 24 * 512 } else { 40960 };
+        let bytes = widths[0] * stride;
+        let copy = DeviceAllocation::new(&library, bytes)?;
+        let produce = |seed: usize, embeddings: &mut [TargetEmbeddingWave<'_, '_>; 2],
+            uploads: &mut [EngramDeviceRows<'_>; 2], gates: &mut [EngramGate<'_, '_>; 2]|
+            -> Result<CuteafdDeviceBuffer> {
+            Ok(match kind {
+                0 => embeddings[seed].execute(&tokens[seed], &positions[seed])?.residual,
+                1 => uploads[seed].upload(&gathered(seed))?.embeddings,
+                // SAFETY: private inputs are complete, disjoint, and retained.
+                _ => unsafe { gates[seed].execute_captured(residuals[seed].buffer,
+                    &private_uploads[seed].view()?)? },
+            })
+        };
+        let mut want = vec![0; bytes];
+        {
+            let mut private_embedding = TargetEmbeddingWave::new(&library, &table, unit, usize::MAX)?;
+            let mut private_gate = EngramGate::new(&weights, unit, usize::MAX)?;
+            let expected = match kind {
+                0 => private_embedding.execute(&tokens[0], &positions[0])?.residual,
+                1 => private_uploads[0].view()?.embeddings,
+                // SAFETY: both private inputs are initialized and retained.
+                _ => unsafe { private_gate.execute_captured(residuals[0].buffer,
+                    &private_uploads[0].view()?)? },
+            };
+            library.copy_d2h(&mut want, expected)?;
+        }
+        let first = produce(0, &mut embeddings, &mut uploads, &mut gates)?;
+        produce(1, &mut embeddings, &mut uploads, &mut gates)?;
+        // Warm the exact fork copy on the same reader, then poison its output.
+        unsafe { library.copy_d2d_async(copy.buffer, first, bytes, reader.raw)?;
+            library.cuda_stream_synchronize(reader.raw)?; }
+        library.copy_h2d(copy.buffer, &vec![0xa5; bytes])?;
+        let chains = [StageChain::new(&library)?, StageChain::new(&library)?];
+        for chain in &chains { chain.set_device_order(true); }
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let reader_gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&library, reader.raw)? };
+        runtime.block_on(chains[0].handle().scope(async {
+            let output = produce(0, &mut embeddings, &mut uploads, &mut gates)?;
+            // SAFETY: source/copy/reader remain owned through both chain drains.
+            unsafe {
+                crate::shared::memory::chain::join(&library, reader.raw)?;
+                library.copy_d2d_async(copy.buffer, output, bytes, reader.raw)?;
+                crate::shared::memory::chain::finish(&library, reader.raw)?;
+            }
+            match kind { 0 => embeddings[0].release_scratch(), 1 => uploads[0].release_scratch(),
+                _ => gates[0].release_scratch() }
+        }))?;
+        let writer = match kind { 0 => embeddings[1].test_writer(!guarded),
+            1 => uploads[1].test_writer(!guarded), _ => gates[1].test_writer(!guarded) };
+        let launched = runtime.block_on(chains[1].handle().scope(async {
+            produce(1, &mut embeddings, &mut uploads, &mut gates)?;
+            anyhow::Ok(())
+        }));
+        match kind { 0 => { embeddings[1].test_writer(false); },
+            1 => { uploads[1].test_writer(false); }, _ => { gates[1].test_writer(false); } }
+        launched?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if guarded { 2 } else { 10 });
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { library.cuda_stream_query(writer)? } { done = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(done, !guarded, "scratch kind {kind}: B completion before reader release");
+        drop(reader_gate);
+        for chain in &chains { chain.drain()?; }
+        unsafe { library.cuda_stream_synchronize(reader.raw)?; }
+        let mut got = vec![0; bytes];
+        library.copy_d2h(&mut got, copy.buffer)?;
+        if guarded { assert_eq!(got, want, "scratch kind {kind}: guarded reader clobbered"); }
+        else { assert_ne!(got, want, "scratch kind {kind}: negative control did not clobber"); }
+        eprintln!("PASS input scratch kind={kind} guarded={guarded} writer_done_before_release={done}");
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
+    fn guarded_input_scratch_waits_for_fork_readers() -> Result<()> {
+        for kind in 0..3 { guarded_input_scratch(kind, true)?; }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
+    fn unguarded_input_scratch_clobbers_fork_readers() -> Result<()> {
+        for kind in 0..3 { guarded_input_scratch(kind, false)?; }
+        Ok(())
+    }
+
 }
