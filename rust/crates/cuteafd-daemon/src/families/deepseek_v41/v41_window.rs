@@ -668,8 +668,10 @@ impl WindowWave<'_, '_> {
             }
             if !super::graph_policy::captures_shape(prepared.rows as u32) {
                 // An uncached prefill tail: run it once eagerly, never capture it.
+                // Launch and return: the chain orders consumers (outside a
+                // chain scope `finish` drains on the host as before).
                 let launched = self.upload(&prepared).and_then(|()| unsafe { self.enqueue(prepared.rows) });
-                launched.and(self.synchronize())?;
+                launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
                 self.ready = Some(prepared);
                 return Ok(());
             }

@@ -904,18 +904,20 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))),
             "compressor query layer, rows or positions differ");
+        let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32);
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
-            && self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner) {
-            // Captured shape: order the producer on the chain (forked from the
-            // query's normalized input) instead of draining it on the host.
-            let graph = self.graph.unwrap().0;
+            && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
+            // Order the producer on the chain (forked from the query's
+            // normalized input) instead of draining it on the host: a captured
+            // shape replays, an uncaptured prefill width launches eagerly.
+            let graph = if uncaptured { None } else { Some(self.graph.unwrap().0) };
             let queued = (|| -> Result<()> { unsafe {
                 crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                     query.hidden.bytes, self.stream.raw)?;
                 self.upload_queued(&prepared)?;
                 crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
-                    prepared.rows, Some(graph), || self.enqueue(state, prepared.rows))?;
+                    prepared.rows, graph, || self.enqueue(state, prepared.rows))?;
                 crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)
             } })();
             if let Err(error) = queued { self.synchronize()?; return Err(error); }
