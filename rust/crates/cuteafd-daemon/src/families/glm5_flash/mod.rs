@@ -39,6 +39,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(args.prefill_waves as u64),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
+        slots: (args.prefill_slots > 0).then_some(args.prefill_slots as u64),
     })?;
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = usize::try_from(shape.waves)?;
@@ -133,6 +134,11 @@ pub(crate) struct EngineArgs {
     #[arg(long = "prefill-waves", default_value_t = 0,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=engine::MAX_PREFILL_WAVES as u64))]
     pub prefill_waves: usize,
+    /// Admitted prefill slots of a resolved deployment (#762); 0/unset resolves
+    /// them. Equal to the waves on a static family.
+    #[arg(long, default_value_t = 0,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=engine::MAX_PREFILL_WAVES as u64))]
+    pub prefill_slots: usize,
     /// Shared prefill span; 0 resolves to waves times per-unit rows.
     #[arg(long, default_value_t = 0)]
     pub prefill_span_rows: usize,

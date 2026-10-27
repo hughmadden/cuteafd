@@ -151,27 +151,86 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
     Ok(GlmScratch { programs, topk: lookup(&name).ok_or_else(|| anyhow::anyhow!("GLM step needs program {name}"))? })
 }
 
+/// Per-row buffers of a GLM step workspace, in allocation order: (name, bytes
+/// per row). `lead` is rank 0 (rank 1 owns no router, wire or logits rows
+/// unless a TP2 pair runs its local router). Page tables and logits are sized
+/// separately ([`step_rows`]).
+pub fn step_row_widths(cfg: &GlmDsaConfig, lead: bool, split: bool, router: bool) -> [(&'static str, u64); 19] {
+    let h = cfg.hidden as u64;
+    let heads = cfg.heads as u64 / if split { 2 } else { 1 };
+    let routed = |width: u64| if lead || router { width } else { 0 };
+    [("h", h * 2), ("x", h * 2), ("query", heads * 576 * 2), ("q_resid", cfg.q_lora_rank as u64 * 2),
+        ("q_fp8", cfg.index_heads as u64 * cfg.index_head_dim as u64), ("head_weights", cfg.index_heads as u64 * 4),
+        ("indices", cfg.index_topk as u64 * 4), ("lengths", 4), ("attn", heads * 512 * 2), ("delta", h * 2),
+        ("positions", 8), ("slots", 8), ("cache_lengths", 4), ("router_logits", routed(cfg.experts as u64 * 4)),
+        ("route_ids", routed(cfg.topk as u64 * 4)), ("route_weights", routed(cfg.topk as u64 * 4)),
+        ("wire", routed(h + h / 32)), ("shared", h * 2), ("ids", 4)]
+}
+
+/// Logits rows a step workspace keeps for `rows`-row calls: every row for
+/// decode or full logits, else at most [`DECODE_ROWS`].
+pub fn logits_rows(rows: u64, decode: bool, full_logits: bool) -> u64 {
+    if decode || full_logits { rows } else { rows.min(DECODE_ROWS) }
+}
+
+/// Device bytes of a GLM step workspace's row buffers for `rows` rows (each
+/// with the engine's 256-byte floor), its `select` buffer, and `logits` rows
+/// of logits (rank 0).
+pub fn step_rows(cfg: &GlmDsaConfig, rows: u64, lead: bool, split: bool, router: bool,
+    logits: u64) -> Result<u64, PlacementError> {
+    let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(PlacementError::Overflow("GLM step buffers"));
+    let mut sum = 0u64;
+    for (_, width) in step_row_widths(cfg, lead, split, router) {
+        sum = sum.checked_add(if width == 0 { FLOOR } else { mul(rows, width)?.max(FLOOR) })
+            .ok_or(PlacementError::Overflow("GLM step buffers"))?;
+    }
+    let logits = if lead { mul(logits, cfg.vocab_size as u64 * 4)? } else { FLOOR };
+    [logits, mul(rows, 8)?].into_iter().try_fold(sum, |sum, bytes| sum.checked_add(bytes.max(FLOOR))
+        .ok_or(PlacementError::Overflow("GLM step buffers")))
+}
+
+/// Device bytes a step workspace shares across its rows: program and top-k
+/// scratch and the LM head workspace (rank 0).
+pub fn step_shared(lead: bool, scratch: GlmScratch) -> u64 {
+    [scratch.programs, scratch.topk, if lead { 4 << 20 } else { FLOOR }].into_iter().map(|b| b.max(FLOOR)).sum()
+}
+
 /// Device bytes beside a step's pool-dependent page table. Every allocation
 /// has the engine's 256-byte floor; pinned router staging is not GPU storage.
 pub fn step_bytes(cfg: &GlmDsaConfig, rows: u64, lead: bool, split: bool,
     decode: bool, full_logits: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
-    let h = cfg.hidden as u64;
-    let heads = cfg.heads as u64 / if split { 2 } else { 1 };
-    let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(PlacementError::Overflow("GLM step buffers"));
-    let row = |width: u64| mul(rows, width);
-    let lead_only = |bytes| if lead { bytes } else { FLOOR };
-    let logits_rows = if decode || full_logits { rows } else { rows.min(DECODE_ROWS) };
-    let buffers = [row(h * 2)?, row(h * 2)?, row(heads * 576 * 2)?,
-        row(cfg.q_lora_rank as u64 * 2)?, row(cfg.index_heads as u64 * cfg.index_head_dim as u64)?,
-        row(cfg.index_heads as u64 * 4)?, row(cfg.index_topk as u64 * 4)?, row(4)?,
-        row(heads * 512 * 2)?, row(h * 2)?, row(8)?, row(8)?, row(4)?,
-        scratch.programs, scratch.topk,
-        lead_only(mul(logits_rows, cfg.vocab_size as u64 * 4)?),
-        lead_only(row(cfg.experts as u64 * 4)?), lead_only(row(cfg.topk as u64 * 4)?),
-        lead_only(row(cfg.topk as u64 * 4)?), lead_only(row(h + h / 32)?), row(h * 2)?,
-        row(4)?, row(8)?, if lead { 4 << 20 } else { FLOOR }];
-    buffers.into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes.max(FLOOR))
-        .ok_or(PlacementError::Overflow("GLM step buffers")))
+    step_rows(cfg, rows, lead, split, false, logits_rows(rows, decode, full_logits))?
+        .checked_add(step_shared(lead, scratch))
+        .ok_or(PlacementError::Overflow("GLM step buffers"))
+}
+
+/// A GLM prefill's admitted shape on one GPU (#762): `slots` units of at most
+/// `unit_rows` in flight, every depth's slots views into per-field arenas of
+/// [`reserve_rows`](crate::serving_capacity::wave_control::reserve_rows) rows,
+/// and the hook-local storage (program/top-k scratch, head) shared once; its
+/// logits rows serve one unit at a time (`launch_head` per unit). Its bytes:
+/// one step workspace's rows at the reserve.
+pub fn prefill_bytes(cfg: &GlmDsaConfig, unit_rows: u64, slots: u64, lead: bool, split: bool, router: bool,
+    full_logits: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
+    let span = prefill_span(unit_rows, slots);
+    step_rows(cfg, span, lead, split, router, logits_rows(unit_rows, false, full_logits))?
+        .checked_add(step_shared(lead, scratch)).ok_or(PlacementError::Overflow("GLM prefill buffers"))
+}
+
+/// Rows of every per-slot prefill arena: `slots` units of at most `unit_rows`
+/// at every admitted depth (one unit when serial).
+pub fn prefill_span(unit_rows: u64, slots: u64) -> u64 {
+    if slots <= 1 { unit_rows } else { crate::serving_capacity::wave_control::reserve_rows(slots, unit_rows) }
+}
+
+/// The engine's prefill slot views (#762): for each admitted depth `k` in
+/// `1..=slots` (index `k - 1`), its `k` slots' row ranges inside the arenas
+/// of [`prefill_span`] rows, slot `s` at `s * unit_for(k)`.
+pub fn slot_views(unit_rows: u64, slots: u64) -> Vec<Vec<std::ops::Range<u64>>> {
+    (1..=slots).map(|k| {
+        let rows = crate::serving_capacity::wave_control::unit_for(k, unit_rows);
+        (0..k).map(|slot| slot * rows..(slot + 1) * rows).collect()
+    }).collect()
 }
 
 /// All non-baseline storage is future storage on both sides. Coordinator
@@ -267,6 +326,9 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     if gpus == 2 && inputs.experts.iter().any(|c| !c.tp2) {
         return Err(PlacementError::Inventory("GLM two-GPU local experts require TP2 halves"));
     }
+    // Rank 1's local router rows are workspace rows only with RTX experts (TP2);
+    // `local_extra_workspace` charges them with the backend, not here.
+    let rtx_router = false;
     let mut rows = Vec::new();
     let mut pool_overhead = Vec::new();
     let table_bytes = (DECODE_ROWS + inputs.prefill_lanes) * 4;
@@ -279,11 +341,13 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             cache.context_table_bytes_per_token.checked_mul(inputs.max_context)
                 .ok_or(PlacementError::Overflow("GLM RoPE"))?, Basis::Formula)));
         let (steps, basis) = match inputs.scratch {
+            // Decode's own workspace, and one prefill workspace whose row
+            // arenas span every admitted depth's slots (#762): hook-local
+            // scratch, head and logits rows are shared by the slots.
             Some([decode, prefill]) => (step_bytes(cfg, DECODE_ROWS, rank == 0, gpus == 2, true,
                 inputs.full_prefill_logits, decode)?.checked_add(
-                    step_bytes(cfg, inputs.prefill_rows, rank == 0, gpus == 2, false,
-                        inputs.full_prefill_logits, prefill)?.checked_mul(inputs.prefill_lanes)
-                        .ok_or(PlacementError::Overflow("GLM lane workspaces"))?)
+                    prefill_bytes(cfg, inputs.prefill_rows, inputs.prefill_lanes, rank == 0, gpus == 2,
+                        rtx_router, inputs.full_prefill_logits, prefill)?)
                     .ok_or(PlacementError::Overflow("GLM workspaces"))?, Basis::Formula),
             None => {
                 let hundredths = if gpus == 1 { 651 } else if rank == 0 { 559 } else { 422 };
@@ -296,8 +360,9 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 (bytes, Basis::Estimated)
             }
         };
+        // EXLR8 shared-expert execution: decode's and the prefill slots' one.
         let steps = if inputs.native_experts {
-            steps.checked_add(inputs.native_workspace.checked_mul(1 + inputs.prefill_lanes)
+            steps.checked_add(inputs.native_workspace.checked_mul(2)
                 .ok_or(PlacementError::Overflow("GLM native lane workspaces"))?)
                 .ok_or(PlacementError::Overflow("GLM native workspaces"))?
         } else { steps };
@@ -323,10 +388,12 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                     Basis::Formula)));
             }
             if inputs.spark_ranks > 0 {
-                // The decode link's 4096-row planes, plus the prefill link's return
-                // slots: one unit of `prefill_rows` per wave in flight.
+                // The decode link's 4096-row planes, plus the prefill link's one
+                // reserve range per rank every admitted depth's return slots
+                // are cut from (#762).
                 let prefill = if inputs.prefill_lanes > 1 {
-                    crate::serving_capacity::prefill_return_bytes(inputs.prefill_lanes, inputs.prefill_rows,
+                    crate::serving_capacity::prefill_return_bytes(1,
+                        prefill_span(inputs.prefill_rows, inputs.prefill_lanes),
                         inputs.spark_ranks as u64, cfg.hidden as u64)
                 } else { 0 };
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
@@ -634,7 +701,9 @@ impl LocalInventory {
 fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
     exchange_f32: bool) -> [u64; 2] {
     let dtype = if exchange_f32 { 4 } else { 2 };
-    let payload = (DECODE_ROWS * h * dtype).max(FLOOR) + lanes * (rows * h * dtype).max(FLOOR);
+    // Workspace rows: one arena whose per-slot views serve every admitted depth (#762).
+    let span = prefill_span(rows, lanes);
+    let payload = (DECODE_ROWS * h * dtype).max(FLOOR) + (span * h * dtype).max(FLOOR);
     let exchange_rows = rows.max(DECODE_ROWS);
     let routes = 2 * lanes * (exchange_rows * topk * 8).next_multiple_of(16)
         + ((2 * lanes + 1) * 16).max(FLOOR) + FLOOR;
@@ -642,7 +711,7 @@ fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
     // Rank 1 normally owns 256-byte placeholders for logits, ids, weights and wire.
     let peer_routes = [experts * 4, topk * 4, topk * 4, h + h / 32].into_iter().map(|width|
         (DECODE_ROWS * width).max(FLOOR) - FLOOR
-            + lanes * ((rows * width).max(FLOOR) - FLOOR)).sum::<u64>();
+            + ((span * width).max(FLOOR) - FLOOR)).sum::<u64>();
     // These optional deltas open with the RTX arena; shared step/attention rows stay Always.
     let rows = [("local expert payloads", [payload; 2]), ("canonical route exchange", [routes; 2]),
         ("FP32 exchange widening", [wide_exchange; 2]),
@@ -1047,9 +1116,11 @@ mod tests {
         for lanes in 1..=4 {
             let mut parallel = native.clone(); parallel.prefill_lanes = lanes;
             let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
+            // Decode's and the prefill slots' one shared execution (#762).
             assert_eq!(term(&request(&parallel).unwrap(), "steps")
-                - term(&request(&ordinary).unwrap(), "steps"), (1 + lanes) * 123456);
-            let prefill = if lanes > 1 { lanes * 4 * parallel.prefill_rows * h * 2 } else { 0 };
+                - term(&request(&ordinary).unwrap(), "steps"), 2 * 123456);
+            // One reserve range per rank every admitted depth is cut from.
+            let prefill = if lanes > 1 { prefill_span(parallel.prefill_rows, lanes) * 4 * h * 2 } else { 0 };
             assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
                 4 * 4096 * h * 2 + prefill);
         }
@@ -1120,6 +1191,61 @@ mod tests {
         assert!(working.spark.spark_layers.is_empty());
         assert_eq!(working.spark.spark_ranks, 0);
         assert_eq!(working.spark.prefill_lanes, 1);
+    }
+
+    /// #762, GLM K4 max (two GPUs, six Sparks, 4 x 2752 admitted): the
+    /// runtime's prefill storage is one arena per `step_row_widths` field at
+    /// the reserve plus the shared step storage, and every depth k=1..4 is
+    /// views inside it: slot 0 at offset 0, slots contiguous and disjoint,
+    /// each at most the admitted unit. The planner charges exactly that, the
+    /// shared storage once rather than per slot.
+    #[test]
+    fn adaptive_prefill_slots_are_views_and_the_planner_charges_one_reserve() {
+        let cfg = config();
+        let (unit, slots) = (2752u64, 4u64);
+        let span = prefill_span(unit, slots);
+        assert_eq!(span, 8256);
+        let views = slot_views(unit, slots);
+        assert_eq!(views.len(), 4);
+        for (index, depth) in views.iter().enumerate() {
+            let k = index as u64 + 1;
+            assert_eq!(depth.len() as u64, k);
+            assert_eq!(depth[0].start, 0, "lane 0 stays at offset 0 at depth {k}");
+            for pair in depth.windows(2) { assert_eq!(pair[0].end, pair[1].start, "contiguous at depth {k}"); }
+            let rows = crate::serving_capacity::wave_control::unit_for(k, unit);
+            assert!(depth.iter().all(|r| r.end - r.start == rows && rows <= unit && rows % 64 == 0));
+            assert!(depth.last().unwrap().end <= span, "depth {k} past the reserve");
+        }
+        assert_eq!(views[2].last().unwrap().end, 8256);
+        assert_eq!(views[3].last().unwrap().end, 8192);
+        let scratch = GlmScratch { programs: 380 << 20, topk: 742 << 20 };
+        for (lead, router) in [(true, false), (false, false), (false, true)] {
+            // The runtime's allocation list: each arena floored at 256 bytes.
+            let arenas: u64 = step_row_widths(&cfg, lead, true, router).iter()
+                .map(|&(_, width)| (span * width).max(FLOOR)).sum();
+            let logits = if lead { DECODE_ROWS * cfg.vocab_size as u64 * 4 } else { FLOOR };
+            let runtime = arenas + logits + span * 8 + step_shared(lead, scratch);
+            assert_eq!(prefill_bytes(&cfg, unit, slots, lead, true, router, false, scratch).unwrap(), runtime);
+            // The former per-slot workspaces charged the shared storage every slot.
+            let per_slot = slots * step_bytes(&cfg, unit, lead, true, false, false, scratch).unwrap();
+            assert!(runtime + (slots - 1) * (scratch.programs + scratch.topk) <= per_slot, "lead {lead}");
+        }
+        // A pinned or serial shape keeps its one span of units.
+        assert_eq!(prefill_span(4096, 2), 8192);
+        assert_eq!(prefill_span(2752, 3), 8256);
+        assert_eq!(prefill_span(4096, 1), 4096);
+        assert_eq!(slot_views(4096, 1), vec![vec![0..4096]]);
+    }
+
+    /// The engine builds its prefill arenas from the planner's field list and
+    /// carves the planner's views; decode keeps its own workspace.
+    #[test]
+    fn glm_engine_prefill_storage_follows_the_planner_lists() {
+        let engine = include_str!("../../../../cuteafd-daemon/src/families/glm5/engine.rs");
+        assert!(engine.contains("glm5::step_row_widths(&self.cfg, lead"));
+        assert!(engine.contains("glm5::slot_views(unit as u64, slots as u64)"));
+        assert!(engine.contains("glm5::prefill_span(unit as u64, slots as u64)"));
+        assert!(engine.contains("*self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?)"));
     }
 
     #[test]
@@ -1245,8 +1371,9 @@ mod tests {
             assert!(working.spark.includes(WorkingSetComponent::SparkExperts));
             assert_eq!(working.tp2_workspace, if n == 0 { [0; 2] } else { input.tp2_workspace });
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
-            // Decode's 4096-row planes plus three prefill return slots of a unit each.
-            assert_eq!(intake.bytes, 4 * 4096 * 6144 * 2 + 3 * 4 * input.prefill_rows * 6144 * 2);
+            // Decode's 4096-row planes plus one reserve range per rank that three
+            // admitted 4096-row slots are cut from (#762).
+            assert_eq!(intake.bytes, 4 * 4096 * 6144 * 2 + 4 * prefill_span(input.prefill_rows, 3) * 6144 * 2);
         }
     }
 
@@ -1561,15 +1688,17 @@ mod tests {
                     let local = local_inventory(&catalog, &manifest, 2, rows, lanes, f32).unwrap();
                     assert_eq!(local.backend_workspace, 80 * 64 + 3 * (32 + 16) + DECODE_ROWS * 6144 * 4);
                     let dtype = if f32 { 4 } else { 2 };
+                    // One payload arena whose slot views serve every admitted depth (#762).
+                    let span = prefill_span(rows, lanes);
                     let payloads = (DECODE_ROWS * 6144 * dtype).max(FLOOR)
-                        + lanes * (rows * 6144 * dtype).max(FLOOR);
+                        + (span * 6144 * dtype).max(FLOOR);
                     let route_slots = 2 * lanes * (DECODE_ROWS * 8 * 8)
                         + ((2 * lanes + 1) * 16).max(FLOOR) + FLOOR;
                     let widened_exchange = if f32 { 4 * lanes * DECODE_ROWS * 6144 * 2 } else { 0 };
                     assert_eq!(local.extra_workspace[0], payloads + route_slots + widened_exchange);
                     let peer_routes = [256 * 4, 8 * 4, 8 * 4, 6144 + 6144 / 32].into_iter().map(|width|
                         (DECODE_ROWS * width).max(FLOOR) - FLOOR
-                            + lanes * ((rows * width).max(FLOOR) - FLOOR)).sum::<u64>();
+                            + ((span * width).max(FLOOR) - FLOOR)).sum::<u64>();
                     assert_eq!(local.extra_workspace[1] - local.extra_workspace[0], peer_routes);
                 }
             }
@@ -2024,7 +2153,8 @@ mod tests {
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
         for (requested_pool, expected_pool, expected_context) in [
-            (Some(32768), 32768, 32512), (None, 115072, 114816),
+            // Two prefill slots share one step's scratch, head and logits (#762).
+            (Some(32768), 32768, 32512), (None, 117248, 116992),
         ] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;

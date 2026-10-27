@@ -1686,3 +1686,51 @@ fn native_v41_wire_rejects_previous_signature_and_version() -> Result<()> {
     assert!(ExpertProtocolV2RequestView::parse(&wire).is_err());
     Ok(())
 }
+
+#[test]
+fn unit_pace_round_trips_in_the_header_tail_and_only_when_set() -> Result<()> {
+    let plain = ExpertProtocolV2Response::new_with_output_stride(70, 71, 3, 2, 2, ExpertV2Dtype::Bf16, 4,
+        ExpertProtocolV2Status::Ok, vec![9; 8])?.with_executor_name("pace-test");
+    let with_pace = plain.clone().with_pace(Some((12_345, 678)));
+    let (a, b) = (plain.encode()?, with_pace.encode()?);
+    assert_eq!(a.len(), b.len(), "pace lives inside the fixed header");
+    assert_eq!(&a[88..96], &[0; 8]);
+    assert_eq!(u32::from_le_bytes(b[88..92].try_into()?), 12_345);
+    assert_eq!(u32::from_le_bytes(b[92..96].try_into()?), 678);
+    let wire_flags = u32::from_le_bytes(b[68..72].try_into()?);
+    assert_ne!(wire_flags & EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE, 0);
+    assert_eq!(u32::from_le_bytes(a[68..72].try_into()?) & EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE, 0);
+    let decoded = ExpertProtocolV2Response::decode(&b)?;
+    assert_eq!(decoded, with_pace);
+    assert_eq!(decoded.header.pace, Some((12_345, 678)));
+    // The framing bit never leaks into the decoded flags.
+    assert_eq!(decoded.header.flags & EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE, 0);
+    assert_eq!(ExpertProtocolV2ResponseView::parse(&b)?.header.pace, Some((12_345, 678)));
+    assert_eq!(ExpertProtocolV2ResponseView::parse(&b)?.header.flags, plain.header.flags);
+    assert_eq!(ExpertProtocolV2Response::decode(&a)?.header.pace, None);
+    assert_eq!(ExpertProtocolV2ResponseView::parse_landed_header(&b[..EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?.pace,
+        Some((12_345, 678)));
+    assert_eq!(ExpertProtocolV2ResponseView::parse_landed_header(&a[..EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?.pace,
+        None);
+    Ok(())
+}
+
+#[test]
+fn checksummed_frames_never_carry_a_unit_pace() -> Result<()> {
+    let base = ExpertProtocolV2Response::new_with_output_stride(72, 73, 3, 1, 2, ExpertV2Dtype::Bf16, 4,
+        ExpertProtocolV2Status::Ok, vec![1, 2, 3, 4])?;
+    for response in [base.clone().with_pace(Some((1, 2))).with_debug_checksum(),
+        base.clone().with_debug_checksum().with_pace(Some((1, 2)))] {
+        assert_eq!(response.header.pace, None);
+        let encoded = response.encode()?;
+        assert_eq!(u32::from_le_bytes(encoded[68..72].try_into()?) & EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE, 0);
+        assert_eq!(ExpertProtocolV2Response::decode(&encoded)?, response);
+    }
+    // A forged frame with both bits is refused rather than read as a pace.
+    let mut forged = base.with_debug_checksum().encode()?;
+    let flags = u32::from_le_bytes(forged[68..72].try_into()?) | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE;
+    forged[68..72].copy_from_slice(&flags.to_le_bytes());
+    assert!(ExpertProtocolV2Response::decode(&forged).is_err());
+    assert!(ExpertProtocolV2ResponseView::parse(&forged).is_err());
+    Ok(())
+}

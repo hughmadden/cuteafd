@@ -114,7 +114,7 @@ impl RuntimeSizing {
 /// to their capacity.
 pub fn prefill_shape(rows: u64, waves: u64, spark_ranks: usize) -> anyhow::Result<PrefillShape> {
     let pins = prefill_waves::PrefillOverrides { unit_rows: (rows > 0).then_some(rows),
-        waves: (waves > 0).then_some(waves), span_rows: None };
+        waves: (waves > 0).then_some(waves), span_rows: None, slots: None };
     Ok(prefill_waves::prefill_shape(spark_ranks, crate::plan::Family::prefill_limits(&super::MINIMAX_M3), pins)?.units())
 }
 

@@ -674,6 +674,13 @@ impl<'e, 'a> Execution<'e, 'a> {
 }
 
 impl<'e, 'a> Execution<'e, 'a> {
+    /// The main Spark link at rest, between steps (#762: depth transitions).
+    pub(super) fn with_link<T>(&self, work: impl FnOnce(&mut SparkLink<'a>) -> Result<T>) -> Result<Option<T>> {
+        let mut result = None;
+        self.main.with_transport(|link| { result = Some(work(link)?); Ok(()) })?;
+        Ok(result)
+    }
+
     /// One sequence's prefill as row units on the single lane and Spark link
     /// (PLAN "Prefill contract"): up to `waves` units' Spark waves in flight.
     /// The terminal residual of every unit lands in its rows of `input`.

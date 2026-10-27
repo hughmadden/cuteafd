@@ -177,8 +177,11 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
+        let identity = crate::shared::prefill_depth::DeploymentIdentity::new(&opened.library,
+            args.peers.as_deref().unwrap_or_default().split(',').filter(|peer| !peer.is_empty()),
+            format!("attention-{}-split{:?}-tp2{}", args.attention_placement, args.split_device, engine.has_tp2()));
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
-            ranks, &prefix, args.token_io.token_select, || {
+            ranks, &prefix, args.token_io.token_select, identity, || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(engine.max_context));
                 }
@@ -449,13 +452,28 @@ fn draft_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement,
-    ready: impl FnOnce()) -> Result<()> {
+    identity: crate::shared::prefill_depth::DeploymentIdentity, ready: impl FnOnce()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
         &crate::families::glm5_flash::serve::MESSAGE_STARTS)?;
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, opened.snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos_tokens.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
+    // Runtime prefill depth (#762): calibrated (or loaded) before readiness,
+    // on cold sequences admitted and released here (nothing retained).
+    if engine.pipelined() && transport.is_some() {
+        let depth = engine.prefill_depth();
+        let key = crate::shared::prefill_depth::CalibrationKey::new("glm5", &opened.snapshot, depth, identity);
+        crate::shared::prefill_depth::calibrate(depth, key, &tokenizer, |_, tokens| {
+            let capacity = (tokens.len() + DECODE_ROWS).min(engine.max_context);
+            let mut placement = cache.admit_cold(&family, tokens.len(), capacity,
+                |pages| GlmPlacement { pages, len: 0 })?.placement;
+            let ran = engine.prefill_device(&mut placement, tokens, transport.as_deref_mut().map(|t| (t, runtime)))
+                .and_then(|logits| logits.map(|_| ()).context("calibration prefill logits"));
+            cache.release(&family, &placement.pages)?;
+            ran
+        })?;
+    }
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     use crate::shared::draft::{resource, runtime::SharedPolicy};

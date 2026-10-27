@@ -544,6 +544,13 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_read_wait(void* handle, size_t offset_
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
+// One receive: header into the host slot at `offset_bytes`, payload into
+// [landing + landing_offset, + landing_bytes) of the range registered with
+// `cuteafd_rdma_rc_endpoint_set_recv_landing`; the landing rotation is not used.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_landing_at(void* handle, size_t offset_bytes,
+                                                           size_t bytes, uint64_t wr_id,
+                                                           size_t landing_offset,
+                                                           size_t landing_bytes);
 // Receives scatter their first `header_bytes` into the host slot and the rest
 // into equal `slot_bytes` ranges of [device_ptr, device_ptr + bytes) (dma-buf
 // MR), rotating in successful receive-post order. A null range restores host
