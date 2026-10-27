@@ -15,13 +15,13 @@ use std::time::Duration;
 pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, pass: &mut P, other: &mut P,
     requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], lease: CacheLease,
-    tokens: &[u32], chunk_rows: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+    tokens: &[u32], chunk_rows: usize, waves: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
 ) -> Result<u32> {
     let (events, _receive) = mpsc::unbounded_channel();
     let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     let [first_transport, second_transport] = transports;
     super::prefill(lib, runtime, pass, other, requests, first_transport, second_transport,
-        lease, tokens, chunk_rows, &job, draft, &mut || Ok(()))?.select(None)
+        lease, tokens, super::PrefillShape { rows: chunk_rows, waves }, &job, draft, &mut || Ok(()))?.select(None)
 }
 
 /// Only request-owned state survives a unit; both execution lanes are drained.
@@ -116,6 +116,8 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
     pub(crate) lease: CacheLease,
     pub(crate) tokens: &'s [u32],
     pub(crate) chunk_rows: usize,
+    /// Units in flight on the shared executor.
+    pub(crate) waves: usize,
     pub(crate) job: &'s NativeRequest,
     pub(crate) draft: Option<&'s mut DraftRuntime<'w, 'a, C>>,
     pub(crate) hold: &'s mut dyn FnMut() -> Result<()>,
@@ -223,26 +225,20 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 }
                 *next = range.end;
             }
-            (V41Unit::Stream(ranges), PrefillState::Encoder { suffix, next, replay_end, .. }) => {
+            (V41Unit::Stream(ranges), PrefillState::Encoder { suffix, next, .. }) => {
                 let chunks: Vec<_> = ranges.iter().map(|range| &self.tokens[range.clone()]).collect();
                 let started = Instant::now();
-                // Both lanes call this synchronous hook without nesting.
                 let hold = RefCell::new(&mut *self.hold);
-                let before_chunk = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
-                // Preserve alternating lane ownership after a bounded singleton stream.
-                let odd = (*next - *replay_end) / self.chunk_rows % 2 != 0;
-                let (first, second, a, b) = if odd {
-                    (&mut *self.other, &mut *self.pass, &mut *self.other_transport, &mut *self.transport)
-                } else {
-                    (&mut *self.pass, &mut *self.other, &mut *self.transport, &mut *self.other_transport)
-                };
-                // SAFETY: independent lanes retain the same request/suffix through drained completion.
-                self.runtime.block_on(unsafe { first.execute_encoder_stream_held(second, self.requests,
-                    self.lease, &chunks, [a, b], suffix,
-                    &|| !self.job.events.is_closed(), &before_chunk) })?;
-                tracing::debug!(target: "cuteafd::timing", rows=self.tokens.len(),
-                    total_us=started.elapsed().as_micros() as u64, "target encoder stream");
-                *next = ranges.last().context("empty encoder stream")?.end;
+                let before_unit = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
+                // SAFETY: the two slots' passes and links retain the request and
+                // suffix through drained completion or cancellation.
+                self.runtime.block_on(unsafe { self.pass.encoder_units(self.other, self.requests,
+                    self.lease, &chunks, [self.transport, self.other_transport], suffix,
+                    &|| !self.job.events.is_closed(), &before_unit, self.waves) })?;
+                tracing::debug!(target: "cuteafd::timing", rows=chunks.iter().map(|c| c.len()).sum::<usize>(),
+                    units=chunks.len(), waves=self.waves, total_us=started.elapsed().as_micros() as u64,
+                    "target encoder units");
+                *next = ranges.last().context("empty encoder units")?.end;
             }
             (V41Unit::DecoderReplay, PrefillState::Replay { suffix } | PrefillState::Encoder { suffix, .. }) => {
                 ensure!(!self.job.events.is_closed(), "client disconnected");
@@ -304,28 +300,17 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     /// live through completion/cancellation, with no conflicting access.
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()>;
+    /// Encoder units of one prompt on the shared executor, `waves` in flight:
+    /// slot k is `[self, other][k]` with `transports[k]`.
     /// # Safety
-    /// The passes have independent workspaces and the same layout/model. Input
-    /// chunks and suffix follow the encoder stream's request/cache contract.
-    async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
+    /// The passes have independent workspaces and the same layout/model; the
+    /// chunks and suffix follow the encoder's request/cache contract.
+    /// `before_unit` runs synchronously before each unit (host-cache store
+    /// pacing, packet HC-9).
+    #[allow(clippy::too_many_arguments)]
+    async unsafe fn encoder_units(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
         chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool) -> Result<()>;
-    /// # Safety
-    /// Same contract as `encoder_stream`, plus: `before_chunk` runs synchronously
-    /// before each dispatched chunk (host-cache store pacing, packet HC-9).
-    async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
-        suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
-        before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
-        // Default for passes without a held dispatch (dual-RTX lane): the hold is
-        // load-bearing on the single-GPU 5090 path only; log once so degradation
-        // is observable rather than silent (rc2 lesson).
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::warn!("held encoder stream unavailable on this pass; HC-9 per-chunk hold inactive");
-        }
-        self.encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await
-    }
+        keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>, waves: usize) -> Result<()>;
     /// # Safety
     /// Batch inputs and optional completed encoder suffix match this target.
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
@@ -346,18 +331,11 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
             unsafe { self.execute_encoder_replay(requests, batch, transport, 0, suffix).await }
         } else { unsafe { self.execute_encoder(requests, batch, transport, 0, suffix).await } }
     }
-    async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
+    async unsafe fn encoder_units(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
         chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool) -> Result<()> {
+        keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>, waves: usize) -> Result<()> {
         unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports, suffix, keep_running,
-            &|| Ok(()), 2).await }
-    }
-    async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
-        suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
-        before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports, suffix,
-            keep_running, before_chunk, 2).await }
+            before_unit, waves).await }
     }
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -387,10 +365,11 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         self.set_attention_decode(false);
         unsafe { self.execute(&RefCell::new(requests), batch, transport, 0, &[], Some(suffix), None, false).await }
     }
-    async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
+    async unsafe fn encoder_units(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
         chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool) -> Result<()> {
-        unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports, suffix, keep_running, 2).await }
+        keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>, waves: usize) -> Result<()> {
+        unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports, suffix, keep_running,
+            before_unit, waves).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],

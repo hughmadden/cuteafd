@@ -72,6 +72,7 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
     chunks: &'s [&'s [u32]],
     suffix: &'s mut DeviceOwner<'a, EncoderSuffix<'a>>,
     keep_running: &'s dyn Fn() -> bool,
+    before_unit: &'s dyn Fn() -> Result<()>,
     /// Every unit committed: the request stays admitted.
     complete: bool,
 }
@@ -105,6 +106,7 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     }
     async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
         ensure!((self.keep_running)(), "client disconnected");
+        (self.before_unit)()?;
         let slot = &mut self.slots[unit.slot];
         ensure!(slot.batch.is_none() && slot.prepared.is_none(), "encoder unit slot occupied");
         slot.started = Instant::now();
@@ -187,7 +189,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     /// placement and capacity. Poll on one CUDA-owning executor thread.
     pub(crate) async unsafe fn execute_encoder_units(&mut self, other: &mut Self, requests: &mut Requests<'a>,
         lease: CacheLease, chunks: &[&[u32]], transports: [&mut DeviceOwner<'a, NativeTp4Wave<'a>>; 2],
-        suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, keep_running: &dyn Fn() -> bool, waves: usize) -> Result<()> {
+        suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, keep_running: &dyn Fn() -> bool,
+        before_unit: &dyn Fn() -> Result<()>, waves: usize) -> Result<()> {
         ensure!((1..=2).contains(&waves), "encoder unit owner count differs");
         ensure!(self.state == State::Idle && other.state == State::Idle, "distributed encoder lane still in use");
         ensure!(self.resources.map == other.resources.map, "distributed encoder lane placement differs");
@@ -204,7 +207,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now() },
                 UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now() },
             ],
-            requests: RefCell::new(requests), lease, chunks, suffix, keep_running, complete: false,
+            requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit, complete: false,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
         hooks.complete = true;

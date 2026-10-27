@@ -643,12 +643,13 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     other_transport: &mut P::Transport,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
     tokens: &[u32],
-    chunk_rows: usize,
+    shape: PrefillShape,
     job: &NativeRequest,
     draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<RetainedScores> {
     use prefill_target::{V41Prefill, V41PrefillStep, V41PrefillTimes};
+    let PrefillShape { rows: chunk_rows, waves } = shape;
     if let Some(probe) = job.probe.as_ref().filter(|probe| !probe.spec.cold_steps.is_empty()) {
         probe.spec.validate_cold_steps(tokens.len(), tokens.len(), 1)?;
         ensure!(!probe.spec.cold_steps[0].decode, "V4.1 cold replay must begin with encoder prefill");
@@ -660,7 +661,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
             if index == 0 {
                 let mut times = V41PrefillTimes::default();
                 let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
-                    other_transport, lease, tokens: chunk, chunk_rows, job, draft: draft.as_deref_mut(),
+                    other_transport, lease, tokens: chunk, chunk_rows, waves, job, draft: draft.as_deref_mut(),
                     hold, times: &mut times };
                 scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
             } else if cold_step.decode {
@@ -689,8 +690,22 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     }
     let mut times = V41PrefillTimes::default();
     let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
-        other_transport, lease, tokens, chunk_rows, job, draft, hold, times: &mut times };
+        other_transport, lease, tokens, chunk_rows, waves, job, draft, hold, times: &mut times };
     crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
+}
+
+/// The serving prefill shape: unit rows (`--prefill-batch-tokens`) and units
+/// in flight on the shared executor (`--prefill-waves`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillShape {
+    pub rows: usize,
+    pub waves: usize,
+}
+
+impl PrefillShape {
+    pub(crate) fn from_args(args: &crate::cli::NativeServeArgs) -> Self {
+        Self { rows: args.prefill_batch_tokens as usize, waves: usize::from(args.prefill_waves) }
+    }
 }
 
 /// A benchmark probe's teacher-forced scoring pass finished: the request
@@ -771,15 +786,15 @@ impl ScoringPlan {
 fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, other: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
     other_transport: &mut P::Transport, lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
-    tokens: &[u32], from: usize, chunk_rows: usize, job: &NativeRequest,
+    tokens: &[u32], from: usize, shape: PrefillShape, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
-    let plan = ScoringPlan::for_probe(&probe.spec, chunk_rows)?;
+    let plan = ScoringPlan::for_probe(&probe.spec, shape.rows)?;
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let from = from.clamp(1, tokens.len() - 1);
     let first = prefill(lib, runtime, pass, other, requests, transport, other_transport, lease, &tokens[..from],
-        chunk_rows, job, draft.as_deref_mut(), hold)?;
+        shape, job, draft.as_deref_mut(), hold)?;
     probe.row(from, &first.logits()?);
     for step in plan.steps(from, tokens.len()) {
         ensure!(!job.events.is_closed(), "client disconnected");

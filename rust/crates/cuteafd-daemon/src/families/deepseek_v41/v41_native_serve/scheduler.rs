@@ -477,13 +477,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
                     P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                     super::score(lib, runtime, first, second, requests, first_transport, second_transport, lease,
-                        &prompt, from, args.prefill_batch_tokens as usize, &job, draft.as_deref_mut(),
+                        &prompt, from, super::PrefillShape::from_args(args), &job, draft.as_deref_mut(),
                         &mut || prefixes.prefill_hold())?;
                 }
                 P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                 let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
                 else { prefill(lib, runtime, first, second, requests, first_transport,
-                    second_transport, lease, &prompt, args.prefill_batch_tokens as usize, &job,
+                    second_transport, lease, &prompt, super::PrefillShape::from_args(args), &job,
                     draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
                 requests.record_state(lease, &job.probe, "prompt")?;
                 if crate::shared::probe::wants_first(&job.probe) {

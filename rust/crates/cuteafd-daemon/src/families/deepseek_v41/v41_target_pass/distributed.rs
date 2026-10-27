@@ -1374,7 +1374,7 @@ mod tests {
             draft.admit(id)?;
             let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
                 &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
-                &prompt, chunk_rows, Some(draft.get_mut()))?;
+                &prompt, chunk_rows, 2, Some(draft.get_mut()))?;
             assert_eq!(anchor, reference_anchor, "serving prefill anchor differs from matching sequential chunks");
             draft.validate_position(id, 7)?;
             let proposed = loop {
@@ -1386,7 +1386,7 @@ mod tests {
             let continued: Vec<_> = prompt.into_iter().chain([800, 900]).collect();
             let next = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
                 &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
-                &continued, chunk_rows, Some(draft.get_mut()))?;
+                &continued, chunk_rows, 2, Some(draft.get_mut()))?;
             ensure!(next < 129280, "invalid continuation anchor");
             assert_eq!(requests.cache().committed_end(lease)?, 9);
             draft.validate_position(id, 9)?;
@@ -1486,6 +1486,7 @@ mod tests {
                             [&mut transport, &mut other_transport],
                             &mut suffix,
                             &|| true,
+                            &|| Ok(()),
                             2,
                         )
                     })?;
@@ -1664,6 +1665,7 @@ mod tests {
                     calls.set(calls.get() + 1);
                     calls.get() < 12
                 },
+                &|| Ok(()),
                 2,
             )
         });

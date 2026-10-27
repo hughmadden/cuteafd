@@ -53,9 +53,6 @@ is a static, CPU-only descriptor. It is registered in `REGISTRY` (`:162`).
   - `initial_unit_rows`: a measured starting unit (Step-5: 2048).
   - Hard executor caps: `max_waves` (Qwen4: 2, because its mapped-PLE ring
     has two slots), `max_unit_rows`, `capacities`.
-- **`spark_prefill() -> SparkPrefill`** (`family.rs:130`): `Ladder` for every
-  shared-executor family. `Streams(2)` exists only for V4.1's legacy CED
-  executor ([loader/plan/spark_executions.rs:36](../../rust/crates/cuteafd-loader/src/plan/spark_executions.rs#L36)).
 - **`open() -> FamilyModel`** (`family.rs:55`), which carries the tensor
   contract (`accepts`, `experts`) and `placement()` (`:70`). `placement()` is
   the family's adapter over the shared solver (section 5).
@@ -76,7 +73,7 @@ Current entries:
 
 | Family | LaneSupport | Prefill estimate |
 |---|---|---|
-| V4.1 | FixedTwo (C8 1.17×, C16 1.19×, #723) | legacy CED, `Streams(2)` |
+| V4.1 | FixedTwo (C8 1.17×, C16 1.19×, #723) | MeasuredWaves k2 (`max_waves` 2: one target pass per slot), initial unit 2048 |
 | V4 | One (V4 Flash two-lane A/B pending) | MeasuredWaves k3 @ 6 |
 | GLM 5.3 | One (second graph set ≈3 GiB/GPU) | Timing S 13 ms, T 19.5 ms @ 6, 2752 rows |
 | GLM Flash | One (min-card two-lane A/B pending) | MeasuredWaves k2 @ 4, k3 above |
@@ -212,6 +209,10 @@ Reference ports:
 - Kimi (the first): `UnitHooks` at [kimi_k3/layers.rs:708](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/layers.rs#L708).
 - GLM 5.3: [glm5/engine.rs:2402](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L2402).
 - V4: [deepseek_v4/engine/prefill.rs:128](../../rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine/prefill.rs#L128).
+- V4.1 (async hooks, `run_prefill_units_async`): encoder units over layers
+  0..20, one target pass and Spark link per slot, at
+  [deepseek_v41/v41_target_pass/encoder_units.rs](../../rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_target_pass/encoder_units.rs)
+  and its two-RTX form in `distributed/encoder_units.rs`.
 - Step-5, Qwen4 and GLM Flash also implement it.
 
 The ordering, row-ownership and head rules are in
@@ -271,9 +272,9 @@ comes from `family_prefill_mode` (`:395`):
 
 | Mode | Families | Serve flags |
 |---|---|---|
-| `units` | step5, kimi_k3, qwen4, deepseek_v4 | `--prefill-rows` (unit), `--prefill-waves` |
+| `units` | step5, kimi_k3, qwen4, deepseek_v4, deepseek_v41 | `--prefill-rows` (unit; V4.1 `--prefill-batch-tokens`), `--prefill-waves` |
 | `units-span` | glm5, glm5_flash | the above plus `--prefill-span-rows`: rows one continuous call streams. It must equal unit × waves (`IntakeSpan`, `prefill_waves.rs:144`). |
-| `legacy` | mimo_v2 (V4.1 launches through `run.sh`) | not on the shared executor |
+| `legacy` | mimo_v2 | not on the shared executor |
 
 A new family opts in here once its serve CLI accepts the shape.
 
@@ -498,7 +499,6 @@ These are the gates; the tiers and bars are in
    - `spark_decode` rows;
    - `prefill_limits`: `MeasuredWaves`, `Timing` or `Unmeasured`, with
      `source`;
-   - `spark_prefill() = Ladder`.
 3. Write the placement adapter: a `PlacementRequest` builder over the shared
    solver (`loader/placement/families/`). Charge every owner with a category
    and group before allocation, and don't run a private pool or onboard policy.
