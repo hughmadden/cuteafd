@@ -136,14 +136,17 @@ impl UnitPreparedLayer {
 impl PreparedLayer<'_, '_, '_> {
     /// Finish the attention chain before releasing its borrow to the executor.
     pub async fn into_unit(self) -> Result<UnitPreparedLayer> {
-        let (binding, cooperative, attended_us) = match self.ffn {
-            PreparedFfn::Ready(ffn) => (ffn.input.binding(), false, self.attended_us),
+        let (binding, attended_us) = match self.ffn {
+            PreparedFfn::Ready(ffn) => (ffn.input.binding(), self.attended_us),
             PreparedFfn::Pending(pending) => {
                 let ffn = pending.complete().await?;
-                (ffn.input.binding(), true, self.started.elapsed().as_micros() as u64)
+                (ffn.input.binding(), self.started.elapsed().as_micros() as u64)
             }
         };
-        Ok(UnitPreparedLayer { binding, cooperative, rows: self.rows, batch: self.batch,
+        // A unit's router and shared-expert waits yield to the executor (the
+        // same kernels; only the wait differs): another unit issues meanwhile
+        // instead of the engine thread blocking on this unit's stream (#815).
+        Ok(UnitPreparedLayer { binding, cooperative: true, rows: self.rows, batch: self.batch,
             layer: self.layer, started: self.started, produced_us: self.produced_us,
             indexed_us: self.indexed_us, attended_us })
     }

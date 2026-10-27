@@ -164,11 +164,11 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         };
         // SAFETY: the transport result and original unit binding remain live.
         unsafe {
-            slot.pass.resources.execution.complete_layer(
+            slot.pass.resources.execution.complete_layer_cooperative(
                 batch.cache()?,
                 &mut slot.pass.resources.lane,
                 completed,
-            )?;
+            ).await?;
         }
         Ok(())
     }
@@ -202,13 +202,14 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
                 .land(&mut slot.pass.resources.lane, slot.transport)
                 .await?
         };
-        // SAFETY: result and batch belong to the original prepared layer.
+        // SAFETY: result and batch belong to the original prepared layer. The
+        // mHC finish yields to the executor while it runs (#815).
         unsafe {
-            slot.pass.resources.execution.complete_layer(
+            slot.pass.resources.execution.complete_layer_cooperative(
                 batch.cache()?,
                 &mut slot.pass.resources.lane,
                 completed,
-            )?;
+            ).await?;
         }
         Ok(())
     }
