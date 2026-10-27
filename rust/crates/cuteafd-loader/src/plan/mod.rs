@@ -1247,7 +1247,11 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             }
             return Ok(report);
         }
-        // Fit is monotone in the reserve: bisect for the largest that fits.
+        // The largest page-multiple reserve that fits, by bisection (fit is
+        // monotone in the reserve). Units are roundup64(reserve / k); the
+        // charged rows are the largest split, k x unit (8192 charges 8256),
+        // planned at the configured k, whose split is the largest at the
+        // shared default k = 3.
         use crate::serving_capacity::prefill_waves::{reserve_candidates, reserve_unit_rows, RESERVE_ROWS};
         let waves = report.prefill_waves.unwrap_or(2);
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
@@ -1260,7 +1264,10 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
         };
-        let candidates = reserve_candidates();
+        // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`).
+        let candidates: Vec<u64> = reserve_candidates().into_iter()
+            .filter(|&reserve| reserve_unit_rows(reserve, waves) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
+            .collect();
         let full = at(RESERVE_ROWS)?;
         if full.executable() { return Ok(full); }
         let smallest = at(*candidates.last().unwrap())?;
@@ -1280,8 +1287,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             let report = at(candidates[mid])?;
             if report.executable() { lo = mid; best = report; } else { hi = mid; }
         }
-        return Ok(best);
-        Ok(report)
+        Ok(best)
     };
     let mut requested = candidate(count)?;
     if count > available {

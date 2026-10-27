@@ -3535,8 +3535,8 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
 #[test]
 fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // TJ 2026-10-27: the reserve is sized first, the largest that fits the
-    // card (8192, else a multiple of 768 rows), split into k units; the pool
-    // takes what remains. Only an explicit pin changes the shape.
+    // card (8192, else a multiple of 64 rows), split into roundup64(R / k)
+    // units; the pool takes what remains. Only an explicit pin changes it.
     use crate::serving_capacity::prefill_waves::{reserve_unit_rows, RESERVE_STEP_ROWS};
     let dir = strict_v41_snapshot(false);
     let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
@@ -3554,10 +3554,11 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert_eq!(capped.prefill_unit_rows, Some(reserve_unit_rows(reserve, 3)), "{}", render(&capped));
     if reserve < 8192 {
         assert_eq!(reserve % RESERVE_STEP_ROWS, 0);
-        // The next larger reserve does not fit: the cap is the largest.
-        let larger = reserve + RESERVE_STEP_ROWS;
+        // The next reserve with larger units does not fit: the cap is the largest.
+        let mut larger = reserve + RESERVE_STEP_ROWS;
+        while reserve_unit_rows(larger, 3) == reserve_unit_rows(reserve, 3) { larger += RESERVE_STEP_ROWS; }
         let pinned = PlanOptions { layout: Some(layout::LayoutOptions {
-            prefill_rows: if larger >= 8192 { 2752 } else { larger / 3 }, prefill_waves: 3, ..layout.clone() }), ..sparks(4) };
+            prefill_rows: reserve_unit_rows(larger, 3), prefill_waves: 3, ..layout.clone() }), ..sparks(4) };
         assert!(!plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap().executable());
     }
     // An explicit pin keeps its shape whether or not it fits.

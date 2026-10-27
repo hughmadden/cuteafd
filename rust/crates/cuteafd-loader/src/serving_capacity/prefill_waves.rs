@@ -4,17 +4,21 @@
 //! 8192-row reserve. Runtime S/T adaptation is a separate executor change.
 
 pub const RESERVE_ROWS: u64 = 8192;
-/// A capped reserve is a multiple of lcm(2, 3, 4) pages, so every k = 2..4
-/// split stays on 64-row pages (TJ 2026-10-27).
-pub const RESERVE_STEP_ROWS: u64 = 12 * 64;
+/// Reserves are page multiples (TJ 2026-10-27).
+pub const RESERVE_STEP_ROWS: u64 = 64;
 
-/// Reserves a planner may admit, largest first: the full reserve, then every
-/// smaller multiple of [`RESERVE_STEP_ROWS`]. The planner takes the largest one
-/// that fits the card; the KV pool takes what remains and never shrinks it.
+/// Reserves a planner may admit, largest first: every multiple of 64 rows up
+/// to [`RESERVE_ROWS`]. The planner takes the largest whose charge
+/// ([`reserve_charge_rows`]) fits the card; the KV pool takes what remains and
+/// never shrinks it.
 pub fn reserve_candidates() -> Vec<u64> {
-    std::iter::once(RESERVE_ROWS)
-        .chain((1..=(RESERVE_ROWS - 1) / RESERVE_STEP_ROWS).rev().map(|n| n * RESERVE_STEP_ROWS))
-        .collect()
+    (1..=RESERVE_ROWS / RESERVE_STEP_ROWS).rev().map(|n| n * RESERVE_STEP_ROWS).collect()
+}
+
+/// Rows a reserve charges: its largest k = 2..4 split, k x roundup64(reserve / k)
+/// (8192 charges 8256 for 3 x 2752).
+pub fn reserve_charge_rows(reserve: u64) -> u64 {
+    (2..=MAX_WAVES).map(|waves| waves * reserve_unit_rows(reserve, waves)).max().unwrap_or(reserve)
 }
 pub const MAX_WAVES: u64 = 4;
 pub const MIN_FILL: f64 = 0.5;
@@ -28,12 +32,9 @@ pub fn unit_rows(waves: u64) -> u64 {
     }
 }
 
-/// Units of an admitted reserve: the full reserve's exact capacities
-/// (`unit_rows`), else `reserve / waves`, exact on 64-row pages.
+/// Units of a reserve: roundup64(reserve / k) (8192: 4096/2752/2048).
 pub fn reserve_unit_rows(reserve: u64, waves: u64) -> u64 {
-    let waves = waves.max(1);
-    if reserve >= RESERVE_ROWS { return unit_rows(waves); }
-    reserve.div_ceil(64 * waves) * 64
+    reserve.div_ceil(waves.max(1)).div_ceil(64) * 64
 }
 
 /// Family-owned evidence, never inferred from the family's name or rank count.
@@ -204,15 +205,17 @@ mod tests {
         assert_eq!((2..=4).map(unit_rows).collect::<Vec<_>>(), [4096, 2752, 2048]);
         assert_eq!((2..=4).map(|k| reserve_unit_rows(RESERVE_ROWS, k)).collect::<Vec<_>>(), [4096, 2752, 2048]);
         let candidates = reserve_candidates();
-        assert_eq!(candidates[..3], [8192, 7680, 6912]);
-        assert_eq!(*candidates.last().unwrap(), 768);
-        for &reserve in &candidates[1..] {
+        assert_eq!(candidates[..3], [8192, 8128, 8064]);
+        assert_eq!(*candidates.last().unwrap(), 64);
+        assert_eq!(reserve_charge_rows(8192), 8256);
+        for &reserve in &candidates {
             for waves in 2..=MAX_WAVES {
                 let unit = reserve_unit_rows(reserve, waves);
-                assert_eq!((unit * waves, unit % 64), (reserve, 0), "{reserve} / {waves}");
+                assert!(unit % 64 == 0 && unit * waves >= reserve && unit * waves < reserve + 64 * waves, "{reserve} / {waves}");
+                assert!(unit * waves <= reserve_charge_rows(reserve));
             }
         }
-        assert_eq!((2..=4).map(|k| reserve_unit_rows(3072, k)).collect::<Vec<_>>(), [1536, 1024, 768]);
+        assert_eq!((2..=4).map(|k| reserve_unit_rows(3840, k)).collect::<Vec<_>>(), [1920, 1280, 960]);
     }
 
     #[test]
