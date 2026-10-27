@@ -94,10 +94,10 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         Ok(bytes)
     }
     pub fn storage_on_device(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32,
-        gpu: usize) -> Result<DeviceOwner<'a, Rc<IndexLaneStorage<'a>>>> {
+        gpu: usize, readers: &[i32]) -> Result<DeviceOwner<'a, Rc<IndexLaneStorage<'a>>>> {
         ensure!(gpu < 2 && weights.placement.is_some(), "placed index storage requires distributed weights");
         let device = Device { library: weights.library, id: gpu as i32 };
-        device.own(|| Self::storage_inner(weights, rows, unit, Some(device.id)))
+        device.own(|| Self::storage_inner(weights, rows, unit, Some(device.id), readers))
     }
     pub fn on_storage_on_device(weights: &'w IndexLaneWeights<'a>,
         storage: Rc<IndexLaneStorage<'a>>) -> Result<DeviceOwner<'a, Self>> {

@@ -8,7 +8,12 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Compressor, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
 use std::{marker::PhantomData, rc::Rc};
-use crate::shared::memory::row_window::RowWindow;
+use crate::shared::memory::row_window::{RowWindow, ScratchGuard};
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static SKIP_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(crate) struct IndexQueryWeights<'a> {
     library: &'a NativeLibrary,
@@ -81,9 +86,9 @@ impl<'a> IndexQueryWeights<'a> {
             IndexQueryWave::device_bytes(self.library, capacity)? <= budget,
             "index query wave exceeds budget"
         );
-        self.on_storage(self.storage(capacity, capacity)?)
+        self.on_storage(self.storage(capacity, capacity, &[self.library.cuda_get_device()?])?)
     }
-    pub fn storage(&self, rows: u32, unit: u32) -> Result<Rc<IndexQueryStorage<'a>>> {
+    pub fn storage(&self, rows: u32, unit: u32, readers: &[i32]) -> Result<Rc<IndexQueryStorage<'a>>> {
         ensure!(unit > 0 && unit <= rows, "index query unit outside reserve");
         let fp8 = self.library.v41_fp8_matrix_plan(unit, 1280, 4096)?;
         let scratch = DeviceAllocation::new(self.library, fp8.info().scratch_bytes as usize)?;
@@ -102,10 +107,10 @@ impl<'a> IndexQueryWeights<'a> {
             frequencies: DeviceAllocation::new(self.library, unit as usize * 256)?,
             projected: DeviceAllocation::new(self.library, unit as usize * 8192)?,
             head_projected: DeviceAllocation::new(self.library, unit as usize * 64)?,
-            packed: DeviceAllocation::new(self.library, rows as usize * 2048)?,
-            scales: DeviceAllocation::new(self.library, rows as usize * 128)?,
-            head_weights: DeviceAllocation::new(self.library, rows as usize * 64)?,
-            rows, unit,
+            packed: DeviceAllocation::new(self.library, unit as usize * 2048)?,
+            scales: DeviceAllocation::new(self.library, unit as usize * 128)?,
+            head_weights: DeviceAllocation::new(self.library, unit as usize * 64)?,
+            guard: ScratchGuard::new(self.library, readers)?, rows, unit,
         };
         // SAFETY: scratch and alpha belong to this stream and outlive initialization.
         unsafe { storage.fp8.initialize_scratch(storage.scratch.buffer, storage.alpha.buffer, storage.stream.raw)?;
@@ -124,13 +129,15 @@ impl<'a> IndexQueryWeights<'a> {
         })
     }
 }
-/// Shared index-query storage (`row_window` contract).
-/// Row planes: packed, scales and head_weights, read by selection on another
-/// stream. Scratch: qr, hidden, positions (copied and consumed inside the
-/// projection hook), frequencies, projected, head_projected, GEMM scratch,
-/// alpha and compressor workspace; every reader is on this one stream.
+/// Index-query storage shared by all slots. Packed/scales/head_weights are
+/// guarded unit-cap scratch: selection and sparse attention read them on fork
+/// streams within the attention hook. Release after its last reader joins.
+/// Plain unit-cap scratch: qr, hidden, positions, frequencies, projected,
+/// head_projected, GEMM scratch, alpha and compressor workspace; one stream
+/// consumes these within the projection hook. No cross-hook planes here.
 /// Bindings, phase and graphs remain per slot; no host-staged metadata here.
 pub(crate) struct IndexQueryStorage<'a> {
+    guard: ScratchGuard<'a>,
     stream: LoadStream<'a>,
     fp8: V41Fp8Plan<'a>,
     dense: V41Compressor<'a>,
@@ -207,6 +214,15 @@ impl<'w, 'a> IndexQueryWave<'w, 'a> {
     }
 }
 impl IndexQueryWave<'_, '_> {
+    #[cfg(test)]
+    pub(super) fn scratch_stream(&self) -> *mut std::ffi::c_void { self.storage.stream.raw }
+    pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
+    fn acquire_scratch(&self) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+        // SAFETY: the owned writer stream is live on the current device.
+        unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
+    }
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
         ensure!(self.pending.is_none() && self.ready.is_none(), "index query window changes only at rest");
         if let Some(range) = window.range() {
@@ -218,7 +234,7 @@ impl IndexQueryWave<'_, '_> {
     }
     pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<usize> {
         ensure!(unit > 0 && unit <= rows, "index query unit outside reserve");
-        Ok(Self::device_bytes(library, unit)? + (rows - unit) as usize * 2240)
+        Self::device_bytes(library, unit)
     }
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         let info = library.v41_fp8_matrix_plan_info(capacity, 1280, 4096)?;
@@ -283,9 +299,9 @@ impl IndexQueryWave<'_, '_> {
                 self.storage.projected.buffer,
                 self.storage.frequencies.buffer,
                 self.storage.head_projected.buffer,
-                self.window.apply(self.storage.packed.buffer, 2048),
-                self.window.apply(self.storage.scales.buffer, 128),
-                self.window.apply(self.storage.head_weights.buffer, 64),
+                self.storage.packed.buffer,
+                self.storage.scales.buffer,
+                self.storage.head_weights.buffer,
                 rows as usize,
                 self.storage.stream.raw,
             )?;
@@ -300,6 +316,7 @@ impl IndexQueryWave<'_, '_> {
         self.validate(rows)?;
         // SAFETY: the caller retains inputs through the queued projection.
         unsafe { crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?; }
+        self.acquire_scratch()?;
         let launched = unsafe { self.enqueue(rows) };
         let completed = if self.window.is_windowed() {
             // SAFETY: publication retains this stream and its output planes.
@@ -450,6 +467,7 @@ impl IndexQueryWave<'_, '_> {
             && !crate::shared::decode_graph::census::eager("layer_row")));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.acquire_scratch()?;
             for (dst, src) in [(self.storage.qr.buffer, query.normalized_rank),
                 (self.storage.hidden.buffer, query.hidden), (self.storage.positions.buffer, query.positions)] {
                 self.storage.stream.library.copy_d2d_async(dst, src, src.bytes, self.storage.stream.raw)?;
@@ -497,9 +515,9 @@ impl IndexQueryWave<'_, '_> {
             origin: self.origin,
             tokens: &self.tokens,
             layer: self.weights.layer,
-            packed: sized(self.window.apply(self.storage.packed.buffer, 2048), 2048),
-            scales: sized(self.window.apply(self.storage.scales.buffer, 128), 128),
-            head_weights: sized(self.window.apply(self.storage.head_weights.buffer, 64), 64),
+            packed: sized(self.storage.packed.buffer, 2048),
+            scales: sized(self.storage.scales.buffer, 128),
+            head_weights: sized(self.storage.head_weights.buffer, 64),
             _owner: PhantomData,
         })
     }

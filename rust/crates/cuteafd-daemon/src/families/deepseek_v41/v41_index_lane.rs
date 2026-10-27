@@ -39,10 +39,11 @@ impl<'a> IndexLaneWeights<'a> {
     }
 }
 
-/// One per GPU: query row planes and selection output planes span the reserve;
-/// query/selection hook-local scratch spans only the unit cap. Source and
-/// reindex have distinct retained planes but share one selection stream and
-/// scratch. All phase, bindings and pinned metadata remain in each slot's waves.
+/// One per GPU: only source-20 candidate blocks span the reserve (later hooks
+/// reindex them). Query outputs and selected IDs are guarded unit-cap scratch.
+/// Source/reindex share a selection stream and guard; stream order protects
+/// their plain scratch within a unit, release/acquire protects fork readers
+/// across units. Bindings, phases and pinned metadata stay per slot.
 pub(crate) struct IndexLaneStorage<'a> {
     query: Rc<IndexQueryStorage<'a>>,
     source: Rc<IndexSelectionStorage<'a>>,
@@ -90,29 +91,29 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         ensure!(weights.placement.is_some() == device.is_some(), "index workspace placement differs from weights");
         let first = Self::next_owned(weights, device, 0);
         ensure!(first < LAYERS.len(), "GPU has no index producers");
-        Self::on_storage(weights, Self::storage_inner(weights, capacity, capacity, device)?)
+        Self::on_storage(weights, Self::storage_inner(weights, capacity, capacity, device, &[weights.library.cuda_get_device()?])?)
     }
     pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<[usize; 3]> {
         Ok([IndexQueryWave::storage_bytes(library, rows, unit)?,
             IndexSelectionWave::storage_bytes(rows as usize, unit as usize)?,
-            rows as usize * (2048 + 8192)])
+            IndexSelectionWave::shared_device_bytes(unit as usize)?])
     }
-    pub fn storage(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32) -> Result<Rc<IndexLaneStorage<'a>>> {
+    pub fn storage(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32, readers: &[i32]) -> Result<Rc<IndexLaneStorage<'a>>> {
         ensure!(weights.placement.is_none(), "unplaced index storage requires unplaced weights");
-        Self::storage_inner(weights, rows, unit, None)
+        Self::storage_inner(weights, rows, unit, None, readers)
     }
     fn storage_inner(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32,
-        device: Option<i32>) -> Result<Rc<IndexLaneStorage<'a>>> {
+        device: Option<i32>, readers: &[i32]) -> Result<Rc<IndexLaneStorage<'a>>> {
         ensure!(weights.weights.len() == LAYERS.len() && weights.placement.is_some() == device.is_some(),
             "index storage weight placement differs");
         let first = Self::next_owned(weights, device, 0);
         ensure!(first < LAYERS.len(), "GPU has no index producers");
-        let source = IndexSelectionWave::storage(weights.library, rows as usize, unit as usize)?;
+        let source = IndexSelectionWave::storage(weights.library, rows as usize, unit as usize, readers)?;
         let reindex = if device.is_none_or(|gpu| weights.placement.is_some_and(|p| p.attention(20).ok() == Some(gpu as usize))) {
             Some(IndexSelectionWave::follower_storage(&source)?)
         } else { None };
         Ok(Rc::new(IndexLaneStorage {
-            query: weights.weights[first].storage(rows, unit)?, source, reindex, device,
+            query: weights.weights[first].storage(rows, unit, readers)?, source, reindex, device,
         }))
     }
     pub fn on_storage(weights: &'w IndexLaneWeights<'a>, storage: Rc<IndexLaneStorage<'a>>) -> Result<Self> {
@@ -126,6 +127,12 @@ impl<'w, 'a> IndexLane<'w, 'a> {
             reindex: storage.reindex.as_ref().map(|s| IndexSelectionWave::on_storage(s.clone())).transpose()?,
             next: first, device: storage.device, ready: None, invalid: false,
         })
+    }
+    /// Call after the attention hook's final fork reader joined the chain,
+    /// possibly on the peer GPU. Source/reindex share one release event.
+    pub(crate) fn release_scratch(&self) -> Result<()> {
+        self.query.release_scratch()?;
+        self.source.release_scratch()
     }
     /// Select at rest, after the previous unit and all its readers have drained.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
@@ -346,22 +353,67 @@ mod shared_storage_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights;
     use crate::families::deepseek_v41::v41_compressor::{CompressorChunk, CompressorState, CompressorWeights};
+    use crate::families::deepseek_v41::{v41_index_query, v41_index_selection};
     use crate::families::deepseek_v41::v41_index_selection::SelectionRequest;
-    use crate::shared::memory::{chain, LoadStream};
+    use crate::shared::memory::{chain, DeviceAllocation};
+    use crate::shared::memory::device::Stream;
+    use cuteafd_ffi::CuteafdDeviceBuffer;
 
-    #[test]
-    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
-    fn windowed_index_units_match_private_runs_behind_a_gated_stream() -> Result<()> {
-        eprintln!("index shared-storage gate: preparing weights and inputs");
-        // Distinct unit widths/positions poison both host metadata and row planes.
-        // Each unit has its own stage chain, just as in-flight prefill slots do.
+    #[derive(Clone, Copy, Debug)]
+    enum Scratch { Query, Selection }
+    impl Scratch {
+        fn skip(self, skip: bool) {
+            match self {
+                Self::Query => v41_index_query::SKIP_ACQUIRE.with(|value| value.set(skip)),
+                Self::Selection => v41_index_selection::SKIP_ACQUIRE.with(|value| value.set(skip)),
+            }
+        }
+        fn buffers(self, lane: &IndexLane<'_, '_>) -> Result<Vec<CuteafdDeviceBuffer>> {
+            Ok(match self {
+                Self::Query => {
+                    let q = lane.query.output()?;
+                    vec![q.packed, q.scales, q.head_weights]
+                }
+                Self::Selection => vec![if lane.query.output()?.layer == 20 {
+                    lane.source.output()?.selected
+                } else { lane.reindex.as_ref().unwrap().output()?.selected }],
+            })
+        }
+        fn stream(self, lane: &IndexLane<'_, '_>) -> *mut std::ffi::c_void {
+            match self {
+                Self::Query => lane.query.scratch_stream(),
+                Self::Selection => lane.source.scratch_stream(),
+            }
+        }
+    }
+    struct ResetSkip(Scratch);
+    impl Drop for ResetSkip { fn drop(&mut self) { self.0.skip(false); } }
+
+    // Each arm exercises two independent chains, widths 13/11, source20 and
+    // reindex24. Query and selection guards are tested independently: the other
+    // guard must not accidentally serialize the negative control's writer.
+    fn run(focus: Scratch, guarded: bool, peer: bool) -> Result<()> {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
         let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
             &std::env::var("CUTEAFD_SNAPSHOT")?))?;
-        let weights = IndexLaneWeights::load(&library, &catalog, usize::MAX, 1 << 20)?;
-        let shared = IndexLane::storage(&weights, 48, 16)?;
-        let mut slots = [IndexLane::on_storage(&weights, shared.clone())?,
-            IndexLane::on_storage(&weights, shared.clone())?];
+        let devices: &[i32] = if peer { &[0, 1] } else { &[0] };
+        let reader_device = Device { library: &library, id: i32::from(peer) };
+        if peer {
+            library.cuda_enable_peer(1)?;
+            reader_device.run(|| library.cuda_enable_peer(0))?;
+        }
+        let weights = if peer {
+            let placement = CachePlacement::new(std::array::from_fn(|layer| usize::from(layer < 20)))?;
+            IndexLaneWeights::load_distributed(&library, &catalog, placement,
+                IndexLaneWeights::distributed_device_bytes(&library, &catalog, placement)?, 1 << 20)?
+        } else { IndexLaneWeights::load(&library, &catalog, usize::MAX, 1 << 20)? };
+        let shared = if peer { IndexLane::storage_on_device(&weights, 48, 16, 0, devices)? }
+            else { Device { library: &library, id: 0 }.own(|| IndexLane::storage(&weights, 48, 16, devices))? };
+        let mut slots = (0..2).map(|_| {
+            if peer { IndexLane::on_storage_on_device(&weights, shared.get().clone()) }
+            else { Device { library: &library, id: 0 }.own(|| IndexLane::on_storage(&weights, shared.get().clone())) }
+        }).collect::<Result<Vec<_>>>()?;
         let counts = [13usize, 11];
         let context = [1024usize, 896];
         let tokens = std::array::from_fn::<_, 2, _>(|i|
@@ -381,7 +433,7 @@ mod shared_storage_tests {
         let mut compressors = [cw.wave(context[0], usize::MAX)?, cw.wave(context[1], usize::MAX)?];
         for i in 0..2 {
             library.copy_h2d(compressors[i].input(), &input(i, context[i]))?;
-            // SAFETY: initialized private input and live state; execution drains.
+            // SAFETY: private initialized input and retained state; execution drains.
             unsafe { compressors[i].execute(&state, &[CompressorChunk {
                 lease: leases[i], position: 0, tokens: context[i] as u32,
             }])?; }
@@ -403,124 +455,185 @@ mod shared_storage_tests {
             }
             queries.push(units);
         }
-        // First-use module/handle setup may synchronize the CUDA context. Warm
-        // exact calls on these same streams before closing the gate, using the
-        // otherwise unused tail of each retained row plane for throwaway output.
-        eprintln!("index shared-storage gate: warming projection, selection and reindex");
-        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-        for i in 0..2 {
-            let slot = &mut slots[i];
-            slot.select_window(RowWindow::rows(32..32 + counts[i]))?;
-            let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
-            let warm_chain = chain::StageChain::new(&library)?;
-            warm_chain.set_device_order(true);
-            for layer in 0..2 {
-                runtime.block_on(warm_chain.handle().scope(async {
-                    slot.query.rebind(&weights.weights[3 + layer])?;
-                    // SAFETY: upstream queries and warm-up outputs are retained.
-                    unsafe { slot.query.enqueue_attention(&queries[layer][i].output()?)?; }
-                    ensure!(slot.query.poll_pending()?, "warm projection blocked");
-                    let query = slot.query.output()?;
-                    if layer == 0 {
-                        unsafe { slot.source.enqueue_selection(&query, &requests, None)?; }
-                        ensure!(slot.source.poll_pending()?, "warm selection blocked");
-                    } else {
-                        let source = slot.source.output()?;
-                        let follower = slot.reindex.as_mut().unwrap();
-                        unsafe { follower.enqueue_selection(&query, &requests, Some(&source))?; }
-                        ensure!(follower.poll_pending()?, "warm reindex blocked");
-                    }
-                    anyhow::Ok(())
-                }))?;
-            }
-            warm_chain.drain()?;
-            slot.restart()?;
-            slot.select_window(RowWindow::rows(i * 16..i * 16 + counts[i]))?;
-        }
-        let chains = [chain::StageChain::new(&library)?, chain::StageChain::new(&library)?];
-        for chain in &chains { chain.set_device_order(true); }
-        let gate_stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        // SAFETY: live stream retained until all chains drain; gate release is RAII.
-        let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&library, gate_stream.raw)? };
-        eprintln!("index shared-storage gate: closed");
-        for chain in &chains {
-            runtime.block_on(chain.handle().scope(async {
-                // SAFETY: mark an initial dependency behind the still-closed gate.
-                unsafe { chain::join(&library, gate_stream.raw)?;
-                    chain::finish(&library, gate_stream.raw)?; }
-                anyhow::Ok(())
-            }))?;
-        }
-        for layer in 0..2 {
-            // Both units project before either selection is submitted: selection
-            // reads another stream's outputs, not the next unit's scratch.
-            for i in 0..2 {
-                eprintln!("index shared-storage gate: enqueue projection layer={layer} unit={i}");
-                runtime.block_on(chains[i].handle().scope(async {
-                    slots[i].query.rebind(&weights.weights[3 + layer])?;
-                    // SAFETY: upstream queries are complete and retained.
-                    unsafe { slots[i].query.enqueue_attention(&queries[layer][i].output()?)?; }
-                    ensure!(slots[i].query.poll_pending()?, "projection blocked on the host");
-                    anyhow::Ok(())
-                }))?;
-            }
-            for i in 0..2 {
-                eprintln!("index shared-storage gate: enqueue selection layer={layer} unit={i}");
-                runtime.block_on(chains[i].handle().scope(async {
-                    let slot = &mut slots[i];
-                    let query = slot.query.output()?;
-                    let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
-                    if layer == 0 {
-                        // SAFETY: query and proposals survive both queued units.
-                        unsafe { slot.source.enqueue_selection(&query, &requests, None)?; }
-                        ensure!(slot.source.poll_pending()?, "source selection blocked on the host");
-                    } else {
-                        let source = slot.source.output()?;
-                        let follower = slot.reindex.as_mut().unwrap();
-                        // SAFETY: source candidates are unit-disjoint retained planes.
-                        unsafe { follower.enqueue_selection(&query, &requests, Some(&source))?; }
-                        ensure!(follower.poll_pending()?, "reindex blocked on the host");
-                    }
-                    anyhow::Ok(())
-                }))?;
-            }
-        }
-        eprintln!("index shared-storage gate: releasing");
-        drop(gate);
-        for chain in &chains { chain.drain()?; }
-        eprintln!("index shared-storage gate: drained; comparing private references");
-        assert_ne!(slots[0].query.output()?.packed.ptr, slots[1].query.output()?.packed.ptr);
-        assert_ne!(slots[0].source.output()?.selected.ptr, slots[1].source.output()?.selected.ptr);
-        assert_ne!(slots[0].source.output()?.candidate_blocks().unwrap().ptr,
-            slots[1].source.output()?.candidate_blocks().unwrap().ptr);
-        let read = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+        let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes]; library.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
         };
+        // Private references include each source/follower output and the source
+        // blocks that must survive both units' later reindex hooks.
+        let mut expected = Vec::new();
+        let mut blocks = Vec::new();
         for i in 0..2 {
-            let mut private = IndexLane::new(&weights, 16, usize::MAX)?;
+            let mut private = if peer { IndexLane::new_on_device(&weights, 16, usize::MAX, 0)? }
+                else { Device { library: &library, id: 0 }.own(|| IndexLane::new(&weights, 16, usize::MAX))? };
             let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
+            let mut layers = Vec::new();
             for layer in 0..2 {
                 private.query.rebind(&weights.weights[3 + layer])?;
-                // SAFETY: all inputs complete and private storage is exclusive.
+                // SAFETY: completed input, exclusive private storage.
                 unsafe { private.query.execute_attention(&queries[layer][i].output()?)?; }
                 if layer == 0 {
-                    unsafe { private.source.execute(&private.query.output()?, &requests, None)?; }
+                    let lane = private.get_mut();
+                    unsafe { lane.source.execute(&lane.query.output()?, &requests, None)?; }
+                    blocks.push(read(private.source.output()?.candidate_blocks().unwrap())?);
                 } else {
-                    unsafe { private.reindex.as_mut().unwrap().execute(&private.query.output()?,
-                        &requests, Some(&private.source.output()?))?; }
+                    let lane = private.get_mut();
+                    unsafe { lane.reindex.as_mut().unwrap().execute(&lane.query.output()?,
+                        &requests, Some(&lane.source.output()?))?; }
                 }
+                layers.push(focus.buffers(&private)?.into_iter().map(&read).collect::<Result<Vec<_>>>()?);
             }
-            for (actual, expected) in [
-                (slots[i].query.output()?.packed, private.query.output()?.packed),
-                (slots[i].query.output()?.scales, private.query.output()?.scales),
-                (slots[i].query.output()?.head_weights, private.query.output()?.head_weights),
-                (slots[i].source.output()?.selected, private.source.output()?.selected),
-                (slots[i].source.output()?.candidate_blocks().unwrap(), private.source.output()?.candidate_blocks().unwrap()),
-                (slots[i].reindex.as_ref().unwrap().output()?.selected, private.reindex.as_ref().unwrap().output()?.selected),
-            ] {
-                assert_eq!(read(actual)?, read(expected)?, "unit {i} shared/private mismatch");
+            expected.push(layers);
+        }
+        let reader = Stream::new(reader_device)?;
+        let copies = expected[0][0].iter().map(|bytes|
+            reader_device.own(|| DeviceAllocation::new(&library, bytes.len())))
+            .collect::<Result<Vec<_>>>()?;
+        let copy_outputs = |buffers: Vec<CuteafdDeviceBuffer>| -> Result<()> {
+            reader_device.run(|| {
+                // SAFETY: all allocations remain live through both chains; the
+                // reader joins its producer and publishes its completion.
+                unsafe {
+                    chain::join(&library, reader.raw)?;
+                    for (copy, source) in copies.iter().zip(buffers) {
+                        if peer { library.copy_peer_async(copy.buffer, source, source.bytes, reader.raw)?; }
+                        else { library.copy_d2d_async(copy.buffer, source, source.bytes, reader.raw)?; }
+                    }
+                    chain::finish(&library, reader.raw)
+                }
+            })
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        // Warm exact enqueue/poll, rebind, snapshot, and peer-copy calls on the
+        // very same plans/streams and both widths before any gate exists.
+        eprintln!("index guard {focus:?} guarded={guarded} peer={peer}: warm exact calls");
+        for i in 0..2 {
+            let warm = chain::StageChain::on_devices(&library, devices)?;
+            for layer in 0..2 {
+                runtime.block_on(warm.handle().scope(async {
+                    let slot = slots[i].get_mut();
+                    slot.query.rebind(&weights.weights[3 + layer])?;
+                    unsafe { slot.query.enqueue_attention(&queries[layer][i].output()?)?; }
+                    ensure!(slot.query.poll_pending()?);
+                    let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
+                    if layer == 0 {
+                        unsafe { slot.source.enqueue_selection(&slot.query.output()?, &requests, None)?; }
+                        ensure!(slot.source.poll_pending()?);
+                    } else {
+                        let source = slot.source.output()?;
+                        let follower = slot.reindex.as_mut().unwrap();
+                        unsafe { follower.enqueue_selection(&slot.query.output()?, &requests, Some(&source))?; }
+                        ensure!(follower.poll_pending()?);
+                    }
+                    copy_outputs(focus.buffers(slot)?)?;
+                    slot.release_scratch()
+                }))?;
+                warm.drain()?;
             }
+            slots[i].restart()?;
+        }
+        let chains = [chain::StageChain::on_devices(&library, devices)?,
+            chain::StageChain::on_devices(&library, devices)?];
+        for layer in 0..2 {
+            let gate = reader_device.run(|| unsafe {
+                cuteafd_ffi::test_support::CudaStreamGate::new(&library, reader.raw)
+            })?;
+            eprintln!("index guard {focus:?}: gate closed, enqueue A layer={layer}");
+            runtime.block_on(chains[0].handle().scope(async {
+                let slot = slots[0].get_mut();
+                let i = 0;
+                slot.query.rebind(&weights.weights[3 + layer])?;
+                // SAFETY: queries/proposals persist through both units and readers.
+                unsafe { slot.query.enqueue_attention(&queries[layer][i].output()?)?; }
+                ensure!(slot.query.poll_pending()?, "projection blocked on host");
+                let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
+                if layer == 0 {
+                    unsafe { slot.source.enqueue_selection(&slot.query.output()?, &requests, None)?; }
+                    ensure!(slot.source.poll_pending()?, "selection blocked on host");
+                } else {
+                    let source = slot.source.output()?;
+                    let follower = slot.reindex.as_mut().unwrap();
+                    unsafe { follower.enqueue_selection(&slot.query.output()?, &requests, Some(&source))?; }
+                    ensure!(follower.poll_pending()?, "reindex blocked on host");
+                }
+
+                // In the selection-only test the query's final reader is the
+                // selection stream, not the held sparse-attention fork. Release
+                // it now so it cannot hide a missing selection guard.
+                if matches!(focus, Scratch::Selection) { slot.query.release_scratch()?; }
+                copy_outputs(focus.buffers(slot)?)?;
+                if matches!(focus, Scratch::Query) { slot.query.release_scratch()?; }
+                slot.source.release_scratch()
+            }))?;
+            let reset = ResetSkip(focus);
+            focus.skip(!guarded);
+            eprintln!("index guard {focus:?}: enqueue B layer={layer}");
+            runtime.block_on(chains[1].handle().scope(async {
+                let slot = slots[1].get_mut();
+                let i = 1;
+                slot.query.rebind(&weights.weights[3 + layer])?;
+                // SAFETY: queries/proposals persist through both units and readers.
+                unsafe { slot.query.enqueue_attention(&queries[layer][i].output()?)?; }
+                ensure!(slot.query.poll_pending()?, "projection blocked on host");
+                let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
+                if layer == 0 {
+                    unsafe { slot.source.enqueue_selection(&slot.query.output()?, &requests, None)?; }
+                    ensure!(slot.source.poll_pending()?, "selection blocked on host");
+                } else {
+                    let source = slot.source.output()?;
+                    let follower = slot.reindex.as_mut().unwrap();
+                    unsafe { follower.enqueue_selection(&slot.query.output()?, &requests, Some(&source))?; }
+                    ensure!(follower.poll_pending()?, "reindex blocked on host");
+                }
+                anyhow::Ok(())
+            }))?;
+            drop(reset);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(if guarded { 2 } else { 10 });
+            let mut done = false;
+            while std::time::Instant::now() < deadline {
+                if unsafe { library.cuda_stream_query(focus.stream(&slots[1]))? } { done = true; break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            eprintln!("index guard {focus:?} guarded={guarded} peer={peer} layer={layer}: before release writer_done={done}");
+            assert_eq!(done, !guarded, "negative control must run; ordered writer must wait");
+            drop(gate);
+            for chain in &chains { chain.drain()?; }
+            let got = copies.iter().map(|copy| reader_device.run(|| read(copy.buffer)))
+                .collect::<Result<Vec<_>>>()?;
+            if guarded { assert_eq!(got, expected[0][layer], "A fork reader was clobbered"); }
+            else { assert_ne!(got, expected[0][layer], "negative control failed to expose clobber"); }
+            let actual_b = focus.buffers(&slots[1])?.into_iter().map(&read).collect::<Result<Vec<_>>>()?;
+            assert_eq!(actual_b, expected[1][layer], "B differs from private execution");
+            for i in 0..2 {
+                assert_eq!(read(slots[i].source.output()?.candidate_blocks().unwrap())?, blocks[i],
+                    "source20 candidates must survive later reindex hooks");
+            }
+            runtime.block_on(chains[1].handle().scope(async { slots[1].release_scratch() }))?;
+            chains[1].drain()?;
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore = "requires native library, snapshot and a GPU"]
+    fn windowed_index_units_match_private_runs_behind_a_gated_stream() -> Result<()> {
+        run(Scratch::Query, true, false)?; run(Scratch::Selection, true, false)
+    }
+    #[test]
+    #[ignore = "requires native library, snapshot and a GPU"]
+    fn unguarded_index_query_clobbers_a_gated_fork_reader() -> Result<()> { run(Scratch::Query, false, false) }
+    #[test]
+    #[ignore = "requires native library, snapshot and a GPU"]
+    fn unguarded_index_selection_clobbers_a_gated_fork_reader() -> Result<()> { run(Scratch::Selection, false, false) }
+    #[test]
+    #[ignore = "requires native library, snapshot and two GPUs"]
+    fn placed_index_units_match_private_runs_with_a_peer_fork_reader() -> Result<()> {
+        run(Scratch::Query, true, true)?; run(Scratch::Selection, true, true)
+    }
+    #[test]
+    #[ignore = "requires native library, snapshot and two GPUs"]
+    fn unguarded_placed_index_query_clobbers_a_peer_fork_reader() -> Result<()> { run(Scratch::Query, false, true) }
+    #[test]
+    #[ignore = "requires native library, snapshot and two GPUs"]
+    fn unguarded_placed_index_selection_clobbers_a_peer_fork_reader() -> Result<()> { run(Scratch::Selection, false, true) }
 }
