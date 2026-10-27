@@ -3,7 +3,7 @@
 //! [`crate::shared::spark_waves::Waves`]).
 use super::{MiniMaxError, execution::ExpertExecutor, native::Native};
 use crate::shared::{experts::{fp8::Fp8Experts, staging::RouteStaging}, memory::device::Device,
-    spark_intake::SparkLink, spark_waves::WaveTicket};
+    prefill_depth::{Depth, PrefillDepth}, spark_intake::SparkLink, spark_waves::WaveTicket};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -58,13 +58,18 @@ pub(super) struct Wave { pub layer: usize, pub slot: usize, pub rows: usize }
 
 /// Sent waves not yet collected, oldest first. A step collects its waves in dispatch order with
 /// at most `waves` in flight, which is exactly what the link's exchange admits (one return slot per
-/// wave, landed oldest first): the order is checked here before the exchange sees it.
+/// wave of its current cut, landed oldest first): the order is checked here before the exchange sees it.
 pub(super) struct WaveOrder<T> { waves: usize, sent: VecDeque<(Wave, T)> }
 
 impl<T> WaveOrder<T> {
     pub fn new(waves: usize) -> Self { Self { waves, sent: VecDeque::new() } }
-    pub fn waves(&self) -> usize { self.waves }
     pub fn is_empty(&self) -> bool { self.sent.is_empty() }
+    /// Follows the link's re-cut return slots (#762), at rest only.
+    pub fn resize(&mut self, waves: usize) -> Result<()> {
+        ensure!(self.sent.is_empty(), MiniMaxError::Invalid("Spark return slots re-cut with a wave in flight"));
+        self.waves = waves;
+        Ok(())
+    }
     /// Refuses a wave past the link's return slots.
     pub fn admit(&self) -> Result<()> {
         ensure!(self.sent.len() < self.waves, MiniMaxError::Invalid("Spark waves in flight exceed the link's return slots"));
@@ -85,16 +90,20 @@ impl<T> WaveOrder<T> {
 }
 
 /// The Spark experts' exchange: one link (rank connections, intake return slots, request
-/// staging and the exchange worker) for decode and prefill alike, with up to `waves` waves in
-/// flight (each prefill wave's while other rows' GPU work runs). Every send, land and reduce is
-/// queued on the execution's one stream; this thread never waits for the wire.
+/// staging and the exchange worker) for decode and prefill alike, with up to `slots` waves in
+/// flight (each prefill wave's while other rows' GPU work runs). Its return slots are cut from
+/// one reserve range per rank, re-cut at rest to each prefill call's depth (#762). Every send,
+/// land and reduce is queued on the execution's one stream; this thread never waits for the wire.
 pub(super) struct Spark<'a> {
     /// `None` once released after a failed step. Its terminal-owned intake retains the library.
     link: Option<SparkLink<'a>>,
     device: Device<'a>,
     build: Build,
-    /// Rows of every return slot: one prefill unit, the widest wave.
+    /// Rows of the admitted unit: the widest wave any cut carries.
     rows: usize,
+    /// Admitted return slots: the deepest cut.
+    slots: usize,
+    /// The current cut's waves in flight.
     order: WaveOrder<WaveTicket>,
     /// The last request identity (the bootstrap's is 1).
     identity: u64,
@@ -114,40 +123,49 @@ impl Drop for Spark<'_> {
 }
 
 impl<'a> Spark<'a> {
-    /// Connects `waves` return slots of `rows` rows, bootstraps with the widest wave (routed
-    /// layer `first`) and exchanges it once, so connections, rings and the ranks' expert
-    /// programs are warm before the engine runs.
+    /// Connects up to `slots` return slots of up to `rows` rows, cut from one `reserve`-row range per
+    /// rank (#762), bootstraps with the widest wave (routed layer `first`) and exchanges it once on
+    /// one admitted unit, so connections, rings and the ranks' expert programs are warm before the
+    /// engine runs. A static link's reserve is exactly its slots' units, and it keeps that cut.
     #[allow(clippy::too_many_arguments)]
     pub fn connect(library_owner: &'a Arc<NativeLibrary>, device: i32, world: SparkWorld, peers: &[SocketAddr],
-        rows: usize, config: TcpTransportConfig, first: usize, build: Build, waves: usize) -> Result<Self> {
+        rows: usize, config: TcpTransportConfig, first: usize, build: Build, slots: usize, reserve: usize) -> Result<Self> {
         let library = library_owner.as_ref();
         let device = Device { library, id: device };
         require_device_landing(library, device.id)?;
         // The compact reducer sums rows of the process expert geometry.
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::MINIMAX_M3,
             "MiniMax Spark helpers require the process expert geometry before the link");
-        ensure!((1..=4096).contains(&rows) && (1..=MAX_WAVES as usize).contains(&waves),
-            MiniMaxError::Invalid("Spark link rows or waves"));
+        ensure!((1..=4096).contains(&rows) && (1..=MAX_WAVES as usize).contains(&slots)
+            && (rows..=slots * rows).contains(&reserve), MiniMaxError::Invalid("Spark link rows, slots or reserve"));
         let warm = bootstrap_request(first, rows, build)?;
         let mut link = device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(u32::try_from(peers.len())?)?;
-            // Each wave is at most one unit's rows: every return slot holds a unit.
-            let mut link = SparkLink::new_waves(library, world, peers, u32::try_from(rows)?, config, ROW, waves,
-                u32::try_from(rows)?)?;
+            // Each wave is at most one unit's rows. Several slots are cut from one reserve range per
+            // rank, so the prefill depth can change between calls within them (#762); one slot is a
+            // plain single-slot link, as Step-5's.
+            let mut link = if slots > 1 {
+                SparkLink::new_reserve(library, world, peers, u32::try_from(rows)?, config, ROW, slots,
+                    u32::try_from(rows)?, reserve)?
+            } else { SparkLink::new(library, world, peers, u32::try_from(rows)?, config, ROW)? };
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
             link.bootstrap(&warm)?;
             Ok(link)
         })?;
-        ensure!(link.world_size() == peers.len() && link.waves() == waves,
-            "MiniMax Spark link differs from its admitted world or waves");
+        ensure!(link.world_size() == peers.len() && link.slots() == slots,
+            "MiniMax Spark link differs from its admitted world or slots");
         ensure!(link.installed_grouping()?.len() == peers.len(),
             "MiniMax Spark bootstrap requires installed grouping from every rank");
+        // One admitted unit takes the widest wave until the first prefill call re-cuts to its depth.
+        let cut = link.exchange()?.geometry();
+        if cut.rows < rows { device.run(|| link.set_geometry(1, rows))?; }
+        let waves = link.waves();
         device.run(|| warm_up(library, &mut link, warm, rows))?;
-        Ok(Self { link: Some(link), device, build, rows, order: WaveOrder::new(waves), identity: 1, terminal: false })
+        Ok(Self { link: Some(link), device, build, rows, slots, order: WaveOrder::new(waves), identity: 1, terminal: false })
     }
 
-    /// Waves the link admits in flight (its return slots).
-    pub fn waves(&self) -> usize { self.order.waves() }
+    /// Return slots the link admits in flight at its deepest cut.
+    pub fn slots(&self) -> usize { self.slots }
     pub fn world_size(&self) -> Option<usize> { self.link.as_ref().map(SparkLink::world_size) }
 
     /// No wave is in flight (between steps).
@@ -156,13 +174,57 @@ impl<'a> Spark<'a> {
         Ok(())
     }
 
-    /// Refuses a step whose widest wave of `rows` rows does not fit a return slot and its request staging.
-    fn fits(&mut self, rows: usize) -> Result<()> {
+    /// Re-cuts the return slots into `waves` slots of `rows` rows, at rest (#762): offsets only;
+    /// nothing is allocated, registered or reconnected. An unchanged cut is left alone (a one-slot
+    /// link has none to change).
+    fn recut(&mut self, waves: usize, rows: usize) -> Result<()> {
+        self.idle()?;
+        let device = self.device;
+        let link = self.link.as_mut().context("MiniMax Spark link released")?;
+        let cut = link.exchange()?.geometry();
+        if (cut.waves, cut.rows) != (waves, rows) { device.run(|| link.set_geometry(waves, rows))?; }
+        self.order.resize(waves)
+    }
+
+    /// Makes the current cut hold a step's `waves` waves of up to `rows` rows and checks its request
+    /// staging holds the widest. A one-wave step wider than the last prefill call's cut runs on one
+    /// admitted unit (re-cut at rest); a unit call's depth was cut at its start, so a multi-wave step
+    /// the cut cannot hold is refused.
+    fn fit(&mut self, waves: usize, rows: usize) -> Result<()> {
         ensure!((1..=self.rows).contains(&rows), MiniMaxError::Invalid("Spark wave rows exceed its return slot"));
+        let cut = self.link.as_mut().context("MiniMax Spark link released")?.exchange()?.geometry();
+        if waves > cut.waves || rows > cut.rows {
+            ensure!(waves == 1, MiniMaxError::Invalid("Spark waves in flight exceed the link's return slots"));
+            self.recut(1, self.rows)?;
+        }
         let bytes = RouteStaging::new(rows, TOPK, ROW)?.bytes;
         let link = self.link.as_mut().context("MiniMax Spark link released")?;
         ensure!(link.exchange()?.fits(bytes), MiniMaxError::Invalid("Spark exchange staging is narrower than a prefill unit"));
         Ok(())
+    }
+
+    /// A unit call's boundary (#762): reports every finished prefill call's pace to `depth` (no host
+    /// wait: a call whose last wave has not landed stays for a later boundary), takes this call's
+    /// depth (sequence `key` from row `start`, `rows` rows), re-cuts the return slots to it at rest
+    /// and starts summing this call's waves. Returns the depth the call runs.
+    pub fn start_prefill(&mut self, depth: &PrefillDepth, key: u64, start: usize, rows: usize) -> Result<Depth> {
+        ensure!(!self.terminal, MiniMaxError::Invalid("Spark link stopped after a failed step"));
+        self.idle()?;
+        let device = self.device;
+        let link = self.link.as_mut().context("MiniMax Spark link released")?;
+        depth.report(device.run(|| link.exchange()?.take_prefill())?);
+        let next = depth.start(key, start, rows);
+        ensure!(next.waves <= self.slots && next.unit_rows <= self.rows,
+            "MiniMax prefill depth {next:?} outside the link's {} admitted slots of {} rows", self.slots, self.rows);
+        self.recut(next.waves, next.unit_rows)?;
+        let link = self.link.as_mut().context("MiniMax Spark link released")?;
+        device.run(|| link.exchange()?.begin_prefill(next.call))?;
+        Ok(next)
+    }
+
+    /// The unit call's last wave was sent (or the call failed): later waves are not its.
+    pub fn stop_prefill(&mut self) {
+        if let Some(Ok(exchange)) = self.link.as_mut().map(SparkLink::exchange) { exchange.stop_prefill(); }
     }
 
     /// Queues `wave` into the next return slot: its route ids, gate weights and BF16 expert input
@@ -280,8 +342,8 @@ impl<'a> Routed<'a> {
         if let Some(spark)=&spark { ensure!(spark.world_size().is_some_and(|ranks|matches!(ranks,2|3|4|6)),
             MiniMaxError::Unsupported("Spark experts require TP2, TP3, TP4 or TP6")); }
         // Local layers run on the stream at collect, from any slot; each Spark wave in flight takes
-        // one of the link's return slots.
-        let slots=spark.as_ref().map_or(MAX_WAVES as usize,Spark::waves);
+        // one of the link's admitted return slots.
+        let slots=spark.as_ref().map_or(MAX_WAVES as usize,Spark::slots);
         Ok(Self{local,spark,pending:(0..slots).map(|_|None).collect(),kind:ExpertV2SourceKind::Decode,poisoned:false})
     }
 }
@@ -295,9 +357,14 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
         self.kind=kind;
         let local=self.local.as_ref().map_or(0,|l|l.layers.len());
         routed.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")?;
-        if let Some(spark)=&mut self.spark { spark.idle()?; spark.fits(rows)?; }
+        if let Some(spark)=&mut self.spark { spark.idle()?; spark.fit(slots,rows)?; }
         Ok(())
     }
+    fn start_prefill(&mut self,depth:&PrefillDepth,key:u64,start:usize,rows:usize)->Result<Option<Depth>> {
+        ensure!(!self.poisoned,MiniMaxError::Invalid("previous expert failure; restart required"));
+        self.spark.as_mut().map(|spark|spark.start_prefill(depth,key,start,rows)).transpose()
+    }
+    fn stop_prefill(&mut self) { if let Some(spark)=&mut self.spark { spark.stop_prefill(); } }
     fn local(&self,layer:usize)->bool { self.local.as_ref().is_some_and(|l|l.index_of(layer).is_ok()) }
     fn dispatch(&mut self,layer:usize,slot:usize,rows:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,
         input:CuteafdDeviceBuffer,native:&Native<'a>)->Result<()> {
@@ -400,9 +467,9 @@ mod tests {
             [".arm", "()"].concat(), [".expect", "(remote"].concat(), ["record_", "wave"].concat()] {
             assert!(!source.contains(&banned), "{banned}");
         }
-        let connect = source.split("pub fn connect").nth(1).unwrap().split("pub fn waves").next().unwrap();
-        let order = ["SparkLink::new_waves(", "link.enable_terminal_ownership(", "link.bootstrap(&warm)",
-            "link.installed_grouping()", "warm_up(library, &mut link, warm, rows)"]
+        let connect = source.split("pub fn connect").nth(1).unwrap().split("pub fn slots").next().unwrap();
+        let order = ["SparkLink::new_reserve(", "link.enable_terminal_ownership(", "link.bootstrap(&warm)",
+            "link.installed_grouping()", "link.set_geometry(1, rows)", "warm_up(library, &mut link, warm, rows)"]
             .map(|needle| connect.find(needle).unwrap_or_else(|| panic!("{needle}")));
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
         assert!(connect.find("require_device_landing(").unwrap() < order[0], "a GeForce card is refused before the link");
@@ -453,6 +520,33 @@ mod tests {
             "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "NVIDIA RTX PRO 6000 Blackwell Server Edition"] {
             refuse_geforce(0, name).unwrap();
         }
+    }
+
+    /// A unit call's boundary (#762) runs in the shared order, at rest: finished calls' paces reported (no host
+    /// wait), this call's depth taken, the return slots re-cut to it, then its waves flagged as the call's. A
+    /// one-wave step wider than the cut runs on one admitted unit; a re-cut moves the wave order's slots, at rest.
+    #[test]
+    fn minimax_prefill_calls_report_take_recut_and_flag_in_order() -> Result<()> {
+        let source = include_str!("routed.rs").split("#[cfg(test)]").next().unwrap();
+        let start = source.split("pub fn start_prefill").nth(1).unwrap().split("pub fn stop_prefill").next().unwrap();
+        let order = ["self.idle()?", "depth.report(device.run(|| link.exchange()?.take_prefill())?)",
+            "depth.start(key, start, rows)", "self.recut(next.waves, next.unit_rows)?",
+            "link.exchange()?.begin_prefill(next.call)"].map(|needle| start.find(needle).unwrap_or_else(|| panic!("{needle}")));
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        let recut = source.split("fn recut(").nth(1).unwrap().split("fn fit(").next().unwrap();
+        for needle in ["self.idle()?", "link.set_geometry(waves, rows)", "self.order.resize(waves)"] {
+            assert!(recut.contains(needle), "{needle}");
+        }
+        let fit = source.split("fn fit(").nth(1).unwrap().split("pub fn start_prefill").next().unwrap();
+        assert!(fit.contains("ensure!(waves == 1,") && fit.contains("self.recut(1, self.rows)?"));
+        let mut order = WaveOrder::new(1);
+        order.push(Wave { layer: 3, slot: 0, rows: 64 }, 0)?;
+        assert!(order.resize(4).is_err(), "never with a wave in flight");
+        order.pop(Wave { layer: 3, slot: 0, rows: 64 })?;
+        order.resize(3)?;
+        for slot in 0..3 { order.push(Wave { layer: 3, slot, rows: 64 }, slot)?; }
+        assert!(order.admit().is_err(), "three return slots");
+        Ok(())
     }
 
     #[test]

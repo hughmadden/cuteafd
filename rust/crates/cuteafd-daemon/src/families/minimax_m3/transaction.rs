@@ -40,7 +40,7 @@ impl Step {
         let mut batch = BatchView { positions: Vec::new(), slots: Vec::new(), requests: Vec::new(), pool_pages };
         for s in &self.sequences {
             batch.requests.push(RequestView { row_start: s.start, rows: s.tokens.len(), start_position: s.base,
-                pages: s.pages.iter().map(|&p| p as i32).collect() });
+                pages: s.pages.iter().map(|&p| p as i32).collect(), sequence: s.slot });
             for position in s.base..s.base + s.tokens.len() {
                 batch.positions.push(position as i64);
                 batch.slots.push(i64::from(s.pages[position / 64]) * 64 + (position % 64) as i64);

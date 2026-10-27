@@ -42,8 +42,9 @@ pub(super) fn spark_rings() -> Result<cuteafd_core::SparkRings> {
 }
 
 /// The worker admission serve seals to every Spark rank: the one endpoint decode and every prefill
-/// wave share (a unit's rows, BF16 in), and the typed owners the shared family admission gives
-/// MiniMax's NVFP4 package ladder: one decode owner, and one prefill owner buffering a unit per wave.
+/// wave share (the admitted unit's rows, BF16 in), and the typed owners the shared family admission
+/// gives MiniMax's NVFP4 package ladder: one decode owner, and one prefill owner buffering a unit per
+/// admitted slot (#762).
 pub(super) fn spark_model(sizing: RuntimeSizing) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let endpoint = sizing.spark_endpoint()?;
     cuteafd_transport::worker_selection::ModelAdmission::for_clients(cuteafd_core::ExpertGeometry::MINIMAX_M3,
@@ -105,27 +106,29 @@ mod tests {
     }
 
     /// Serve seals one endpoint (decode and every wave) and the typed owners to every rank: one
-    /// decode owner at the package's covering m80 export, and one prefill owner at the unit's
-    /// covering export (m4096 for 4096, 2752 and 2048 rows) buffering a unit per wave.
+    /// decode owner at the package's covering m80 export, and one prefill owner at the admitted unit's
+    /// covering export (m4096 for 4096, 2752 and 2048 rows) buffering a unit per admitted slot: the
+    /// adaptive four 4096-row slots (#762) and the pinned shapes alike.
     #[test]
     fn minimax_spark_model_seals_one_endpoint_and_typed_owners() -> Result<()> {
         use cuteafd_core::{DecodeExecution, PrefillExecution};
-        for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+        for (rows, lanes, slots) in [(4096, 2, 4), (4096, 1, 1), (4096, 2, 2), (2752, 3, 3), (2048, 4, 4)] {
             let sizing = RuntimeSizing { unit_rows: rows, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
-                logit_rows: 64, waves: lanes };
+                logit_rows: 64, waves: lanes, slots };
             let model = spark_model(sizing)?;
             assert_eq!(model.endpoints, [sizing.spark_endpoint()?]);
             assert_eq!(model.executions.decode, [DecodeExecution { capacity: 64, compiled_capacity: 80 }]);
             assert_eq!(model.executions.prefill, PrefillExecution { capacity: rows as u32, compiled_capacity: 4096,
-                unit_rows: rows as u32, buffered_units: lanes as u8 });
+                unit_rows: rows as u32, buffered_units: slots as u8 });
             assert_eq!((model.capacity(), model.compiled_capacity()), (rows as u32, 4096));
             model.require_clients(sizing.spark_endpoint()?, 1)?;
         }
         Ok(())
     }
 
-    /// A plan of the test snapshot on `ranks` Sparks at the descriptor's shape (two 4096-row waves
-    /// while MiniMax's prefill estimate is unmeasured), and the sizing serve runs it with.
+    /// A plan of the test snapshot on `ranks` Sparks at the descriptor's shape (four admitted 4096-row
+    /// slots starting at two waves while MiniMax's prefill estimate is unmeasured, #762), and the sizing
+    /// serve runs it with.
     fn planned(ranks: usize) -> Result<(tempfile::TempDir, cuteafd_loader::plan::PlanReport, RuntimeSizing)> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
@@ -136,9 +139,8 @@ mod tests {
                 pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, ..Default::default() }),
             ..Default::default() })?;
         ensure!(report.placement_supported, "TP{ranks}: {:?}", report.hints);
-        let shape = admission::prefill_shape(0, 0, ranks)?;
-        let sizing = RuntimeSizing { unit_rows: shape.unit_rows as usize, decode_rows: 64, sequences: 16, context: 4096,
-            spark_ranks: ranks, logit_rows: 64, waves: shape.waves as usize };
+        let sizing = RuntimeSizing { unit_rows: 0, decode_rows: 64, sequences: 16, context: 4096,
+            spark_ranks: ranks, logit_rows: 64, waves: 0, slots: 0 }.with_prefill(admission::prefill_shape(0, 0, 0, ranks)?)?;
         Ok((dir, report, sizing))
     }
 
@@ -148,26 +150,28 @@ mod tests {
             .items.iter().find(|i| i.group == "MiniMax spark_intake").map(|i| i.bytes)
     }
 
-    /// The coordinator's Spark intake is charged as the one link's return slots, a BF16 plane of a
-    /// unit's rows per wave and rank, whatever the intake mode: the ledger has no landing input, and
-    /// the intake allocates exactly those device planes in GPU and pinned modes alike
-    /// (`minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes`, CPU fixture).
+    /// The coordinator's Spark intake is charged as the one link's reserve: a BF16 range per rank holding
+    /// every admitted slot (8256 rows for four 4096-row slots, #762), whatever the intake mode: the ledger
+    /// has no landing input, and the intake allocates exactly those device ranges in GPU and pinned modes
+    /// alike (`minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes`, CPU fixture).
     #[test]
     fn minimax_planner_charges_the_link_return_slots_at_the_adaptive_shapes() -> Result<()> {
-        for (ranks, unit, waves) in [(2, 4096, 2), (3, 4096, 2), (4, 4096, 2), (6, 4096, 2)] {
+        for (ranks, unit, waves, slots, span) in [(2, 4096, 2, 4, 8256), (3, 4096, 2, 4, 8256), (4, 4096, 2, 4, 8256),
+            (6, 4096, 2, 4, 8256)] {
             let (_dir, report, sizing) = planned(ranks)?;
-            assert_eq!((sizing.unit_rows, sizing.waves, report.prefill_unit_rows, report.prefill_waves),
-                (unit, waves, Some(unit as u64), Some(waves as u64)), "TP{ranks}");
-            let slots = (waves * ranks * unit * 6144 * 2) as u64;
-            assert_eq!(planned_intake(&report), Some(slots), "TP{ranks}");
-            assert_eq!(slots, cuteafd_loader::serving_capacity::prefill_return_bytes(waves as u64, unit as u64, ranks as u64, 6144));
+            assert_eq!((sizing.unit_rows, sizing.waves, sizing.slots, sizing.slot_rows()), (unit, waves, slots, span), "TP{ranks}");
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_slots, report.prefill_span_rows),
+                (Some(unit as u64), Some(waves as u64), Some(slots as u64), Some(span as u64)), "TP{ranks}");
+            let reserve = (ranks * span * 6144 * 2) as u64;
+            assert_eq!(planned_intake(&report), Some(reserve), "TP{ranks}");
+            assert_eq!(reserve, cuteafd_loader::serving_capacity::prefill_return_bytes(1, span as u64, ranks as u64, 6144));
         }
         Ok(())
     }
 
     /// Every Spark rank is charged exactly the one transport serve opens to it: the endpoint serve
-    /// seals (a unit's rows, BF16 in), with the rings serve's link registers, and one execution slot
-    /// per wave in flight.
+    /// seals (the admitted unit's rows, BF16 in), with the rings serve's link registers, and a prefill
+    /// owner buffering a unit per admitted slot.
     #[test]
     fn minimax_planner_charges_the_one_spark_endpoint_serve_seals() -> Result<()> {
         use cuteafd_core::memory_layout::DeviceKind;
@@ -176,9 +180,9 @@ mod tests {
             let model = spark_model(sizing)?;
             assert_eq!(model.endpoints, [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: sizing.unit_rows as u32,
                 ingress: cuteafd_core::SparkIngress::Bf16 }], "TP{ranks}");
-            assert_eq!((model.executions.prefill.buffered_units as usize, report.prefill_transports), (sizing.waves, Some(1)),
+            assert_eq!((model.executions.prefill.buffered_units as usize, report.prefill_transports), (sizing.slots, Some(1)),
                 "TP{ranks}");
-            assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("minimax_m3", sizing.waves as u64), 1);
+            assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("minimax_m3", sizing.slots as u64), 1);
             let ring = cuteafd_loader::plan::layout::spark_ring_geometry(1);
             assert_eq!(model.rings, cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
                 slot_bytes: ring.slot_bytes, alignment: ring.alignment }, "the planner registers serve's rings");
@@ -204,9 +208,9 @@ mod tests {
     }
 
     /// The Spark link's intake allocates exactly the planned intake on the coordinator GPU, in the
-    /// default GPU-landing mode and with `CUTEAFD_SPARK_INTAKE=pinned` alike: a BF16 plane of a unit's
-    /// rows per wave and rank. Pinned landing adds host staging (the link's landing staging and a
-    /// small-wave buffer), never device memory.
+    /// default GPU-landing mode and with `CUTEAFD_SPARK_INTAKE=pinned` alike: a BF16 range per rank
+    /// holding every admitted slot (the reserve, #762). Pinned landing adds host staging (the link's
+    /// landing staging and a small-wave buffer), never device memory.
     #[test]
     #[ignore = "CPU-only native fixture; requires an explicit build slot and fixture directory"]
     fn minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes() -> Result<()> {
@@ -223,11 +227,12 @@ mod tests {
                 // The fixture's own device accounting (`cuda_memory_info` takes host memory for its
                 // integrated-looking device).
                 let (before, _) = library.cuda_physical_memory_info()?;
-                let intake = SparkIntake::with_waves(&library, mode, ranks, sizing.unit_rows, 6144 * 2, sizing.waves)?;
+                let intake = SparkIntake::with_reserve(&library, mode, ranks, sizing.unit_rows, 6144 * 2, sizing.slots,
+                    sizing.slot_rows())?;
                 let (after, _) = library.cuda_physical_memory_info()?;
                 assert_eq!((before - after) as u64, planned, "TP{ranks} {mode:?}: device bytes the intake allocated");
-                assert_eq!((0..sizing.waves).flat_map(|slot| intake.slot_buffers(slot)).map(|plane| plane.bytes as u64)
-                    .sum::<u64>(), planned, "TP{ranks} {mode:?}: every return slot's rank planes");
+                assert_eq!(intake.ranges().iter().map(|range| range.bytes as u64).sum::<u64>(), planned,
+                    "TP{ranks} {mode:?}: every rank's reserve range");
                 drop(intake);
                 assert_eq!(library.cuda_physical_memory_info()?.0, before, "TP{ranks} {mode:?}: the intake released its planes");
             }
@@ -237,19 +242,28 @@ mod tests {
 
     /// The ledger's extend-launch tables cover the shared executor's cuts: a prefill call cut into
     /// units (`prefill_units`), each unit tiled into extend launches of at most the 1024 rows the
-    /// index-prefill and attention-extend programs take.
+    /// index-prefill and attention-extend programs take. An adaptive sizing's calls (at most
+    /// `call_rows`) run at every depth its controller may choose (#762).
     #[test]
     fn minimax_extend_launches_cover_every_unit_cut() -> Result<()> {
         use crate::shared::prefill_pipeline::prefill_units;
-        for (rows, lanes) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (1024, 2), (256, 2)] {
+        use cuteafd_loader::serving_capacity::wave_control::{call_rows, candidates, unit_for};
+        for (rows, lanes, slots) in [(4096, 2, 4), (4096, 1, 1), (4096, 2, 2), (2752, 3, 3), (2048, 4, 4), (1024, 2, 2),
+            (256, 2, 2)] {
             let sizing = RuntimeSizing { unit_rows: rows, decode_rows: 64, sequences: 1, context: 1 << 20, spark_ranks: 4,
-                logit_rows: 64, waves: lanes };
+                logit_rows: 64, waves: lanes, slots };
             let bound = admission::extend_launches(sizing, 1024);
-            for span in (1..=sizing.slot_rows()).step_by(37).chain([sizing.slot_rows()]) {
-                let units = prefill_units(span, rows, lanes, 256)?;
-                assert!(units.len() <= lanes && units.iter().all(|unit| unit.len() <= rows), "{lanes} x {rows}: span {span}");
-                let tiles: u64 = units.iter().map(|unit| (unit.len() as u64).div_ceil(1024)).sum();
-                assert!(tiles <= bound, "{lanes} x {rows}: span {span} cuts into {tiles} tiles, bound {bound}");
+            let (longest, depths) = if sizing.adaptive() {
+                (call_rows(slots as u64, rows as u64) as usize, candidates(slots as u64, rows as u64))
+            } else { (sizing.slot_rows(), vec![lanes as u64]) };
+            for depth in depths {
+                let (unit, waves) = (unit_for(depth, rows as u64) as usize, depth as usize);
+                for span in (1..=longest).step_by(37).chain([longest]) {
+                    let units = prefill_units(span, unit, waves, 256)?;
+                    assert!(units.len() <= waves && units.iter().all(|cut| cut.len() <= unit), "{waves} x {unit}: span {span}");
+                    let tiles: u64 = units.iter().map(|cut| (cut.len() as u64).div_ceil(1024)).sum();
+                    assert!(tiles <= bound, "{waves} x {unit}: span {span} cuts into {tiles} tiles, bound {bound}");
+                }
             }
         }
         Ok(())
@@ -294,12 +308,12 @@ mod tests {
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
             && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        // The plan's #762 waves at TP3, with its 256-row units.
-        let lanes = admission::prefill_shape(256, 0, 3)?.waves as usize;
-        assert_eq!(lanes, 2);
+        // The plan's #762 prefill at TP3 with its 256-row unit: four admitted slots starting at two waves.
+        let prefill = admission::prefill_shape(256, 0, 0, 3)?;
+        assert_eq!((prefill.unit_rows, prefill.waves, prefill.slots, prefill.span_rows), (256, 2, 4, 1024));
         let request = Request {
             sizing: RuntimeSizing { unit_rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
-                waves: lanes },
+                waves: 0, slots: 0 }.with_prefill(prefill)?,
             kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
             spark_budget: cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0,
             headroom: 0, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding, startup_graphs: false, rings: spark_rings()?,
@@ -326,7 +340,7 @@ mod tests {
         Ok(())
     }
 
-    /// Automatic vision at the shipped TP2 shapes (64 sequences, the plan's two 4096-row waves, the
+    /// Automatic vision at the shipped TP2 shapes (64 sequences, the plan's four 4096-row slots, the
     /// checkpoint's context, FP8 K/V, an automatic pool, the default Spark budget and 2 GiB headroom),
     /// speculator off and DFlash2 with its default rings, on an RTX PRO 6000. The planner keeps the
     /// bundled tower on the coordinator GPU, as serve-minimax does, and plans the server's pool: the
@@ -348,8 +362,8 @@ mod tests {
         std::fs::write(dir.path().join("fp8/fp8-minimax-nvfp4a4/manifest.json"), package(None).to_string())?;
         let drafter = tempfile::tempdir()?;
         std::fs::write(drafter.path().join("config.json"), testing::minimax_dflash2_config().to_string())?;
-        let shape = admission::prefill_shape(0, 0, 2)?;
-        let (rows, sequences, lanes, headroom) = (shape.unit_rows as usize, 64, shape.waves as usize, 2u64 << 30);
+        let prefill = admission::prefill_shape(0, 0, 0, 2)?;
+        let (rows, sequences, headroom) = (prefill.unit_rows as usize, 64, 2u64 << 30);
         let rings = admission::default_draft_rings(sequences, admission::DECODE_ROWS);
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let arch = ArchContext::coordinator(rtx, None);
@@ -373,7 +387,8 @@ mod tests {
                 GlmDraftRepresentation::Fp8Only, Qwen4KvCache::Fp8)).transpose()?;
             let sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences,
                 context: cfg.max_position as u64, spark_ranks: 2,
-                logit_rows: RuntimeSizing::head_rows(shape.slot_rows() as usize, false, 0), waves: lanes };
+                logit_rows: RuntimeSizing::head_rows(prefill.span_rows as usize, false, 0), waves: 0, slots: 0 }
+                .with_prefill(prefill)?;
             let request = Request { sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
                 spark_budget: admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0, headroom,
                 draft_bytes: draft.map_or(0, |d| d.bytes), draft_rings: draft.map_or(0, |d| d.slots),

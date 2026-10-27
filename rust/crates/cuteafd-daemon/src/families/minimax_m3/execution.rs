@@ -4,7 +4,8 @@
 mod units;
 use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, native::Native,
     scratch::{Rows, Scratch}, weights::Weights};
-use crate::shared::{memory::device::{Allocation, Device}, prefix::view, token_io::DeviceLogits};
+use crate::shared::{memory::device::{Allocation, Device}, prefill_depth::{Depth, PrefillDepth}, prefix::view,
+    token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::{Programs,Scalar}, CuteafdDeviceBuffer};
 use cuteafd_transport::ExpertV2SourceKind;
@@ -12,8 +13,10 @@ use cuteafd_loader::{families::minimax_m3::{cache::PAGE_ROWS,config::MiniMaxM3Co
     plan::{checkpoint::Checkpoint,families::minimax::admission::{RuntimeLedger,RuntimeSizing}}};
 
 pub(super) struct LayerCache<'a> { pub key: Allocation<'a>, pub value: Allocation<'a>, pub index: Allocation<'a> }
+/// One request's rows of a step: `sequence` is its scheduler slot (a prefill call's depth key, #762).
 #[derive(Debug,Clone)]
-pub(super) struct RequestView { pub row_start:usize, pub rows:usize, pub start_position:usize, pub pages:Vec<i32> }
+pub(super) struct RequestView { pub row_start:usize, pub rows:usize, pub start_position:usize, pub pages:Vec<i32>,
+    pub sequence:usize }
 /// A step's rows as the kernels see them, built from a wave the shared
 /// append checks validated ([`super::transaction::Step::batch`]).
 #[derive(Debug,Clone)]
@@ -209,6 +212,12 @@ pub(super) trait ExpertExecutor<'a> {
         input:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
     /// Lands slot `slot`'s wave of routed layer `layer` into `output`.
     fn collect(&mut self, layer:usize, slot:usize, rows:usize, output:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
+    /// A serving unit call's boundary (#762): reports every finished prefill call's pace to `depth`, takes this
+    /// call's depth (sequence `key` from row `start`, `rows` rows), re-cuts the Spark link's return slots to it at
+    /// rest and starts summing this call's waves. `None` without a Spark link: the call cuts statically.
+    fn start_prefill(&mut self, _depth:&PrefillDepth, _key:u64, _start:usize, _rows:usize) -> Result<Option<Depth>> { Ok(None) }
+    /// The unit call's last wave was sent (or the call failed): later waves are not its.
+    fn stop_prefill(&mut self) {}
     /// After a step's drain: no wave outstanding, and the expert wire healthy.
     fn finish(&mut self) -> Result<()> { Ok(()) }
     /// A failed step, before its stream drains: stops the expert exchange, which releases every
@@ -225,11 +234,15 @@ pub(super) struct Execution<'a> {
     weights: Weights<'a>,
     scratch: Scratch<'a>,
     cfg: MiniMaxM3Config,
-    /// Rows of the widest step: the prefill span, `waves` units of `unit_rows` (`RuntimeSizing::slot_rows`).
+    /// Rows of the widest step: the prefill span (`RuntimeSizing::slot_rows`), which every depth's units fit.
     rows:usize,
+    /// Rows of the admitted unit (`--prefill-rows`).
     unit_rows:usize,
-    /// Prefill waves in flight on the Spark link (`--prefill-waves`).
+    /// Prefill waves in flight on the Spark link (`--prefill-waves`): the static depth.
     waves:usize,
+    /// The runtime prefill depth (#762): serving's controller within the admitted slots; `None` cuts every unit
+    /// call at the static `unit_rows` x `waves` (golden).
+    depth:Option<PrefillDepth>,
     /// The most rows a program launch takes (the export's row capacity).
     program_rows:usize,
     logit_rows:usize,
@@ -283,10 +296,22 @@ impl<'a> Execution<'a> {
             native.drain()?;
             Ok((weights,TargetHeadOwner::new(&native,&scratch,logit_rows,cfg.vocab_size)?))
         })?;
-        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,unit_rows:sizing.unit_rows,waves:sizing.waves,program_rows,
-            logit_rows,context,decode_rows,extend_rows,table_stride,
+        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,unit_rows:sizing.unit_rows,waves:sizing.waves,depth:None,
+            program_rows,logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),in_units:std::cell::Cell::new(false),diagnostics,draft:None})
     }
+    /// Serving's runtime prefill depth (#762): `depth`'s admitted slots of its unit, whose reserve is this
+    /// execution's span.
+    pub fn set_prefill_depth(&mut self, depth:PrefillDepth)->Result<()> {
+        ensure!(depth.unit_cap()==self.unit_rows && depth.reserve_rows()==self.rows,
+            MiniMaxError::Invalid("prefill depth differs from the admitted unit and span"));
+        self.depth=Some(depth);
+        Ok(())
+    }
+    /// The runtime prefill depth controller, when serving.
+    pub fn prefill_depth(&self)->Option<&PrefillDepth> { self.depth.as_ref() }
+    /// Rows of the longest prefill call: whole units at every depth the controller may choose (#762), else the span.
+    pub fn call_rows(&self)->usize { self.depth.as_ref().map_or(self.rows,|depth|depth.call_rows().min(self.rows)) }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
         layout:super::dspark::Layout)->Result<()> {
         // The released drafter attends its block noncausally from the anchor.
@@ -343,7 +368,7 @@ impl<'a> Execution<'a> {
         })
     }
     pub fn stream(&self)->*mut std::ffi::c_void { self.native.raw() }
-    /// Rows of one prefill unit (`--prefill-rows`).
+    /// Rows of the admitted prefill unit (`--prefill-rows`).
     pub fn unit_rows(&self)->usize { self.unit_rows }
     pub fn drain(&self)->Result<()> { self.native.drain() }
     /// Runs every layer; the head projects only `logits` (batch rows), and an
@@ -384,13 +409,19 @@ impl<'a> Execution<'a> {
         // Every step runs eagerly: the Spark exchange's stream waits and writes are runtime
         // state, never captured, so no whole decode step is recorded.
         let mut guard=self.native.cancellation_guard("MiniMax step");
+        let mut started=false;
         let result=(||{
             let units=match step_path(batch.requests.len(),rows,kind,diagnostics.is_some(),self.decode_rows,self.program_rows)? {
-                StepPath::Units => Some(self.units(rows,logits.len(),last_layer,overlap)?),
+                StepPath::Units => {
+                    let call=self.start_call(batch,rows,logits.len(),overlap,experts)?;
+                    started=call.is_some();
+                    Some(self.units(rows,logits.len(),last_layer,overlap,call)?)
+                }
                 StepPath::OnePass => None,
             };
+            // No more waves are in flight than the call has units.
             let (waves,widest)=units.as_ref().map_or((1,rows),|(units,waves)|
-                (*waves,units.iter().map(|unit|unit.rows.len()).max().unwrap_or(rows)));
+                ((*waves).min(units.len()),units.iter().map(|unit|unit.rows.len()).max().unwrap_or(rows)));
             experts.begin(routed,waves,widest,kind)?;
             self.native.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.native.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
@@ -403,6 +434,8 @@ impl<'a> Execution<'a> {
                 None => self.layers(embedded,batch,caches,experts,&plan,rows,last_layer,logits.clone(),&mut diagnostics),
             }
         })();
+        // The unit call's waves are all sent (or it failed): later waves are not its (#762).
+        if started { experts.stop_prefill(); }
         // A failed step's stream may hold Spark exchange waits that only the link's worker
         // releases: stop the exchange (releasing them) before the drain.
         if result.is_err() { experts.abort(); }
@@ -621,8 +654,8 @@ mod tests {
     #[test] fn minimax_attention_metadata_is_built_once_per_step() -> Result<()> {
         // Two requests: 3 rows from 62 (pages 0, 2) and 1 row at 4 (page 4).
         let batch=BatchView {positions:vec![62,63,64,4],slots:vec![62,63,128,260],pool_pages:5,
-            requests:vec![RequestView{row_start:0,rows:3,start_position:62,pages:vec![0,2]},
-                RequestView{row_start:3,rows:1,start_position:4,pages:vec![4]}]};
+            requests:vec![RequestView{row_start:0,rows:3,start_position:62,pages:vec![0,2],sequence:0},
+                RequestView{row_start:3,rows:1,start_position:4,pages:vec![4],sequence:1}]};
         batch.validate(64,128)?;
         let (tables,lengths,offsets)=decode_tables(&batch,2)?;
         assert_eq!(tables,[0,-1, 0,-1, 0,2, 4,-1]);
@@ -650,7 +683,8 @@ mod tests {
         let mut row=0;
         for (i,&n) in sizes.iter().enumerate() {
             let base=(i*100) as i32;
-            requests.push(RequestView{row_start:row,rows:n,start_position:start,pages:(0..(start+n).div_ceil(64) as i32).map(|p|base+p).collect()});
+            requests.push(RequestView{row_start:row,rows:n,start_position:start,pages:(0..(start+n).div_ceil(64) as i32).map(|p|base+p).collect(),
+                sequence:requests.len()});
             row+=n;
         }
         let positions=sizes.iter().flat_map(|&n|(start..start+n).map(|p|p as i64)).collect();
@@ -679,9 +713,16 @@ mod tests {
             (2240,2172,vec![(2240,1024),(3264,1024),(4288,124)])]);
         assert_eq!(tiles(&chunk(64,&[300]),&cut(300,4096,2)?)?,[(0,300,vec![(0,300)])]);
         assert_eq!(tiles(&chunk(0,&[4096]),&cut(4096,4096,1)?)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)])]);
-        for (unit,waves) in [(4096,1),(4096,2),(2752,3),(2048,4),(1024,2),(256,2)] {
-            let sizing=RuntimeSizing{unit_rows:unit,decode_rows:64,sequences:1,context:1<<20,spark_ranks:4,logit_rows:64,waves};
-            let (bound,span)=(usize::try_from(extend_launches(sizing,1024))?,sizing.slot_rows());
+        use cuteafd_loader::serving_capacity::wave_control::{call_rows,candidates,unit_for};
+        for (admitted,start,slots) in [(4096,2,4),(4096,1,1),(4096,2,2),(2752,3,3),(2048,4,4),(1024,2,2),(256,2,2)] {
+            let sizing=RuntimeSizing{unit_rows:admitted,decode_rows:64,sequences:1,context:1<<20,spark_ranks:4,logit_rows:64,
+                waves:start,slots};
+            let bound=usize::try_from(extend_launches(sizing,1024))?;
+            // Every depth the runtime controller may run, on the calls it takes (#762); a static shape its own.
+            let (span,depths)=if sizing.adaptive() {
+                (call_rows(slots as u64,admitted as u64) as usize,candidates(slots as u64,admitted as u64))
+            } else { (sizing.slot_rows(),vec![start as u64]) };
+            for (unit,waves) in depths.into_iter().map(|k|(unit_for(k,admitted as u64) as usize,k as usize)) {
             for rows in (65..=span).step_by(37).chain([unit,span]) {
                 for start in [0,64,100] {
                     let units=cut(rows,unit,waves)?;
@@ -700,6 +741,7 @@ mod tests {
                     }
                     ensure!(launches<=bound,"{waves} x {unit}, {rows} rows: {launches} launches, admitted {bound}");
                 }
+            }
             }
         }
         // A one-pass (decode) plan keeps one piece over the step.
@@ -763,7 +805,11 @@ mod tests {
             assert!(!source.contains(&banned),"{banned}");
         }
         let step=source.split("fn step(").nth(1).unwrap().split("fn layers(").next().unwrap();
-        let order=["self.prefill(","if result.is_err() { experts.abort(); }","let drained=if result.is_ok() { self.native.wait() } else { self.native.drain() };",
+        // A unit call takes its runtime depth before it cuts its units, and stops flagging waves as its own (#762)
+        // once they are sent or the call failed, before a failed step quiesces the exchange.
+        let order=["let call=self.start_call(","started=call.is_some();","self.units(rows,logits.len(),last_layer,overlap,call)?",
+            "experts.begin(routed,waves,widest,kind)?","self.prefill(","if started { experts.stop_prefill(); }",
+            "if result.is_err() { experts.abort(); }","let drained=if result.is_ok() { self.native.wait() } else { self.native.drain() };",
             "experts.finish()?","if completed { experts.release(); }"]
             .map(|needle|step.find(needle).unwrap_or_else(||panic!("{needle}")));
         assert!(order.windows(2).all(|w|w[0]<w[1]),"{order:?}");

@@ -228,10 +228,12 @@ impl Family for MiniMaxM3 {
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
-        // Unmeasured on the shared executor: no S/T timing and no wave-count comparison exists for
-        // MiniMax units yet, so the shared policy keeps its conservative two waves at every Spark count.
+        // Adaptive (#762): the plan admits four 4096-row slots inside the shared reserve, and the engine
+        // chooses each call's depth at runtime from the Sparks' measured unit pace and its own reply wait,
+        // calibrating at startup. No S/T timing or wave-count comparison exists for MiniMax units, so the
+        // estimate stays unmeasured: it is only the starting depth (the shared fallback's two waves).
         // The executor's caps are the shared ones (1..=4 waves of page-aligned units up to 4096 rows).
-        PrefillLimits { estimate: PrefillEstimate::Unmeasured, ..Default::default() }
+        PrefillLimits { estimate: PrefillEstimate::Unmeasured, adaptive: true, ..Default::default() }
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // MiniMax decode/verify steps send at most `admission::DECODE_ROWS` (64) rows.

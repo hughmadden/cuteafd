@@ -36,13 +36,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     ensure!(report.requested_attention.is_none_or(|p| p == AttentionPlacement::Heads), AdmissionError::Unsupported("attention placement"));
     ensure!(report.audio == MediaMode::Off, AdmissionError::Unsupported("audio"));
     let cfg = model.cfg();
-    // The shared prefill contract: waves of unit rows on one Spark transport. `cuteafd plan`
-    // passes --prefill-waves as `prefill_lanes` as well, which is how an explicit count shows.
-    let shape = admission::prefill_shape(opts.prefill_rows, opts.prefill_lanes, requested.spark_ranks())
+    // The shared prefill contract (#762): admitted slots of the unit on one Spark transport, the depth
+    // starting at the estimate's. `cuteafd plan` passes --prefill-waves as `prefill_lanes` as well,
+    // which is how an explicit count (a pinned depth) shows.
+    let prefill = admission::prefill_shape(opts.prefill_rows, opts.prefill_lanes, 0, requested.spark_ranks())
         .context("MiniMax prefill shape")?;
-    (opts.prefill_unit_rows, opts.prefill_waves) = (Some(shape.unit_rows), shape.waves);
-    (report.prefill_span_rows, report.prefill_transports) = (Some(shape.slot_rows()), Some(1));
-    let (rows, lanes, span) = (usize::try_from(shape.unit_rows)?, usize::try_from(shape.waves)?, usize::try_from(shape.slot_rows())?);
+    (opts.prefill_unit_rows, opts.prefill_waves, opts.prefill_slots) = (Some(prefill.unit_rows), prefill.waves, prefill.slots);
+    (report.prefill_span_rows, report.prefill_transports) = (Some(prefill.span_rows), Some(1));
+    let (rows, lanes, slots, span) = (usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?,
+        usize::try_from(prefill.slots)?, usize::try_from(prefill.span_rows)?);
     let sequences = if opts.concurrency == 0 { 64 } else { usize::try_from(opts.concurrency)? };
     ensure!(opts.state_slots.is_none_or(|n| n == sequences as u64), AdmissionError::Unsupported("sequence-slot mismatch"));
     let rings = opts.draft_context_slots.map_or(Ok(admission::default_draft_rings(sequences,
@@ -65,7 +67,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let draft_rows = draft.as_ref().map_or(0, |d| d.sequences * 7);
     let sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences, context: if opts.context_tokens == 0 {
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks(),
-        logit_rows: RuntimeSizing::head_rows(span, opts.full_prefill_logits, draft_rows), waves: lanes };
+        logit_rows: RuntimeSizing::head_rows(span, opts.full_prefill_logits, draft_rows), waves: lanes, slots }
+        .with_prefill(prefill)?;
     sizing.validate(cfg)?;
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let manifest = crate::plan::checkpoint::read_json(path).context("MiniMax native admission requires its matching PROGRAMS.json")?;
@@ -193,9 +196,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         *report.bytes_by_owner.entry("routed expert weights".into()).or_default() += assigned.resident_bytes;
         memory.devices.push(device);
     }
-    memory.notes.push(format!("MiniMax shape: prefill {lanes} waves of {rows} rows (span {span}) on one Spark link; each \
-        rank's typed owners: one decode owner and one prefill owner buffering {lanes} units; sequences {sequences}, decode \
-        tile {}, context {}; Spark replies land in GPU planes; exported scratch is not scaled by runtime rows",
+    memory.notes.push(format!("MiniMax shape: prefill {slots} admitted slots of up to {rows} rows (span {span}) on one \
+        Spark link, starting at {lanes} waves{}; each rank's typed owners: one decode owner and one prefill owner buffering \
+        {slots} units; sequences {sequences}, decode tile {}, context {}; Spark replies land in GPU planes; exported scratch \
+        is not scaled by runtime rows", if sizing.adaptive() { " (the engine chooses each call's depth at runtime)" } else { "" },
         recipe.programs.decode_capacity(), sizing.context));
     if opts.host_embedding {
         report.bytes_by_owner.insert("host-mapped embedding".into(), edge(Component::Embedding));

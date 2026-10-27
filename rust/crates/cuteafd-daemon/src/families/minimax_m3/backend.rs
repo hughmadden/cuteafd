@@ -36,12 +36,12 @@ fn check_captures(startup: u64, current: u64) -> Result<()> {
     Ok(())
 }
 
-/// Rows of the scheduler's prefill chunks: the call span (`RuntimeSizing::slot_rows`, every unit of every wave
-/// in flight), or one unit when every prefill row's logits are served. A call's scored rows stay in one unit
-/// (`retained_logits_units`), so prefill-shaped scoring runs one-unit calls, as GLM 5.3 scores under full
-/// prefill logits; serving asks only for each call's last row.
-fn chunk_rows(span: usize, unit_rows: usize, full_prefill_logits: bool) -> usize {
-    if full_prefill_logits { unit_rows.min(span) } else { span }
+/// Rows of the scheduler's prefill chunks: the longest call (`Execution::call_rows`: whole units at every depth
+/// the runtime controller may choose, #762, else the static span), or one admitted unit when every prefill row's
+/// logits are served. A call's scored rows stay in one unit (`retained_logits_units`), so prefill-shaped scoring
+/// runs one-unit calls, as GLM 5.3 scores under full prefill logits; serving asks only for each call's last row.
+fn chunk_rows(call: usize, unit_rows: usize, full_prefill_logits: bool) -> usize {
+    if full_prefill_logits { unit_rows.min(call) } else { call }
 }
 
 fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, State, ()>]) -> Result<()> {
@@ -110,6 +110,8 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub trace: RefCell<Option<super::diagnostics::LogitTrace>>,
     /// Graph captures at ready: serving adds none.
     pub startup_captures: std::cell::Cell<Option<u64>>,
+    /// The deployment the runtime prefill depth calibrates for (#762): serving's; golden has none.
+    pub identity: Option<crate::shared::prefill_depth::DeploymentIdentity>,
     /// DFlash2's keyed selector prior (the scheduler prices its drafts' features); none for DSpark.
     pub selector: Option<scheduler::SelectorPrior>,
 }
@@ -178,7 +180,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.vocabulary, max_context: self.cache.context,
             slots: self.cache.sequences,
-            prefill_rows: chunk_rows(self.rows, self.execution.unit_rows(), self.full_prefill_logits),
+            prefill_rows: chunk_rows(self.execution.call_rows(), self.execution.unit_rows(), self.full_prefill_logits),
             decode_rows: self.rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS),
             full_prefill_logits: self.full_prefill_logits }
     }
@@ -316,6 +318,10 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
         Some(observe(&self.probe.borrow(),&[None]))
     }
+    fn prefill_depth(&self) -> Option<(&crate::shared::prefill_depth::PrefillDepth,
+        crate::shared::prefill_depth::DeploymentIdentity)> {
+        Some((self.execution.prefill_depth()?, self.identity.clone()?))
+    }
 }
 
 #[cfg(test)]
@@ -323,21 +329,31 @@ mod tests {
     use super::*;
     use scheduler::Placement as _;
 
-    /// The scheduler chunks prompts at the span the planner admits (8192 rows at 2 x 4096 and 4 x 2048, 8256 at
-    /// a pinned 3 x 2752, from `slot_rows`), or at one unit when every prefill row's logits are served.
+    /// The scheduler chunks prompts at the longest call: an adaptive deployment's 8192 rows (whole units at
+    /// 2 x 4096, 3 x 2752 and 4 x 2048, #762) inside its 8256-row reserve, a pinned shape's span (8192 at 2 x 4096
+    /// and 4 x 2048, 8256 at 3 x 2752), or one admitted unit when every prefill row's logits are served.
     #[test]
-    fn minimax_scheduler_prefill_rows_are_the_span_unless_every_row_is_scored() {
+    fn minimax_scheduler_prefill_rows_are_the_call_unless_every_row_is_scored() -> Result<()> {
         use cuteafd_loader::plan::families::minimax::admission::RuntimeSizing;
-        for (unit_rows, waves, span) in [(4096, 2, 8192), (2752, 3, 8256), (2048, 4, 8192), (4096, 1, 4096), (128, 1, 128)] {
+        for (unit_rows, waves, slots, span, call) in [(4096, 2, 4, 8256, 8192), (4096, 2, 2, 8192, 8192),
+            (2752, 3, 3, 8256, 8256), (2048, 4, 4, 8192, 8192), (4096, 1, 1, 4096, 4096), (128, 1, 1, 128, 128)] {
             let sizing = RuntimeSizing { unit_rows, decode_rows: 64, sequences: 1, context: 1 << 20, spark_ranks: 6,
-                logit_rows: 64, waves };
-            assert_eq!(sizing.slot_rows(), span);
-            assert_eq!((chunk_rows(span, unit_rows, false), chunk_rows(span, unit_rows, true)), (span, unit_rows));
+                logit_rows: 64, waves, slots };
+            assert_eq!((sizing.slot_rows(), sizing.adaptive()), (span, slots > waves), "{unit_rows} x {waves} of {slots}");
+            // Serve's controller (pinned unless adaptive) over that span: `Execution::call_rows`.
+            let depth = crate::shared::prefill_depth::PrefillDepth::new(waves, slots, unit_rows, !sizing.adaptive())?;
+            assert_eq!(depth.reserve_rows(), span);
+            let longest = depth.call_rows().min(span);
+            assert_eq!(longest, call, "{unit_rows} x {waves} of {slots}");
+            assert_eq!((chunk_rows(longest, unit_rows, false), chunk_rows(longest, unit_rows, true)), (call, unit_rows));
         }
         let serve = include_str!("serve.rs");
         assert!(serve.contains("let span = sizing.slot_rows();") && serve.contains("rows: span,"));
         let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(backend.contains("prefill_rows: chunk_rows(self.rows, self.execution.unit_rows(), self.full_prefill_logits),"));
+        assert!(backend.contains("prefill_rows: chunk_rows(self.execution.call_rows(), self.execution.unit_rows(), self.full_prefill_logits),"));
+        let execution = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(execution.contains("self.depth.as_ref().map_or(self.rows,|depth|depth.call_rows().min(self.rows))"));
+        Ok(())
     }
 
     #[test]

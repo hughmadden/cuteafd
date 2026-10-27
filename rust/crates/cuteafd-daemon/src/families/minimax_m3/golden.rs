@@ -733,7 +733,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!(!args.check_prefix || windows[0].tokens.len() >= 66, "prefix qualification needs 66 tokens in first window");
     let sizing = admission::RuntimeSizing {unit_rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
         sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize,
-        waves:args.prefill_waves};
+        // Golden pins its depth at its own cut: it admits only its waves' slots (#762).
+        waves:args.prefill_waves, slots:args.prefill_waves};
     let (package, local_package) = super::admission::local_package(native)?;
     // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = library.cuda_memory_info()?.0 as u64;

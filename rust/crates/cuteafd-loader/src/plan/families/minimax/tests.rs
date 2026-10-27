@@ -134,8 +134,10 @@ fn native_manifest_uses_shared_allocation_ledger() {
     assert!(memory.notes.iter().any(|n| n.contains("native allocation ledger")));
     let rtx = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     let item = |name: &str| rtx.items.iter().find(|i| i.group == name).unwrap();
-    // Two lanes of 256 rows by default: the per-row buffers hold their 512-row chunk.
-    assert_eq!(item("MiniMax residual").bytes, 2 * 256 * 6144 * 4);
+    // Four admitted 256-row slots by default (#762): the per-row buffers hold their 1024-row reserve.
+    assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_slots, report.prefill_span_rows),
+        (Some(256), Some(2), Some(4), Some(1024)));
+    assert_eq!(item("MiniMax residual").bytes, 4 * 256 * 6144 * 4);
     // Every program shares the scratch arena; the prefill scorer's is the largest.
     assert_eq!(item("MiniMax scratch").bytes, 134_799_872);
     assert!(rtx.used_bytes() <= PRO_TOTAL_BYTES);
@@ -169,9 +171,9 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let on = testing::plan(dir.path(), &options).unwrap();
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
-    // Sixteen sequences each hold a context ring (at most 64 decode rows / 2); the taps hold a
-    // two-wave call.
-    let draft = DraftMemory::new(&contract, admission::default_draft_rings(16, 64), 2 * 256, 188).unwrap();
+    // Sixteen sequences each hold a context ring (at most 64 decode rows / 2); the taps hold the
+    // span: the 1024-row reserve of four admitted 256-row slots (#762).
+    let draft = DraftMemory::new(&contract, admission::default_draft_rings(16, 64), 4 * 256, 188).unwrap();
     assert_eq!(draft.slots, 16);
     let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
@@ -272,8 +274,8 @@ fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
 }
 
 /// The default Spark budget, measured on headless Sparks, holds every routed layer at TP2 with the
-/// default shape (two waves of 4096 rows on each rank's typed owners, 64 sequences): nothing
-/// onboards onto the RTX.
+/// default prefill (four admitted 4096-row slots on each rank's typed owners, #762; 64 sequences):
+/// nothing onboards onto the RTX.
 #[test]
 fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     let dir = snapshot(false, false);
@@ -296,7 +298,7 @@ fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
     assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "{:?}", memory.notes);
     let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
     assert!(spark.items.iter().any(|i| i.group == "execution owners"
-        && i.format.starts_with("1 decode + 1 prefill (m4096 scratch once; 2 x 4096-row units)")), "{:?}", spark.items);
+        && i.format.starts_with("1 decode + 1 prefill (m4096 scratch once; 4 x 4096-row units)")), "{:?}", spark.items);
 }
 
 /// TP2 on the RTX PRO 6000 with automatic vision: the bundled tower stays on the coordinator GPU
@@ -317,7 +319,8 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     let layout = options.layout.as_mut().unwrap();
     layout.workspace_manifest = Some(programs);
     layout.native_mtp_layers = 0;
-    layout.prefill_rows = 1024;
+    // Two pinned 1024-row waves (a static shape: their slots only).
+    (layout.prefill_rows, layout.prefill_lanes) = (1024, 2);
     layout.concurrency = 64;
     // A 108 GiB Spark budget, so TP2 onboards layers (the load peak takes three).
     layout.spark_allocation_budget_bytes = Some(108 << 30);
@@ -336,7 +339,7 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     let wide = testing::plan(dir.path(), &options).unwrap();
     assert!(wide.wip_launchable(), "{:?}", wide.hints);
     assert!(wide.memory_layout.as_ref().unwrap().pool_tokens < memory.pool_tokens);
-    options.layout.as_mut().unwrap().prefill_rows = 1024;
+    (options.layout.as_mut().unwrap().prefill_rows, options.layout.as_mut().unwrap().prefill_lanes) = (1024, 2);
     options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
     let refused = testing::plan(dir.path(), &options).unwrap();
     assert!(!refused.fits && !refused.placement_supported);
@@ -360,26 +363,29 @@ fn native_options(dir: &std::path::Path, ranks: usize) -> PlanOptions {
     options
 }
 
-/// The one Spark link's return slots: a GPU plane of a unit's rows per wave and rank, where the NIC
-/// lands every reply (the shared `prefill_return_bytes`), whatever the shape; host admission charges
-/// the same waves on one transport.
+/// The one Spark link's return slots: a GPU range per rank holding every admitted slot, where the NIC
+/// lands every reply (the shared `prefill_return_bytes`): a pinned shape's waves of its unit, or the
+/// unpinned plan's 8256-row reserve for four 4096-row slots (#762). Host admission charges the same
+/// rows on one transport.
 #[test]
 fn spark_intake_is_every_waves_return_slots_on_the_gpu() {
     let dir = snapshot(false, false);
-    for (ranks, rows, waves) in [(3u64, 4096u64, 1u64), (3, 4096, 2), (2, 2048, 4), (6, 2752, 3), (4, 1024, 3)] {
+    for (ranks, pins, (rows, waves, slots, span)) in [(3u64, (0, 0), (4096u64, 2u64, 4u64, 8256u64)),
+        (6, (0, 0), (4096, 2, 4, 8256)), (3, (4096, 1), (4096, 1, 1, 4096)), (3, (4096, 2), (4096, 2, 2, 8192)),
+        (2, (2048, 4), (2048, 4, 4, 8192)), (6, (2752, 3), (2752, 3, 3, 8256)), (4, (1024, 3), (1024, 3, 3, 3072))] {
         let mut options = native_options(dir.path(), ranks as usize);
         let layout = options.layout.as_mut().unwrap();
-        (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (rows, waves, 0);
+        (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (pins.0, pins.1, 0);
         (layout.concurrency, layout.context_tokens, layout.pool_tokens) = (16, 65536, Some(65536));
         let report = testing::plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{:?}", report.hints);
-        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_transports),
-            (Some(rows), Some(waves), Some(rows * waves), Some(1)));
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_slots, report.prefill_span_rows,
+            report.prefill_transports), (Some(rows), Some(waves), Some(slots), Some(span), Some(1)), "TP{ranks} {pins:?}");
         let gpu = report.memory_layout.as_ref().unwrap().devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap()
             .items.iter().find(|i| i.group == "MiniMax spark_intake").unwrap().bytes;
-        assert_eq!(gpu, crate::serving_capacity::prefill_return_bytes(waves, rows, ranks, 6144), "TP{ranks} {waves}x{rows}");
+        assert_eq!(gpu, crate::serving_capacity::prefill_return_bytes(1, span, ranks, 6144), "TP{ranks} {pins:?}");
         let host = report.host_ledger.as_ref().unwrap().items.iter().find(|i| i.group == "spark-intake").unwrap().bytes;
-        assert_eq!(host, gpu, "TP{ranks} {waves}x{rows}: host-mode bound of the same slots");
+        assert_eq!(host, gpu, "TP{ranks} {pins:?}: host-mode bound of the same slots");
     }
 }
 
@@ -406,16 +412,18 @@ fn rtx_5090_is_refused_by_name() {
 
 /// The RTX PRO 6000 cards (the example configs' shapes: 64 sequences, the checkpoint's context, FP8
 /// K/V, DFlash2 with its default rings, automatic vision, the default Spark budget) on the units
-/// contract: #762's shape, one Spark transport, the typed owners (one decode, one prefill buffering a
-/// unit per wave) on every rank, and every rank within its budget. The coordinator image's expert package carries its TP1 layout only, so
-/// Spark scratch is the estimate, as on a real launch.
+/// contract: #762's adaptive prefill (four 4096-row slots in the 8256-row reserve, starting at two
+/// waves), one Spark transport, the typed owners (one decode, one prefill buffering a unit per slot) on
+/// every rank, and every rank within its budget. The coordinator image's expert package carries its TP1
+/// layout only, so Spark scratch is the estimate, as on a real launch.
 #[test]
 fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
     use crate::plan::{encoder::EncoderKind, MediaMode};
     let dir = snapshot(true, false);
     let drafter = tempfile::tempdir().unwrap();
     std::fs::write(drafter.path().join("config.json"), testing::minimax_dflash2_config().to_string()).unwrap();
-    for (ranks, unit, waves) in [(2usize, 4096u64, 2u64), (3, 4096, 2), (4, 4096, 2), (6, 4096, 2)] {
+    for (ranks, unit, waves, slots, span) in [(2usize, 4096u64, 2u64, 4u64, 8256u64), (3, 4096, 2, 4, 8256),
+        (4, 4096, 2, 4, 8256), (6, 4096, 2, 4, 8256)] {
         let mut options = native_options(dir.path(), ranks);
         let mut package = admission::tests::expert_manifest();
         package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
@@ -426,8 +434,8 @@ fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
         layout.minimax_drafter_snapshot = Some(drafter.path().to_path_buf());
         let report = testing::plan(dir.path(), &options).unwrap();
         assert!(report.wip_launchable(), "TP{ranks}: {:?}", report.hints);
-        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_transports),
-            (Some(unit), Some(waves), Some(unit * waves), Some(1)), "TP{ranks}");
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_slots, report.prefill_span_rows,
+            report.prefill_transports), (Some(unit), Some(waves), Some(slots), Some(span), Some(1)), "TP{ranks}");
         let memory = report.memory_layout.as_ref().unwrap();
         assert!(memory.pool_tokens > 1_000_000, "TP{ranks}: {} pool tokens", memory.pool_tokens);
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes), "TP{ranks}");
@@ -435,12 +443,12 @@ fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
         let sparks = memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
         assert_eq!(sparks.len(), ranks);
         let sizing = admission::RuntimeSizing { unit_rows: unit as usize, decode_rows: 64, sequences: 64, context: 1 << 20,
-            spark_ranks: ranks, logit_rows: 64, waves: waves as usize };
+            spark_ranks: ranks, logit_rows: 64, waves: waves as usize, slots: slots as usize };
         let owners = sizing.spark_executions().unwrap()
             .workspace_bytes(|extent| admission::spark_owner_bytes(None, ranks, extent)).unwrap().unwrap();
         for spark in &sparks {
             let owner = spark.items.iter().find(|i| i.group == "execution owners").unwrap();
-            assert_eq!(owner.format, format!("1 decode + 1 prefill (m4096 scratch once; {waves} x {unit}-row units); \
+            assert_eq!(owner.format, format!("1 decode + 1 prefill (m4096 scratch once; {slots} x {unit}-row units); \
                 0 bytes already reserved"), "TP{ranks}");
             let item = |name: &str| spark.items.iter().find(|i| i.group == name).unwrap().bytes;
             assert_eq!((owner.bytes, item("execution staging")), (owners.device_bytes, owners.pinned_bytes), "TP{ranks}");
@@ -561,10 +569,10 @@ fn tp6_holds_every_routed_layer_in_six_equal_slices() {
     assert!(ranks.iter().all(|d| item(d, "routed expert weights") == experts));
     assert!(experts < item(&sparks(&tp4)[1], "routed expert weights"));
     // The package exports tp6: each rank's owners take its capacities (decode m256, prefill m4096), not the estimate.
-    assert_eq!((tp6.prefill_unit_rows, tp6.prefill_waves), (Some(4096), Some(2)));
+    assert_eq!((tp6.prefill_unit_rows, tp6.prefill_waves, tp6.prefill_slots), (Some(4096), Some(2), Some(4)));
     let owners = admission::RuntimeSizing { unit_rows: 4096, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
-        logit_rows: 64, waves: 2 }.spark_executions().unwrap();
-    assert_eq!((owners.decode[0].capacity, owners.prefill.unit_rows, owners.prefill.buffered_units), (64, 4096, 2));
+        logit_rows: 64, waves: 2, slots: 4 }.spark_executions().unwrap();
+    assert_eq!((owners.decode[0].capacity, owners.prefill.unit_rows, owners.prefill.buffered_units), (64, 4096, 4));
     let row = 6144 * 2 + 4 * 8 + 6144 * 2;
     assert!(ranks.iter().all(|d| item(d, "execution owners") == 102_837_248 + 64 * row + 987_654_321 + 4096 * row));
     assert_eq!(tp6.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });

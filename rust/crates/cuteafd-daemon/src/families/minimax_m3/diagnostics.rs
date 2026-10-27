@@ -183,7 +183,7 @@ mod tests {
         let root = temporary.path().join("dump");
         let mut diagnostic = Diagnostics::new(root.clone(), 3)?;
         let mut batch = BatchView { positions:vec![0,1], slots:vec![0,1], pool_pages:1,
-            requests:vec![RequestView { row_start:0, rows:2, start_position:0, pages:vec![0] }] };
+            requests:vec![RequestView { row_start:0, rows:2, start_position:0, pages:vec![0], sequence:0 }] };
         let mut step = diagnostic.begin(&batch)?;
         assert!(!root.join("manifest.json").exists());
         step.bytes("input", "f32", &[2,1], &[0;8])?;

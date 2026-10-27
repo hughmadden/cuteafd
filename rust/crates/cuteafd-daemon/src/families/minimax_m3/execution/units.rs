@@ -1,9 +1,11 @@
 //! MiniMax prefill on the shared executor (PLAN "Prefill contract"): a single-sequence call of more than the
 //! decode rows runs as row units under [`run_prefill_units`], with up to `waves` units' Spark waves in flight on
-//! the one link. MiniMax's per-row buffers hold the whole call (the `slot_rows` span), so every unit views its own
-//! rows of each one (Kimi K3's shape): what a hook leaves for a later hook (the residual, the shared expert's
-//! output) lives in the unit's rows, and the rest is rewritten inside each hook. `step` uploads every unit's
-//! attention tiles before the executor runs; the call publishes its frontier once, and drafter work runs after it.
+//! the one link. Serving chooses each call's depth (its waves and their unit) at runtime within the admitted slots
+//! (#762, [`Execution::start_call`]); golden cuts at its static shape. MiniMax's per-row buffers hold the whole
+//! call (the `slot_rows` span, which every depth's units fit), so every unit views its own rows of each one (Kimi
+//! K3's shape): what a hook leaves for a later hook (the residual, the shared expert's output) lives in the unit's
+//! rows, and the rest is rewritten inside each hook. `step` uploads every unit's attention tiles before the
+//! executor runs; the call publishes its frontier once, and drafter work runs after it.
 use super::*;
 use crate::shared::prefill_pipeline::{prefill_units, retained_logits_units, run_prefill_units, FfnRoute, PrefillHooks,
     Unit};
@@ -137,12 +139,29 @@ impl PrefillHooks for UnitHooks<'_, '_> {
 }
 
 impl<'a> Execution<'a> {
+    /// A serving unit call's depth (#762): the controller's, taken at the call's start through the Spark link,
+    /// which reports finished calls' paces, re-cuts its return slots and sums this call's waves. Calls that score
+    /// more than one row (they keep every scored row in one unit), golden's identity arms and an execution without
+    /// a controller cut at the static shape instead.
+    pub(super) fn start_call(&self, batch: &BatchView, rows: usize, logit_rows: usize, overlap: Overlap,
+        experts: &mut dyn ExpertExecutor<'a>) -> Result<Option<Depth>> {
+        let Some(depth) = &self.depth else { return Ok(None) };
+        if overlap != Overlap::Admitted || logit_rows > 1 { return Ok(None) }
+        let request = batch.requests.first().context("MiniMax prefill call without a request")?;
+        experts.start_prefill(depth, request.sequence as u64, request.start_position, rows)
+    }
+
     /// The units of a single-sequence prefill call of `rows` rows through `last_layer`, the head projecting
-    /// `logit_rows` of them, and the waves it keeps in flight (`overlap`).
-    pub(super) fn units(&self, rows: usize, logit_rows: usize, last_layer: usize, overlap: Overlap)
-        -> Result<(Vec<Unit>, usize)> {
-        let (cut, waves) = call_waves(self.waves, overlap)?;
-        Ok((call_units(unit_cuts(rows, self.unit_rows, cut, logit_rows, self.logit_rows)?, waves, last_layer), waves))
+    /// `logit_rows` of them, and the waves it keeps in flight (`overlap`): at the call's runtime depth when one was
+    /// taken (`call`), else at the static unit and waves.
+    pub(super) fn units(&self, rows: usize, logit_rows: usize, last_layer: usize, overlap: Overlap,
+        call: Option<Depth>) -> Result<(Vec<Unit>, usize)> {
+        let (unit_rows, admitted) = call.map_or((self.unit_rows, self.waves), |depth| (depth.unit_rows, depth.waves));
+        let (cut, waves) = call_waves(admitted, overlap)?;
+        let units = call_units(unit_cuts(rows, unit_rows, cut, logit_rows, self.logit_rows)?, waves, last_layer);
+        // The controller learns how many units the call cut (fewer than its depth when short) and its rows.
+        if let (Some(call), Some(depth)) = (call, &self.depth) { depth.ran(call, units.len(), rows); }
+        Ok((units, waves))
     }
 
     /// Runs a single-sequence prefill call's `units` on the shared executor with up to `waves` units' Spark waves
@@ -174,7 +193,8 @@ mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, Step};
 
-    /// Unit shapes the planner and launcher admit (the descriptor's 2 x 4096, pinned 3 x 2752 and 4 x 2048, smaller units).
+    /// Unit shapes the planner and launcher admit: every depth of the descriptor's four 4096-row slots (2 x 4096,
+    /// 3 x 2752, 4 x 2048, #762), the same as pins, and smaller units.
     const SHAPES: [(usize, usize); 6] = [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (1024, 2), (256, 2)];
 
     fn source(text: &'static str) -> &'static str { text.split("#[cfg(test)]").next().unwrap() }

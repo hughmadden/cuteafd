@@ -1,7 +1,7 @@
 //! Allocation recipe shared by native serving and manifest-backed planning.
 use std::collections::BTreeMap;
 use crate::formats::native_dense::RankWeightLayout;
-use crate::serving_capacity::{prefill_return_bytes, prefill_waves, PrefillShape};
+use crate::serving_capacity::{prefill_return_bytes, prefill_waves, wave_control, PrefillShape};
 use crate::families::minimax_m3::{cache::{MiniMaxCacheLayout, PAGE_ROWS}, config::MiniMaxM3Config};
 use crate::families::qwen4::Qwen4KvCache;
 use serde_json::Value;
@@ -40,14 +40,14 @@ pub fn spark_worlds() -> Vec<usize> {
     crate::plan::experts::spark_worlds(super::PACKAGE, cuteafd_core::ExpertGeometry::MINIMAX_M3.intermediate as usize)
 }
 
-/// The prefill shape and Spark exchange one coordinator admits (PLAN "Prefill contract"): `waves`
-/// waves of `unit_rows` rows each in flight on one Spark link, which decode shares. Spark replies
-/// land in GPU memory (the RTX PRO 6000): every wave's return slots are device planes in every
-/// intake mode.
+/// The prefill shape and Spark exchange one coordinator admits (PLAN "Prefill contract"): up to
+/// `slots` waves of at most `unit_rows` rows each in flight on one Spark link, which decode shares.
+/// Spark replies land in GPU memory (the RTX PRO 6000): every return slot is cut from one device
+/// range per rank in every intake mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeSizing {
-    /// Rows of one prefill unit (`--prefill-rows`), one wave on the Spark link: the most rows any
-    /// program launch takes.
+    /// Rows of the admitted prefill unit (`--prefill-rows`), the widest wave on the Spark link: the
+    /// most rows any program launch takes. A runtime depth cuts narrower units (#762).
     pub unit_rows: usize,
     pub decode_rows: usize,
     pub sequences: usize,
@@ -57,16 +57,29 @@ pub struct RuntimeSizing {
     /// row when full prefill logits are served. Prefill otherwise projects
     /// only the rows whose logits a request needs.
     pub logit_rows: usize,
-    /// Prefill waves in flight on the one Spark link (`--prefill-waves`): a call spans up to
-    /// `waves` units, each wave with its own return slot on every rank. The runtime's lane loop
-    /// runs them as that many lanes until its prefill moves onto the shared executor.
+    /// Prefill waves a call keeps in flight (`--prefill-waves`): the static depth, or the depth an
+    /// adaptive engine starts at.
     pub waves: usize,
+    /// Admitted prefill slots (`--prefill-slots`, #762): the Spark link's return slots and the units
+    /// each rank's prefill owner buffers. Equal to `waves` when the depth is static or pinned; with
+    /// more, the engine chooses each call's depth within them at runtime.
+    pub slots: usize,
 }
 impl RuntimeSizing {
-    /// The prefill unit shape this sizing admits.
+    /// The starting prefill unit shape: `waves` units of the admitted unit.
     pub fn shape(self) -> PrefillShape { PrefillShape { unit_rows: self.unit_rows as u64, waves: self.waves as u64 } }
-    /// Rows of the longest prefill call, which the per-row buffers hold: one unit per wave in flight.
-    pub fn slot_rows(self) -> usize { self.unit_rows * self.waves }
+    /// Whether the engine chooses its depth at runtime (the shared `PrefillPlan::adaptive`): more slots
+    /// than waves, or slots whose depths cut different units.
+    pub fn adaptive(self) -> bool {
+        self.slots > self.waves || wave_control::candidates(self.slots as u64, self.unit_rows as u64).len() > 1
+    }
+    /// Rows the per-row buffers and the Spark link's reserve hold: a static call's `waves` units, or
+    /// the reserve every admitted depth is cut from (`wave_control::reserve_rows`: 8256 for four
+    /// 4096-row slots, which holds 3 x 2752).
+    pub fn slot_rows(self) -> usize {
+        if self.adaptive() { wave_control::reserve_rows(self.slots as u64, self.unit_rows as u64) as usize }
+        else { self.unit_rows * self.waves }
+    }
     /// Head rows for a server: every prefill row with full prefill logits,
     /// otherwise decode rows or the drafter's block rows, whichever is wider.
     pub fn head_rows(rows: usize, full_prefill_logits: bool, draft_rows: usize) -> usize {
@@ -74,9 +87,10 @@ impl RuntimeSizing {
     }
     pub fn validate(self, cfg: &MiniMaxM3Config) -> Result<()> {
         // One wave may take any rows a launch holds (golden's windows); several cut the call on
-        // whole KV pages, as the shared unit shape requires.
-        let shape = if self.waves == 1 { (1..=4096).contains(&self.unit_rows) } else {
-            self.shape().validate().is_ok() && self.unit_rows % PAGE_ROWS as usize == 0 };
+        // whole KV pages, as the shared unit shape requires. Admitted slots hold the starting depth.
+        let shape = if self.slots == 1 { self.waves == 1 && (1..=4096).contains(&self.unit_rows) } else {
+            self.shape().validate().is_ok() && self.unit_rows % PAGE_ROWS as usize == 0
+                && (self.waves..=prefill_waves::MAX_WAVES as usize).contains(&self.slots) };
         if !shape || !(1..=64).contains(&self.decode_rows)
             || self.sequences == 0 || self.sequences > self.decode_rows || self.sequences > self.unit_rows
             || self.logit_rows < self.decode_rows || self.logit_rows > self.slot_rows() {
@@ -93,11 +107,11 @@ impl RuntimeSizing {
     }
     /// The typed Spark owners every rank allocates (the shared family admission on the NVFP4
     /// package's export ladder): one decode owner of [`DECODE_ROWS`], and the one prefill owner at
-    /// the export covering a unit, buffering a unit per wave in flight. Plan, serve and golden seal
-    /// this value.
+    /// the export covering the admitted unit, buffering a unit per admitted slot (#762). Plan, serve
+    /// and golden seal this value.
     pub fn spark_executions(self) -> anyhow::Result<cuteafd_core::SparkExecutions> {
         let exports = crate::plan::spark_executions::SparkBackend::Fp8.exports();
-        crate::plan::spark_executions::admit_family("minimax_m3", &exports, None, self.unit_rows as u64, self.waves as u64)
+        crate::plan::spark_executions::admit_family("minimax_m3", &exports, None, self.unit_rows as u64, self.slots as u64)
     }
     /// The one Spark endpoint decode and prefill share: a wave of up to a unit's rows, BF16 in.
     pub fn spark_endpoint(self) -> std::result::Result<cuteafd_core::SparkEndpoint, std::num::TryFromIntError> {
@@ -106,16 +120,30 @@ impl RuntimeSizing {
     }
 }
 
-/// The prefill shape a plan or server admits (PLAN "Prefill contract"): the shared policy
-/// (`prefill_waves::prefill_shape`) over MiniMax's descriptor limits, with `rows` and `waves` (0 =
-/// unpinned) as pins. Unpinned, the descriptor's estimate picks the waves (it is unmeasured: two at
-/// every Spark count, one without Sparks) and the unit follows them inside the 8192-row reserve.
-/// A 2752- or 2048-row unit runs on the expert package's 4096-row programs, which take any rows up
-/// to their capacity.
-pub fn prefill_shape(rows: u64, waves: u64, spark_ranks: usize) -> anyhow::Result<PrefillShape> {
+/// The prefill a plan or server admits (PLAN "Prefill contract", #762): the shared policy
+/// (`prefill_waves::prefill_shape`) over MiniMax's adaptive descriptor, with `rows`, `waves` and
+/// `slots` (0 = unpinned) as pins. Unpinned, it admits four slots of the 4096-row unit inside the
+/// shared 8256-row reserve and starts at the estimate's depth (unmeasured: two waves at every Spark
+/// count); the engine then chooses each call's depth (2 x 4096, 3 x 2752 or 4 x 2048) at runtime. A
+/// resolved deployment's slots pass back as the pin; explicit waves alone pin the depth (slots equal
+/// the waves). One wave without Sparks. A 2752- or 2048-row unit runs on the expert package's
+/// 4096-row programs, which take any rows up to their capacity.
+pub fn prefill_shape(rows: u64, waves: u64, slots: u64, spark_ranks: usize) -> anyhow::Result<prefill_waves::PrefillPlan> {
     let pins = prefill_waves::PrefillOverrides { unit_rows: (rows > 0).then_some(rows),
-        waves: (waves > 0).then_some(waves), span_rows: None, slots: None };
-    Ok(prefill_waves::prefill_shape(spark_ranks, crate::plan::Family::prefill_limits(&super::MINIMAX_M3), pins)?.units())
+        waves: (waves > 0).then_some(waves), span_rows: None, slots: (slots > 0).then_some(slots) };
+    Ok(prefill_waves::prefill_shape(spark_ranks, crate::plan::Family::prefill_limits(&super::MINIMAX_M3), pins)?)
+}
+
+impl RuntimeSizing {
+    /// The prefill fields of a resolved plan: the admitted unit, the starting depth and the slots,
+    /// whose span ([`Self::slot_rows`]) the plan's must equal.
+    pub fn with_prefill(self, plan: prefill_waves::PrefillPlan) -> anyhow::Result<Self> {
+        let sizing = Self { unit_rows: usize::try_from(plan.unit_rows)?, waves: usize::try_from(plan.waves)?,
+            slots: usize::try_from(plan.slots)?, ..self };
+        anyhow::ensure!(sizing.slot_rows() as u64 == plan.span_rows && sizing.adaptive() == plan.adaptive(),
+            "MiniMax prefill span {} differs from the plan's {} ({plan:?})", sizing.slot_rows(), plan.span_rows);
+        Ok(sizing)
+    }
 }
 
 pub const PROGRAM_NAMES: &[&str] = &[
@@ -244,9 +272,10 @@ impl RuntimeLedger {
         add("scratch", &[programs.workspace_bytes()])?;
         add("sampler", &[cuteafd_core::target_sampler_device_bytes(sizing.decode_rows, cfg.vocab_size) as u64])?;
         add("selector", &[sizing.decode_rows as u64, 12])?;
-        // The Spark link's return slots: one BF16 device plane of a unit's rows per wave and rank,
-        // where the NIC lands every reply.
-        add("spark_intake", &[prefill_return_bytes(sizing.waves as u64, sizing.unit_rows as u64, sizing.spark_ranks as u64, h)])?;
+        // The Spark link's return slots, where the NIC lands every reply: one BF16 device range per
+        // rank holding every admitted slot (a static call's units, or the reserve each depth is cut
+        // from, #762).
+        add("spark_intake", &[prefill_return_bytes(1, sizing.slot_rows() as u64, sizing.spark_ranks as u64, h)])?;
         let fixed_bytes = sum(allocations.iter().map(|a| a.bytes))?;
         Ok(Self { allocations, fixed_bytes })
     }
@@ -282,9 +311,10 @@ pub fn decode_graphs(sizing: RuntimeSizing, draft_rings: usize) -> Result<crate:
 }
 
 /// Most extend launches one prefill step makes: each request's rows split
-/// into tiles of at most `tile` rows, and at each unit cut.
+/// into tiles of at most `tile` rows, and at each unit cut (a call cuts at
+/// most one unit per admitted slot).
 pub fn extend_launches(sizing: RuntimeSizing, tile: u64) -> u64 {
-    sizing.sequences as u64 + (sizing.slot_rows() as u64).div_ceil(tile) + sizing.waves as u64 - 1
+    sizing.sequences as u64 + (sizing.slot_rows() as u64).div_ceil(tile) + sizing.slots as u64 - 1
 }
 
 /// Source scales are released after preparation completes; the MMA arrangement
@@ -661,7 +691,7 @@ pub(crate) mod tests {
         serde_json::json!({"layouts":layouts})
     }
     fn sizing() -> RuntimeSizing { RuntimeSizing { unit_rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3,
-        logit_rows: 64, waves: 1 } }
+        logit_rows: 64, waves: 1, slots: 1 } }
     fn config() -> MiniMaxM3Config { MiniMaxM3Config::from_hf(&release_config()).unwrap() }
 
     #[test]
@@ -698,10 +728,11 @@ pub(crate) mod tests {
     #[test]
     fn minimax_row_buffers_hold_one_row_per_chunk_row() {
         for lanes in [1, 2, 3, 4] {
-            let sizing = RuntimeSizing { waves: lanes, ..sizing() };
+            let sizing = RuntimeSizing { waves: lanes, slots: lanes, ..sizing() };
             let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
             let ledger = RuntimeLedger::new(&config(), sizing, &programs).unwrap();
-            // Unit views stride these by row: each holds exactly waves x unit rows x its row bytes.
+            // Unit views stride these by row: a static shape holds exactly waves x unit rows x its row bytes.
+            assert!(!sizing.adaptive());
             assert_eq!(sizing.slot_rows(), lanes * 256);
             assert_eq!(sizing.shape().slot_rows(), sizing.slot_rows() as u64);
             for &(name, width, bytes) in ROW_BUFFERS {
@@ -714,33 +745,59 @@ pub(crate) mod tests {
             // One prefill owner buffering a unit per wave in flight on every rank.
             assert_eq!(sizing.spark_executions().unwrap().prefill.buffered_units, lanes as u8);
         }
+        // Adaptive (#762): four 256-row slots starting at two waves hold the reserve every depth is cut from
+        // (256 rows per unit at any depth: 4 x 256), the intake one range of it per rank, and the prefill owner
+        // buffers a unit per slot.
+        let adaptive = RuntimeSizing { waves: 2, slots: 4, ..sizing() };
+        assert!(adaptive.adaptive() && adaptive.validate(&config()).is_ok());
+        assert_eq!(adaptive.slot_rows(), 1024);
+        let ledger = RuntimeLedger::new(&config(), adaptive, &ProgramSizes::from_manifest(&programs_manifest(), adaptive).unwrap()).unwrap();
+        assert_eq!(ledger.bytes("residual"), Some(1024 * 6144 * 4));
+        assert_eq!(ledger.bytes("spark_intake"), Some(crate::serving_capacity::prefill_return_bytes(1, 1024, 3, 6144)));
+        assert_eq!(extend_launches(adaptive, 1024), 16 + 1 + 3);
+        assert_eq!(adaptive.spark_executions().unwrap().prefill.buffered_units, 4);
+        let shipped = RuntimeSizing { unit_rows: 4096, waves: 2, slots: 4, ..sizing() };
+        assert_eq!((shipped.adaptive(), shipped.slot_rows()), (true, 8256));
         assert!(RuntimeSizing { waves: 0, ..sizing() }.validate(&config()).is_err());
-        assert!(RuntimeSizing { waves: 5, ..sizing() }.validate(&config()).is_err());
+        assert!(RuntimeSizing { waves: 5, slots: 5, ..sizing() }.validate(&config()).is_err());
+        // Slots hold the starting depth: never fewer, never more than the shared four.
+        assert!(RuntimeSizing { waves: 3, slots: 2, ..sizing() }.validate(&config()).is_err());
+        assert!(RuntimeSizing { waves: 2, slots: 5, ..sizing() }.validate(&config()).is_err());
         // Several waves cut on whole KV pages; one wave takes any rows a launch holds.
         let unaligned = RuntimeSizing { unit_rows: 100, sequences: 1, decode_rows: 64, logit_rows: 64, ..sizing() };
-        assert!(RuntimeSizing { waves: 2, ..unaligned }.validate(&config()).is_err());
+        assert!(RuntimeSizing { waves: 2, slots: 2, ..unaligned }.validate(&config()).is_err());
+        assert!(RuntimeSizing { waves: 1, slots: 2, ..unaligned }.validate(&config()).is_err());
         assert!(RuntimeSizing { waves: 1, ..unaligned }.validate(&config()).is_ok());
         assert!(RuntimeSizing { unit_rows: 4160, waves: 1, ..sizing() }.validate(&config()).is_err());
     }
 
-    /// The shared policy picks the waves from MiniMax's descriptor estimate and the unit for the
-    /// waves; explicit waves or rows pin them. The estimate is unmeasured, so every Spark count runs
-    /// two 4096-row waves until a measured MiniMax estimate lands; three 2752-row waves (the 8192-row
-    /// reserve rounded up to whole pages) remain a pin.
+    /// The shared policy over MiniMax's adaptive descriptor (#762): unpinned, every Spark count admits four
+    /// 4096-row slots in the 8256-row reserve and starts at the estimate's depth, which is unmeasured (two
+    /// waves) until a MiniMax measurement lands; the engine chooses each call's depth within the slots at
+    /// runtime. A deployment's slots pass back; explicit waves pin the depth (their own unit, slots equal to
+    /// the waves), and pinned rows keep theirs. No Sparks: one wave.
     #[test]
     fn prefill_shape_follows_the_descriptor_estimate_unless_pinned() {
-        let shape = |rows, waves, ranks| prefill_shape(rows, waves, ranks).map(|s| (s.unit_rows, s.waves, s.slot_rows()));
-        for ranks in [2, 3, 4, 6] { assert_eq!(shape(0, 0, ranks).unwrap(), (4096, 2, 8192), "TP{ranks}"); }
-        assert_eq!(shape(0, 3, 6).unwrap(), (2752, 3, 8256));
-        assert_eq!(shape(0, 0, 0).unwrap(), (4096, 1, 4096));
-        assert!(matches!(crate::plan::Family::prefill_limits(&super::super::MINIMAX_M3).estimate,
-            prefill_waves::PrefillEstimate::Unmeasured));
-        // Pinned waves take their own unit; pinned rows keep theirs.
-        assert_eq!(shape(0, 2, 6).unwrap(), (4096, 2, 8192));
-        assert_eq!(shape(0, 4, 4).unwrap(), (2048, 4, 8192));
-        assert_eq!(shape(2048, 0, 4).unwrap(), (2048, 2, 4096));
-        assert_eq!(shape(1024, 3, 2).unwrap(), (1024, 3, 3072));
-        for (rows, waves) in [(100, 2), (4160, 1), (4096, 5), (32, 1)] { assert!(shape(rows, waves, 4).is_err(), "{rows} x {waves}"); }
+        let shape = |rows, waves, slots, ranks| prefill_shape(rows, waves, slots, ranks)
+            .map(|p| (p.unit_rows, p.waves, p.slots, p.span_rows));
+        for ranks in [2, 3, 4, 6] {
+            assert_eq!(shape(0, 0, 0, ranks).unwrap(), (4096, 2, 4, 8256), "TP{ranks}");
+            assert_eq!(shape(4096, 2, 4, ranks).unwrap(), (4096, 2, 4, 8256), "TP{ranks}: the launcher's pass-back");
+            assert!(prefill_shape(0, 0, 0, ranks).unwrap().adaptive());
+        }
+        let limits = crate::plan::Family::prefill_limits(&super::super::MINIMAX_M3);
+        assert!(limits.adaptive && matches!(limits.estimate, prefill_waves::PrefillEstimate::Unmeasured));
+        assert_eq!(shape(0, 0, 0, 0).unwrap(), (4096, 1, 1, 4096));
+        // Pinned waves take their own unit and admit only their slots; pinned rows keep theirs.
+        assert_eq!(shape(0, 3, 0, 6).unwrap(), (2752, 3, 3, 8256));
+        assert_eq!(shape(2752, 3, 3, 6).unwrap(), (2752, 3, 3, 8256));
+        assert_eq!(shape(0, 2, 0, 6).unwrap(), (4096, 2, 2, 8192));
+        assert_eq!(shape(0, 4, 0, 4).unwrap(), (2048, 4, 4, 8192));
+        assert_eq!(shape(2048, 0, 0, 4).unwrap(), (2048, 2, 4, 8192));
+        assert_eq!(shape(1024, 3, 0, 2).unwrap(), (1024, 3, 3, 3072));
+        for (rows, waves, slots) in [(100, 2, 0), (4160, 1, 0), (4096, 5, 0), (32, 1, 0), (2752, 4, 0), (0, 3, 2), (0, 2, 5)] {
+            assert!(shape(rows, waves, slots, 4).is_err(), "{rows} x {waves} of {slots}");
+        }
     }
 
     /// A 2752-row wave needs no 2752-row export: the expert package runs it on the smallest capacity
@@ -749,7 +806,7 @@ pub(crate) mod tests {
     fn six_spark_units_run_on_the_4096_row_capacities() {
         assert_eq!(expert_workspace(&expert_manifest(), 6, 2752).unwrap(), 987_654_321);
         assert_eq!(expert_workspace(&expert_manifest(), 1, 2752).unwrap(), 987_654_321);
-        let sizing = RuntimeSizing { unit_rows: 2752, waves: 3, spark_ranks: 6, ..sizing() };
+        let sizing = RuntimeSizing { unit_rows: 2752, waves: 3, slots: 3, spark_ranks: 6, ..sizing() };
         assert!(ProgramSizes::from_manifest(&programs_manifest(), sizing).is_ok());
         let ledger = RuntimeLedger::new(&config(), sizing, &ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap()).unwrap();
         assert_eq!(ledger.bytes("residual"), Some(3 * 2752 * 6144 * 4));
@@ -843,7 +900,7 @@ pub(crate) mod tests {
 
     /// One Spark endpoint carries decode and every wave; each rank allocates the typed owners: one
     /// decode owner (m80 scratch, 64 rows of I/O) and one prefill owner (the unit's covering export
-    /// scratch once, a unit's I/O), so another wave in flight adds only its pinned route staging.
+    /// scratch once, a unit's I/O), so another admitted slot adds only its pinned route staging.
     #[test]
     fn every_wave_in_flight_adds_only_its_route_staging_to_the_typed_owners() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -853,7 +910,7 @@ pub(crate) mod tests {
         let catalog = crate::read_expert_catalog(dir.path())?;
         let ring = crate::plan::layout::spark_ring_geometry(1);
         let recipe = |lanes, package: Option<&Value>| Recipe::new(&cfg, &checkpoint, &catalog, &programs_manifest(), package, Request {
-            sizing: RuntimeSizing { unit_rows: 4096, waves: lanes, context: 4096, ..sizing() }, kv_format: Qwen4KvCache::Fp8,
+            sizing: RuntimeSizing { unit_rows: 4096, waves: lanes, slots: lanes, context: 4096, ..sizing() }, kv_format: Qwen4KvCache::Fp8,
             local_layers: LocalLayers::Bottom(0), spark_budget: u64::MAX, spark_vision_bytes: 0, headroom: 0, draft_bytes: 0,
             draft_rings: 0, draft_staging: 0, host_embedding: false, startup_graphs: false,
             rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,

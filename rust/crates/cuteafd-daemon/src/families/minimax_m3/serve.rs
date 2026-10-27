@@ -31,8 +31,8 @@ pub(crate) struct ServeArgs {
     kv_cache: Qwen4KvCache,
     #[arg(long, default_value_t = 0)]
     max_context: u64,
-    /// Rows of one prefill unit: one Spark wave, and the most rows a program launch takes. Several waves
-    /// need whole 64-row pages (the plan's unit shape). Unset, the shared prefill policy picks it.
+    /// Rows of the admitted prefill unit: the widest Spark wave, and the most rows a program launch takes.
+    /// Several waves need whole 64-row pages (the plan's unit shape). Unset, the shared prefill policy picks it.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: Option<u32>,
     #[arg(long, default_value = "auto")]
@@ -72,12 +72,19 @@ pub(crate) struct ServeArgs {
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
-    /// Spark waves a prefill call keeps in flight (1 to 4): a call of up to this many units of
-    /// --prefill-rows rows runs on the shared executor, each unit's routed wave in flight on the one
-    /// Spark link while other units' GPU layers run. The launcher passes the plan's resolved shape;
-    /// unset, the shared prefill policy picks it from MiniMax's descriptor, as the plan does.
+    /// Spark waves a prefill call keeps in flight (1 to 4): a call of up to this many units runs on the
+    /// shared executor, each unit's routed wave in flight on the one Spark link while other units' GPU
+    /// layers run. With more --prefill-slots this is the starting depth; alone it pins the depth.
+    /// The launcher passes the plan's resolved shape; unset, the shared prefill policy picks it from
+    /// MiniMax's descriptor, as the plan does.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_waves::MAX_WAVES))]
     prefill_waves: Option<usize>,
+    /// Admitted prefill slots (1 to 4, #762): the Spark link's return slots and the units each rank's
+    /// prefill owner buffers. More than --prefill-waves lets the engine choose each call's depth at
+    /// runtime within them, measuring the Sparks' unit pace; equal pins it. The launcher passes the
+    /// plan's; unset, the shared prefill policy resolves them as the plan does.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_waves::MAX_WAVES))]
+    prefill_slots: Option<usize>,
     /// Project every prefill row's logits (prefill-shaped probe scoring);
     /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
@@ -110,17 +117,15 @@ pub(crate) struct ServeArgs {
     api: crate::shared::api::ApiArgs,
 }
 impl ServeArgs {
-    /// The prefill shape (unit rows, waves): the launch's pins (the launcher passes the plan's
-    /// resolved shape; one wave may take any rows a launch holds), and the plan's own resolution
-    /// (`admission::prefill_shape`, MiniMax's descriptor estimate) for whatever is not pinned.
-    pub(crate) fn shape(&self) -> Result<(usize, usize)> {
-        if let (Some(rows), Some(waves)) = (self.prefill_rows, self.prefill_waves) { return Ok((rows as usize, waves)); }
-        let shape = admission::prefill_shape(self.prefill_rows.map_or(0, u64::from), self.prefill_waves.map_or(0, |w| w as u64),
-            self.peers.len())?;
-        Ok((usize::try_from(shape.unit_rows)?, usize::try_from(shape.waves)?))
+    /// The admitted prefill (unit rows, starting waves, slots and span): the plan's own resolution
+    /// (`admission::prefill_shape` over MiniMax's adaptive descriptor) with the launch's values as pins
+    /// (the launcher passes the plan's resolved unit, waves and slots; explicit waves alone pin the depth).
+    pub(crate) fn shape(&self) -> Result<prefill_waves::PrefillPlan> {
+        admission::prefill_shape(self.prefill_rows.map_or(0, u64::from), self.prefill_waves.map_or(0, |w| w as u64),
+            self.prefill_slots.map_or(0, |s| s as u64), self.peers.len())
     }
     pub(crate) fn validate(&self) -> Result<Option<usize>> {
-        let (rows, _) = self.shape()?;
+        let rows = usize::try_from(self.shape()?.unit_rows)?;
         // The Spark worlds the expert package ships (the shared Spark-range policy).
         let worlds = admission::spark_worlds();
         if self.device < 0 || !worlds.contains(&self.peers.len())
@@ -213,15 +218,16 @@ pub(super) struct Runtime<'a> {
 
 /// The start-up after admission, shared by serve and golden: Spark worker admission runs while
 /// the target weights, token embedding and local experts load, then the KV cache is allocated and
-/// the Spark link connects (one connection per rank; one return slot per prefill lane).
+/// the Spark link connects (one connection per rank; return slots cut from one reserve per rank).
 pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, device: i32,
     programs: &'a cuteafd_ffi::programs::Programs<'a>, start: Start<'_>) -> Result<Runtime<'a>> {
     let library = library_owner.as_ref();
     let Start { snapshot, checkpoint, cfg, sizing, ledger, cache, local_layers, spark_layers, peers, catalog,
         package, embed, available, draft } = start;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
-    // One link carries decode and every prefill wave: one persistent client per rank, its endpoint a
-    // unit's rows, and an execution slot per wave in flight, as the planner charges every rank.
+    // One link carries decode and every prefill wave: one persistent client per rank, its endpoint the
+    // admitted unit's rows, and typed owners buffering a unit per admitted slot, as the planner charges
+    // every rank.
     let model = admission::spark_model(sizing)?;
     let endpoint = sizing.spark_endpoint()?;
     let pending = if spark_layers.is_empty() { None } else {
@@ -269,7 +275,7 @@ pub(super) fn start<'a>(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, devi
         Some(&first) => {
             cuteafd_transport::worker_selection::require_peer_clients(peers, endpoint, 1)?;
             Some(super::routed::Spark::connect(library_owner, device, SparkWorld::canonical(peers.len())?, peers,
-                sizing.unit_rows, config, first, request, sizing.waves)?)
+                sizing.unit_rows, config, first, request, sizing.slots, sizing.slot_rows())?)
         }
     };
     let routed = if local.is_none() && spark.is_none() {None} else {Some(Routed::new(local, spark)?)};
@@ -291,12 +297,14 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     super::routed::require_device_landing(&library, args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
-    let ((rows, waves), sequences) = (args.shape()?, args.max_sequences as usize);
-    // The prefill shape the launch resolved (the plan's units): `--prefill-waves` units of
-    // `--prefill-rows` in flight. Head rows follow once the drafter's block is known.
+    let (prefill, sequences) = (args.shape()?, args.max_sequences as usize);
+    let rows = usize::try_from(prefill.unit_rows)?;
+    // The prefill the launch resolved (the plan's): `--prefill-slots` admitted slots of up to
+    // `--prefill-rows` rows, starting at `--prefill-waves` (#762). Head rows follow once the drafter's
+    // block is known.
     let mut sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS),
         sequences, context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context},
-        spark_ranks: args.peers.len(), logit_rows: 0, waves };
+        spark_ranks: args.peers.len(), logit_rows: 0, waves: 0, slots: 0 }.with_prefill(prefill)?;
     let span = sizing.slot_rows();
     let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::plan::families::minimax::admission::default_draft_rings(
         sequences, rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS)));
@@ -359,7 +367,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
-    let Runtime { execution, cache, embedding, token_ids, embedded, routed } = start(&library, args.device, &programs, Start {
+    let Runtime { mut execution, cache, embedding, token_ids, embedded, routed } = start(&library, args.device, &programs, Start {
         snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &admitted.ledger,
         cache: &admitted.cache, local_layers: &admitted.local_layers, spark_layers: &admitted.spark_layers,
         peers: &args.peers, catalog: &catalog, package: &package, embed: args.token_io.embed_placement, available,
@@ -369,13 +377,21 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
             (None, None) => None,
         } })?;
     let experts = routed.context("MiniMax serving admitted no routed expert owner")?;
+    // Each prefill call's depth within the admitted slots (#762): the controller reads the Sparks' unit pace
+    // from the link's replies and is calibrated before readiness (a pinned shape keeps its depth).
+    if !admitted.spark_layers.is_empty() {
+        execution.set_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(sizing.waves, sizing.slots,
+            sizing.unit_rows, !sizing.adaptive())?)?;
+    }
+    let identity = crate::shared::prefill_depth::DeploymentIdentity::new(&library, &args.peers,
+        format!("tp{}-rtx{}", args.peers.len(), admitted.local_layers.len()));
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(experts), rows: span, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
         rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits,
         trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?),
-        startup_captures: std::cell::Cell::new(None),
+        startup_captures: std::cell::Cell::new(None), identity: Some(identity),
         selector: match execution.draft() {
             Ok(super::execution::Drafter::Dflash(draft)) => Some(draft.selector_prior()?),
             _ => None,
@@ -388,7 +404,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
-        unit_rows=sizing.unit_rows, prefill_waves=sizing.waves, span_rows=span, logit_rows=sizing.logit_rows, draft_rings,
+        unit_rows=sizing.unit_rows, prefill_waves=sizing.waves, prefill_slots=sizing.slots, adaptive=sizing.adaptive(),
+        span_rows=span, logit_rows=sizing.logit_rows, draft_rings,
         speculator=%args.speculator, draft_bytes,
         "MiniMax native target; decode runs eagerly, prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator!="off" {
@@ -468,30 +485,62 @@ mod tests {
         assert!(parse("0").is_err() && parse("8").is_err());
     }
 
-    /// `--prefill-waves` is the waves the one Spark link keeps in flight (1 to 4, the plan's shape with
-    /// `--prefill-rows`); unpinned, serve resolves the plan's shape from MiniMax's descriptor (two 4096-row
-    /// waves while its estimate is unmeasured, at every Spark count). The lane flags and their aliases are gone.
+    /// `--prefill-waves` is the depth a prefill call starts at (1 to 4) and `--prefill-slots` the slots the one
+    /// Spark link admits (#762). Unpinned, serve resolves the plan's prefill from MiniMax's adaptive descriptor:
+    /// four 4096-row slots in the 8256-row reserve, starting at two waves (its estimate is unmeasured) at every
+    /// Spark count. The launcher passes the plan's values back; explicit waves alone pin the depth, as the plan
+    /// pins them, and a pin beyond the shared reserve is refused as the plan refuses it. The lane flags and their
+    /// aliases are gone.
     #[test]
     fn minimax_prefill_waves_take_one_to_four_without_lane_aliases() {
         let parse = |peers: &str, extra: &[&str]| match crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot",
             "/model", "--native-lib", "/lib.so", "--peers", peers].into_iter().chain(extra.iter().copied())) {
-            Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) => a.shape().ok(),
+            Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) =>
+                a.shape().ok().map(|p| (p.unit_rows, p.waves, p.slots, p.span_rows)),
             _ => None,
         };
         let waves = |extra: &[&str]| parse("127.0.0.1:1,127.0.0.1:2", extra);
-        assert_eq!(waves(&[]), Some((4096, 2)));
+        assert_eq!(waves(&[]), Some((4096, 2, 4, 8256)));
         let six = (1..=6).map(|port| format!("127.0.0.1:{port}")).collect::<Vec<_>>().join(",");
-        assert_eq!(parse(&six, &[]), Some((4096, 2)));
-        assert_eq!(parse(&six, &["--prefill-waves", "3"]), Some((2752, 3)));
-        for (rows, waves) in [(4096, 2), (2752, 3)] {
-            assert_eq!(cuteafd_loader::plan::families::minimax::admission::prefill_shape(0, waves, 6).unwrap().unit_rows, rows);
+        assert_eq!(parse(&six, &[]), Some((4096, 2, 4, 8256)));
+        assert_eq!(parse(&six, &["--prefill-rows", "4096", "--prefill-waves", "2", "--prefill-slots", "4"]), Some((4096, 2, 4, 8256)));
+        assert_eq!(parse(&six, &["--prefill-waves", "3"]), Some((2752, 3, 3, 8256)));
+        assert_eq!(parse(&six, &["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-slots", "3"]), Some((2752, 3, 3, 8256)));
+        for (rows, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
+            assert_eq!(cuteafd_loader::plan::families::minimax::admission::prefill_shape(0, waves, 0, 6).unwrap().unit_rows, rows);
         }
-        assert_eq!(waves(&["--prefill-rows", "2048", "--prefill-waves", "3"]), Some((2048, 3)));
-        assert_eq!(waves(&["--prefill-rows", "2752", "--prefill-waves", "4"]), Some((2752, 4)));
-        for refused in ["0", "5"] { assert_eq!(waves(&["--prefill-waves", refused]), None, "{refused} waves"); }
+        assert_eq!(waves(&["--prefill-rows", "2048", "--prefill-waves", "3"]), Some((2048, 3, 3, 6144)));
+        assert_eq!(waves(&["--prefill-waves", "1"]), Some((4096, 1, 1, 4096)));
+        // Beyond the 8192-row reserve, or slots below the starting depth.
+        assert_eq!(waves(&["--prefill-rows", "2752", "--prefill-waves", "4"]), None);
+        assert_eq!(waves(&["--prefill-waves", "3", "--prefill-slots", "2"]), None);
+        for refused in ["0", "5"] {
+            assert_eq!(waves(&["--prefill-waves", refused]), None, "{refused} waves");
+            assert_eq!(waves(&["--prefill-slots", refused]), None, "{refused} slots");
+        }
         for gone in ["--prefill-lanes", "--prefill-batch-tokens", "--prefill-lane-rows"] {
             assert_eq!(waves(&[gone, "2"]), None, "{gone}");
         }
+    }
+
+    /// Serving chooses each prefill call's depth at runtime (#762): serve starts the shared controller over the
+    /// admitted slots (pinned unless adaptive) whenever routed layers run on the Sparks, and the backend hands it
+    /// and its deployment to the shared scheduler, which calibrates it before readiness. Golden pins its depth.
+    #[test]
+    fn minimax_serving_chooses_its_prefill_depth_at_runtime() {
+        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        let worker = serve.split("fn worker(").nth(1).unwrap();
+        let depth = worker.find("execution.set_prefill_depth(").expect("serve starts the controller");
+        assert!(worker[depth..].starts_with("execution.set_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(\
+            sizing.waves, sizing.slots,"));
+        assert!(worker.contains("sizing.unit_rows, !sizing.adaptive())?)?;"));
+        assert!(worker[..depth].trim_end().ends_with("if !admitted.spark_layers.is_empty() {"));
+        assert!(depth < worker.find("scheduler::schedule(&backend,").unwrap());
+        assert!(worker.contains("identity: Some(identity),"));
+        let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(backend.contains("Some((self.execution.prefill_depth()?, self.identity.clone()?))"));
+        let golden = include_str!("golden.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(golden.contains("waves:args.prefill_waves, slots:args.prefill_waves};") && !golden.contains("set_prefill_depth"));
     }
 
     /// MiniMax decodes on the shared Qwen scheduler, whose decode round is lane 0 of a shared LaneSet
