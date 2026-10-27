@@ -20,7 +20,7 @@ pub(crate) struct PrefillDepth {
     slots: usize,
     unit_cap: usize,
     control: RefCell<WaveControl>,
-    /// The running call's depth units actually in flight and its context end,
+    /// The running call's depth (units actually in flight) and prompt rows,
     /// reported with its pace at the next transition.
     call: std::cell::Cell<Option<(usize, u64)>>,
 }
@@ -58,28 +58,27 @@ impl PrefillDepth {
     }
 
     /// The decode→prefill transition: `pace` (the previous call's, when its
-    /// last wave has landed) is reported for that call, then the depth of the
-    /// call ending at context row `context` is chosen (by its context class).
-    pub(crate) fn begin(&self, pace: Option<PrefillPace>, context: usize) -> Depth {
-        if let (Some(pace), Some((waves, ended))) = (pace, self.call.take()) { self.finish(waves, ended, &pace); }
-        self.control.borrow_mut().choose(context as u64);
+    /// last wave has landed) is reported for that call, then this call's
+    /// depth is returned.
+    pub(crate) fn begin(&self, pace: Option<PrefillPace>) -> Depth {
+        if let (Some(pace), Some((waves, rows))) = (pace, self.call.take()) { self.finish(waves, rows, &pace); }
         let depth = self.next();
-        self.call.set(Some((depth.waves, context as u64)));
+        self.call.set(Some((depth.waves, 0)));
         depth
     }
 
-    /// The running call cut `units` units: fewer than its depth when short.
-    pub(crate) fn ran(&self, units: usize) {
-        if let Some((waves, context)) = self.call.get() { self.call.set(Some((units.min(waves), context))); }
+    /// The running call cut `units` units of `rows` prompt rows in all
+    /// (fewer units than its depth when short).
+    pub(crate) fn ran(&self, units: usize, rows: usize) {
+        if let Some((waves, _)) = self.call.get() { self.call.set(Some((units.min(waves), rows as u64))); }
     }
 
-    fn finish(&self, waves: usize, context: u64, pace: &PrefillPace) -> Decision {
-        let before = self.next();
-        let d = self.control.borrow_mut().observe(waves as u64, context, pace);
-        // One line per reported call (its depth and its class's measured period).
-        tracing::info!(waves, unit_rows = before.unit_rows, context, next_waves = d.waves,
-            next_unit_rows = d.unit_rows, rows = pace.rows, busy_us_per_row = ?d.busy_us_per_row,
-            idle_us_per_row = ?d.idle_us_per_row, period_us = ?d.period_us, reason = d.reason, "prefill depth");
+    fn finish(&self, waves: usize, rows: u64, pace: &PrefillPace) -> Decision {
+        let d = self.control.borrow_mut().observe(waves as u64, rows, pace);
+        // One line per reported call: its depth, period, Spark idle and the next depth.
+        tracing::info!(ran = d.ran, rows, wall_us = pace.wall_us, period_us = ?d.period_us,
+            idle_share = ?d.idle_share, next_waves = d.waves, next_unit_rows = d.unit_rows, reason = d.reason,
+            "prefill depth");
         d
     }
 }
@@ -95,8 +94,8 @@ mod tests {
         assert_eq!(depth.call_rows(), 8192);
         assert_eq!(PrefillDepth::new(3, 3, 2752, true)?.call_rows(), 8256);
         let pinned = PrefillDepth::new(2, 4, 4096, true)?;
-        let starving = PrefillPace { rows: 60_000, ranks: vec![(1_000_000, 500_000); 6] };
-        for _ in 0..4 { pinned.begin(Some(starving.clone()), 65_536); }
+        let starving = PrefillPace { rows: 60_000, ranks: vec![(1_000_000, 500_000); 6], wall_us: 3_000_000 };
+        for _ in 0..4 { pinned.begin(Some(starving.clone())); pinned.ran(2, 8192); }
         assert_eq!(pinned.next(), Depth { waves: 2, unit_rows: 4096 });
         assert!(PrefillDepth::new(5, 4, 2048, false).is_err());
         assert!(PrefillDepth::new(1, 4, 8192, false).is_err());
@@ -104,17 +103,16 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_call_counts_only_at_its_own_depth_and_context_class() -> anyhow::Result<()> {
+    fn a_reported_call_counts_with_its_rows_and_depth() -> anyhow::Result<()> {
         let depth = PrefillDepth::new(3, 4, 4096, false)?;
-        let pace = PrefillPace { rows: 10_000, ranks: vec![(40_000, 1_000); 6] };
-        // The first call is measured, then the class explores its next candidate.
-        assert_eq!(depth.begin(None, 8192).waves, 3);
-        assert_eq!(depth.begin(Some(pace.clone()), 8192).waves, 2);
-        // A short call (fewer units than its depth) is not a measurement.
-        depth.ran(1);
-        assert_eq!(depth.begin(Some(pace.clone()), 8192).waves, 2);
-        // The long class keeps its own state.
-        assert_eq!(depth.begin(Some(pace), 65_536).waves, 3);
+        // Sparks waiting on the coordinator point at fewer, wider units.
+        let idle = PrefillPace { rows: 10_000, ranks: vec![(40_000, 10_000); 6], wall_us: 40_000 };
+        assert_eq!(depth.begin(None).waves, 3);
+        depth.ran(3, 8192);
+        assert_eq!(depth.begin(Some(idle.clone())).waves, 2);
+        // A call below 60% of the smallest unit is no sample: the depth stays.
+        depth.ran(1, 1000);
+        assert_eq!(depth.begin(Some(idle)).waves, 2);
         Ok(())
     }
 }

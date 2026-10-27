@@ -275,10 +275,9 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             // The decode->prefill transition (#762): the previous call's Spark pace
             // (no host wait), this call's depth, the link re-cut to it at rest.
             let depth = self.depth.as_ref().context("Step-5 prefill depth")?;
-            let context = descriptors[0].base + first_row;
             let next = self.execution.with_link(|link| {
                 let pace = link.exchange()?.take_prefill();
-                let next = depth.begin(pace, context);
+                let next = depth.begin(pace);
                 link.set_geometry(next.waves, next.unit_rows)?;
                 link.exchange()?.begin_prefill()?;
                 Ok(next)
@@ -286,7 +285,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             let units = crate::shared::prefill_pipeline::prefill_units(first_row, next.unit_rows, next.waves, 64)?
                 .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index,
                     sequence: 0, rows, layers: 0..92, slot: index % next.waves, barrier: false }).collect::<Vec<_>>();
-            depth.ran(units.len());
+            depth.ran(units.len(), first_row);
             let ran = self.execution.enqueue_units(&mut step, &input.residual, kind, &units, next.waves);
             // The call's last wave is sent: later waves are not its.
             self.execution.with_link(|link| { link.exchange()?.stop_prefill(); Ok(()) })?;

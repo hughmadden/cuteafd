@@ -738,7 +738,12 @@ fn worker_sums_prefill_wave_pace_before_publishing_landed() -> Result<()> {
         worker.join().unwrap().0
     })?;
     // Wave 2 is rank 0's first prefill unit; waves 3 and 4 count.
+    // No begin_prefill here: the call's wall time is unknown (0).
     assert_eq!(link.prefill().finish(),
-        cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: 200, ranks: vec![(7_000, 70)] });
+        cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: 200, ranks: vec![(7_000, 70)], wall_us: 0 });
+    let mut timed = PrefillAccumulator { began: Some(std::time::Instant::now()), ..Default::default() };
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    timed.add(100, &[Some((10, 1)), None, None, None, None, None, None, None]);
+    assert!(timed.finish().wall_us >= 2_000, "the call's wall time runs from begin to its last landing");
     Ok(())
 }

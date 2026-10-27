@@ -234,12 +234,16 @@ pub(crate) struct PrefillAccumulator {
     ranks: [(u64, u64); cuteafd_core::MAX_SPARK_WORLD],
     seen: [bool; cuteafd_core::MAX_SPARK_WORLD],
     world: usize,
+    /// The call's host start ([`Waves::begin_prefill`]) and its last wave's landing.
+    began: Option<std::time::Instant>,
+    landed: Option<std::time::Instant>,
 }
 
 impl PrefillAccumulator {
     /// One landed prefill wave of `rows` rows with each rank's reported pace.
     /// Its rows count once every reporting rank has passed its first unit.
     pub(crate) fn add(&mut self, rows: usize, pace: &[Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD]) {
+        self.landed = Some(std::time::Instant::now());
         let mut counted = false;
         for (rank, sample) in pace.iter().enumerate() {
             let Some((busy, idle)) = *sample else { continue };
@@ -253,8 +257,12 @@ impl PrefillAccumulator {
     }
     /// The call's pace (empty when no rank reported past its first unit).
     pub(crate) fn finish(&self) -> cuteafd_loader::serving_capacity::wave_control::PrefillPace {
+        let wall_us = match (self.began, self.landed) {
+            (Some(began), Some(landed)) => landed.saturating_duration_since(began).as_micros() as u64,
+            _ => 0,
+        };
         cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: self.rows,
-            ranks: self.ranks[..self.world].to_vec() }
+            ranks: self.ranks[..self.world].to_vec(), wall_us }
     }
 }
 
@@ -1017,7 +1025,7 @@ impl<'a> Waves<'a> {
     /// previous call's sums. Call with no wave outstanding.
     pub(crate) fn begin_prefill(&mut self) -> Result<()> {
         ensure!(self.outstanding.is_empty(), "a prefill call begins with no Spark wave outstanding");
-        *self.pace.prefill() = PrefillAccumulator::default();
+        *self.pace.prefill() = PrefillAccumulator { began: Some(std::time::Instant::now()), ..Default::default() };
         self.prefill = true;
         self.prefill_last = None;
         Ok(())

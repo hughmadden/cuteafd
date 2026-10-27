@@ -296,19 +296,25 @@ and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
   Spark pace to its `PrefillDepth`
   ([daemon/shared/prefill_depth.rs:19](../../rust/crates/cuteafd-daemon/src/shared/prefill_depth.rs#L19)).
   The pace is busy and idle time per unit, measured on the Spark prefill owner
-  and returned in the reply header, and it is read without a host wait.
-  Busy + idle per row on the critical rank is the call's delivered period.
-  `WaveControl` measures each candidate depth (2 × 4096, 3 × 2752,
-  4 × 2048) once per context class (calls ending at most 16K context rows,
-  and longer), then runs the class's lowest, re-measuring the current depth
-  on every full-depth call. No depth is predicted from another, because
-  coordinator turnaround per row depends on the unit size. The engine then
-  takes the next depth, re-cuts the prefill link's return slots at
-  rest, and brackets the call. GLM 5 does this in `start_prefill`
-  ([daemon/families/glm5/engine.rs:1368](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1368)),
+  and returned in the reply header, plus the call's host wall time from its
+  start to its last wave's landing. It is read without a host wait.
+  `WaveControl` (`wave_control.rs`) treats every prefill call of at least 60%
+  of the smallest unit as a sample of its overall period per prompt row
+  (wall / rows) for the depth it ran, and keeps each depth's last two
+  samples. A sample expires after 15 prefill calls of any size. After each
+  call it runs the depth with the best fresh period. The one exception: if the
+  Sparks' idle share points at a neighbouring depth that has no fresh
+  evidence, it steps once that way to measure it. Above 5% idle points at
+  fewer, wider units; below 1% points at more units. There is no other
+  exploration. The engine then takes that depth, re-cuts the prefill link's
+  return slots at rest, and brackets the call. GLM 5 does this in
+  `start_prefill`
+  ([daemon/families/glm5/engine.rs:1366](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1366)),
   Kimi in `RoutedLane::start_prefill`
-  ([daemon/families/kimi_k3/spark.rs:140](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/spark.rs#L140)).
-- **One call** is `call_rows` (`wave_control.rs:57`): the smallest
+  ([daemon/families/kimi_k3/spark.rs:140](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/spark.rs#L140)),
+  and Step in its backend's prefill path
+  ([daemon/families/step5/backend.rs:278](../../rust/crates/cuteafd-daemon/src/families/step5/backend.rs#L278)).
+- **One call** is `call_rows` (`wave_control.rs:60`): the smallest
   k × unit over the candidate depths, 8192 rows at U = 4096. Every depth
   therefore cuts whole units.
 - **Storage never changes.** Every depth's slots are views at

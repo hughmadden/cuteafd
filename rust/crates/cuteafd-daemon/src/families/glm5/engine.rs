@@ -989,7 +989,7 @@ impl<'a> GlmEngine<'a> {
             let link = link.as_mut().context("GLM prefill units need the prefill link")?;
             // The decode->prefill transition (#762): the previous call's pace,
             // this call's depth, the link re-cut to it.
-            let depth = self.start_prefill(link, start + t)?;
+            let depth = self.start_prefill(link)?;
             let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
                 MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
@@ -997,7 +997,7 @@ impl<'a> GlmEngine<'a> {
                 lanes.push(self.prefill_tables(placement, start + rows.start, rows.len())?);
                 chunks.push(&tokens[rows]);
             }
-            self.depth.ran(lanes.len());
+            self.depth.ran(lanes.len(), t);
             let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
             let logits = self.step_lanes(&lanes, &chunks, depth, logit_rows, link, runtime);
             // The call's last wave is sent: later waves are not its.
@@ -1363,9 +1363,9 @@ impl<'a> GlmEngine<'a> {
     /// Spark pace (when its last wave has landed on the host; no wait) to the
     /// depth controller, the next depth, the link re-cut to it at rest, and
     /// this call's waves flagged as the prefill's.
-    fn start_prefill(&self, link: &mut SparkLink<'_>, context: usize) -> Result<crate::shared::prefill_depth::Depth> {
+    fn start_prefill(&self, link: &mut SparkLink<'_>) -> Result<crate::shared::prefill_depth::Depth> {
         let pace = link.exchange()?.take_prefill();
-        let next = self.depth.begin(pace, context);
+        let next = self.depth.begin(pace);
         ensure!(next.waves <= link.slots() && next.unit_rows <= self.prefill_rows,
             "prefill depth {next:?} outside the link's {} admitted slots", link.slots());
         link.set_geometry(next.waves, next.unit_rows)?;
