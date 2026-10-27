@@ -163,6 +163,13 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     pub fn inputs(&self) -> [CuteafdDeviceBuffer; 2] {
         self.attention.inputs()
     }
+    /// Selects this slot's unit rows in both boundaries' shared planes
+    /// (`shared::memory::row_window`), at rest.
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        ensure!(matches!(self.phase, Phase::Idle), "block window changes only at rest");
+        self.attention.select_window(window.clone())?;
+        self.ffn.select_window(window)
+    }
     pub fn reset(&mut self) {
         self.phase = Phase::Idle;
         self.tokens.clear();

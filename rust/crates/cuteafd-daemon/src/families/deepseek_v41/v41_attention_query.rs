@@ -107,19 +107,25 @@ impl<'a> AttentionQueryWeights<'a> {
             AttentionQueryWave::device_bytes_with_split(self.library, capacity,self.split_query_b)? <= budget,
             "attention query wave exceeds budget"
         );
+        self.on_storage(self.storage(capacity, capacity)?)
+    }
+    /// Shared storage: row planes over `rows` reserve rows, GEMM plans and
+    /// scratch for units of up to `unit` rows.
+    pub fn storage(&self, rows: u32, unit: u32) -> Result<std::rc::Rc<AttentionQueryStorage<'a>>> {
+        ensure!(unit >= 1 && unit <= rows, "attention query unit {unit} outside {rows} rows");
         let stream = LoadStream {
             library: self.library,
             raw: self.library.cuda_stream_create()?,
         };
         let kernels = MATRICES
             .into_iter().take(if self.split_query_b {1} else {2})
-            .map(|(k, n)| self.library.v41_fp8_matrix_plan(capacity, k, n))
+            .map(|(k, n)| self.library.v41_fp8_matrix_plan(unit, k, n))
             .collect::<Result<Vec<_>>>()?;
         let scratch = kernels
             .iter()
             .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize))
             .collect::<Result<Vec<_>>>()?;
-        let value = AttentionQueryWave {
+        let storage = AttentionQueryStorage {
             stream,
             kernels,
             scratch,
@@ -128,33 +134,44 @@ impl<'a> AttentionQueryWeights<'a> {
                 .into_iter().enumerate()
                 .map(|(i, n)| {
                     if i == 4 && !cfg!(test) { Ok(None) }
-                    else { DeviceAllocation::new(self.library, n * capacity as usize).map(Some) }
+                    else { DeviceAllocation::new(self.library, n * rows as usize).map(Some) }
                 })
                 .collect::<Result<Vec<_>>>()?,
+            rows,
+            unit,
+        };
+        for i in 0..storage.kernels.len() {
+            let launched = unsafe {
+                storage.kernels[i].initialize_scratch(
+                    storage.scratch[i].buffer,
+                    storage.alpha.buffer,
+                    storage.stream.raw,
+                )
+            };
+            launched.and(unsafe { self.library.cuda_stream_synchronize(storage.stream.raw) })?;
+        }
+        Ok(std::rc::Rc::new(storage))
+    }
+    /// A slot's query over shared `storage` (one per GPU for prefill slots).
+    pub fn on_storage(&self, storage: std::rc::Rc<AttentionQueryStorage<'a>>) -> Result<AttentionQueryWave<'_, 'a>> {
+        ensure!(storage.kernels.len() == self.scales.len(), "attention query storage plans differ from the weights");
+        let value = AttentionQueryWave {
+            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
             norm: self.library.v41_attention_ops()?,
-            position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
             weights: self,
-            capacity,
+            capacity: storage.unit,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             tp2_prefix_graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             ready: None,
             binding: None,
             tokens: Vec::new(),
+            window: crate::shared::memory::row_window::RowWindow::NONE,
+            storage,
         };
         ensure!(
             value.b(0).device_id == self.tensors.get(&self.names[0])?.device_id,
             "query weight device differs"
         );
-        for i in 0..value.kernels.len() {
-            let launched = unsafe {
-                value.kernels[i].initialize_scratch(
-                    value.scratch[i].buffer,
-                    value.alpha.buffer,
-                    value.stream.raw,
-                )
-            };
-            launched.and(value.synchronize())?;
-        }
         Ok(value)
     }
 }
@@ -184,12 +201,35 @@ impl AttentionQueryOutput<'_> {
         Ok(self.tokens)
     }
 }
-pub(crate) struct AttentionQueryWave<'w, 'a> {
+/// The attention query's stream, GEMM scratch and row planes
+/// (`shared::memory::row_window` contract). The outputs (hidden, ranks,
+/// rotated, positions, frequencies) are row planes, because the window,
+/// compressor, index and sparse attention read them on their own streams.
+/// The GEMM plans' scratch and alpha are scratch: this stream writes and
+/// consumes them inside one hook. Prefill slots share one per GPU.
+pub(crate) struct AttentionQueryStorage<'a> {
     stream: LoadStream<'a>,
     kernels: Vec<V41Fp8Plan<'a>>,
     scratch: Vec<DeviceAllocation<'a>>,
     alpha: DeviceAllocation<'a>,
     buffers: Vec<Option<DeviceAllocation<'a>>>,
+    /// Rows the planes span (the reserve); the plans run units up to `unit`.
+    rows: u32,
+    unit: u32,
+}
+impl Drop for AttentionQueryStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the stream is owned here; queued work reads only this storage.
+        if let Err(error) = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } {
+            tracing::error!(%error, "draining attention query storage");
+        }
+    }
+}
+pub(crate) struct AttentionQueryWave<'w, 'a> {
+    storage: std::rc::Rc<AttentionQueryStorage<'a>>,
+    /// This unit's rows in every plane (`RowWindow::NONE`: from row 0).
+    window: crate::shared::memory::row_window::RowWindow,
+    /// Per slot: rewritten on the host for each unit (pinned staging rule).
     position_staging: HostAllocation<'a>,
     norm: V41AttentionOps<'a>,
     weights: &'w AttentionQueryWeights<'a>,
@@ -208,12 +248,12 @@ impl<'w, 'a> AttentionQueryWave<'w, 'a> {
         self.binding = None;
         self.tokens.clear();
         ensure!(
-            std::ptr::eq(self.stream.library, weights.library)
-                && self.kernels.len()==weights.scales.len()
+            std::ptr::eq(self.storage.stream.library, weights.library)
+                && self.storage.kernels.len()==weights.scales.len()
                 && weights.tensors.get(&weights.names[0])?.device_id == self.b(0).device_id,
             "attention rebound weight library or device differs"
         );
-        self.stream.require_complete()?;
+        self.storage.stream.require_complete()?;
         self.weights = weights;
         Ok(())
     }
@@ -231,7 +271,19 @@ impl AttentionQueryWave<'_, '_> {
         Ok(bytes)
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
-        self.buffers[i].as_ref().expect("query buffer is allocated").buffer
+        self.window.apply(self.storage.buffers[i].as_ref().expect("query buffer is allocated").buffer, ROW_BYTES[i])
+    }
+    /// Selects this slot's unit rows in the shared planes, at rest
+    /// (`shared::memory::row_window`).
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        ensure!(self.ready.is_none(), "attention query window changes only at rest");
+        if let Some(range) = window.range() {
+            ensure!(range.end <= self.storage.rows as usize && range.len() <= self.capacity as usize,
+                "attention query window {range:?} outside {} rows or wider than the {}-row unit",
+                self.storage.rows, self.capacity);
+        }
+        self.window = window;
+        Ok(())
     }
     pub fn layer(&self) -> usize {
         self.weights.layer
@@ -243,15 +295,15 @@ impl AttentionQueryWave<'_, '_> {
         self.b(5)
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
     }
     fn validate(&mut self, rows: u32) -> Result<()> {
         self.ready = None;
         self.binding = None;
         self.tokens.clear();
         ensure!(
-            rows > 0 && rows <= self.capacity,
-            "query rows exceed capacity"
+            rows > 0 && rows <= self.capacity && self.window.admits(rows as usize),
+            "query rows exceed capacity or the unit's window"
         );
         Ok(())
     }
@@ -262,17 +314,17 @@ impl AttentionQueryWave<'_, '_> {
                 self.b(6),
                 rows,
                 self.weights.layer as u32,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
-            self.kernels[0].launch(
+            self.storage.kernels[0].launch(
                 self.b(0),
                 self.weights.tensors.get(&self.weights.names[0])?,
                 self.weights.scales[0].buffer,
-                self.scratch[0].buffer,
-                self.alpha.buffer,
+                self.storage.scratch[0].buffer,
+                self.storage.alpha.buffer,
                 self.b(1),
                 rows,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
             self.norm.norm(
                 self.b(1),
@@ -281,7 +333,7 @@ impl AttentionQueryWave<'_, '_> {
                 self.b(2),
                 rows,
                 1280,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
         }
         Ok(())
@@ -290,22 +342,22 @@ impl AttentionQueryWave<'_, '_> {
         ensure!(!self.weights.split_query_b,"split query-B weights require TP2 execution");
         unsafe {
             self.enqueue_rank(rows)?;
-            self.kernels[1].launch(
+            self.storage.kernels[1].launch(
                 self.b(2),
                 self.weights.tensors.get(&self.weights.names[2])?,
                 self.weights.scales[1].buffer,
-                self.scratch[1].buffer,
-                self.alpha.buffer,
+                self.storage.scratch[1].buffer,
+                self.storage.alpha.buffer,
                 self.b(3),
                 rows,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
             // Preserve the pre-RoPE tensor only for numerical trace fixtures.
             // Serving rotates the completed projection in place, saving one
             // 64-head BF16 buffer per lane without changing the kernel math.
             #[cfg(test)]
-            self.stream.library.copy_d2d_async(self.b(4), self.b(3),
-                rows as usize * ROW_BYTES[3], self.stream.raw)?;
+            self.storage.stream.library.copy_d2d_async(self.b(4), self.b(3),
+                rows as usize * ROW_BYTES[3], self.storage.stream.raw)?;
             self.norm.rope(
                 self.b(3),
                 self.b(6),
@@ -313,7 +365,7 @@ impl AttentionQueryWave<'_, '_> {
                 rows,
                 64,
                 false,
-                self.stream.raw,
+                self.storage.stream.raw,
             )?;
         }
         Ok(())
@@ -324,8 +376,9 @@ impl AttentionQueryWave<'_, '_> {
     /// this wave; callers bind outputs to the matching request/query snapshot.
     pub unsafe fn execute(&mut self, rows: u32) -> Result<AttentionQueryOutput<'_>> {
         self.validate(rows)?;
+        // Launch and return under a stage chain; outside one, `finish` drains.
         let launched = unsafe { self.enqueue(rows) };
-        launched.and(self.synchronize())?;
+        launched.and(unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) })?;
         self.ready = Some(rows);
         self.output()
     }
@@ -350,12 +403,12 @@ impl AttentionQueryWave<'_, '_> {
     /// Capture only after the input producer and warmup have completed.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
         unsafe {
-            self.stream
+            self.storage.stream
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 if let Err(error) = unsafe {
@@ -363,7 +416,7 @@ impl AttentionQueryWave<'_, '_> {
                         .insert(self.weights.layer, self.weights, rows, graph)
                 } {
                     unsafe {
-                        self.stream.library.cuda_graph_exec_destroy(graph)?;
+                        self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
                     }
                     return Err(error);
                 }
@@ -371,7 +424,7 @@ impl AttentionQueryWave<'_, '_> {
             }
             (Err(e), Ok(graph)) => {
                 unsafe {
-                    self.stream.library.cuda_graph_exec_destroy(graph)?;
+                    self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(e)
             }
@@ -388,11 +441,11 @@ impl AttentionQueryWave<'_, '_> {
             .context("attention query graph missing")?;
         ensure!(count == rows, "attention query capture row count differs");
         let launched = unsafe {
-            self.stream
+            self.storage.stream
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.storage.stream.raw)
         };
-        launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
+        launched.and(unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) })?;
         self.ready = Some(rows);
         self.output()
     }
@@ -429,14 +482,14 @@ impl AttentionQueryWave<'_, '_> {
         }
         let prepared_and_executed = (|| -> Result<()> {
             unsafe {
-                crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-                self.stream.library.copy_host_buffer_h2d_async(
-                    self.positions(), self.position_staging.buffer, tokens.len() * 8, self.stream.raw,
+                crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+                self.storage.stream.library.copy_host_buffer_h2d_async(
+                    self.positions(), self.position_staging.buffer, tokens.len() * 8, self.storage.stream.raw,
                 )?;
             }
-            prepare(self.stream.raw, self.input())?;
+            prepare(self.storage.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
-            unsafe { crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?; }
             let rows = tokens.len() as u32;
             if !super::graph_policy::captures_shape(rows) {
                 unsafe { self.execute(rows)?; }
@@ -483,17 +536,17 @@ impl AttentionQueryWave<'_, '_> {
         }
         let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
         let queued = (|| -> Result<()> { unsafe {
-            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-            self.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
-                tokens.len()*8, self.stream.raw)?;
-            prepare(self.stream.raw, self.input())?;
+            crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
+                tokens.len()*8, self.storage.stream.raw)?;
+            prepare(self.storage.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
-            crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?;
-            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+            crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?;
+            crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
                 rows as usize, graph.map(|(raw, _)| raw), || self.enqueue(rows))
         } })();
-        let drained = if queued.is_err() { self.stream.wait().await }
-            else { unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await } };
+        let drained = if queued.is_err() { self.storage.stream.wait().await }
+            else { unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await } };
         queued.and(drained)?;
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
@@ -523,7 +576,7 @@ impl AttentionQueryWave<'_, '_> {
         ensure!(tokens.iter().all(|&p|p<1048576)
             && projection.kind()==crate::families::deepseek_v41::v41_projection_tp2::Kind::QueryB
             && projection.output_device().id==self.input().device_id
-            && std::ptr::eq(projection.output_device().library,self.stream.library),"TP2 query origin differs");
+            && std::ptr::eq(projection.output_device().library,self.storage.stream.library),"TP2 query origin differs");
         let rows=tokens.len() as u32;
         let binding=QueryBinding::new(self.weights.layer)?;
         for (dst,token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
@@ -539,33 +592,33 @@ impl AttentionQueryWave<'_, '_> {
                 }
             }
         }
-        let mut guard=Drain { stream:&self.stream,complete:false };
+        let mut guard=Drain { stream:&self.storage.stream,complete:false };
         let graph=self.tp2_prefix_graphs.get_shape(self.weights.layer,self.weights,rows);
         unsafe {
-            self.stream.library.copy_host_buffer_h2d_async(self.positions(),self.position_staging.buffer,
-                tokens.len()*8,self.stream.raw)?;
-            prepare(self.stream.raw,self.input())?;
-            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+            self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(),self.position_staging.buffer,
+                tokens.len()*8,self.storage.stream.raw)?;
+            prepare(self.storage.stream.raw,self.input())?;
+            crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
                 rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))?;
-            projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.stream.raw),|projected,stream| {
-                self.stream.library.copy_d2d_async(self.b(3),projected,rows as usize*ROW_BYTES[3],stream)?;
+            projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.storage.stream.raw),|projected,stream| {
+                self.storage.stream.library.copy_d2d_async(self.b(3),projected,rows as usize*ROW_BYTES[3],stream)?;
                 #[cfg(test)]
-                self.stream.library.copy_d2d_async(self.b(4),projected,rows as usize*ROW_BYTES[3],stream)?;
+                self.storage.stream.library.copy_d2d_async(self.b(4),projected,rows as usize*ROW_BYTES[3],stream)?;
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
         if graph.is_none() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
-            unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
+            unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };
-            let captured=unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+            let captured=unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
             match (queued,captured) {
                 (Ok(()),Ok(graph))=> {
                     if let Err(error)=unsafe { self.tp2_prefix_graphs.insert(self.weights.layer,self.weights,rows,graph) } {
-                        unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }return Err(error);
+                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }return Err(error);
                     }
                 },
-                (Err(error),Ok(graph))=> { unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }return Err(error); },
+                (Err(error),Ok(graph))=> { unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }return Err(error); },
                 (Err(error),Err(_)) | (Ok(()),Err(error))=>return Err(error),
             }
         }
@@ -587,7 +640,7 @@ impl AttentionQueryWave<'_, '_> {
             #[cfg(test)]
             projected: b(4),
             #[cfg(test)]
-            qb_scratch: self.scratch.get(1).map(|scratch|scratch.buffer),
+            qb_scratch: self.storage.scratch.get(1).map(|scratch|scratch.buffer),
             rotated: b(3),
             positions: b(5),
             frequencies: b(6),
@@ -649,7 +702,7 @@ mod tp2_tests {
             assert!(split_weights.tensors.get(&split_weights.names[2]).is_err());
             assert_eq!(split_weights.scales.len(),1);
             let mut query=device.own(||split_weights.wave(capacity,usize::MAX))?;
-            assert_eq!(query.scratch.len(),1);
+            assert_eq!(query.storage.scratch.len(),1);
             assert!(query.rebind(&weights).is_err());
             let halves=[vec![Weights::load(devices[0],&catalog,layer,Kind::QueryB,0,
                 Weights::load_peak_device_bytes(Kind::QueryB))?],
@@ -713,5 +766,76 @@ impl AttentionQueryWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
         for (i, s) in self.scales.iter().enumerate() { f(format!("{prefix}packed_scale{i}"), s.buffer); }
+    }
+}
+
+/// Reference pattern for the row_window contract's GPU check: in-flight units
+/// on one shared storage, each in its own window, queued behind a gated stream
+/// so every enqueue (host staging writes included) happens before any of them
+/// runs. Each unit's planes must equal a private-storage run of the same rows.
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
+    fn windowed_units_on_shared_storage_match_private_runs_behind_a_gated_stream() -> Result<()> {
+        use crate::shared::memory::row_window::RowWindow;
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let weights = AttentionQueryWeights::load(&library, &catalog, 2,
+            AttentionQueryWeights::device_bytes(&library, &catalog, 2)?, 1 << 20)?;
+        // Units of 13 rows (not a capture width: eager, as prefill units run)
+        // in a 3 x 16-row reserve; unit 1 sits mid-plane.
+        let (unit, reserve, rows) = (16u32, 48u32, 13usize);
+        let shared = weights.storage(reserve, unit)?;
+        let mut slots = [weights.on_storage(shared.clone())?, weights.on_storage(shared.clone())?];
+        let input = |seed: usize| -> Vec<u8> { (0..rows * 5120).flat_map(|i| {
+            let value = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
+            ((value.to_bits() >> 16) as u16).to_ne_bytes()
+        }).collect() };
+        let tokens = |seed: usize| -> Vec<u64> { (0..rows).map(|i| (seed * 4096 + i * 3) as u64).collect() };
+        let windows = [RowWindow::rows(0..rows), RowWindow::rows(unit as usize..unit as usize + rows)];
+        for (slot, window) in slots.iter_mut().zip(&windows) { slot.select_window(window.clone())?; }
+        let read = |output: &AttentionQueryOutput<'_>| -> Result<Vec<Vec<u8>>> {
+            [output.hidden, output.normalized_rank, output.rotated, output.positions, output.frequencies]
+                .into_iter().map(|view| { let mut bytes = vec![0; view.bytes]; library.copy_d2h(&mut bytes, view)?; Ok(bytes) })
+                .collect()
+        };
+        // A device-ordered stage chain, as encoder units run: stages launch and
+        // return; every unit's staging write and launch is queued before any runs.
+        let chain = crate::shared::memory::chain::StageChain::new(&library)?;
+        chain.set_device_order(true);
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        // Inputs staged on the device first: a pageable H2D would block the
+        // host behind the gate. The producer copies device to device.
+        let sources = [input(0), input(1)].map(|host| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
+            let buffer = crate::shared::memory::DeviceAllocation::new(&library, host.len())?;
+            library.copy_h2d(buffer.buffer, &host)?;
+            Ok(buffer)
+        });
+        let sources = sources.into_iter().collect::<Result<Vec<_>>>()?;
+        runtime.block_on(chain.handle().scope(async {
+            let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&library, shared.stream.raw)? };
+            for (seed, slot) in slots.iter_mut().enumerate() {
+                let source = sources[seed].buffer;
+                unsafe { slot.execute_tokens_prepared(&tokens(seed), |stream, destination| {
+                    library.copy_d2d_async(destination, source, source.bytes, stream)
+                })?; }
+            }
+            drop(gate);
+            anyhow::Ok(())
+        }))?;
+        chain.drain()?;
+        unsafe { library.cuda_stream_synchronize(shared.stream.raw)?; }
+        let mut actual = Vec::new();
+        for slot in &slots { actual.push(read(&slot.output()?)?); }
+        for (seed, got) in actual.iter().enumerate() {
+            let mut private = weights.wave(unit, usize::MAX)?;
+            let host = input(seed);
+            library.copy_h2d(private.input(), &host)?;
+            let expected = read(&unsafe { private.execute_tokens(&tokens(seed))? })?;
+            assert_eq!(got, &expected, "unit {seed} differs from its private run: windows or staging overlap");
+        }
+        Ok(())
     }
 }

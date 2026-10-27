@@ -19,6 +19,8 @@ pub(crate) mod peer_publication;
 pub(crate) mod proposal_replica;
 #[path = "memory/chain.rs"]
 pub(crate) mod chain;
+#[path = "memory/row_window.rs"]
+pub(crate) mod row_window;
 
 #[path = "memory/budget.rs"]
 pub(crate) mod budget;
