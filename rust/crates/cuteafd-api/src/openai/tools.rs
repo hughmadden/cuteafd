@@ -112,7 +112,18 @@ impl ToolConstraints {
                 // XTML response composition owns the optional/required branch.
                 (calls.clone(), calls)
             }
-            ToolSyntax::Dsml => calls_block("<｜DSML｜ calls>", "</｜DSML｜ calls>", tags, parallel),
+            ToolSyntax::Dsml => {
+                let calls = json!({"type":"tag",
+                    "begin":"<｜DSML｜ calls>",
+                    "content":{"type":"sequence", "elements":[
+                        {"type":"regex", "pattern":"[ \\n\\t]{0,16}"},
+                        {"type":"tags_with_separator", "tags":tags, "separator":"\n", "at_least_one":true, "stop_after_first":!parallel},
+                        {"type":"regex", "pattern":"[ \\n\\t]{0,16}"}]},
+                    "end":"</｜DSML｜ calls>"});
+                let triggered = json!({"type":"triggered_tags", "triggers":["<｜DSML｜ calls>"],
+                    "tags":[calls.clone()], "at_least_one":false, "stop_after_first":true});
+                (calls, triggered)
+            }
             ToolSyntax::GlmXml => (
                 json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
                     "stop_after_first":!parallel}),
@@ -149,9 +160,9 @@ impl ToolConstraints {
     }
 }
 
-/// A calls block (DSML, MiniMax M3): `open`, invokes separated by newlines with
-/// whitespace bounded as DSML's so greedy decoding cannot loop on it, `close`;
-/// plus the triggered form that leaves free text until `open`.
+/// MiniMax M3's calls block: `open`, invokes separated by newlines with whitespace
+/// bounded as DSML's so greedy decoding cannot loop on it, `close`; plus the
+/// triggered form that leaves free text until `open`.
 pub(super) fn calls_block(open: &str, close: &str, tags: Vec<Value>, parallel: bool) -> (Value, Value) {
     let calls = json!({"type":"tag", "begin":open, "content":{"type":"sequence", "elements":[
         {"type":"regex", "pattern":"[ \\n\\t]{0,16}"},

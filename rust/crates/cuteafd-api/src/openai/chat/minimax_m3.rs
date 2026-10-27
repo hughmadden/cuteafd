@@ -6,7 +6,7 @@ pub(crate) mod grammar;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::Path;
-use super::glm5::{added_token_id, read_chat_template, read_json, template::ChatTemplate};
+use super::glm5::{read_chat_template, read_json, template::ChatTemplate};
 pub use parser::{MiniMaxOutputParser, MiniMaxParserOptions};
 
 pub const NS: &str = "]<]minimax[>[";
@@ -37,6 +37,14 @@ impl Thinking {
         let enabled = body.get("thinking").and_then(|v| v["type"].as_str()).is_some_and(|t| t.eq_ignore_ascii_case("enabled"));
         Ok(if enabled { Self::Enabled } else { Self::Adaptive })
     }
+}
+
+/// The id `tokenizer.json` gives the added token `content`.
+fn added_token_id(tokenizer: &Value, content: &str) -> Result<u32> {
+    let added = tokenizer["added_tokens"].as_array().context("tokenizer.json added_tokens")?;
+    let id = added.iter().find(|token| token["content"] == content).and_then(|token| token["id"].as_u64())
+        .with_context(|| format!("tokenizer has no {content} token"))?;
+    u32::try_from(id).with_context(|| format!("{content} token id exceeds u32"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

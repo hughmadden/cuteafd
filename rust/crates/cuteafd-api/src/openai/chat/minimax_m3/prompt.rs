@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use super::super::glm5::prompt::{declared_tools, reasoning_effort, template_message, response_format_instruction};
+use super::super::glm5::prompt::{reasoning_effort, template_message, response_format_instruction};
 use super::super::glm5::template::python_json;
 
 /// The template prints scalars with `{{ val }}`: minijinja spells floats unlike
@@ -23,6 +23,13 @@ pub fn pythonize_floats(value: &mut Value) {
 pub(super) fn budget_effort(budget: u32) -> &'static str {
     match budget { 0..=1024 => "low", 1025..=4096 => "medium", 4097..=16384 => "high",
         16385..=32768 => "xhigh", _ => "max" }
+}
+
+/// The request's tools the prompt declares (`names`, from tool selection), in request order.
+fn declared_tools(body: &Value, names: &[String]) -> Result<Vec<Value>, String> {
+    let tools = body.get("tools").and_then(Value::as_array).ok_or("tools must be an array")?;
+    Ok(tools.iter().filter(|tool| tool["function"]["name"].as_str().is_some_and(|name| names.iter().any(|n| n == name)))
+        .cloned().collect())
 }
 
 pub fn template_context(body: &Value, tool_names: &[String]) -> Result<Value, String> {

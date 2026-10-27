@@ -18,7 +18,7 @@ use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{Map, Value};
 use super::{CALL_OPEN, CALL_CLOSE, INVOKE_OPEN, INVOKE_CLOSE, NS, THINK_OPEN, THINK_CLOSE};
-use super::super::glm5::{parser::{excerpt, held_prefix, GlmStop, VisibleContent}, processor::TextParser};
+use super::super::glm5::{parser::{excerpt, held_prefix, GlmStop}, processor::TextParser};
 
 #[derive(Debug, Clone, Default)]
 pub struct MiniMaxParserOptions {
@@ -28,6 +28,27 @@ pub struct MiniMaxParserOptions {
     pub stop_sequences: Vec<String>,
     /// The completion id, naming the request in log lines.
     pub id: String,
+}
+
+/// Visible content as the XML tool-call parsers send it (GLM's rule):
+/// leading whitespace is dropped and trailing whitespace waits until more
+/// content follows, so whitespace around a call never becomes a text block.
+#[derive(Debug, Default)]
+struct VisibleContent { started: bool, held: String }
+
+impl VisibleContent {
+    fn emit(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
+        let text = if self.started { text } else { text.trim_start() };
+        if text.is_empty() { return; }
+        self.started = true;
+        let body = text.trim_end();
+        if !body.is_empty() { out.push(OutputChunk::Raw { content: std::mem::take(&mut self.held) + body }); }
+        self.held.push_str(&text[body.len()..]);
+    }
+    /// The held whitespace, which a call that opens now keeps with its text.
+    fn take_held(&mut self) -> String { std::mem::take(&mut self.held) }
+    /// Hold a call's preceding whitespace again when the call returns as content.
+    fn restore(&mut self, held: String) { self.held = held; }
 }
 
 #[derive(Debug)]

@@ -391,9 +391,12 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
             rank.layout().ranks[rank.rank()].mtp_lengths.len()
         }).sum())
     }
+    fn history(&self, _placement: &Placement) {}
+    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
         self.state.retire(); self.execution.require_live()
     }
+    fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
@@ -480,6 +483,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         Ok(())
     }
     fn probe_begin(&self, _rows: usize) {}
+    fn probe_end(&self) {}
     fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
 }
 

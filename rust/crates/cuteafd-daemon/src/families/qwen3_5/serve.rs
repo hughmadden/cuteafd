@@ -118,6 +118,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         Placement { units, slot: slot as usize, len: 0, state_len: 0 }
     }
     fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia, _tokens: &[u32], _resume: usize) -> Result<()> { Ok(()) }
+    fn history(&self, _placement: &Placement) {}
+    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
         // A selection failure releases the requests without calling accept.
         // The next round boundary must retire that verify before reusing slots.
@@ -126,6 +128,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         }
         self.engine.borrow().require_live()
     }
+    fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");

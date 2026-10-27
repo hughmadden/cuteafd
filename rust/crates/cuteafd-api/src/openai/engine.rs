@@ -418,8 +418,9 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
     });
     match turn.reasoning.enabled {
         Some(enabled) => {
-            // Every chat template reads `adaptive` as `enabled` but MiniMax M3's.
-            let kind = match (enabled, turn.reasoning.adaptive) { (false, _) => "disabled", (true, true) => "adaptive", (true, false) => "enabled" };
+            // MiniMax M3's template tells `adaptive` from `enabled`; every other family gets `enabled`.
+            let adaptive = turn.reasoning.adaptive && matches!(profile.encoding, ModelEncoding::MiniMaxM3(_));
+            let kind = match (enabled, adaptive) { (false, _) => "disabled", (true, true) => "adaptive", (true, false) => "enabled" };
             body["thinking"] = json!({"type": kind});
             if enabled { if let Some(e) = effort.filter(|e| !matches!(*e, "none")) { body["reasoning_effort"] = json!(e); } }
             // MiniMax M3 sizes its <effort> from an Anthropic budget itself (minimax_m3::prompt).

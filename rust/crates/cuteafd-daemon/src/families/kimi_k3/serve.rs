@@ -2,8 +2,8 @@
 use super::{backend::KimiBackend, startup};
 use crate::shared::{prefix::PrefixArgs, qwen::scheduler::{self, Backend}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_api::openai::{chat::kimi::KimiEncoding, ModelEncoding, ModelProfile, NativeLimits};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use cuteafd_api::openai::{chat::kimi::KimiEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+use std::{net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 use cuteafd_loader::families::kimi_k3::{COMPILED_CONTEXT, DEFAULT_CONTEXT};
 
 #[derive(Debug, Clone, clap::Args)]
@@ -92,9 +92,14 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         Some(format!("{organization}/{model}"))
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
     let profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(16);
+    let stats = Arc::new(Mutex::new(serde_json::Value::Null));
+    let worker_stats = stats.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
     let worker_args = args.clone();
-    crate::shared::api::serve_native("Kimi", "kimi_k3", &args.listen, &args.snapshot, api,
-        move |receive, worker_stats, ready| -> Result<()> {
+    let worker = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut ready = Some(ready_tx);
+        let result = (|| -> Result<()> {
             cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
                 .map_err(|_| anyhow::anyhow!("Kimi serving needs an isolated process"))?;
             let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&worker_args.snapshot, false, false)?;
@@ -126,7 +131,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device)?;
-            scheduler::schedule(&backend, &worker_args.snapshot, receive, worker_stats, slots,
+            scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, slots,
                 match loaded.engine.native_draft() {
                     Some(draft) => scheduler::Drafts::Neural {
                         depth: worker_args.draft_fixed.map_or(draft.drafts(), usize::from),
@@ -139,16 +144,37 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                         &[worker_args.device, worker_args.split_device],
                         crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?
                         .record("kimi_k3-serving-loaded", &loaded.admission_free);
-                    ready(backend.geometry().max_context);
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Ok(backend.geometry().max_context));
+                    }
                     Ok(())
                 })
-        },
-        |compiled_context: usize| {
-            let limits = args.api_limits(compiled_context)?;
-            tracing::info!(api_max_context = limits.context(), compiled_max_context = compiled_context,
-                "Kimi API and compiled context limits");
-            Ok((profile, limits))
-        }).await
+        })();
+        if let Some(ready) = ready.take() {
+            let error = result.as_ref().err().map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "scheduler exited before readiness".into());
+            let _ = ready.send(Err(anyhow::anyhow!("Kimi initialization failed: {error}")));
+        }
+        result
+    });
+    let compiled_context = ready_rx.await.context("Kimi worker exited before readiness")??;
+    let limits = args.api_limits(compiled_context)?;
+    tracing::info!(api_max_context = limits.context(), compiled_max_context = compiled_context,
+        "Kimi API and compiled context limits");
+    let snapshot = args.snapshot.clone();
+    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
+        "kimi_k3", profile.id.clone(), snapshot.clone())));
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
+        hub.clone(), api.serve(profile, &snapshot)?);
+    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
+    crate::shared::memory_report::log("ready");
+    tokio::select! {
+        served = axum::serve(listener, api.app(router, hub)
+            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
+        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

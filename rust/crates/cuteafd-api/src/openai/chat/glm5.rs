@@ -221,14 +221,6 @@ pub(crate) fn read_chat_template(snapshot: &Path) -> Result<(String, PathBuf)> {
     }
 }
 
-/// The id `tokenizer.json` gives the added token `content`.
-pub(crate) fn added_token_id(tokenizer: &Value, content: &str) -> Result<u32> {
-    let added = tokenizer["added_tokens"].as_array().context("tokenizer.json added_tokens")?;
-    let id = added.iter().find(|token| token["content"] == content).and_then(|token| token["id"].as_u64())
-        .with_context(|| format!("tokenizer has no {content} token"))?;
-    u32::try_from(id).with_context(|| format!("{content} token id exceeds u32"))
-}
-
 fn vision_markers(config: &Value, tokenizer: &Value) -> Result<[String; 3]> {
     let text = config.get("text_config").unwrap_or(config);
     let vocabulary = text["vocab_size"].as_u64().and_then(|n| u32::try_from(n).ok()).context("GLM Flash vocab_size")?;

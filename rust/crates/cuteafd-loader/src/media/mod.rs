@@ -278,34 +278,29 @@ impl ProcessorConfig {
         let factor = self.patch * self.merge;
         if self.family == ImageFamily::GlmFlash {
             glm_resize(height, width, factor, self.min_pixels, self.effective_max())
+        } else if self.family == ImageFamily::Minimax {
+            minimax::resize_shape(height, width, factor, self.min_pixels, self.effective_max())
         } else {
-            smart_resize(height, width, factor, self.min_pixels, self.effective_max(),
-                self.family == ImageFamily::Minimax)
+            qwen_resize(height, width, factor, self.min_pixels, self.effective_max())
         }
     }
 }
 
-/// Qwen2-VL smart resize: sides round to `factor`, then scale into `[min, max]` pixels.
-/// `release_clamp` is MiniMax's bundled processor (the rounded size is at least one factor
-/// and budget shrinks floor freely); otherwise Qwen's (the floored size is clamped).
-fn smart_resize(height: u32, width: u32, factor: u32, min: u64, max: u64, release_clamp: bool)
-    -> Result<(u32, u32)> {
+fn qwen_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
     let (h, w, f) = (f64::from(height), f64::from(width), f64::from(factor));
     if h.max(w) / h.min(w) > 200.0 {
         return Err(invalid("absolute aspect ratio must be at most 200"));
     }
-    let (round_min, floor_min) = if release_clamp { (f, 0.0) } else { (0.0, f) };
-    let (mut rh, mut rw) = (((h / f).round_ties_even() * f).max(round_min), ((w / f).round_ties_even() * f).max(round_min));
+    let (mut rh, mut rw) = ((h / f).round_ties_even() * f, (w / f).round_ties_even() * f);
     if rh * rw > max as f64 {
         let beta = (h * w / max as f64).sqrt();
-        rh = floor_min.max((h / beta / f).floor() * f);
-        rw = floor_min.max((w / beta / f).floor() * f);
+        rh = f.max((h / beta / f).floor() * f);
+        rw = f.max((w / beta / f).floor() * f);
     } else if rh * rw < min as f64 {
         let beta = (min as f64 / (h * w)).sqrt();
         rh = (h * beta / f).ceil() * f;
         rw = (w * beta / f).ceil() * f;
     }
-    if rh < f || rw < f { return Err(invalid("resize budget cannot hold a merged patch")); }
     Ok((rh as u32, rw as u32))
 }
 fn glm_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {

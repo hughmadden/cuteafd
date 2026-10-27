@@ -1,6 +1,6 @@
 //! Bundled MiniMax processors at release revision 54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e.
 //! The executable processors use smart resize, not the legacy grid-pinpoint fields.
-use super::{MediaError, ProcessorConfig, Result, SpanExpander};
+use super::{invalid, MediaError, ProcessorConfig, Result, SpanExpander};
 use std::path::Path;
 
 pub const IMAGE_TOKEN: u32 = 200_025;
@@ -23,6 +23,28 @@ pub(super) fn validate_config(config: &ProcessorConfig, value: &serde_json::Valu
         }
     }
     Ok(())
+}
+
+/// The bundled processor's smart resize: sides round half to even to `factor` (at least one),
+/// then scale into `[min, max]` pixels; a budget shrink floors freely, so a size that cannot
+/// hold a merged patch is refused rather than clamped as Qwen's is.
+pub(super) fn resize_shape(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
+    let (h, w, f) = (height as f64, width as f64, factor as f64);
+    if h == 0.0 || w == 0.0 || h.max(w) / h.min(w) > 200.0 {
+        return Err(invalid("dimensions must be positive with aspect ratio at most 200"));
+    }
+    let (mut rh, mut rw) = ((h / f).round_ties_even().max(1.0) * f, (w / f).round_ties_even().max(1.0) * f);
+    if rh * rw > max as f64 {
+        let beta = (h * w / max as f64).sqrt();
+        rh = (h / beta / f).floor() * f;
+        rw = (w / beta / f).floor() * f;
+    } else if rh * rw < min as f64 {
+        let beta = (min as f64 / (h * w)).sqrt();
+        rh = (h * beta / f).ceil() * f;
+        rw = (w * beta / f).ceil() * f;
+    }
+    if rh < f || rw < f { return Err(invalid("resize budget cannot hold a merged patch")); }
+    Ok((rh as u32, rw as u32))
 }
 
 /// Resolve image delimiters from the bundled tokenizer, as MiniMaxVLProcessor does.

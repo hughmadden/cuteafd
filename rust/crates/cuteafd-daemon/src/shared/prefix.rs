@@ -44,12 +44,6 @@ pub(crate) struct PrefixArgs {
     /// the store stream) or on-evict (only when the device evicts it).
     #[arg(long, value_enum, default_value_t = crate::cli::HostCacheStore::OnRetain, env = "CUTEAFD_HOST_CACHE_STORE")]
     pub host_cache_store: crate::cli::HostCacheStore,
-    /// Longest the device-evict path waits for an in-flight store before dropping it uncached.
-    #[arg(long, default_value_t = 1000, env = "CUTEAFD_HOST_CACHE_COPY_BUDGET_MS")]
-    pub host_cache_copy_budget_ms: u64,
-    /// Longest a host restore waits before the request falls through to prefill.
-    #[arg(long, default_value_t = 500, env = "CUTEAFD_HOST_CACHE_RESTORE_BUDGET_MS")]
-    pub host_cache_restore_budget_ms: u64,
     /// RAM kept outside an automatic pinned prefix pool, at least 10% of total RAM.
     #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
     pub host_cache_headroom_bytes: u64,
@@ -181,8 +175,6 @@ impl PrefixArgs {
                 crate::cli::HostCacheStore::OnRetain => cuteafd_hostcache::config::StoreMode::OnRetain,
                 crate::cli::HostCacheStore::OnEvict => cuteafd_hostcache::config::StoreMode::OnEvict,
             },
-            copy_budget_ns: self.host_cache_copy_budget_ms.saturating_mul(1_000_000),
-            restore_budget_ns: self.host_cache_restore_budget_ms.saturating_mul(1_000_000),
             min_tokens: self.host_cache_min_tokens,
             max_tokens: u32::try_from(max_context)?,
             ..Default::default()
@@ -250,7 +242,7 @@ pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> 
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })
 }
 
-/// One buffer of a pages-only prefix family (GLM 5.3, MiniMax M3): page `p` is
+/// One buffer of a pages-only prefix family (MiniMax M3): page `p` is
 /// `page_bytes` at `buffer + p * page_bytes`, and the first `rows` rows of a page
 /// are `rows * row_bytes` at each `(offset, row_bytes)` span.
 #[derive(Debug, Clone, Copy)]
@@ -393,10 +385,9 @@ mod tests {
         let config = cli.prefix.host_config(layout, 32768, 1).unwrap().unwrap();
         assert_eq!((config.bytes, config.max_tokens), (1 << 20, 32768));
         assert_eq!(config.store, cuteafd_hostcache::config::StoreMode::OnRetain);
-        assert_eq!((config.copy_budget_ns, config.restore_budget_ns), (1_000_000_000, 500_000_000));
         let cli = Cli::parse_from(["serve", "--host-cache-bytes", "1MiB", "--host-cache-headroom-bytes", "0",
-            "--host-cache-store", "on-evict", "--host-cache-restore-budget-ms", "2000"]);
+            "--host-cache-store", "on-evict"]);
         let config = cli.prefix.host_config(layout, 32768, 1).unwrap().unwrap();
-        assert_eq!((config.store, config.restore_budget_ns), (cuteafd_hostcache::config::StoreMode::OnEvict, 2_000_000_000));
+        assert_eq!(config.store, cuteafd_hostcache::config::StoreMode::OnEvict);
     }
 }

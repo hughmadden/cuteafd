@@ -95,6 +95,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         }
         Ok(())
     }
+    fn history(&self, _placement: &Placement) {}
     fn restore_draft(&self, placement: &Placement, frontier: usize, _tokens: &[u32], seq: &mut DraftState) -> Result<()> {
         let draft = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter was not admitted"))?;
         let (origin, end) = draft.frontier(placement.slot)?;
@@ -108,7 +109,9 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         !neural || saved.draft == Some((0, frontier))
     }
 
+    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
+    fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.engine.step_device(&mut [(placement, tokens)], pool, logit_rows.max(1), true)
