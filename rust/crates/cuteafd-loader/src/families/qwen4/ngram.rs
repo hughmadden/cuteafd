@@ -19,7 +19,7 @@ pub struct NgramHasher {
 }
 
 /// The last `ngram_size - 1` tokens of a sequence (EOS before its start).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NgramHistory(pub Vec<u32>);
 
 const MASK64: u128 = (1u128 << 64) - 1;
