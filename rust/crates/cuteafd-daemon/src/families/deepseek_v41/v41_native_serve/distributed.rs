@@ -464,13 +464,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let token_map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
     let rows = capacity as usize;
     let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, rows,
-        // One wave per in-flight slot plus the prefetched next unit's.
-        (slots + 1) * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024,
+        // One wave per in-flight slot plus the prefetched next unit's when it fits.
+        (slots + super::engram_prefetch_depth(rows, slots)?) * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024,
             cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
     cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
     let mut requests = if args.tp2_attention {
         Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
+    requests.set_prefetch(super::engram_prefetch_depth(rows, slots)? == 1);
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
     for (slot, _) in &mut prefill_slots.extra { slot.configure_cache_replicas(requests.cache())?; }

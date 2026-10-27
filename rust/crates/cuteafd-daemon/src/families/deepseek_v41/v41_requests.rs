@@ -88,6 +88,9 @@ pub(crate) struct Requests<'a> {
     image_requests: usize,
     /// The next encoder unit's Engram I/O, started ahead of its reservation (#815).
     prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
+    /// Whether the Engram gather pool holds a prefetched wave beside every
+    /// in-flight slot's (`v41_native_serve::engram_prefetch_depth`).
+    prefetch_enabled: bool,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
 }
@@ -107,7 +110,7 @@ impl<'a> Requests<'a> {
             units: vec![Vec::new(); slots],
             released_units: Vec::new(),
             image_requests: 0,
-            prefetched: Default::default(),
+            prefetched: Default::default(), prefetch_enabled: false,
             releases: 0,
         })
     }
@@ -127,7 +130,7 @@ impl<'a> Requests<'a> {
             units: vec![Vec::new(); slots],
             released_units: Vec::new(),
             image_requests: 0,
-            prefetched: Default::default(),
+            prefetched: Default::default(), prefetch_enabled: false,
             releases: 0,
         })
     }
@@ -138,7 +141,7 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(), prefetch_enabled: false,releases:0 })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")

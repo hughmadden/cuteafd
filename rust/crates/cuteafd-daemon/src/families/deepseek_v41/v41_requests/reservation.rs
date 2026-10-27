@@ -48,9 +48,13 @@ impl Requests<'_> {
     /// `reserve_encoder` of exactly these tokens adopts it. Any other
     /// reservation cancels it. Text-only units; image requests prepare at
     /// reservation.
+    /// Enables `prefetch_encoder`: only when the Engram gather pool was sized
+    /// for one more wave than the in-flight slots (else a prefetched wave can
+    /// hold the slots an in-flight unit's gather waits for).
+    pub fn set_prefetch(&mut self, enabled: bool) { self.prefetch_enabled = enabled; }
     pub fn prefetch_encoder(&mut self, lease: CacheLease, tokens: &[u32]) -> Result<()> {
         self.prefetched.cancel();
-        if tokens.is_empty() || self.image_requests > 0 { return Ok(()); }
+        if !self.prefetch_enabled || tokens.is_empty() || self.image_requests > 0 { return Ok(()); }
         let live = self.request(lease)?;
         let history = live.prefill.as_ref().map_or(&live.history, |p| p.history());
         let position = history.position();

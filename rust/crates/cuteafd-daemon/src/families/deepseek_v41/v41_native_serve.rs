@@ -399,10 +399,11 @@ fn worker(
     let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
     // Both Engram layers retain their staging leases until consumed. Reserve
     // both layers for both active lanes so the second lane can gather early.
-    // One wave per in-flight slot plus the next unit's prefetched wave
-    // (`Requests::prefetch_encoder`): without its tickets the prefetch can
-    // hold the gather slots an in-flight unit's layer-14 gather waits for.
-    let gather_slots = (slots + 1) * cuteafd_core::ENGRAM_LAYERS.len();
+    // One wave per in-flight slot plus, when the staging budget holds it, the
+    // next unit's prefetched wave (`Requests::prefetch_encoder`): without its
+    // tickets the prefetch could hold the slots an in-flight unit waits for.
+    let prefetch = engram_prefetch_depth(rows, slots)?;
+    let gather_slots = (slots + prefetch) * cuteafd_core::ENGRAM_LAYERS.len();
     let pipeline =
         unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, rows, gather_slots, rows * 64 * 1024,
             cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
@@ -563,6 +564,7 @@ fn worker(
     let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity,
         topology)?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
+    requests.set_prefetch(prefetch == 1);
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;
@@ -723,6 +725,16 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
         other_transport, prefill: prefill_slots, lease, tokens, chunk_rows, waves, job, draft, hold, times: &mut times };
     crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
+}
+
+/// Engram waves prefetched ahead of their unit's reservation (0 or 1): the
+/// gather pool must hold every in-flight slot's wave plus the prefetched
+/// ones inside the pipeline's pinned staging budget (rows x 64 KiB).
+pub(crate) fn engram_prefetch_depth(rows: usize, slots: usize) -> Result<usize> {
+    let per_slot = cuteafd_loader::EngramBatchStaging::storage_bytes(rows)?;
+    let fits = |waves: usize| waves * cuteafd_core::ENGRAM_LAYERS.len() * per_slot <= rows * 64 * 1024;
+    anyhow::ensure!(fits(slots), "Engram gather staging cannot hold {slots} in-flight waves of {rows} rows");
+    Ok(usize::from(fits(slots + 1)))
 }
 
 /// The serving prefill shape: unit rows (`--prefill-batch-tokens`) and units
@@ -983,4 +995,22 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);
     }
     anchor.context("prefix continuation produced no logits")
+}
+
+#[cfg(test)]
+mod engram_prefetch_tests {
+    /// The prefetch depth each prefill depth gets inside the Engram staging
+    /// budget: one prefetched wave up to three slots, none at four.
+    #[test]
+    fn prefetch_depth_fits_the_gather_staging_budget() -> anyhow::Result<()> {
+        for rows in [1024usize, 2048, 2752, 4096] {
+            let depths: Vec<_> = (2..=4).map(|slots| super::engram_prefetch_depth(rows, slots)).collect::<anyhow::Result<_>>()?;
+            assert_eq!(depths, [1, 1, 0], "rows {rows}");
+            for (slots, depth) in (2..=4).zip(depths) {
+                let bytes = (slots + depth) * 2 * cuteafd_loader::EngramBatchStaging::storage_bytes(rows)?;
+                assert!(bytes <= rows * 64 * 1024, "{slots} slots + {depth} prefetch exceed the budget");
+            }
+        }
+        Ok(())
+    }
 }
