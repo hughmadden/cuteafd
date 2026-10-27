@@ -1,19 +1,38 @@
 //! Shared prefill admission (#762). A family supplies its measured base estimate
 //! and hard executor capacities; the shared planner scales Spark compute to the
-//! deployed rank count and admits at most ceil(T / S) + 1 waves. Units share one
-//! 8192-row reserve. Runtime S/T adaptation is a separate executor change.
+//! deployed rank count and admits at most ceil(T / S) + 1 waves. Units are
+//! automatic splits of one prefill reserve (TJ 2026-10-27): the standard 8192
+//! rows where the card holds it, else the largest 64-row multiple that fits.
 
+/// The standard prefill reserve.
 pub const RESERVE_ROWS: u64 = 8192;
 pub const MAX_WAVES: u64 = 4;
 pub const MIN_FILL: f64 = 0.5;
+/// Prefill rows are 64-row pages.
+pub const ROW_PAGE: u64 = 64;
 
-/// Exact shared capacities inside the reserve (three units round to 64-row pages).
-pub fn unit_rows(waves: u64) -> u64 {
-    match waves {
-        0..=2 => 4096,
-        3 => 2752,
-        _ => 2048,
-    }
+/// The unit of a `waves`-way split of `reserve` rows: reserve / k rounded up
+/// to a 64-row page (one and two waves both run reserve / 2). It runs as live
+/// rows on the smallest compiled capacity at least that wide.
+pub fn unit_rows_in(waves: u64, reserve: u64) -> u64 {
+    reserve.div_ceil(waves.clamp(2, MAX_WAVES)).div_ceil(ROW_PAGE) * ROW_PAGE
+}
+
+/// The standard reserve's units: 4096 / 2752 / 2048 at two, three and four waves.
+pub fn unit_rows(waves: u64) -> u64 { unit_rows_in(waves, RESERVE_ROWS) }
+
+/// Rows a reserve charges: the widest split of it (k x unit(k) over k = 2..4;
+/// 8256 for 8192, at most reserve + 192).
+pub fn charge_rows(reserve: u64) -> u64 {
+    (2..=MAX_WAVES).map(|k| k * unit_rows_in(k, reserve)).max().unwrap_or(0)
+}
+
+/// The largest reserve (a multiple of 64, at most the standard one) whose
+/// charge fits in `rows`.
+pub fn reserve_within(rows: u64) -> u64 {
+    let mut reserve = RESERVE_ROWS.min(rows) / ROW_PAGE * ROW_PAGE;
+    while reserve > 0 && charge_rows(reserve) > rows { reserve -= ROW_PAGE; }
+    reserve
 }
 
 /// Family-owned evidence, never inferred from the family's name or rank count.
@@ -237,6 +256,30 @@ mod tests {
     fn measured(waves: u64) -> PrefillLimits {
         PrefillLimits { estimate: PrefillEstimate::MeasuredWaves { waves, reference_ranks: 6, larger_topology_waves: waves, source: "test comparison" },
             ..Default::default() }
+    }
+
+    #[test]
+    fn units_are_automatic_splits_of_the_reserve() {
+        // The standard reserve reproduces the shipped units and its 8256-row charge.
+        assert_eq!((2..=4).map(|k| unit_rows_in(k, RESERVE_ROWS)).collect::<Vec<_>>(), [4096, 2752, 2048]);
+        assert_eq!(charge_rows(RESERVE_ROWS), 8256);
+        assert_eq!(reserve_within(u64::MAX), RESERVE_ROWS);
+        assert_eq!(reserve_within(8256), RESERVE_ROWS);
+        // Any reserve: page-aligned units covering it, charge at most reserve + 192.
+        for reserve in (64..=RESERVE_ROWS).step_by(64) {
+            for k in 2..=MAX_WAVES {
+                let unit = unit_rows_in(k, reserve);
+                assert!(unit % ROW_PAGE == 0 && k * unit >= reserve && unit <= reserve, "{reserve}/{k}: {unit}");
+            }
+            assert!(charge_rows(reserve) <= reserve + 3 * ROW_PAGE, "{reserve}");
+            // The largest reserve whose charge fits a span is never below what the span holds.
+            let fit = reserve_within(charge_rows(reserve));
+            assert!(fit >= reserve && charge_rows(fit) <= charge_rows(reserve), "{reserve} -> {fit}");
+        }
+        // A card holding 8000 rows admits 7872: units 3968 / 2624 / 1984 (charge 7936).
+        assert_eq!(reserve_within(8000), 7872);
+        assert_eq!((2..=4).map(|k| unit_rows_in(k, 7872)).collect::<Vec<_>>(), [3968, 2624, 1984]);
+        assert_eq!(charge_rows(7872), 7936);
     }
 
     #[test]
