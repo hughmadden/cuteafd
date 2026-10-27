@@ -226,20 +226,6 @@ workloads are unchanged.
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg)
 
-## MiniMax M3.1
-
-- 2026-10-25 · Full report · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build c493c0bc9c1c · [report](minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-4spark-rtx5090-dflash2/report.svg)
-- 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-dflash2/report.svg)
-- 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-dspark/report.svg)
-- 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-off/report.svg)
-- 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 3× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-3spark-rtx5090-dflash2/report.svg)
-- 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-dflash2/report.svg)
-- 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-dspark/report.svg)
-- 2026-10-25 · Full report · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget · build bea8ee0f8a31 · [report](minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-2spark-rtx5090-dflash2/report.svg)
-- 2026-10-25 · Full report · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget · build 243f3635353b · [report](minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-2spark-rtx5090-off/report.svg)
-- 2026-10-24 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget · build 62a8c10b3cd8 · [report](minimax_m3/2026-10-24-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-dspark/report.svg)
-- 2026-10-24 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget · build 62a8c10b3cd8 · [report](minimax_m3/2026-10-24-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-off/report.svg)
-
 ## Qwen 3.8
 
 - 2026-10-18 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 450/450 W + 2× DGX Spark · build v3.0.0-rc5 · [report](qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/report.svg)
