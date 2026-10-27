@@ -73,6 +73,16 @@ def test_model_context_and_comparison_jobs_include_minimax():
     jobs = {name: (exporter, args) for name, exporter, args in module.jobs("all")}
     assert {"minimax", "routed-minimax"} <= jobs.keys()
     assert jobs["minimax"] == ("export_b12x_dsv4_aot.py", ["--geometry", "minimax"])
+    # The routed comparison covers every layout the package ships (TP3 included) at the package ladder.
+    exporter, args = jobs["routed-minimax"]
+    layouts = args[args.index("--layouts") + 1].split(",")
+    spec = importlib.util.spec_from_file_location("minimax_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = package
+    spec.loader.exec_module(package)
+    assert exporter == "package_fp8_moe_aot.py"
+    assert layouts == [*package.MINIMAX_ROLE_LAYOUTS["coordinator"], *package.MINIMAX_ROLE_LAYOUTS["spark"]]
+    assert args[args.index("--capacities") + 1] == module.CAPACITIES
     # The coordinator exporter is the only path to the MiniMax programs.
     assert not any(exporter == "export_b12x_minimax_aot.py" for exporter, _ in jobs.values())
 

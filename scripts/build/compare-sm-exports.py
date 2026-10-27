@@ -97,8 +97,10 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    # Every layout MiniMax's package ships (coordinator TP1; Spark TP2, TP3, TP4, TP6) at the
+    # package ladder, which holds the decode owner's m80 and the prefill owner's m4096 exports.
     result.append(("routed-minimax", "package_fp8_moe_aot.py",
-                   ["--geometry", "minimax_nvfp4", "--capacities", "1,16,256", "--layouts", "tp1,tp2,tp4,tp6"]))
+                   ["--geometry", "minimax_nvfp4", "--capacities", CAPACITIES, "--layouts", "tp1,tp2,tp3,tp4,tp6"]))
     result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
