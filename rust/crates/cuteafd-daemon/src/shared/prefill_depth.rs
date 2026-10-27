@@ -44,6 +44,8 @@ pub(crate) struct PrefillDepth {
     /// calibration finishes when every call reported, or at the first
     /// serving call after them; a late pace still records its ratio).
     calibration: Cell<(usize, usize)>,
+    /// Ids of the calibration calls started (only their paces count down).
+    calibration_calls: RefCell<Vec<u64>>,
     /// Where the evidence persists, and when it was last written.
     store: RefCell<Option<(CalibrationStore, Instant)>>,
 }
@@ -60,7 +62,8 @@ impl PrefillDepth {
         tracing::info!(slots, unit_cap, initial = control.waves(), pinned, candidates = ?control.candidates(),
             reserve_rows = reserve_rows(slots as u64, unit_cap as u64), "prefill depth control");
         Ok(Self { slots, unit_cap, control: RefCell::new(control), pending: RefCell::new(VecDeque::new()),
-            last: Cell::new(None), calibration: Cell::new((0, 0)), store: RefCell::new(None) })
+            last: Cell::new(None), calibration: Cell::new((0, 0)),
+            calibration_calls: RefCell::new(Vec::new()), store: RefCell::new(None) })
     }
 
     /// Admitted in-flight slots (fixed at startup).
@@ -96,7 +99,8 @@ impl PrefillDepth {
                 period_us = ?sample.period_us, ratio = ?sample.ratio, idle_share = ?sample.idle_share,
                 reply_wait_share = ?sample.reply_wait_share, reason = decision.reason, "prefill call");
             let (unstarted, unreported) = self.calibration.get();
-            if unreported > 0 {
+            let calibration_call = self.calibration_calls.borrow().contains(&call);
+            if unreported > 0 && calibration_call {
                 self.calibration.set((unstarted, unreported - 1));
                 if unreported == 1 { self.finish_calibration(); }
             }
@@ -109,15 +113,16 @@ impl PrefillDepth {
     /// ended there; otherwise it opens a prefill. An opening at row 0 of at
     /// least 90% of a full call is a reference call (evidence). Returns its depth.
     pub(crate) fn start(&self, key: u64, start: usize, rows: usize) -> Depth {
-        match self.calibration.get() {
+        let calibration_call = match self.calibration.get() {
             (0, unreported) if unreported > 0 => {
                 // Serving begins with calibration paces outstanding: choose from what arrived.
                 self.calibration.set((0, 0));
                 self.finish_calibration();
+                false
             }
-            (unstarted, unreported) if unstarted > 0 => self.calibration.set((unstarted - 1, unreported)),
-            _ => {}
-        }
+            (unstarted, unreported) if unstarted > 0 => { self.calibration.set((unstarted - 1, unreported)); true }
+            _ => false,
+        };
         let running = start > 0 && self.last.get() == Some((key, start));
         let boundary = if running { Boundary::Running } else { Boundary::Opening };
         let reference = start == 0 && rows as f64 >= REFERENCE_SHARE * self.call_rows() as f64;
@@ -125,6 +130,7 @@ impl PrefillDepth {
         let mut pending = self.pending.borrow_mut();
         if pending.len() == PENDING { pending.pop_front(); }
         pending.push_back((decision, 0));
+        if calibration_call { self.calibration_calls.borrow_mut().push(decision.call); }
         self.last.set(Some((key, start)));
         tracing::debug!(call = decision.call, waves = decision.waves, unit_rows = decision.unit_rows,
             boundary = ?boundary, reference, transition = decision.transition, reason = decision.reason,
@@ -495,6 +501,29 @@ mod tests {
         depth.report(vec![(late.call, pace(8192, wall(late.waves), 1_000_000, 100_000)),
             (serving.call, pace(8192, wall(serving.waves), 1_000_000, 100_000))]);
         assert_eq!(depth.start(2, 0, 8192).waves, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn an_earlier_calls_pace_during_calibration_does_not_finish_it_early() -> anyhow::Result<()> {
+        // GLM cards F: a 512-row request before calibration reported during
+        // it; only calibration calls count down, so all depths get measured.
+        let depth = PrefillDepth::new(3, 4, 4096, false)?;
+        let early = depth.start(9, 0, 512);
+        depth.ran(early, 1, 512);
+        let calls = depth.calibration();
+        let mut started = Vec::new();
+        for call in 0..calls {
+            let d = depth.start(3000 + call as u64, 0, 8192);
+            depth.ran(d, d.waves, 8192);
+            started.push(d);
+            if call == 0 { depth.report(vec![(early.call, pace(512, 400_000, 200_000, 100_000))]); }
+        }
+        for d in &started[..calls - 1] { depth.report(vec![(d.call, pace(8192, wall(d.waves), 1_000_000, 100_000))]); }
+        assert!(depth.calibrating(), "the 512-row pace must not count as a calibration report");
+        let last = started[calls - 1];
+        depth.report(vec![(last.call, pace(8192, wall(last.waves), 1_000_000, 100_000))]);
+        assert!(!depth.calibrating() && depth.control.borrow().calibrated());
         Ok(())
     }
 
