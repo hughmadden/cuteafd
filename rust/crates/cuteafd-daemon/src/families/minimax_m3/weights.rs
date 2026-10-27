@@ -1,12 +1,14 @@
 //! Unchanged MXFP8 payloads through the shared dense records, the shared
 //! gate/up and K/V fused layout, and load-time scale arrangement.
 use super::native::Native;
-use crate::shared::{memory::device::Allocation, experts::rtx::dense::load_records};
-use anyhow::{Context, Result};
+use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
+use crate::shared::memory::device::{Allocation, Device};
+use anyhow::{ensure, Context, Result};
+use cuteafd_core::DType;
 use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer};
-use cuteafd_loader::formats::native_dense::RankWeightLayout;
+use cuteafd_loader::formats::native_dense::{element_bytes, RankWeightLayout, WeightOperand, WeightSlice};
 use cuteafd_loader::plan::{checkpoint::Checkpoint, families::minimax::coordinator};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 pub(super) const EMBEDDING: &str = "language_model.model.embed_tokens.weight";
 pub(super) struct Weights<'a> { operands: BTreeMap<String, Allocation<'a>> }
@@ -46,11 +48,83 @@ impl<'a> Weights<'a> {
     }
 }
 
+/// Where a native dense operand's bytes come from, in allocation order: each
+/// source's checkpoint rectangle (the whole tensor, the rank's rows or the
+/// rank's column window, in source order) at its operand offset, flagged when
+/// an F32 rectangle narrows to BF16 into half its bytes. Also returns the
+/// packed bytes, which the header admission must match.
+fn operand_lands(snapshot: &Path, layout: &RankWeightLayout, operand: &WeightOperand)
+    -> Result<(Vec<(Rect, usize, bool)>, usize)> {
+    let elem = element_bytes(&operand.dtype).with_context(|| format!("{}: unsupported precision", operand.name))? as usize;
+    let mut lands = Vec::with_capacity(operand.sources.len());
+    let mut at = 0usize;
+    for source in &operand.sources {
+        let meta = &source.meta;
+        let narrow = meta.dtype != operand.dtype;
+        ensure!(!narrow || (operand.dtype == DType::Bf16 && meta.dtype == DType::F32),
+            "{}: native parameter precision changed", meta.name);
+        let total = if meta.shape.len() >= 2 { meta.shape[0] } else { 1 };
+        let bytes = usize::try_from(meta.byte_length)?;
+        ensure!(total > 0 && bytes % total == 0, "{}: rows do not divide the tensor", meta.name);
+        let whole = Rect { name: meta.name.clone(), path: snapshot.join(&source.shard), base: meta.byte_offset,
+            row_bytes: bytes / total, rows: 0..total, cols: 0..bytes / total };
+        let rect = match operand.slice {
+            WeightSlice::Replicated => whole,
+            WeightSlice::Rows | WeightSlice::Cols => {
+                ensure!(operand.sources.len() == 1 && meta.shape.len() == 2, "{}: split source layout", meta.name);
+                let (rank, ranks) = (layout.rank, layout.ranks);
+                // Narrowing is elementwise: a source element's width selects the window.
+                let elem = if narrow { 4 } else { elem };
+                if operand.slice == WeightSlice::Rows {
+                    ensure!(total % ranks == 0, "{}: rows do not split over {ranks} GPUs", meta.name);
+                    whole.sub(rank * total / ranks..(rank + 1) * total / ranks)
+                } else {
+                    ensure!(meta.shape[1] % ranks == 0, "{}: columns do not split over {ranks} GPUs", meta.name);
+                    let width = meta.shape[1] / ranks * elem;
+                    Rect { cols: rank * width..(rank + 1) * width, ..whole }
+                }
+            }
+        };
+        let landed = if narrow { rect.bytes() / 2 } else { rect.bytes() };
+        lands.push((rect, at, narrow));
+        at += landed;
+    }
+    let expected = operand.shape.iter().try_fold(elem, |n: usize, dim| n.checked_mul(*dim))
+        .context("packed size overflow")?;
+    ensure!(at == expected && expected.max(256) as u64 == operand.allocation_bytes,
+        "{}: packed storage disagrees with header admission", operand.name);
+    Ok((lands, at))
+}
+
+/// `operand`'s bytes as dense records into `buffer` (allocated as the mount
+/// allocates it): its [`operand_lands`], the unchanged rectangles as one
+/// operand and each narrowed one as a staged step on the GPU. Filled through
+/// the mount at once, or recorded for the coordinator push group.
+fn load_records(device: Device<'_>, snapshot: &Path, layout: &RankWeightLayout, operand: &WeightOperand,
+    buffer: CuteafdDeviceBuffer) -> Result<()> {
+    let (lands, bytes) = operand_lands(snapshot, layout, operand)?;
+    ensure!(buffer.bytes >= bytes, "{}: allocation smaller than its packed bytes", operand.name);
+    let dense = DenseLoad::mount(device.library);
+    let mut unchanged = Vec::with_capacity(lands.len());
+    for (rect, at, narrow) in lands {
+        if !narrow { unchanged.push((rect, at)); continue; }
+        // F32 -> BF16 on the GPU: one tensor per step (CSA indexer tensors).
+        let n = rect.bytes();
+        ensure!(n <= STEP_BYTES, "{}: F32 narrowing step beyond the staging bound", rect.name);
+        // The lands keep the narrowed values inside the packed bytes.
+        let dst = CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(at), bytes: n / 2, ..buffer };
+        device.run(|| dense.step(Step { device: device.id, rects: vec![rect],
+            jobs: vec![Job::NarrowF32Bf16 { at: 0, bytes: n, dst }] }, std::ptr::null_mut()))?;
+    }
+    if !unchanged.is_empty() {
+        device.run(|| dense.operand(Operand { device: device.id, buffer, lands: unchanged, bytes }))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::experts::rtx::dense::operand_lands;
-    use cuteafd_loader::formats::native_dense::WeightSlice;
     use cuteafd_loader::plan::testing;
     #[test] fn minimax_draft_fusion_preserves_native_headers_and_allocation_bytes() -> Result<()> {
         use cuteafd_loader::families::minimax_m3::dspark::{DsparkContract,PREFIX};
