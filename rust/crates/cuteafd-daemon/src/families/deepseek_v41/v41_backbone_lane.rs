@@ -663,21 +663,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             BackboneRouterWave::device_bytes(capacity)?,
         ])
     }
-    /// Bytes [`Self::new_sharing`] allocates: the lane's own groups without
-    /// the borrowed attention-local output projection and sparse planes.
-    pub fn sharing_workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        let sizes = Self::workspace_bytes(library, capacity)?;
-        Ok(sizes[0] + sizes[1] + sizes[3] + sizes[5] + SparseAttentionWave::sharing_device_bytes(capacity as usize)?)
-    }
-    /// A prefill-only slot's lane (1 RTX) borrowing `owner`'s attention-local
-    /// output projection and sparse attention storage; residual, query,
-    /// router and shared-FFN storage stay its own. See
-    /// `AttentionOutputWave::wave_sharing` for the serialized-attention invariant.
-    pub fn new_sharing(owner: &BackboneLane<'w, 'a>) -> Result<Self> {
-        ensure!(owner.weights.placement.is_none() && owner.layer == 0 && owner.tp2_output.is_none()
-            && owner.dual_sparse.is_none(), "attention sharing needs an unplaced lane at layer zero");
-        Self::new_inner_with(owner.weights, owner.capacity as u32, usize::MAX, 0, Some(owner))
-    }
     /// One lane owns one allocation of each workspace group. Independent lanes
     /// borrow the same immutable weights and allocate distinct mutable storage.
     pub fn new(weights: &'w BackboneLaneWeights<'a>, capacity: u32, budget: usize) -> Result<Self> {
@@ -685,10 +670,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         Self::new_inner(weights, capacity, budget, 0)
     }
     fn new_inner(weights: &'w BackboneLaneWeights<'a>, capacity: u32, budget: usize, first_layer: usize) -> Result<Self> {
-        Self::new_inner_with(weights, capacity, budget, first_layer, None)
-    }
-    fn new_inner_with(weights: &'w BackboneLaneWeights<'a>, capacity: u32, budget: usize, first_layer: usize,
-        sharing: Option<&BackboneLane<'w, 'a>>) -> Result<Self> {
         let mut sizes = Self::workspace_bytes(weights.library, capacity)?;
         if weights.placement.is_some() { sizes[3] = 0; }
         sizes[1]=AttentionQueryWave::device_bytes_with_split(weights.library,capacity,weights.split_query_b)?;
@@ -710,15 +691,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             query: first.query.wave(capacity, sizes[1])?,
             tp2_query: None,
             tp2_output: None,
-            projection: match sharing {
-                Some(owner) => first.projection.wave_sharing(&owner.projection)?,
-                None => first.projection.wave(capacity, sizes[2])?,
-            },
+            projection: first.projection.wave(capacity, sizes[2])?,
             shared: first.shared.as_ref().map(|w| w.wave(capacity,sizes[3])).transpose()?,
-            sparse: Some(match sharing {
-                Some(owner) => SparseAttentionWave::new_sharing(owner.sparse.as_ref().context("owner sparse attention absent")?)?,
-                None => SparseAttentionWave::new(weights.library, capacity as usize, sizes[4])?,
-            }),
+            sparse: Some(SparseAttentionWave::new(weights.library, capacity as usize, sizes[4])?),
             dual_sparse: None,
             capacity: capacity as usize,
             router: first.router.wave(capacity, sizes[5])?,

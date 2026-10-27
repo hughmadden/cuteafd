@@ -60,27 +60,6 @@ impl<'w, 'a> IndexLane<'w, 'a> {
     pub fn new(weights: &'w IndexLaneWeights<'a>, capacity: u32, budget: usize) -> Result<Self> {
         Self::new_inner(weights, capacity, budget, None)
     }
-    /// Bytes [`Self::new_sharing`] allocates: its own selections (their outputs
-    /// serve later layers) without the borrowed index query planes.
-    pub fn sharing_workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        let bytes = Self::workspace_bytes(library, capacity)?;
-        Ok(bytes[1] + bytes[2])
-    }
-    /// A prefill-only slot's index lane (1 RTX) borrowing `owner`'s
-    /// attention-local query projection planes; selections stay its own. See
-    /// `IndexQueryWave::wave_sharing` for the serialized-attention invariant.
-    pub fn new_sharing(owner: &IndexLane<'w, 'a>) -> Result<Self> {
-        ensure!(owner.device.is_none() && owner.next == 0, "index sharing needs an unplaced lane at its first layer");
-        let weights = owner.weights;
-        let capacity = owner.source.capacity() as u32;
-        let bytes = Self::workspace_bytes(weights.library, capacity)?;
-        let query = weights.weights[0].wave_sharing(&owner.query)?;
-        let mut source = IndexSelectionWave::new(weights.library, capacity as usize, bytes[1])?;
-        let reindex = if bytes[2] == 0 { None } else {
-            Some(IndexSelectionWave::sharing_scratch(&mut source, bytes[2])?)
-        };
-        Ok(Self { weights, query, source, reindex, next: 0, device: None, ready: None, invalid: false })
-    }
     fn new_inner(weights: &'w IndexLaneWeights<'a>, capacity: u32, budget: usize,
         device: Option<i32>) -> Result<Self> {
         let bytes = match device {

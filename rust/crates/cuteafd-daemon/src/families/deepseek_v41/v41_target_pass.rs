@@ -193,11 +193,6 @@ impl<'a, R> Pass<'a, R> {
     pub(crate) fn set_l2_prefetch(&mut self, on: bool) { self.l2_solo = on; }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
-    /// The lane and index lane a prefill-only slot borrows attention-local
-    /// storage from (`BackboneLane::new_sharing`, `IndexLane::new_sharing`).
-    pub(crate) fn sharing_owners(&self) -> (&BackboneLane<'w, 'a>, &IndexLane<'w, 'a>) {
-        (&self.resources.lane, &self.resources.index)
-    }
     pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement,
             cuteafd_loader::placement::families::deepseek_v41::execution_hops(1))?;

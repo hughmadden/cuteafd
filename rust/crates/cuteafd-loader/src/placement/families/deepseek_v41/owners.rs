@@ -186,14 +186,7 @@ impl<'a> NativePrograms<'a> {
                 let sparse = rows * (64 * 2048 + 88)
                     + rows.min(cuteafd_core::V41_VERIFY_ROWS as u64) * (10 * 64 * 514 * 4 + 120);
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
-                // One RTX: prefill-only slots (lane >= 2) borrow decode lane
-                // 1's attention-local output projection, sparse planes and
-                // index query planes (serialized attention; see
-                // BackboneLane::new_sharing in the daemon).
-                let borrowing = ranks == 1 && lane >= 2;
-                let sparse_planes = rows * 64 * 2048;
-                add(&mut out, "backbone", 2 * rows * 112752 + query
-                    + if borrowing { sparse - sparse_planes } else { output + sparse }
+                add(&mut out, "backbone", 2 * rows * 112752 + query + output + sparse
                     + rows * (11825 + 5280) + shared);
                 // One shared window producer scratch per pass and GPU; each of
                 // the GPU's window layers keeps only its proposal and commit
@@ -216,7 +209,7 @@ impl<'a> NativePrograms<'a> {
                 let selection = index_rows * (48 + 8 + 8 + 16384 * 8 + 16384 * 4
                     + 2048 * 4 + 2048 * 8 + 4096 + topk + 2048 + 16384 + blocks + 8192);
                 let follower = if rank == ranks - 1 { index_rows * (2048 + 8192) } else { 0 };
-                add(&mut out, "index", if borrowing { 0 } else { index_query } + selection + follower);
+                add(&mut out, "index", index_query + selection + follower);
                 if rank == 0 {
                     add(&mut out, "embedding", rows * (4 + 40960 + 16 + 10240 + 4));
                     add(&mut out, "engram", rows * (24 * (256 + 8 + 512) + 1)

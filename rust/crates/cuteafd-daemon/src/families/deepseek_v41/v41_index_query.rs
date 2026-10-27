@@ -75,37 +75,6 @@ impl<'a> IndexQueryWeights<'a> {
             scales,
         })
     }
-    /// A prefill-only slot's wave borrowing `owner`'s attention-local planes
-    /// and GEMM scratch. Sound only while their index projections and
-    /// selections never overlap: the shared prefill executor runs one hook at
-    /// a time and the attention hook completes its selection before returning
-    /// (1 RTX: drained, unchained). A device-ordered attention (#815 option
-    /// (i)) would need an event per borrowed buffer between the owners.
-    pub fn wave_sharing(&self, owner: &IndexQueryWave<'_, 'a>) -> Result<IndexQueryWave<'_, 'a>> {
-        let capacity = owner.capacity;
-        let workspace = DeviceAllocation::new(self.library, V41Compressor::WORKSPACE_BYTES)?;
-        ensure!(workspace.buffer.device_id == owner.scratch.buffer.device_id
-            && workspace.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
-            "shared index query device differs");
-        let dense = unsafe { self.library.v41_compressor(workspace.buffer)? };
-        Ok(IndexQueryWave {
-            stream: LoadStream { library: self.library, raw: self.library.cuda_stream_create()? },
-            fp8: self.library.v41_fp8_matrix_plan(capacity, 1280, 4096)?,
-            dense,
-            _workspace: workspace,
-            scratch: owner.scratch.clone(),
-            alpha: owner.alpha.clone(),
-            norm: self.library.v41_attention_ops()?,
-            weights: self,
-            planes: owner.planes.clone(),
-            capacity,
-            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
-            ready: None,
-            pending: None,
-            origin: None,
-            tokens: Vec::new(),
-        })
-    }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<IndexQueryWave<'_, 'a>> {
         ensure!(
             IndexQueryWave::device_bytes(self.library, capacity)? <= budget,
@@ -128,11 +97,19 @@ impl<'a> IndexQueryWeights<'a> {
             fp8,
             dense,
             _workspace: workspace,
-            scratch: std::rc::Rc::new(scratch),
-            alpha: std::rc::Rc::new(DeviceAllocation::new(self.library, 4)?),
+            scratch,
+            alpha: DeviceAllocation::new(self.library, 4)?,
             norm: self.library.v41_attention_ops()?,
             weights: self,
-            planes: std::rc::Rc::new(IndexQueryPlanes::new(self.library, rows)?),
+            qr: DeviceAllocation::new(self.library, rows * 2560)?,
+            hidden: DeviceAllocation::new(self.library, rows * 10240)?,
+            positions: DeviceAllocation::new(self.library, rows * 8)?,
+            frequencies: DeviceAllocation::new(self.library, rows * 256)?,
+            projected: DeviceAllocation::new(self.library, rows * 8192)?,
+            head_projected: DeviceAllocation::new(self.library, rows * 64)?,
+            packed: DeviceAllocation::new(self.library, rows * 2048)?,
+            scales: DeviceAllocation::new(self.library, rows * 128)?,
+            head_weights: DeviceAllocation::new(self.library, rows * 64)?,
             capacity,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             ready: None,
@@ -167,8 +144,15 @@ impl IndexQueryOutput<'_> {
         Ok(self.tokens)
     }
 }
-/// One index query's row planes, consumed within its attention hook.
-pub(crate) struct IndexQueryPlanes<'a> {
+pub(crate) struct IndexQueryWave<'w, 'a> {
+    stream: LoadStream<'a>,
+    fp8: V41Fp8Plan<'a>,
+    dense: V41Compressor<'a>,
+    _workspace: DeviceAllocation<'a>,
+    scratch: DeviceAllocation<'a>,
+    alpha: DeviceAllocation<'a>,
+    norm: V41AttentionOps<'a>,
+    weights: &'w IndexQueryWeights<'a>,
     qr: DeviceAllocation<'a>,
     hidden: DeviceAllocation<'a>,
     positions: DeviceAllocation<'a>,
@@ -178,34 +162,6 @@ pub(crate) struct IndexQueryPlanes<'a> {
     packed: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
     head_weights: DeviceAllocation<'a>,
-}
-impl<'a> IndexQueryPlanes<'a> {
-    fn new(library: &'a NativeLibrary, rows: usize) -> Result<Self> {
-        Ok(Self {
-            qr: DeviceAllocation::new(library, rows * 2560)?,
-            hidden: DeviceAllocation::new(library, rows * 10240)?,
-            positions: DeviceAllocation::new(library, rows * 8)?,
-            frequencies: DeviceAllocation::new(library, rows * 256)?,
-            projected: DeviceAllocation::new(library, rows * 8192)?,
-            head_projected: DeviceAllocation::new(library, rows * 64)?,
-            packed: DeviceAllocation::new(library, rows * 2048)?,
-            scales: DeviceAllocation::new(library, rows * 128)?,
-            head_weights: DeviceAllocation::new(library, rows * 64)?,
-        })
-    }
-}
-pub(crate) struct IndexQueryWave<'w, 'a> {
-    stream: LoadStream<'a>,
-    fp8: V41Fp8Plan<'a>,
-    dense: V41Compressor<'a>,
-    _workspace: DeviceAllocation<'a>,
-    // Attention-local storage (see `wave_sharing`): produced and consumed by
-    // one layer's index projection and selection inside its attention hook.
-    scratch: std::rc::Rc<DeviceAllocation<'a>>,
-    alpha: std::rc::Rc<DeviceAllocation<'a>>,
-    norm: V41AttentionOps<'a>,
-    weights: &'w IndexQueryWeights<'a>,
-    planes: std::rc::Rc<IndexQueryPlanes<'a>>,
     capacity: u32,
     graphs: LayerGraphs<'w, 'a, IndexQueryWeights<'a>>,
     ready: Option<u32>,
@@ -223,7 +179,7 @@ impl<'w, 'a> IndexQueryWave<'w, 'a> {
         ensure!(
             std::ptr::eq(self.stream.library, weights.library)
                 && weights.tensors.get(&weights.names[0])?.device_id
-                    == self.planes.hidden.buffer.device_id,
+                    == self.hidden.buffer.device_id,
             "index query rebound library or device differs"
         );
         self.stream.require_complete()?;
@@ -241,15 +197,15 @@ impl IndexQueryWave<'_, '_> {
     }
     /// Normalized BF16 query-rank input [capacity,1280], shared with target attention.
     pub fn query_rank(&self) -> CuteafdDeviceBuffer {
-        self.planes.qr.buffer
+        self.qr.buffer
     }
     /// BF16 attention-input hidden states [capacity,5120], in the same row order.
     pub fn hidden(&self) -> CuteafdDeviceBuffer {
-        self.planes.hidden.buffer
+        self.hidden.buffer
     }
     /// U64 token positions below the official context limit, in the same row order.
     pub fn positions(&self) -> CuteafdDeviceBuffer {
-        self.planes.positions.buffer
+        self.positions.buffer
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
@@ -268,36 +224,36 @@ impl IndexQueryWave<'_, '_> {
     unsafe fn enqueue(&self, rows: u32) -> Result<()> {
         unsafe {
             self.norm.backbone_frequencies(
-                self.planes.positions.buffer,
-                self.planes.frequencies.buffer,
+                self.positions.buffer,
+                self.frequencies.buffer,
                 rows,
                 self.weights.layer as u32,
                 self.stream.raw,
             )?;
             self.fp8.launch(
-                self.planes.qr.buffer,
+                self.qr.buffer,
                 self.weights.tensors.get(&self.weights.names[0])?,
                 self.weights.scales.buffer,
                 self.scratch.buffer,
                 self.alpha.buffer,
-                self.planes.projected.buffer,
+                self.projected.buffer,
                 rows,
                 self.stream.raw,
             )?;
             self.dense.weights_project(
-                self.planes.hidden.buffer,
+                self.hidden.buffer,
                 self.weights.tensors.get(&self.weights.names[2])?,
-                self.planes.head_projected.buffer,
+                self.head_projected.buffer,
                 rows as usize,
                 self.stream.raw,
             )?;
             self.dense.query_prepare(
-                self.planes.projected.buffer,
-                self.planes.frequencies.buffer,
-                self.planes.head_projected.buffer,
-                self.planes.packed.buffer,
-                self.planes.scales.buffer,
-                self.planes.head_weights.buffer,
+                self.projected.buffer,
+                self.frequencies.buffer,
+                self.head_projected.buffer,
+                self.packed.buffer,
+                self.scales.buffer,
+                self.head_weights.buffer,
                 rows as usize,
                 self.stream.raw,
             )?;
@@ -397,13 +353,13 @@ impl IndexQueryWave<'_, '_> {
                 && query.layer == self.weights.layer
                 && query.rows == tokens.len()
                 && query.rows <= self.capacity as usize
-                && query.hidden.device_id == self.planes.hidden.buffer.device_id,
+                && query.hidden.device_id == self.hidden.buffer.device_id,
             "index query origin differs"
         );
         for (dst, src) in [
-            (self.planes.qr.buffer, query.normalized_rank),
-            (self.planes.hidden.buffer, query.hidden),
-            (self.planes.positions.buffer, query.positions),
+            (self.qr.buffer, query.normalized_rank),
+            (self.hidden.buffer, query.hidden),
+            (self.positions.buffer, query.positions),
         ] {
             self.stream.library.copy_d2d(dst, src, src.bytes)?;
         }
@@ -438,7 +394,7 @@ impl IndexQueryWave<'_, '_> {
         let tokens = query.tokens()?;
         ensure!(query.rows <= self.capacity as usize && query.rows == tokens.len()
             && binding.layer() == self.weights.layer && query.layer == self.weights.layer
-            && query.hidden.device_id == self.planes.hidden.buffer.device_id, "queued index origin differs");
+            && query.hidden.device_id == self.hidden.buffer.device_id, "queued index origin differs");
         self.tokens.extend_from_slice(tokens);
         let rows = query.rows as u32;
         let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
@@ -446,8 +402,8 @@ impl IndexQueryWave<'_, '_> {
             && !crate::shared::decode_graph::census::eager("layer_row")));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-            for (dst, src) in [(self.planes.qr.buffer, query.normalized_rank),
-                (self.planes.hidden.buffer, query.hidden), (self.planes.positions.buffer, query.positions)] {
+            for (dst, src) in [(self.qr.buffer, query.normalized_rank),
+                (self.hidden.buffer, query.hidden), (self.positions.buffer, query.positions)] {
                 self.stream.library.copy_d2d_async(dst, src, src.bytes, self.stream.raw)?;
             }
             crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
@@ -493,9 +449,9 @@ impl IndexQueryWave<'_, '_> {
             origin: self.origin,
             tokens: &self.tokens,
             layer: self.weights.layer,
-            packed: sized(self.planes.packed.buffer, 2048),
-            scales: sized(self.planes.scales.buffer, 128),
-            head_weights: sized(self.planes.head_weights.buffer, 64),
+            packed: sized(self.packed.buffer, 2048),
+            scales: sized(self.scales.buffer, 128),
+            head_weights: sized(self.head_weights.buffer, 64),
             _owner: PhantomData,
         })
     }
