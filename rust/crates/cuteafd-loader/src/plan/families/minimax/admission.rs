@@ -259,9 +259,12 @@ pub fn extend_table_stride(context: u64) -> u64 { context.div_ceil(PAGE_ROWS).ne
 /// startup census replaces it.
 pub const DECODE_GRAPH_BYTES: u64 = 8 << 20;
 
-/// The decode steps the coordinator records at startup and replays: one per
-/// row count a verify step can have. A drafting sequence verifies its anchor
-/// and up to seven drafts, the others one row each, all within the decode tile.
+/// The whole decode steps a coordinator would record at startup and replay: one
+/// per row count a verify step can have. MiniMax decode runs eagerly (the Spark
+/// exchange's stream memory operations are never captured), so serving, golden
+/// and the planner all admit with `Request::startup_graphs` false and reserve
+/// none. A drafting sequence verifies its anchor and up to seven drafts, the
+/// others one row each, all within the decode tile.
 /// Keys are exact row counts, not padded buckets: a padded row would need its
 /// K/V and index writes masked and its expert routes withheld from the Sparks,
 /// and the recordings cost readiness and memory only once.
@@ -486,7 +489,8 @@ pub struct Request {
     /// source matrix; 0 otherwise): the load peak takes it after the target's weights.
     pub draft_staging: u64,
     pub host_embedding: bool,
-    /// Startup records the decode graphs (golden runs every step eagerly and records none).
+    /// Startup records whole decode steps ([`decode_graphs`]). MiniMax decode runs eagerly, so
+    /// serving, golden and the planner all pass false and the pool takes those bytes.
     pub startup_graphs: bool,
     /// The ring geometry every Spark link registers.
     pub rings: cuteafd_core::SparkRings,

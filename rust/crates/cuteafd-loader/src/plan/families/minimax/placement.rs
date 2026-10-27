@@ -97,7 +97,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         spark_vision_bytes: if matches!(report.vision, MediaMode::Spark(_)) { vision_weights + vision_scratch + GIB } else { 0 },
         headroom: opts.headroom_bytes, draft_bytes: draft.as_ref().map(|d| d.bytes).or(dflash.map(|d| d.bytes)).unwrap_or(0),
         draft_rings: draft.as_ref().map(|d| d.slots).or(dflash.map(|d| d.slots)).unwrap_or(0),
-        draft_staging: dflash.map_or(0, |d| d.staging), host_embedding: opts.host_embedding, startup_graphs: true,
+        draft_staging: dflash.map_or(0, |d| d.staging), host_embedding: opts.host_embedding, startup_graphs: false,
         rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
             slot_bytes: ring.slot_bytes, alignment: ring.alignment } })?;
     let local = recipe.onboarding.local_bytes;
@@ -156,12 +156,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     if recipe.reservations.media > 0 { add_vision(&mut items); }
     items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
-    let graphs = &recipe.graphs;
     let mut memory = MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: opts.rtx_bytes[0], items, kv_tokens: admitted.pool_tokens }], pool_tokens: admitted.pool_tokens,
-        waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; {} decode steps recorded at startup \
-            (rows 1..={}, estimated {} MiB each); speculation {}", graphs.keys.len(), graphs.keys.len(),
-            admission::DECODE_GRAPH_BYTES >> 20,
+        waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; decode runs eagerly, with no \
+            startup decode graphs; speculation {}",
             if draft.is_some() { "bundled DSpark" } else if dflash.is_some() { "DFlash2 (shared drafter)" } else { "off" }),
             "Offline CUDA/code baselines remain estimates; serving re-admits measured free memory before allocation".into(),
             format!("{onboarded} routed layers on the RTX ({:.1} GiB), {} on {} Sparks", local as f64 / GIB as f64,

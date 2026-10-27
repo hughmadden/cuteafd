@@ -190,7 +190,7 @@ mod tests {
                 waves: lanes },
             kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
             spark_budget: cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0,
-            headroom: 0, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
+            headroom: 0, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding, startup_graphs: false, rings: spark_rings()?,
         };
         let available = options.rtx_bytes[0] - measured_baseline;
         let mut live = solve(&checkpoint, &programs, Some(&package), request.clone(), available, Some(4096))?;
@@ -201,10 +201,9 @@ mod tests {
         assert_eq!(live.local_layers.is_empty(), remote_scratch.is_none());
         assert_eq!(live.spark_layers, (3 + live.local_layers.len()..60).collect::<Vec<_>>());
         if remote_scratch.is_some() { return Ok(()); }
-        // The same decode graph keys are recorded by the server and charged by both ledgers.
-        assert_eq!(live.graphs.keys, (1..=16).collect::<Vec<_>>());
-        let charged: u64 = device.items.iter().filter(|i| graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        assert_eq!(charged, live.graphs.inventory.bytes(0));
+        // Decode runs eagerly: neither ledger reserves startup decode graphs.
+        assert!(live.graphs.keys.is_empty() && live.graphs.inventory.bytes(0) == 0);
+        assert!(device.items.iter().all(|i| !graph_groups.contains(&i.group.as_str())));
         assert_eq!(live.ledger.bytes("head_workspace"), Some(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64));
         let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
         assert!(live.readmit(&cfg, request.sizing, live.cache.total_bytes - 1, Some(4096), Qwen4KvCache::Fp8).is_err());
@@ -266,7 +265,7 @@ mod tests {
             let request = Request { sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
                 spark_budget: admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0, headroom,
                 draft_bytes: draft.map_or(0, |d| d.bytes), draft_rings: draft.map_or(0, |d| d.slots),
-                draft_staging: draft.map_or(0, |d| d.staging), host_embedding: false, startup_graphs: true,
+                draft_staging: draft.map_or(0, |d| d.staging), host_embedding: false, startup_graphs: false,
                 rings: spark_rings()? };
             let available = rtx - measured_baseline;
             let mut served = solve(&checkpoint, &programs, Some(&package(None)), request, available, None)?;

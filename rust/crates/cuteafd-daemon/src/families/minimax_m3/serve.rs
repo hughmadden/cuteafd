@@ -327,7 +327,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let request = admission::Request { sizing, kv_format: args.kv_cache, local_layers, spark_budget: args.spark_budget_bytes,
         spark_vision_bytes: 0, headroom, draft_bytes, draft_rings, draft_staging,
         host_embedding: args.token_io.embed_placement == EmbedPlacement::Host,
-        startup_graphs: true, rings: admission::spark_rings()? };
+        startup_graphs: false, rings: admission::spark_rings()? };
     let text_admission = (auto_local && vision_mode == MediaMode::Auto).then(|| -> Result<_> {
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), request.clone(), available()?, None)
     }).transpose()?;
@@ -372,8 +372,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         } };
     // Decode runs eagerly: the Spark exchange's stream waits and writes are never captured, so no
     // whole step is recorded and serving captures nothing after this point.
-    tracing::info!(graph_keys = admitted.graphs.keys.len(), reserved_bytes = admitted.graphs.inventory.bytes(0),
-        "MiniMax decode runs eagerly; the admitted decode graph reserve stays unused");
+    anyhow::ensure!(admitted.graphs.keys.is_empty() && admitted.graphs.inventory.bytes(0) == 0,
+        "MiniMax decode runs eagerly and admits no startup decode graphs");
     backend.startup_captures.set(Some(cuteafd_ffi::graph_captures()));
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
