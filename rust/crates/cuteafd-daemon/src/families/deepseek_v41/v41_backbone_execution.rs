@@ -472,9 +472,9 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
         std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
     }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        let mut total = WindowWave::device_bytes(library, capacity)?
-            .checked_mul(40)
-            .context("window workspace budget overflow")?;
+        // One shared producer scratch; each layer keeps only its proposal.
+        let mut total = crate::families::deepseek_v41::v41_window::WindowScratch::device_bytes(library, capacity)?
+            + 40 * WindowWave::proposal_bytes(capacity);
         for layer in SOURCES {
             total = total
                 .checked_add(CompressorWave::device_bytes(layer, capacity as usize)?)
@@ -500,15 +500,11 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             weights.windows.len() == 40 && weights.sources.len() == 4,
             "cache producer weight owners incomplete"
         );
+        let scratch = crate::families::deepseek_v41::v41_window::WindowScratch::new(weights.library, capacity)?;
         let windows = weights
             .windows
             .iter()
-            .map(|w| {
-                w.wave(
-                    capacity,
-                    WindowWave::device_bytes(weights.library, capacity)?,
-                )
-            })
+            .map(|w| w.wave_shared(capacity, scratch.clone()))
             .collect::<Result<Vec<_>>>()?;
         let sources = weights
             .sources

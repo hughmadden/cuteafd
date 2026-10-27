@@ -256,12 +256,19 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         capacity: u32,
     ) -> Result<[usize; 2]> {
         let mut bytes = [0usize; 2];
-        let window = WindowWave::device_bytes(library, capacity)?;
+        // One shared producer scratch per GPU that owns window layers; each
+        // layer keeps only its proposal.
+        let scratch = crate::families::deepseek_v41::v41_window::WindowScratch::device_bytes(library, capacity)?;
+        let mut owns = [false; 2];
         for layer in 0..40 {
             let gpu = placement.attention(layer)?;
+            owns[gpu] = true;
             bytes[gpu] = bytes[gpu]
-                .checked_add(window)
+                .checked_add(WindowWave::proposal_bytes(capacity))
                 .context("placed SWA workspace overflow")?;
+        }
+        for (gpu, owns) in owns.into_iter().enumerate() {
+            if owns { bytes[gpu] += scratch; }
         }
         for layer in SOURCES {
             let gpu = placement.attention(layer)?;
@@ -287,15 +294,19 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                 .all(|(need, budget)| need <= budget),
             "cache producer workspaces exceed a GPU budget"
         );
+        let mut scratch: [Option<std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowScratch<'a>>>; 2] = [None, None];
         let windows = weights
             .windows
             .iter()
             .map(|weights| {
                 weights.device.own(|| {
-                    weights.wave(
-                        capacity,
-                        WindowWave::device_bytes(weights.device.library, capacity)?,
-                    )
+                    let gpu = usize::try_from(weights.device.id)?;
+                    let shared = match &scratch[gpu.min(1)] {
+                        Some(shared) => shared.clone(),
+                        None => crate::families::deepseek_v41::v41_window::WindowScratch::new(weights.device.library, capacity)?,
+                    };
+                    scratch[gpu.min(1)] = Some(shared.clone());
+                    weights.wave_shared(capacity, shared)
                 })
             })
             .collect::<Result<Vec<_>>>()?;

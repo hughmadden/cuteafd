@@ -188,11 +188,15 @@ impl<'a> NativePrograms<'a> {
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
                 add(&mut out, "backbone", 2 * rows * 112752 + query + output + sparse
                     + rows * (11825 + 5280) + shared);
-                let window = self.scratch(rows, 5120, 512)? + 4 + rows * 13088;
+                // One shared window producer scratch per pass and GPU; each of
+                // the GPU's window layers keeps only its proposal and commit
+                // destinations until the accepted rows commit.
+                let window_scratch = self.scratch(rows, 5120, 512)? + 4 + rows * (10240 + 1024 + 1024 + 8 + 256);
+                let window_proposal = rows * (512 + 16 + 8);
                 let compressor = |ratio2| BLAS + rows * if ratio2 {
                     10240 + 2048 + 2048 + 8 + 1024 + 264 + 512 + 68 + 8 + 288
                 } else { 10240 + 1024 + 1024 + 264 + 512 + 68 + 8 + 288 };
-                add(&mut out, "cache producers", window * if ranks == 1 { 40 } else { 20 }
+                add(&mut out, "cache producers", window_scratch + window_proposal * if ranks == 1 { 40 } else { 20 }
                     + if rank == 0 { 3 * compressor(true) } else { 0 }
                     + if rank == ranks - 1 { compressor(false) } else { 0 });
                 if window_batch {

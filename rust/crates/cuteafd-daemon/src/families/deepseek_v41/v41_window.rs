@@ -291,29 +291,29 @@ impl<'a> WindowWeights<'a> {
             scales,
         })
     }
+    /// A wave with its own producer scratch (references, tests).
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<WindowWave<'_, 'a>> {
         ensure!(
             WindowWave::device_bytes(self.library, capacity)? <= budget,
             "window wave exceeds budget"
         );
-        let fp8 = self.library.v41_fp8_matrix_plan(capacity, 5120, 512)?;
+        self.wave_shared(capacity, WindowScratch::new(self.library, capacity)?)
+    }
+    /// A layer's wave on a pass's shared producer scratch (same device and
+    /// capacity); only the proposal and its commit staging are its own.
+    pub fn wave_shared(&self, capacity: u32, shared: std::rc::Rc<WindowScratch<'a>>) -> Result<WindowWave<'_, 'a>> {
         let rows = capacity as usize;
+        ensure!(shared.capacity == rows && shared.input.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
+            "window producer scratch capacity or device differs");
         let value = WindowWave {
             stream: LoadStream {
                 library: self.library,
                 raw: self.library.cuda_stream_create()?,
             },
-            scratch: DeviceAllocation::new(self.library, fp8.info().scratch_bytes as usize)?,
-            fp8,
-            alpha: DeviceAllocation::new(self.library, 4)?,
+            shared,
             norm: self.library.v41_attention_ops()?,
             kv: self.library.v41_kv()?,
             weights: self,
-            input: DeviceAllocation::new(self.library, rows * 10240)?,
-            projected: DeviceAllocation::new(self.library, rows * 1024)?,
-            normalized: DeviceAllocation::new(self.library, rows * 1024)?,
-            positions: DeviceAllocation::new(self.library, rows * 8)?,
-            frequencies: DeviceAllocation::new(self.library, rows * 256)?,
             values: DeviceAllocation::attention_plane(self.library, rows, 512, "window proposal values")?,
             scales: DeviceAllocation::attention_plane(self.library, rows, 16, "window proposal scales")?,
             destinations: DeviceAllocation::new(self.library, rows * 8)?,
@@ -326,16 +326,6 @@ impl<'a> WindowWeights<'a> {
             pending_commit: None,
             replica: None,
         };
-        ensure!(
-            value.input.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
-            "window weight device differs"
-        );
-        let launched = unsafe {
-            value
-                .fp8
-                .initialize_scratch(value.scratch.buffer, value.alpha.buffer, value.stream.raw)
-        };
-        launched.and(value.synchronize())?;
         Ok(value)
     }
 }
@@ -398,19 +388,54 @@ impl WindowProposal<'_> {
         Ok([self.first, self.offset as u64, self.tokens as u64, position])
     }
 }
-pub(crate) struct WindowWave<'w, 'a> {
-    stream: LoadStream<'a>,
+/// One pass's window producer working set on one GPU, shared by its 40
+/// layers. A pass produces one layer at a time (layer L+1's producer is
+/// ordered after layer L's attention by the stage chain or a host drain), so
+/// only the per-layer proposal (`values`/`scales`, held until the accepted
+/// rows commit) and its commit staging stay per layer.
+pub(crate) struct WindowScratch<'a> {
     fp8: V41Fp8Plan<'a>,
     scratch: DeviceAllocation<'a>,
     alpha: DeviceAllocation<'a>,
-    norm: V41AttentionOps<'a>,
-    kv: V41Kv<'a>,
-    weights: &'w WindowWeights<'a>,
     input: DeviceAllocation<'a>,
     projected: DeviceAllocation<'a>,
     normalized: DeviceAllocation<'a>,
     positions: DeviceAllocation<'a>,
     frequencies: DeviceAllocation<'a>,
+    capacity: usize,
+}
+impl<'a> WindowScratch<'a> {
+    pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
+        Ok(library.v41_fp8_matrix_plan_info(capacity, 5120, 512)?.scratch_bytes as usize
+            + 4 + capacity as usize * (10240 + 1024 + 1024 + 8 + 256))
+    }
+    pub fn new(library: &'a NativeLibrary, capacity: u32) -> Result<std::rc::Rc<Self>> {
+        let fp8 = library.v41_fp8_matrix_plan(capacity, 5120, 512)?;
+        let rows = capacity as usize;
+        let value = Self {
+            scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize)?,
+            alpha: DeviceAllocation::new(library, 4)?,
+            input: DeviceAllocation::new(library, rows * 10240)?,
+            projected: DeviceAllocation::new(library, rows * 1024)?,
+            normalized: DeviceAllocation::new(library, rows * 1024)?,
+            positions: DeviceAllocation::new(library, rows * 8)?,
+            frequencies: DeviceAllocation::new(library, rows * 256)?,
+            fp8,
+            capacity: rows,
+        };
+        let stream = LoadStream { library, raw: library.cuda_stream_create()? };
+        unsafe { value.fp8.initialize_scratch(value.scratch.buffer, value.alpha.buffer, stream.raw)?; }
+        unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+        Ok(std::rc::Rc::new(value))
+    }
+}
+
+pub(crate) struct WindowWave<'w, 'a> {
+    stream: LoadStream<'a>,
+    shared: std::rc::Rc<WindowScratch<'a>>,
+    norm: V41AttentionOps<'a>,
+    kv: V41Kv<'a>,
+    weights: &'w WindowWeights<'a>,
     values: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
     destinations: DeviceAllocation<'a>,
@@ -426,15 +451,17 @@ pub(crate) struct WindowWave<'w, 'a> {
         crate::shared::memory::peer_publication::PeerPublication<'a>)>,
 }
 impl WindowWave<'_, '_> {
+    /// A wave with its own producer scratch.
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        Ok(library
-            .v41_fp8_matrix_plan_info(capacity, 5120, 512)?
-            .scratch_bytes as usize
-            + 4
-            + capacity as usize * 13088)
+        Ok(WindowScratch::device_bytes(library, capacity)? + Self::proposal_bytes(capacity))
+    }
+    /// A layer's own storage beside a shared [`WindowScratch`]: the proposal
+    /// (values, scales) and its commit destinations.
+    pub fn proposal_bytes(capacity: u32) -> usize {
+        capacity as usize * (512 + 16 + 8)
     }
     pub fn input(&self) -> CuteafdDeviceBuffer {
-        self.input.buffer
+        self.shared.input.buffer
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
@@ -445,7 +472,7 @@ impl WindowWave<'_, '_> {
         self.ready = None;
         ensure!(
             state.layer == self.weights.layer
-                && state.values.buffer.device_id == self.input.buffer.device_id,
+                && state.values.buffer.device_id == self.shared.input.buffer.device_id,
             "window state binding differs"
         );
         ensure!(
@@ -491,41 +518,41 @@ impl WindowWave<'_, '_> {
         }
         unsafe {
             self.stream.library.copy_host_buffer_h2d_async(
-                self.positions.buffer, self.staging.buffer, p.rows * 8, self.stream.raw,
+                self.shared.positions.buffer, self.staging.buffer, p.rows * 8, self.stream.raw,
             )
         }
     }
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
         unsafe {
             self.norm.backbone_frequencies(
-                self.positions.buffer,
-                self.frequencies.buffer,
+                self.shared.positions.buffer,
+                self.shared.frequencies.buffer,
                 rows as u32,
                 self.weights.layer as u32,
                 self.stream.raw,
             )?;
-            self.fp8.launch(
-                self.input.buffer,
+            self.shared.fp8.launch(
+                self.shared.input.buffer,
                 self.weights.tensors.get(&self.weights.names[0])?,
                 self.weights.scales.buffer,
-                self.scratch.buffer,
-                self.alpha.buffer,
-                self.projected.buffer,
+                self.shared.scratch.buffer,
+                self.shared.alpha.buffer,
+                self.shared.projected.buffer,
                 rows as u32,
                 self.stream.raw,
             )?;
             self.norm.norm(
-                self.projected.buffer,
+                self.shared.projected.buffer,
                 self.weights.tensors.get(&self.weights.names[2])?,
                 None,
-                self.normalized.buffer,
+                self.shared.normalized.buffer,
                 rows as u32,
                 512,
                 self.stream.raw,
             )?;
             self.kv.pack(
-                self.normalized.buffer,
-                Some(self.frequencies.buffer),
+                self.shared.normalized.buffer,
+                Some(self.shared.frequencies.buffer),
                 self.values.buffer,
                 self.scales.buffer,
                 rows,
@@ -542,7 +569,7 @@ impl WindowWave<'_, '_> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(query.binding()?.layer() == self.weights.layer && query.layer == self.weights.layer
             && query.rows == prepared.rows && query.hidden.bytes == prepared.rows * 10240
-            && query.hidden.device_id == self.input.buffer.device_id
+            && query.hidden.device_id == self.shared.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
         let forced_eager = crate::shared::decode_graph::census::eager("window")
@@ -552,7 +579,7 @@ impl WindowWave<'_, '_> {
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
             unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
-            unsafe { self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
+            unsafe { self.stream.library.copy_d2d_async(self.shared.input.buffer, query.hidden,
                 query.hidden.bytes, self.stream.raw)?; }
             self.upload(&prepared)?;
             let dispatch = || unsafe {
@@ -623,7 +650,7 @@ impl WindowWave<'_, '_> {
             && query.layer == self.weights.layer
             && query.rows == prepared.rows
             && query.hidden.bytes == prepared.rows * 10240
-            && query.hidden.device_id == self.input.buffer.device_id
+            && query.hidden.device_id == self.shared.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))),
             "window query layer, rows or positions differ");
@@ -632,7 +659,7 @@ impl WindowWave<'_, '_> {
                 // Reads only the normalized layer input: overlap the query projections.
                 crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_d2d_async(
-                    self.input.buffer, query.hidden, query.hidden.bytes, self.stream.raw,
+                    self.shared.input.buffer, query.hidden, query.hidden.bytes, self.stream.raw,
                 )?;
             }
             if !super::graph_policy::captures_shape(prepared.rows as u32) {
@@ -746,9 +773,9 @@ impl WindowWave<'_, '_> {
         Ok(WindowOutput {
             values: slice(self.values.buffer, 0, rows * 512),
             scales: slice(self.scales.buffer, 0, rows * 16),
-            projected: slice(self.projected.buffer, 0, rows * 1024),
-            normalized: slice(self.normalized.buffer, 0, rows * 1024),
-            frequencies: slice(self.frequencies.buffer, 0, rows * 256),
+            projected: slice(self.shared.projected.buffer, 0, rows * 1024),
+            normalized: slice(self.shared.normalized.buffer, 0, rows * 1024),
+            frequencies: slice(self.shared.frequencies.buffer, 0, rows * 256),
             _owner: PhantomData,
         })
     }
@@ -819,7 +846,7 @@ impl WindowWave<'_, '_> {
         self.graph = self.graphs.launch(&(rows, owner)).map(|_| (rows, owner));
         if self.graph.is_none() {
             tracing::debug!(target: "cuteafd::graph_capture", site="window", layer=self.weights.layer,
-                rows, owner, device=self.input.buffer.device_id, bank=self as *const Self as usize,
+                rows, owner, device=self.shared.input.buffer.device_id, bank=self as *const Self as usize,
                 retained=self.graphs.len(), "graph cache miss");
         }
         Ok(())
@@ -829,7 +856,7 @@ impl WindowWave<'_, '_> {
         Some((self.graphs.get(&(rows, owner))?.raw, rows, owner))
     }
     fn insert_graph(&mut self, rows: usize, owner: u64, raw: *mut c_void) -> Result<()> {
-        let device = self.input.buffer.device_id;
+        let device = self.shared.input.buffer.device_id;
         // SAFETY: the wave pins weights/workspace; Drop drains before releasing fields.
         let graph = unsafe { GraphOwner::new(self.stream.library, device, raw, ())? };
         self.graphs.insert((rows, owner), graph, None);
