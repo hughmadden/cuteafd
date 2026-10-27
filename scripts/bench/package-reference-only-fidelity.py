@@ -200,6 +200,10 @@ def reference_precision(meta, panel):
     precision = panel.get('reference_snapshot', {}).get('precision')
     if isinstance(precision, str) and precision.strip():
         return precision
+    # A golden over the scored model's own text (MiniMax) records its root precision itself.
+    precision = (meta.get('root_arithmetic') or {}).get('precision')
+    if isinstance(precision, str) and precision.strip():
+        return precision
     if meta.get('root_arithmetic') == KIMI_F32_ROOT:
         return KIMI_F32_PRECISION
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate eight first-party vision fixtures, without external image assets."""
+"""Generate first-party vision fixtures (the eight fidelity windows, or the semantics set), without external assets."""
 from __future__ import annotations
 
 import argparse
@@ -113,12 +113,87 @@ def generate(out: Path, root: Path = ROOT):
     return manifest
 
 
+BOLD = ROOT / "rust/crates/cuteafd-bench/assets/fonts/DejaVuSansMono-Bold.ttf"
+
+
+def generate_semantics(out: Path):
+    """Live-API semantics media with known content, recorded in semantics.json: counted
+    shapes, a 1344x1344 four-quadrant image (four 672^2 tiles' worth; MiniMax shrinks it to
+    one 576-token grid) and a 2016x672 banner."""
+    import random
+    import PIL
+    from PIL import Image, ImageDraw, ImageFont
+
+    out.mkdir(parents=True, exist_ok=True)
+    records = []
+
+    def keep(path, data, **facts):
+        dest = out / path
+        if dest.exists() and dest.read_bytes() != data:
+            raise ValueError("fixture versions are immutable; choose a new output directory")
+        dest.write_bytes(data)
+        records.append({"path": path, "sha256": hashlib.sha256(data).hexdigest(), **facts})
+
+    def png(image):
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=False, compress_level=9)
+        return buffer.getvalue()
+
+    def shapes(count, color, shape, seed):
+        image = Image.new("RGB", (672, 672), "white")
+        draw, rnd, placed = ImageDraw.Draw(image), random.Random(seed), []
+        while len(placed) < count:
+            x, y = rnd.randrange(80, 592), rnd.randrange(80, 592)
+            if all((x - a) ** 2 + (y - b) ** 2 > 140 ** 2 for a, b in placed):
+                placed.append((x, y))
+                if shape == "circle":
+                    draw.ellipse((x - 45, y - 45, x + 45, y + 45), fill=color)
+                elif shape == "square":
+                    draw.rectangle((x - 50, y - 50, x + 50, y + 50), fill=color)
+                else:
+                    draw.polygon([(x, y - 55), (x - 55, y + 45), (x + 55, y + 45)], fill=color)
+        return image
+
+    for name, count, color, rgb, shape, seed in (("circles7", 7, "red", (220, 30, 30), "circle", 1),
+                                                ("squares3", 3, "blue", (30, 80, 220), "square", 2),
+                                                ("triangles5", 5, "green", (30, 160, 60), "triangle", 3)):
+        keep(name + ".png", png(shapes(count, rgb, shape, seed)), id=name, kind="shapes",
+             width=672, height=672, count=count, color=color, shape=shape)
+    quadrants = Image.new("RGB", (1344, 1344))
+    draw = ImageDraw.Draw(quadrants)
+    words = ["ALPHA", "BRAVO", "CHARLIE", "DELTA"]
+    for (x, y), color, word in zip(((0, 0), (672, 0), (0, 672), (672, 672)),
+                                   ("#d62728", "#2ca02c", "#1f77b4", "#ffd700"), words):
+        draw.rectangle((x, y, x + 671, y + 671), fill=color)
+        draw.text((x + 336, y + 336), word, font=ImageFont.truetype(str(BOLD), 120), fill="black", anchor="mm")
+    keep("quadrants.png", png(quadrants), id="quadrants", kind="tiles", width=1344, height=1344,
+         words=words, colors=["red", "green", "blue", "yellow"])
+    banner = Image.new("RGB", (2016, 672), "white")
+    draw = ImageDraw.Draw(banner)
+    words = ["APPLE", "RIVER", "CASTLE"]
+    for x, word in zip((336, 1008, 1680), words):
+        draw.text((x, 336), word, font=ImageFont.truetype(str(BOLD), 150), fill="black", anchor="mm")
+    keep("banner.png", png(banner), id="banner", kind="wide", width=2016, height=672, words=words)
+
+    manifest = {"schema": "cuteafd.media.semantics/1", "font_sha256": hashlib.sha256(BOLD.read_bytes()).hexdigest(),
+                "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "libraries": {"pillow": PIL.__version__}, "fixtures": records}
+    path = out / "semantics.json"
+    content = canonical(manifest) + b"\n"
+    if path.exists() and path.read_bytes() != content:
+        raise ValueError("fixture manifest changed; choose a new output directory")
+    path.write_bytes(content)
+    return manifest
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--set", choices=["fidelity", "semantics"], default="fidelity",
+                   help="fidelity: the eight first-party windows; semantics: live-API image checks")
     args = p.parse_args()
-    result = generate(args.out)
-    print(f"{args.out}: {len(result['fixtures'])} deterministic first-party fixtures")
+    result = generate(args.out) if args.set == "fidelity" else generate_semantics(args.out)
+    print(f"{args.out}: {len(result['fixtures'])} deterministic first-party {args.set} fixtures")
 
 
 if __name__ == "__main__":
