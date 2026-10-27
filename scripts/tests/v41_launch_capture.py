@@ -40,9 +40,11 @@ GPU_PCI = ("00000000:01:00.0", "00000000:02:00.0")
 HOSTS = ("ostrich", "dodo", "emu", "kiwi", "rhea", "moa")
 # The gate kit's V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
 # wip-cards.py generates their configs for a WIP arm.
-KIT_CARDS = ("v41-flash-max", "v41-flash-min", "v41-flash-ref-tp4")
+LEGACY_KIT_CARDS = ("v41-flash-max", "v41-flash-min", "v41-flash-ref-tp4")
+KIT_CARDS = LEGACY_KIT_CARDS + ("v41-flash-sim5090",)
 EXAMPLES = ("deepseek-v41-mxfp4-max", "deepseek-v41-mxfp4-min")
-CASES = EXAMPLES + KIT_CARDS
+# These captures predate the shared launcher; later cards have direct contract tests.
+CASES = EXAMPLES + LEGACY_KIT_CARDS
 WIP_SLOT = "gate"
 
 # Every stub logs its argv as one JSON line; behavior is keyed on the arguments.

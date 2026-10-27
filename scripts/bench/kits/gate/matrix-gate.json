@@ -152,6 +152,38 @@
    }
   },
   {
+   "name": "v41-flash-sim5090",
+   "family": "deepseek_v41",
+   "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8748",
+    "EXPERT_PORT": "19848",
+    "RTX_GPUS": "1",
+    "COORDINATOR_GPU": "0",
+    "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+    "SPARK_INTAKE": "pinned",
+    "MAX_CONTEXT_TOKENS": "1048576",
+    "PREFILL_BATCH_TOKENS": "1024",
+    "SPECULATOR": "dspark",
+    "SPARK_COUNT": "4",
+    "SPARK_TP": "4",
+    "SPARK_EP": "1",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi"
+   }
+  },
+  {
    "name": "v41-flash-min",
    "family": "deepseek_v41",
    "config": "examples/configs/deepseek-v41-mxfp4-min.config",
