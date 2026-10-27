@@ -184,6 +184,10 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                     kind: ExpertV2SourceKind::Prefill,
                 }])?,
         );
+        // Start the next unit's Engram I/O now (#815): see the 2-RTX hook.
+        if let Some(next) = self.chunks.get(unit.index + 1) {
+            self.requests.borrow_mut().prefetch_encoder(self.lease, next)?;
+        }
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
             let positions = batch.cache()?.positions();

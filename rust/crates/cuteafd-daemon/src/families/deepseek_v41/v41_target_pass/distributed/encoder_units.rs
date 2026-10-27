@@ -137,6 +137,12 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         let chunk = self.chunks[unit.index];
         let batch = self.requests.borrow_mut().reserve_encoder(&[RequestTokens { lease: self.lease, tokens: chunk,
             image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
+        // Start the next unit's Engram I/O now (#815, prof13: it otherwise
+        // starts at that unit's reservation, one local layer before layer 1
+        // needs it, which left GPU0 idle ~14 ms per Engram layer).
+        if let Some(next) = self.chunks.get(unit.index + 1) {
+            self.requests.borrow_mut().prefetch_encoder(self.lease, next)?;
+        }
         let batch = slot.batch.insert(batch);
         slot.pass.state.begin()?;
         // SAFETY: the unit exclusively owns its batch and the pass's input storage.

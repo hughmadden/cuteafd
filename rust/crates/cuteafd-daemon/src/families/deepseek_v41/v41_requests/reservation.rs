@@ -43,6 +43,22 @@ impl Requests<'_> {
         unsafe { execution.prepare_encoder_layer(&mut self.cache, batch.cache()?, lane, index) }
     }
 
+    /// Starts the next encoder unit's Engram gather now (#815): `tokens`
+    /// follow the request's reserved prefill frontier. The next
+    /// `reserve_encoder` of exactly these tokens adopts it. Any other
+    /// reservation cancels it. Text-only units; image requests prepare at
+    /// reservation.
+    pub fn prefetch_encoder(&mut self, lease: CacheLease, tokens: &[u32]) -> Result<()> {
+        if let Some((_, _, _, mut stale)) = self.prefetched.take() { stale.cancel(); }
+        if tokens.is_empty() || self.image_requests > 0 { return Ok(()); }
+        let live = self.request(lease)?;
+        let history = live.prefill.as_ref().map_or(&live.history, |p| p.history());
+        let position = history.position();
+        let wave = self.pipeline.prepare(&[EngramRequestTokens { history, token_ids: tokens, image_mask: None }])?;
+        self.prefetched = Some((lease, position, tokens.to_vec(), wave));
+        Ok(())
+    }
+
     pub fn reserve_encoder(&mut self, requests: &[RequestTokens<'_>]) -> Result<RequestBatch> {
         ensure!(!requests.is_empty() && requests.len() <= 16, "invalid encoder request count");
         let masks = self.resolved_masks(requests, true)?;
@@ -71,7 +87,17 @@ impl Requests<'_> {
             history: p.history(), token_ids: r.tokens,
             image_mask: masks.as_ref().map_or(r.image_mask, |m| m[i].as_deref()),
         }).collect::<Vec<_>>();
-        let mut engram = self.pipeline.prepare(&inputs)?;
+        // A matching prefetch (`prefetch_encoder`) already started this I/O.
+        let prefetched = self.prefetched.take();
+        let mut engram = match prefetched {
+            Some((lease, position, tokens, wave)) if requests.len() == 1 && masks.is_none()
+                && lease == requests[0].lease && position == prepared[0].history().position()
+                && tokens == requests[0].tokens => wave,
+            other => {
+                if let Some((_, _, _, mut stale)) = other { stale.cancel(); }
+                self.pipeline.prepare(&inputs)?
+            }
+        };
         let advanced = prepared.iter().zip(engram.batches()).map(|(p, b)| {
             let mut next = p.history().prefill_cursor();
             next.advance_full(b)?;
