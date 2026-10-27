@@ -61,6 +61,20 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("role,cmake", [
+    ("rtx_backbone", "v41_local_experts.cmake"),
+    ("rtx_tp2", "v41_tp2_experts.cmake"),
+])
+def test_v41_slice_gate_matches_ordered_serving_recipe(role, cmake):
+    job = next(job for job in compare_sm.jobs("all") if job[0] == f"v41-slices-{role}")
+    assert job[2] == ["--role", role, "--rows", compare_sm.CAPACITIES,
+                      "--width", "192", "--standard-names"]
+    recipe = (ROOT / "native/cmake/families/deepseek_v41" / cmake).read_text()
+    assert f"--role {role}" in recipe
+    assert "--rows 1,16,80,256,1024,4096 --width 192 --standard-names" in recipe
+    assert "--atomic-min-capacity" not in recipe
+
+
 @pytest.mark.parametrize("group,names", [
     ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
                   "attn_res_c4_add", "attn_res_c5_add",

@@ -210,6 +210,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             if role == "spark_tp3"
             else None
         )
+        partial_cols = (selected_width // 4 + selected_width // 32) if (family == "v41" and not compact) else hidden
         specs = [
             (cutlass.Uint32, (capacity, hidden // 4), (wire // 4, 1)),
             (cutlass.Uint8, (capacity, hidden // 32), (wire, 1)),
@@ -228,7 +229,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             (cutlass.Float32, (routes,), (1,)),
             (cutlass.Int32, (routes,), (1,)),
             (cutlass.Float32, (1,), (1,)) if atomic else
-                (cutlass.Float32, (planes, routes, hidden), (routes * hidden, hidden, 1)),
+                (cutlass.Float32, (planes, routes, partial_cols), (routes * partial_cols, partial_cols, 1)),
             (cutlass.Float32, (capacity * hidden,), (1,)) if atomic else
                 (cutlass.Float32, (routes, hidden), (hidden, 1)),
         ]

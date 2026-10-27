@@ -207,13 +207,17 @@ impl Panel for Prefill {
          except its last 256 tokens."
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
-        Self::lengths(131_072).iter().map(|&l| rates.seconds(l as f64 * 1.15, 2.0) + 1.0).sum()
+        Self::lengths(131_072).iter().map(|&l| rates.seconds(l as f64 * 2.15, 3.0) + 1.0).sum()
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let lengths = Self::lengths(ctx.max_context);
         let mut points = Vec::new();
         for (i, &target) in lengths.iter().enumerate() {
             ctx.progress.step(i as f64 / lengths.len() as f64, format!("{}K", target / 1024));
+            // Warm each length without retaining a prefix or charging its fabric traffic.
+            let warm = sized_prompt(ctx, 2000 + i as u64, target, "Reply with the single word OK.");
+            ctx.client.chat(plain(ctx.client, &warm, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+                .with_context(|| format!("{target}-token prefill warm-up"))?;
             let text = sized_prompt(ctx, 1000 + i as u64, target, "Reply with the single word OK.");
             // Cold: a fresh prompt; its ids come back for the cached run.
             let fabric_mark = ctx.client.fabric_mark();
