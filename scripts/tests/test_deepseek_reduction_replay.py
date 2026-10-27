@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -14,6 +15,53 @@ sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/d
 import analyze_expert_reduction_replay as analyze  # noqa: E402
 import collect_expert_route_bank as collect  # noqa: E402
 import plan_expert_reduction_replay as plan  # noqa: E402
+
+
+def slice_qualifier():
+    spec = importlib.util.spec_from_file_location(
+        "v41_slice_native", TOOLS / "qualify/deepseek_v41/qualify_v41_slice_native.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_slice_repeat_equality_accepts_all_exported_capacities():
+    qualifier = slice_qualifier()
+    options, capacities = qualifier.parse_args([
+        "--native-lib", "/native.so", "--width", "192",
+        "--capacities", "1,16,80,256,1024,4096", "--repeat-equality", "3",
+        "--spark-tp", "3", "--require-ordered",
+    ])
+    assert capacities == set(qualifier.CAPACITIES)
+    assert options.repeat_equality == 3
+    assert options.spark_tp == 3
+    _, defaults = qualifier.parse_args([
+        "--native-lib", "/native.so", "--width", "192", "--repeat-equality", "3",
+    ])
+    assert defaults == set(qualifier.CAPACITIES)
+
+
+@pytest.mark.parametrize("extra", [
+    ["--repeat-equality", "2"], ["--capacities", "256"],
+    ["--capacities", "512", "--repeat-equality", "3"],
+    ["--full-backbone", "--spark-tp", "3"],
+])
+def test_slice_repeat_equality_rejects_invalid_options(extra):
+    with pytest.raises(SystemExit):
+        slice_qualifier().parse_args(["--native-lib", "/native.so", "--width", "192", *extra])
+
+
+@pytest.mark.parametrize("samples, exact", [
+    ([b"\x00\x00\x00\x00"] * 3, True),
+    ([b"\x00\x00\x00\x00", b"\x00\x00\x00\x80", b"\x00\x00\x00\x00"], False),
+])
+def test_slice_repeat_equality_checks_bytes_and_runs_every_replay(samples, exact):
+    qualifier = slice_qualifier()
+    calls = []
+    values = iter(samples)
+    assert qualifier.repeat_equal(lambda: calls.append(1), lambda: next(values), 3) is exact
+    assert len(calls) == 3
 
 
 def flash_manifest() -> dict[str, object]:

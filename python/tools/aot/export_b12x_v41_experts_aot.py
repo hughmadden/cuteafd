@@ -63,12 +63,11 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
     if role in SPARK_ROLES and input_format == "fp8_k32":
         from export_b12x_slices_aot import export as export_slices
 
-        # Keep the fast wide slice arithmetic for serial and speculative decode;
-        # prefill retains its direct token output. The
-        # compact specialization stays limited to the historical TP4 role.
+        # Keep width-192 arithmetic and ordered route output at every capacity.
+        # Compact specialization stays limited to the historical TP4 role.
         widths = {capacity: 192 for capacity in rows}
         compact = role == "spark" and compact_live_rows is not None
-        export_slices(output_dir, rows, widths, atomic_min_capacity=256,
+        export_slices(output_dir, rows, widths,
                       role=role, standard_names=True,
                       compact_max_capacity=16 if compact else None,
                       compact_live_rows=compact_live_rows if compact else None)

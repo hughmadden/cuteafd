@@ -128,8 +128,6 @@ def jobs(scope):
     ])
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
-        if role != "dspark_tp2":
-            args += ["--atomic-min-capacity", "256"]
         result.append((f"v41-slices-{role}", "export_b12x_slices_aot.py", args))
     result.append(("v41-slices-rtx_tp2-hybrid", "export_b12x_slices_aot.py",
                    ["--role", "rtx_tp2", "--rows", "1,2,16,80", "--width", "192",
