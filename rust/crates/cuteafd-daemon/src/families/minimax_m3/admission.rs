@@ -123,6 +123,112 @@ mod tests {
         Ok(())
     }
 
+    /// A plan of the test snapshot on `ranks` Sparks at #762's shape (2 x 4096 below six Sparks,
+    /// 3 x 2752 at six), and the sizing serve runs it with.
+    fn planned(ranks: usize) -> Result<(tempfile::TempDir, cuteafd_loader::plan::PlanReport, RuntimeSizing)> {
+        let dir = tempfile::tempdir()?;
+        testing::write_minimax_m3_snapshot(dir.path(), false, false);
+        let path = dir.path().join("PROGRAMS.json");
+        std::fs::write(&path, manifest().to_string())?;
+        let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks },
+            layout: Some(LayoutOptions { workspace_manifest: Some(path), concurrency: 16, context_tokens: 4096,
+                pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, ..Default::default() }),
+            ..Default::default() })?;
+        ensure!(report.placement_supported, "TP{ranks}: {:?}", report.hints);
+        let shape = admission::prefill_shape(0, 0, ranks)?;
+        let sizing = RuntimeSizing { unit_rows: shape.unit_rows as usize, decode_rows: 64, sequences: 16, context: 4096,
+            spark_ranks: ranks, logit_rows: 64, waves: shape.waves as usize };
+        Ok((dir, report, sizing))
+    }
+
+    /// The planned coordinator item for the Spark intake.
+    fn planned_intake(report: &cuteafd_loader::plan::PlanReport) -> Option<u64> {
+        report.memory_layout.as_ref()?.devices.iter().find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)?
+            .items.iter().find(|i| i.group == "MiniMax spark_intake").map(|i| i.bytes)
+    }
+
+    /// The coordinator's Spark intake is charged as the one link's return slots, a BF16 plane of a
+    /// unit's rows per wave and rank, whatever the intake mode: the ledger has no landing input, and
+    /// the intake allocates exactly those device planes in GPU and pinned modes alike
+    /// (`minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes`, CPU fixture).
+    #[test]
+    fn minimax_planner_charges_the_link_return_slots_at_the_adaptive_shapes() -> Result<()> {
+        for (ranks, unit, waves) in [(2, 4096, 2), (3, 4096, 2), (4, 4096, 2), (6, 2752, 3)] {
+            let (_dir, report, sizing) = planned(ranks)?;
+            assert_eq!((sizing.unit_rows, sizing.waves, report.prefill_unit_rows, report.prefill_waves),
+                (unit, waves, Some(unit as u64), Some(waves as u64)), "TP{ranks}");
+            let slots = (waves * ranks * unit * 6144 * 2) as u64;
+            assert_eq!(planned_intake(&report), Some(slots), "TP{ranks}");
+            assert_eq!(slots, cuteafd_loader::serving_capacity::prefill_return_bytes(waves as u64, unit as u64, ranks as u64, 6144));
+        }
+        Ok(())
+    }
+
+    /// Every Spark rank is charged exactly the one transport serve opens to it: the endpoint serve
+    /// seals (a unit's rows, BF16 in), with the rings serve's link registers, and one execution slot
+    /// per wave in flight.
+    #[test]
+    fn minimax_planner_charges_the_one_spark_endpoint_serve_seals() -> Result<()> {
+        use cuteafd_core::memory_layout::DeviceKind;
+        for ranks in [2, 3, 4, 6] {
+            let (_dir, report, sizing) = planned(ranks)?;
+            let model = spark_model(sizing)?;
+            assert_eq!(model.endpoints, [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: sizing.unit_rows as u32,
+                ingress: cuteafd_core::SparkIngress::Bf16 }], "TP{ranks}");
+            assert_eq!((model.execution_slots as usize, report.prefill_transports), (sizing.waves, Some(1)), "TP{ranks}");
+            assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("minimax_m3", sizing.waves as u64), 1);
+            let ring = cuteafd_loader::plan::layout::spark_ring_geometry(1);
+            assert_eq!(model.rings, cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
+                slot_bytes: ring.slot_bytes, alignment: ring.alignment }, "the planner registers serve's rings");
+            // One endpoint's transport on every rank (every routed layer is on the Sparks here).
+            let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: (3..60).collect(),
+                spark_ranks: ranks, prefill_lanes: 1 };
+            let io = working.rank_endpoints_io(0, cuteafd_core::ExpertGeometry::MINIMAX_M3, &model.endpoints, model.rings)?;
+            let sparks = report.memory_layout.as_ref().unwrap().devices.iter().filter(|d| d.kind == DeviceKind::Spark)
+                .collect::<Vec<_>>();
+            assert_eq!(sparks.len(), ranks);
+            for spark in sparks {
+                let item = |group: &str| spark.items.iter().find(|i| i.group == group).map(|i| i.bytes);
+                assert_eq!((item("expert intake"), item("endpoint response prefixes"), item("rdma rings")),
+                    (Some(io.intake), Some(io.endpoint_staging), Some(io.mapped_rings)), "TP{ranks} rank {}", spark.index);
+                assert_eq!(item("execution slots").is_some(), sizing.waves > 1, "TP{ranks} rank {}", spark.index);
+            }
+        }
+        Ok(())
+    }
+
+    /// The Spark link's intake allocates exactly the planned intake on the coordinator GPU, in the
+    /// default GPU-landing mode and with `CUTEAFD_SPARK_INTAKE=pinned` alike: a BF16 plane of a unit's
+    /// rows per wave and rank. Pinned landing adds host staging (the link's landing staging and a
+    /// small-wave buffer), never device memory.
+    #[test]
+    #[ignore = "CPU-only native fixture; requires an explicit build slot and fixture directory"]
+    fn minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes() -> Result<()> {
+        use crate::shared::spark_intake::{IntakeMode, SparkIntake};
+        use anyhow::Context;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 40)?;
+        library.cuda_set_device(0)?;
+        for ranks in [2, 3, 4, 6] {
+            let (_dir, report, sizing) = planned(ranks)?;
+            let planned = planned_intake(&report).context("planned Spark intake")?;
+            for mode in [IntakeMode::Gpu, IntakeMode::Pinned] {
+                // The fixture's own device accounting (`cuda_memory_info` takes host memory for its
+                // integrated-looking device).
+                let (before, _) = library.cuda_physical_memory_info()?;
+                let intake = SparkIntake::with_waves(&library, mode, ranks, sizing.unit_rows, 6144 * 2, sizing.waves)?;
+                let (after, _) = library.cuda_physical_memory_info()?;
+                assert_eq!((before - after) as u64, planned, "TP{ranks} {mode:?}: device bytes the intake allocated");
+                assert_eq!((0..sizing.waves).flat_map(|slot| intake.slot_buffers(slot)).map(|plane| plane.bytes as u64)
+                    .sum::<u64>(), planned, "TP{ranks} {mode:?}: every return slot's rank planes");
+                drop(intake);
+                assert_eq!(library.cuda_physical_memory_info()?.0, before, "TP{ranks} {mode:?}: the intake released its planes");
+            }
+        }
+        Ok(())
+    }
+
     /// The ledger's extend-launch tables cover the shared executor's cuts: a prefill call cut into
     /// units (`prefill_units`), each unit tiled into extend launches of at most the 1024 rows the
     /// index-prefill and attention-extend programs take.
