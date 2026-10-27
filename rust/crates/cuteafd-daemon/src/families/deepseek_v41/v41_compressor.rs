@@ -387,6 +387,7 @@ impl<'a> CompressorWeights<'a> {
             pending_commit: None,
             replica: None,
             commit_staging: HostAllocation::new(self.library, rows*4+256)?,
+            commit_destinations: HostAllocation::new(self.library, rows * 8)?,
         })
     }
 }
@@ -557,6 +558,11 @@ pub(crate) struct CompressorWave<'w, 'a> {
     replica: Option<(std::rc::Rc<SourceReplica<'a>>,
         crate::shared::memory::peer_publication::PeerPublication<'a>)>,
     commit_staging: HostAllocation<'a>,
+    /// Commit destinations: their own pinned buffer. An async H2D reads pinned
+    /// staging when it executes, so no two queued uses share one (the producer's
+    /// descriptors/positions copy may not have run when a device-ordered commit
+    /// is staged, #815).
+    commit_destinations: HostAllocation<'a>,
 }
 impl<'w, 'a> CompressorWave<'w, 'a> {
     pub fn device_bytes(layer: usize, rows: usize) -> Result<usize> {

@@ -317,7 +317,8 @@ impl<'a> WindowWeights<'a> {
             values: DeviceAllocation::attention_plane(self.library, rows, 512, "window proposal values")?,
             scales: DeviceAllocation::attention_plane(self.library, rows, 16, "window proposal scales")?,
             destinations: DeviceAllocation::new(self.library, rows * 8)?,
-            staging: HostAllocation::new(self.library, rows * 8 + 128)?,
+            staging: HostAllocation::new(self.library, rows * 8)?,
+            commit_staging: HostAllocation::new(self.library, rows * 8 + 128)?,
             capacity: rows,
             graph: None,
             graphs: GraphBank::new(None),
@@ -440,6 +441,9 @@ pub(crate) struct WindowWave<'w, 'a> {
     scales: DeviceAllocation<'a>,
     destinations: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
+    /// Commit destinations and slot ends: their own pinned buffer, never the
+    /// producer's position staging, which a queued H2D may still read (#815).
+    commit_staging: HostAllocation<'a>,
     capacity: usize,
     graph: Option<(usize, u64)>,
     // Exact cache-owner bindings; containing wave pins workspace and weights.

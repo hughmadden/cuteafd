@@ -83,9 +83,9 @@ impl<'a> CompressorWave<'_, 'a> {
                     .index
                     .destination(&plan, row.lease.slot, row.position as usize / ratio)?;
         }
-        // Reuse pinned proposal metadata after execution has drained. Commit is
-        // outside the proposal graph because acceptance is only known afterward.
-        for (dst, value) in self.staging.bytes_mut()[..prepared.rows * 8]
+        // Commit is outside the proposal graph because acceptance is only known
+        // afterward; its destinations use their own pinned buffer.
+        for (dst, value) in self.commit_destinations.bytes_mut()[..prepared.rows * 8]
             .chunks_exact_mut(8)
             .zip(&destinations)
         {
@@ -107,7 +107,7 @@ impl<'a> CompressorWave<'_, 'a> {
                 unsafe {
                     self.stream.library.copy_h2d_async(
                         self.cache_destinations.buffer,
-                        &self.staging.bytes_mut()[..prepared.rows * 8],
+                        &self.commit_destinations.bytes_mut()[..prepared.rows * 8],
                         self.stream.raw,
                     )?;
                     self.kernel.index_store(

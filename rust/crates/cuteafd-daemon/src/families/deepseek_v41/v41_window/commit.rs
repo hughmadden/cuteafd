@@ -86,7 +86,7 @@ impl<'a> WindowWave<'_, 'a> {
             }
             ends.push(c.position + n as u64);
         }
-        let staging = self.staging.bytes_mut();
+        let staging = self.commit_staging.bytes_mut();
         for (i, d) in destinations.iter().enumerate() {
             staging[i * 8..i * 8 + 8].copy_from_slice(&d.to_ne_bytes());
         }
@@ -124,7 +124,7 @@ impl<'a> WindowWave<'_, 'a> {
             unsafe {
                 self.stream.library.copy_h2d_async(
                     self.destinations.buffer,
-                    &self.staging.bytes_mut()[..p.rows * 8],
+                    &self.commit_staging.bytes_mut()[..p.rows * 8],
                     self.stream.raw,
                 )?;
                 self.kv.store(
@@ -140,7 +140,7 @@ impl<'a> WindowWave<'_, 'a> {
                 for (i, c) in p.chunks.iter().enumerate() {
                     self.stream.library.copy_h2d_async(
                         slice(state.ends.buffer, c.lease.slot * 8, 8),
-                        &self.staging.bytes_mut()[p.rows * 8 + i * 8..p.rows * 8 + i * 8 + 8],
+                        &self.commit_staging.bytes_mut()[p.rows * 8 + i * 8..p.rows * 8 + i * 8 + 8],
                         self.stream.raw,
                     )?;
                 }
@@ -245,6 +245,57 @@ mod tests {
     #[ignore = "requires SM peer copy, CUTEAFD_CACHE_COMMIT_MODEL and two CUDA GPUs"]
     fn native_queued_windows_publish_replicas_before_commit_completion() -> Result<()> {
         queued_windows(true)
+    }
+    /// #815: a device-ordered commit stages its destinations on the host while
+    /// the producer's queued position upload has not run yet. With the stream
+    /// gated, both are queued before either executes; the result must still
+    /// match the drained reference (the commit must not reuse the producer's
+    /// pinned staging).
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn native_commit_staging_survives_a_queued_producer_upload() -> Result<()> {
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
+        let weights = WindowWeights::load(&lib, &catalog, 0,
+            WindowWeights::device_bytes(&lib, &catalog, 0)?, 1024*1024)?;
+        let mut state = WindowState::new(&lib, 0, 1, usize::MAX)?;
+        let mut reference = WindowState::new(&lib, 0, 1, usize::MAX)?;
+        let lease = state.begin_request(0, 11)?;
+        let original = reference.begin_request(0, 11)?;
+        let mut gated = weights.wave(16, usize::MAX)?;
+        let mut direct = weights.wave(16, usize::MAX)?;
+        let rows = 13;
+        let input: Vec<u8> = (0..rows*5120).flat_map(|i| {
+            let value = ((i % 23) as f32 / 23.0).to_bits();
+            ((value >> 16) as u16).to_ne_bytes()
+        }).collect();
+        let chunk = |lease| WindowChunk { lease, position: 0, tokens: rows as u32 };
+        lib.copy_h2d(direct.input(), &input)?;
+        unsafe { direct.execute(&reference, &[chunk(original)])?; }
+        direct.commit(&mut reference, &[rows as u32])?;
+        lib.copy_h2d(gated.input(), &input)?;
+        {
+            let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, gated.stream.raw)? };
+            let prepared = gated.prepare(&state, &[chunk(lease)])?;
+            gated.upload(&prepared)?;
+            unsafe { gated.enqueue(prepared.rows)?; }
+            gated.ready = Some(prepared);
+            // The commit stages on the host while the upload above is still queued.
+            unsafe { gated.enqueue_commit(&state, &[rows as u32])?; }
+            drop(gate);
+        }
+        gated.synchronize()?;
+        gated.commit(&mut state, &[rows as u32])?;
+        let (actual, expected) = (state.view(lease)?, reference.view(original)?);
+        for (a, b, width) in [(actual.values, expected.values, 512), (actual.scales, expected.scales, 16)] {
+            let mut left = vec![0; rows * width];
+            let mut right = left.clone();
+            lib.copy_d2h(&mut left, slice(a, 0, rows * width))?;
+            lib.copy_d2h(&mut right, slice(b, 0, rows * width))?;
+            assert_eq!(left, right, "queued producer positions were overwritten by commit staging");
+        }
+        Ok(())
     }
     fn queued_windows(replicated: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
