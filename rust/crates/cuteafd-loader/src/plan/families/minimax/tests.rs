@@ -103,7 +103,8 @@ fn vision_uses_encoder_owner_and_reserves_weights_and_scratch() {
         if expected == EncoderKind::Off { assert!(items.is_empty()); assert_eq!(encoder.admitted_bytes(), 0); }
         else {
             assert_eq!(items.len(), 2);
-            assert_eq!(encoder.scratch, 762_383_616);
+            // One 576-token image's tower scratch with the BLAS workspace (the native ledger's).
+            assert_eq!(encoder.scratch, 210_841_856);
             assert!(encoder.weights > report.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes);
             assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), encoder.admitted_bytes());
         }

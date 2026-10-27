@@ -303,8 +303,11 @@ mod scoring_workspace_tests {
 
     #[test]
     fn minimax_vision_scratch_matches_the_native_ledger() {
-        // native/tests/vision_minimax_contract_selftest.cc: scratch 758,189,312 + 4 MiB BLAS.
-        assert_eq!(minimax_vision_scratch_bytes(), 758_189_312 + 4 * MIB);
+        // native/tests/vision_minimax_contract_selftest.cc: scratch 758,189,312 at 4096 tokens and
+        // 206,647,552 at one 576-token image, each beside the 4 MiB BLAS workspace.
+        assert_eq!(minimax_vision_scratch_bytes_for(4096), 758_189_312 + 4 * MIB);
+        assert_eq!(minimax_vision_scratch_bytes_for(576), 206_647_552 + 4 * MIB);
+        assert_eq!(minimax_vision_scratch_bytes(), minimax_vision_scratch_bytes_for(crate::media::minimax::ENCODER_TOKENS as u64));
     }
 
     #[test]
@@ -1273,10 +1276,15 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 
-/// Mirrors scratch_minimax at the tower's 4096-token capacity (16,384 patches), with the
-/// fixed 1024-row GEMM staging, LSE and the BLAS workspace: 762,383,616 bytes.
+/// The MiniMax tower's scratch at its loaded capacity (one image, `ENCODER_TOKENS`): 210,841,856 bytes.
 pub fn minimax_vision_scratch_bytes() -> u64 {
-    let (n, chunk, tokens) = (4096 * 4, 1024, 4096);
+    minimax_vision_scratch_bytes_for(crate::media::minimax::ENCODER_TOKENS as u64)
+}
+
+/// Mirrors scratch_minimax at a `tokens`-token capacity (four patches a token), with the fixed
+/// 1024-row GEMM staging, LSE and the BLAS workspace.
+fn minimax_vision_scratch_bytes_for(tokens: u64) -> u64 {
+    let (n, chunk) = (tokens * 4, 1024);
     [n*1280*4, n*1280*2, n*1176*4, n*1280*2, n*1280*2, n*1280*2, n*1280*2, tokens*6144*2, n*6144*2,
      chunk*1280*3*4, chunk*1280*4, chunk*5120*4, chunk*5120*2, chunk*6144*4, chunk*6144*2, chunk*6144*4,
      n*2*14*14*3, 768*4, n*3*4, 16384*16*4, 2*4, 4*MIB]

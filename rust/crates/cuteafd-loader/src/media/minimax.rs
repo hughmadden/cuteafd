@@ -5,8 +5,10 @@ use std::path::Path;
 
 pub const IMAGE_TOKEN: u32 = 200_025;
 pub const VIDEO_TOKEN: u32 = 200_026;
-/// Token capacity of the loaded tower (16,384 patches of scratch).
-pub const ENCODER_TOKENS: usize = 4096;
+/// Token capacity of the loaded tower: one image. The bundled processor resizes every image into
+/// `max_pixels` 451,584 (672 x 672) on a 28-pixel factor (patch 14 x merge 2), so an image is at most
+/// 2,304 patches, 576 merged tokens ([`resize_shape`]); video is not admitted.
+pub const ENCODER_TOKENS: usize = 576;
 pub const PROCESSOR_SOURCES: [(&str, &str); 3] = [
     ("image_processor.py", "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994"),
     ("video_processor.py", "ced0f8d85d73f8722fecb26033d2d91ecf4a4e5112c91ce1b1522ca7edd0943d"),

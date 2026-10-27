@@ -42,6 +42,8 @@ int main() {
   check(ledger.weights==cursor,"resident weight bytes");
   check(ledger.scratch==758189312,"4096-token scratch bytes");
   check(ledger.blas_workspace==4194304,"BLAS workspace bytes");
+  auto image=spec;image.max_tokens=576;
+  check(cuteafd_vision_required(&image,&ledger)==0 && ledger.scratch==206647552,"576-token image scratch bytes");
   check(ledger.device_allocations==0 && ledger.encodes==0,"admission does not allocate or encode");
   auto reject=[&](cuteafd_vision_spec candidate,const char* name) {
     check(cuteafd_vision_required(&candidate,&ledger)!=0,name);

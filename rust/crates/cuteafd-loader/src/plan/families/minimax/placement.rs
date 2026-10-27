@@ -152,7 +152,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let add_vision = |items: &mut Vec<Item>| {
         items.push(Item::new(Category::Weights, "vision tower + projector", "BF16 + F32 conv/vectors", encoder.weights, Basis::Formula));
-        items.push(Item::new(Category::Workspace, "vision scratch", "4096 merged tokens", encoder.scratch, Basis::Formula));
+        items.push(Item::new(Category::Workspace, "vision scratch", "one image, 576 merged tokens", encoder.scratch, Basis::Formula));
     };
     if recipe.reservations.media > 0 { add_vision(&mut items); }
     items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
