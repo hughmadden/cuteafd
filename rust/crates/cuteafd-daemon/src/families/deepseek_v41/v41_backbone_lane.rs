@@ -498,8 +498,7 @@ impl LaneFfn<'_, '_, '_> {
                     else { shared.execute_ffn(input)? } };
             let shared_us = timing.elapsed().as_micros() as u64;
             if let Some(l2) = l2 { l2.issue(input.layer)?; }
-            let result = unsafe { if cooperative { pending.finish_cooperative(&contribution).await }
-                else { pending.finish(&contribution).await } }?;
+            let result = unsafe { pending.finish(&contribution).await }?;
             if let Some(split) = ffn_split.as_deref_mut() {
                 split.remote_layers += 1;
                 split.remote_routed_us += routed_us;
