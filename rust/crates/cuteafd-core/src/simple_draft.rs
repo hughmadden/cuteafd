@@ -16,7 +16,10 @@
 //! with room verifies one position past its cutoff, so the calibration keeps
 //! seeing outcomes there: without it a position whose raw confidence starts
 //! below the cutoff is never verified, so never calibrated (V4.1's dSpark
-//! head stayed at depth one).
+//! head stayed at depth one). Exploration priorities come from request-local
+//! streams seeded by identity and a fixed seed. Candidates still compete for
+//! one shared exploration row; shared calibration learns in identity order
+//! within a round, but completed lane rounds remain asynchronous.
 //!
 //! **Arms.** `simple`: cutoff 0.5. `simple-rc`: row `n + 1` is verified while
 //! `q > (T(n + 1) - T(n)) / c`, `T` the pooled row-cost surface
@@ -295,10 +298,27 @@ impl Outcomes {
 fn logit(p: f64) -> f64 { (p / (1. - p)).ln() }
 fn sigmoid(z: f64) -> f64 { 1. / (1. + (-z).exp()) }
 
+/// Request-local exploration stream and acceptance evidence; both retire together.
+#[derive(Clone, Copy, Debug)]
+struct RequestState { outcomes: Outcomes, rng: u64 }
+
+impl RequestState {
+    fn new(id: u64) -> Self {
+        Self { outcomes: Outcomes::default(), rng: id ^ 0x9e37_79b9_7f4a_7c15 }
+    }
+    fn random(&mut self) -> u64 {
+        self.rng = self.rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SimpleDraft {
     mode: DraftMode,
-    outcomes: std::collections::BTreeMap<u64, Outcomes>,
+    requests: std::collections::BTreeMap<u64, RequestState>,
     calibration: Vec<Platt>,
     /// First copy-tail position: the drafter's widest native block.
     native: usize,
@@ -308,7 +328,6 @@ pub(crate) struct SimpleDraft {
     /// The pooled row-cost surface.
     curve: CurveFit,
     row_cost: RowCost,
-    rng: u64,
     pending: Option<SimpleSelection>,
     last: Option<SimpleRound>,
     /// `[group][native, tail][position]`.
@@ -317,8 +336,8 @@ pub(crate) struct SimpleDraft {
 
 impl SimpleDraft {
     pub fn new(mode: DraftMode, positions: usize, native: usize) -> Self {
-        Self { mode, outcomes: Default::default(), calibration: vec![Platt::new(); positions], native, tokens: 0., time: 0.,
-            curve: CurveFit::default(), row_cost: RowCost::Linear, rng: 0x9e37_79b9_7f4a_7c15, pending: None, last: None,
+        Self { mode, requests: Default::default(), calibration: vec![Platt::new(); positions], native, tokens: 0., time: 0.,
+            curve: CurveFit::default(), row_cost: RowCost::Linear, pending: None, last: None,
             reliability: std::array::from_fn(|_| std::array::from_fn(|_| vec![Reliability::default(); positions])) }
     }
     pub fn mode(&self) -> DraftMode { self.mode }
@@ -340,7 +359,7 @@ impl SimpleDraft {
     /// The request's logit offset (zero for `simple`).
     pub fn offset(&self, id: u64) -> f64 {
         if self.mode != DraftMode::SimpleDerived { return 0.; }
-        self.outcomes.get(&id).map_or(0., Outcomes::offset)
+        self.requests.get(&id).map_or(0., |state| state.outcomes.offset())
     }
     /// Conditional acceptance per position as the rule uses it.
     pub fn probabilities(&self, id: u64, confidence: &[f64]) -> Vec<f64> {
@@ -348,7 +367,7 @@ impl SimpleDraft {
         self.platt(confidence).into_iter()
             .map(|p| if offset == 0. { p } else { sigmoid(logit(p.clamp(1e-6, 1. - 1e-6)) + offset) }).collect()
     }
-    pub fn release(&mut self, id: u64) { self.outcomes.remove(&id); }
+    pub fn release(&mut self, id: u64) { self.requests.remove(&id); }
     /// The cutoff of the first draft row of a selection over `requests`
     /// requests (`n` = the anchors). Deeper rows are priced in the selection.
     pub fn cutoff(&self, requests: usize) -> Cutoff {
@@ -374,13 +393,13 @@ impl SimpleDraft {
     fn cost_per_token(&self) -> Option<f64> {
         (self.tokens > 0.).then(|| self.time / self.tokens)
     }
-    fn random(&mut self, below: usize) -> usize {
-        // splitmix64: deterministic, so replays and tests repeat.
-        self.rng = self.rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((z ^ (z >> 31)) % below as u64) as usize
+    fn explore(&mut self, decisions: &[SimpleDecision], open: &[usize]) -> Option<usize> {
+        // One priority per eligible request: other lanes cannot consume its stream.
+        open.iter().copied().map(|index| {
+            let id = decisions[index].id;
+            let priority = self.requests.entry(id).or_insert_with(|| RequestState::new(id)).random();
+            ((priority, id), index)
+        }).max_by_key(|&(key, _)| key).map(|(_, index)| index)
     }
 
     /// Lengths under `max_rows` verifier rows (anchors included).
@@ -403,10 +422,9 @@ impl SimpleDraft {
             positions.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
             for decision in &mut decisions { decision.chosen = 0; }
             for &(_, _, index) in positions.iter().take(budget) { decisions[index].chosen += 1; }
-        } else if wanted < budget {
+        } else if wanted < budget && cutoff.curve.is_none() {
             let open: Vec<usize> = (0..decisions.len()).filter(|&i| decisions[i].chosen < decisions[i].joint.len()).collect();
-            if !open.is_empty() {
-                let index = open[self.random(open.len())];
+            if let Some(index) = self.explore(&decisions, &open) {
                 decisions[index].chosen += 1;
                 decisions[index].explore = true;
             }
@@ -445,10 +463,11 @@ impl SimpleDraft {
         }
         let open: Vec<usize> = (0..decisions.len()).filter(|&i| decisions[i].chosen < decisions[i].joint.len()
             && decisions[i].chosen == decisions[i].passing).collect();
-        if rows - anchors < budget && !open.is_empty() {
-            let index = open[self.random(open.len())];
-            decisions[index].chosen += 1;
-            decisions[index].explore = true;
+        if rows - anchors < budget {
+            if let Some(index) = self.explore(decisions, &open) {
+                decisions[index].chosen += 1;
+                decisions[index].explore = true;
+            }
         }
     }
 
@@ -457,13 +476,16 @@ impl SimpleDraft {
         let rows: usize = round.requests.iter().map(|r| r.rows).sum();
         let accepted: usize = round.requests.iter().map(|r| r.accepted).sum();
         let group = report_group(round.requests.len());
-        for request in round.requests {
+        // Canonical within-round learning; completed lane rounds still arrive asynchronously.
+        let mut requests: Vec<_> = round.requests.iter().collect();
+        requests.sort_by_key(|request| request.id);
+        for request in requests {
             let Some(confidence) = request.confidence.filter(|_| request.rows > 1) else { continue };
             let hits = request.accepted - 1;
             let positions = (request.rows - 1).min(confidence.len()).min(self.calibration.len());
             let predicted = self.probabilities(request.id, &confidence[..positions]);
             let platt = self.platt(&confidence[..positions]);
-            let outcomes = self.outcomes.entry(request.id).or_default();
+            let outcomes = &mut self.requests.entry(request.id).or_insert_with(|| RequestState::new(request.id)).outcomes;
             outcomes.hits *= OFFSET_DECAY;
             outcomes.predicted *= OFFSET_DECAY;
             outcomes.reached *= OFFSET_DECAY;
@@ -506,6 +528,81 @@ mod tests {
     fn observe(policy: &mut SimpleDraft, requests: &[ObservedDraftRequest<'_>], total_us: f64) {
         policy.observe(&DraftRoundObservation { shared: false, requests, routes: &[], layer_us: &[],
             total_us, draft_us: f64::NAN, drafted_requests: None, wide: false, predicted_us: None });
+    }
+
+    #[test]
+    fn exploration_streams_ignore_other_lane_rounds_and_candidate_order() {
+        let confidence = [0.1; 3];
+        let candidates = [DraftCandidate { id: 7, confidence: &confidence },
+            DraftCandidate { id: 19, confidence: &confidence }];
+        for mode in [DraftMode::Simple, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
+            let mut alone = SimpleDraft::new(mode, 3, 3);
+            let mut interleaved = alone.clone();
+            let mut winners = std::collections::BTreeSet::new();
+            for round in 0..64 {
+                let expected = alone.select(&candidates, 64).lengths;
+                interleaved.select(&[DraftCandidate { id: 90 + round, confidence: &confidence }], 64);
+                interleaved.release(90 + round);
+                let actual = interleaved.select(&[candidates[1], candidates[0]], 64).lengths;
+                assert_eq!(expected, [actual[1], actual[0]], "{mode:?} round {round}");
+                assert_eq!(expected.iter().sum::<usize>(), 1);
+                winners.insert(expected.iter().position(|&n| n == 1).unwrap());
+                for id in [7, 19] { assert_eq!(alone.requests[&id].rng, interleaved.requests[&id].rng); }
+            }
+            assert_eq!(winners.len(), 2, "both eligible requests must explore");
+        }
+    }
+
+    #[test]
+    fn priced_exploration_advances_each_eligible_request_once() {
+        let mut policy = SimpleDraft::new(DraftMode::SimpleRc, 3, 3);
+        // A usable linear row surface with a half-probability cutoff.
+        for round in 0..100 {
+            let rows = 1 + round % 5;
+            observe(&mut policy, &[ObservedDraftRequest { id: 90, rows, accepted: rows, confidence: None }],
+                2_000. * rows as f64);
+        }
+        assert!(policy.cutoff(2).curve.is_some());
+        let p = [0.1; 3];
+        let selected = policy.select(&[DraftCandidate { id: 7, confidence: &p },
+            DraftCandidate { id: 19, confidence: &p }], 64);
+        assert_eq!(selected.lengths.iter().sum::<usize>(), 1);
+        for id in [7, 19] {
+            let mut expected = RequestState::new(id);
+            expected.random();
+            assert_eq!(policy.requests[&id].rng, expected.rng);
+        }
+    }
+
+    #[test]
+    fn release_retires_exploration_and_acceptance_state() {
+        let mut policy = SimpleDraft::new(DraftMode::SimpleDerived, 3, 3);
+        let p = [0.1; 3];
+        let candidates = [DraftCandidate { id: 7, confidence: &p }, DraftCandidate { id: 19, confidence: &p }];
+        let first = policy.select(&candidates, 64).lengths;
+        let initial = policy.requests.clone();
+        for _ in 0..4 { policy.select(&candidates, 64); }
+        for id in [7, 19] { policy.release(id); }
+        assert!(policy.requests.is_empty());
+        assert_eq!(policy.select(&candidates, 64).lengths, first);
+        for id in [7, 19] { assert_eq!(initial[&id].rng, policy.requests[&id].rng); }
+    }
+
+    #[test]
+    fn calibration_is_canonical_within_a_round_but_shared_across_rounds() {
+        let mut first = SimpleDraft::new(DraftMode::SimpleDerived, 3, 3);
+        let mut reversed = first.clone();
+        let p = [0.7, 0.5, 0.3];
+        let requests = [ObservedDraftRequest { id: 19, rows: 4, accepted: 2, confidence: Some(&p) },
+            ObservedDraftRequest { id: 7, rows: 4, accepted: 4, confidence: Some(&p) }];
+        observe(&mut first, &requests, 100.);
+        observe(&mut reversed, &[requests[1], requests[0]], 100.);
+        assert_eq!(first.calibration(), reversed.calibration());
+        for id in [7, 19] { assert_eq!(first.offset(id), reversed.offset(id)); }
+        let before = first.calibration();
+        observe(&mut first, &[ObservedDraftRequest { id: 90, rows: 4, accepted: 1, confidence: Some(&p) }], 100.);
+        assert_ne!(first.calibration(), before);
+        assert_ne!(first.probabilities(7, &p), reversed.probabilities(7, &p));
     }
 
     #[test]
