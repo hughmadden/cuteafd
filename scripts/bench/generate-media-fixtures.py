@@ -119,11 +119,8 @@ BOLD = ROOT / "rust/crates/cuteafd-bench/assets/fonts/DejaVuSansMono-Bold.ttf"
 def generate_semantics(out: Path):
     """Live-API semantics media with known content, recorded in semantics.json: counted
     shapes, a 1344x1344 four-quadrant image (four 672^2 tiles' worth; MiniMax shrinks it to
-    one 576-token grid), a 2016x672 banner, and numbered clips with a moving ball (H.264,
-    plus the clip's 1 fps samples as frames). Clip encoding needs ffmpeg with libx264."""
+    one 576-token grid) and a 2016x672 banner."""
     import random
-    import subprocess
-    import tempfile
     import PIL
     from PIL import Image, ImageDraw, ImageFont
 
@@ -178,40 +175,9 @@ def generate_semantics(out: Path):
         draw.text((x, 336), word, font=ImageFont.truetype(str(BOLD), 150), fill="black", anchor="mm")
     keep("banner.png", png(banner), id="banner", kind="wide", width=2016, height=672, words=words)
 
-    def clip(background, seconds=6, fps=10, size=(640, 480)):
-        """A number per second (1..N) and a red ball moving left to right."""
-        frames = []
-        for k in range(seconds * fps):
-            image = Image.new("RGB", size, background)
-            draw = ImageDraw.Draw(image)
-            draw.text((size[0] // 2, size[1] // 2 - 40), str(1 + k // fps), font=ImageFont.truetype(str(BOLD), 200),
-                      fill="white", anchor="mm")
-            x = 40 + (size[0] - 80) * k // (seconds * fps - 1)
-            draw.ellipse((x - 25, size[1] - 90, x + 25, size[1] - 40), fill=(220, 30, 30))
-            frames.append(image)
-        with tempfile.TemporaryDirectory() as tmp:
-            for k, frame in enumerate(frames):
-                frame.save(f"{tmp}/f{k:04d}.png")
-            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-framerate", str(fps),
-                            "-i", f"{tmp}/f%04d.png", "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p",
-                            "-crf", "18", f"{tmp}/clip.mp4"], check=True)
-            return frames, Path(f"{tmp}/clip.mp4").read_bytes()
-
-    frames, data = clip((40, 40, 40))
-    samples = list(range(0, 60, 10)) + [59]  # the serving sampler's 1 fps indices, last frame kept
-    names = []
-    for index in samples:
-        names.append(f"clip-{index:02d}.png")
-        keep(names[-1], png(frames[index]), id=f"clip-{index:02d}", kind="clip-frame", width=640, height=480)
-    keep("clip.mp4", data, id="clip", kind="clip", width=640, height=480, fps=10, seconds=6,
-         numbers=list(range(1, 7)), motion="left to right", frames=names, frame_indices=samples)
-    for k, background in enumerate([(40, 40, 70), (70, 40, 40), (40, 70, 40)]):
-        keep(f"clip-timing{k}.mp4", clip(background)[1], id=f"clip-timing{k}", kind="clip",
-             width=640, height=480, fps=10, seconds=6)
-    version = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True).stdout.split("\n")[0]
     manifest = {"schema": "cuteafd.media.semantics/1", "font_sha256": hashlib.sha256(BOLD.read_bytes()).hexdigest(),
                 "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "libraries": {"pillow": PIL.__version__, "ffmpeg": version}, "fixtures": records}
+                "libraries": {"pillow": PIL.__version__}, "fixtures": records}
     path = out / "semantics.json"
     content = canonical(manifest) + b"\n"
     if path.exists() and path.read_bytes() != content:
@@ -224,7 +190,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--set", choices=["fidelity", "semantics"], default="fidelity",
-                   help="fidelity: the eight first-party windows; semantics: live-API image/video checks")
+                   help="fidelity: the eight first-party windows; semantics: live-API image checks")
     args = p.parse_args()
     result = generate(args.out) if args.set == "fidelity" else generate_semantics(args.out)
     print(f"{args.out}: {len(result['fixtures'])} deterministic first-party {args.set} fixtures")

@@ -739,3 +739,22 @@ mod router {
         assert!(seen.prompt.contains("<effort>xhigh</effort>"), "{}", seen.prompt);
     }
 }
+
+#[test]
+fn image_markers_expand_outside_literal_spans_and_shift_their_offsets() {
+    let literal = "literal ]<]image[>[ and ]<]start of image[>[";
+    let prompt = format!("é ]<]image[>[ {literal} ]<]image[>[");
+    let start = prompt.find(literal).unwrap();
+    let (expanded, spans) = expand_image_markers(&prompt, &[start..start + literal.len()], 2).unwrap();
+    let wrapped = "]<]start of image[>[]<]image[>[]<]end of image[>[";
+    assert_eq!(spans.len(), 1);
+    assert_eq!(&expanded[spans[0].clone()], literal);
+    assert!(spans[0].start > start);
+    assert_eq!(expanded, format!("é {wrapped} {literal} {wrapped}"));
+    // Unshielded, the quoted marker is structural and outnumbers the images.
+    assert!(expand_image_markers(&prompt, &[], 2).is_err());
+    assert!(expand_image_markers(&prompt, &[1..2], 2).is_err());
+    assert!(expand_image_markers(&prompt, &[start..start + literal.len()], 1).is_err());
+    assert!(expand_image_markers("", &[], 1).is_err());
+    assert_eq!(expand_image_markers("]<]x[>[", &[], 0).unwrap().0, "]<]x[>[");
+}

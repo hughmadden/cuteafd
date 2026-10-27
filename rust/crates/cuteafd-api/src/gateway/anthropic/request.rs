@@ -335,7 +335,6 @@ fn part(block: &Value) -> Result<Vec<Part>, GatewayError> {
                 detail: None,
             }]
         }
-        "video" => vec![crate::gateway::video::anthropic(block)?],
         "document" => {
             let source = block
                 .get("source")

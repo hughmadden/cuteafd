@@ -26,7 +26,6 @@ pub mod search;
 pub mod session;
 pub mod turn;
 pub mod upstream;
-pub(crate) mod video;
 
 #[cfg(test)]
 pub(crate) mod testing;

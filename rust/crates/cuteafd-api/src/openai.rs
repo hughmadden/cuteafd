@@ -651,7 +651,6 @@ struct MediaWork {
     /// Generic-family images, in template order.
     media: Vec<media::MediaSource>,
     audio: Vec<(String, cuteafd_loader::media::audio::AudioFormat)>,
-    videos: Vec<media::video::VideoSource>,
 }
 
 /// A chat request after protocol conversion and prompt rendering: everything
@@ -682,7 +681,7 @@ impl Built {
     pub(crate) fn prompt(&self) -> &str { &self.prompt }
     /// Whether any image or audio source must be prepared.
     pub(crate) fn has_media(&self) -> bool {
-        !self.work.images.is_empty() || !self.work.media.is_empty() || !self.work.audio.is_empty() || !self.work.videos.is_empty()
+        !self.work.images.is_empty() || !self.work.media.is_empty() || !self.work.audio.is_empty()
     }
 }
 
@@ -690,7 +689,7 @@ impl Built {
 /// free of side effects except claiming a benchmark probe.
 pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum::http::HeaderMap, mut body: Value)
     -> Result<Built, Rejection> {
-    images::guard_content(&body, profile.capabilities, matches!(profile.encoding, ModelEncoding::MiniMaxM3(_))).map_err(Rejection::bad)?;
+    images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     if let Some(p) = &probe {
         if let Err(message) = p.spec.validate_media() {
@@ -711,10 +710,6 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     if !matches!(profile.encoding, ModelEncoding::Kimi(_)) {
         shield.messages(&mut body, &profile.literal_tokens);
     }
-    let video_sources = if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
-        media::video::take_sources(&mut body).map_err(Rejection::bad)?
-    } else { Vec::new() };
-    if !video_sources.is_empty() && probe.is_some() { return Err(Rejection::bad("video probe overrides are unsupported")); }
     let audio_sources = if profile.capabilities.audio {
         if profile.audio_preparer.is_none() { return Err(Rejection::unavailable("audio processor unavailable")); }
         media::audio::take_audio_sources(&mut body).map_err(Rejection::bad)?
@@ -729,7 +724,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some(preparer) => media::extract_image_sources(&body, preparer.limits.images).map_err(Rejection::bad)?,
         None => Vec::new(),
     };
-    if (!media_sources.is_empty() || !video_sources.is_empty() || probe.as_ref().is_some_and(|p| !p.spec.media.is_empty()))
+    if (!media_sources.is_empty() || probe.as_ref().is_some_and(|p| !p.spec.media.is_empty()))
         && profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
         return Err(Rejection::unavailable("vision encoder unavailable"));
     }
@@ -1019,7 +1014,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     }
     let (prompt, literal_spans) = shield.finish(prompt, matches!(profile.encoding, ModelEncoding::DeepseekV41));
     Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
-        work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources, videos: video_sources },
+        work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
         probe, streaming, include_usage, id, model, stop_sequences, tap })
 }
 
@@ -1028,11 +1023,10 @@ struct Prepared {
     images: Vec<cuteafd_loader::V41Image>,
     media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
-    videos: Vec<media::video::PreparedVideo>,
 }
 
 impl Prepared {
-    fn image_tokens(&self) -> usize { self.media.iter().map(|image| image.tokens).sum::<usize>() + self.videos.iter().flat_map(|v| &v.segments).map(|v| v.tokens).sum::<usize>() }
+    fn image_tokens(&self) -> usize { self.media.iter().map(|image| image.tokens).sum() }
     fn audio_tokens(&self) -> usize { self.audio.iter().map(|clip| clip.geometry.tokens).sum() }
 }
 
@@ -1040,7 +1034,7 @@ impl Prepared {
 /// (when held) bounds waiters while the decoders run.
 async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, work: MediaWork,
     probe: Option<&Arc<probe::Probe>>) -> Result<Prepared, Rejection> {
-    let MediaWork { images: image_sources, media: media_sources, audio: audio_sources, videos: video_sources } = work;
+    let MediaWork { images: image_sources, media: media_sources, audio: audio_sources } = work;
     let images = if image_sources.is_empty() { Vec::new() } else {
         // A C16 burst should wait here instead of imposing a hidden C4 image limit.
         let slot = decoder.slots.clone().acquire_owned().await
@@ -1055,20 +1049,17 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
-    // Images and videos share the media preparer: one slot, one blocking job.
-    let (media, videos) = if media_sources.is_empty() && video_sources.is_empty() { (Vec::new(), Vec::new()) } else {
+    let media = if media_sources.is_empty() { Vec::new() } else {
         let preparer = profile.media_preparer.as_ref().expect("sources require preparer").clone();
         let slot = preparer.slots.clone().acquire_owned().await
-            .map_err(|_| Rejection::unavailable("media preparation is closed"))?;
+            .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
         let hashes = probe.map(|p| p.spec.media.iter()
             .map(|span| span.fixture.as_ref().map(|f| f.sha256.clone())).collect::<Vec<_>>()).unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            let images = if media_sources.is_empty() { Vec::new() } else { preparer.prepare_verified(&media_sources, &hashes)?.images };
-            let videos = if video_sources.is_empty() { Vec::new() } else { preparer.prepare_videos(&video_sources)? };
-            anyhow::Ok((images, videos))
+            preparer.prepare_verified(&media_sources, &hashes)
         }).await {
-            Ok(Ok(prepared)) => prepared,
+            Ok(Ok(prepared)) => prepared.images,
             Ok(Err(message)) => return Err(Rejection::bad(message)),
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
@@ -1087,7 +1078,7 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
     };
-    Ok(Prepared { images, media, audio, videos })
+    Ok(Prepared { images, media, audio })
 }
 
 /// Shared engine-facing state the chat route and the gateway backend submit through.
@@ -1161,7 +1152,7 @@ impl Submitter {
         let prepared = prepare_media(profile, &self.images, work, probe.as_ref()).await?;
         let (image_tokens, audio_tokens) = (prepared.image_tokens(), prepared.audio_tokens());
         let (prompt, literal_spans) = if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) && probe.is_none() {
-            media::video::expand_prompt(&prompt, &literal_spans, prepared.media.len(), &prepared.videos).map_err(Rejection::bad)?
+            minimax_m3::expand_image_markers(&prompt, &literal_spans, prepared.media.len()).map_err(Rejection::bad)?
         } else { (prompt, literal_spans) };
         // Unbounded on purpose: inference threads send without ever blocking, so a
         // client that stops reading cannot stall the shared scheduler. A request's
@@ -1171,7 +1162,7 @@ impl Submitter {
         let job = NativeRequest {
             prefix_cache_source: prefix_cache_source.clone(),
             audio: prepared.audio,
-            videos: prepared.videos.into_iter().flat_map(|v| v.segments).collect(),
+            videos: Vec::new(),
             media: prepared.media,
             prompt,
             literal_spans,
@@ -1251,7 +1242,6 @@ impl Submitter {
 /// (encoder-prepared images and audio) refuse rather than undercount.
 pub(crate) async fn count_prompt(state: &NativeState, built: Built, snapshot: std::path::PathBuf) -> Result<u32, Rejection> {
     let Built { prompt, literal_spans, work, .. } = built;
-    if !work.videos.is_empty() { return Err(Rejection::bad("count_tokens with video input is not supported")); }
     if !work.media.is_empty() || !work.audio.is_empty() {
         return Err(Rejection::bad("count_tokens with image or audio input is not supported for this model yet (its media rows are counted by the encoder)"));
     }

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Live MiniMax M3.1 image and video semantics, identity, replay and exact-hit qualification.
+"""Live MiniMax M3.1 image semantics, identity, replay and exact-hit qualification.
 
 --fixtures-dir holds scripts/bench/generate-media-fixtures.py output for both sets (the
 fidelity chart and terminal windows, and --set semantics: counted shapes, a 1344x1344
-four-quadrant image, a 2016x672 banner and numbered clips). Expected answers are ordered
-terms taken from the fixture manifests. --timing N adds streamed TTFT rows: one fresh
-pixel per image request, a distinct clip per video request, and text-only prompts of
-matching lengths, plus the `/v1/thermal` window they ran in. The API key arrives on
-stdin; the report records fixture hashes.
+four-quadrant image and a 2016x672 banner). Expected answers are ordered terms taken from
+the fixture manifests. --timing N adds streamed TTFT rows: one fresh pixel per image
+request and text-only prompts of matching lengths, plus the `/v1/thermal` window they ran
+in. The API key arrives on stdin; the report records fixture hashes.
 """
 import argparse
 import base64
@@ -44,8 +43,7 @@ def main():
         args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
     def url(path):
-        mime = {"png": "image/png", "mp4": "video/mp4"}[path.rsplit(".", 1)[1]]
-        return f"data:{mime};base64," + base64.b64encode((root / path).read_bytes()).decode()
+        return "data:image/png;base64," + base64.b64encode((root / path).read_bytes()).decode()
 
     def image(path):
         return dict(type="image_url", image_url=dict(url=url(path)))
@@ -136,18 +134,9 @@ def main():
          ["12", "28", "19", "35"])
     call("terminal", body([image("terminal0.png")], "What command was run, how many tests passed, and what was "
          "the exit status?"), ["cargo test media", "17"])
-    clip = semantics["clip"]
-    question = ("The video shows numbers one after another and a red ball. List the numbers in the order they "
-                "appear, then say whether the ball moves left-to-right or right-to-left.")
-    terms = [str(n) for n in clip["numbers"]] + [("left to right", "left-to-right")]
-    video = dict(type="video_url", video_url=dict(url=url("clip.mp4")))
-    first = call("clip", body([video], question), terms)
-    exact("clip-exact", first, call("clip-repeat", body([video], question), terms))
-    frames = dict(type="video_url", video_url=dict(frames=[url(name) for name in clip["frames"]], source_fps=1))
-    call("clip-frames", body([frames], question), terms)
     if args.timing:
         start = thermal(args.base_url)["now_s"]
-        timing(args, post, report, save, root, url)
+        timing(args, post, report, save, root)
         # Whether, why and how much the GPUs throttled while the timing rows ran.
         report["thermal"] = thermal(args.base_url, start).get("window")
         for gpu in (report["thermal"] or {}).get("gpus", []):
@@ -167,7 +156,7 @@ def thermal(base_url, start=None):
         return json.load(response)
 
 
-def timing(args, post, report, save, root, url):
+def timing(args, post, report, save, root):
     from PIL import Image
     rnd = random.Random(time.time_ns())
 
@@ -205,17 +194,10 @@ def timing(args, post, report, save, root, url):
         save()
         print(json.dumps(row), flush=True)
 
-    names = next(f for f in json.loads((root / "semantics.json").read_text())["fixtures"] if f["id"] == "clip")["frames"]
-    for k in range(args.timing):
+    for _ in range(args.timing):
         stream("tile-672", [fresh("circles7.png"), dict(type="text", text="Describe the image.")])
         stream("quadrants-1344", [fresh("quadrants.png"), dict(type="text", text="Describe the image.")])
         stream("text-600", [text(570)])
-        clip = dict(type="video_url", video_url=dict(url=url(f"clip-timing{k % 3}.mp4")))
-        stream("clip-480p" if k < 3 else "clip-480p-cached", [clip, dict(type="text", text="Describe the video.")])
-        # The same sampled frames as PNGs: no ffmpeg, the same tokens.
-        frames = [fresh(names[0])["image_url"]["url"]] + [url(name) for name in names[1:]]
-        stream("clip-frames", [dict(type="video_url", video_url=dict(frames=frames, source_fps=1)),
-                               dict(type="text", text="Describe the video.")])
         stream("text-1700", [text(1630)])
 
 

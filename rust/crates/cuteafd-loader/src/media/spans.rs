@@ -195,7 +195,7 @@ impl SpanExpander {
                 continue;
             };
             if i == 0 || tokens.get(i - 1) != Some(&self.start) || tokens.get(i + 1) != Some(&self.end) {
-                return Err(invalid("media placeholder must be enclosed by image start/end tokens"));
+                return Err(invalid("image placeholder must be enclosed by image start/end tokens"));
             }
             media.push(MediaSpan { start: expanded.len(), len, key });
             offsets.push(offset);

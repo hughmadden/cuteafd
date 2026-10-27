@@ -1,19 +1,13 @@
 //! Bundled MiniMax processors at release revision 54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e.
 //! The executable processors use smart resize, not the legacy grid-pinpoint fields.
-use super::{invalid, media_key, resize, EncoderId, ImageFamily, ImageGrid, ImageKey, MediaError, ProcessorConfig, Result, RgbImage, SpanExpander};
+use super::{ImageGrid, ImageKey, MediaError, ProcessorConfig, Result, SpanExpander};
 use std::{path::Path, sync::Arc};
 
 pub const IMAGE_TOKEN: u32 = 200_025;
 pub const VIDEO_TOKEN: u32 = 200_026;
-/// sglang `_apply_max_frames_limit` splits `grid_t` into runs of `vision_segment_max_frames`
-/// (4) temporal patches, each its own attention segment with positions 0..t: 8 frames.
-pub const MAX_SEGMENT_FRAMES: usize = 2 * cuteafd_core::media::MAX_SEGMENT_PAIRS as usize;
 /// Token capacity of the loaded tower (16,384 patches of scratch); one video segment
 /// must fit it whatever the image detail cap is.
 pub const ENCODER_TOKENS: usize = 4096;
-/// The serving default rate; its frame cap is `isqrt(max_pixels)` floored to 28.
-pub const VIDEO_FPS: f64 = 1.0;
-const VIDEO_SIDE: u32 = 756;
 pub const PROCESSOR_SOURCES: [(&str, &str); 3] = [
     ("image_processor.py", "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994"),
     ("video_processor.py", "ced0f8d85d73f8722fecb26033d2d91ecf4a4e5112c91ce1b1522ca7edd0943d"),
@@ -30,30 +24,6 @@ pub(super) fn validate_config(config: &ProcessorConfig, value: &serde_json::Valu
         }
     }
     Ok(())
-}
-
-/// Video frame sizing: the serving default, the bundled processor's smart resize
-/// (`do_resize`) or none (`do_resize: false`; dimensions must already align to 28).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoResize { Vendor, Smart, Off }
-impl VideoResize {
-    pub fn shape(self, height: u32, width: u32) -> Result<(u32, u32)> {
-        match self {
-            // sglang `get_hw_multiple_of` with an integer cap: scale the longer side down
-            // to 756, round each side half to even, then up to 28; smaller frames only align.
-            Self::Vendor => {
-                if height == 0 || width == 0 { return Err(invalid("video dimensions must be positive")); }
-                let longer = height.max(width);
-                let ratio = if longer > VIDEO_SIDE { f64::from(VIDEO_SIDE) / f64::from(longer) } else { 1.0 };
-                let side = |n: u32| ((f64::from(n) * ratio).round_ties_even() as u32).div_ceil(28) * 28;
-                let (h, w) = (side(height), side(width));
-                if h == 0 || w == 0 { return Err(invalid("video aspect ratio leaves no merged patch")); }
-                Ok((h, w))
-            }
-            Self::Smart => super::smart_resize(height, width, 28, 3136, 602_112, true),
-            Self::Off => Ok((height, width)),
-        }
-    }
 }
 
 /// Resolve image delimiters from the bundled tokenizer, as MiniMaxVLProcessor does.
@@ -85,117 +55,10 @@ pub struct PreparedVideoSegment {
     pub source_frames: usize,
 }
 
-/// Explicit `do_sample_frames` sampling inherited from Transformers 4.57.1
-/// BaseVideoProcessor. With sampling disabled every frame is retained.
-/// The bundled `min_frames`/`max_frames` fields are not consulted by this method.
-pub fn sample_frame_indices(total: usize, source_fps: Option<f64>, sample: bool,
-    num_frames: Option<usize>, fps: Option<f64>) -> Result<Vec<usize>> {
-    if total == 0 || total > i32::MAX as usize { return Err(invalid("invalid video frame count")); }
-    if !sample { return Ok((0..total).collect()); }
-    if num_frames.is_some() && fps.is_some() { return Err(invalid("num_frames and fps are mutually exclusive")); }
-    let count = if let Some(count) = num_frames { count } else {
-        let source = source_fps.filter(|n| n.is_finite() && *n > 0.0).ok_or_else(|| invalid("fps sampling requires source fps"))?;
-        let target = fps.unwrap_or(1.0);
-        if !target.is_finite() || target <= 0.0 { return Err(invalid("sampling fps must be positive")); }
-        (total as f64 / source * target) as usize
-    };
-    if count == 0 || count > total { return Err(invalid("sample count must be positive and at most the source frame count")); }
-    let step = total as f64 / count as f64;
-    // torch.arange's floating endpoint can produce one extra sample when
-    // ceil(total / step) exceeds count because of division rounding.
-    let len = (total as f64 / step).ceil() as usize;
-    let indices: Vec<_> = (0..len).map(|index| (index as f64 * step) as f32 as usize).collect();
-    if indices.iter().any(|index| *index >= total) {
-        return Err(invalid("uniform sampling rounded an index outside the video"));
-    }
-    Ok(indices)
-}
-
-/// The serving sampler (sglang `_compute_sampled_frame_indices`, the training
-/// extractor's constant mode): frames at least `1/fps` apart from the first, then
-/// always the last. The serving path applies no frame cap by default.
-pub fn constant_interval_indices(total: usize, source_fps: Option<f64>, fps: f64) -> Result<Vec<usize>> {
-    if total == 0 || total > i32::MAX as usize { return Err(invalid("invalid video frame count")); }
-    let source = source_fps.filter(|n| n.is_finite() && *n > 0.0).ok_or_else(|| invalid("fps sampling requires source fps"))?;
-    if !fps.is_finite() || fps <= 0.0 { return Err(invalid("sampling fps must be positive")); }
-    const EPS: f64 = 1e-4;
-    let (mut indices, mut kept) = (vec![0usize], 0.0f64);
-    loop {
-        let next = (((kept + 1.0 / fps - EPS) * source).ceil() as usize).max(indices[indices.len() - 1] + 1);
-        if next >= total { break; }
-        indices.push(next);
-        kept = next as f64 / source;
-    }
-    if indices[indices.len() - 1] != total - 1 && (total - 1) as f64 / source - kept > EPS { indices.push(total - 1); }
-    Ok(indices)
-}
-
-/// Input frames are already decoded and sampled; `sizing` picks their size (see
-/// [`VideoResize`]). Odd segments repeat their last frame, as the processor pads.
-pub fn prepare_video_frames(frames: &[RgbImage], encoder: EncoderId, sizing: VideoResize) -> Result<Vec<PreparedVideoSegment>> {
-    let first = frames.first().ok_or_else(|| invalid("video contains no frames"))?;
-    if frames.len() > 768 { return Err(invalid("video exceeds 768 frames")); }
-    if first.width == 0 || first.height == 0 || u64::from(first.width) * u64::from(first.height) > 64 << 20 {
-        return Err(invalid("video dimensions must be positive and at most 64 megapixels"));
-    }
-    if frames.iter().any(|frame| frame.width != first.width || frame.height != first.height
-        || frame.data.len() != frame.width as usize * frame.height as usize * 3) {
-        return Err(invalid("video frames must share dimensions and complete RGB extents"));
-    }
-    let (height, width) = sizing.shape(first.height, first.width)?;
-    if height % 28 != 0 || width % 28 != 0 { return Err(invalid("unresized video dimensions must be multiples of 28")); }
-    let frame_tokens = height as usize / 28 * (width as usize / 28);
-    if frame_tokens.checked_mul(frames.len().div_ceil(2)).is_none_or(|n| n > 57_600) {
-        return Err(invalid("video exceeds total token budget"));
-    }
-    let config = ProcessorConfig::for_family(ImageFamily::Minimax);
-    let mut segments = Vec::new();
-    for frames in frames.chunks(MAX_SEGMENT_FRAMES) {
-        let grid = ImageGrid { t: frames.len().div_ceil(2) as u32, h: height / 14, w: width / 14 };
-        let mut rgb = Vec::with_capacity(grid.t as usize * 2 * height as usize * width as usize * 3);
-        for index in 0..grid.t as usize * 2 {
-            let frame = &frames[index.min(frames.len() - 1)];
-            if (frame.height, frame.width) != (height, width) { rgb.extend(resize::resize_bicubic_torch(frame, width, height).data); }
-            else { rgb.extend_from_slice(&frame.data); }
-        }
-        segments.push(PreparedVideoSegment { key: media_key(b"cuteafd-minimax-video-v1", encoder, &config, grid, &rgb), grid,
-            rgb8: rgb.into(), tokens: grid.t as usize * frame_tokens, source_frames: frames.len() });
-    }
-    Ok(segments)
-}
-
-impl PreparedVideoSegment {
-    /// One video's marker text before tokenization, as MiniMaxVLProcessor lays it out:
-    /// each temporal pair gets its timestamp and its own image delimiters around one
-    /// video marker, which SpanExpander::expand_paired expands into the pair's rows.
-    /// `frame_indices` holds this segment's source indices, so timestamps keep the
-    /// video's timeline.
-    pub fn placeholder(&self, fps: Option<f64>, frame_indices: Option<&[usize]>) -> Result<String> {
-        let grid = [self.grid.t, self.grid.h, self.grid.w];
-        if cuteafd_core::media::video_segment_patches(grid) != Some(self.tokens as u64 * 4) || self.tokens > 57_600 {
-            return Err(invalid("video placeholder grid and token count differ"));
-        }
-        let t = self.grid.t as usize;
-        let timestamps = if let (Some(fps),Some(indices)) = (fps,frame_indices) {
-            if !fps.is_finite() || fps <= 0.0 || indices.is_empty() { return Err(invalid("invalid video timestamp metadata")); }
-            Some((fps,indices))
-        } else { None };
-        let mut text = String::new();
-        for frame in 0..t {
-            if let Some((fps,indices)) = timestamps {
-                let timestamp = indices[(frame * 2).min(indices.len()-1)] as f64 / fps;
-                text.push_str(&format!("]<]{timestamp:.1} seconds[>["));
-            }
-            text.push_str("]<]start of image[>[]<]video[>[]<]end of image[>[");
-        }
-        Ok(text)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::ImageProcessor;
+    use crate::media::{EncoderId, ImageFamily, ImageProcessor, RgbImage};
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -272,74 +135,6 @@ mod tests {
         assert_eq!(processor.resize_shape(1008,1008).unwrap(),(672,672));
     }
 
-    #[test]
-    fn optional_video_sampling_uses_uniform_floor_indices() {
-        assert_eq!(sample_frame_indices(10,None,false,None,None).unwrap(), (0..10).collect::<Vec<_>>());
-        assert_eq!(sample_frame_indices(10,None,true,Some(4),None).unwrap(), [0,2,5,7]);
-        assert_eq!(sample_frame_indices(90,Some(30.0),true,None,None).unwrap(), [0,30,60]);
-        assert_eq!(sample_frame_indices(11,Some(2.5),true,None,Some(1.0)).unwrap(), [0,2,5,8]);
-        assert!(sample_frame_indices(10,None,true,None,None).is_err());
-        assert!(sample_frame_indices(10,None,true,Some(11),None).is_err());
-        assert!(sample_frame_indices(15,None,true,Some(13),None).is_err());
-        assert!(sample_frame_indices(10,Some(30.0),true,None,None).is_err());
-        assert!(sample_frame_indices(10,Some(30.0),true,Some(4),Some(1.0)).is_err());
-    }
-
-    #[test]
-    fn serving_sampler_keeps_constant_intervals_and_the_last_frame() {
-        // Expectations evaluated with sglang `_compute_sampled_frame_indices` (python/reference/minimax_m3_media.py).
-        let thirty = [0,30,60,90,120,150,180,210,240,270,299];
-        assert_eq!(constant_interval_indices(300,Some(30.0),VIDEO_FPS).unwrap(), thirty);
-        assert_eq!(constant_interval_indices(300,Some(30000.0/1001.0),VIDEO_FPS).unwrap(), thirty);
-        assert_eq!(constant_interval_indices(18,Some(5.0),1.0).unwrap(), [0,5,10,15,17]);
-        assert_eq!(constant_interval_indices(16,Some(5.0),1.0).unwrap(), [0,5,10,15]);
-        assert_eq!(constant_interval_indices(90,Some(30.0),2.0).unwrap(), [0,15,30,45,60,75,89]);
-        assert_eq!(constant_interval_indices(10,Some(4.0),8.0).unwrap(), (0..10).collect::<Vec<_>>());
-        assert_eq!(constant_interval_indices(1,Some(30.0),1.0).unwrap(), [0]);
-        assert!(constant_interval_indices(0,Some(30.0),1.0).is_err());
-        assert!(constant_interval_indices(10,None,1.0).is_err());
-        assert!(constant_interval_indices(10,Some(30.0),0.0).is_err());
-    }
-
-    #[test]
-    fn serving_sizing_caps_the_longer_side_at_756_and_aligns_to_28() {
-        // sglang `get_hw_multiple_of((w, h), 28, 756)`, written here as (height, width).
-        for ((h, w), expected) in [((720,1280),(448,756)), ((1080,1920),(448,756)), ((480,640),(504,644)),
-            ((1280,720),(756,448)), ((2160,3840),(448,756)), ((760,1000),(588,756)), ((28,28),(28,28)), ((1,1),(28,28))] {
-            assert_eq!(VideoResize::Vendor.shape(h,w).unwrap(), expected, "{h}x{w}");
-        }
-        assert!(VideoResize::Vendor.shape(1,2000).is_err());
-        assert_eq!(VideoResize::Smart.shape(720,1280).unwrap(), (560,1008));
-        assert_eq!(VideoResize::Off.shape(720,1280).unwrap(), (720,1280));
-        // 720p is 16 x 27 merged tokens per temporal patch; unresized it does not align.
-        let frame = RgbImage { width:1280, height:720, data:vec![9;1280*720*3] };
-        let segment = prepare_video_frames(&[frame.clone()],EncoderId([0;32]),VideoResize::Vendor).unwrap().remove(0);
-        assert_eq!((segment.grid.h, segment.grid.w, segment.tokens), (32, 54, 432));
-        assert!(segment.rgb8.iter().all(|&v| v == 9));
-        assert!(prepare_video_frames(&[frame],EncoderId([0;32]),VideoResize::Off).is_err());
-    }
-
-    #[test]
-    fn video_placeholder_wraps_each_temporal_pair_and_keeps_sampled_timestamps() {
-        let frames = vec![RgbImage {width:56,height:28,data:vec![0;56*28*3]};3];
-        let segment = prepare_video_frames(&frames,EncoderId([0;32]),VideoResize::Off).unwrap().remove(0);
-        let pair = "]<]start of image[>[]<]video[>[]<]end of image[>[";
-        assert_eq!(segment.placeholder(None,None).unwrap(),pair.repeat(2));
-        assert_eq!(segment.placeholder(Some(4.0),Some(&[1,8,15])).unwrap(),
-            format!("]<]0.2 seconds[>[{pair}]<]3.8 seconds[>[{pair}"));
-        assert_eq!(segment.placeholder(Some(2.0),Some(&[7])).unwrap(),
-            format!("]<]3.5 seconds[>[{pair}]<]3.5 seconds[>[{pair}"));
-        assert_eq!(segment.placeholder(None,Some(&[1,8,15])).unwrap(),pair.repeat(2));
-        assert_eq!(segment.placeholder(Some(4.0),None).unwrap(),pair.repeat(2));
-        assert!(segment.placeholder(Some(4.0),Some(&[])).is_err());
-        assert!(segment.placeholder(Some(0.0),Some(&[0])).is_err());
-        let mut invalid = segment.clone(); invalid.tokens += 1;
-        assert!(invalid.placeholder(None,None).is_err());
-    }
-
-    fn segment_patches(segment: &PreparedVideoSegment) -> Result<Vec<f32>> {
-        crate::media::patch_rows(segment.grid, &segment.rgb8, false, &ProcessorConfig::for_family(ImageFamily::Minimax))
-    }
     /// `processor-parity.py`'s integer pattern, so pinned vendor hashes need no fixture files.
     fn formula(height: u32, width: u32, salt: u64) -> RgbImage {
         let data = (0..u64::from(height)).flat_map(|y| (0..u64::from(width)).flat_map(move |x|
@@ -355,7 +150,7 @@ mod tests {
     #[test]
     fn release_processor_patch_hashes_match_the_bundled_python_processor() {
         // python/tools/qualify/minimax_m3/processor-parity.py: the release's own
-        // image_processor.py / video_processor.py on Transformers 5.14.0, torch 2.14.1 CPU.
+        // image_processor.py on Transformers 5.14.0, torch 2.14.1 CPU.
         let config = ProcessorConfig::for_family(ImageFamily::Minimax);
         for (h, w, grid, sha) in [
             (1080, 1920, (36, 64), "e5831b6ddc674249ecb85e88ee9aeb30d38a70f2ffde33e66b9349aa9c64e95a"),
@@ -366,21 +161,9 @@ mod tests {
             assert_eq!((image.grid.t, image.grid.h, image.grid.w), (1, grid.0, grid.1), "{h}x{w}");
             assert_eq!(f32_sha(&image.patches(&config).unwrap()), sha, "{h}x{w}");
         }
-        for (count, h, w, sizing, grid, sha) in [
-            (9, 56, 112, VideoResize::Off, (5, 4, 8), "0e65e134d2175491cb906d4b5e79ceda33f72c27001e3a48b79f68f5ceff2cd5"),
-            (5, 360, 640, VideoResize::Smart, (3, 26, 46), "5569c6706e03d80144c69ea70445b516388d0418fe25596b4a6666d76a9fd241"),
-        ] {
-            let frames: Vec<_> = (0..count).map(|k| formula(h, w, k)).collect();
-            let segments = prepare_video_frames(&frames, EncoderId([0; 32]), sizing).unwrap();
-            assert_eq!(segments.iter().map(|s| s.grid.t).sum::<u32>(), grid.0);
-            assert!(segments.iter().all(|s| (s.grid.h, s.grid.w) == (grid.1, grid.2)));
-            let patches: Vec<f32> = segments.iter().flat_map(|s| segment_patches(s).unwrap()).collect();
-            assert_eq!(f32_sha(&patches), sha, "{count}x{h}x{w}");
-        }
     }
 
-    /// Full comparison against `processor-parity.py --out DIR` (images, frame lists,
-    /// prompt expansion, both samplers and both frame sizings), bit for bit.
+    /// Full comparison against `processor-parity.py --out DIR` (its images), bit for bit.
     #[test]
     #[ignore = "set CUTEAFD_MINIMAX_PROCESSOR_PARITY to a processor-parity.py output directory"]
     fn minimax_vendor_parity() {
@@ -406,74 +189,5 @@ mod tests {
             assert_eq!(image.tokens as u64, case["tokens"].as_u64().unwrap(), "{name}");
             expect(name, &image.patches(&config).unwrap());
         }
-        for case in cases["videos"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap();
-            let count = case["frames"].as_u64().unwrap() as usize;
-            let frames: Vec<_> = (0..count).map(|k| read_png(&format!("{name}-{k}.png"))).collect();
-            let sizing = if case["do_resize"].as_bool().unwrap() { VideoResize::Smart } else { VideoResize::Off };
-            let segments = prepare_video_frames(&frames, EncoderId([0; 32]), sizing).unwrap();
-            let vendor = grid(&case["grid"]);
-            assert_eq!(segments.iter().map(|s| s.grid.t).sum::<u32>(), vendor[0], "{name}");
-            assert!(segments.iter().all(|s| (s.grid.h, s.grid.w) == (vendor[1], vendor[2])), "{name}");
-            expect(name, &segments.iter().flat_map(|s| segment_patches(s).unwrap()).collect::<Vec<_>>());
-            let indices: Vec<usize> = (0..count).collect();
-            let (mut text, mut offset) = (String::new(), 0);
-            for segment in &segments {
-                // The processor writes every row's marker; the expander does that in token space.
-                let rows = segment.tokens / segment.grid.t as usize;
-                text.push_str(&segment.placeholder(case["source_fps"].as_f64(),
-                    Some(&indices[offset..offset + segment.source_frames])).unwrap()
-                    .replace("]<]video[>[", &"]<]video[>[".repeat(rows)));
-                offset += segment.source_frames;
-            }
-            assert_eq!(text, case["placeholder"].as_str().unwrap(), "{name}");
-        }
-        let list = |value: &serde_json::Value| -> Vec<usize> {
-            value.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect()
-        };
-        for case in cases["serving_sampler"].as_array().unwrap() {
-            let total = case["total"].as_u64().unwrap() as usize;
-            assert_eq!(constant_interval_indices(total, case["video_fps"].as_f64(), case["fps"].as_f64().unwrap()).unwrap(),
-                list(&case["indices"]), "{case}");
-        }
-        for case in cases["uniform_sampler"].as_array().unwrap() {
-            let total = case["total"].as_u64().unwrap() as usize;
-            assert_eq!(sample_frame_indices(total, case["video_fps"].as_f64(), true,
-                case["num_frames"].as_u64().map(|n| n as usize), case["fps"].as_f64()).unwrap(),
-                list(&case["indices"]), "{case}");
-        }
-        for (key, sizing) in [("serving_sizing", VideoResize::Vendor), ("smart_sizing", VideoResize::Smart)] {
-            for case in cases[key].as_array().unwrap() {
-                let (h, w) = (case["height"].as_u64().unwrap() as u32, case["width"].as_u64().unwrap() as u32);
-                match case["resized"].as_array() {
-                    Some(_) => {
-                        let (rh, rw) = sizing.shape(h, w).unwrap();
-                        assert_eq!(vec![rh, rw], grid(&case["resized"]), "{key} {h}x{w}");
-                    }
-                    None => assert!(sizing.shape(h, w).is_err(), "{key} {h}x{w}"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn video_keeps_all_frames_segments_eight_and_pads_last() {
-        let frames: Vec<_> = (0..11).map(|v| RgbImage { width:28, height:28, data:vec![v;28*28*3] }).collect();
-        let segments = prepare_video_frames(&frames, EncoderId([0;32]), VideoResize::Off).unwrap();
-        assert_eq!(segments.len(),2);
-        assert_eq!((segments[0].grid.t,segments[0].tokens,segments[0].source_frames),(4,4,8));
-        assert_eq!((segments[1].grid.t,segments[1].tokens,segments[1].source_frames),(2,2,3));
-        let frame = 28*28*3;
-        assert_eq!(&segments[1].rgb8[2*frame..3*frame], &segments[1].rgb8[3*frame..]);
-        let lut = ProcessorConfig::for_family(ImageFamily::Minimax).normalization_lut();
-        let patches = segment_patches(&segments[0]).unwrap();
-        for time in 0..4 {
-            assert_eq!(patches[time*4*1176],lut[0][time*2]); assert_eq!(patches[time*4*1176+196],lut[0][time*2+1]);
-        }
-        let mut wide = segments[0].clone();
-        (wide.grid.t, wide.tokens, wide.rgb8) = (5, 5, vec![0; 10*frame].into());
-        assert!(wide.placeholder(None,None).is_err());
-        assert!(prepare_video_frames(&[],EncoderId([0;32]),VideoResize::Off).is_err());
-        assert!(prepare_video_frames(&[RgbImage {width:29,height:28,data:vec![0;29*28*3]}],EncoderId([0;32]),VideoResize::Off).is_err());
     }
 }

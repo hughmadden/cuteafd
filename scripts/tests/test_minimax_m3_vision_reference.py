@@ -221,20 +221,13 @@ def test_reference_matches_transformers_tower(torch):
 
 
 def test_media_preprocessing_matches_release_cases():
-    # Expectations from the release processors and sglang (processor-parity.py), also
+    # Expectations from the release image processor (processor-parity.py), also
     # pinned in the loader's Rust tests.
     assert media.smart_resize(1080, 1920) == (504, 896)
     assert media.smart_resize(1344, 1344) == (672, 672)
     assert media.smart_resize(1, 1) == (56, 56)
-    assert media.smart_resize(720, 1280, max_pixels=media.VIDEO_MAX_PIXELS) == (560, 1008)
     with pytest.raises(ValueError):
         media.smart_resize(1, 201)
-    assert media.serving_frame_size(720, 1280) == (448, 756)
-    assert media.serving_frame_size(480, 640) == (504, 644)
-    assert media.serving_frame_size(1, 1) == (28, 28)
-    assert media.serving_frame_indices(300, 30.0) == [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 299]
-    assert media.serving_frame_indices(18, 5.0) == [0, 5, 10, 15, 17]
-    assert media.serving_frame_indices(16, 5.0) == [0, 5, 10, 15]
 
 
 def test_media_patches_follow_merge_window_positions():

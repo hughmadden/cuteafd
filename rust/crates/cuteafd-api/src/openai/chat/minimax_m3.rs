@@ -90,6 +90,36 @@ impl MiniMaxEncoding {
     }
 }
 
+/// MiniMaxVLProcessor's image layout: every rendered image marker gets its own start
+/// and end markers, which the worker's span expander requires. Literal byte ranges (shielded
+/// request text) keep their bytes and move with the expansion; only structural markers expand.
+pub fn expand_image_markers(prompt: &str, literals: &[std::ops::Range<usize>], images: usize)
+    -> Result<(String, cuteafd_loader::LiteralSpans)> {
+    let mut out = String::new();
+    let mut spans = Vec::new();
+    let (mut image, mut cursor) = (0, 0);
+    let mut expand = |text: &str, out: &mut String| -> Result<()> {
+        let mut rest = text;
+        while let Some(at) = rest.find("]<]") {
+            out.push_str(&rest[..at]); rest = &rest[at..];
+            if let Some(tail) = rest.strip_prefix(IMAGE) {
+                anyhow::ensure!(image < images, "image placeholder count differs from inputs");
+                image += 1; out.push_str("]<]start of image[>[]<]image[>[]<]end of image[>["); rest = tail;
+            } else { out.push_str("]<]"); rest = &rest[3..]; }
+        }
+        out.push_str(rest); Ok(())
+    };
+    for span in literals {
+        anyhow::ensure!(span.start >= cursor && span.end <= prompt.len() && span.start <= span.end
+            && prompt.is_char_boundary(span.start) && prompt.is_char_boundary(span.end), "invalid literal span");
+        expand(&prompt[cursor..span.start], &mut out)?;
+        let start = out.len(); out.push_str(&prompt[span.clone()]); spans.push(start..out.len()); cursor = span.end;
+    }
+    expand(&prompt[cursor..], &mut out)?;
+    anyhow::ensure!(image == images, "media input count differs from rendered placeholders");
+    Ok((out, spans))
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     pub const TEMPLATE: &str = include_str!("minimax_m3/fixtures/chat_template.jinja");

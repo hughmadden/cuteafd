@@ -10,7 +10,7 @@ prepared by python/reference/minimax_m3_media.py, which processor-parity.py chec
 against the release processors. The reference runs twice on the GPU: with the release
 numerics (BF16, F32 convolution) and in FP32 as the yardstick. A stage passes when the
 native tower is no farther from FP32 (mean row cosine, 90th-percentile row error) than
-the BF16 reference, with a small margin. Segments above --reference-max-patches are timed only:
+the BF16 reference, with a small margin. Images above --reference-max-patches are timed only:
 the reference materializes full attention scores.
 """
 from __future__ import annotations
@@ -196,21 +196,13 @@ def verdict(native, floor):
 
 
 def inputs(args):
-    """(name, frames [2t, H, W, 3] uint8 processor-sized, grid, video?)."""
+    """(name, frames [2, H, W, 3] uint8 processor-sized, grid)."""
     from PIL import Image
     cases = []
     for path in args.images:
         rgb = np.asarray(Image.open(path).convert("RGB"))
         frame = media.resize_rgb(rgb, *media.smart_resize(*rgb.shape[:2]))
-        cases.append((Path(path).stem, np.stack([frame, frame]), (1, frame.shape[0] // 14, frame.shape[1] // 14), False))
-    clip = [np.asarray(Image.open(p).convert("RGB")) for p in args.clip_frames]
-    for size in args.clip_sizes:
-        frames = [media.resize_rgb(frame, *size) for frame in clip]
-        frames += frames[-1:] * (len(frames) % 2)  # an odd clip repeats its last frame
-        t = len(frames) // 2
-        if not 1 <= t <= 4:
-            raise ValueError("a clip segment holds one to eight frames")
-        cases.append((f"clip-{t}x{size[0]}x{size[1]}", np.stack(frames), (t, size[0] // 14, size[1] // 14), True))
+        cases.append((Path(path).stem, np.stack([frame, frame]), (1, frame.shape[0] // 14, frame.shape[1] // 14)))
     return cases
 
 
@@ -226,8 +218,6 @@ def run(args):
     library.cuteafd_vision_upload.argtypes = [C.c_void_p, C.c_uint64, C.c_void_p, C.c_uint64]
     library.cuteafd_vision_encode.argtypes = [C.c_void_p, C.c_void_p, C.c_uint64, C.c_void_p, C.c_int32, C.c_int32,
                                               C.c_void_p, C.c_uint64, OBSERVER, C.c_void_p]
-    library.cuteafd_vision_encode_frames.argtypes = [C.c_void_p, C.c_void_p, C.c_uint64, C.c_void_p, C.c_int32,
-                                                     C.c_int32, C.c_int32, C.c_void_p, C.c_uint64]
     library.cuteafd_vision_get_ledger.argtypes = [C.c_void_p, C.POINTER(Ledger)]
     library.cuteafd_vision_destroy.argtypes = [C.c_void_p]
     cudart.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]
@@ -249,9 +239,9 @@ def run(args):
         check(library.cuteafd_vision_upload(owner, 0, blob, len(blob)))
         del blob
 
-        def encode(frames, grid, video, observe=False):
+        def encode(frames, grid, observe=False):
             t, gh, gw = grid
-            rgb = np.ascontiguousarray(frames if video else frames[0])
+            rgb = np.ascontiguousarray(frames[0])
             out = np.empty((t * gh * gw // 4, 6144), np.uint16)
             stages, errors = {}, []
 
@@ -268,13 +258,9 @@ def run(args):
                     return 1
 
             started = time.perf_counter()
-            if video:
-                check(library.cuteafd_vision_encode_frames(owner, rgb.ctypes.data, rgb.nbytes, table.ctypes.data,
-                                                           t, gh, gw, out.ctypes.data, out.nbytes))
-            else:
-                observer = OBSERVER(callback) if observe else OBSERVER()
-                check(library.cuteafd_vision_encode(owner, rgb.ctypes.data, rgb.nbytes, table.ctypes.data,
-                                                    gh, gw, out.ctypes.data, out.nbytes, observer, None))
+            observer = OBSERVER(callback) if observe else OBSERVER()
+            check(library.cuteafd_vision_encode(owner, rgb.ctypes.data, rgb.nbytes, table.ctypes.data,
+                                                gh, gw, out.ctypes.data, out.nbytes, observer, None))
             elapsed = (time.perf_counter() - started) * 1000
             if errors:
                 raise RuntimeError(errors)
@@ -282,15 +268,15 @@ def run(args):
 
         cases = inputs(args)
         saved, natives = {}, {}
-        for name, frames, grid, video in cases:
-            encode(frames, grid, video)  # first use of this shape
-            natives[name] = encode(frames, grid, video, observe=not args.native_only and not video)
+        for name, frames, grid in cases:
+            encode(frames, grid)  # first use of this shape
+            natives[name] = encode(frames, grid, observe=not args.native_only)
             saved[name] = natives[name][0]
         if not args.native_only:
             arms = {}
             for arm, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32)):
                 weights = reference_weights(tensors, dtype, "cuda")
-                for name, frames, grid, video in cases:
+                for name, frames, grid in cases:
                     if grid[0] * grid[1] * grid[2] > args.reference_max_patches:
                         continue
                     captured = {}
@@ -316,7 +302,7 @@ def run(args):
                     m = metrics(value, fp32[key])
                     measured[stage] = dict(m, versus_bf16_reference=metrics(value, bf16[key])["relative_l2"],
                                            **{"pass": verdict(m, floor[stage])})
-                grid = next(g for n, _, g, _ in cases if n == name)
+                grid = next(g for n, _, g in cases if n == name)
                 result["g2"][name] = dict(grid=list(grid), tokens=grid[0] * grid[1] * grid[2] // 4,
                                           native=measured, bf16_reference=floor)
                 print(json.dumps(dict(event="G2", case=name, grid=grid, native=measured["output"],
@@ -325,8 +311,8 @@ def run(args):
         initial, final = Ledger(), Ledger()
         check(library.cuteafd_vision_get_ledger(owner, C.byref(initial)))
         for repeat in range(args.repeats):
-            for name, frames, grid, video in (reversed(cases) if repeat % 2 else cases):
-                value, _, elapsed = encode(frames, grid, video)
+            for name, frames, grid in (reversed(cases) if repeat % 2 else cases):
+                value, _, elapsed = encode(frames, grid)
                 result["encode_ms"].setdefault(name, []).append(round(elapsed, 3))
                 result["g3"][name] = result["g3"].get(name, True) and bool(np.array_equal(value, saved[name]))
         check(library.cuteafd_vision_get_ledger(owner, C.byref(final)))
@@ -344,22 +330,12 @@ def run(args):
         check(library.cuteafd_vision_destroy(owner))
 
 
-def size(value):
-    h, w = (int(v) for v in value.split("x"))
-    if h % 28 or w % 28:
-        raise argparse.ArgumentTypeError("clip sizes are HxW multiples of 28")
-    return h, w
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--images", type=Path, nargs="*", default=[])
-    parser.add_argument("--clip-frames", type=Path, nargs="*", default=[],
-                        help="one to eight sampled frames of a clip (one attention segment)")
-    parser.add_argument("--clip-sizes", type=size, nargs="*", default=[], help="HxW sizes to encode the clip at")
     parser.add_argument("--reference-max-patches", type=int, default=7000)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--native-only", action="store_true")
