@@ -253,7 +253,8 @@ def test_smoke_no_outer_lock_and_detached_numeric_exit(entry, tmp_path, monkeypa
     cmd, kwargs = seen[0]
     assert cmd[0] == 'setsid'
     assert 'secret' not in str(cmd)
-    assert 'printf' in cmd[3] and '$rc' in cmd[3]
+    assert cmd[1] == '--wait'
+    assert 'printf' in cmd[4] and '$rc' in cmd[4]
     assert kwargs['env']['CUTEAFD_API_KEY'] == 'secret'
 
 
@@ -1895,16 +1896,16 @@ def test_fabric_assessment_timed_contamination_and_unknown():
               dict(name='decode', timed=True, assessments=['SparkNest traffic: x', 'foreign traffic: x',
                                                           'storage attribution unavailable: x', 'xmit_wait rising above idle: x'])]
     caveats = cards.fabric_assessment(phases)
-    assert len(caveats) == 3
-    assert all('decode:' in c and 'rerun' in c for c in caveats)
+    assert len(caveats) == 1
+    assert all('decode:' in c and 'informational' in c for c in caveats)
     assert cards.fabric_assessment([]) == []
 
 
 def test_summary_retains_fabric_and_requires_rerun(tmp_path):
     rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
                  fabric=[dict(name='decode', timed=True, ports=[dict(host='coordinator',device='nic',port=1,
-                     sent_bytes=100,received_bytes=100,engine_sent_bytes=40,engine_received_bytes=40,
-                     sparknest_sent_bytes=50,sparknest_received_bytes=50)])],
+                     sent_bytes=1_000_000_000,received_bytes=1_000_000_000,engine_sent_bytes=40,engine_received_bytes=40,
+                     seconds=1, sparknest_sent_bytes=50,sparknest_received_bytes=50)])],
                  fabric_caveats=['decode: SparkNest traffic: rerun'] if arm == 'candidate' else [])
             for arm in ['base','candidate']]
     cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
@@ -1921,8 +1922,10 @@ def test_fabric_health_caveat_only_gates_timed_phases():
     warning = 'fabric health: port: retransmits 0.6% of packets exceed 0.5%'
     phases = [dict(name='warmup', timed=False, assessments=[warning]),
               dict(name='decode', timed=True, assessments=[warning])]
-    assert cards.fabric_assessment(phases) == [
-        'decode: ' + warning + '; investigate fabric health and rerun before accepting A/B']
+    assert cards.fabric_assessment(phases) == []
+    phases[1]['ports'] = [dict(health=dict(retransmit_pct=0.6, retransmit_judged=True))]
+    assert 'results remain valid' in cards.fabric_assessment(phases)[0]
+    assert cards.fabric_rerun_reasons(phases) == []
 
 
 def _checkout(path, run_sh=True):
@@ -1991,6 +1994,7 @@ def test_coordinator_only_build_claims_its_root_before_any_build_work(tmp_path, 
     assert seen, 'build_arms ran no build command'
     assert all(claimed for _name, claimed in seen), seen
     assert json.loads(marker.read_text()) == dict(task='task', instance='test-base')
+    assert json.loads((tmp_path / 'plan.json').read_text())['arms']['base']['cleanup_hosts']
 
 
 def test_arm_repo_overrides_arm_wip_and_unmapped_arm_falls_back_to_repo(entry, tmp_path, monkeypatch, capsys):
@@ -2457,3 +2461,127 @@ def test_cancelled_smoke_skips_remote_profile_collection(entry, tmp_path, monkey
                           '--interleave', '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
                           '--state', str(tmp_path / 'state')], rc_for=stopped)
     assert rc == 143 and launched == ['v41-min/base']
+
+
+@pytest.mark.parametrize('utilization', [0.287833, 0.300341])
+def test_771_zero_ecn_and_retransmits_never_rerun(tmp_path, utilization):
+    phases = [dict(name='prefill/65536', timed=True, assessments=[
+        'fabric health: coordinator mlx5_0/1: no ECN marking under load',
+        'fabric health: coordinator mlx5_0/1: retransmits 0% of packets (warning above 0.5%)'],
+        ports=[dict(host='coordinator', health=dict(verdict='warn', ecn_marked_packets=0,
+            retransmit_pct=0.0, retransmit_judged=True, utilization=utilization))])]
+    assert cards.fabric_assessment(phases) == []
+    assert cards.fabric_rerun_reasons(phases) == []
+    rows = [dict(card='glm-max', arm='candidate', repeat=1, simulated=False, status='pass', fabric=phases,
+                 fabric_caveats=cards.fabric_assessment(phases))]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'eligible'
+    assert 'Rerun' not in (tmp_path / 'summary.md').read_text()
+
+
+def test_771_old_receiver_uses_exact_peer_not_whole_fabric():
+    # #771 2026-10-26T08:37: recorded Step 8K ostrich counters.
+    spark = dict(host='10.55.0.1:19843', device='rocep1s0f0', port=1, seconds=5.019005078,
+        sent_bytes=5_806_438_220, received_bytes=5_908_870_656,
+        engine_sent_bytes=5_745_843_392, engine_received_bytes=109_576_192,
+        peers=[dict(peer='00000000000000000000ffff0a370016')])
+    coordinator = dict(host='coordinator', peers=[dict(peer='00000000000000000000ffff0a370001',
+        sent_bytes=6_018_321_408, received_bytes=5_920_040_192),
+        dict(peer='00000000000000000000ffff0a370002', sent_bytes=6_018_321_408, received_bytes=5_920_040_192)])
+    phase = dict(name='prefill/8192', timed=True, ports=[spark, coordinator],
+        assessments=['foreign traffic: 10.55.0.1:19843 9.2 Gb/s received'])
+    assert cards.fabric_rerun_reasons([phase]) == []
+    assert cards.fabric_assessment([phase]) == []
+    # A real foreign ingress still clears the same threshold, despite peers.
+    spark['received_bytes'] += 6_000_000_000
+    assert len(cards.fabric_rerun_reasons([phase])) == 1
+    phase['timed'] = False
+    assert cards.fabric_rerun_reasons([phase]) == []
+
+
+def test_771_used_down_port_only_is_rerun():
+    p = dict(state='1: DOWN', engine_received_bytes=1)
+    assert cards.fabric_rerun_reasons([dict(timed=True, ports=[p])])
+    p['engine_received_bytes'] = 0
+    assert cards.fabric_rerun_reasons([dict(timed=True, ports=[p])]) == []
+
+
+@pytest.mark.parametrize('error', [ValueError('fatal preflight refusal'), OSError('missing binary')])
+def test_771_fatal_preflight_boundary_exits_nonzero(monkeypatch, capsys, error):
+    def fail():
+        raise error
+    monkeypatch.setattr(cards, 'main', fail)
+    assert cards.cli() == 2
+    assert str(error) in capsys.readouterr().err
+
+
+def test_771_missing_binary_cli_exit(tmp_path):
+    # The real hidden preflight hook reads the job before taking any locks.
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/wip-cards.py'),
+        '--preflight-job', str(tmp_path / 'missing-job.json')], capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'missing-job.json' in result.stderr and 'wip-cards:' in result.stderr
+
+
+def test_771_detached_leader_propagates_fatal_status(tmp_path):
+    # Force setsid's fork path: without --wait the outer process reports 0.
+    command = [sys.executable, '-c',
+        'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], start_new_session=True).returncode)',
+        'setsid', '--wait', 'bash', '-c', 'exit 82']
+    assert subprocess.run(command, timeout=10).returncode == 82
+    process = cards.detached(['/missing/fabric-binary'], tmp_path / 'log', tmp_path / 'exit', dict(os.environ))
+    assert cards.wait_detached(process, grace=5) == 127
+    assert (tmp_path / 'exit').read_text().strip() == '127'
+
+
+def test_771_missing_borrowed_binary_real_cli(entry, tmp_path):
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/wip-cards.py'),
+        '--task', 'fabric-missing-binary', '--state', str(tmp_path / 'state'),
+        '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--matrix',
+        '--arm', 'candidate=fabric-owned:gate', '--repo', str(ROOT),
+        '--binary', str(tmp_path / 'missing-cuteafd'), '--preflight-only'], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert 'is neither a file nor on PATH' in result.stderr
+    assert not (tmp_path / 'state/preflight.json').exists()
+
+
+def test_771_cleanup_includes_recorded_seed_hosts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: calls.append(cmd) or SimpleNamespace(stdout=''))
+    cards.cleanup({'owned': dict(instance='fabric-owned', slot='gate',
+        cleanup_hosts=['cassowary', 'future-seed'])}, 'fabric-verdict', False)
+    hosts = [cmd[3] for cmd in calls if cmd[0] == 'ssh']
+    assert hosts.count('cassowary') == 1
+    assert 'future-seed' in hosts
+
+
+def test_771_live_chip_uses_rate_and_actual_down_not_ecn_or_relative_link_speed():
+    import shutil
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node unavailable')
+    source = ROOT / 'rust/crates/cuteafd-api/assets/cuteafd-ui.js'
+    script = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const context = {window: {}, document: {documentElement: {}}, getComputedStyle: () => ({getPropertyValue: () => ''})};
+vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+const health = {verdict: 'warn', ecn_marked_packets: 0, retransmit_pct: 0, retransmit_judged: true, moved_gb: 5};
+const p = {device: 'mlx5_0', port: 1, state: '4: ACTIVE', link_gbps: 100, health_since_start: health};
+const host = {engine: [{device: 'mlx5_0', port: 1, sent_bytes: 1}], ports: [p, {...p, port: 2, link_gbps: 200}]};
+let model = () => context.window.CuteUI.fabricModel({hosts: {coordinator: host}}, 0);
+assert.equal(model().problems.length, 0); assert.equal(model().hosts[0].rows[0].verdict, 'ok');
+p.state = null; assert.equal(model().problems.length, 0);
+p.state = '1: DOWN'; assert.equal(model().problems[0].issue, 'down');
+p.state = '4: ACTIVE'; health.retransmit_pct = 0.51; assert.equal(model().problems[0].issue, 'retransmits');
+health.retransmit_judged = false; health.moved_gb = 1; assert.equal(model().problems.length, 0);
+assert.equal(model().hosts[0].rows[0].verdict, 'idle');
+"""
+    subprocess.run([node, '-e', script, str(source)], check=True, capture_output=True, text=True)
+
+
+def test_771_registered_storage_above_threshold_is_not_hidden_by_own_slack():
+    port = dict(seconds=1, sent_bytes=10_600_000_000, received_bytes=0,
+        engine_sent_bytes=10_000_000_000, engine_received_bytes=0,
+        sparknest_sent_bytes=600_000_000, sparknest_received_bytes=0)
+    reasons = cards.fabric_rerun_reasons([dict(timed=True, ports=[port])])
+    assert len(reasons) == 1 and 'SparkNest traffic:' in reasons[0]

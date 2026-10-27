@@ -677,9 +677,11 @@ def detached(cmd, log, exit_file, env):
     # CLI disappears. It ignores stop signals itself (smoke handles them), so it
     # waits for smoke's teardown and still records smoke's exit status. The
     # parent's serving turn outlives this process and its container teardown.
+    # setsid may fork when its caller is a process-group leader; --wait must
+    # propagate the child status rather than report the successful fork.
     script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
     with Path(log).open('w') as output:
-        process = subprocess.Popen(['setsid', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+        process = subprocess.Popen(['setsid', '--wait', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
     with _LIVE_LOCK:
         _LIVE[id(process)] = process
     if STOP['signal'] is not None:  # arrived while it started
@@ -1083,16 +1085,64 @@ def classify(row, launched):
     return 'measurement'
 
 
-def fabric_assessment(phases):
-    """Assessment hook for timed background traffic; byte evidence stays per port."""
-    caveats = []
+def fabric_rerun_reasons(phases):
+    """Reconcile wire bytes with both endpoints, including older RX meters."""
+    reasons = []
     for phase in phases:
         if not phase.get('timed'):
             continue
-        for warning in phase.get('assessments', []):
-            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:', 'fabric health:')):
-                action = 'investigate fabric health and rerun' if warning.startswith('fabric health:') else 'rerun in a quiet window'
-                caveats.append(f"{phase.get('name', '?')}: {warning}; {action} before accepting A/B")
+        ports = phase.get('ports', [])
+        for p in ports:
+            label = f"{p.get('host')} {p.get('device')}/{p.get('port')}"
+            if any((p.get(k) or 0) > 0 for k in ('engine_sent_bytes', 'engine_received_bytes')) and 'DOWN' in (p.get('state') or ''):
+                reasons.append(f"{phase.get('name', '?')}: port down while used: {label}")
+            seconds = p.get('seconds') or 0
+            if seconds <= 0:
+                continue
+            # Coordinator GIDs identify each Spark; never borrow unrelated bytes.
+            import ipaddress
+            try:
+                address = p['host'].rsplit(':', 1)[0]
+                gid = '00000000000000000000ffff' + ipaddress.IPv4Address(address).packed.hex()
+            except (ValueError, KeyError):
+                gid = None
+            local_gids = {peer['local_gid'].replace(':', '').lower() for peer in p.get('peers', []) if peer.get('local_gid')}
+            unique_port = sum(bool(other.get('peers')) for other in ports if other.get('host') == p.get('host')) == 1
+            peers = [peer for other in ports if other.get('host') == 'coordinator'
+                     for peer in other.get('peers', [])
+                     if p.get('peers') and ((peer.get('peer', '').replace(':', '').lower() in local_gids) if local_gids
+                         else unique_port and gid and peer.get('peer', '').replace(':', '').lower() == gid)]
+            nic = sum(p.get(k) or 0 for k in ('sent_bytes', 'received_bytes'))
+            storage_bytes = sum(p.get(k) or 0 for k in ('sparknest_sent_bytes', 'sparknest_received_bytes'))
+            if storage_bytes * 8 / seconds / 1e9 > 1 and storage_bytes > nic * 0.05:
+                reasons.append(f"{phase.get('name', '?')}: SparkNest traffic: {label} {storage_bytes * 8 / seconds / 1e9:.2f} Gb/s (>5% and >1 Gb/s)")
+            for side, opposite in [('sent', 'received'), ('received', 'sent')]:
+                physical, local = p.get(side + '_bytes'), p.get('engine_' + side + '_bytes')
+                if physical is None or local is None:
+                    continue
+                storage = p.get('sparknest_' + side + '_bytes')
+                if p.get('sparknest_status') not in (None, '', 'unregistered') and storage is None:
+                    continue
+                own = max(local, sum(peer.get(opposite + '_bytes', 0) for peer in peers))
+                residual = max(0, physical - own - int(own * 0.65) - (p.get('estimated_header_' + side + '_bytes') or 0) - (storage or 0))
+                if residual * 8 / seconds / 1e9 > 1 and residual > nic * 0.05:
+                    reasons.append(f"{phase.get('name', '?')}: foreign traffic: {label} {residual * 8 / seconds / 1e9:.2f} Gb/s {side} (>5% and >1 Gb/s)")
+    return list(dict.fromkeys(reasons))
+
+
+def fabric_assessment(phases):
+    """Fabric recovery is informational; raw counters, not old labels, decide."""
+    caveats = fabric_rerun_reasons(phases)
+    for phase in phases:
+        if not phase.get('timed'):
+            continue
+        for p in phase.get('ports', []):
+            h = p.get('health') or {}
+            share = h.get('retransmit_pct')
+            if h.get('retransmit_judged') and share is not None and share > (h.get('retransmit_warn_pct') or 0.5):
+                caveats.append(f"{phase.get('name', '?')}: retransmits {share:.2g}% of packets; results remain valid, throughput may be lower")
+        caveats.extend(f"{phase.get('name', '?')}: {a}; informational" for a in phase.get('assessments', [])
+                       if a.startswith('storage attribution unavailable:'))
     return list(dict.fromkeys(caveats))
 
 
@@ -1247,7 +1297,7 @@ def summarize_job(job, exit_code):
         if not row['requests'] and not (prefill_only or fidelity_only):
             fail(row, 'matched prompts produced no per-request console rounds')
     row['fabric_caveats'] = fabric_assessment(row['fabric'])
-    row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'
+    row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row['fabric']) else 'eligible'
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
@@ -1386,9 +1436,13 @@ def write_summary(state, rows, arms):
                    key=lambda k: (int(k.split()[1]), k))
     present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
     medians, paired = summary_math(rows, names, present or METRICS)
+    for row in rows:
+        row['fabric_caveats'] = fabric_assessment(row.get('fabric', []))
+        row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row.get('fabric', [])) else 'eligible'
+    rerun = any(row['ab_verdict'] == 'rerun' for row in rows)
     caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c) for r in rows for c in r.get('fabric_caveats', [])]
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
-                                    ab_verdict='rerun' if caveats else 'eligible', fabric_caveats=caveats))
+                                    ab_verdict='rerun' if rerun else 'eligible', fabric_caveats=caveats))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -1421,7 +1475,7 @@ def write_summary(state, rows, arms):
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
         text += '\n'
     if caveats:
-        text += '## A/B Verdict: Rerun\n\nTimed unhealthy fabric, contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
+        text += ('## A/B Verdict: Rerun\n\nTimed foreign traffic or a used port down: compare in a quiet window.\n\n' if rerun else '## Fabric Notes\n\nResults remain valid; retransmits may reduce throughput.\n\n')
         for c in caveats:
             text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
         text += '\n'
@@ -1444,11 +1498,12 @@ def write_summary(state, rows, arms):
                 for p in phase.get('ports', []):
                     h = p.get('health') or {}
                     values = [r['card'], r['arm'], phase.get('name'), f"{p.get('host')} {p.get('device')}/{p.get('port')}",
-                              h.get('verdict', 'unknown'), h.get('retransmit_pct', 'unknown'),
+                              ('warn' if h.get('retransmit_judged') and (h.get('retransmit_pct') or 0) > (h.get('retransmit_warn_pct') or 0.5) else 'ok' if h.get('retransmit_judged') and h.get('retransmit_pct') is not None else 'idle / unavailable'), h.get('retransmit_pct', 'unknown'),
                               'yes' if h.get('retransmit_judged') else 'no (under 2 GB)',
-                              '; '.join(h.get('reasons') or ['no continuous observation'])]
+                              'results remain valid']
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
-        text += '\nPause: not collected. Retransmits are go-back-N resends (one per sequence gap or timeout); no data is lost.\n\n'
+        pauses = [p.get('health', {}).get('pause_counters', {}) for r in rows for phase in r.get('fabric', []) for p in phase.get('ports', []) if p.get('health')]
+        text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
         trace = r.get('trace') or {}
@@ -1615,12 +1670,13 @@ print('verified absent', root, overlay)
     return re.sub(r'\b(ROOT_NAME|OWNER|NAMES|INSTANCE|SLOT)\b', lambda m: replacements[m[0]], script)
 
 
-def cleanup(arms, task, dry):
+def cleanup(arms, task, dry, seed=None):
     for arm in arms.values():
         if 'wip_instance' in arm or 'release' in arm:
             continue  # External sealed builds and release images are never owned by this task.
         script = cleanup_script(arm, task)
-        for host in ('raptor', *HOSTS, *SEED_HOSTS):
+        hosts = dict.fromkeys(('raptor', *HOSTS, *SEED_HOSTS, *arm.get('seed_candidates', []), *arm.get('cleanup_hosts', []), *([seed] if seed and seed != 'auto' else [])))
+        for host in hosts:
             cmd = ['python3', '-c', script] if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(['python3', '-c', script])]
             print(shlex.join(cmd))
             if not dry:
@@ -1918,6 +1974,11 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         arm['seed_separate'] = seed_option_capable(revision)
         requested = seed
         seed, arm['seed_explicit'], seed_candidates = resolve_seed(requested, revision, arm['seed_separate'])
+        arm['seed_candidates'] = list(seed_candidates)
+        arm['cleanup_hosts'] = list(dict.fromkeys(('raptor', *HOSTS, *seed_candidates, seed)))
+        if not dry:
+            # Preserve ownership inventory even if compiling/sealing later fails.
+            save(state / 'plan.json', {'task': task, 'arms': arms, 'jobs': []})
         if build_role == 'both' and arm['seed_separate'] and arm['seed_explicit']:
             build_cmd += ['--seed', seed]
         # A coordinator-only slot stages to no Spark: SPARK_COUNT=0, no ranks named.
@@ -2131,7 +2192,7 @@ def main():
             if recorded['task'] != args.task or set(recorded['arms']) != set(arms) or any(recorded['arms'][name]['instance'] != arm['instance'] or recorded['arms'][name]['slot'] != arm['slot'] or recorded['arms'][name].get('release') != arm.get('release') for name, arm in arms.items()):
                 raise ValueError('cleanup does not match this task plan')
             arms = recorded['arms']
-        cleanup(arms, args.task, args.dry_run)
+        cleanup(arms, args.task, args.dry_run, args.seed_host)
         return 0
     if not args.cards or not (args.matrix or args.interleave):
         parser.error('--cards and --matrix or --interleave required')
@@ -2495,9 +2556,13 @@ def main():
         return stopped_code() or 1
 
 
-if __name__ == '__main__':
+def cli():
     try:
-        raise SystemExit(main())
+        return main()
     except (ValueError, RuntimeError, subprocess.SubprocessError, OSError) as error:
         print('wip-cards: ' + str(error), file=sys.stderr)
-        raise SystemExit(2)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(cli())
