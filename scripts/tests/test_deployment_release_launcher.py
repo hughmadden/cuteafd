@@ -82,11 +82,23 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--draft-kv-cache", draft_kv]
-        # Includes the byte-identical V4.1 fingerprint. Other families have no
-        # resolved-config fingerprint today; adding a fabricated one is a failure.
+        # Other families have no resolved-config fingerprint today; adding a
+        # fabricated one is a failure. V4.1's fingerprint now also covers the
+        # shared executor's prefill waves, which reach serve-native.
         if entry["family"] == "deepseek_v41" and "serve-native" in before["command"]:
             position = before["command"].index("--max-output-tokens") + 2
             before["command"][position:position] = ["--mapped-scale-preload-gib", "0"]
+            command = after["command"]
+            waves = command[command.index("--prefill-waves") + 1]
+            assert waves in ("1", "2"), (entry["name"], waves)
+            anchor = "--decode-lanes" if "--decode-lanes" in before["command"] else "--mapped-scale-preload-gib"
+            position = before["command"].index(anchor) + 2
+            before["command"][position:position] = ["--prefill-waves", waves]
+
+        fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
+        if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
+            assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])
+            before["env"][fingerprint] = after["env"][fingerprint]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
 

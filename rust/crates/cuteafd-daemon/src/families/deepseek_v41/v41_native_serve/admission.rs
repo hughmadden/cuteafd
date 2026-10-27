@@ -3,14 +3,14 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, bf16: bool)
+fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, waves: u8, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
     use cuteafd_loader::plan::spark_executions::{admit_family, SparkBackend};
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    // The descriptor's legacy stream shape queues the live chunk on one owner.
+    // The shared ladder: the unit's covering export, `waves` units buffered.
     let executions = admit_family("deepseek_v41", &SparkBackend::for_catalog(catalog)?.exports(), None,
-        u64::from(capacity), 1)?;
+        u64::from(capacity), u64::from(waves))?;
     // One endpoint per link: the decode transport and the prefill transport.
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2],
@@ -44,7 +44,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
-        spark_model(catalog, capacity, catalog.nvfp4().is_some())?)?))
+        spark_model(catalog, capacity, args.prefill_waves, catalog.nvfp4().is_some())?)?))
 }
 
 #[cfg(test)]
@@ -72,11 +72,13 @@ mod spark_tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let backend = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
         for live in [256u32, 2048, 4096] {
-            // V4.1's layout pins its unit to the live chunk at one wave.
-            let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
-                prefill_waves: 1, ..Default::default() };
-            assert_eq!(spark_model(&catalog, live, false)?.executions,
-                cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
+            for waves in [1u8, 2] {
+                // The planner's resolved unit and waves, as serve admits them.
+                let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
+                    prefill_waves: u64::from(waves), ..Default::default() };
+                assert_eq!(spark_model(&catalog, live, waves, false)?.executions,
+                    cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
+            }
         }
         Ok(())
     }
@@ -88,9 +90,9 @@ mod spark_tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
             for bf16 in [false, true] {
-                let model = spark_model(&catalog, live, bf16)?;
+                let model = spark_model(&catalog, live, 2, bf16)?;
                 assert_eq!((model.capacity(), model.compiled_capacity()), (live, compiled));
-                // Two decode lanes, one prefill owner; two streams queue on it.
+                // Two decode lanes, one prefill owner holding the two units in flight.
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
                     capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
