@@ -5468,8 +5468,12 @@ Every family that sends experts to Sparks prefills the same way.
   waves without reallocating or recapturing.
   `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
   5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
-  (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
-  fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.
+  (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. The reserve is sized
+  before KV and never shrunk for it (TJ, 2026-10-27): the planner admits
+  8192 rows, or on a card where that doesn't fit (5090) the largest multiple
+  of 768 rows (12 pages, so every k = 2..4 split stays page-aligned) that
+  does, split into k units automatically or by pin; the KV pool takes what
+  remains.
 - **One transport, N waves:** each unit's expert wave goes out on one
   transport that admits N outstanding waves, each with its own return slot.
   The Spark side already pipelines (rings 8 deep, in order); only the
