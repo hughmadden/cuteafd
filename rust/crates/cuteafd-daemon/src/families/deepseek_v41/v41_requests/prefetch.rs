@@ -1,0 +1,120 @@
+//! The next encoder unit's Engram I/O, started ahead of its reservation
+//! (#815). A wave is adopted only by the reservation it was prepared for;
+//! every other path cancels it before dropping it.
+
+/// A wave that must be cancelled (its queued I/O drained) before it drops.
+pub(crate) trait CancelWave { fn cancel(&mut self); }
+
+impl CancelWave for cuteafd_loader::EngramWave {
+    fn cancel(&mut self) { cuteafd_loader::EngramWave::cancel(self) }
+}
+
+/// What a prefetched wave was prepared for: the request, its reserved
+/// prefill frontier and the unit's tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrefetchKey<L> { pub lease: L, pub position: u64, pub tokens: Vec<u32> }
+
+/// At most one prefetched wave.
+pub(crate) struct PrefetchSlot<L, W: CancelWave> { held: Option<(PrefetchKey<L>, W)> }
+
+impl<L: PartialEq, W: CancelWave> Default for PrefetchSlot<L, W> {
+    fn default() -> Self { Self { held: None } }
+}
+
+impl<L: PartialEq, W: CancelWave> PrefetchSlot<L, W> {
+    /// Holds `wave` for `key`, cancelling whatever was held.
+    pub(crate) fn hold(&mut self, key: PrefetchKey<L>, wave: W) {
+        self.cancel();
+        self.held = Some((key, wave));
+    }
+    /// The held wave if it was prepared for exactly `key`; otherwise the
+    /// held wave (if any) is cancelled and None returned.
+    pub(crate) fn take_matching(&mut self, key: &PrefetchKey<L>) -> Option<W> {
+        match self.held.take() {
+            Some((held, wave)) if held == *key => Some(wave),
+            Some((_, mut stale)) => { stale.cancel(); None }
+            None => None,
+        }
+    }
+    /// Cancels a wave held for `lease` (release, decoder replay).
+    pub(crate) fn cancel_owner(&mut self, lease: &L) {
+        if self.held.as_ref().is_some_and(|(key, _)| key.lease == *lease) { self.cancel(); }
+    }
+    /// Cancels any held wave.
+    pub(crate) fn cancel(&mut self) {
+        if let Some((_, mut stale)) = self.held.take() { stale.cancel(); }
+    }
+    pub(crate) fn is_empty(&self) -> bool { self.held.is_none() }
+}
+
+impl<L, W: CancelWave> Drop for PrefetchSlot<L, W> {
+    /// A request bank dropped with a prefetch in flight (abort) cancels it.
+    fn drop(&mut self) {
+        if let Some((_, mut stale)) = self.held.take() { stale.cancel(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Records cancels and drops; dropping uncancelled is a leak.
+    struct Wave { id: u32, log: Rc<RefCell<Vec<String>>>, cancelled: bool }
+    impl CancelWave for Wave { fn cancel(&mut self) { self.cancelled = true; self.log.borrow_mut().push(format!("cancel {}", self.id)); } }
+    impl Drop for Wave {
+        fn drop(&mut self) { self.log.borrow_mut().push(format!("drop {} cancelled={}", self.id, self.cancelled)); }
+    }
+    fn key(lease: u32, position: u64, tokens: &[u32]) -> PrefetchKey<u32> { PrefetchKey { lease, position, tokens: tokens.to_vec() } }
+    fn wave(id: u32, log: &Rc<RefCell<Vec<String>>>) -> Wave { Wave { id, log: log.clone(), cancelled: false } }
+    fn leaked(log: &Rc<RefCell<Vec<String>>>) -> bool { log.borrow().iter().any(|line| line.ends_with("cancelled=false")) }
+
+    #[test]
+    fn an_exact_reservation_adopts_the_prefetch() {
+        let log = Rc::default();
+        let mut slot = PrefetchSlot::default();
+        slot.hold(key(1, 2752, &[5, 6]), wave(1, &log));
+        let adopted = slot.take_matching(&key(1, 2752, &[5, 6])).expect("adopted");
+        assert_eq!(adopted.id, 1);
+        assert!(!adopted.cancelled && slot.is_empty());
+        drop(slot);
+        assert!(log.borrow().is_empty(), "nothing cancelled or dropped by the slot");
+        let mut adopted = adopted; adopted.cancel();
+    }
+
+    #[test]
+    fn mismatched_reservations_cancel_and_never_adopt() {
+        for other in [key(2, 2752, &[5, 6]), key(1, 2688, &[5, 6]), key(1, 2752, &[5, 7])] {
+            let log = Rc::default();
+            let mut slot = PrefetchSlot::default();
+            slot.hold(key(1, 2752, &[5, 6]), wave(1, &log));
+            assert!(slot.take_matching(&other).is_none(), "{other:?} adopted a wave prepared for another key");
+            assert!(slot.is_empty());
+            assert_eq!(*log.borrow(), ["cancel 1", "drop 1 cancelled=true"]);
+        }
+    }
+
+    #[test]
+    fn release_and_replay_cancel_only_their_own_lease() {
+        let log = Rc::default();
+        let mut slot = PrefetchSlot::default();
+        slot.hold(key(1, 0, &[5]), wave(1, &log));
+        slot.cancel_owner(&2);
+        assert!(!slot.is_empty(), "another request's release keeps the prefetch");
+        slot.cancel_owner(&1);
+        assert!(slot.is_empty());
+        assert_eq!(*log.borrow(), ["cancel 1", "drop 1 cancelled=true"]);
+    }
+
+    #[test]
+    fn a_new_prefetch_and_an_abort_cancel_the_held_wave() {
+        let log = Rc::default();
+        let mut slot = PrefetchSlot::default();
+        slot.hold(key(1, 0, &[5]), wave(1, &log));
+        slot.hold(key(1, 1, &[6]), wave(2, &log));
+        drop(slot);
+        assert_eq!(*log.borrow(), ["cancel 1", "drop 1 cancelled=true", "cancel 2", "drop 2 cancelled=true"]);
+        assert!(!leaked(&log));
+    }
+}

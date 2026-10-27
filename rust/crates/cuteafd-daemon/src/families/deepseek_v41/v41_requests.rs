@@ -8,6 +8,7 @@ use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramHistory, EngramPrefillCursor};
 mod reservation;
+mod prefetch;
 mod images;
 pub(crate) use images::RequestImages;
 use cuteafd_ffi::NativeLibrary;
@@ -85,9 +86,8 @@ pub(crate) struct Requests<'a> {
     /// Units of released slots, for the prefix engine to unreference once their consumers drained.
     released_units: Vec<Vec<u32>>,
     image_requests: usize,
-    /// One encoder unit's Engram I/O started ahead of its reservation (#815):
-    /// lease, start position and tokens it was prepared for.
-    prefetched: Option<(CacheLease, u64, Vec<u32>, EngramWave)>,
+    /// The next encoder unit's Engram I/O, started ahead of its reservation (#815).
+    prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
 }
@@ -107,7 +107,7 @@ impl<'a> Requests<'a> {
             units: vec![Vec::new(); slots],
             released_units: Vec::new(),
             image_requests: 0,
-            prefetched: None,
+            prefetched: Default::default(),
             releases: 0,
         })
     }
@@ -127,7 +127,7 @@ impl<'a> Requests<'a> {
             units: vec![Vec::new(); slots],
             released_units: Vec::new(),
             image_requests: 0,
-            prefetched: None,
+            prefetched: Default::default(),
             releases: 0,
         })
     }
@@ -138,7 +138,7 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: None,releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
@@ -186,9 +186,7 @@ impl<'a> Requests<'a> {
         }).collect::<Result<Vec<_>>>().map(Some)
     }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
-        if self.prefetched.as_ref().is_some_and(|(owner, ..)| *owner == lease) {
-            if let Some((_, _, _, mut stale)) = self.prefetched.take() { stale.cancel(); }
-        }
+        self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }
         let slot = self
             .slots
@@ -402,9 +400,7 @@ impl<'a> Requests<'a> {
         ensure!(self.request(lease)?.history.position() == self.cache.committed_end(lease)?,
             "encoder history differs before replay");
         let start = self.cache.begin_decoder_replay(lease)?;
-        if self.prefetched.as_ref().is_some_and(|(owner, ..)| *owner == lease) {
-            if let Some((_, _, _, mut stale)) = self.prefetched.take() { stale.cancel(); }
-        }
+        self.prefetched.cancel_owner(&lease);
         self.slots.iter_mut().flatten().find(|r| r.lease == lease)
             .expect("validated request").prefill = None;
         Ok(start)
