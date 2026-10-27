@@ -1,22 +1,20 @@
 //! Runtime prefill wave adaptation (#762 stages 2–4). The planner admits a
-//! maximum of `max` in-flight units and a unit extent; at each decode→prefill
-//! transition the executor asks [`WaveControl`] for the wave count k′ of the
-//! next prefill, within that admission. Each finished full-depth prefill
-//! reports what the Sparks measured on their prefill owner ([`PrefillPace`]):
-//! per-unit busy time S and the idle gap I before each unit started. The
-//! controller adds a wave while the Sparks starve, tries one fewer while they
-//! never do, and keeps a move only if the delivered Spark period per row did
-//! not regress. Pure arithmetic over the reported counters; no clock, no I/O.
+//! maximum of `slots` in-flight units and a unit extent; at each
+//! decode→prefill transition the executor asks [`WaveControl`] for the depth
+//! k′ of the next prefill, within that admission. Each finished full-depth
+//! prefill reports what the Sparks measured on their prefill owner
+//! ([`PrefillPace`]): per-unit busy time and the idle gap before each unit.
+//! Their sum per row is the call's delivered Spark period per row; the
+//! controller measures every candidate depth once and then runs the one with
+//! the lowest period, re-measuring the current depth on each full-depth call.
+//! Pure arithmetic over the reported counters; no clock, no I/O.
 
 use super::prefill_waves::{unit_rows, MAX_WAVES};
 
-/// Idle share above which the Sparks wait between units ("gaps above zero",
-/// above the timing noise floor): the call measures turnaround exactly.
-pub const IDLE_ADD: f64 = 0.01;
-/// A depth replaces the current one only if its predicted period per row is
+/// A depth replaces the current one only if its measured period per row is
 /// lower by this share (hysteresis against noise).
 pub const MARGIN: f64 = 0.01;
-/// Weight of the newest call in each unit's running Spark cost per row.
+/// Weight of the newest call in each depth's running period per row.
 const WEIGHT: f64 = 0.25;
 
 /// The Sparks' measured cost of one prefill call at one depth: per rank, the
@@ -74,24 +72,21 @@ pub struct Decision {
     /// The finished call's Spark busy and idle µs per row (critical rank).
     pub busy_us_per_row: Option<f64>,
     pub idle_us_per_row: Option<f64>,
-    /// Coordinator turnaround per row the choice used (µs), and whether it
-    /// is exact (the Sparks waited) or an upper bound (they never did).
-    pub turnaround_us: Option<f64>,
-    pub exact: bool,
+    /// The finished depth's running period per row (busy + idle, µs).
+    pub period_us: Option<f64>,
     pub reason: &'static str,
 }
 
-/// Chooses each prefill's depth from measured S and T (#762 stages 2–4).
+/// Chooses each prefill's depth by its measured Spark period per row (#762).
 ///
-/// Per row of a unit, the Spark is busy s(unit) and the coordinator turns
-/// a unit around in τ (attention, routing and norms scale with the unit's
-/// rows; τ grows with context). With k units in flight a Spark waits only
-/// when τ exceeds the k−1 units queued behind it: idle per row =
-/// max(0, τ − (k−1)·s). s depends on the unit's rows, not on the prompt, so
-/// it is learned once per admitted unit (each candidate runs once). τ is
-/// re-measured by every full-depth call: exactly when the Sparks waited,
-/// else bounded by (k−1)·s (the tightest bound since the last exact value). It runs the candidate with the
-/// lowest predicted Spark period per row, s + max(0, τ − (k−1)·s). Pinned
+/// The delivered prefill rate is one unit per Spark period, so the Sparks'
+/// busy + idle time per row is the call's wall period per row: busy is their
+/// work, idle whatever the coordinator did not hide. Both depend on the unit
+/// size (busy per row on the kernels' row curve; the coordinator's turnaround
+/// per row on its per-unit costs), so no depth is predicted from another:
+/// each candidate (the deepest depth per distinct unit) runs once, then the
+/// lowest measured period wins, and every full-depth call refreshes its own
+/// depth's running period (context length and load move it). Pinned
 /// controllers never move (explicit PREFILL_WAVES, benchmarks, goldens).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaveControl {
@@ -99,10 +94,8 @@ pub struct WaveControl {
     unit_cap: u64,
     pinned: bool,
     candidates: Vec<u64>,
-    /// Per depth: Spark busy µs per row.
-    busy: [Option<f64>; MAX_WAVES as usize],
-    /// The last full-depth call's turnaround per row (µs) and whether it is exact.
-    turnaround: Option<(f64, bool)>,
+    /// Per depth: running Spark period µs per row (busy + idle).
+    period: [Option<f64>; MAX_WAVES as usize],
 }
 
 impl WaveControl {
@@ -115,7 +108,7 @@ impl WaveControl {
         let k = if pinned { initial } else {
             *candidates.iter().find(|&&k| k >= initial).expect("max is a candidate")
         };
-        Self { k, unit_cap, pinned, candidates, busy: [None; MAX_WAVES as usize], turnaround: None }
+        Self { k, unit_cap, pinned, candidates, period: [None; MAX_WAVES as usize] }
     }
     /// The wave count of the next prefill.
     pub fn waves(&self) -> u64 { self.k }
@@ -123,12 +116,6 @@ impl WaveControl {
     pub fn unit_rows(&self) -> u64 { unit_for(self.k, self.unit_cap) }
     pub fn pinned(&self) -> bool { self.pinned }
     pub fn candidates(&self) -> &[u64] { &self.candidates }
-
-    /// Predicted Spark period per row at depth `j` under turnaround `tau` per row.
-    fn predict(&self, j: u64, tau: f64) -> Option<f64> {
-        let s = self.busy[(j - 1) as usize]?;
-        Some(s + (tau - (j as f64 - 1.0) * s).max(0.0))
-    }
 
     /// One finished prefill that ran `waves` deep (fewer when the prompt was
     /// short) reports its Spark pace; only calls at the chosen depth count.
@@ -138,37 +125,29 @@ impl WaveControl {
             return self.decision(None, None, if self.pinned { "pinned" } else { "not full depth" });
         };
         let k = self.k;
-        let cell = &mut self.busy[(k - 1) as usize];
-        *cell = Some(cell.map_or(busy, |old| old + WEIGHT * (busy - old)));
-        let queued = (k as f64 - 1.0) * busy;
-        // Sparks that waited measure τ exactly. Sparks that never waited only
-        // bound it by the work queued behind each unit; a deeper depth's bound
-        // is looser, so the tightest bound seen since the last exact value
-        // applies (too tight a bound makes the next call wait and corrects it).
-        let exact = idle / (busy + idle) > IDLE_ADD;
-        self.turnaround = Some(if exact { (idle + queued, true) } else {
-            (self.turnaround.map_or(queued, |(previous, _)| previous.min(queued)), false)
-        });
-        let reason = if let Some(&unknown) = self.candidates.iter().find(|&&j| self.busy[(j - 1) as usize].is_none()) {
+        let cell = &mut self.period[(k - 1) as usize];
+        let measured = busy + idle;
+        *cell = Some(cell.map_or(measured, |old| old + WEIGHT * (measured - old)));
+        let reason = if let Some(&unknown) = self.candidates.iter().find(|&&j| self.period[(j - 1) as usize].is_none()) {
             self.k = unknown;
-            "measure an admitted unit's Spark cost once"
+            "measure each candidate depth once"
         } else {
-            let (t, _) = self.turnaround.expect("this call set a turnaround");
-            let current = self.predict(k, t).expect("this call measured the current depth");
-            let best = self.candidates.iter().filter_map(|&j| self.predict(j, t).map(|p| (j, p)))
+            let current = self.period[(k - 1) as usize].expect("this call measured the current depth");
+            let best = self.candidates.iter().filter_map(|&j| self.period[(j - 1) as usize].map(|p| (j, p)))
                 .min_by(|a, b| a.1.total_cmp(&b.1)).expect("measured candidates");
             if best.0 != k && best.1 < (1.0 - MARGIN) * current {
                 self.k = best.0;
-                "lowest predicted Spark period per row"
+                "lowest measured Spark period per row"
             } else { "hold" }
         };
-        self.decision(Some(busy), Some(idle), reason)
+        let mut decision = self.decision(Some(busy), Some(idle), reason);
+        decision.period_us = self.period[(k - 1) as usize];
+        decision
     }
 
     fn decision(&self, busy: Option<f64>, idle: Option<f64>, reason: &'static str) -> Decision {
-        let turnaround = self.turnaround;
         Decision { waves: self.k, unit_rows: self.unit_rows(), busy_us_per_row: busy, idle_us_per_row: idle,
-            turnaround_us: turnaround.map(|t| t.0), exact: turnaround.is_some_and(|t| t.1), reason }
+            period_us: None, reason }
     }
 }
 
@@ -177,8 +156,8 @@ mod tests {
     use super::*;
 
     /// One rank of a k-deep pipeline: busy `s(unit)` µs per unit; the
-    /// coordinator needs `tau` µs per row of a unit, so each unit after the
-    /// first waits max(0, tau·unit − (k−1)·busy). `rows` prompt rows.
+    /// coordinator needs `tau` µs per row of a unit (depending on the unit),
+    /// so each unit after the first waits max(0, tau·unit − (k−1)·busy).
     fn pace(k: u64, unit: u64, rows: u64, s: impl Fn(u64) -> f64, tau: f64) -> PrefillPace {
         let busy = s(unit);
         let idle = (tau * unit as f64 - (k as f64 - 1.0) * busy).max(0.0);
@@ -187,10 +166,47 @@ mod tests {
     }
 
     fn run(control: &mut WaveControl, lengths: &[u64], s: impl Fn(u64) -> f64 + Copy, t: impl Fn(u64) -> f64) -> Vec<u64> {
+        run_units(control, lengths, s, |rows, _| t(rows))
+    }
+
+    /// [`run`] with the coordinator's turnaround per row depending on the
+    /// prompt length and the unit (`t(rows, unit)`).
+    fn run_units(control: &mut WaveControl, lengths: &[u64], s: impl Fn(u64) -> f64 + Copy,
+        t: impl Fn(u64, u64) -> f64) -> Vec<u64> {
         lengths.iter().map(|&rows| {
-            let k = control.waves();
-            control.observe(k, &pace(k, control.unit_rows(), rows, s, t(rows))).waves
+            let (k, unit) = (control.waves(), control.unit_rows());
+            control.observe(k, &pace(k, unit, rows, s, t(rows, unit))).waves
         }).collect()
+    }
+
+    /// Spark busy and coordinator turnaround per row (µs) by unit, from the
+    /// #762 cards' adaptive arms (rw762-cards-a, U = 4096): 3 x 2752 busy
+    /// 3.71 / idle 0.29 (GLM K4 max), 4.97 / 0.93 (Kimi BF16 max); 2 x 4096
+    /// 3.36 / 1.54 and 4.45 / 1.74; 4 x 2048 delivered 7.9% / 11% less than
+    /// 3 x 2752 at 8K. τ = idle + (k − 1) · busy at each depth.
+    fn measured(family: &str) -> (impl Fn(u64) -> f64 + Copy, impl Fn(u64, u64) -> f64 + Copy) {
+        let glm = family == "glm";
+        let busy = move |unit: u64| match (glm, unit) {
+            (true, 4096) => 3.36, (true, 2752) => 3.71, (true, _) => 3.90,
+            (false, 4096) => 4.45, (false, 2752) => 4.97, (false, _) => 5.40 };
+        let tau = move |_: u64, unit: u64| match (glm, unit) {
+            (true, 4096) => 1.54 + 3.36, (true, 2752) => 0.29 + 2.0 * 3.71, (true, _) => 0.44 + 3.0 * 3.90,
+            (false, 4096) => 1.74 + 4.45, (false, 2752) => 0.93 + 2.0 * 4.97, (false, _) => 1.25 + 3.0 * 5.40 };
+        (move |unit: u64| busy(unit) * unit as f64, tau)
+    }
+
+    #[test]
+    fn unit_dependent_turnaround_settles_glm_and_kimi_on_three_by_2752() {
+        // The superseded S/T model held 4 x 2048 here: it assumed one
+        // turnaround per row for every unit. The measured period does not.
+        for family in ["glm", "kimi"] {
+            let (s, t) = measured(family);
+            for start in 2..=4 {
+                let mut control = WaveControl::new(start, 4, 4096, false);
+                let trace = run_units(&mut control, &bench(40), s, t);
+                assert!(trace[3..].iter().all(|&k| k == 3), "{family} start {start}: {trace:?}");
+            }
+        }
     }
 
     /// The bench's order: warm and timed 8K, then warm and timed 64K, repeated.
@@ -230,11 +246,6 @@ mod tests {
         let trace = run(&mut control, &bench(200), s, |_| 19_500.0 / 2752.0);
         assert_eq!(&trace[..2], [4, 3], "{trace:?}");
         assert!(trace[2..].iter().all(|&k| k == 3), "{trace:?}");
-        // A context-dependent turnaround that outgrows 3 units at 64K moves
-        // 64K prefills deeper when that predicts a lower period, and back.
-        let mut control = WaveControl::new(3, 4, 2752, false);
-        let trace = run(&mut control, &bench(40), s, |rows| if rows > 16_384 { 22.0 } else { 5.0 });
-        assert!(trace.contains(&3) && trace.contains(&4), "{trace:?}");
     }
 
     #[test]

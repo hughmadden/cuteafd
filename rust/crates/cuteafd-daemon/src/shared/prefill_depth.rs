@@ -58,16 +58,10 @@ impl PrefillDepth {
     pub(crate) fn finish(&self, waves: usize, pace: &PrefillPace) -> Decision {
         let before = self.next();
         let d = self.control.borrow_mut().observe(waves as u64, pace);
-        if d.waves as usize != before.waves {
-            tracing::info!(waves = before.waves, unit_rows = before.unit_rows, next_waves = d.waves,
-                next_unit_rows = d.unit_rows, rows = pace.rows, busy_us_per_row = ?d.busy_us_per_row,
-                idle_us_per_row = ?d.idle_us_per_row, turnaround_us = ?d.turnaround_us, exact = d.exact,
-                reason = d.reason, "prefill depth");
-        } else {
-            tracing::debug!(waves = before.waves, unit_rows = before.unit_rows, rows = pace.rows,
-                busy_us_per_row = ?d.busy_us_per_row, idle_us_per_row = ?d.idle_us_per_row,
-                turnaround_us = ?d.turnaround_us, exact = d.exact, reason = d.reason, "prefill depth");
-        }
+        // One line per prefill call (the chosen depth and its measured period).
+        tracing::info!(waves = before.waves, unit_rows = before.unit_rows, next_waves = d.waves,
+            next_unit_rows = d.unit_rows, rows = pace.rows, busy_us_per_row = ?d.busy_us_per_row,
+            idle_us_per_row = ?d.idle_us_per_row, period_us = ?d.period_us, reason = d.reason, "prefill depth");
         d
     }
 }
