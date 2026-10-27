@@ -123,22 +123,22 @@ fn step_cuts(rows:usize,lanes:usize,lane_rows:usize,program_rows:usize,diagnosti
 }
 
 /// Batch rows `first..first + rows` of a step and their extend launches (a
-/// range of the plan's; empty for a decode plan): one prefill lane
-/// (`serving_capacity::prefill_lanes`). Each lane has its own expert exchange
-/// in flight while another lane's layer runs on the stream.
+/// range of the plan's; empty for a decode plan): one prefill lane today, and
+/// one prefill unit or a whole one-pass step once units run on the shared
+/// executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Lane { first:usize, rows:usize, launches:std::ops::Range<usize> }
+struct UnitTiles { first:usize, rows:usize, launches:std::ops::Range<usize> }
 
-/// The lanes of a step cut at `cuts` (each lane's first row after the first),
-/// with the launches of `plan` each holds (extend tiles never cross a cut).
-fn lanes_at(plan:&AttentionPlan,rows:usize,cuts:&[usize])->Vec<Lane> {
+/// The row pieces of a step cut at `cuts` (each piece's first row after the
+/// first), with the launches of `plan` each holds (extend tiles never cross a cut).
+fn unit_tiles(plan:&AttentionPlan,rows:usize,cuts:&[usize])->Vec<UnitTiles> {
     let launches=match plan { AttentionPlan::Extend{launches}=>launches.as_slice(), AttentionPlan::Decode{..}=>&[] };
     let mut bounds=vec![0]; bounds.extend_from_slice(cuts); bounds.push(rows);
     let mut at=0;
     bounds.windows(2).map(|w| {
         let start=at;
         while at<launches.len() && launches[at].row<w[1] { at+=1; }
-        Lane{first:w[0],rows:w[1]-w[0],launches:start..at}
+        UnitTiles{first:w[0],rows:w[1]-w[0],launches:start..at}
     }).collect()
 }
 
@@ -204,11 +204,12 @@ impl<'a> Drafter<'a> {
             Self::Dflash(d) => d.prefill_rows(start, rows, slot),
         }
     }
-    /// Taps the residual rows of one lane at `layer` (`rows`: the step's rows).
-    fn tap(&self, native: &Native<'a>, layer: usize, residual: CuteafdDeviceBuffer, lane: &Lane, rows: usize) -> Result<()> {
+    /// Taps batch rows `first..first + rows` of a `span`-row step at `layer` (`residual`: their view).
+    fn tap(&self, native: &Native<'a>, layer: usize, residual: CuteafdDeviceBuffer, first: usize, rows: usize,
+        span: usize) -> Result<()> {
         match self {
-            Self::Dspark(d) => d.tap(native, layer, residual, lane.first, lane.rows),
-            Self::Dflash(d) => d.tap(native, layer, residual, lane.first, lane.rows, rows),
+            Self::Dspark(d) => d.tap(native, layer, residual, first, rows),
+            Self::Dflash(d) => d.tap(native, layer, residual, first, rows, span),
         }
     }
 }
@@ -393,7 +394,7 @@ impl<'a> Execution<'a> {
             self.native.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.native.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             let plan=self.plan_attention(batch,rows,&cuts)?;
-            let lanes=lanes_at(&plan,rows,&cuts);
+            let lanes=unit_tiles(&plan,rows,&cuts);
             self.layers(embedded,batch,batch.pool_pages,caches,experts,&plan,&lanes,rows,last_layer,logits.clone(),
                 &mut diagnostics)
         })();
@@ -421,7 +422,7 @@ impl<'a> Execution<'a> {
     /// diagnostic, which dumps whole layers) is the layer's own order.
     #[allow(clippy::too_many_arguments)]
     fn layers(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, pool_pages:usize, caches:&[LayerCache<'a>],
-        experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, lanes:&[Lane], rows:usize, last_layer:usize,
+        experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, lanes:&[UnitTiles], rows:usize, last_layer:usize,
         logits:std::ops::Range<usize>, diagnostics:&mut Option<Diagnostics>) -> Result<Option<DeviceLogits>> {
         ensure!(diagnostics.is_none() || lanes.len()==1,MiniMaxError::Invalid("a diagnostic dumps one lane"));
         let views=lanes.iter().map(|lane|self.scratch.rows(lane.first,lane.rows)).collect::<Result<Vec<_>>>()?;
@@ -438,11 +439,7 @@ impl<'a> Execution<'a> {
                     for (lane,s) in lanes.iter().zip(&views) {
                         if let Some(d)=&mut dump { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
                         self.attention(layer,lane,pool_pages,batch,cache,plan,s,dump.as_mut())?;
-                        ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,lane.rows)?;
-                        if let Some(d)=&mut dump { d.tensor(&self.native,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
-                        ffn::dense(&self.native,&self.weights,s,layer,lane.rows,false)?;
-                        self.residual(s,lane.rows)?;
-                        if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane,rows)?; }
+                        self.dense_ffn(layer,lane.first,lane.rows,rows,s,dump.as_mut())?;
                     }
                     if let Some(mut d)=dump {
                         d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
@@ -451,7 +448,7 @@ impl<'a> Execution<'a> {
                 }
                 Visit::Collect{layer,lane} => {
                     let (view,s)=(lanes.get(lane).context("MiniMax lane")?,&views[lane]);
-                    self.routed_back(layer,lane,view,s,experts,rows)?;
+                    self.ffn_back(layer,lane,view.first,view.rows,rows,s,experts)?;
                     // A routed layer's dump ends once its last lane collected.
                     if lane+1==lanes.len() { if let Some(mut d)=routed.take() {
                         d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
@@ -466,7 +463,8 @@ impl<'a> Execution<'a> {
                         if let Some(d)=&mut routed { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
                     }
                     let cache=caches.get(layer).context("MiniMax layer cache")?;
-                    self.routed_front(layer,lane,view,pool_pages,batch,cache,plan,s,experts,routed.as_mut())?;
+                    self.attention(layer,view,pool_pages,batch,cache,plan,s,routed.as_mut())?;
+                    self.ffn_front(layer,lane,view.rows,s,experts,routed.as_mut())?;
                 }
             }
         }
@@ -477,13 +475,25 @@ impl<'a> Execution<'a> {
     fn residual(&self,s:&Rows<'_>,rows:usize)->Result<()> {
         self.native.launch("minimax_residual", &[s.get("residual")?,s.get("delta")?,s.get("residual")?], &[Scalar::I32(rows as i32)])
     }
-    /// A routed layer's first half on one lane: attention, the router and the
-    /// expert dispatch, then the shared expert while the experts run.
-    #[allow(clippy::too_many_arguments)]
-    fn routed_front(&self,layer:usize,index:usize,lane:&Lane,pool_pages:usize,batch:&BatchView,cache:&LayerCache<'a>,
-        plan:&AttentionPlan,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>,mut dump:Option<&mut StepDump>)->Result<()> {
-        let rows=lane.rows;
-        self.attention(layer,lane,pool_pages,batch,cache,plan,s,dump.as_deref_mut())?;
+    /// The drafter's tap of batch rows `first..first + rows` (`s` views them) of a `span`-row step.
+    fn tap(&self,layer:usize,s:&Rows<'_>,first:usize,rows:usize,span:usize)->Result<()> {
+        if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,first,rows,span)?; }
+        Ok(())
+    }
+    /// A dense layer's FFN on batch rows `first..first + rows` of a `span`-row step (`s` views
+    /// them): the post-attention norm, the dense MLP into the residual, and the drafter's tap.
+    fn dense_ffn(&self,layer:usize,first:usize,rows:usize,span:usize,s:&Rows<'_>,mut dump:Option<&mut StepDump>)->Result<()> {
+        ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,rows)?;
+        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.native,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
+        ffn::dense(&self.native,&self.weights,s,layer,rows,false)?;
+        self.residual(s,rows)?;
+        self.tap(layer,s,first,rows,span)
+    }
+    /// A routed layer's FFN front on `rows` rows (`s` views them), after their attention: the
+    /// post-attention norm, the router and the expert dispatch into slot `slot`, then the shared
+    /// expert while the experts run. The shared expert's output stays in the rows' `shared`.
+    fn ffn_front(&self,layer:usize,slot:usize,rows:usize,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>,
+        mut dump:Option<&mut StepDump>)->Result<()> {
         ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,rows)?;
         if let Some(d)=dump.as_deref_mut() { d.tensor(&self.native,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
         self.native.launch("minimax_router_scores", &[s.get("norm")?,
@@ -494,20 +504,20 @@ impl<'a> Execution<'a> {
             d.tensor(&self.native,"router_ids","i32",&[rows,4],s.get("route_ids")?)?;
             d.tensor(&self.native,"router_weights","f32",&[rows,4],s.get("route_weights")?)?;
         }
-        experts.dispatch(layer,index,rows,s.get("route_ids")?,s.get("route_weights")?,s.get("norm")?,&self.native)?;
+        experts.dispatch(layer,slot,rows,s.get("route_ids")?,s.get("route_weights")?,s.get("norm")?,&self.native)?;
         ffn::dense(&self.native,&self.weights,s,layer,rows,true)?;
         if let Some(d)=dump { d.tensor(&self.native,"shared","bf16",&[rows,6144],s.get("shared")?)?; }
         Ok(())
     }
-    /// Its second half: the lane's routed experts plus the shared expert into
-    /// the residual, and the drafter's tap.
-    fn routed_back(&self,layer:usize,index:usize,lane:&Lane,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>,
-        rows:usize)->Result<()> {
-        experts.collect(layer,index,lane.rows,s.get("routed")?,&self.native)?;
-        self.native.add_bf16(s.get("shared")?,s.get("routed")?,s.get("delta")?,lane.rows*6144)?;
-        self.residual(s,lane.rows)?;
-        if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane,rows)?; }
-        Ok(())
+    /// Its back on batch rows `first..first + rows` of a `span`-row step: slot `slot`'s routed
+    /// experts plus the shared expert into the residual, and the drafter's tap.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_back(&self,layer:usize,slot:usize,first:usize,rows:usize,span:usize,s:&Rows<'_>,
+        experts:&mut dyn ExpertExecutor<'a>)->Result<()> {
+        experts.collect(layer,slot,rows,s.get("routed")?,&self.native)?;
+        self.native.add_bf16(s.get("shared")?,s.get("routed")?,s.get("delta")?,rows*6144)?;
+        self.residual(s,rows)?;
+        self.tap(layer,s,first,rows,span)
     }
     /// Where a step's lanes after the first start (batch rows): a one-request
     /// prefill chunk runs in up to `lanes` lanes of `lane_rows` rows (at most
@@ -548,7 +558,7 @@ impl<'a> Execution<'a> {
     /// One lane's attention for a layer: its rows (`s` views them) and its
     /// extend launches.
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, layer:usize,lane:&Lane,pool_pages:usize,batch:&BatchView,cache:&LayerCache<'a>,
+    fn attention(&self, layer:usize,lane:&UnitTiles,pool_pages:usize,batch:&BatchView,cache:&LayerCache<'a>,
         plan:&AttentionPlan,s:&Rows<'_>,mut dump:Option<&mut StepDump>)->Result<()> {
         let rows=lane.rows;
         ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
@@ -683,7 +693,7 @@ mod tests {
             let cuts=step_cuts(rows,want,lane_rows,4096,false)?;
             let (launches,..)=extend_tables(batch,1024,1<<12,&cuts)?;
             let plan=AttentionPlan::Extend{launches:launches.clone()};
-            Ok(lanes_at(&plan,rows,&cuts).into_iter().map(|l|(l.first,l.rows,
+            Ok(unit_tiles(&plan,rows,&cuts).into_iter().map(|l|(l.first,l.rows,
                 launches[l.launches].iter().map(|t|(t.row,t.rows)).collect())).collect())
         };
         // Two lanes of 4096 rows: a full chunk keeps the serial tiles.
@@ -699,7 +709,7 @@ mod tests {
         assert!(step_cuts(4097,2,2048,4096,false).is_err(),"two lanes of 2048 rows hold 4096");
         assert!(step_cuts(8192,1,4096,4096,true).unwrap_err().to_string().contains("--prefill-lanes 1"));
         // Decode plans keep one lane.
-        assert_eq!(lanes_at(&AttentionPlan::Decode{stride:4},64,&[]),[Lane{first:0,rows:64,launches:0..0}]);
+        assert_eq!(unit_tiles(&AttentionPlan::Decode{stride:4},64,&[]),[UnitTiles{first:0,rows:64,launches:0..0}]);
         Ok(())
     }
 
