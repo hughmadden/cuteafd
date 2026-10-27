@@ -352,6 +352,7 @@ mod shared_storage_tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a GPU"]
     fn windowed_index_units_match_private_runs_behind_a_gated_stream() -> Result<()> {
+        eprintln!("index shared-storage gate: preparing weights and inputs");
         // Distinct unit widths/positions poison both host metadata and row planes.
         // Each unit has its own stage chain, just as in-flight prefill slots do.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
@@ -402,12 +403,46 @@ mod shared_storage_tests {
             }
             queries.push(units);
         }
+        // First-use module/handle setup may synchronize the CUDA context. Warm
+        // exact calls on these same streams before closing the gate, using the
+        // otherwise unused tail of each retained row plane for throwaway output.
+        eprintln!("index shared-storage gate: warming projection, selection and reindex");
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for i in 0..2 {
+            let slot = &mut slots[i];
+            slot.select_window(RowWindow::rows(32..32 + counts[i]))?;
+            let requests = [SelectionRequest { proposal: &proposals[i], positions: &tokens[i] }];
+            let warm_chain = chain::StageChain::new(&library)?;
+            warm_chain.set_device_order(true);
+            for layer in 0..2 {
+                runtime.block_on(warm_chain.handle().scope(async {
+                    slot.query.rebind(&weights.weights[3 + layer])?;
+                    // SAFETY: upstream queries and warm-up outputs are retained.
+                    unsafe { slot.query.enqueue_attention(&queries[layer][i].output()?)?; }
+                    ensure!(slot.query.poll_pending()?, "warm projection blocked");
+                    let query = slot.query.output()?;
+                    if layer == 0 {
+                        unsafe { slot.source.enqueue_selection(&query, &requests, None)?; }
+                        ensure!(slot.source.poll_pending()?, "warm selection blocked");
+                    } else {
+                        let source = slot.source.output()?;
+                        let follower = slot.reindex.as_mut().unwrap();
+                        unsafe { follower.enqueue_selection(&query, &requests, Some(&source))?; }
+                        ensure!(follower.poll_pending()?, "warm reindex blocked");
+                    }
+                    anyhow::Ok(())
+                }))?;
+            }
+            warm_chain.drain()?;
+            slot.restart()?;
+            slot.select_window(RowWindow::rows(i * 16..i * 16 + counts[i]))?;
+        }
         let chains = [chain::StageChain::new(&library)?, chain::StageChain::new(&library)?];
         for chain in &chains { chain.set_device_order(true); }
-        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         let gate_stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
         // SAFETY: live stream retained until all chains drain; gate release is RAII.
         let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&library, gate_stream.raw)? };
+        eprintln!("index shared-storage gate: closed");
         for chain in &chains {
             runtime.block_on(chain.handle().scope(async {
                 // SAFETY: mark an initial dependency behind the still-closed gate.
@@ -420,6 +455,7 @@ mod shared_storage_tests {
             // Both units project before either selection is submitted: selection
             // reads another stream's outputs, not the next unit's scratch.
             for i in 0..2 {
+                eprintln!("index shared-storage gate: enqueue projection layer={layer} unit={i}");
                 runtime.block_on(chains[i].handle().scope(async {
                     slots[i].query.rebind(&weights.weights[3 + layer])?;
                     // SAFETY: upstream queries are complete and retained.
@@ -429,6 +465,7 @@ mod shared_storage_tests {
                 }))?;
             }
             for i in 0..2 {
+                eprintln!("index shared-storage gate: enqueue selection layer={layer} unit={i}");
                 runtime.block_on(chains[i].handle().scope(async {
                     let slot = &mut slots[i];
                     let query = slot.query.output()?;
@@ -448,8 +485,10 @@ mod shared_storage_tests {
                 }))?;
             }
         }
+        eprintln!("index shared-storage gate: releasing");
         drop(gate);
         for chain in &chains { chain.drain()?; }
+        eprintln!("index shared-storage gate: drained; comparing private references");
         assert_ne!(slots[0].query.output()?.packed.ptr, slots[1].query.output()?.packed.ptr);
         assert_ne!(slots[0].source.output()?.selected.ptr, slots[1].source.output()?.selected.ptr);
         assert_ne!(slots[0].source.output()?.candidate_blocks().unwrap().ptr,
