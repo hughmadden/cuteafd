@@ -396,10 +396,6 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     Ok(reference)
 }
 
-/// The MiniMax golden's 64-hex source pins (families/minimax_m3/golden.py `source_pin`).
-const MINIMAX_SOURCE_DIGESTS: [&str; 7] = ["model_sha256", "golden_sha256", "shape_invariant_sha256",
-    "fidelity_windows_sha256", "transformers_sources_sha256", "vllm_sources_sha256", "cache_programs_sha256"];
-
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -456,13 +452,6 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                     "transformers_source_sha256", "compressed_tensors_source_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
                 && padding_valid
-        } else if manifest["family"] == "minimax_m3" {
-            // The independent decoder and harness, and the Transformers, vLLM and cache-program
-            // sources it follows, at the root's own revision.
-            manifest["root_checkpoint"]["id"] == "MiniMaxAI/MiniMax-M3.1-Flash"
-                && source["revision"] == manifest["root_checkpoint"]["revision"]
-                && ["transformers_revision", "vllm_revision"].iter().all(|key| hash(&source[key], 40))
-                && MINIMAX_SOURCE_DIGESTS.iter().all(|key| hash(&source[key], 64))
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -1237,59 +1226,6 @@ mod tests {
         assert_eq!(qualification_label(&paired, &manifest).unwrap(), "paired qualified");
         paired["shapes"]["decode"]["delta_difference"] = json!(0.01);
         assert!(qualification_label(&paired, &manifest).is_err());
-    }
-
-    #[test]
-    fn minimax_reference_pins_its_decoder_sources_at_the_root_revision() {
-        let revision = "5".repeat(40);
-        let root = "MiniMaxAI/MiniMax-M3.1-Flash";
-        let identity = json!({"checkpoint":root, "snapshot_revision":revision,
-            "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
-        let manifest = json!({"family":"minimax_m3", "set_sha256":"set", "vocab":200064,
-            "root_checkpoint":{"id":root, "revision":revision}});
-        let mut source = json!({"revision":revision, "transformers_revision":"6".repeat(40),
-            "vllm_revision":"7".repeat(40)});
-        for key in MINIMAX_SOURCE_DIGESTS { source[key] = json!("d".repeat(64)); }
-        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
-            "qualifies":true, "engine_parity":false, "set_sha256":"set", "nll":0.9, "scored_tokens":32768,
-            "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
-                "scored_tokens":32768, "nll":0.9, "golden_seal_sha256":"e".repeat(64), "full_seal_sha256":"f".repeat(64)},
-            "prefix_qualification":{"passed":true, "finite":true, "rows":512, "different_rows":[],
-                "argmax_disagreements":0, "set_sha256":"set", "snapshot_identity":identity, "fixed_rows":128,
-                "vocab":200064, "lengths":[576,640], "score_from":64, "logits_sha256":["1".repeat(64),"2".repeat(64)]},
-            "reference_provenance":{"snapshot_identity":identity, "source_pin":source, "tokenizers":"0.22.1",
-                "platform":{"gpu":"reference GPU"}, "mtp":false, "use_cache":false, "attention":"eager"}});
-        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
-        for key in ["revision", "transformers_revision", "vllm_revision"] {
-            for invalid in [Value::Null, json!("g".repeat(40)), json!("a".repeat(39)), json!("a".repeat(64))] {
-                let mut bad = qualification.clone();
-                bad["reference_provenance"]["source_pin"][key] = invalid;
-                assert!(qualification_label(&bad, &manifest).is_err(), "{key}");
-            }
-        }
-        for key in MINIMAX_SOURCE_DIGESTS {
-            for invalid in [Value::Null, json!("g".repeat(64)), json!("A".repeat(64)), json!("a".repeat(63))] {
-                let mut bad = qualification.clone();
-                bad["reference_provenance"]["source_pin"][key] = invalid;
-                assert!(qualification_label(&bad, &manifest).is_err(), "{key}");
-            }
-        }
-        let mut bad = qualification.clone();
-        bad["reference_provenance"]["source_pin"]["revision"] = json!("9".repeat(40));
-        assert!(qualification_label(&bad, &manifest).is_err(), "pinned sources must be the root revision's");
-        // A dense Transformers pin does not stand in for the decoder's own sources.
-        let mut dense = qualification.clone();
-        dense["reference_provenance"]["source_pin"] = json!({"revision":revision,
-            "modeling_sha256":"1".repeat(64), "source_tree_sha256":"2".repeat(64)});
-        assert!(qualification_label(&dense, &manifest).is_err());
-        // Another checkpoint published under the MiniMax family fails closed.
-        let other = "someone/MiniMax-M3.1-Flash";
-        let (mut changed, mut renamed) = (qualification.clone(), manifest.clone());
-        renamed["root_checkpoint"]["id"] = json!(other);
-        for path in ["/reference_provenance/snapshot_identity/checkpoint", "/prefix_qualification/snapshot_identity/checkpoint"] {
-            *changed.pointer_mut(path).unwrap() = json!(other);
-        }
-        assert!(qualification_label(&changed, &renamed).is_err());
     }
 
     #[test]

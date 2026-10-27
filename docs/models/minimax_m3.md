@@ -104,8 +104,9 @@ and, from TP3 up, no routed layers on the RTX.
   generated-role rows: top-1 >= 0.94, KL <= 0.03 nat and NLL at most 0.01
   above the reference. Rows outside the chat template (raw text with no turn
   marker, text after an end of turn) are near-degenerate and swing between any
-  two arithmetics, so the gate scores generated rows only. The bench fidelity
-  panel needs the set published as a dataset with a `PUBLICATIONS` row.
+  two arithmetics, so the gate scores generated rows only. This decoder is the
+  qualification gate's reference, not a published one: the bench fidelity panel
+  comes in a later step, with the release's own reference.
 
 ## Speculation
 
