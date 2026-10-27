@@ -68,14 +68,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         logit_rows: RuntimeSizing::head_rows(span, opts.full_prefill_logits, draft_rows), waves: lanes };
     sizing.validate(cfg)?;
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)
-        .context("MiniMax native admission requires its matching PROGRAMS.json")?)?;
+    let manifest = crate::plan::checkpoint::read_json(path).context("MiniMax native admission requires its matching PROGRAMS.json")?;
     let parent = path.parent().context("MiniMax PROGRAMS.json has no parent")?;
     let package_path = [parent.join("fp8/fp8-minimax-nvfp4a4/manifest.json"),
         parent.join("../lib/fp8/fp8-minimax-nvfp4a4/manifest.json"), parent.join("fp8-minimax-nvfp4a4/manifest.json")]
         .into_iter().find(|p| p.is_file());
-    let package: Option<serde_json::Value> = package_path.map(|p| -> anyhow::Result<_> {
-        Ok(serde_json::from_slice(&std::fs::read(p)?)?) }).transpose()?;
+    let package = package_path.map(|p| crate::plan::checkpoint::read_json(&p)).transpose()?;
     let catalog = input.expert_catalog()?;
     let edge = |component| *model.bytes.get(&component).unwrap_or(&0);
     let vision_source = edge(Component::Vision);
