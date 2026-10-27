@@ -277,21 +277,19 @@ def test_step5_metadata_build_scope_and_routed_extent(tmp_path, monkeypatch, kin
         aot.checkpoint_family.describe(config)
 
 
-def test_step5_bf16_input_sibling_is_allowed_in_wip(tmp_path):
-    config = config_file(tmp_path, 'step5', 'Step-5-Preview', 6)
-    output = dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5'})
-    assert 'WIP AOT scopes (step5)' in output
-    # Derived without the environment, and the derived value reaches the build (#516).
-    derived = dry_run(tmp_path, config)
-    assert 'FP8 BF16-input siblings: step5' in derived
+def test_optional_bf16_input_sibling_is_allowed_in_wip(tmp_path):
+    config = config_file(tmp_path, 'mimo_v2', 'MiMo-V2.6-Pro', 6)
+    output = dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'mimop'})
+    assert 'WIP AOT scopes (mimo_v2)' in output
+    assert 'FP8 BF16-input siblings: mimop' in output
     wip = (ROOT / 'wip.sh').read_text()
     pattern = wip.split("bf16_family_pattern='^(", 1)[1].split(')', 1)[0]
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     allowed = build.split('case "$bf16_family" in', 1)[1].split(') ;;', 1)[0].strip()
     assert set(pattern.split('|')) == set(allowed.split('|'))
-    assert 'step5' in allowed.split('|')
+    assert 'mimop' in allowed.split('|')
     with pytest.raises(AssertionError, match='must be a semicolon list'):
-        dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5;unknown'})
+        dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'mimop;unknown'})
 
 
 def test_step5_card_union_keeps_native_format_tp_counts():
@@ -303,10 +301,11 @@ def test_step5_card_union_keeps_native_format_tp_counts():
     assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
     assert set(scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {
         'step5:nvfp4=4', 'step5:fp8=6', 'step5:bf16=4', 'step5:bf16=6'}
-    # The FP8 card's BF16 rows need the BF16-input sibling; it is derived, not hand-set (#516).
-    assert scopes['CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES'] == 'step5'
-    nvfp4_only = aot.family_scopes(cards[:1], configs.__getitem__)
-    assert 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES' not in nvfp4_only
+    # FP8 uses K32; BF16 tail layers use their native weight package, not an FP8 sibling.
+    assert 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES' not in scopes
+    for card in cards:
+        single = aot.family_scopes([card], configs.__getitem__)
+        assert 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES' not in single
 
 
 def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):

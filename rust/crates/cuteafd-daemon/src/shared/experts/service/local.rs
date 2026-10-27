@@ -25,6 +25,7 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
         config.rdma_endpoints = model.endpoints.len();
         config.bf16_ingress = model.endpoints.iter().any(|endpoint|
             matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16
+                | cuteafd_core::SparkIngress::Native
                 | cuteafd_core::SparkIngress::Bf16Decode { .. }));
         config.model_admission = Some(model.clone());
     }

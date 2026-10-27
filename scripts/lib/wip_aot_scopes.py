@@ -58,7 +58,7 @@ def family_scopes(cards, config_reader):
     # coordinator scopes, and a Spark card's TP count is keyed to its own family
     # (FAMILY=COUNT, read by native/cmake/shared/{exl3,fp8_moe}.cmake), so one
     # card's geometry is never exported at another card's TP.
-    scopes, spark_scopes, roles, counts, bf16_input, env = set(), set(), set(), set(), set(), {}
+    scopes, spark_scopes, roles, counts, env = set(), set(), set(), set(), {}
     for card in cards:
         family = card.get('family')
         require_mapping(family)
@@ -109,13 +109,9 @@ def family_scopes(cards, config_reader):
                             (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
                 scopes.add(tag + (':nvfp4' if tag == 'qwen4' or nvfp4 else ':fp8'))
                 if fam == 'step5':
-                    # Both official quants retain a native BF16 routed layer.
+                    # Both official quants retain native BF16 routed layers.
                     # Format keys keep the min/max card TP layouts independent.
                     scopes.add('step5:bf16')
-                    # Its golden and serving paths send BF16 rows to the FP8 experts,
-                    # which need the BF16-input sibling package (#516).
-                    if not nvfp4:
-                        bf16_input.add('step5')
                     if count:
                         counts.update(f"{scope}={int(values.get('SPARK_TP', count))}" for scope in scopes)
                 if fam == 'glm5_flash' and nvfp4:
@@ -132,8 +128,6 @@ def family_scopes(cards, config_reader):
         card_scopes, scopes = scopes, scopes_before | scopes
         if count:
             spark_scopes |= {scope for scope in card_scopes if not scope.startswith('glmfdense:')}
-    if bf16_input:
-        env['CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES'] = ';'.join(sorted(bf16_input))
     env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
                CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts)),
                CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)),
