@@ -10,31 +10,33 @@
 //!
 //! # Contract (every component that serves prefill units)
 //!
-//! **Row planes.** A buffer is a [`RowPlane`] sized for the reserve
-//! (`wave_control::reserve_rows`) if any of these hold:
-//! - another hook of the same unit reads it (HC residual, FFN input, router
-//!   ids/weights/wire, shared result, window proposals, compressor
-//!   destinations, taps);
-//! - a stream other than the component's own reads it: a fork reader
-//!   (window/compressor/index reading the query output), a peer copy, a Spark
-//!   send, a TP2 input.
+//! **Row planes.** A buffer that another *hook* of the same unit reads is a
+//! [`RowPlane`] sized for the reserve (`wave_control::reserve_rows`): the
+//! HC residual and boundary state, the FFN input, router ids/weights/wire,
+//! the shared result, window proposals, compressor destinations and taps. A
+//! unit only touches its own rows (`RowWindow`), so in-flight units never
+//! share a byte of a row plane.
 //!
-//! Units are on different layers at once and their stage chains are separate.
-//! A cross-stream reader of unit A is therefore not ordered before unit B's
-//! next write on the shared stream (the publication events order only the
-//! same layer). A unit only touches its own rows (`RowWindow`), so in-flight
-//! units never share a byte of a row plane.
+//! **Scratch.** A buffer written and fully consumed inside one hook is
+//! scratch, sized once for the widest admitted unit (`PrefillDepth::unit_cap`)
+//! and shared by all slots. There are two kinds:
+//! - Plain scratch: written and read only on the component's own shared
+//!   stream (GEMM workspaces, split-K partials). That stream's order is the
+//!   guard.
+//! - Guarded scratch: also read by other streams inside the hook, the fork
+//!   readers (query outputs read by the window, compressor, index and sparse
+//!   attention), on this GPU or the other. Units sit on different layers and
+//!   their stage chains are separate, so unit B's next write on the shared
+//!   stream is not ordered after unit A's fork readers. Use a
+//!   [`ScratchGuard`]:
+//!   - the hook calls `release` after its last reader joined the unit's chain
+//!     (`chain::finish` merges forks into the head; the guard records the
+//!     joined head, on whichever GPU holds it);
+//!   - every writer calls `acquire` (a stream wait, cross-device if needed)
+//!     before writing.
 //!
-//! **Scratch.** A buffer written and fully consumed on the component's own
-//! stream inside one hook is scratch. Examples are GEMM workspaces, projection
-//! intermediates that the same stream consumes, and split-K partials. It is
-//! sized once for the widest admitted unit (`PrefillDepth::unit_cap`) and all
-//! units share it. Stream order is the guard: every unit issues on the
-//! component's one shared stream, so unit B's writer follows unit A's last
-//! reader. When a buffer would be scratch except for one cross-stream reader
-//! that cannot move, guard it with a [`ScratchGuard`] instead of a plane: the
-//! reader records `release` after its read, and the next writer waits on it
-//! in `acquire`.
+//!   A reader that runs in a *later* hook makes the buffer a row plane, not
+//!   guarded scratch.
 //!
 //! **Pinned staging.** A pinned buffer an async H2D reads is never rewritten
 //! until that copy has completed. Either it is per unit (a row plane in host
@@ -45,9 +47,10 @@
 //! **Who records, who waits.** Within a unit, stages order on the unit's stage
 //! chain (`chain::join`/`finish`). Across units, each slot records its
 //! per-layer publication (`chain::record_into`), and the next unit's same
-//! layer waits on it (`chain::depend`). Shared scratch needs nothing more,
-//! because of the stream order above. Row planes need nothing, because they
-//! are disjoint. A slot is drained before it is reused (`begin_unit`).
+//! layer waits on it (`chain::depend`). Plain scratch needs nothing more,
+//! because of the shared stream order. Guarded scratch adds its
+//! release/acquire. Row planes need nothing, because they are disjoint. A
+//! slot is drained before it is reused (`begin_unit`).
 //!
 //! **Host state.** Phase fields (begun, ready, pending, tokens, prepared
 //! descriptors) and per-layer weight bindings stay on the slot's own
@@ -137,41 +140,73 @@ impl RowPlane {
     }
 }
 
-/// A scratch buffer that one other stream reads: the reader records
-/// `release`, the next writer waits on it in `acquire` (no host wait).
+/// Unit-cap scratch that streams other than its writer read inside one hook
+/// (fork readers on this GPU or the other one), shared by every slot.
+///
+/// - The hook that used it calls [`Self::release`] after its last reader
+///   joined the unit's stage chain (`chain::finish` merges the forks into the
+///   head). That records the joined head: every reader, on either GPU.
+/// - The next writer, in any slot, calls [`Self::acquire`] on its stream
+///   before writing. That is a stream wait on the recorded event, cross-device
+///   when the head was on the other GPU.
+///
+/// There are no host waits. Outside a chain scope both are no-ops: host-ordered
+/// passes drain every stage.
 pub(crate) struct ScratchGuard<'a> {
     library: &'a cuteafd_ffi::NativeLibrary,
-    event: *mut std::ffi::c_void,
-    recorded: bool,
+    /// One ordering event per device a chain head may sit on.
+    events: Vec<(i32, *mut std::ffi::c_void)>,
+    /// The event holding the last release, if any.
+    recorded: std::cell::Cell<Option<usize>>,
 }
 
 impl<'a> ScratchGuard<'a> {
-    pub(crate) fn new(library: &'a cuteafd_ffi::NativeLibrary) -> Result<Self> {
-        Ok(Self { library, event: library.cuda_event_create_ordering()?, recorded: false })
+    pub(crate) fn new(library: &'a cuteafd_ffi::NativeLibrary, devices: &[i32]) -> Result<Self> {
+        ensure!(!devices.is_empty(), "scratch guard needs a device");
+        let previous = library.cuda_get_device()?;
+        let mut guard = Self { library, events: Vec::with_capacity(devices.len()), recorded: std::cell::Cell::new(None) };
+        for &device in devices {
+            let created = library.cuda_set_device(device).and_then(|()| library.cuda_event_create_ordering());
+            match created {
+                Ok(event) => guard.events.push((device, event)),
+                Err(error) => { let _ = library.cuda_set_device(previous); return Err(error); }
+            }
+        }
+        library.cuda_set_device(previous)?;
+        Ok(guard)
     }
+    /// Orders `writer` (a live stream on the current device) after the last
+    /// release.
     /// # Safety
-    /// `writer` is a live stream on the event's device.
+    /// `writer` is a live stream of the current device.
     pub(crate) unsafe fn acquire(&self, writer: *mut std::ffi::c_void) -> Result<()> {
-        if !self.recorded { return Ok(()); }
-        // SAFETY: caller contract; the event outlives this wait (owned here).
-        unsafe { self.library.cuda_stream_wait_event(writer, self.event) }
+        let Some(index) = self.recorded.get() else { return Ok(()) };
+        // SAFETY: caller contract; the event outlives the wait (owned here),
+        // and cross-device event waits are permitted.
+        unsafe { self.library.cuda_stream_wait_event(writer, self.events[index].1) }
     }
-    /// # Safety
-    /// `reader` is a live stream on the event's device whose queued work
-    /// includes the last read of the scratch.
-    pub(crate) unsafe fn release(&mut self, reader: *mut std::ffi::c_void) -> Result<()> {
-        // SAFETY: caller contract.
-        unsafe { self.library.cuda_event_record(self.event, reader)?; }
-        self.recorded = true;
+    /// Records the joined chain head: the scratch is free once it completes.
+    /// Call after the hook's last reader finished on the chain.
+    pub(crate) fn release(&self) -> Result<()> {
+        if !super::chain::active() { return Ok(()); }
+        let Some(device) = super::chain::head_device() else { return Ok(()) };
+        let index = self.events.iter().position(|&(d, _)| d == device)
+            .ok_or_else(|| anyhow::anyhow!("scratch guard has no event on chain head device {device}"))?;
+        // SAFETY: the event lives on the head's device (record_into contract).
+        if unsafe { super::chain::record_into(self.library, self.events[index].1)? } {
+            self.recorded.set(Some(index));
+        }
         Ok(())
     }
 }
 
 impl Drop for ScratchGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: owned; the owner drains its streams before dropping guards.
-        if let Err(error) = unsafe { self.library.cuda_event_destroy(self.event) } {
-            tracing::error!(%error, "destroying scratch guard event");
+        for &(_, event) in &self.events {
+            // SAFETY: owned; the owner drains its streams before dropping guards.
+            if let Err(error) = unsafe { self.library.cuda_event_destroy(event) } {
+                tracing::error!(%error, "destroying scratch guard event");
+            }
         }
     }
 }
