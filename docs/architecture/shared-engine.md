@@ -209,14 +209,40 @@ Reference ports:
 - Kimi (the first): `UnitHooks` at [kimi_k3/layers.rs:708](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/layers.rs#L708).
 - GLM 5.3: [glm5/engine.rs:2402](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L2402).
 - V4: [deepseek_v4/engine/prefill.rs:128](../../rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine/prefill.rs#L128).
-- V4.1 (async hooks, `run_prefill_units_async`): encoder units over layers
-  0..20, one target pass and Spark link per slot, at
+- V4.1 (async hooks, `run_prefill_units_async`): one target pass and Spark
+  link per slot, every hook in the slot's device-ordered stage chain, at
   [deepseek_v41/v41_target_pass/encoder_units.rs](../../rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_target_pass/encoder_units.rs)
-  and its two-RTX form in `distributed/encoder_units.rs`.
+  and its two-RTX form in `distributed/encoder_units.rs`. The model's causal
+  encoder/decoder (CED) stays family arithmetic: encoder layers 0–19 prefill
+  the prompt as the executor's units, and the decoder layers 20–39 replay the
+  last ≤128 rows once per prompt. The shared executor schedules both; there
+  is no private V4.1 prefill loop.
 - Step-5, Qwen4 and GLM Flash also implement it.
 
 The ordering, row-ownership and head rules are in
 [PLAN "Prefill contract"](../../PLAN.md#prefill-contract-tj-2026-10-23).
+
+### Never block the issuing thread
+
+The executor walks its steps on one thread, one hook at a time, so a hook that
+waits on the host for its own unit's work stalls every other unit. On a
+prefill or unit path, a wait for Spark replies (collect/land), a route sync, a
+shared-expert or mHC finish, or a stream sync must be a device-side wait
+(stream/event ordering: the stage chain,
+[shared/memory/chain.rs](../../rust/crates/cuteafd-daemon/src/shared/memory/chain.rs),
+`Waves::land`'s value wait) or happen once per unit at its end. It must never
+be a host spin, sleep or `cuda_stream_synchronize`; in a sequential walk a
+cooperative yield is no better, because nothing else is runnable.
+
+Why: in #815, 5326add93 made V4.1's 1-RTX collect spin on the host until the
+reply landed. That serialised units, and V4.1 prefill fell to about 0.5×, with
+the Sparks idle half the time. The fix was #817, then V4.1's units in
+device-ordered chains, linked across slots with `chain::record_into`/`depend`.
+
+How to spot it: a `PROFILE=transport-timing,expert-timing` run where, per
+Spark rank, CUDA compute is about equal to the GPU idle gaps between units,
+staging and post per wave are small (≈0.1 ms / ≈1 ms), and posted→all-replies
+is large (≈10 ms at 1024 rows).
 
 ### Waves and the 8192-row reserve
 
@@ -318,6 +344,12 @@ mapped alias, never `cudaMemcpyAsync` (the module doc, `:1-64`, explains why).
 On a transport error, the worker records a terminal health failure and
 releases every queued wait. Every consumer checks `healthy()` (`:125`) after
 its sampling sync.
+
+**Landing mode.** Ranks land in GPU memory (dma-buf) or pinned host memory,
+which the probe decides per link (`CUTEAFD_SPARK_INTAKE`). The #815 regression
+showed on both, so test any exchange change on both:
+`v41-flash-sim5090` (TP4, pinned) and the TP3 5090 shape (`v41-flash-min` at
+31.8 GiB, 1024-row units, dma-buf).
 
 Links are `SparkLink::new_waves(..., waves, wave_rows)`
 ([daemon/shared/spark_intake.rs:1474](../../rust/crates/cuteafd-daemon/src/shared/spark_intake.rs#L1474)).
@@ -465,7 +497,9 @@ These are the gates; the tiers and bars are in
    must pass 10/10: identical ids and row hashes with drafts on and off, with
    no tie tolerance.
 5. **One wip-cards pair.** One launch per arm, candidate against work/p0,
-   through `scripts/bench/wip-cards.py` ([docs/wip-cards.md](../wip-cards.md)):
+   through `scripts/bench/wip-cards.py` ([docs/wip-cards.md](../wip-cards.md)).
+   An exchange or prefill-scheduling change also runs the two landing-mode
+   cards: `v41-flash-sim5090` (pinned) and the TP3 5090 shape (dma-buf):
    - panels `baseline` and `spec_lossless_set`;
    - C1/C8/C16;
    - 8K and 64K prefill.
