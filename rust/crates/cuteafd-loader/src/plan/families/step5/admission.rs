@@ -164,11 +164,14 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 pub struct RuntimeInputs {
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
-    /// Span rows: one prefill call's rows, `waves` units in flight.
+    /// Span rows: every per-call plane's rows (`waves` units, or the reserve
+    /// of `waves` adaptive slots).
     pub rows: usize,
-    /// Prefill units in flight on the one Spark transport (PLAN "Prefill
-    /// contract"); each unit is `rows / waves` rows.
+    /// Admitted prefill slots on the one Spark transport (PLAN "Prefill
+    /// contract"): hop lanes, return slots and Spark owner units.
     pub waves: usize,
+    /// The admitted unit (#762); 0 takes `rows / waves` (a static span).
+    pub unit: usize,
     /// All-row prefill scoring was admitted at launch; otherwise the head holds
     /// only the decode/verify width (prefill needs its last row).
     pub full_prefill_logits: bool,
@@ -209,7 +212,10 @@ impl RuntimeInputs {
     }
 
     /// Rows one hook runs: attention, FFN scratch, peer partials and hops.
-    pub fn unit_rows(&self) -> usize { self.rows / self.waves.max(1) }
+    pub fn unit_rows(&self) -> usize { if self.unit > 0 { self.unit } else { self.rows / self.waves.max(1) } }
+
+    /// Whether the span is the reserve of adaptive slots (#762).
+    fn adaptive(&self) -> bool { self.unit_rows() * self.waves != self.rows }
 
     pub fn validate(&self, cfg: &Config) -> Result<()> {
         let ranks = self.inventory.gpus.len();
@@ -225,17 +231,23 @@ impl RuntimeInputs {
         ensure!(
             (1..=4096).contains(&self.unit_rows())
                 && (1..=4).contains(&self.waves)
-                && self.rows % self.waves == 0
+                && (self.adaptive() || self.rows % self.waves == 0)
                 && (self.waves == 1 || self.unit_rows() % 64 == 0)
                 && (1..=64).contains(&self.sequences)
                 && self.sequences <= self.unit_rows(),
             "Step-5 span rows, prefill waves or sequence slots"
         );
         use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        prefill_shape(self.inventory.spark_ranks, crate::plan::Family::prefill_limits(&super::STEP5), PrefillOverrides {
-            unit_rows: Some(self.unit_rows() as u64), waves: Some(self.waves as u64),
-            span_rows: Some(self.rows as u64),
-        })?;
+        if self.adaptive() {
+            // Four admitted slots of the unit: every depth's cut fits the reserve.
+            ensure!(self.rows as u64 == crate::serving_capacity::wave_control::reserve_rows(self.waves as u64,
+                self.unit_rows() as u64), "Step-5 adaptive span differs from its slots' reserve");
+        } else {
+            prefill_shape(self.inventory.spark_ranks, crate::plan::Family::prefill_limits(&super::STEP5), PrefillOverrides {
+                unit_rows: Some(self.unit_rows() as u64), waves: Some(self.waves as u64),
+                span_rows: Some(self.rows as u64), slots: None,
+            })?;
+        }
         ensure!(
             cfg.max_context == EXTENT && (FLOOR..=EXTENT).contains(&self.context),
             "Step-5 requires 1M compiled extent and at least 256K request context"
@@ -503,8 +515,9 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                     add(
                         Category::Transport,
                         "Step-5 Spark intake planes",
-                        crate::serving_capacity::prefill_return_bytes(inputs.waves as u64,
-                            inputs.unit_rows() as u64, inputs.inventory.spark_ranks as u64, 4096)
+                        // One reserve range per rank every admitted depth is cut from (#762).
+                        crate::serving_capacity::prefill_return_bytes(1, inputs.rows as u64,
+                            inputs.inventory.spark_ranks as u64, 4096)
                             .max(256 * inputs.inventory.spark_ranks as u64),
                     );
                     add(Category::Workspace, "Step-5 routed reply", (inputs.rows as u64 * 4096 * 2).max(256));
@@ -698,7 +711,7 @@ mod tests {
     fn inputs(ranks: usize) -> RuntimeInputs {
         RuntimeInputs {
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
-            full_prefill_logits: false, waves: 1,
+            full_prefill_logits: false, waves: 1, unit: 0,
             inventory: Inventory {
                 gpus: vec![
                     GpuBudget {

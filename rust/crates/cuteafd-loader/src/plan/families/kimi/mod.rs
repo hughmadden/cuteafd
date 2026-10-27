@@ -265,7 +265,7 @@ impl Family for KimiK3 {
         PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
             waves: 3, reference_ranks: 6, larger_topology_waves: 3,
             source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; K6/BF16 k3 versus legacy k2, no independent S/T",
-        }, ..Default::default() }
+        }, adaptive: true, ..Default::default() }
     }
     fn id(&self) -> &'static str { "kimi_k3" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }

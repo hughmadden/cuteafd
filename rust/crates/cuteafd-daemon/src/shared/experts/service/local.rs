@@ -580,7 +580,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 // independently of each connection's required reply order.
                 let finished = match holding[index].front().copied() {
                     Some(unit) if queues.ready(unit) => connections[index].finish_deferred(|view, mapped, emit| {
-                        let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
+                        let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?
+                            .with_pace(queues.pace(unit));
                         emit(ProtocolV2ExecutorResponseRef::Device(response))
                     }).and_then(|()| {
                         holding[index].pop_front();
@@ -736,13 +737,16 @@ fn execution_owner(owners: &cuteafd_transport::worker_selection::SparkExecutions
 struct HeldUnit { owner: usize, id: u64 }
 
 /// GPU publication follows owner FIFO; transport emission follows connection
-/// FIFO. A completed unit still retains its own I/O and admission credit.
+/// FIFO. A completed unit still retains its own I/O and admission credit, and
+/// its measured pace until its reply carries it.
 struct OwnerQueues {
     limits: Vec<usize>,
     retained: Vec<usize>,
     pending: Vec<std::collections::VecDeque<HeldUnit>>,
-    completed: std::collections::HashSet<HeldUnit>,
+    completed: std::collections::HashMap<HeldUnit, Option<crate::shared::experts::execution::timing::UnitPace>>,
     next_id: u64,
+    /// The prefill owner's index: only its units report a pace (#762).
+    prefill: usize,
 }
 impl OwnerQueues {
     fn new(owners: &cuteafd_transport::worker_selection::SparkExecutions) -> Self {
@@ -750,7 +754,8 @@ impl OwnerQueues {
         let capacity = limits.iter().sum();
         Self { retained: vec![0; limits.len()],
             pending: limits.iter().map(|&limit| std::collections::VecDeque::with_capacity(limit)).collect(),
-            limits, completed: std::collections::HashSet::with_capacity(capacity), next_id: 0 }
+            limits, completed: std::collections::HashMap::with_capacity(capacity), next_id: 0,
+            prefill: owners.decode.len() }
     }
     fn admit(&self, owner: usize) -> Result<()> {
         if self.retained[owner] >= self.limits[owner] {
@@ -766,23 +771,29 @@ impl OwnerQueues {
         self.pending[owner].push_back(unit);
         Ok(unit)
     }
-    fn ready(&self, unit: HeldUnit) -> bool { self.completed.contains(&unit) }
+    fn ready(&self, unit: HeldUnit) -> bool { self.completed.contains_key(&unit) }
+    /// A completed unit's pace for its reply header: prefill owner units only.
+    fn pace(&self, unit: HeldUnit) -> Option<(u32, u32)> {
+        self.completed.get(&unit).copied().flatten().filter(|_| unit.owner == self.prefill)
+            .map(|pace| (pace.busy_us, pace.idle_us))
+    }
     fn complete_ready(&mut self, owner: usize, execution: &mut Execution<'_, '_>) -> Result<bool> {
         let mut progressed = false;
         while !self.pending[owner].is_empty() && execution.unit_ready()? {
-            execution.complete()?;
-            self.publish_oldest(owner)?;
+            let pace = execution.complete()?;
+            self.publish_oldest(owner, pace)?;
             progressed = true;
         }
         Ok(progressed)
     }
-    fn publish_oldest(&mut self, owner: usize) -> Result<()> {
+    fn publish_oldest(&mut self, owner: usize,
+        pace: Option<crate::shared::experts::execution::timing::UnitPace>) -> Result<()> {
         let unit = self.pending[owner].pop_front().context("expert owner has no queued unit")?;
-        ensure!(self.completed.insert(unit), "expert unit published twice");
+        ensure!(self.completed.insert(unit, pace).is_none(), "expert unit published twice");
         Ok(())
     }
     fn release(&mut self, unit: HeldUnit) -> Result<()> {
-        ensure!(self.completed.remove(&unit), "expert I/O released before unit completion");
+        ensure!(self.completed.remove(&unit).is_some(), "expert I/O released before unit completion");
         self.retained[unit.owner] = self.retained[unit.owner].checked_sub(1)
             .context("expert unit credit underflow")?;
         Ok(())
@@ -907,7 +918,7 @@ impl<'w, 'a> Serve<'_, 'w, 'a> {
             let response = unsafe { execution.execute_mapped(&request, executor_id, self.exchange, mapped) }
                 .map_err(|error| ServeFailure { error, execution: true })?;
             if let Some(response) = response {
-                execution.synchronize().and_then(|()| execution.complete())
+                execution.synchronize().and_then(|()| execution.complete().map(|_| ()))
                     .map_err(|error| ServeFailure { error, execution: true })?;
                 emit(ProtocolV2ExecutorResponseRef::Device(response))?;
                 return Ok(Served { executed: request.rows() > 0 });
@@ -980,14 +991,14 @@ mod owner_tests {
         assert!(matches!(error.downcast_ref::<ExecutionProtocolError>(),
             Some(ExecutionProtocolError::Full { owner: 2, limit: 3 })));
         assert!(queues.release(units[0]).is_err());
-        queues.publish_oldest(2)?;
+        queues.publish_oldest(2, None)?;
         assert!(queues.ready(units[0]) && !queues.ready(units[1]));
         assert!(queues.admit(2).is_err(), "completion alone cannot recycle retained I/O");
         queues.release(units[0])?;
         let replacement = queues.record(2)?;
         assert_ne!(replacement, units[0]);
         for unit in [units[1], units[2], replacement] {
-            queues.publish_oldest(2)?;
+            queues.publish_oldest(2, None)?;
             assert!(queues.ready(unit));
             queues.release(unit)?;
         }
@@ -1026,10 +1037,25 @@ mod owner_tests {
         assert_eq!(queues.retained, [1, 1, 2]);
         assert!(queues.admit(admitted.decode.len()).is_err());
         for unit in units {
-            queues.publish_oldest(unit.owner)?;
+            queues.publish_oldest(unit.owner, None)?;
             queues.release(unit)?;
         }
         assert_eq!(queues.retained, [0; 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn only_prefill_owner_units_carry_their_pace_until_release() -> Result<()> {
+        use crate::shared::experts::execution::timing::UnitPace;
+        let mut queues = OwnerQueues::new(&owners());
+        let (decode, prefill) = (queues.record(0)?, queues.record(2)?);
+        queues.publish_oldest(0, Some(UnitPace { busy_us: 5, idle_us: 6 }))?;
+        queues.publish_oldest(2, Some(UnitPace { busy_us: 700, idle_us: 30 }))?;
+        assert_eq!(queues.pace(decode), None, "decode owners never report a pace");
+        assert_eq!(queues.pace(prefill), Some((700, 30)));
+        queues.release(prefill)?;
+        assert_eq!(queues.pace(prefill), None);
+        queues.release(decode)?;
         Ok(())
     }
 
@@ -1040,10 +1066,10 @@ mod owner_tests {
         assert!(queues.admit(0).is_err());
         assert!(queues.admit(1).is_ok() && queues.admit(2).is_ok());
         let second = queues.record(1)?;
-        queues.publish_oldest(1)?;
+        queues.publish_oldest(1, None)?;
         assert!(!queues.ready(first) && queues.ready(second));
         queues.release(second)?;
-        queues.publish_oldest(0)?;
+        queues.publish_oldest(0, None)?;
         queues.release(first)?;
         Ok(())
     }

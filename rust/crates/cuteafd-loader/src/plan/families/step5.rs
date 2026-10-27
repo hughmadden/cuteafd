@@ -347,10 +347,12 @@ impl Family for Step5 {
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
-        PrefillLimits { initial_unit_rows: Some(2048), estimate: PrefillEstimate::MeasuredWaves {
-            waves: 4, reference_ranks: 6, larger_topology_waves: 4,
-            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6412873210; fixed2048 k4 wins the four-arm prefill oracle with one owner",
-        }, ..Default::default() }
+        // A8 wire (#802): 3 x 2752 delivered most at 8K/64K (2720/2425 tok/s vs
+        // 4 x 2048 2483/2357, 2 x 4096 2347/2253); adaptive inside 4 x 4096 (#762).
+        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
+            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
+            source: "https://github.com/tpurtell/cuteafd/pull/802; A8 wire unit runs: 3x2752 best at 8K/64K",
+        }, adaptive: true, ..Default::default() }
     }
     fn id(&self) -> &'static str { "step5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }

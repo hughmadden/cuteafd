@@ -406,12 +406,16 @@ release_prefill_shape() {
     release_die "the $family deployment plan names no prefill unit rows"
   PREFILL_WAVES="$(jq -er '.prefill_waves | select(type == "number" and . > 0)' <<<"$deployment")" ||
     release_die "the $family deployment plan names no prefill waves"
+  # Admitted slots (#762): an adaptive executor chooses its depth within them;
+  # equal to the waves when static or pinned by PREFILL_WAVES.
+  PREFILL_SLOTS="$(jq -er '.prefill_slots | select(type == "number" and . > 0)' <<<"$deployment")" ||
+    release_die "the $family deployment plan names no prefill slots"
   if [[ "$mode" == units-span ]]; then
     PREFILL_SPAN_ROWS="$(jq -er '.prefill_span_rows | select(type == "number" and . > 0)' <<<"$deployment")" ||
       release_die "the $family deployment plan names no prefill span rows"
-    echo "Resolved prefill: PREFILL_ROWS=$PREFILL_ROWS PREFILL_WAVES=$PREFILL_WAVES PREFILL_SPAN_ROWS=$PREFILL_SPAN_ROWS"
+    echo "Resolved prefill: PREFILL_ROWS=$PREFILL_ROWS PREFILL_WAVES=$PREFILL_WAVES PREFILL_SLOTS=$PREFILL_SLOTS PREFILL_SPAN_ROWS=$PREFILL_SPAN_ROWS"
   elif [[ "$mode" == units ]]; then
-    echo "Resolved prefill: PREFILL_ROWS=$PREFILL_ROWS PREFILL_WAVES=$PREFILL_WAVES"
+    echo "Resolved prefill: PREFILL_ROWS=$PREFILL_ROWS PREFILL_WAVES=$PREFILL_WAVES PREFILL_SLOTS=$PREFILL_SLOTS"
   fi
 }
 # WIP bypasses artifact readiness, never the planner's deployment guards.
@@ -2812,7 +2816,8 @@ audio_encoder_hash=""
     esac
   fi
   case "$(family_prefill_mode "$family")" in
-    units|units-span) family_args+=(--prefill-rows "$PREFILL_ROWS" --prefill-waves "$PREFILL_WAVES") ;;
+    units|units-span) family_args+=(--prefill-rows "$PREFILL_ROWS" --prefill-waves "$PREFILL_WAVES"
+      --prefill-slots "$PREFILL_SLOTS") ;;
   esac
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")

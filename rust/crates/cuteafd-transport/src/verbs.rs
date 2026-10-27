@@ -1,7 +1,7 @@
 mod registered_response;
 mod send_queue;
 mod landing;
-pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe};
+pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe, LandingSlice};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod egress;
 pub use egress::StagingArena;
@@ -1598,7 +1598,7 @@ fn verbs_host_protocol_v2_persistent_client_chunk_pipeline(
             let submission = session
                 .as_mut()
                 .expect("persistent verbs-host session exists")
-                .post_request(&command.request, config);
+                .post_request(&command.request, config, None);
             match submission {
                 Ok(timing) => {
                     pending.push_back(VerbsHostProtocolV2PendingChunkRoundtrip::new(
@@ -1825,6 +1825,11 @@ struct VerbsHostProtocolV2PersistentClientSession {
     pinned_response_frame_recycle_rx: mpsc::Receiver<VerbsHostProtocolV2PinnedResponseFrame>,
     /// Response payloads land in device memory; only headers reach the host.
     gpu_landing: bool,
+    /// The landing is placed: each request posts its own receive at the
+    /// slice it names; none is posted ahead or reposted on completion.
+    placed_landing: bool,
+    /// Placed receives posted so far (their header slots follow the ring).
+    response_post_sequence: usize,
     /// Zero-copy egress: the shared request buffer and its region on this
     /// endpoint. Declared after `endpoint`, so the registration goes first.
     egress: Option<(Arc<egress::EgressBuffer>, u32)>,
@@ -2234,7 +2239,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
         endpoint.connect_with_flow_label(&ready.server_native_endpoint, flow_label)?;
         // Before any receive is posted, so every response slot scatters alike.
         let gpu_landing = landing.is_some_and(|landing| landing::attach(&endpoint, landing, addr));
-        for slot in 0..response_ring.depth {
+        // A placed landing posts each receive with its request (at that
+        // wave's slice); everything else keeps the whole ring posted.
+        let placed_landing = gpu_landing && landing.is_some_and(|landing| landing.placed);
+        for slot in 0..if placed_landing { 0 } else { response_ring.depth } {
             endpoint.post_recv_at(
                 response_ring.slot_offset(slot),
                 response_ring.slot_capacity_bytes,
@@ -2272,6 +2280,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
             pinned_response_frame_recycle_tx,
             pinned_response_frame_recycle_rx,
             gpu_landing,
+            placed_landing,
+            response_post_sequence: 0,
             egress: None,
         })
     }
@@ -2623,7 +2633,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let request_frame_bytes = request_wire_bytes;
         let mut post_recv_ms = 0.0_f64;
         let send_started = timing_enabled.then(Instant::now);
-        self.post_request(request, config)?;
+        self.post_request(request, config, None)?;
         let send_ms = elapsed_ms_optional(send_started);
         let mut poll_ms = 0.0_f64;
         let mut copy_recv_ms = 0.0_f64;

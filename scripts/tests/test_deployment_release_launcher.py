@@ -77,6 +77,10 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", waves,
                     "--prefill-span-rows", "4096" if waves == "1" else "8192"]
+            if "--prefill-waves" in before["command"] and entry["family"] != "deepseek_v41":
+                # Every units family gets its deployment's admitted slots back (#762).
+                position = before["command"].index("--prefill-waves") + 2
+                before["command"][position:position] = ["--prefill-slots", before["command"][position - 1]]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]

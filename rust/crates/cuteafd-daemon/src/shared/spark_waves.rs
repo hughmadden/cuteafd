@@ -64,6 +64,7 @@
 //!
 //! [`health`]: cuteafd_transport::health
 use crate::shared::experts::staging::RouteStaging;
+use crate::shared::wave_geometry::SlotGeometry;
 use crate::shared::memory::HostAllocation;
 use crate::shared::spark_intake::{copy_parallel, upload_offset, MAX_INTAKE_RANKS};
 use anyhow::{ensure, Context, Result};
@@ -179,9 +180,16 @@ pub(crate) struct Job {
     sequence: u32,
     slot: usize,
     rows: usize,
+    /// The prefill call it belongs to ([`Waves::begin_prefill`]): its ranks'
+    /// reported unit pace counts towards that call's [`PrefillPace`].
+    prefill: Option<u64>,
     source: Source,
-    /// The slot's use count the worker waits for before posting (planes free).
-    consumed: u32,
+    /// The use counts the worker waits for before posting (planes free): the
+    /// slot's own last use, or after a re-cut every slot's ([`SlotGeometry::fences`]).
+    consumed: Vec<(usize, u32)>,
+    /// Byte offset and extent of the wave's return slot in each rank's range
+    /// (also its placed GPU landing slice and its pinned staging region).
+    slice: (usize, usize),
     sent: Instant,
 }
 
@@ -212,6 +220,51 @@ pub(crate) struct LinkPace {
     round_trip_us: AtomicU32,
     idle_us: AtomicU32,
     waves: AtomicU32,
+    /// Per prefill call not yet taken, its Spark-reported unit pace (#762),
+    /// filled by the worker before it publishes each prefill wave's landing.
+    prefill: std::sync::Mutex<Vec<(u64, PrefillAccumulator)>>,
+}
+
+/// Sums each rank's reported unit busy/idle microseconds over one prefill
+/// call. A rank's first reported unit of the call is skipped: its idle gap is
+/// the call boundary, not the pipeline's turnaround.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct PrefillAccumulator {
+    rows: u64,
+    ranks: [(u64, u64); cuteafd_core::MAX_SPARK_WORLD],
+    seen: [bool; cuteafd_core::MAX_SPARK_WORLD],
+    world: usize,
+    /// When the call's latest wave landed on the host.
+    landed: Option<std::time::Instant>,
+}
+
+impl PrefillAccumulator {
+    /// One landed prefill wave of `rows` rows with each rank's reported pace.
+    /// Its rows count once every reporting rank has passed its first unit.
+    pub(crate) fn add(&mut self, rows: usize, pace: &[Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD]) {
+        self.landed = Some(std::time::Instant::now());
+        let mut counted = false;
+        for (rank, sample) in pace.iter().enumerate() {
+            let Some((busy, idle)) = *sample else { continue };
+            self.world = self.world.max(rank + 1);
+            if !std::mem::replace(&mut self.seen[rank], true) { continue; }
+            self.ranks[rank].0 += u64::from(busy);
+            self.ranks[rank].1 += u64::from(idle);
+            counted = true;
+        }
+        if counted { self.rows += rows as u64; }
+    }
+    /// The call's pace (empty when no rank reported past its first unit),
+    /// its wall time running from `start` to its last landing.
+    pub(crate) fn finish(&self, start: Option<std::time::Instant>)
+        -> cuteafd_loader::serving_capacity::wave_control::PrefillPace {
+        let wall_us = match (start, self.landed) {
+            (Some(start), Some(landed)) => landed.saturating_duration_since(start).as_micros() as u64,
+            _ => 0,
+        };
+        cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: self.rows,
+            ranks: self.ranks[..self.world].to_vec(), wall_us, reply_wait_us: None }
+    }
 }
 
 impl LinkPace {
@@ -228,40 +281,28 @@ impl LinkPace {
         if let Some(idle) = idle { Self::add(&self.idle_us, idle * 1e6, first); }
         self.waves.fetch_add(1, Ordering::Relaxed);
     }
+    fn prefill(&self) -> std::sync::MutexGuard<'_, Vec<(u64, PrefillAccumulator)>> {
+        // A panic while holding it leaves plain counters; keep using them.
+        self.prefill.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Adds one landed wave of prefill call `call`.
+    fn add_prefill(&self, call: u64, rows: usize, ranks: &RankPace) {
+        let mut calls = self.prefill();
+        let at = match calls.iter().position(|(id, _)| *id == call) {
+            Some(at) => at,
+            None => { calls.push((call, PrefillAccumulator::default())); calls.len() - 1 }
+        };
+        calls[at].1.add(rows, ranks);
+    }
+    /// Removes and returns call `call`'s sums.
+    fn take_prefill(&self, call: u64) -> PrefillAccumulator {
+        let mut calls = self.prefill();
+        calls.iter().position(|(id, _)| *id == call).map(|at| calls.remove(at).1).unwrap_or_default()
+    }
     /// (mean round trip, mean idle gap) in microseconds, and the waves seen.
     pub(crate) fn sample(&self) -> (u32, u32, u32) {
         (self.round_trip_us.load(Ordering::Relaxed), self.idle_us.load(Ordering::Relaxed),
             self.waves.load(Ordering::Relaxed))
-    }
-}
-
-/// Hysteresis over the idle signal at the prefill->decode boundary (#762):
-/// Sparks idle between units (gap above `IDLE_ADD` of a round trip) asks for
-/// one more wave; no gap (below `IDLE_DROP`) for `HOLD` boundaries in a row
-/// tries one fewer. One step at a time, within 1..=`max`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct WaveDepth { pub waves: usize, pub max: usize, quiet: u32 }
-
-impl WaveDepth {
-    pub(crate) const IDLE_ADD: f64 = 0.05;
-    pub(crate) const IDLE_DROP: f64 = 0.01;
-    pub(crate) const HOLD: u32 = 3;
-    pub(crate) fn new(waves: usize, max: usize) -> Self { Self { waves: waves.clamp(1, max.max(1)), max: max.max(1), quiet: 0 } }
-    /// One boundary's observation; returns the recommended wave count.
-    pub(crate) fn observe(&mut self, round_trip_us: u32, idle_us: u32) -> usize {
-        if round_trip_us == 0 { return self.waves; }
-        let share = f64::from(idle_us) / f64::from(round_trip_us);
-        if share > Self::IDLE_ADD {
-            self.quiet = 0;
-            self.waves = (self.waves + 1).min(self.max);
-        } else if share < Self::IDLE_DROP {
-            self.quiet += 1;
-            if self.quiet >= Self::HOLD {
-                self.quiet = 0;
-                self.waves = self.waves.saturating_sub(1).max(1);
-            }
-        } else { self.quiet = 0; }
-        self.waves
     }
 }
 
@@ -273,18 +314,24 @@ pub(crate) trait Backend {
     fn counter(&self, counter: Counter) -> u32;
     /// Builds (from its slot's staging) and posts the job's request.
     fn post(&mut self, job: Job) -> Result<Self::Wave>;
-    /// One progress pass over the oldest wave in `slot` of `rows` rows:
-    /// copies arrived rows of pinned ranks into the slot's landing staging.
-    /// `true` once every rank's rows are in place.
-    fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<bool>;
+    /// One progress pass over the oldest wave of `rows` rows, whose return
+    /// slot is `slice` (byte offset, extent) of each rank's range: copies
+    /// arrived rows of pinned ranks into that region of their landing staging.
+    /// `Some(per-rank unit pace)` once every rank's rows are in place.
+    fn poll(&mut self, wave: &mut Self::Wave, slice: (usize, usize), rows: usize) -> Result<Option<RankPace>>;
     /// Stores `landed = sequence` (also used to release waits after a failure).
     fn publish(&mut self, sequence: u32);
 }
+
+/// Per rank: the worker's reported (busy µs, idle µs) for one unit (#762).
+pub(crate) type RankPace = [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD];
 
 struct Inflight<W> {
     sequence: u32,
     slot: usize,
     rows: usize,
+    prefill: Option<u64>,
+    slice: (usize, usize),
     wave: W,
     posted: Instant,
     times: WaveTimes,
@@ -386,23 +433,26 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     Source::Staged { .. } => reached(backend.counter(Counter::Staged(job.slot)), job.sequence),
                     Source::Built(_) => true,
                 };
-                if staged && reached(backend.counter(Counter::Consumed(job.slot)), job.consumed) {
+                let free = job.consumed.iter().all(|&(slot, uses)| reached(backend.counter(Counter::Consumed(slot)), uses));
+                if staged && free {
                     let job = queued.pop_front().expect("front job");
-                    let (sequence, slot, rows) = (job.sequence, job.slot, job.rows);
+                    let (sequence, slot, rows, prefill, slice) = (job.sequence, job.slot, job.rows, job.prefill, job.slice);
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
                     Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
                     let started = Instant::now();
                     let idle = idle_from.take().map(|from| started.duration_since(from).as_secs_f64());
                     let wave = backend.post(job)?;
                     times.posted = started.elapsed().as_secs_f64();
-                    inflight.push_back(Inflight { sequence, slot, rows, wave, posted: Instant::now(), times, idle });
+                    inflight.push_back(Inflight { sequence, slot, rows, prefill, slice, wave, posted: Instant::now(), times, idle });
                     progressed = true;
                 }
             }
             // Progress the oldest wave.
             if let Some(front) = inflight.front_mut() {
-                if backend.poll(&mut front.wave, front.slot, front.rows)? {
+                if let Some(ranks) = backend.poll(&mut front.wave, front.slice, front.rows)? {
                     let mut done = inflight.pop_front().expect("front wave");
+                    // Before `landed`: the engine reads the call's pace after it.
+                    if let Some(call) = done.prefill { link.add_prefill(call, done.rows, &ranks); }
                     done.times.received = done.posted.elapsed().as_secs_f64();
                     Pace::add(&mut pace.round_trip, done.times.received);
                     last_landed = Instant::now();
@@ -484,11 +534,15 @@ fn release_until_closed<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Comm
 /// [`SparkExperts`] in serving; an in-process echo in the GPU exchange test.
 pub(crate) trait Transport: Send + 'static {
     type Wave: Send;
-    fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<Self::Wave>;
+    /// Posts `request`; `landing` places the payload of each GPU-landing rank
+    /// at that slice of its registered range.
+    fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[cuteafd_transport::LandingSlice]>)
+        -> Result<Self::Wave>;
     /// One non-blocking pass: arrived rows go to `sink(rank, first row,
-    /// payload)`; `Some(landed ranks)` once every rank's rows arrived.
+    /// payload)`; `Some((landed ranks, per-rank unit pace))` once every
+    /// rank's rows arrived.
     fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
-        -> Result<Option<u8>>;
+        -> Result<Option<(u8, RankPace)>>;
     /// The response deadline every wave is held to.
     fn timeout(&self) -> Duration;
     /// Gives up every outstanding wave (after a failure).
@@ -497,36 +551,38 @@ pub(crate) trait Transport: Send + 'static {
 
 impl Transport for SparkExperts {
     type Wave = (SparkExpertWave, WaveReceipt);
-    fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<Self::Wave> {
-        Ok((self.dispatch_wave(request)?, WaveReceipt::default()))
+    fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[cuteafd_transport::LandingSlice]>)
+        -> Result<Self::Wave> {
+        Ok((self.dispatch_wave_at(request, landing)?, WaveReceipt::default()))
     }
     fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
-        -> Result<Option<u8>> {
+        -> Result<Option<(u8, RankPace)>> {
         let (wave, receipt) = wave;
         let done = self.poll_wave(wave, receipt, |rank, first, payload| sink(rank, first, payload.as_ref()))?;
-        Ok(done.then_some(receipt.landed))
+        Ok(done.then_some((receipt.landed, receipt.pace)))
     }
     fn timeout(&self) -> Duration { SparkExperts::timeout(self) }
     fn abandon(&mut self) { self.abandon_waves("Spark exchange failed with waves in flight"); }
 }
 
-/// One rank's landing destination in a slot: device plane, and the pinned
-/// staging its rows arrive in when the rank does not land in device memory.
-#[derive(Clone, Copy)]
-struct Plane { host: usize, bytes: usize }
-
-/// The worker's backend over a [`Transport`]: the slots' request staging
-/// and landing staging, and the control counters.
+/// The worker's backend over a [`Transport`]: the slots' request staging,
+/// the pinned landing staging and the control counters.
 struct Native<T> {
     transport: T,
     arenas: Vec<StagingArena>,
     words: Words,
-    /// Per slot, per rank.
-    planes: Vec<Vec<Plane>>,
+    /// Per rank: the pinned range its rows arrive in when the rank does not
+    /// land in device memory (0 when it does), `range_bytes` long; a wave's
+    /// rows go to its slice of it.
+    hosts: Vec<usize>,
+    range_bytes: usize,
     ranks: usize,
     row_bytes: usize,
     /// Bit r: rank r lands in device memory; others arrive pinned.
     landing: u8,
+    /// Whether the GPU-landing ranks' ranges are placed (each wave's request
+    /// names its slice); false only for legacy rotating landings.
+    placed: bool,
 }
 
 impl<T: Transport> Backend for Native<T> {
@@ -550,35 +606,38 @@ impl<T: Transport> Backend for Native<T> {
                 build(routes, wire)?
             }
         };
-        self.transport.dispatch(&request)
+        let slices = (self.placed && self.landing != 0).then(|| vec![cuteafd_transport::LandingSlice {
+            offset: job.slice.0, bytes: job.slice.1 }; self.ranks]);
+        self.transport.dispatch(&request, slices.as_deref())
     }
 
-    fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<bool> {
-        let (planes, ranks, row_bytes) = (&self.planes[slot], self.ranks, self.row_bytes);
+    fn poll(&mut self, wave: &mut Self::Wave, slice: (usize, usize), rows: usize) -> Result<Option<RankPace>> {
+        let (hosts, ranks, row_bytes, range_bytes) = (&self.hosts, self.ranks, self.row_bytes, self.range_bytes);
         let plane_bytes = rows * row_bytes;
         let landing = self.landing;
+        ensure!(plane_bytes <= slice.1 && slice.0 + slice.1 <= range_bytes, "wave of {rows} rows exceeds its return slot");
         let done = self.transport.poll(wave, &mut |rank, first, payload| {
-            let plane = planes.get(rank).copied().context("rank outside the intake planes")?;
-            ensure!(plane.host != 0 && landing & (1 << rank) == 0,
+            let host = hosts.get(rank).copied().context("rank outside the intake planes")?;
+            ensure!(host != 0 && landing & (1 << rank) == 0,
                 "rank {rank} arrived in host memory but its link lands it in device memory");
-            ensure!(plane_bytes <= plane.bytes, "wave of {rows} rows exceeds its return slot");
             let bytes = payload.len();
-            let offset = upload_offset(ranks, rank, first, row_bytes, bytes, plane_bytes)?;
-            // SAFETY: the slot's landing staging holds `plane.bytes` for this
-            // rank (checked above); the engine stream reads it only after this
-            // wave's `landed`, and the slot's next wave is posted only after
-            // that read (`consumed`), so nothing else touches it now.
-            let target = unsafe { std::slice::from_raw_parts_mut((plane.host + offset) as *mut u8, bytes) };
+            let offset = slice.0 + upload_offset(ranks, rank, first, row_bytes, bytes, plane_bytes)?;
+            // SAFETY: the rank's pinned range holds `range_bytes` and this
+            // region lies inside the wave's slice of it (checked above); the
+            // engine stream reads it only after this wave's `landed`, and the
+            // next wave whose slice overlaps it is posted only after that read
+            // (`consumed`), so nothing else touches it now.
+            let target = unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, bytes) };
             copy_parallel(target, payload);
             Ok(())
         })?;
         match done {
-            Some(landed) => {
+            Some((landed, pace)) => {
                 ensure!(landed == self.landing,
                     "ranks {landed:#b} landed in device memory; the link expects {:#b}", self.landing);
-                Ok(true)
+                Ok(Some(pace))
             }
-            None => Ok(false),
+            None => Ok(None),
         }
     }
 
@@ -592,18 +651,31 @@ impl<T: Transport> Backend for Native<T> {
     }
 }
 
-/// What a link hands its exchange: the intake geometry the worker lands in.
+/// What a link hands its exchange: each rank's reserve range and the
+/// admitted/current cut of it ([`SlotGeometry`]) the worker lands in.
 pub(crate) struct Intake {
     pub ranks: usize,
-    pub rows: usize,
     pub row_bytes: usize,
-    pub waves: usize,
-    /// Per slot: rank planes in rank order.
-    pub planes: Vec<Vec<CuteafdDeviceBuffer>>,
+    /// Per rank: the device range every return slot is a slice of.
+    pub ranges: Vec<CuteafdDeviceBuffer>,
+    pub geometry: SlotGeometry,
     /// Bit r: rank r lands in device memory.
     pub landing: u8,
-    /// The slot the transport's next wave lands in (its landing rotation).
+    /// The GPU-landing ranks' ranges are placed: each request names its slice
+    /// ([`cuteafd_transport::DeviceLanding::placed`]). False keeps a legacy
+    /// rotating landing, which forbids re-cutting.
+    pub placed: bool,
+    /// The slot the transport's next wave lands in (a rotating landing's phase).
     pub next_slot: usize,
+}
+
+impl Intake {
+    /// Rank planes of `slot` under the current cut, in rank order.
+    pub(crate) fn slot_planes(&self, slot: usize) -> Vec<CuteafdDeviceBuffer> {
+        let (offset, bytes) = self.geometry.slice(slot, self.row_bytes);
+        self.ranges.iter().map(|range| CuteafdDeviceBuffer { ptr: (range.ptr as usize + offset) as *mut c_void,
+            bytes, ..*range }).collect()
+    }
 }
 
 /// Runs the compact reducer once over slot 0's planes on a scratch stream
@@ -611,7 +683,7 @@ pub(crate) struct Intake {
 /// queues a reduce behind an exchange wait.
 fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
     let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-    for (pointer, plane) in pointers.iter_mut().zip(&intake.planes[0]) { *pointer = plane.ptr.cast(); }
+    for (pointer, plane) in pointers.iter_mut().zip(&intake.slot_planes(0)) { *pointer = plane.ptr.cast(); }
     let output = crate::shared::memory::DeviceAllocation::new(library, intake.row_bytes.max(256))?;
     let stream = crate::shared::spark_intake::WarmStream::new(library)?;
     // SAFETY: slot 0's planes and the output hold one row; the stream is
@@ -635,14 +707,21 @@ pub(crate) struct Waves<'a> {
     arenas: Vec<StagingArena>,
     /// Per slot: the request arena's device alias (mapped pinned memory).
     arena_alias: Vec<usize>,
-    /// Per slot: owns the pinned landing staging of the ranks that arrive in
-    /// host memory (the worker writes it; `landing_alias` reads it).
-    _landing_staging: Vec<Option<HostAllocation<'a>>>,
-    /// Per slot: the staging's device alias (mapped pinned memory), read by
-    /// SM copies behind the landing wait.
-    landing_alias: Vec<Option<usize>>,
+    /// Owns the pinned landing staging of the ranks that arrive in host
+    /// memory: one reserve range per rank, back to back (the worker writes a
+    /// wave's slice of it; `landing_alias` reads it).
+    _landing_staging: Option<HostAllocation<'a>>,
+    /// The staging's device alias (mapped pinned memory), read by SM copies
+    /// behind the landing wait.
+    landing_alias: Option<usize>,
     landing: u8,
-    planes: Vec<Vec<CuteafdDeviceBuffer>>,
+    placed: bool,
+    /// Per rank: the reserve range return slots are cut from.
+    ranges: Vec<CuteafdDeviceBuffer>,
+    geometry: SlotGeometry,
+    /// The sequence at the last re-cut: a staging arena is reused only after
+    /// both its slot's previous wave and every wave before the re-cut landed.
+    cut_at: u32,
     /// Per slot: the layout of its last staged wave (route bytes for probes).
     layouts: Vec<Option<RouteStaging>>,
     /// Per slot: landed and not yet marked consumed.
@@ -651,16 +730,34 @@ pub(crate) struct Waves<'a> {
     /// wave once `consumed[slot]` reaches this).
     uses: Vec<u32>,
     ranks: usize,
-    rows: usize,
     row_bytes: usize,
-    waves: usize,
     next_slot: usize,
     sequence: u32,
-    outstanding: VecDeque<(u32, usize)>,
+    /// Per outstanding wave: sequence, slot and the prefill call it belongs to.
+    outstanding: VecDeque<(u32, usize, Option<u64>)>,
     /// The workers' installed grouping, fixed at bootstrap.
     grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
+    /// The prefill call waves sent now belong to ([`Self::begin_prefill`]).
+    prefill: Option<u64>,
+    /// Prefill calls whose pace is not yet taken, oldest first.
+    calls: VecDeque<PendingCall>,
+    /// When the last taken prefill call's last wave landed.
+    last_landed: Option<Instant>,
+    /// Reply-wait timing events (start, end) free for reuse, on `event_device`.
+    free_events: Vec<(*mut c_void, *mut c_void)>,
+    event_device: Option<i32>,
     /// The worker's always-on round-trip and Spark idle means (#762).
     pace: std::sync::Arc<LinkPace>,
+}
+
+/// One prefill call until its pace is taken (#762).
+struct PendingCall {
+    id: u64,
+    began: Instant,
+    /// The call's last wave, once it stopped sending.
+    last: Option<u32>,
+    /// Per landed wave: timing events around the consuming stream's wait.
+    waits: Vec<(*mut c_void, *mut c_void)>,
 }
 
 impl<'a> Waves<'a> {
@@ -670,27 +767,24 @@ impl<'a> Waves<'a> {
         grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
         arenas: Vec<StagingArena>, timing: bool) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        let waves = intake.waves;
-        ensure!(arenas.len() == waves && intake.planes.len() == waves, "one staging arena and plane set per slot");
-        ensure!(intake.planes.iter().all(|planes| planes.len() == intake.ranks), "one plane per rank");
-        let control = HostAllocation::new(library, Counter::words(waves) * LINE)?;
-        let words = Words { base: control.buffer.ptr as usize, slots: waves };
-        let plane_bytes = intake.rows * intake.row_bytes;
+        let slots = intake.geometry.slots();
+        let range_bytes = intake.geometry.reserve_rows() * intake.row_bytes;
+        ensure!(arenas.len() == slots, "one staging arena per admitted slot");
+        ensure!(intake.ranges.len() == intake.ranks && intake.ranges.iter().all(|range| range.bytes >= range_bytes),
+            "one reserve range of {range_bytes} bytes per rank");
+        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
+        let words = Words { base: control.buffer.ptr as usize, slots };
         let all = if intake.ranks == 8 { u8::MAX } else { (1u8 << intake.ranks) - 1 };
         let pinned = all & !intake.landing;
-        let landing_staging = (0..waves).map(|_| (pinned != 0)
-            .then(|| HostAllocation::new(library, intake.ranks * plane_bytes)).transpose())
-            .collect::<Result<Vec<_>>>()?;
-        let planes = intake.planes.iter().zip(&landing_staging).map(|(planes, staging)| planes.iter().enumerate()
-            .map(|(rank, _)| Plane { bytes: plane_bytes,
-                host: staging.as_ref().filter(|_| pinned & (1 << rank) != 0)
-                    .map_or(0, |staging| staging.buffer.ptr as usize + rank * plane_bytes) })
-            .collect()).collect();
+        let landing_staging = (pinned != 0).then(|| HostAllocation::new(library, intake.ranks * range_bytes))
+            .transpose()?;
+        let hosts = (0..intake.ranks).map(|rank| landing_staging.as_ref().filter(|_| pinned & (1 << rank) != 0)
+            .map_or(0, |staging| staging.buffer.ptr as usize + rank * range_bytes)).collect();
         // Pinned ranks reach the planes by an SM copy on the consuming stream,
         // which reads the mapped staging when it runs, after the wait.
-        let landing_alias = landing_staging.iter().map(|staging| staging.as_ref()
+        let landing_alias = landing_staging.as_ref()
             .map(|staging| library.cuda_host_buffer_device_alias(staging.buffer).map(|alias| alias.ptr as usize))
-            .transpose()).collect::<Result<Vec<_>>>()?;
+            .transpose()?;
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
         // The exchange's own kernels load now, with nothing pending: a lazily
@@ -699,9 +793,11 @@ impl<'a> Waves<'a> {
         library.peer_exchange_initialize()?;
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
-        let mut native = Native { transport, arenas: arenas.clone(), words, planes, ranks: intake.ranks,
-            row_bytes: intake.row_bytes, landing: intake.landing };
-        tracing::info!(waves, ranks = intake.ranks, landing = format!("{:#b}", intake.landing),
+        let mut native = Native { transport, arenas: arenas.clone(), words, hosts, range_bytes, ranks: intake.ranks,
+            row_bytes: intake.row_bytes, landing: intake.landing, placed: intake.placed };
+        let cut = intake.geometry.cut();
+        tracing::info!(slots, waves = cut.waves, rows = cut.rows, reserve_rows = intake.geometry.reserve_rows(),
+            ranks = intake.ranks, landing = format!("{:#b}", intake.landing), placed = intake.placed,
             staging_bytes = arenas.first().map_or(0, StagingArena::bytes), "Spark exchange worker started");
         let (jobs, inbox) = mpsc::channel();
         let pace = std::sync::Arc::new(LinkPace::default());
@@ -722,9 +818,48 @@ impl<'a> Waves<'a> {
             (Box::new(native.transport) as Box<dyn std::any::Any + Send>, result)
         })?;
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, _landing_staging: landing_staging, landing_alias,
-            landing: intake.landing, planes: intake.planes, layouts: vec![None; waves], unread: vec![false; waves],
-            uses: vec![0; waves], ranks: intake.ranks, rows: intake.rows, row_bytes: intake.row_bytes, waves,
-            next_slot: intake.next_slot % waves, sequence: 0, outstanding: VecDeque::new(), grouping, pace })
+            landing: intake.landing, placed: intake.placed, ranges: intake.ranges, layouts: vec![None; slots],
+            unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
+            next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, cut_at: 0, sequence: 0,
+            outstanding: VecDeque::new(), grouping, pace,
+            prefill: None, calls: VecDeque::new(), last_landed: None, free_events: Vec::new(), event_device: None })
+    }
+
+    /// Re-cuts the reserve into `waves` return slots of `rows` rows for the
+    /// next waves (#762): offsets change, nothing is allocated, registered
+    /// or reconnected. Legal only at rest: no wave outstanding and every
+    /// landed wave consumed (the decode→prefill boundary). Slot rotation
+    /// restarts at 0. A legacy rotating GPU landing cannot be re-cut.
+    ///
+    /// Ordering: the first wave into each new slot waits (on the worker) for
+    /// every old slot's last consumed count, so no reply overwrites planes a
+    /// queued reduce still reads; a request staging arena is rewritten only
+    /// after every wave sent before the re-cut landed (the NIC no longer
+    /// reads any arena), as well as its own slot's previous wave.
+    pub(crate) fn set_geometry(&mut self, waves: usize, rows: usize) -> Result<()> {
+        ensure!(self.outstanding.is_empty() && self.unread.iter().all(|unread| !unread),
+            "the Spark exchange re-cuts its return slots only at rest");
+        let cut = self.geometry.cut();
+        if cut.waves == waves && cut.rows == rows { return Ok(()); }
+        ensure!(self.placed || self.landing == 0,
+            "a rotating GPU landing fixes the wave geometry; re-cutting needs a placed landing");
+        self.geometry.set(waves, rows)?;
+        self.next_slot = 0;
+        self.cut_at = self.sequence;
+        tracing::debug!(waves, rows, "Spark exchange re-cut its return slots");
+        Ok(())
+    }
+
+    /// The current cut: return slots in flight and rows per slot.
+    pub(crate) fn geometry(&self) -> crate::shared::wave_geometry::Cut { self.geometry.cut() }
+    /// Admitted return slots and unit rows (the bounds of [`Self::set_geometry`]).
+    pub(crate) fn admitted(&self) -> (usize, usize) { (self.geometry.slots(), self.geometry.max_rows()) }
+
+    /// Device planes of `slot` under the current cut, in rank order.
+    fn slot_planes(&self, slot: usize) -> impl Iterator<Item = CuteafdDeviceBuffer> + '_ {
+        let (offset, bytes) = self.geometry.slice(slot, self.row_bytes);
+        self.ranges.iter().map(move |range| CuteafdDeviceBuffer {
+            ptr: (range.ptr as usize + offset) as *mut c_void, bytes, ..*range })
     }
 
     /// The workers' installed expert grouping (from the bootstrap).
@@ -737,8 +872,9 @@ impl<'a> Waves<'a> {
 
     fn submit(&mut self, rows: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
         [CuteafdDeviceBuffer; 3])>) -> Result<WaveTicket> {
-        ensure!(self.outstanding.len() < self.waves, WaveError::Admission(self.outstanding.len()));
-        ensure!(rows > 0 && rows <= self.rows, WaveError::Rows { rows, capacity: self.rows });
+        let cut = self.geometry.cut();
+        ensure!(self.outstanding.len() < cut.waves, WaveError::Admission(self.outstanding.len()));
+        ensure!(rows > 0 && rows <= cut.rows, WaveError::Rows { rows, capacity: cut.rows });
         healthy()?;
         let slot = self.next_slot;
         ensure!(!self.unread[slot], WaveError::Unconsumed(slot));
@@ -769,8 +905,11 @@ impl<'a> Waves<'a> {
                 Ok(((alias + offsets[i]) as *mut c_void, sources[i].ptr.cast_const(), sizes[i] as u64))
             }).collect::<Result<_>>()?;
             unsafe {
-                self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed),
-                    sequence.wrapping_sub(self.waves as u32))?;
+                // After a re-cut, also every wave sent before it (which may
+                // have used this arena under another slot numbering).
+                let previous = sequence.wrapping_sub(cut.waves as u32);
+                let reuse = if reached(previous, self.cut_at) { previous } else { self.cut_at };
+                self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), reuse)?;
                 self.library.sm_copy_regions(&regions, stream)?;
                 self.library.cuda_stream_write_value32(stream, self.words.ptr(Counter::Staged(slot)), sequence)?;
             }
@@ -779,12 +918,14 @@ impl<'a> Waves<'a> {
             self.layouts[slot] = None;
         }
         cuteafd_transport::wait_policy::note_active();
-        let job = Job { sequence, slot, rows, source, consumed: self.uses[slot], sent: Instant::now() };
+        let consumed = self.geometry.fences(slot, &self.uses);
+        let slice = self.geometry.slice(slot, self.row_bytes);
+        let job = Job { sequence, slot, rows, prefill: self.prefill, source, consumed, slice, sent: Instant::now() };
         self.jobs.as_ref().context("Spark exchange stopped")?.send(Command::Wave(job))
             .map_err(|_| WaveError::Lost(sequence))?;
         self.sequence = sequence;
-        self.outstanding.push_back((sequence, slot));
-        self.next_slot = (slot + 1) % self.waves;
+        self.outstanding.push_back((sequence, slot, self.prefill));
+        self.next_slot = (slot + 1) % cut.waves;
         Ok(WaveTicket { sequence, slot, rows })
     }
 
@@ -814,17 +955,33 @@ impl<'a> Waves<'a> {
     /// waits on the host. Mark the planes read with [`Self::consumed`] after
     /// the reduce, or reduce with [`Self::reduce`].
     pub(crate) fn land(&mut self, ticket: WaveTicket, stream: *mut c_void) -> Result<()> {
-        let (expected, slot) = self.outstanding.pop_front().ok_or(WaveError::Lost(ticket.sequence))?;
+        let (expected, slot, call) = self.outstanding.pop_front().ok_or(WaveError::Lost(ticket.sequence))?;
         ensure!(expected == ticket.sequence && slot == ticket.slot,
             WaveError::Order { expected, found: ticket.sequence });
-        // SAFETY: as `submit`'s waits.
-        unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)? };
-        ensure!(ticket.rows <= self.rows, "Spark wave of {} rows lands past its {}-row planes", ticket.rows, self.rows);
-        if let Some(alias) = self.landing_alias[slot] {
-            let pinned: Vec<cuteafd_ffi::peer_exchange::PeerPlane> = self.planes[slot].iter().enumerate()
+        // A prefill wave times the consuming stream's wait on its reply (#762).
+        let timed = match call { Some(call) => Some((call, self.wait_events()?)), None => None };
+        // SAFETY: as `submit`'s waits; the events are live events of the
+        // current device (the stream's), retained until queried complete.
+        unsafe {
+            if let Some((_, (start, _))) = timed { self.library.cuda_event_record(start, stream)?; }
+            self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)?;
+            if let Some((_, (_, end))) = timed { self.library.cuda_event_record(end, stream)?; }
+        }
+        if let Some((call, events)) = timed {
+            match self.calls.iter_mut().find(|pending| pending.id == call) {
+                Some(pending) => pending.waits.push(events),
+                None => self.free_events.push(events),
+            }
+        }
+        let cut = self.geometry.cut();
+        ensure!(ticket.rows <= cut.rows, "Spark wave of {} rows lands past its {}-row planes", ticket.rows, cut.rows);
+        if let Some(alias) = self.landing_alias {
+            let range_bytes = self.geometry.reserve_rows() * self.row_bytes;
+            let (offset, _) = self.geometry.slice(slot, self.row_bytes);
+            let pinned: Vec<cuteafd_ffi::peer_exchange::PeerPlane> = self.slot_planes(slot).enumerate()
                 .filter(|(rank, _)| self.landing & (1 << rank) == 0)
                 .map(|(rank, plane)| cuteafd_ffi::peer_exchange::PeerPlane {
-                    destination: plane.ptr, source: (alias + rank * self.rows * self.row_bytes) as *const c_void,
+                    destination: plane.ptr, source: (alias + rank * range_bytes + offset) as *const c_void,
                     rows: ticket.rows as u64, row_bytes: self.row_bytes as u64,
                     destination_pitch: self.row_bytes as u64, source_pitch: self.row_bytes as u64 })
                 .collect();
@@ -854,7 +1011,7 @@ impl<'a> Waves<'a> {
     /// Plane pointers of return slot `slot` (rank order), for the reduce.
     pub(crate) fn planes(&self, slot: usize) -> [*const u16; MAX_INTAKE_RANKS] {
         let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-        for (pointer, plane) in pointers.iter_mut().zip(&self.planes[slot]) { *pointer = plane.ptr.cast(); }
+        for (pointer, plane) in pointers.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
         pointers
     }
 
@@ -867,7 +1024,7 @@ impl<'a> Waves<'a> {
     /// Marks `slot`'s planes read once `stream` reaches this point (after the
     /// reduce): the worker posts the slot's next wave only after it.
     pub(crate) fn consumed(&mut self, slot: usize, stream: *mut c_void) -> Result<()> {
-        ensure!(slot < self.waves && self.unread[slot], "return slot {slot} has no landed wave to consume");
+        ensure!(slot < self.geometry.cut().waves && self.unread[slot], "return slot {slot} has no landed wave to consume");
         let uses = self.uses[slot].wrapping_add(1);
         // SAFETY: as `submit`'s writes.
         unsafe { self.library.cuda_stream_write_value32(stream, self.words.ptr(Counter::Consumed(slot)), uses)? };
@@ -904,10 +1061,100 @@ impl<'a> Waves<'a> {
     }
 
 
-    pub(crate) fn waves(&self) -> usize { self.waves }
+    /// Return slots of the current cut.
+    pub(crate) fn waves(&self) -> usize { self.geometry.cut().waves }
 
-    /// The link's running means: (round trip us, Spark idle gap us, waves).
-    pub(crate) fn pace(&self) -> (u32, u32, u32) { self.pace.sample() }
+    /// Starts prefill call `call` (#762): every wave sent until
+    /// [`Self::stop_prefill`] reports its ranks' measured unit pace and its
+    /// consuming stream's reply wait under that call. Call with no wave
+    /// outstanding.
+    pub(crate) fn begin_prefill(&mut self, call: u64) -> Result<()> {
+        ensure!(self.outstanding.is_empty(), "a prefill call begins with no Spark wave outstanding");
+        self.stop_prefill();
+        self.prefill = Some(call);
+        self.calls.push_back(PendingCall { id: call, began: Instant::now(), last: None, waits: Vec::new() });
+        Ok(())
+    }
+
+    /// Stops flagging waves as the prefill call's (its last wave was sent);
+    /// its waves may still be in flight. Later waves (decode) are not summed.
+    pub(crate) fn stop_prefill(&mut self) {
+        let Some(call) = self.prefill.take() else { return };
+        let sequence = self.sequence;
+        if let Some(pending) = self.calls.iter_mut().find(|pending| pending.id == call) { pending.last = Some(sequence); }
+    }
+
+    /// Every finished prefill call's pace, oldest first, without any host
+    /// wait: a call is finished once its last wave landed on the host (the
+    /// worker sums a wave before publishing its landing) and its stream
+    /// passed every reply wait. Unfinished calls stay for a later take.
+    /// A call's wall time runs from its start, or the previous call's last
+    /// landing when later, to its own last landing.
+    pub(crate) fn take_prefill(&mut self)
+        -> Result<Vec<(u64, cuteafd_loader::serving_capacity::wave_control::PrefillPace)>> {
+        let mut taken = Vec::new();
+        while let Some(front) = self.calls.front() {
+            let Some(last) = front.last else { break };
+            if !reached(self.words.load(Counter::Landed), last) { break; }
+            let Some(reply_wait_us) = self.reply_wait_us(&front.waits)? else { break };
+            let call = self.calls.pop_front().expect("front call");
+            self.free_events.extend(call.waits.iter().copied());
+            let sums = self.pace.take_prefill(call.id);
+            let start = self.last_landed.map_or(call.began, |landed| landed.max(call.began));
+            let mut pace = sums.finish(Some(start));
+            pace.reply_wait_us = (!call.waits.is_empty()).then_some(reply_wait_us);
+            if let Some(landed) = sums.landed { self.last_landed = Some(landed); }
+            taken.push((call.id, pace));
+        }
+        Ok(taken)
+    }
+
+    /// A free (start, end) timing event pair on the current device.
+    fn wait_events(&mut self) -> Result<(*mut c_void, *mut c_void)> {
+        let device = self.library.cuda_get_device()?;
+        ensure!(self.event_device.is_none_or(|owner| owner == device),
+            "reply-wait events of one Spark link stay on one device");
+        self.event_device = Some(device);
+        if let Some(events) = self.free_events.pop() { return Ok(events); }
+        Ok((self.library.cuda_event_create()?, self.library.cuda_event_create()?))
+    }
+
+    /// Destroys every reply-wait event (the link's owner drained its streams;
+    /// CUDA releases an event still pending once it completes).
+    fn destroy_events(&mut self) {
+        let mut events: Vec<_> = self.free_events.drain(..).collect();
+        for call in self.calls.drain(..) { events.extend(call.waits); }
+        let Some(device) = self.event_device else { return };
+        let library = self.library;
+        let destroyed = (|| -> Result<()> {
+            let previous = library.cuda_get_device()?;
+            library.cuda_set_device(device)?;
+            for (start, end) in events {
+                // SAFETY: events this link created on `device` and no longer records.
+                unsafe { library.cuda_event_destroy(start)?; library.cuda_event_destroy(end)?; }
+            }
+            library.cuda_set_device(previous)
+        })();
+        if let Err(error) = destroyed { tracing::error!(%error, "destroying Spark reply-wait events"); }
+    }
+
+    /// Summed µs between each pair, or None while any end has not completed.
+    fn reply_wait_us(&self, waits: &[(*mut c_void, *mut c_void)]) -> Result<Option<u64>> {
+        let Some(device) = self.event_device.filter(|_| !waits.is_empty()) else { return Ok(Some(0)) };
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(device)?;
+        let result = (|| {
+            let mut total = 0.0f64;
+            for &(start, end) in waits {
+                // SAFETY: live events of this link, created and recorded on `device`.
+                if !unsafe { self.library.cuda_event_query(end)? } { return Ok(None); }
+                total += f64::from(unsafe { self.library.cuda_event_elapsed_ms(start, end)? });
+            }
+            Ok(Some((total * 1e3) as u64))
+        })();
+        self.library.cuda_set_device(previous)?;
+        result
+    }
 
     /// Stops the worker and returns the transport (after a failure, with its
     /// waves abandoned) and the slot its next wave lands in. Every sent wave
@@ -955,6 +1202,7 @@ impl Drop for Waves<'_> {
                 self.library.quarantine_module_after_failed_drain();
             }
         }
+        self.destroy_events();
     }
 }
 

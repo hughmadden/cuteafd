@@ -33,6 +33,13 @@ pub(crate) fn demand_with(rows: usize, waves: usize, unit: Option<usize>, lane: 
     Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane))
 }
 
+/// The admitted intake: one reserve range per rank, every depth up to
+/// `slots` slots of at most `unit` rows cut from it (#762).
+pub(crate) fn admitted_demand(slots: usize, unit: usize, lane: usize) -> Result<Demand> {
+    let shape = cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: slots as u64 }.validate()?;
+    Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ticket { layer: usize, rows: usize, sequence: u64 }
 
@@ -74,7 +81,7 @@ impl<'a> RoutedLane<'a> {
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3,
             "Kimi Spark helpers require the process latent expert geometry before native loading");
         ensure!(peers.len() == RANKS, "Kimi routed exchange requires six real Spark ranks");
-        let charge = demand_with(local.rows(), waves, Some(unit), local.lane_index())?;
+        let charge = admitted_demand(waves, unit, local.lane_index())?;
         let charges = placement.items[1].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
         ensure!(charges.len() == 1 && charges[0].category == charge.category
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
@@ -84,8 +91,12 @@ impl<'a> RoutedLane<'a> {
         let library = library_owner.as_ref();
         let mut link = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
-            let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
-                waves, u32::try_from(unit)?)?;
+            // Return slots are cut from one reserve range per rank, so the
+            // prefill depth can change between calls (#762) within `waves`
+            // admitted slots of at most `unit` rows.
+            let reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(waves as u64, unit as u64);
+            let mut link = SparkLink::new_reserve(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
+                waves, u32::try_from(unit)?, usize::try_from(reserve)?)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
             Ok(link)
         })?;
@@ -96,9 +107,52 @@ impl<'a> RoutedLane<'a> {
             ensure!(link.installed_grouping()?.len() == RANKS,
                 "Kimi bootstrap requires installed grouping from all six ranks");
         }
+        // One admitted unit until the first prefill re-cuts to its depth.
+        if waves > 1 { stream.device.run(|| link.set_geometry(1, unit))?; }
         Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner),
-            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
+            terminal: false, capacity: unit, waves: 1, unit, sequence: std::cell::Cell::new(0),
             outstanding: std::collections::VecDeque::new() })
+    }
+
+    /// Re-cuts the return slots for the next prefill (#762): `waves` slots of
+    /// `unit` rows within the admitted slots and unit. At rest only.
+    pub(crate) fn set_depth(&mut self, waves: usize, unit: usize) -> Result<()> {
+        ensure!(self.outstanding.is_empty(), "Kimi prefill depth changes only with no wave outstanding");
+        ensure!(unit <= self.capacity, "Kimi prefill unit {unit} exceeds the admitted {}", self.capacity);
+        let link = self.link.as_mut().context("Kimi Spark lane retired")?;
+        ensure!(waves <= link.slots(), "Kimi prefill depth {waves} exceeds the admitted {} slots", link.slots());
+        self.stream.device.run(|| link.set_geometry(waves, unit))?;
+        (self.waves, self.unit) = (waves, unit);
+        Ok(())
+    }
+
+    /// Re-cuts to one admitted unit when a non-prefill step of `rows` rows is
+    /// wider than the current cut (at rest, between steps; #762).
+    pub(crate) fn fit_rows(&mut self, rows: usize) -> Result<()> {
+        if rows <= self.unit { return Ok(()); }
+        self.set_depth(1, self.capacity)
+    }
+
+    /// A prefill call boundary (#762): reports every finished prefill call's
+    /// pace to `depth` (no host wait), takes this call's depth (sequence
+    /// `key` from row `start`), re-cuts the return slots to it at rest and
+    /// starts summing this call's waves. Returns the depth this call runs.
+    pub(crate) fn start_prefill(&mut self, depth: &crate::shared::prefill_depth::PrefillDepth, key: u64,
+        start: usize, rows: usize) -> Result<crate::shared::prefill_depth::Depth> {
+        let stream = self.stream.device;
+        let exchange = self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?;
+        depth.report(stream.run(|| exchange.take_prefill())?);
+        let next = depth.start(key, start, rows);
+        self.set_depth(next.waves, next.unit_rows)?;
+        let exchange = self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?;
+        stream.run(|| exchange.begin_prefill(next.call))?;
+        Ok(next)
+    }
+
+    /// The prefill call's last wave is sent: later (decode) waves are not its.
+    pub(crate) fn stop_prefill(&mut self) -> Result<()> {
+        self.link.as_mut().context("Kimi Spark lane retired")?.exchange()?.stop_prefill();
+        Ok(())
     }
 
     pub(crate) fn installed_grouping(&self)

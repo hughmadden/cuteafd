@@ -61,7 +61,8 @@ pub(super) fn layout(
     let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;
     let checked_rows = usize::try_from(shape.unit_rows)?;
-    let waves = usize::try_from(shape.waves)?;
+    // Admitted slots (#762): hop lanes, return slots and Spark owner units.
+    let waves = usize::try_from(shape.slots)?;
 
     let sequences = usize::try_from(if opts.concurrency == 0 {
         16
@@ -172,6 +173,7 @@ pub(super) fn layout(
         inventory,
         rows: usize::try_from(shape.span_rows)?,
         waves,
+        unit: checked_rows,
         full_prefill_logits: opts.full_prefill_logits,
         sequences,
         context,
@@ -319,7 +321,7 @@ pub(super) fn layout(
         // Unlike the legacy family wave allowances, Step-5 has no first-slot scratch reserve.
         let backend = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?;
         let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
-            shape.unit_rows, shape.waves)?;
+            shape.unit_rows, shape.slots)?;
         crate::plan::layout::spark_slots::charge_executions(&mut device, input, &working, "step5", &executions)?;
         memory.devices.push(device);
     }

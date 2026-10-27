@@ -471,13 +471,14 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     }
 
     /// Publish deferred diagnostics after the owner's existing completion check.
-    pub(crate) fn complete(&mut self) -> Result<()> {
-        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
+    /// Returns the completed unit's measured pace.
+    pub(crate) fn complete(&mut self) -> Result<Option<timing::UnitPace>> {
+        let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
         if let Some(timing) = &mut self.worker_timing {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "native")?; }
         }
-        Ok(())
+        Ok(Some(pace))
     }
 
     pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
@@ -774,6 +775,8 @@ impl ExpertExecution<'_, '_> {
             }
         }
         let uploaded = (|| -> Result<()> { unsafe {
+            // The unit's pace starts before its input copies (#762).
+            self.pending.arrive(self.stream.raw)?;
             match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
                 Some(view) => self.library.copy_d2d_async(self.hidden.buffer,
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,

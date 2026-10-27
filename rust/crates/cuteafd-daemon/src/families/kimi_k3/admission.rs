@@ -53,6 +53,9 @@ pub(crate) struct Inputs<'a> {
     pub waves: usize,
     /// Explicit unit rows (else `rows / waves`).
     pub unit_rows: Option<usize>,
+    /// Admitted Spark return slots and prefill-owner units (#762): at least
+    /// `waves`; the executor re-cuts its depth within them at runtime.
+    pub slots: usize,
     pub lane_layouts: Vec<[LaneLayout; 2]>,
     pub fixed: Vec<Demand>,
     pub startup: Vec<Demand>,
@@ -108,6 +111,7 @@ pub(crate) struct Admission<'a> {
     devices: [i32; 2],
     lanes: u64,
     waves: usize,
+    slots: usize,
     unit_rows: usize,
     lane_layouts: Vec<[LaneLayout; 2]>,
     lane_allocated: Vec<[bool; 2]>,
@@ -208,6 +212,8 @@ impl<'a> Admission<'a> {
     /// one transport/intake owner per admitted lane; expired owners cannot be
     /// replaced by an uncharged second allocation.
     pub(crate) fn waves(&self) -> usize { self.waves }
+    /// Admitted prefill slots (the deepest runtime depth).
+    pub(crate) fn slots(&self) -> usize { self.slots }
     pub(crate) fn unit_rows(&self) -> usize { self.unit_rows }
     /// Rows of one prefill call: the lane's row planes (`waves` units).
     pub(crate) fn lane_rows(&self) -> usize { self.lane_layouts[0][0].rows() }
@@ -220,7 +226,7 @@ impl<'a> Admission<'a> {
         let expected = self.check_spark(lane)?;
         ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted GPU1 intake owner");
         let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config,
-            self.waves, self.unit_rows)?;
+            self.slots, self.unit_rows)?;
         self.spark_connected[lane] = true;
         Ok(routed)
     }
@@ -524,6 +530,8 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
     let inputs_waves = inputs.waves;
+    let inputs_slots = inputs.slots;
+    ensure!((inputs.waves..=4).contains(&inputs.slots), "Kimi admitted slots below the starting depth");
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
     let lane_layouts = inputs.lane_layouts.clone();
@@ -628,7 +636,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0, cache_format)?, CacheLayout::new(cfg, &placement, 1, cache_format)?];
     let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
-        devices, lanes, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
+        devices, lanes, waves: inputs_waves, slots: inputs_slots, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
         global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
@@ -716,7 +724,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
     }
     for lane in 0..i.lanes {
-        let demand = super::spark::demand_with(i.rows, i.waves, i.unit_rows, lane)?;
+        let demand = super::spark::admitted_demand(i.slots, unit, lane)?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi Spark intake charge supplied twice");
         fixed.push(demand);
@@ -940,7 +948,7 @@ pub(super) mod tests {
     pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
         Inputs { cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
-            attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
+            attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None, slots: 2,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
@@ -1158,7 +1166,8 @@ pub(super) mod tests {
             ..Default::default()
         })?;
         ensure!(automatic.fits && automatic.placement_supported, "Auto shape/pool: {:?}", automatic.hints);
-        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves), (Some(2752), Some(3)));
+        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves, automatic.prefill_slots),
+            (Some(4096), Some(3), Some(4)));
         assert!(automatic.memory_layout.context("automatic Kimi ledger")?.pool_tokens
             >= cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT as u64);
         let mut refused = 0;
@@ -1211,7 +1220,8 @@ pub(super) mod tests {
             let mut i = inputs(&cfg);
             i.cache_format = format;
             i.requested_pool = requested_pool;
-            i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
+            // An explicit wave count pins the depth: it admits only its own slots.
+            i.rows = rows; i.waves = waves; i.unit_rows = Some(unit); i.slots = waves;
             i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];

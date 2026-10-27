@@ -20,6 +20,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
     };
     let shape = prefill.units();
+    // Slot-owned Spark charges cover every depth the executor may run (#762).
+    let admitted = prefill.admitted();
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
@@ -187,7 +189,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
-            crate::families::kimi_k3::spark_reserve_bytes(shape.waves, shape.unit_rows)?)?;
+            crate::families::kimi_k3::spark_reserve_bytes(admitted.waves, admitted.unit_rows)?)?;
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
         for &layer in &working.spark_layers {
@@ -372,13 +374,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             unit as u32, false, rings, 0) {
             refusal(report, format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
-        if let Err(error) = kimi_owners(&mut device, &working, shape.unit_rows, shape.waves) {
+        if let Err(error) = kimi_owners(&mut device, &working, admitted.unit_rows, admitted.waves) {
             refusal(report, format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
         memory.devices.push(device);
     }
     memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",
-        spark_budget.budget, shape.waves, shape.unit_rows));
+        spark_budget.budget, admitted.waves, admitted.unit_rows));
     memory
 }
 

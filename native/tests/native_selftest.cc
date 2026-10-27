@@ -190,6 +190,8 @@ void test_rdma_abi() {
   unsigned char endpoint_byte = 0;
   assert(cuteafd_rdma_rc_endpoint_post_recv_at(nullptr, 0, 1, 1) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_post_recv_landing_at(nullptr, 0, 1, 1, 0, 1) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_send_at(nullptr, &endpoint_byte, 0, 1, 1) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_send_parts_at(nullptr, &endpoint_byte, 1,

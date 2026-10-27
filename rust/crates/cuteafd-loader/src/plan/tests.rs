@@ -229,8 +229,10 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let (unit, waves) = (expected.unit_rows, expected.waves);
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
-            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(unit), Some(waves), Some(unit * waves)), "{family} ranks={ranks}: {}", render(&report));
+            // An adaptive family admits its slots inside one reserve (#762).
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_slots),
+                (Some(unit), Some(waves), Some(expected.span_rows), Some(expected.slots)),
+                "{family} ranks={ranks}: {}", render(&report));
             for (unit, waves) in [(1024, 1), (2048, 2), (2752, 3), (2048, 4)] {
                 let layout = options.layout.as_mut().unwrap();
                 layout.prefill_rows = unit;
@@ -326,14 +328,14 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
             options.prefill_rows = unit;
             options.prefill_lanes = waves;
             let daemon = prefill_shape(6, limits, PrefillOverrides {
-                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None, slots: None,
             }).unwrap();
             let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
             assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());
             let expected = daemon.unit_rows;
             assert_eq!((options.prefill_rows, options.spark_capacity_rows), (expected, expected));
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(expected), Some(daemon.waves), Some(expected * daemon.waves)));
+                (Some(expected), Some(daemon.waves), Some(daemon.span_rows)));
         }
         let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
         options.workspace_manifest = Some(manifest.clone());
@@ -3537,7 +3539,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // TJ 2026-10-27: the reserve is sized first, the largest that fits the
     // card (8192, else a multiple of 64 rows), split into roundup64(R / k)
     // units; the pool takes what remains. Only an explicit pin changes it.
-    use crate::serving_capacity::prefill_waves::{reserve_unit_rows, RESERVE_STEP_ROWS};
+    use crate::serving_capacity::prefill_waves::{unit_rows_in, ROW_PAGE as RESERVE_STEP_ROWS};
     let dir = strict_v41_snapshot(false);
     let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
@@ -3551,14 +3553,14 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(capped.executable(), "{}", render(&capped));
     let reserve = capped.prefill_reserve_rows.unwrap();
     assert_eq!(capped.prefill_waves, Some(3));
-    assert_eq!(capped.prefill_unit_rows, Some(reserve_unit_rows(reserve, 3)), "{}", render(&capped));
+    assert_eq!(capped.prefill_unit_rows, Some(unit_rows_in(3, reserve)), "{}", render(&capped));
     if reserve < 8192 {
         assert_eq!(reserve % RESERVE_STEP_ROWS, 0);
         // The next reserve with larger units does not fit: the cap is the largest.
         let mut larger = reserve + RESERVE_STEP_ROWS;
-        while reserve_unit_rows(larger, 3) == reserve_unit_rows(reserve, 3) { larger += RESERVE_STEP_ROWS; }
+        while unit_rows_in(3, larger) == unit_rows_in(3, reserve) { larger += RESERVE_STEP_ROWS; }
         let pinned = PlanOptions { layout: Some(layout::LayoutOptions {
-            prefill_rows: reserve_unit_rows(larger, 3), prefill_waves: 3, ..layout.clone() }), ..sparks(4) };
+            prefill_rows: unit_rows_in(3, larger), prefill_waves: 3, ..layout.clone() }), ..sparks(4) };
         assert!(!plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap().executable());
     }
     // An explicit pin keeps its shape whether or not it fits.

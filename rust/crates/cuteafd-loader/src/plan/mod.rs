@@ -247,6 +247,10 @@ pub struct PlanReport {
     /// Family-resolved units in flight on each transport.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_waves: Option<u64>,
+    /// Admitted prefill slots (#762): the deepest depth an adaptive executor
+    /// may run; equal to the waves when static or pinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_slots: Option<u64>,
     /// The admitted pool's RTX expert layers and the pool the same solve
     /// admits with none onboarded (bench cards read both beside the pool).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -679,6 +683,7 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         prefill_span_rows: None,
         prefill_unit_rows: None,
         prefill_waves: None,
+        prefill_slots: None,
         onboard_layers: None,
         max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
@@ -964,6 +969,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
+        report.prefill_slots = Some(layout_options.prefill_slots.max(layout_options.prefill_waves));
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
             report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
@@ -1016,6 +1022,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
+        report.prefill_slots = Some(inventory.prefill_slots.max(inventory.prefill_waves));
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -1252,12 +1259,12 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         // charged rows are the largest split, k x unit (8192 charges 8256),
         // planned at the configured k, whose split is the largest at the
         // shared default k = 3.
-        use crate::serving_capacity::prefill_waves::{reserve_candidates, reserve_unit_rows, RESERVE_ROWS};
+        use crate::serving_capacity::prefill_waves::{unit_rows_in, RESERVE_ROWS, ROW_PAGE};
         let waves = report.prefill_waves.unwrap_or(2);
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
                 let layout = candidate.layout.as_mut().unwrap();
-                layout.prefill_rows = reserve_unit_rows(reserve, waves);
+                layout.prefill_rows = unit_rows_in(waves, reserve);
                 layout.prefill_waves = waves;
                 input.plan(&candidate)?
             };
@@ -1265,8 +1272,8 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             Ok(report)
         };
         // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`).
-        let candidates: Vec<u64> = reserve_candidates().into_iter()
-            .filter(|&reserve| reserve_unit_rows(reserve, waves) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
+        let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
+            .filter(|&reserve| unit_rows_in(waves, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
             .collect();
         let full = at(RESERVE_ROWS)?;
         if full.executable() { return Ok(full); }
@@ -1275,7 +1282,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             let mut refused = full;
             refused.hints.push(Hint {
                 what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows ({waves} x {})",
-                    candidates.last().unwrap(), reserve_unit_rows(*candidates.last().unwrap(), waves)),
+                    candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
                 how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
             });
             return Ok(refused);
@@ -1345,8 +1352,9 @@ pub fn render(report: &PlanReport) -> String {
             let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #671 / #709)");
         }
         _ => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
-            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows; intake {} rows; {} Spark transport(s)",
-                report.prefill_span_rows.unwrap_or(unit * waves), report.prefill_transports.unwrap_or(0));
+            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows ({} admitted slots); intake {} rows; {} Spark transport(s)",
+                report.prefill_slots.unwrap_or(waves), report.prefill_span_rows.unwrap_or(unit * waves),
+                report.prefill_transports.unwrap_or(0));
         },
     }
     if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
