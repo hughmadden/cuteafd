@@ -41,10 +41,10 @@ fn native_image_replacement_and_reuse() -> Result<()> {
             tokens[row] = V41_IMAGE_TOKEN_ID;
         }
         let (baseline, pre) = copy(wave.execute(&tokens, &positions)?)?;
-        unsafe { wave.enqueue_into(&tokens, stream.raw, [peer.residual.buffer, peer.pre.buffer])?; }
+        unsafe { wave.enqueue_into(&tokens, stream.raw, [peer.storage.residual.buffer, peer.storage.pre.buffer])?; }
         runtime.block_on(stream.wait())?;
-        let mut residual = peer.residual.buffer; residual.bytes = rows * 40960;
-        let mut incoming = peer.pre.buffer; incoming.bytes = rows * 16;
+        let mut residual = peer.storage.residual.buffer; residual.bytes = rows * 40960;
+        let mut incoming = peer.storage.pre.buffer; incoming.bytes = rows * 16;
         let queued = copy(TargetEmbedding { residual, pre: incoming, token_ids: &tokens,
             positions: &positions, _owner: PhantomData })?;
         assert_eq!(queued, (baseline.clone(), pre.clone()));
@@ -150,16 +150,16 @@ fn native_host_embedding_exact_512() -> Result<()> {
             lib.copy_h2d(ids.buffer, &tokens[..16].iter().flat_map(|t| t.to_ne_bytes()).collect::<Vec<_>>())?;
             let ops = lib.v41_attention_ops_width(width)?;
             // SAFETY: immutable table and owned disjoint buffers live through both drains.
-            unsafe { ops.embed(table.get("embed.weight")?, ids.buffer, residual.buffer, pre.buffer, 16, wave.stream.raw)?; }
+            unsafe { ops.embed(table.get("embed.weight")?, ids.buffer, residual.buffer, pre.buffer, 16, wave.storage.stream.raw)?; }
             wave.synchronize()?;
             // SAFETY: the same fixed storage remains owned until replay drains.
             let graph = unsafe {
-                lib.cuda_graph_begin_capture(wave.stream.raw)?;
-                ops.embed(table.get("embed.weight")?, ids.buffer, residual.buffer, pre.buffer, 16, wave.stream.raw)?;
-                lib.cuda_graph_end_capture(wave.stream.raw)?
+                lib.cuda_graph_begin_capture(wave.storage.stream.raw)?;
+                ops.embed(table.get("embed.weight")?, ids.buffer, residual.buffer, pre.buffer, 16, wave.storage.stream.raw)?;
+                lib.cuda_graph_end_capture(wave.storage.stream.raw)?
             };
             // SAFETY: captured graph references these live buffers; destroy follows a drain.
-            unsafe { lib.cuda_graph_launch(graph, wave.stream.raw)?; }
+            unsafe { lib.cuda_graph_launch(graph, wave.storage.stream.raw)?; }
             wave.synchronize()?;
             // SAFETY: replay has completed and the graph has no queued users.
             unsafe { lib.cuda_graph_exec_destroy(graph)?; }
