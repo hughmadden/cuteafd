@@ -7,7 +7,7 @@ use crate::shared::{experts::{fp8::Fp8Experts, staging::RouteStaging}, memory::d
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::serving_capacity::prefill_lanes::MAX_PREFILL_LANES;
+use cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES;
 use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2SourceKind, TcpTransportConfig,
     expert::SparkWorld};
 use std::{collections::VecDeque, ffi::c_void, net::SocketAddr, sync::Arc};
@@ -52,12 +52,12 @@ fn bootstrap_request(layer: usize, rows: usize, build: Build) -> Result<ExpertPr
         ExpertV2SourceKind::Prefill)
 }
 
-/// A sent Spark wave: lane `lane`'s rows of routed layer `layer`.
+/// A sent Spark wave: routed layer `layer`'s `rows` rows from slot `slot`'s rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Wave { pub layer: usize, pub lane: usize, pub rows: usize }
+pub(super) struct Wave { pub layer: usize, pub slot: usize, pub rows: usize }
 
-/// Sent waves not yet collected, oldest first. A step's lanes collect in dispatch order with at
-/// most `waves` in flight, which is exactly what the link's exchange admits (one return slot per
+/// Sent waves not yet collected, oldest first. A step collects its waves in dispatch order with
+/// at most `waves` in flight, which is exactly what the link's exchange admits (one return slot per
 /// wave, landed oldest first): the order is checked here before the exchange sees it.
 pub(super) struct WaveOrder<T> { waves: usize, sent: VecDeque<(Wave, T)> }
 
@@ -86,14 +86,14 @@ impl<T> WaveOrder<T> {
 
 /// The Spark experts' exchange: one link (rank connections, intake return slots, request
 /// staging and the exchange worker) for decode and prefill alike, with up to `waves` waves in
-/// flight (each prefill lane's while the other lanes' GPU work runs). Every send, land and
-/// reduce is queued on the execution's one stream; this thread never waits for the wire.
+/// flight (each prefill wave's while other rows' GPU work runs). Every send, land and reduce is
+/// queued on the execution's one stream; this thread never waits for the wire.
 pub(super) struct Spark<'a> {
     /// `None` once released after a failed step. Its terminal-owned intake retains the library.
     link: Option<SparkLink<'a>>,
     device: Device<'a>,
     build: Build,
-    /// Rows of every return slot: one prefill lane, the widest wave.
+    /// Rows of every return slot: one prefill unit, the widest wave.
     rows: usize,
     order: WaveOrder<WaveTicket>,
     /// The last request identity (the bootstrap's is 1).
@@ -126,12 +126,12 @@ impl<'a> Spark<'a> {
         // The compact reducer sums rows of the process expert geometry.
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::MINIMAX_M3,
             "MiniMax Spark helpers require the process expert geometry before the link");
-        ensure!((1..=4096).contains(&rows) && (1..=MAX_PREFILL_LANES).contains(&waves),
+        ensure!((1..=4096).contains(&rows) && (1..=MAX_WAVES as usize).contains(&waves),
             MiniMaxError::Invalid("Spark link rows or waves"));
         let warm = bootstrap_request(first, rows, build)?;
         let mut link = device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(u32::try_from(peers.len())?)?;
-            // Each wave is at most one lane's rows: every return slot holds a lane.
+            // Each wave is at most one unit's rows: every return slot holds a unit.
             let mut link = SparkLink::new_waves(library, world, peers, u32::try_from(rows)?, config, ROW, waves,
                 u32::try_from(rows)?)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
@@ -153,6 +153,15 @@ impl<'a> Spark<'a> {
     /// No wave is in flight (between steps).
     fn idle(&self) -> Result<()> {
         ensure!(self.order.is_empty(), MiniMaxError::Invalid("Spark wave in flight outside its step"));
+        Ok(())
+    }
+
+    /// Refuses a step whose widest wave of `rows` rows does not fit a return slot and its request staging.
+    fn fits(&mut self, rows: usize) -> Result<()> {
+        ensure!((1..=self.rows).contains(&rows), MiniMaxError::Invalid("Spark wave rows exceed its return slot"));
+        let bytes = RouteStaging::new(rows, TOPK, ROW)?.bytes;
+        let link = self.link.as_mut().context("MiniMax Spark link released")?;
+        ensure!(link.exchange()?.fits(bytes), MiniMaxError::Invalid("Spark exchange staging is narrower than a prefill unit"));
         Ok(())
     }
 
@@ -242,7 +251,7 @@ fn warm_up(library: &NativeLibrary, link: &mut SparkLink<'_>, warm: ExpertProtoc
 }
 
 /// A dispatched wave not yet collected: a local one keeps its operand views
-/// (lane scratch) until it runs at collect.
+/// (its rows' scratch) until it runs at collect.
 enum Pending {
     Local { layer:usize,rows:usize,index:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,input:CuteafdDeviceBuffer },
     Spark(Wave),
@@ -250,7 +259,7 @@ enum Pending {
 pub(super) struct Routed<'a> {
     local: Option<Fp8Experts<'a>>,
     spark: Option<Spark<'a>>,
-    /// Per lane, the dispatched wave not yet collected.
+    /// Per slot, the dispatched wave not yet collected.
     pending: Vec<Option<Pending>>,
     kind:ExpertV2SourceKind,
     poisoned:bool,
@@ -270,29 +279,29 @@ impl<'a> Routed<'a> {
         // shipped packages owns them); any other link world is a bug.
         if let Some(spark)=&spark { ensure!(spark.world_size().is_some_and(|ranks|matches!(ranks,2|3|4|6)),
             MiniMaxError::Unsupported("Spark experts require TP2, TP3, TP4 or TP6")); }
-        // Local layers run on the stream at collect, in any lane; each Spark lane's wave takes
+        // Local layers run on the stream at collect, from any slot; each Spark wave in flight takes
         // one of the link's return slots.
-        let lanes=spark.as_ref().map_or(MAX_PREFILL_LANES,Spark::waves);
-        Ok(Self{local,spark,pending:(0..lanes).map(|_|None).collect(),kind:ExpertV2SourceKind::Decode,poisoned:false})
+        let slots=spark.as_ref().map_or(MAX_WAVES as usize,Spark::waves);
+        Ok(Self{local,spark,pending:(0..slots).map(|_|None).collect(),kind:ExpertV2SourceKind::Decode,poisoned:false})
     }
 }
 impl<'a> ExpertExecutor<'a> for Routed<'a> {
-    fn begin(&mut self,waves:usize,lanes:usize,kind:ExpertV2SourceKind)->Result<()> {
+    fn begin(&mut self,routed:usize,slots:usize,rows:usize,kind:ExpertV2SourceKind)->Result<()> {
         ensure!(!self.poisoned,MiniMaxError::Invalid("previous expert failure; restart required"));
         ensure!(self.pending.iter().all(Option::is_none),MiniMaxError::Invalid("pending expert wave at step start"));
-        ensure!((1..=self.lanes()).contains(&lanes),MiniMaxError::Invalid("expert lanes"));
+        ensure!((1..=self.slots()).contains(&slots),MiniMaxError::Invalid("expert slots"));
         ensure!(matches!(kind,ExpertV2SourceKind::Decode|ExpertV2SourceKind::Prefill),
             MiniMaxError::Unsupported("expert source kind"));
         self.kind=kind;
         let local=self.local.as_ref().map_or(0,|l|l.layers.len());
-        waves.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")?;
-        if let Some(spark)=&self.spark { spark.idle()?; }
+        routed.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")?;
+        if let Some(spark)=&mut self.spark { spark.idle()?; spark.fits(rows)?; }
         Ok(())
     }
-    fn lanes(&self)->usize { self.pending.len() }
-    fn dispatch(&mut self,layer:usize,lane:usize,rows:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,
+    fn slots(&self)->usize { self.pending.len() }
+    fn dispatch(&mut self,layer:usize,slot:usize,rows:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,
         input:CuteafdDeviceBuffer,native:&Native<'a>)->Result<()> {
-        ensure!(self.pending.get(lane).is_some_and(Option::is_none),MiniMaxError::Invalid("overlapping expert waves"));
+        ensure!(self.pending.get(slot).is_some_and(Option::is_none),MiniMaxError::Invalid("overlapping expert waves"));
         let pending=if let Some(index)=self.local.as_ref().and_then(|l|l.index_of(layer).ok()) {
             Pending::Local{layer,rows,index,ids,weights,input}
         } else {
@@ -300,17 +309,17 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
                 "MiniMax Spark expert operand extent");
             native.check_device(&[ids,weights,input])?;
             let spark=self.spark.as_mut().context("MiniMax routed layer has neither local experts nor Spark transport")?;
-            let wave=Wave{layer,lane,rows};
-            // SAFETY: the router and norm wrote these lane views on the execution's stream,
+            let wave=Wave{layer,slot,rows};
+            // SAFETY: the router and norm wrote these row views on the execution's stream,
             // whose staging copies read them in order; the scratch outlives the step's work.
             unsafe { spark.send(wave,self.kind,ids,weights,input,native.raw())? };
             Pending::Spark(wave)
         };
-        self.pending[lane]=Some(pending);
+        self.pending[slot]=Some(pending);
         Ok(())
     }
-    fn collect(&mut self,layer:usize,lane:usize,rows:usize,output:CuteafdDeviceBuffer,native:&Native<'a>)->Result<()> {
-        match self.pending.get_mut(lane).and_then(Option::take).context("MiniMax expert collect without dispatch")? {
+    fn collect(&mut self,layer:usize,slot:usize,rows:usize,output:CuteafdDeviceBuffer,native:&Native<'a>)->Result<()> {
+        match self.pending.get_mut(slot).and_then(Option::take).context("MiniMax expert collect without dispatch")? {
             Pending::Local{layer:expected,rows:count,index,ids,weights,input}=>{
                 ensure!((layer,rows)==(expected,count),MiniMaxError::Invalid("local expert wave identity"));
                 let owner=self.local.as_ref().context("MiniMax local owner")?;
@@ -326,7 +335,7 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
                 ensure!(rows>0 && output.bytes>=rows*ROW,"MiniMax Spark expert output extent");
                 native.check_device(&[output])?;
                 let spark=self.spark.as_mut().context("MiniMax Spark owner")?;
-                // SAFETY: the output is this lane's scratch view on the execution's stream,
+                // SAFETY: the output is this slot's rows' scratch view on the execution's stream,
                 // disjoint from the link's planes and live through the step's work.
                 unsafe { spark.land(wave,output,native.raw()) }
             }
@@ -448,7 +457,7 @@ mod tests {
 
     #[test]
     fn minimax_wave_order_admits_link_slots_and_lands_oldest_first() -> Result<()> {
-        let wave = |layer, lane| Wave { layer, lane, rows: 64 };
+        let wave = |layer, slot| Wave { layer, slot, rows: 64 };
         let mut order = WaveOrder::new(2);
         order.push(wave(3, 0), 1)?;
         order.push(wave(3, 1), 2)?;

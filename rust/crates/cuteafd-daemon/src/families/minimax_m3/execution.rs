@@ -215,13 +215,16 @@ impl<'a> Drafter<'a> {
 }
 
 pub(super) trait ExpertExecutor<'a> {
-    /// Before a step's layers: `waves` routed layers on each of `lanes` lanes.
-    fn begin(&mut self, _waves:usize, _lanes:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
-    /// Lanes whose waves can be in flight at once (the Spark link's return slots).
-    fn lanes(&self) -> usize { 1 }
-    fn dispatch(&mut self, layer:usize, lane:usize, rows:usize, ids:CuteafdDeviceBuffer, weights:CuteafdDeviceBuffer,
+    /// Before a step's layers: `routed` routed layers, up to `slots` waves in flight (one per slot), none wider
+    /// than `rows` rows.
+    fn begin(&mut self, _routed:usize, _slots:usize, _rows:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
+    /// Waves that can be in flight at once (the Spark link's return slots).
+    fn slots(&self) -> usize { 1 }
+    /// Sends routed layer `layer`'s wave of `rows` rows from slot `slot`'s rows.
+    fn dispatch(&mut self, layer:usize, slot:usize, rows:usize, ids:CuteafdDeviceBuffer, weights:CuteafdDeviceBuffer,
         input:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
-    fn collect(&mut self, layer:usize, lane:usize, rows:usize, output:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
+    /// Lands slot `slot`'s wave of routed layer `layer` into `output`.
+    fn collect(&mut self, layer:usize, slot:usize, rows:usize, output:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
     /// After a step's drain: no wave outstanding, and the expert wire healthy.
     fn finish(&mut self) -> Result<()> { Ok(()) }
     /// A failed step, before its stream drains: stops the expert exchange, which releases every
@@ -384,13 +387,14 @@ impl<'a> Execution<'a> {
         for cache in caches { ensure!(cache.key.buffer.bytes>=batch.pool_pages*32768
             && cache.value.buffer.bytes>=batch.pool_pages*32768 && cache.index.buffer.bytes>=batch.pool_pages*8448,
             MiniMaxError::Invalid("physical cache extent")); }
-        let waves=self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count();
+        let routed=self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count();
         // Every step runs eagerly: the Spark exchange's stream waits and writes are runtime
         // state, never captured, so no whole decode step is recorded.
         let mut guard=self.native.cancellation_guard("MiniMax step");
         let result=(||{
-            let cuts=self.lane_cuts(batch,rows,experts.lanes(),diagnostics.is_some())?;
-            experts.begin(waves,cuts.len()+1,kind)?;
+            let cuts=self.lane_cuts(batch,rows,experts.slots(),diagnostics.is_some())?;
+            let widest=cuts.iter().chain([&rows]).scan(0,|at,&cut|{let piece=cut-*at; *at=cut; Some(piece)}).max().unwrap_or(rows);
+            experts.begin(routed,cuts.len()+1,widest,kind)?;
             self.native.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.native.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             let plan=self.plan_attention(batch,rows,&cuts)?;
@@ -757,7 +761,7 @@ mod tests {
                             let slot=(sent%lanes as u64) as usize;
                             assert!(slots[slot],"wave {sent} reuses slot {slot} before its previous wave landed");
                             slots[slot]=false;
-                            order.push(Wave{layer,lane,rows:64},sent).unwrap();
+                            order.push(Wave{layer,slot:lane,rows:64},sent).unwrap();
                             sent+=1;
                             sent-1
                         });
@@ -767,7 +771,7 @@ mod tests {
                         let (dispatched,spark)=pending[lane].take().expect("collect after dispatch");
                         assert_eq!(dispatched,layer);
                         if let Some(wave)=spark {
-                            assert_eq!(order.pop(Wave{layer,lane,rows:64})?,wave,"the oldest wave lands first");
+                            assert_eq!(order.pop(Wave{layer,slot:lane,rows:64})?,wave,"the oldest wave lands first");
                             slots[(wave%lanes as u64) as usize]=true;
                         }
                     }
