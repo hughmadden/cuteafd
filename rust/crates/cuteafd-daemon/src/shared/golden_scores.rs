@@ -1,6 +1,39 @@
 //! CPU scoring for independently exported, explicitly selected golden rows.
 use anyhow::{ensure, Result};
 
+/// Cosine and relative L2 of engine hidden states against the reference,
+/// accumulated over row chunks as a run evaluates them.
+#[derive(Debug, Default)]
+pub(crate) struct HiddenMetrics { dot: f64, ours: f64, norm: f64, error: f64, values: usize }
+
+impl HiddenMetrics {
+    pub(crate) fn add(&mut self, actual: &[f32], expected: &[f32]) -> Result<()> {
+        ensure!(actual.len() == expected.len() && actual.iter().chain(expected).all(|v| v.is_finite()),
+            "hidden comparison shape/finite mismatch");
+        for (&a, &b) in actual.iter().zip(expected) {
+            let (a, b) = (f64::from(a), f64::from(b));
+            self.error += (a - b).powi(2);
+            self.norm += b * b;
+            self.dot += a * b;
+            self.ours += a * a;
+        }
+        self.values += actual.len();
+        Ok(())
+    }
+
+    /// `(cosine, relative L2)`.
+    pub(crate) fn result(&self) -> Result<(f64, f64)> {
+        ensure!(self.values > 0 && self.norm > 0. && self.ours > 0., "zero hidden state norm");
+        Ok((self.dot / (self.norm * self.ours).sqrt(), (self.error / self.norm).sqrt()))
+    }
+}
+
+pub(crate) fn hidden_metrics(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
+    let mut metrics = HiddenMetrics::default();
+    metrics.add(actual, expected)?;
+    metrics.result()
+}
+
 pub(crate) fn select_scored_rows(logits: &[f32], positions: &[usize], vocab: usize) -> Result<Vec<f32>> {
     ensure!(vocab > 0 && logits.len() % vocab == 0 && !positions.is_empty(), "dense row selection shape mismatch");
     let rows = logits.len() / vocab;

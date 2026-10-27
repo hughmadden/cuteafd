@@ -63,6 +63,10 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let (first, last) = kimi_routed(text_config(config))?;
             ("kimi_k3", first, Some(last))
         }
+        "minimax_m3_vl" => {
+            let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(config)?;
+            ("minimax_m3", cfg.moe.iter().position(|routed| *routed).unwrap_or(cfg.layers), Some(cfg.layers - 1))
+        }
         other => bail!("unsupported model_type {other:?}"),
     };
     Ok(LaunchDescription { family, model_type, first_expert_layer: first, last_expert_layer: last })

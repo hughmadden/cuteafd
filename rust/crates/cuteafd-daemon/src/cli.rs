@@ -110,6 +110,9 @@ pub(crate) enum Commands {
     /// Qualify a native Step-5 target prefix with real Spark experts.
     #[command(hide = true)]
     Step5Golden(crate::families::step5::golden::GoldenArgs),
+    /// Qualify native MiniMax M3 execution and exact prefix pages.
+    #[command(hide = true)]
+    MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
     /// Compare a cold Kimi decoder prefix against a flagged residual state.
     #[command(hide = true)]
     KimiGolden(crate::families::kimi_k3::golden::GoldenArgs),
@@ -119,6 +122,9 @@ pub(crate) enum Commands {
     /// Serve an eager native Step-5 target with real Spark experts.
     #[command(hide = true)]
     ServeStep5(crate::families::step5::serve::ServeArgs),
+    /// Serve MiniMax M3 with one coordinator and native NVFP4 Spark experts.
+    #[command(name = "serve-minimax", hide = true)]
+    ServeMiniMax(crate::families::minimax_m3::serve::ServeArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),
@@ -476,6 +482,9 @@ pub(crate) struct PlanArgs {
     /// Plan GLM 5.3's DFlash2 drafter with native BF16 projections.
     #[arg(long)]
     pub(crate) glm5_draft_bf16: bool,
+    /// Plan MiniMax M3's DFlash2 drafter with its checkpoint BF16 GEMMs (serve-minimax --draft-fp8 false).
+    #[arg(long)]
+    pub(crate) minimax_draft_bf16: bool,
     /// MiMo native local expert package manifest.json for exact scratch.
     #[arg(long)]
     pub(crate) mimo_expert_manifest: Option<PathBuf>,

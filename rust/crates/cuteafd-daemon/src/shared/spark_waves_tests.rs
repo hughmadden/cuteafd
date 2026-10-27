@@ -328,6 +328,9 @@ fn no_family_exchanges_on_the_engine_thread() {
         ("deepseek_v4 prefill", include_str!("../families/deepseek_v4/engine/prefill.rs")),
         ("kimi_k3", include_str!("../families/kimi_k3/spark.rs")),
         ("deepseek_v41", include_str!("../families/deepseek_v41/v41_experts/coordinator.rs")),
+        ("minimax_m3", include_str!("../families/minimax_m3/routed.rs")),
+        ("minimax_m3 execution", include_str!("../families/minimax_m3/execution.rs")),
+        ("minimax_m3 units", include_str!("../families/minimax_m3/execution/units.rs")),
     ] {
         for needle in &banned {
             assert!(!source.contains(needle.as_str()), "{family} still exchanges inline ({needle})");

@@ -83,7 +83,7 @@ fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
     // Admitted slots (#762): at least the starting depth; more only where the
     // family's executor chooses its depth at runtime.
     let (waves, slots) = (value["prefill_waves"].as_u64().unwrap(), value["prefill_slots"].as_u64().unwrap());
-    let adaptive = matches!(value["family"].as_str(), Some("glm5" | "kimi_k3" | "step5"));
+    let adaptive = matches!(value["family"].as_str(), Some("glm5" | "kimi_k3" | "step5" | "minimax_m3"));
     assert!(slots == waves || (adaptive && slots > waves && slots <= 4), "prefill_slots {slots} for {waves} waves: {value}");
     // Exercise the launcher's actual consumer, not a copied jq predicate or a
     // fabricated plan. Sourcing the whole launcher would start containers.
@@ -149,6 +149,37 @@ fn glm53_max_deployment_admits_four_4096_row_slots_starting_at_three() {
     assert_eq!(deployment["prefill_waves"], 3);
     assert_eq!(deployment["prefill_slots"], 4);
     assert_eq!(deployment["prefill_span_rows"], 8256);
+}
+
+#[test]
+fn minimax_deployments_admit_four_4096_row_slots_starting_at_the_measured_depth() {
+    use cuteafd_loader::plan::{families::minimax::admission::PROGRAM_NAMES, testing};
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_minimax_m3_snapshot(snapshot.path(), false, false);
+    // The image's program inventory: decode tiles of 64 rows, 1024-row prefill tiles, 4096-row programs.
+    let manifest = snapshot.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, serde_json::json!({"programs": PROGRAM_NAMES.iter().map(|suffix| {
+        let rows = if suffix.ends_with("_decode") { 64 } else if matches!(*suffix, "index_prefill" | "attention_extend") { 1024 }
+            else { 4096 };
+        serde_json::json!({"name": format!("minimax_{suffix}"), "capacity_rows": rows,
+            "scratch_bytes_at_capacity": {"scratch": 53_478_400}, "geometry": {"max_pages": 16384, "max_batch": 64}})
+    }).collect::<Vec<_>>()}).to_string()).unwrap();
+    for (ranks, pin, expected) in [("2", None, (4096, 2, 4, 8256)), ("6", None, (4096, 3, 4, 8256)),
+        ("6", Some("3"), (2752, 3, 3, 8256)), ("6", Some("2"), (4096, 2, 2, 8192))] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+        command.arg("plan").arg(snapshot.path()).args(["--deployment", "--rtx", "1", "--spark-ranks", ranks,
+            "--vision", "off", "--audio", "off", "--speculator", "off", "--workspace-manifest"]).arg(&manifest);
+        if let Some(waves) = pin { command.args(["--prefill-waves", waves]); }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "TP{ranks}: {}", String::from_utf8_lossy(&output.stderr));
+        let deployment = release_accepts_prefill(&output.stdout);
+        assert_eq!(deployment["family"], "minimax_m3");
+        // Unpinned: the admitted unit (reserve / 2) in four slots, the depth starting at the measured
+        // estimate (#762): two waves at TP2, three from TP3. PREFILL_WAVES pins the depth: only its own slots.
+        let field = |name: &str| deployment[name].as_u64().unwrap();
+        assert_eq!((field("prefill_unit_rows"), field("prefill_waves"), field("prefill_slots"), field("prefill_span_rows")),
+            expected, "TP{ranks} {pin:?}");
+    }
 }
 
 fn installed_example_snapshot(model_id: &str, revision: Option<&str>, hf_home: &std::path::Path)

@@ -163,6 +163,13 @@ pub struct LayoutOptions {
     pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
+    /// MiniMax M3 paged K/V storage (`--kv-cache`).
+    pub minimax_kv: crate::families::qwen4::Qwen4KvCache,
+    /// MiniMax M3's DFlash2 drafter checkpoint (`--speculator dflash2`), on the shared drafter
+    /// with `draft_kv_cache` rings and `draft_context_slots`; absent plans the bundled DSpark or none.
+    pub minimax_drafter_snapshot: Option<std::path::PathBuf>,
+    /// Plan that drafter with its checkpoint BF16 GEMMs (serve-minimax --draft-fp8 false).
+    pub minimax_draft_bf16: bool,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -254,6 +261,9 @@ impl Default for LayoutOptions {
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
+            minimax_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
+            minimax_drafter_snapshot: None,
+            minimax_draft_bf16: false,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
@@ -294,6 +304,15 @@ pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64,
 #[cfg(test)]
 mod scoring_workspace_tests {
     use super::*;
+
+    #[test]
+    fn minimax_vision_scratch_matches_the_native_ledger() {
+        // native/tests/vision_minimax_contract_selftest.cc: scratch 758,189,312 at 4096 tokens and
+        // 206,647,552 at one 576-token image, each beside the 4 MiB BLAS workspace.
+        assert_eq!(minimax_vision_scratch_bytes_for(4096), 758_189_312 + 4 * MIB);
+        assert_eq!(minimax_vision_scratch_bytes_for(576), 206_647_552 + 4 * MIB);
+        assert_eq!(minimax_vision_scratch_bytes(), minimax_vision_scratch_bytes_for(crate::media::minimax::ENCODER_TOKENS as u64));
+    }
 
     #[test]
     fn unknown_package_runtime_item_uses_manifest_formula() {
@@ -339,6 +358,8 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
         "mimo_v2" => lanes as usize,
+        // Decode and every prefill wave share one link.
+        "minimax_m3" => 1,
         "qwen4" => 1,
         _ => 0,
     }
@@ -1263,6 +1284,21 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 
+/// The MiniMax tower's scratch at its loaded capacity (one image, `ENCODER_TOKENS`): 210,841,856 bytes.
+pub fn minimax_vision_scratch_bytes() -> u64 {
+    minimax_vision_scratch_bytes_for(crate::media::minimax::ENCODER_TOKENS as u64)
+}
+
+/// Mirrors scratch_minimax at a `tokens`-token capacity (four patches a token), with the fixed
+/// 1024-row GEMM staging, LSE and the BLAS workspace.
+fn minimax_vision_scratch_bytes_for(tokens: u64) -> u64 {
+    let (n, chunk) = (tokens * 4, 1024);
+    [n*1280*4, n*1280*2, n*1176*4, n*1280*2, n*1280*2, n*1280*2, n*1280*2, tokens*6144*2, n*6144*2,
+     chunk*1280*3*4, chunk*1280*4, chunk*5120*4, chunk*5120*2, chunk*6144*4, chunk*6144*2, chunk*6144*4,
+     n*2*14*14*3, 768*4, n*3*4, 16384*16*4, 2*4, 4*MIB]
+        .into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
 /// Resolve the serving representation, not the inventory's target-only defaults.
 fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
     -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
@@ -1286,7 +1322,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
         mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
         dense_qwen_kv: options.dense_qwen_kv, qwen_kv: options.qwen_kv, mla_kv: options.mla_kv,
-        step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        step5_kv: options.step5_kv, minimax_kv: options.minimax_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot
@@ -1420,7 +1456,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
             layers: u32::try_from(spec.layers.len())? };
         let endpoints = spark_endpoints(family, lanes);
-        let bf16 = native || matches!(family, "glm5" | "qwen4");
+        let bf16 = native || matches!(family, "glm5" | "qwen4" | "minimax_m3");
         let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
         let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };

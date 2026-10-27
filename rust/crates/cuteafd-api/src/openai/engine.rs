@@ -93,7 +93,7 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Step5(encoding) => encoding.render(&body, &super::step5::Step5PromptOptions {
             tool_names: Vec::new(), tool_choice: super::step5::Step5ToolChoice::Auto, response_format: None }).is_err(),
-        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) | ModelEncoding::MiniMaxM3(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }
@@ -418,8 +418,15 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
     });
     match turn.reasoning.enabled {
         Some(enabled) => {
-            body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }});
+            // MiniMax M3's template tells `adaptive` from `enabled`; every other family gets `enabled`.
+            let adaptive = turn.reasoning.adaptive && matches!(profile.encoding, ModelEncoding::MiniMaxM3(_));
+            let kind = match (enabled, adaptive) { (false, _) => "disabled", (true, true) => "adaptive", (true, false) => "enabled" };
+            body["thinking"] = json!({"type": kind});
             if enabled { if let Some(e) = effort.filter(|e| !matches!(*e, "none")) { body["reasoning_effort"] = json!(e); } }
+            // MiniMax M3 sizes its <effort> from an Anthropic budget itself (minimax_m3::prompt).
+            if let (true, ModelEncoding::MiniMaxM3(_), Some(budget)) = (enabled, &profile.encoding, turn.reasoning.budget_tokens) {
+                body["thinking"]["budget_tokens"] = json!(budget);
+            }
         }
         None => if let Some(e) = effort { body["reasoning_effort"] = json!(e); },
     }

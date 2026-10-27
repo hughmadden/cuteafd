@@ -2,9 +2,11 @@
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
+mod minimax;
 mod qwen;
 pub mod local;
 pub mod remote;
+pub mod startup;
 pub mod worker;
 pub mod audio;
 
@@ -137,7 +139,7 @@ pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
 }
-fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
+fn tower_catalog(snapshot: &Path, prefixes: &[&str]) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
     let mut files = BTreeSet::new();
     let index_path = snapshot.join("model.safetensors.index.json");
     if index_path.exists() {
@@ -146,7 +148,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
         .as_object()
         .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
         for (name, file) in map {
-        if name.starts_with(prefix) {
+        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
             let file = file.as_str().ok_or_else(|| {
             VisionError::Unsupported(format!("invalid file for {name}"))
             })?;
@@ -176,7 +178,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
         for metadata in read_safetensors_metadata(&path)
         .map_err(|e| VisionError::Unsupported(e.to_string()))?
         {
-        if metadata.name.starts_with(prefix) {
+        if prefixes.iter().any(|prefix| metadata.name.starts_with(prefix)) {
             let name = metadata.name.clone();
             if tensors
             .insert(name.clone(), (path.clone(), metadata))
@@ -197,6 +199,7 @@ impl TowerSpec {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            Some("minimax_m3_vl") => Self::minimax(snapshot, max_tokens),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
@@ -205,13 +208,14 @@ impl TowerSpec {
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
+            4 => ImageFamily::Minimax,
             _ => ImageFamily::Mimo,
         }
     }
     pub fn mimo(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: MimoConfig = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         cfg.validate(max_tokens)?;
-        let tensors = tower_catalog(snapshot, "visual.")?;
+        let tensors = tower_catalog(snapshot, &["visual."])?;
         for bias in [
             "visual.merger.ln_q.bias",
             "visual.merger.mlp.0.bias",
@@ -322,6 +326,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
             cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+            cuteafd_loader::media::ImageFamily::Minimax => "minimax_m3",
         };
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
     }
@@ -345,7 +350,8 @@ impl TowerSpec {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
         }
-        let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
+        let frequencies = if self.native.reserved == 4 { 13 }
+            else if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
         for i in 0..frequencies {
             let value = 1.0f32 / 10000f32.powf(i as f32 / frequencies as f32);
             let start = self.native.inv_freq as usize + i * 4;
@@ -355,13 +361,10 @@ impl TowerSpec {
     }
 }
 
-/// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
+/// The loader's per-family normalization table, flattened `[channel * 256 + rgb8]`.
 pub fn normalization_lut(config: &cuteafd_loader::media::ProcessorConfig) -> Arc<[f32; 768]> {
-    Arc::new(std::array::from_fn(|i| {
-        let c = i / 256;
-        let pixel = ((i % 256) as f64 * (1.0 / 255.0)) as f32;
-        (pixel - config.mean[c] as f32) / config.std[c] as f32
-    }))
+    let table = config.normalization_lut();
+    Arc::new(std::array::from_fn(|i| table[i / 256][i % 256]))
 }
 
 pub struct VitRuntime {

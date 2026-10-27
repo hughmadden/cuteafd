@@ -4,7 +4,7 @@
 //! cached), for every family's template; tool calls round-trip through each
 //! protocol; dropping a gateway stream cancels the engine request.
 use super::*;
-use crate::openai::{chat::{glm5, qwen4}, router_for_model, ConsoleHub, GatewayMount, InferenceChunk, InferenceFinishReason,
+use crate::openai::{chat::{glm5, minimax_m3, qwen4}, router_for_model, ConsoleHub, GatewayMount, InferenceChunk, InferenceFinishReason,
     NativeRequest, PromptUsage};
 use axum::body::Body;
 use std::sync::Mutex;
@@ -42,6 +42,8 @@ fn families() -> Vec<Family> {
             snapshot: None },
         Family { name: "qwen-fixture", profile: ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))),
             snapshot: None },
+        Family { name: "minimax-fixture", profile: ModelProfile::new("test-minimax",
+            ModelEncoding::MiniMaxM3(Arc::new(minimax_m3::fixtures::encoding()))), snapshot: None },
     ];
     for (name, rel, glm) in [
         ("glm53-flash", "models--zai-org--GLM-5.3-Flash", true),
@@ -645,6 +647,42 @@ async fn system_items_follow_each_template_placement_rule() {
 }
 
 #[tokio::test]
+async fn chat_developer_and_root_roles_reach_only_the_minimax_template() {
+    // MiniMax's template renders `developer` (its low-priority system slot) and
+    // `root` (its high-priority one); the adapter's role enum, shared by every
+    // family, has neither, so the other families still refuse them.
+    for family in families() {
+        let minimax = matches!(family.profile.encoding, ModelEncoding::MiniMaxM3(_));
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for role in ["developer", "root"] {
+            let body = json!({"model":family.profile.id,"stream":false,"max_tokens":8,"thinking":{"type":"disabled"},
+                "messages":[{"role":role,"content":"Answer in French."},{"role":"user","content":"hi"}]});
+            let (status, text) = post(&app, "/v1/chat/completions", body).await;
+            assert_eq!(status, if minimax { StatusCode::OK } else { StatusCode::BAD_REQUEST }, "{} {role}: {text}", family.name);
+        }
+        let prompts = worker.prompts.lock().unwrap().clone();
+        if !minimax { assert!(prompts.is_empty(), "{}", family.name); continue; }
+        assert!(prompts[0].contains("[e~[\n]~b]developer\nAnswer in French.[e~[\n]~b]user\nhi"), "{}", prompts[0]);
+        assert!(prompts[1].starts_with("]~!b[]~b]system\nAnswer in French.\n\n<thinking_instructions>"), "{}", prompts[1]);
+        assert!(prompts[1].contains("]~b]developer\nYou are a helpful assistant.[e~["), "{}", prompts[1]);
+        // The template drops a later `root`; refuse it rather than lose its text.
+        let body = json!({"model":family.profile.id,"messages":[{"role":"user","content":"hi"},{"role":"root","content":"x"}]});
+        assert_eq!(post(&app, "/v1/chat/completions", body).await.0, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn chat_rejects_a_non_object_body_for_every_family() {
+    for family in families() {
+        let (app, _) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for body in [json!([]), json!("hi"), json!(7)] {
+            let (status, text) = post(&app, "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}: {text}", family.name);
+        }
+    }
+}
+
+#[tokio::test]
 async fn resent_web_search_call_without_results_keeps_the_session_valid() {
     // Codex over HTTP (store:false) resends its hosted web_search_call items
     // by value: action and status, never the sources. Every later turn must
@@ -712,6 +750,47 @@ async fn messages_without_thinking_do_not_reason_while_responses_and_chat_keep_d
     assert!(thinks(&prompts[1]), "Messages thinking enabled");
     assert!(thinks(&prompts[2]), "Responses keeps the server default");
     assert!(thinks(&prompts[3]), "chat keeps the server default");
+}
+
+/// MiniMax M3 reads one `<effort>` level from the system prompt: Anthropic
+/// budgets bucket into it, Responses/Chat efforts pass through, the switches
+/// that turn thinking off and efforts none or minimal (as the vendor
+/// documents) close the reasoning prefix, an explicit enable (Anthropic
+/// `enabled`, a Responses effort of low or more) opens it, and Anthropic
+/// `adaptive` or a bare chat effort leaves it to the model.
+#[tokio::test]
+async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
+    let profile = ModelProfile::new("test-minimax", ModelEncoding::MiniMaxM3(Arc::new(minimax_m3::fixtures::encoding())));
+    let (app, worker) = serve(profile, None, vec![], false);
+    let msg = |thinking: Value| json!({"model":"m","max_tokens":8,"thinking":thinking,"messages":[{"role":"user","content":"hi"}]});
+    let requests = [
+        ("/v1/messages", json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":1024}))),
+        ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":8000}))),
+        ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":64000}))),
+        ("/v1/messages", msg(json!({"type":"disabled"}))),
+        ("/v1/messages", msg(json!({"type":"adaptive","budget_tokens":8000}))),
+        ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"xhigh"}})),
+        ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"minimal"}})),
+        ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"none"}})),
+        ("/v1/chat/completions", json!({"model":"test-minimax","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"low"}})),
+        ("/v1/chat/completions", json!({"model":"test-minimax","reasoning_effort":"minimal","messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/chat/completions", json!({"model":"test-minimax","reasoning_effort":"high","thinking":{"type":"disabled"},
+            "messages":[{"role":"user","content":"hi"}]})),
+    ];
+    for (path, body) in requests {
+        let (status, text) = post(&app, path, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{path} {body}: {text}");
+    }
+    let prompts = worker.prompts.lock().unwrap().clone();
+    let effort = |p: &str| p.split("<effort>").nth(1).and_then(|r| r.split("</effort>").next()).map(str::to_owned);
+    let mode = |p: &str| if p.ends_with("</mm:think>") { "off" } else if p.ends_with("<mm:think>") { "enabled" } else { "adaptive" };
+    let got: Vec<_> = prompts.iter().map(|p| (effort(p), mode(p))).collect();
+    let some = |level: &str, mode| (Some(level.to_owned()), mode);
+    assert_eq!(got, vec![(None, "off"), some("low", "enabled"), some("high", "enabled"), some("max", "enabled"), (None, "off"),
+        some("high", "adaptive"), some("xhigh", "enabled"), (None, "off"), (None, "off"), some("medium", "adaptive"),
+        some("low", "enabled"), (None, "off"), (None, "off")]);
 }
 
 #[tokio::test]

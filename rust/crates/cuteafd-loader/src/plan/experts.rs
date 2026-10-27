@@ -10,7 +10,9 @@
 //!   and tp2, a tp1 coordinator package.
 //! - NVFP4 (ModelOpt) through the same programs (`glmf:nvfp4`, `qwen4:nvfp4`,
 //!   `glm:nvfp4`): Spark tp4, tp2, tp3 and tp6 in whole 16-value blocks, a tp1
-//!   coordinator package. GLM Flash also has padded K16 TP5.
+//!   coordinator package. GLM Flash also has padded K16 TP5. MiniMax M3
+//!   (`minimax:nvfp4`, compressed-tensors scales, SwiGLU-OAI) uses the same
+//!   worlds at its exact 1536/1024/768/512 widths.
 //! - EXL3 (`python/tools/aot/package_exl3_aot.py`): Spark worlds 4, 2, 3, and
 //!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
@@ -213,7 +215,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
     let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
-        || (family == "step5" && format == "nvfp4");
+        || (matches!(family, "step5" | "minimax") && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
     let bf16 = family == "step5" && format == "bf16";

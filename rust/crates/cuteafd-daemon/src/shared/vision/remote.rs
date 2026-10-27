@@ -34,6 +34,12 @@ pub struct EncoderHandshake {
     pub plan_hash: [u8; 32],
 }
 impl EncoderHandshake {
+    /// What a peer hosting `spec` answers, and so what a coordinator expects of it.
+    pub fn for_tower(spec: &super::TowerSpec, encoder_id: EncoderId, processor: &cuteafd_loader::media::ProcessorConfig,
+        plan_hash: [u8; 32]) -> Self {
+        Self { encoder_id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
+            output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash }
+    }
     fn validate(&self) -> Result<()> {
         if self.max_patches == 0
             || self.max_patches > MAX_PATCHES

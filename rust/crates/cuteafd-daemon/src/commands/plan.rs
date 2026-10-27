@@ -67,6 +67,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
+                minimax_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
                 mla_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
@@ -276,6 +280,12 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
                 "Kimi MLA speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
             layout.kimi_drafter_snapshot = args.drafter_snapshot.clone();
         }
+        if family == "minimax_m3" && args.speculator == "dflash2" {
+            anyhow::ensure!(args.drafter_snapshot.is_some(),
+                "MiniMax DFlash2 speculation requires --drafter-snapshot SNAPSHOT");
+            layout.minimax_drafter_snapshot = args.drafter_snapshot.clone();
+            layout.minimax_draft_bf16 = args.minimax_draft_bf16;
+        }
         let config = &checkpoint.config;
         let v41 = config.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41")
             || config.get("architectures").and_then(serde_json::Value::as_array)
@@ -443,6 +453,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
         "mimo_v2" | "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
         "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
+        "minimax_m3" if snapshot.join("dspark").is_dir() && args.native_mtp_layers > 0 => "dspark",
         _ => "off",
     };
     if args.speculator == "auto" {
@@ -461,13 +472,14 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
         args.speculator = "off".into();
     } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
-        args.speculator = if family == "kimi_k3" && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
+        args.speculator = if matches!(family, "kimi_k3" | "minimax_m3") && args.drafter_snapshot.is_some() { "dflash2".into() }
+            else { default.into() };
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "minimax_m3", "dspark") | ("minimax_m3", "dflash2") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);
@@ -508,15 +520,18 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
                 ("glm5", "dflash2") => Some("incoai/GLM-5.3-DFlash2"),
                 ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
                 ("glm5_flash", "dspark") => Some("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"),
+                ("minimax_m3", "dflash2") => Some("RadixArk/Minimax-M3.1-Flash-Dflash2"),
                 _ => None,
             });
         if let Some(model) = model {
             let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+            // A family's own drafter keeps the revision it was qualified at (the launcher's
+            // family_default_drafter) unless the config names another.
             let revision = cfg.get("SPECULATOR_MODEL_REVISION").or_else(|| cfg.get("DRAFT_MODEL_REVISION"))
-                .filter(|v| !v.is_empty()).map(String::as_str).or_else(|| {
-                    (family == "qwen3_5" && args.speculator == "dspark"
-                        && model == "RadixArk/Qwen3.8-27B-DSpark")
-                        .then_some("85ef153be924f17ce4bf62726954eeaa4a73e854")
+                .filter(|v| !v.is_empty()).map(String::as_str).or(match (family, args.speculator.as_str(), model) {
+                    ("qwen3_5", "dspark", "RadixArk/Qwen3.8-27B-DSpark") => Some("85ef153be924f17ce4bf62726954eeaa4a73e854"),
+                    ("minimax_m3", "dflash2", "RadixArk/Minimax-M3.1-Flash-Dflash2") => Some("923bf1d4b567d5ccb71b0488c6e61b5e4794e92a"),
+                    _ => None,
                 });
             args.drafter_snapshot = Some(resolve_snapshot_at_revision(model, Some(&hf_home), revision)?
                 .snapshot_path.with_context(|| format!("required speculator {model} is not downloaded; use --no-speculator only when serving without it"))?);
@@ -933,7 +948,7 @@ mod tests {
             mimo_decode_graphs: false,
             physical_sms: None,
             mimo_draft_bf16: false,
-            glm5_draft_bf16: false,
+            glm5_draft_bf16: false, minimax_draft_bf16: false,
             mimo_expert_manifest: None,
             prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
             native_mtp_layers: 3,
@@ -1486,6 +1501,32 @@ mod tests {
             input.config = Some(config.clone());
             let resolved = file_args(input, target.path()).unwrap();
             assert_eq!(resolved.speculator, "dspark");
+            assert_eq!(resolved.drafter_snapshot, Some(draft));
+        }
+    }
+
+    #[test]
+    fn minimax_dflash2_pins_qualified_revision_and_preserves_overrides() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &serde_json::json!({"architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+            "model_type": "minimax_m3_vl"}), &[t("unused.weight", "BF16", &[2])], None);
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("hub/models--RadixArk--Minimax-M3.1-Flash-Dflash2");
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "unavailable-main").unwrap();
+        let config = target.path().join("launch.config");
+        for selected in [None, Some("explicit-revision")] {
+            let revision = selected.unwrap_or("923bf1d4b567d5ccb71b0488c6e61b5e4794e92a");
+            let draft = repo.join("snapshots").join(revision);
+            std::fs::create_dir_all(&draft).unwrap();
+            std::fs::write(&config, format!("SPECULATOR=dflash2\n{}", selected.map_or_else(String::new,
+                |revision| format!("SPECULATOR_MODEL_REVISION={revision}\n")))).unwrap();
+            let mut input = args(target.path(), 0, false);
+            input.hf_home = Some(home.path().into());
+            input.config = Some(config.clone());
+            let resolved = file_args(input, target.path()).unwrap();
+            assert_eq!(resolved.speculator, "dflash2");
             assert_eq!(resolved.drafter_snapshot, Some(draft));
         }
     }

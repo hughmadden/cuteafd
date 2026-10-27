@@ -32,6 +32,7 @@ pub fn family_title(family: &str) -> &str {
         "glm5" => "GLM 5.3",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
+        "minimax_m3" => "MiniMax M3.1",
         "qwen4" => "Qwen 3.8",
         other => other,
     }

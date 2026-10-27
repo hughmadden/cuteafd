@@ -5,3 +5,4 @@ pub(crate) mod glm5;
 pub(crate) mod mimo_v2;
 pub(crate) mod kimi_k3;
 pub(crate) mod kimi_k3_split;
+pub mod minimax;

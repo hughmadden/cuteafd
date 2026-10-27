@@ -175,6 +175,14 @@ fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
             None => "dSpark".into(),
         });
     }
+    // A serve command that names its drafter (MiniMax: --speculator dspark|off, --draft-fixed N).
+    if let Some(kind) = setting(settings, &["speculator"]).filter(|v| *v != "off") {
+        let kind = if kind == "dspark" { "dSpark" } else { kind };
+        return Some(match setting(settings, &["draft-fixed"]) {
+            Some(depth) => format!("{kind} (fixed {depth})"),
+            None => kind.into(),
+        });
+    }
     if let Some(draft) = setting(settings, &["draft"]).filter(|v| *v != "false") {
         let name = Path::new(draft).file_name().and_then(|n| n.to_str()).unwrap_or(draft);
         let kind = if draft.to_ascii_lowercase().contains("dspark") { "dSpark" } else { "DFlash2" };
@@ -294,6 +302,11 @@ mod tests {
         assert_eq!(speculator(Some("glm5_flash"), &[s("draft",
             "/hf/models--RedHatAI--GLM-5.3-Flash-speculator.dspark-preview/snapshots/1972f1f0", None, "cli")]).as_deref(),
             Some("dSpark (1972f1f0)"));
+        assert_eq!(speculator(Some("minimax_m3"), &[s("speculator", "dspark", Some("dspark"), "cli")]).as_deref(),
+            Some("dSpark"));
+        assert_eq!(speculator(Some("minimax_m3"), &[s("speculator", "dspark", Some("dspark"), "default"),
+            s("draft-fixed", "7", None, "cli")]).as_deref(), Some("dSpark (fixed 7)"));
+        assert_eq!(speculator(Some("minimax_m3"), &[s("speculator", "off", Some("dspark"), "cli")]), None);
         assert_eq!(speculator(Some("qwen4"), &[]), None);
         assert_eq!(speculator(Some("mimo_v2"), &[]), None);
     }

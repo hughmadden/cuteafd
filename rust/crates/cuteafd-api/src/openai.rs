@@ -53,6 +53,7 @@ pub enum ModelEncoding {
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
+    MiniMaxM3(Arc<minimax_m3::MiniMaxEncoding>),
 }
 
 impl ModelEncoding {
@@ -72,6 +73,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => encoding.tokens().eos.clone(),
             Self::Kimi(encoding) => encoding.eos_token_ids(),
             Self::Step5(encoding) => encoding.tokens().eos.clone(),
+            Self::MiniMaxM3(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -82,6 +84,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
             Self::Kimi(_) => None,
             Self::Step5(encoding) => Some(encoding.tokens().think_close),
+            Self::MiniMaxM3(encoding) => Some(encoding.tokens().think_close),
         }
     }
 }
@@ -152,6 +155,7 @@ impl ModelProfile {
     /// A profile whose EOS ids come from `encoding`.
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
+        let minimax = matches!(encoding, ModelEncoding::MiniMaxM3(_));
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
         Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
@@ -160,7 +164,8 @@ impl ModelProfile {
                 "<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>",
                 "<|image_pad|>", "<|image|>", "<|audio_pad|>", "<|im_start|>", "<|im_end|>",
                 kimi::OPEN, kimi::CLOSE, kimi::SEP, kimi::END,
-            ].into_iter().map(str::to_owned))) }
+            ].into_iter().chain(minimax.then_some([minimax_m3::IMAGE, minimax_m3::VIDEO,
+                "]<]start of image[>[", "]<]end of image[>["]).into_iter().flatten()).map(str::to_owned))) }
     }
 
     /// Load the complete added-token vocabulary, including non-special media
@@ -194,11 +199,12 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::MiniMaxM3(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::MiniMaxM3(encoding) => encoding.stop_token_ids(),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -223,7 +229,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, kimi, qwen4, step5};
+use chat::{deepseek, glm5, kimi, qwen4, step5, minimax_m3};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -563,6 +569,7 @@ enum Templated {
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
+    MiniMaxM3(Arc<minimax_m3::MiniMaxEncoding>),
 }
 
 impl Templated {
@@ -573,6 +580,8 @@ impl Templated {
         match self {
             Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
             Self::Qwen(_) | Self::Kimi(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::MiniMaxM3(_) => Ok(glm5::GlmThinking {
+                enabled: minimax_m3::Thinking::of(body)? != minimax_m3::Thinking::Off, effort: None }),
             Self::Step5(_) => {
                 step5::prompt::validate_thinking(body)?;
                 Ok(glm5::GlmThinking { enabled: true, effort: None })
@@ -588,6 +597,7 @@ enum OutputProcessor {
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
     Kimi(glm5::GlmStreamProcessor<ChatGenerator, kimi::KimiOutputParser>),
     Step5(glm5::GlmStreamProcessor<ChatGenerator, step5::Step5OutputParser>),
+    MiniMaxM3(glm5::GlmStreamProcessor<ChatGenerator, minimax_m3::MiniMaxOutputParser>),
 }
 
 impl OutputProcessor {
@@ -598,6 +608,7 @@ impl OutputProcessor {
             Self::Qwen(processor) => Box::pin(processor.process(input)),
             Self::Kimi(processor) => Box::pin(processor.process(input)),
             Self::Step5(processor) => Box::pin(processor.process(input)),
+            Self::MiniMaxM3(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -735,6 +746,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
         ModelEncoding::Kimi(encoding) => Some(Templated::Kimi(encoding.clone())),
         ModelEncoding::Step5(encoding) => Some(Templated::Step5(encoding.clone())),
+        ModelEncoding::MiniMaxM3(encoding) => Some(Templated::MiniMaxM3(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -776,6 +788,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     if response_format.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) == Some("regex") {
         body["response_format"] = json!({"type":"text"});
     }
+    // Only an object takes defaults; anything else fails validation below (a
+    // non-object body must be a 400, not a panic indexing into it).
+    if let (ModelEncoding::MiniMaxM3(_), Some(object)) = (&profile.encoding, body.as_object_mut()) {
+        for (key, value) in [("temperature", 1.0), ("top_p", 0.95)] {
+            if object.get(key).is_none_or(Value::is_null) { object.insert(key.into(), json!(value)); }
+        }
+    }
     let sampling = request_target_sampling(&body).map_err(Rejection::bad)?;
     // V4.1's checkpoint encoder also takes a numeric budget (1-100), which the
     // adapter's enum cannot parse: take it out here and apply it after rendering.
@@ -808,6 +827,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     if !audio_sources.is_empty() {
         if glm_request.is_none() { return Err(Rejection::bad("audio requires a checkpoint chat template")); }
         media::audio::strip_adapter_audio(&mut body);
+    }
+    // MiniMax's template renders `developer` and its own `root` from the raw
+    // body kept above; the adapter has neither role and checks them as system.
+    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
+        for message in body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
+            if matches!(message["role"].as_str(), Some("developer" | "root")) { message["role"] = json!("system"); }
+        }
     }
     let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
@@ -845,17 +871,25 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
         Some((Templated::Qwen(_), _, _)) | Some((Templated::Step5(_), _, _)) => tools::ToolSyntax::QwenXml,
         Some((Templated::Kimi(_), _, _)) => tools::ToolSyntax::KimiXtml,
+        Some((Templated::MiniMaxM3(_), _, _)) => tools::ToolSyntax::MiniMaxM3,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = match profile.encoding.think_close_token_id() {
+    // MiniMax tells adaptive from enabled thinking, which the switch above merges.
+    let minimax_thinking = match &glm_request {
+        Some((Templated::MiniMaxM3(_), raw, _)) => Some(minimax_m3::Thinking::of(raw).map_err(Rejection::bad)?),
+        _ => None,
+    };
+    let constraint = if let Some(thinking) = minimax_thinking {
+        minimax_m3::grammar::response(response_format.clone(), thinking, tool_constraints.as_ref())
+    } else { match profile.encoding.think_close_token_id() {
         Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
         None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref()),
-    }.map_err(Rejection::bad)?;
+    }}.map_err(Rejection::bad)?;
     let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
@@ -901,6 +935,16 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::MiniMaxM3(encoding), raw, _thinking)) => {
+            let names = converted.conversation.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+            let prompt = encoding.render(&raw, &names).map_err(Rejection::bad)?;
+            // tool_choice none already left no tools (the recipe's conversion drops them).
+            let parser = minimax_m3::MiniMaxOutputParser::new(minimax_m3::MiniMaxParserOptions {
+                thinking: minimax_thinking == Some(minimax_m3::Thinking::Enabled),
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
+            (prompt, Vec::new(), OutputProcessor::MiniMaxM3(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Step5(encoding), raw, _thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -1106,6 +1150,9 @@ impl Submitter {
         if let Some(scope) = &usage { scope.queued(queue_started.elapsed().as_secs_f64() * 1000.); }
         let prepared = prepare_media(profile, &self.images, work, probe.as_ref()).await?;
         let (image_tokens, audio_tokens) = (prepared.image_tokens(), prepared.audio_tokens());
+        let (prompt, literal_spans) = if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) && probe.is_none() {
+            minimax_m3::expand_image_markers(&prompt, &literal_spans, prepared.media.len()).map_err(Rejection::bad)?
+        } else { (prompt, literal_spans) };
         // Unbounded on purpose: inference threads send without ever blocking, so a
         // client that stops reading cannot stall the shared scheduler. A request's
         // backlog is bounded by its own max_tokens.

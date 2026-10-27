@@ -42,6 +42,7 @@ pub(super) enum ToolSyntax {
     QwenXml,
     /// Kimi XTML; assisted decoding uses its native JSON-object call form.
     KimiXtml,
+    MiniMaxM3,
 }
 
 pub(super) struct ToolConstraints {
@@ -71,6 +72,7 @@ impl ToolConstraints {
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
             tags.push(match syntax {
+                ToolSyntax::MiniMaxM3 => super::minimax_m3::grammar::invocation(&tool.name),
                 ToolSyntax::KimiXtml => json!({"type":"tag",
                     "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
                     "content":{"type":"sequence", "elements":[
@@ -101,6 +103,7 @@ impl ToolConstraints {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            ToolSyntax::MiniMaxM3 => calls_block(super::minimax_m3::CALL_OPEN, super::minimax_m3::CALL_CLOSE, tags, parallel),
             ToolSyntax::KimiXtml => {
                 let calls = json!({"type":"tag", "begin":"<|open|>tools<|sep|>",
                     "content":{"type":"tags_with_separator", "tags":tags, "separator":"",
@@ -155,6 +158,19 @@ impl ToolConstraints {
         }
         Ok(())
     }
+}
+
+/// MiniMax M3's calls block: `open`, invokes separated by newlines with whitespace
+/// bounded as DSML's so greedy decoding cannot loop on it, `close`; plus the
+/// triggered form that leaves free text until `open`.
+pub(super) fn calls_block(open: &str, close: &str, tags: Vec<Value>, parallel: bool) -> (Value, Value) {
+    let calls = json!({"type":"tag", "begin":open, "content":{"type":"sequence", "elements":[
+        {"type":"regex", "pattern":"[ \\n\\t]{0,16}"},
+        {"type":"tags_with_separator", "tags":tags, "separator":"\n", "at_least_one":true, "stop_after_first":!parallel},
+        {"type":"regex", "pattern":"[ \\n\\t]{0,16}"}]}, "end":close});
+    let triggered = json!({"type":"triggered_tags", "triggers":[open], "tags":[calls.clone()],
+        "at_least_one":false, "stop_after_first":true});
+    (calls, triggered)
 }
 
 #[derive(Default)]

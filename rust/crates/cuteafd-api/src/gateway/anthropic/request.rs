@@ -208,11 +208,13 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
     turn.sampling.top_p = float(value, "top_p")?;
     turn.sampling.top_k = number(value, "top_k")?;
     if let Some(thinking) = value.get("thinking") {
-        turn.reasoning.enabled = Some(match string(thinking, "type")?.as_str() {
+        let kind = string(thinking, "type")?;
+        turn.reasoning.enabled = Some(match kind.as_str() {
             "enabled" | "adaptive" => true,
             "disabled" | "between_tools" => false,
             _ => return Err(GatewayError::invalid("unknown thinking.type")),
         });
+        turn.reasoning.adaptive = kind == "adaptive";
         turn.reasoning.budget_tokens = number(thinking, "budget_tokens")?;
         turn.reasoning.return_text =
             thinking.get("display").and_then(Value::as_str) != Some("omitted");

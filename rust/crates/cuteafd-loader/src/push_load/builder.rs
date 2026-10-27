@@ -672,6 +672,7 @@ impl Builder {
     ) -> Result<()> {
         use crate::formats::fp8_experts::ExpertFormat;
         let tensors = tensors.for_layer_metadata(layer)?;
+        tensors.validate_push_scales()?;
         let name = tensors.name(layer, expert, projection);
         let [w, mut s] = tensors.projection_slices(projection, world, rank, slicing)?;
         let (source, _) = tensors.push_source(&name)?;

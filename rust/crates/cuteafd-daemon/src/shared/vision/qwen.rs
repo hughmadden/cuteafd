@@ -26,7 +26,7 @@ impl TowerSpec {
         {
             return Err(VisionError::Unsupported("Qwen tower config/merger geometry or image capacity".into()));
         }
-        let tensors = tower_catalog(snapshot, "model.visual.")?;
+        let tensors = tower_catalog(snapshot, &["model.visual."])?;
         let mut reads = Vec::new();
         let mut cursor = 0usize;
         let mut put = |name: &str, shape: &[usize], vector: bool| -> Result<u64> {

@@ -1269,6 +1269,7 @@ mod warm_stream_tests {
         for (family, source, library) in [
             ("glm5_flash", include_str!("../families/glm5_flash/mod.rs"), "self.library.as_ref()"),
             ("mimo_v2", include_str!("../families/mimo_v2/mod.rs"), "&*self.library"),
+            ("minimax_m3", include_str!("../families/minimax_m3/routed.rs"), "library"),
         ] {
             let created = ["let warm_stream = crate::shared::spark_intake::Warm", "Stream::new(", library, ")?;"].concat();
             assert_eq!((source.matches(&created).count(), source.matches(&finished).count()), (1, 1), "{family}");
@@ -1320,6 +1321,7 @@ mod warm_stream_tests {
             ("qwen4", include_str!("../families/qwen4/mod.rs")),
             ("step5", include_str!("../families/step5/serve.rs")),
             ("step5 golden", include_str!("../families/step5/golden.rs")),
+            ("minimax_m3", include_str!("../families/minimax_m3/routed.rs")),
         ] {
             let transport = spark_transport_constructor(source)
                 .unwrap_or_else(|| panic!("{family}: no Spark transport"));
@@ -1339,6 +1341,7 @@ mod warm_stream_tests {
             include_str!("../families/mimo_v2/mod.rs"),
             include_str!("../families/qwen4/mod.rs"),
             include_str!("../families/qwen4/engine.rs"),
+            include_str!("../families/minimax_m3/routed.rs"),
         ] {
             assert!(!source.contains(&bare), "a Spark transport is bootstrapped without a wave request");
         }
@@ -1838,7 +1841,7 @@ mod tests {
     fn registered_egress_slots_hold_a_whole_prefill_wave_staging() -> Result<()> {
         use cuteafd_core::ExpertGeometry as G;
         for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO, G::GLM5, G::GLM5_FLASH,
-            G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4, G::KIMI_K3, G::STEP5] {
+            G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4, G::KIMI_K3, G::STEP5, G::MINIMAX_M3] {
             for rows in [1u32, 64, 1024, 4096] {
                 for bf16 in [false, true] {
                     let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);

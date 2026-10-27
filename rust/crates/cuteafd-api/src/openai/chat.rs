@@ -5,3 +5,4 @@ pub mod glm5;
 pub mod kimi;
 pub mod qwen4;
 pub mod step5;
+pub mod minimax_m3;
