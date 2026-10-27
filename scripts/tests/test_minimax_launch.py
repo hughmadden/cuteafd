@@ -27,6 +27,8 @@ RADIXARK_REVISION = "923bf1d4b567d5ccb71b0488c6e61b5e4794e92a"
 
 
 def _launch(tmp_path, keys="", *, ranks=4, **kwargs):
+    # MiniMax is under qualification (#284): it serves from a WIP slot only.
+    kwargs.setdefault("extra_args", ("--wip", "minimax"))
     return _family_launch_result(tmp_path, CONFIG, MODEL,
         f"SPARK_COUNT={ranks}\nRTX_GPUS=1\nVISION=off\nAUDIO=off\nHOST_CACHE_BYTES=0\n"
         + _hosts(ranks) + keys, encoder_plan=kwargs.pop("encoder_plan", PLANNED), **kwargs)
@@ -69,7 +71,8 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
 ])
 def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, keys, quota, store):
     result = _family_launch_result(tmp_path, CONFIG, MODEL,
-        "SPARK_COUNT=4\nRTX_GPUS=1\nVISION=off\nAUDIO=off\n" + _hosts(4) + keys, encoder_plan=PLANNED)
+        "SPARK_COUNT=4\nRTX_GPUS=1\nVISION=off\nAUDIO=off\n" + _hosts(4) + keys, encoder_plan=PLANNED,
+        extra_args=("--wip", "minimax"))
     serve = _line(result, "serve-minimax --snapshot")
     assert _flag(serve, "--host-cache-bytes") == quota
     assert _flag(serve, "--host-cache-store") == store
@@ -108,6 +111,19 @@ def test_minimax_refuses_unsupported_launch(tmp_path, keys, diagnostic):
     assert result.returncode != 0
     assert diagnostic in result.stderr
     assert "docker run -d" not in result.stderr
+
+
+def test_minimax_refuses_release_images_and_slots_without_serve_minimax(tmp_path):
+    release = _launch(tmp_path / "release", extra_args=())
+    assert release.returncode != 0
+    assert "minimax_m3 serving is under qualification; run it from a WIP slot" in release.stderr
+    # The slot's binary predates serve-minimax: --help on it fails, nothing is planned or started.
+    old = _launch(tmp_path / "old", probe_fails=True)
+    assert old.returncode == 2, old.stderr
+    assert ("WIP slot minimax has no 'serve-minimax' command; build the slot from a commit that serves minimax_m3"
+            in old.stderr)
+    for result in (release, old):
+        assert "cuteafd plan" not in result.stderr and "docker run -d" not in result.stderr
 
 
 @pytest.mark.parametrize("keys,pinned,resolved", [
@@ -213,9 +229,10 @@ def test_minimax_routes_bundled_vision_from_the_plan(tmp_path, kind):
     placement = {"kind": kind, "rank" if kind == "spark" else "gpu": 0}
     plan = {**PLANNED, "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": placement, "replicas": []}, "max_image_tokens": 4096}
+    # Under qualification MiniMax keeps its bundled image tower (#284).
     result = _family_launch_result(tmp_path, config, MODEL,
         "SPARK_COUNT=4\nRTX_GPUS=1\nVISION=auto\nAUDIO=off\n" + _hosts(4),
-        encoder_plan=plan)
+        encoder_plan=plan, extra_args=("--wip", "minimax"))
     serve = _line(result, "serve-minimax --snapshot")
     assert _flag(serve, "--vision") == f"{kind}:0"
     assert _flag(serve, "--host-cache-bytes") == "auto"

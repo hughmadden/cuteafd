@@ -1697,11 +1697,17 @@ esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
 # in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5 defaults
-# to native MTP depth 3 (SPECULATOR=off disables it).
+# to native MTP depth 3 (SPECULATOR=off disables it). MiniMax M3.1 (#284) is
+# under qualification from WIP slots too, with automatic attention placement;
+# its bundled image tower is in scope, so it keeps VISION.
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
-if ((qualifying)); then
+wip_only=$qualifying
+[[ "$family" != minimax_m3 ]] || wip_only=1
+if ((wip_only)); then
   [[ -n "$wip_slot" ]] || release_die "$family serving is under qualification; run it from a WIP slot (--wip SLOT)"
+fi
+if ((qualifying)); then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
     *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
@@ -1816,7 +1822,7 @@ if [[ -n "$wip_slot" ]]; then
 fi
 # Families whose serve command lands on its own branch: refuse a slot whose
 # binary predates it before planning or touching any service.
-if ((qualifying)); then
+if ((wip_only)); then
   docker run --rm --network none --mount "type=bind,src=$wip_layout/bin/cuteafd,dst=/opt/cuteafd-serve-probe,readonly" \
     --entrypoint /opt/cuteafd-serve-probe "$coordinator_image" "$serve" --help >/dev/null ||
     release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"

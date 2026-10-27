@@ -7,8 +7,9 @@ MXFP8 dense projections, a bundled vision tower and a bundled DSpark drafter.
 Status: **under qualification**. MiniMax runs on the shared engine: prefill
 units on the shared executor and Spark exchange, typed Spark owners, decode
 as lane 0 of the shared Qwen scheduler and exact prefix-cache restores. No
-release image ships `serve-minimax` yet, so serve it from a `./wip.sh` slot
-(`--wip SLOT`) on one RTX PRO 6000 coordinator with 2, 3, 4 or 6 Sparks.
+release image ships `serve-minimax` yet: the launcher serves it only from a
+`./wip.sh` slot (`--wip SLOT`), with its image tower, on one RTX PRO 6000
+coordinator with 2, 3, 4 or 6 Sparks.
 `cuteafd plan --layout` admits it from the slot's `PROGRAMS.json` with the
 server's own allocation recipe. Its hardware qualification on the RTX PRO
 6000 (golden fidelity, exact prefix restores, lossless speculation, N=1-vs-N
