@@ -79,12 +79,13 @@ impl V41PrefillTimes {
         let end = (next + chunk_rows).min(tokens);
         if !streamed { return V41Unit::Single(next..end); }
         let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
-        // V4.1 cuts fixed units of exactly the registered prefill rows and one
-        // tail: its owners capture graphs only at that width
-        // (graph_policy::captures_shape), and an uncaptured width runs every
-        // site eagerly, several with host waits. The shared balanced cut
-        // (prefill_units) would make every unit an uncaptured width.
-        let _ = waves;
+        if whole && waves > 1 && chunk_rows % 64 == 0 {
+            // The shared cut: full units of the configured (captured) width and one tail.
+            if let Ok(units) = crate::shared::prefill_pipeline::prefill_units(tokens - next, chunk_rows, waves,
+                cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize) {
+                return V41Unit::Stream(units.into_iter().map(|unit| next + unit.start..next + unit.end).collect());
+            }
+        }
         let mut chunks = vec![next..end];
         let mut next = end;
         while next < tokens && (whole || chunks.len() < 2) {

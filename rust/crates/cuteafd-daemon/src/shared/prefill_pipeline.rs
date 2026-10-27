@@ -220,28 +220,25 @@ pub(crate) enum Step {
 /// whole prompt's rows rather than switching route on a half.
 pub(crate) const MIN_SPLIT_ROWS: usize = 1024;
 
-/// Cut `span` rows into equal 64-row-aligned units of at most `unit_rows`.
+/// Cut `span` rows into 64-row-aligned units of at most `unit_rows`.
 ///
-/// A span of at least `waves` units cuts into a multiple of `waves` units
-/// while each keeps `min_rows`, so the in-flight units finish together and no
-/// unit runs a short tail alone. A shorter span runs on fewer waves rather
-/// than cut units below half a unit (#762, `prefill_waves::waves_used`), and
-/// a span that fits one unit splits only when each wave keeps
-/// [`MIN_SPLIT_ROWS`].
+/// A span longer than one unit cuts into full units of exactly `unit_rows`
+/// and one remainder tail: families capture graphs at the configured unit
+/// width, and a balanced width (`span / count`) would run every unit of a
+/// prompt eagerly (#815). A span that fits one unit splits into equal halves
+/// (or more) only when each wave keeps [`MIN_SPLIT_ROWS`] and the units stay
+/// half full (#762, `prefill_waves::waves_used`).
 pub(crate) fn prefill_units(span: usize, unit_rows: usize, waves: usize, min_rows: usize)
     -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     anyhow::ensure!(span > 0 && unit_rows > 0 && unit_rows % 64 == 0 && waves > 0 && min_rows > 0,
         "prefill unit geometry must be positive and page aligned");
-    let mut count = span.div_ceil(unit_rows);
-    let floor = if count == 1 { min_rows.max(MIN_SPLIT_ROWS) } else { min_rows };
-    if count >= waves {
-        let rounded = count.next_multiple_of(waves);
-        if span / rounded >= floor { count = rounded; }
-    } else {
-        let used = cuteafd_loader::serving_capacity::prefill_waves::waves_used(
-            span as u64, waves as u64, unit_rows as u64) as usize;
-        count = (count..=used).rev().find(|&n| n == count || span / n >= floor).unwrap_or(count);
+    if span > unit_rows {
+        return Ok((0..span).step_by(unit_rows).map(|first| first..span.min(first + unit_rows)).collect());
     }
+    let floor = min_rows.max(MIN_SPLIT_ROWS);
+    let used = cuteafd_loader::serving_capacity::prefill_waves::waves_used(
+        span as u64, waves as u64, unit_rows as u64) as usize;
+    let count = (1..=used).rev().find(|&n| n == 1 || span / n >= floor).unwrap_or(1);
     // ceil(span / count) <= unit_rows, and unit_rows is page aligned.
     let width = span.div_ceil(count).next_multiple_of(64);
     Ok((0..span).step_by(width).map(|first| first..span.min(first + width)).collect())
@@ -586,87 +583,54 @@ mod tests {
     }
 
     #[test]
-    fn units_cut_equal_page_aligned_and_in_multiples_of_waves() -> anyhow::Result<()> {
+    fn spans_past_one_unit_cut_full_captured_units_and_one_tail() -> anyhow::Result<()> {
+        // #815: every unit but the tail is exactly the configured (captured) width.
         assert_eq!(prefill_units(4096, 2048, 2, 256)?, [0..2048, 2048..4096]);
-        assert_eq!(prefill_units(5000, 2048, 2, 256)?, [0..1280, 1280..2560, 2560..3840, 3840..5000]);
-        assert_eq!(prefill_units(300, 2048, 2, 256)?, [0..300]);
-        assert_eq!(prefill_units(8192, 2048, 2, 256)?.len(), 4);
+        assert_eq!(prefill_units(5000, 2048, 2, 256)?, [0..2048, 2048..4096, 4096..5000]);
+        assert_eq!(prefill_units(8192, 2752, 3, 256)?, [0..2752, 2752..5504, 5504..8192]);
+        assert_eq!(prefill_units(8192, 1024, 3, 256)?.len(), 8);
+        assert_eq!(prefill_units(8192, 4096, 2, 256)?, [0..4096, 4096..8192]);
+        assert_eq!(prefill_units(65536, 4096, 2, 256)?.len(), 16);
         assert!(prefill_units(0, 2048, 2, 256).is_err() && prefill_units(10, 100, 2, 256).is_err());
-        // Spans that fit one unit stay whole below 2 x MIN_SPLIT_ROWS, at any wave count.
+        for span in 1..=20_000 {
+            for (rows, waves) in [(2048, 2), (1024, 2), (512, 1), (2048, 3), (2752, 3), (2048, 4)] {
+                let units = prefill_units(span, rows, waves, 256)?;
+                assert_eq!((units.first().unwrap().start, units.last().unwrap().end), (0, span));
+                assert!(units.windows(2).all(|pair| pair[0].end == pair[1].start && pair[1].start % 64 == 0));
+                assert!(units.iter().all(|unit| unit.len() <= rows));
+                if span > rows {
+                    assert!(units[..units.len() - 1].iter().all(|unit| unit.len() == rows), "{span}: {units:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A span that fits one unit splits only when each wave keeps
+    /// MIN_SPLIT_ROWS, onto the fewest waves that keep units half full (#762).
+    #[test]
+    fn spans_within_one_unit_split_for_overlap_only_when_worth_it() -> anyhow::Result<()> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{unit_rows, waves_used, MAX_WAVES};
+        assert_eq!(prefill_units(300, 2048, 2, 256)?, [0..300]);
         for span in [512, 1033, 1354, 2047] {
             for waves in 1..=4 {
                 assert_eq!(prefill_units(span, 4096, waves, 256)?, [0..span]);
                 assert_eq!(prefill_units(span, 2048, waves, 256)?, [0..span]);
             }
         }
-        // Below half a unit per wave a span runs on fewer waves (#762).
         assert_eq!(prefill_units(2048, 4096, 2, 256)?, [0..2048]);
         assert_eq!(prefill_units(4095, 4096, 2, 256)?, [0..4095]);
         assert_eq!(prefill_units(4096, 4096, 2, 256)?, [0..2048, 2048..4096]);
-        assert_eq!(prefill_units(2 * 2090, 4096, 2, 256)?, [0..2112, 2112..4180]);
-        for span in 1..=9000 {
-            for (rows, waves) in [(2048, 2), (1024, 2), (512, 1), (2048, 3)] {
-                let units = prefill_units(span, rows, waves, 256)?;
-                assert_eq!(units.first().unwrap().start, 0);
-                assert_eq!(units.last().unwrap().end, span);
-                assert!(units.windows(2).all(|pair| pair[0].end == pair[1].start && pair[1].start % 64 == 0));
-                assert!(units.iter().all(|unit| unit.len() <= rows));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn spans_longer_than_one_unit_keep_their_wave_cuts() -> anyhow::Result<()> {
-        // The cut rule before MIN_SPLIT_ROWS, for spans of at least `waves` units.
-        let before = |span: usize, unit_rows: usize, waves: usize| {
-            let mut count = span.div_ceil(unit_rows);
-            if span / count.next_multiple_of(waves) >= 256 { count = count.next_multiple_of(waves); }
-            let width = span.div_ceil(count).next_multiple_of(64);
-            (0..span).step_by(width).map(|first| first..span.min(first + width)).collect::<Vec<_>>()
-        };
-        for (unit_rows, waves) in [(4096, 2), (2048, 2), (1024, 2), (512, 2), (2752, 3), (4096, 3), (2048, 4)] {
-            for span in ((waves - 1) * unit_rows + 1..=70_000).step_by(7).chain([8192, 65536, 2 * 2090])
-                .filter(|&span| span > (waves - 1) * unit_rows) {
-                assert_eq!(prefill_units(span, unit_rows, waves, 256)?, before(span, unit_rows, waves),
-                    "{span} rows, {unit_rows} x {waves}");
-            }
-        }
-        assert_eq!(prefill_units(8192, 4096, 2, 256)?, [0..4096, 4096..8192]);
-        assert_eq!(prefill_units(65536, 4096, 2, 256)?.len(), 16);
-        Ok(())
-    }
-
-    /// #762: the reserve split into k waves; a span shorter than k units runs
-    /// on the fewest waves that keep each unit at least half full.
-    #[test]
-    fn short_spans_keep_units_half_full_at_every_wave_count() -> anyhow::Result<()> {
-        use cuteafd_loader::serving_capacity::prefill_waves::{unit_rows, waves_used, MAX_WAVES};
-        // Three waves of 2752: 8K splits 2752 + 2752 + 2688 (as W3 ran: 2752/2752/2639 of 8143).
-        assert_eq!(prefill_units(8192, 2752, 3, 256)?, [0..2752, 2752..5504, 5504..8192]);
-        assert_eq!(prefill_units(8143, 2752, 3, 256)?, [0..2752, 2752..5504, 5504..8143]);
-        // Exactly half a unit per wave splits; one row less does not.
-        assert_eq!(prefill_units(3 * 1376, 2752, 3, 256)?, [0..1408, 1408..2816, 2816..4128]);
-        assert_eq!(prefill_units(3 * 1376 - 1, 2752, 3, 256)?.len(), 2);
-        assert_eq!(prefill_units(2 * 1376, 2752, 3, 256)?, [0..1408, 1408..2752]);
-        assert_eq!(prefill_units(2 * 1376 - 1, 2752, 3, 256)?, [0..2751]);
-        // Four waves of 2048.
-        assert_eq!(prefill_units(8192, 2048, 4, 256)?.len(), 4);
-        assert_eq!(prefill_units(4096, 2048, 4, 256)?.len(), 4);
-        assert_eq!(prefill_units(4095, 2048, 4, 256)?.len(), 3);
+        assert_eq!(prefill_units(2752, 2752, 3, 256)?, [0..1408, 1408..2752]);
         for waves in 2..=MAX_WAVES as usize {
             let unit = unit_rows(waves as u64) as usize;
-            for span in 1..=(waves * unit + 300) {
+            for span in 1..=unit {
                 let units = prefill_units(span, unit, waves, 256)?;
                 assert_eq!((units.first().unwrap().start, units.last().unwrap().end), (0, span));
-                assert!(units.iter().all(|u| u.len() <= unit), "{span} rows over {waves} x {unit}");
-                if span < waves * unit {
-                    let used = waves_used(span as u64, waves as u64, unit as u64) as usize;
-                    assert!(units.len() <= used && units.len() <= waves, "{span}: {} > {used}", units.len());
-                    // Every split unit but a page-rounded tail keeps half a unit.
-                    if units.len() > 1 {
-                        assert!(units[..units.len() - 1].iter().all(|u| 2 * u.len() >= unit), "{span}: {units:?}");
-                    }
+                let used = waves_used(span as u64, waves as u64, unit as u64) as usize;
+                assert!(units.len() <= used.max(1) && units.len() <= waves, "{span}: {}", units.len());
+                if units.len() > 1 {
+                    assert!(units[..units.len() - 1].iter().all(|u| u.len() >= MIN_SPLIT_ROWS), "{span}: {units:?}");
                 }
             }
         }
