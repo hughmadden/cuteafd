@@ -230,10 +230,16 @@ impl Family for MiniMaxM3 {
         use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
         // Adaptive (#762): the plan admits four 4096-row slots inside the shared reserve, and the engine
         // chooses each call's depth at runtime from the Sparks' measured unit pace and its own reply wait,
-        // calibrating at startup. No S/T timing or wave-count comparison exists for MiniMax units, so the
-        // estimate stays unmeasured: it is only the starting depth (the shared fallback's two waves).
-        // The executor's caps are the shared ones (1..=4 waves of page-aligned units up to 4096 rows).
-        PrefillLimits { estimate: PrefillEstimate::Unmeasured, adaptive: true, ..Default::default() }
+        // calibrating at startup. The estimate is only the starting depth, measured as the depth the
+        // controller settles on and the best pinned depth in the prefill matrix: two waves at TP2, where the
+        // Sparks bound every depth and each extra unit adds a pass over the expert weights; three (3 x 2752)
+        // at TP4 and TP6, where two waves leave the Sparks idle a third of the call or more. TP3 borrows
+        // TP4's depth. The executor's caps are the shared ones (1..=4 waves of page-aligned units up to 4096
+        // rows).
+        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
+            waves: 2, reference_ranks: 2, larger_topology_waves: 3,
+            source: "RTX PRO 6000 + GB10 prefill matrix, adaptive vs pinned k2/k3/k4: k2 best at TP2, k3 at TP4 and TP6",
+        }, adaptive: true, ..Default::default() }
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // MiniMax decode/verify steps send at most `admission::DECODE_ROWS` (64) rows.

@@ -487,8 +487,8 @@ mod tests {
 
     /// `--prefill-waves` is the depth a prefill call starts at (1 to 4) and `--prefill-slots` the slots the one
     /// Spark link admits (#762). Unpinned, serve resolves the plan's prefill from MiniMax's adaptive descriptor:
-    /// four 4096-row slots in the 8256-row reserve, starting at two waves (its estimate is unmeasured) at every
-    /// Spark count. The launcher passes the plan's values back; explicit waves alone pin the depth, as the plan
+    /// four 4096-row slots in the 8256-row reserve, starting at the measured depth (two waves at TP2, three from
+    /// TP3). The launcher passes the plan's values back; explicit waves alone pin the depth, as the plan
     /// pins them, and a pin beyond the shared reserve is refused as the plan refuses it. The lane flags and their
     /// aliases are gone.
     #[test]
@@ -502,7 +502,8 @@ mod tests {
         let waves = |extra: &[&str]| parse("127.0.0.1:1,127.0.0.1:2", extra);
         assert_eq!(waves(&[]), Some((4096, 2, 4, 8256)));
         let six = (1..=6).map(|port| format!("127.0.0.1:{port}")).collect::<Vec<_>>().join(",");
-        assert_eq!(parse(&six, &[]), Some((4096, 2, 4, 8256)));
+        assert_eq!(parse(&six, &[]), Some((4096, 3, 4, 8256)));
+        assert_eq!(parse(&six, &["--prefill-rows", "4096", "--prefill-waves", "3", "--prefill-slots", "4"]), Some((4096, 3, 4, 8256)));
         assert_eq!(parse(&six, &["--prefill-rows", "4096", "--prefill-waves", "2", "--prefill-slots", "4"]), Some((4096, 2, 4, 8256)));
         assert_eq!(parse(&six, &["--prefill-waves", "3"]), Some((2752, 3, 3, 8256)));
         assert_eq!(parse(&six, &["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-slots", "3"]), Some((2752, 3, 3, 8256)));

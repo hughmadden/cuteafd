@@ -123,8 +123,8 @@ impl RuntimeSizing {
 /// The prefill a plan or server admits (PLAN "Prefill contract", #762): the shared policy
 /// (`prefill_waves::prefill_shape`) over MiniMax's adaptive descriptor, with `rows`, `waves` and
 /// `slots` (0 = unpinned) as pins. Unpinned, it admits four slots of the 4096-row unit inside the
-/// shared 8256-row reserve and starts at the estimate's depth (unmeasured: two waves at every Spark
-/// count); the engine then chooses each call's depth (2 x 4096, 3 x 2752 or 4 x 2048) at runtime. A
+/// shared 8256-row reserve and starts at the estimate's depth (measured: two waves at TP2, three from
+/// TP3); the engine then chooses each call's depth (2 x 4096, 3 x 2752 or 4 x 2048) at runtime. A
 /// resolved deployment's slots pass back as the pin; explicit waves alone pin the depth (slots equal
 /// the waves). One wave without Sparks. A 2752- or 2048-row unit runs on the expert package's
 /// 4096-row programs, which take any rows up to their capacity.
@@ -772,28 +772,34 @@ pub(crate) mod tests {
     }
 
     /// The shared policy over MiniMax's adaptive descriptor (#762): unpinned, every Spark count admits four
-    /// 4096-row slots in the 8256-row reserve and starts at the estimate's depth, which is unmeasured (two
-    /// waves) until a MiniMax measurement lands; the engine chooses each call's depth within the slots at
+    /// 4096-row slots in the 8256-row reserve and starts at the estimate's depth, measured on the PRO 6000
+    /// cards (two waves at TP2, three from TP3); the engine chooses each call's depth within the slots at
     /// runtime. A deployment's slots pass back; explicit waves pin the depth (their own unit, slots equal to
     /// the waves), and pinned rows keep theirs. No Sparks: one wave.
     #[test]
     fn prefill_shape_follows_the_descriptor_estimate_unless_pinned() {
         let shape = |rows, waves, slots, ranks| prefill_shape(rows, waves, slots, ranks)
             .map(|p| (p.unit_rows, p.waves, p.slots, p.span_rows));
-        for ranks in [2, 3, 4, 6] {
-            assert_eq!(shape(0, 0, 0, ranks).unwrap(), (4096, 2, 4, 8256), "TP{ranks}");
-            assert_eq!(shape(4096, 2, 4, ranks).unwrap(), (4096, 2, 4, 8256), "TP{ranks}: the launcher's pass-back");
+        for (ranks, start) in [(2, 2), (3, 3), (4, 3), (6, 3)] {
+            assert_eq!(shape(0, 0, 0, ranks).unwrap(), (4096, start, 4, 8256), "TP{ranks}");
+            assert_eq!(shape(4096, start, 4, ranks).unwrap(), (4096, start, 4, 8256), "TP{ranks}: the launcher's pass-back");
             assert!(prefill_shape(0, 0, 0, ranks).unwrap().adaptive());
         }
+        // A deployment planned before the estimate (two waves) still passes back unchanged.
+        assert_eq!(shape(4096, 2, 4, 6).unwrap(), (4096, 2, 4, 8256));
         let limits = crate::plan::Family::prefill_limits(&super::super::MINIMAX_M3);
-        assert!(limits.adaptive && matches!(limits.estimate, prefill_waves::PrefillEstimate::Unmeasured));
+        assert!(limits.adaptive && matches!(limits.estimate, prefill_waves::PrefillEstimate::MeasuredWaves {
+            waves: 2, reference_ranks: 2, larger_topology_waves: 3, .. }));
+        assert_eq!([2, 3, 4, 6].map(|ranks| limits.estimate.waves(ranks)), [2, 3, 3, 3]);
         assert_eq!(shape(0, 0, 0, 0).unwrap(), (4096, 1, 1, 4096));
         // Pinned waves take their own unit and admit only their slots; pinned rows keep theirs.
         assert_eq!(shape(0, 3, 0, 6).unwrap(), (2752, 3, 3, 8256));
         assert_eq!(shape(2752, 3, 3, 6).unwrap(), (2752, 3, 3, 8256));
         assert_eq!(shape(0, 2, 0, 6).unwrap(), (4096, 2, 2, 8192));
         assert_eq!(shape(0, 4, 0, 4).unwrap(), (2048, 4, 4, 8192));
-        assert_eq!(shape(2048, 0, 0, 4).unwrap(), (2048, 2, 4, 8192));
+        // Pinned rows alone keep the adaptive slots and start at the layout's measured depth.
+        assert_eq!(shape(2048, 0, 0, 4).unwrap(), (2048, 3, 4, 8192));
+        assert_eq!(shape(2048, 0, 0, 2).unwrap(), (2048, 2, 4, 8192));
         assert_eq!(shape(1024, 3, 0, 2).unwrap(), (1024, 3, 3, 3072));
         for (rows, waves, slots) in [(100, 2, 0), (4160, 1, 0), (4096, 5, 0), (32, 1, 0), (2752, 4, 0), (0, 3, 2), (0, 2, 5)] {
             assert!(shape(rows, waves, slots, 4).is_err(), "{rows} x {waves} of {slots}");

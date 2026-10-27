@@ -127,8 +127,8 @@ mod tests {
     }
 
     /// A plan of the test snapshot on `ranks` Sparks at the descriptor's shape (four admitted 4096-row
-    /// slots starting at two waves while MiniMax's prefill estimate is unmeasured, #762), and the sizing
-    /// serve runs it with.
+    /// slots starting at the measured depth: two waves at TP2, three from TP3, #762), and the sizing serve
+    /// runs it with.
     fn planned(ranks: usize) -> Result<(tempfile::TempDir, cuteafd_loader::plan::PlanReport, RuntimeSizing)> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
@@ -156,8 +156,8 @@ mod tests {
     /// alike (`minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes`, CPU fixture).
     #[test]
     fn minimax_planner_charges_the_link_return_slots_at_the_adaptive_shapes() -> Result<()> {
-        for (ranks, unit, waves, slots, span) in [(2, 4096, 2, 4, 8256), (3, 4096, 2, 4, 8256), (4, 4096, 2, 4, 8256),
-            (6, 4096, 2, 4, 8256)] {
+        for (ranks, unit, waves, slots, span) in [(2, 4096, 2, 4, 8256), (3, 4096, 3, 4, 8256), (4, 4096, 3, 4, 8256),
+            (6, 4096, 3, 4, 8256)] {
             let (_dir, report, sizing) = planned(ranks)?;
             assert_eq!((sizing.unit_rows, sizing.waves, sizing.slots, sizing.slot_rows()), (unit, waves, slots, span), "TP{ranks}");
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_slots, report.prefill_span_rows),
@@ -308,9 +308,9 @@ mod tests {
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
             && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        // The plan's #762 prefill at TP3 with its 256-row unit: four admitted slots starting at two waves.
+        // The plan's #762 prefill at TP3 with its 256-row unit: four admitted slots starting at three waves.
         let prefill = admission::prefill_shape(256, 0, 0, 3)?;
-        assert_eq!((prefill.unit_rows, prefill.waves, prefill.slots, prefill.span_rows), (256, 2, 4, 1024));
+        assert_eq!((prefill.unit_rows, prefill.waves, prefill.slots, prefill.span_rows), (256, 3, 4, 1024));
         let request = Request {
             sizing: RuntimeSizing { unit_rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
                 waves: 0, slots: 0 }.with_prefill(prefill)?,

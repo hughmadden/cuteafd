@@ -20,8 +20,11 @@ CONFIG = {"model_type": "minimax_m3_vl", "text_config": {
 }, "quantization_config": {"quant_method": "mxfp8", "moe_quant_algo": "NVFP4",
                            "moe_quant_format": "nvfp4-pack-quantized", "group_size": 16}}
 PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30}
-# The plan's adaptive prefill (#762): four 4096-row slots in the 8256-row reserve, starting at two waves.
-ADAPTIVE = {"prefill_unit_rows": 4096, "prefill_waves": 2, "prefill_slots": 4, "prefill_span_rows": 8256}
+# The plan's adaptive prefill (#762): four 4096-row slots in the 8256-row reserve, starting at the measured
+# depth: two waves at TP2, three from TP3.
+def _adaptive(ranks):
+    return {"prefill_unit_rows": 4096, "prefill_waves": 2 if ranks == 2 else 3, "prefill_slots": 4,
+            "prefill_span_rows": 8256}
 # The qualified DFlash2 draft's revision, the launcher's default.
 RADIXARK_REVISION = "923bf1d4b567d5ccb71b0488c6e61b5e4794e92a"
 
@@ -37,7 +40,8 @@ def _launch(tmp_path, keys="", *, ranks=4, **kwargs):
 @pytest.mark.parametrize("ranks", [2, 3, 4, 6])
 @pytest.mark.parametrize("kv", ["fp8", "bf16"])
 def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
-    result = _launch(tmp_path, f"KV_CACHE={kv}\nRTX_EXPERT_LAYERS=auto\n", ranks=ranks, deployment_overrides=ADAPTIVE)
+    result = _launch(tmp_path, f"KV_CACHE={kv}\nRTX_EXPERT_LAYERS=auto\n", ranks=ranks,
+                     deployment_overrides=_adaptive(ranks))
     serve = _line(result, "serve-minimax --snapshot")
     plan = _line(result, "cuteafd plan")
     # DFlash2 is MiniMax's default speculator.
@@ -48,9 +52,9 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     assert _flag(serve, "--spark-budget-bytes") == str(108 << 30)
     assert _flag(serve, "--max-sequences") == _flag(plan, "--concurrency") == "64"
     # Prefill: the plan resolves MiniMax's adaptive descriptor (no key pins it: four 4096-row slots,
-    # starting at two waves while the estimate is unmeasured) and serve takes the unit, the starting
-    # depth and the slots back, choosing each call's depth at runtime (#762).
-    unit, waves, slots = ("4096", "2", "4")
+    # starting at the measured depth) and serve takes the unit, the starting depth and the slots back,
+    # choosing each call's depth at runtime (#762).
+    unit, waves, slots = ("4096", "2" if ranks == 2 else "3", "4")
     assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves"), _flag(serve, "--prefill-slots")) == (unit, waves, slots)
     assert _flag(plan, "--prefill-rows") is None and _flag(plan, "--prefill-waves") is None
     assert not any(flag in serve + plan for flag in ("--prefill-lanes", "--prefill-batch-tokens", "--prefill-span-rows"))
@@ -175,13 +179,13 @@ def test_minimax_refuses_push_loading(tmp_path):
 
 
 def test_minimax_dry_run_takes_the_shared_deployment_plan(tmp_path):
-    result = _launch(tmp_path, extra_args=("--wip", "qualification", "--dry-run"), deployment_overrides=ADAPTIVE)
+    result = _launch(tmp_path, extra_args=("--wip", "qualification", "--dry-run"), deployment_overrides=_adaptive(4))
     assert result.returncode == 0, result.stderr
     # The deployment the launch would take is stdout's last line, after the resolved prefill.
     deployment = json.loads(result.stdout.splitlines()[-1])
     assert deployment["family"] == "minimax_m3" and deployment["wip_launchable"]
-    assert (deployment["prefill_unit_rows"], deployment["prefill_waves"], deployment["prefill_slots"]) == (4096, 2, 4)
-    assert "Resolved prefill: PREFILL_ROWS=4096 PREFILL_WAVES=2 PREFILL_SLOTS=4" in result.stdout
+    assert (deployment["prefill_unit_rows"], deployment["prefill_waves"], deployment["prefill_slots"]) == (4096, 3, 4)
+    assert "Resolved prefill: PREFILL_ROWS=4096 PREFILL_WAVES=3 PREFILL_SLOTS=4" in result.stdout
     plan = _line(result, "cuteafd plan")
     assert _flag(plan, "--spark-ranks") == "4" and "--deployment" in plan
     assert "docker run -d" not in result.stderr and "serve-minimax --snapshot" not in result.stderr

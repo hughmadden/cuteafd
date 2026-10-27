@@ -63,8 +63,9 @@ and, from TP3 up, no routed layers on the RTX.
   four slots of the 4096-row unit inside the shared 8256-row reserve, and the
   engine chooses each call's depth at runtime (#762): 2 x 4096, 3 x 2752 or
   4 x 2048, from the Sparks' measured unit pace and its own reply wait. It
-  starts at two waves because MiniMax has no measured estimate yet, and
-  calibrates every depth before readiness. `PREFILL_WAVES` pins the depth
+  starts at the measured depth, two waves at TP2 (the Sparks bound every
+  depth) and three from TP3 (two waves leave them idle), and calibrates every
+  depth before readiness. `PREFILL_WAVES` pins the depth
   (`PREFILL_WAVES=3` runs 3 x 2752 throughout). Scoring calls that project
   every row keep them in one unit.
 - Decode: lane 0 of the shared Qwen scheduler, one lane: a second lane would
@@ -245,8 +246,9 @@ copy; `on-retain` copies each snapshot when it is kept. A page is 180 segments
 - One RTX PRO 6000 coordinator only: the RTX 5090 is refused by name, and
   two-GPU head splits are not implemented.
 - No video input, no partial prefix reuse and no BF16 K/V kernel.
-- MiniMax has no measured prefill estimate: the depth starts at two waves and
-  the runtime controller measures from there.
+- The prefill controller learns only from full 8192-row calls and runs one
+  depth for every call: a prompt shorter than one unit runs as a single unit,
+  with no overlap between the coordinator and the Sparks.
 - A Spark rank's owner scratch is an estimate unless the Spark world's package
   layout is installed beside `PROGRAMS.json`.
 - `--full-prefill-logits` charges logits for the whole span (about 6.6 GB at

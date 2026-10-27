@@ -152,7 +152,7 @@ fn glm53_max_deployment_admits_four_4096_row_slots_starting_at_three() {
 }
 
 #[test]
-fn minimax_deployments_admit_four_4096_row_slots_starting_at_two() {
+fn minimax_deployments_admit_four_4096_row_slots_starting_at_the_measured_depth() {
     use cuteafd_loader::plan::{families::minimax::admission::PROGRAM_NAMES, testing};
     let snapshot = tempfile::tempdir().unwrap();
     testing::write_minimax_m3_snapshot(snapshot.path(), false, false);
@@ -164,8 +164,8 @@ fn minimax_deployments_admit_four_4096_row_slots_starting_at_two() {
         serde_json::json!({"name": format!("minimax_{suffix}"), "capacity_rows": rows,
             "scratch_bytes_at_capacity": {"scratch": 53_478_400}, "geometry": {"max_pages": 16384, "max_batch": 64}})
     }).collect::<Vec<_>>()}).to_string()).unwrap();
-    for (ranks, pin, expected) in [("2", None, (4096, 2, 4, 8256)), ("6", None, (4096, 2, 4, 8256)),
-        ("6", Some("3"), (2752, 3, 3, 8256))] {
+    for (ranks, pin, expected) in [("2", None, (4096, 2, 4, 8256)), ("6", None, (4096, 3, 4, 8256)),
+        ("6", Some("3"), (2752, 3, 3, 8256)), ("6", Some("2"), (4096, 2, 2, 8192))] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
         command.arg("plan").arg(snapshot.path()).args(["--deployment", "--rtx", "1", "--spark-ranks", ranks,
             "--vision", "off", "--audio", "off", "--speculator", "off", "--workspace-manifest"]).arg(&manifest);
@@ -174,8 +174,8 @@ fn minimax_deployments_admit_four_4096_row_slots_starting_at_two() {
         assert!(output.status.success(), "TP{ranks}: {}", String::from_utf8_lossy(&output.stderr));
         let deployment = release_accepts_prefill(&output.stdout);
         assert_eq!(deployment["family"], "minimax_m3");
-        // Unpinned: the admitted unit (reserve / 2) in four slots, the depth starting at the unmeasured
-        // estimate's two waves (#762). PREFILL_WAVES pins the depth: only its own slots.
+        // Unpinned: the admitted unit (reserve / 2) in four slots, the depth starting at the measured
+        // estimate (#762): two waves at TP2, three from TP3. PREFILL_WAVES pins the depth: only its own slots.
         let field = |name: &str| deployment[name].as_u64().unwrap();
         assert_eq!((field("prefill_unit_rows"), field("prefill_waves"), field("prefill_slots"), field("prefill_span_rows")),
             expected, "TP{ranks} {pin:?}");
