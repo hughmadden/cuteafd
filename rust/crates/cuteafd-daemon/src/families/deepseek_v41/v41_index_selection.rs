@@ -247,6 +247,7 @@ impl<'a> IndexSelectionWave<'a> {
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         self.buffers[i].buffer
     }
+    pub fn capacity(&self) -> usize { self.capacity }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
     }

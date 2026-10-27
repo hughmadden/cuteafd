@@ -476,8 +476,26 @@ fn worker(
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     // Prefill slots beyond the two lanes: their own pass and Spark endpoint.
+    // They borrow decode lane 1's attention-local storage (output projection,
+    // sparse attention, index query planes): the shared prefill executor runs
+    // one hook at a time and each unit's attention completes in its hook (1
+    // RTX: drained, unchained), and decode is idle while prefill runs. A
+    // device-ordered attention (#815 option (i)) would need per-buffer events.
+    let (owner_lane, owner_index) = prefill_pass.sharing_owners();
+    let make_sharing_pass = || TargetPass::new(
+        TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?,
+        BackboneLane::new_sharing(owner_lane)?,
+        IndexLane::new_sharing(owner_index)?,
+        BackboneExecution::new(&producers, capacity, BackboneExecution::workspace_bytes(&lib, capacity)?)?,
+        EngramDeviceRows::new(&lib, rows, EngramDeviceRows::device_bytes(rows)?)?,
+        [EngramGate::new(&engram_weights[0], rows, 1024 * 1024 * 1024)?,
+         EngramGate::new(&engram_weights[1], rows, 1024 * 1024 * 1024)?],
+        head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS, TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?)?,
+        crate::families::deepseek_v41::v41_target_pass::TargetTapWave::new(&lib, rows, crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(rows)?)?,
+        Duration::from_secs(120),
+    );
     let mut extra = (2..slots).map(|lane| -> Result<_> {
-        let pass = make_prefill_pass()?;
+        let pass = make_sharing_pass()?;
         let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world, u32::try_from(lane)?)?;
         Ok((pass, NativeTp4Wave::new(&lib, roce, wave_bytes)?))
     }).collect::<Result<Vec<_>>>()?;

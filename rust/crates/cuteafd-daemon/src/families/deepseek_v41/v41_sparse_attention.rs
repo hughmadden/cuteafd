@@ -59,8 +59,10 @@ pub(crate) type CompactSparseAttentionWave<'a> = LocalSparseAttentionWave<'a,32>
 pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     stream: LoadStream<'a>,
     kernel: V41SparseAttention<'a>,
-    query: DeviceAllocation<'a>,
-    output: DeviceAllocation<'a>,
+    // Attention-local planes (see `new_sharing`): read and written only
+    // inside one layer's attention, so extra prefill slots may borrow them.
+    query: std::rc::Rc<DeviceAllocation<'a>>,
+    output: std::rc::Rc<DeviceAllocation<'a>>,
     split_scratch: DeviceAllocation<'a>,
     descriptors: DeviceAllocation<'a>,
     /// Per-layer pinned staging (see `LayerStaging`): metadata, descriptors
@@ -136,19 +138,38 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         Ok(capacity * (HEADS*2048+88) + V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS), 10)?/64*HEADS
             + V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?)
     }
+    /// Bytes [`Self::new_sharing`] allocates beside a borrowed owner.
+    pub fn sharing_device_bytes(capacity: usize) -> Result<usize> {
+        Ok(Self::device_bytes(capacity)? - 2 * capacity * HEADS * 1024)
+    }
     pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
         ensure!(
             Self::device_bytes(capacity)? <= budget,
             "sparse attention exceeds budget"
         );
+        let planes = [0, 1].map(|_| DeviceAllocation::new(library, capacity * (HEADS*1024)).map(std::rc::Rc::new));
+        let [query, output] = planes;
+        Self::with_planes(library, capacity, query?, output?)
+    }
+    /// A prefill-only slot's wave borrowing `owner`'s attention-local query and
+    /// output planes. Sound only while the two waves' attentions never overlap:
+    /// the shared prefill executor runs one hook at a time and a unit's
+    /// attention hook completes its attention before returning (1 RTX: drained,
+    /// unchained). A device-ordered attention (#815 option (i)) would need an
+    /// event per borrowed plane between the owners.
+    pub fn new_sharing(owner: &Self) -> Result<Self> {
+        Self::with_planes(owner.stream.library, owner.capacity, owner.query.clone(), owner.output.clone())
+    }
+    fn with_planes(library: &'a NativeLibrary, capacity: usize, query: std::rc::Rc<DeviceAllocation<'a>>,
+        output: std::rc::Rc<DeviceAllocation<'a>>) -> Result<Self> {
         Ok(Self {
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
             },
             kernel: if HEADS==64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
-            query: DeviceAllocation::new(library, capacity * (HEADS*1024))?,
-            output: DeviceAllocation::new(library, capacity * (HEADS*1024))?,
+            query,
+            output,
             split_scratch: DeviceAllocation::new(
                 library,
                 V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS), 10)?/64*HEADS,

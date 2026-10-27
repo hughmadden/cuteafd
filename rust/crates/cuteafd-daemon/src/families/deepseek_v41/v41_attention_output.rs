@@ -98,6 +98,35 @@ impl<'a> AttentionOutputWeights<'a> {
             self.tensors.get(&self.names[2]).ok(), self.scales.as_ref().map(|scales| scales.buffer)]
             .into_iter().flatten().collect()
     }
+    /// A prefill-only slot's wave borrowing `owner`'s attention-local storage
+    /// (row planes, GEMM scratch). Sound only while the two waves' attention
+    /// tails never overlap: the shared prefill executor runs one hook at a
+    /// time and a unit's attention hook completes before returning (1 RTX:
+    /// drained, unchained). A device-ordered attention (#815 option (i)) would
+    /// need an event per borrowed buffer between the owners.
+    pub fn wave_sharing(&self, owner: &AttentionOutputWave<'_, 'a>) -> Result<AttentionOutputWave<'_, 'a>> {
+        ensure!(owner.kernel.is_some() == self.scales.is_some()
+            && owner.grouped_scratch.buffer.device_id == self.grouped_scales.buffer.device_id,
+            "shared attention output geometry or device differs");
+        let capacity = owner.capacity;
+        let kernel=self.scales.as_ref().map(|_|self.library.v41_fp8_matrix_plan(capacity,8192,5120)).transpose()?;
+        Ok(AttentionOutputWave {
+            stream: LoadStream { library: self.library, raw: self.library.cuda_stream_create()? },
+            grouped: self.library.v41_fp8_matrix_plan(capacity, 32768, 8192)?,
+            grouped_scratch: owner.grouped_scratch.clone(),
+            scratch: owner.scratch.clone(),
+            kernel,
+            alpha: owner.alpha.clone(),
+            norm: self.library.v41_attention_ops()?,
+            buffers: owner.buffers.clone(),
+            position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
+            weights: self,
+            capacity,
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            ready: None,
+            origin: None,
+        })
+    }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<AttentionOutputWave<'_, 'a>> {
         ensure!(
             AttentionOutputWave::device_bytes_with_split(self.library, capacity,self.scales.is_none())? <= budget,
@@ -109,18 +138,18 @@ impl<'a> AttentionOutputWeights<'a> {
         };
         let kernel=self.scales.as_ref().map(|_|self.library.v41_fp8_matrix_plan(capacity,8192,5120)).transpose()?;
         let grouped = self.library.v41_fp8_matrix_plan(capacity, 32768, 8192)?;
-        let grouped_scratch = DeviceAllocation::new(self.library, grouped.info().scratch_bytes as usize)?;
+        let grouped_scratch = std::rc::Rc::new(DeviceAllocation::new(self.library, grouped.info().scratch_bytes as usize)?);
         let value = AttentionOutputWave {
             stream,
             grouped,
             grouped_scratch,
-            scratch: kernel.as_ref().map(|k|DeviceAllocation::new(self.library,k.info().scratch_bytes as usize)).transpose()?,
+            scratch: kernel.as_ref().map(|k|DeviceAllocation::new(self.library,k.info().scratch_bytes as usize).map(std::rc::Rc::new)).transpose()?,
             kernel,
-            alpha: DeviceAllocation::new(self.library, 4)?,
+            alpha: std::rc::Rc::new(DeviceAllocation::new(self.library, 4)?),
             norm: self.library.v41_attention_ops()?,
             buffers: ROW_BYTES
                 .into_iter()
-                .map(|n| DeviceAllocation::new(self.library, n * capacity as usize))
+                .map(|n| DeviceAllocation::new(self.library, n * capacity as usize).map(std::rc::Rc::new))
                 .collect::<Result<Vec<_>>>()?,
             position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
             weights: self,
@@ -170,12 +199,14 @@ impl AttentionOutput<'_> {
 pub(crate) struct AttentionOutputWave<'w, 'a> {
     stream: LoadStream<'a>,
     grouped: V41Fp8Plan<'a>,
-    grouped_scratch: DeviceAllocation<'a>,
+    // Attention-local storage (see `wave_sharing`): written and read only
+    // inside one layer's attention tail, so extra prefill slots may borrow it.
+    grouped_scratch: std::rc::Rc<DeviceAllocation<'a>>,
     kernel: Option<V41Fp8Plan<'a>>,
-    scratch: Option<DeviceAllocation<'a>>,
-    alpha: DeviceAllocation<'a>,
+    scratch: Option<std::rc::Rc<DeviceAllocation<'a>>>,
+    alpha: std::rc::Rc<DeviceAllocation<'a>>,
     norm: V41AttentionOps<'a>,
-    buffers: Vec<DeviceAllocation<'a>>,
+    buffers: Vec<std::rc::Rc<DeviceAllocation<'a>>>,
     position_staging: HostAllocation<'a>,
     weights: &'w AttentionOutputWeights<'a>,
     capacity: u32,
