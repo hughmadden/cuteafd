@@ -11,6 +11,10 @@ use v41::DraftInventory;
 // Neither generic PROGRAMS.json module counts nor other families' graph costs
 // describe the native executor's loaded code.
 const NATIVE_CODE_ESTIMATE: u64 = 2 * GIB;
+/// Units the V4.1 executor runs: every 256-row step its native programs serve
+/// (live rows round up to an AOT capacity, `v41_aot_rows`).
+const V41_UNIT_ROWS: [u32; 16] = [256, 512, 768, 1024, 1280, 1536, 1792, 2048,
+    2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096];
 const SPARK: SparkCharges = SparkCharges {
     host_bytes: Some(9 * GIB), wave_bytes: 21 * GIB / 10, basis: Basis::Estimated,
 };
@@ -18,16 +22,23 @@ const SPARK: SparkCharges = SparkCharges {
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> Result<MemoryLayout> {
     let checkpoint = input.checkpoint();
-    let explicit_unit = options.prefill_unit_rows.is_some();
-    let shape = Shape::resolve(report, model, options, ShapePolicy {
-        context: ContextPolicy::Checkpoint, prefill_rows: Some(2048), all_native_stages: false,
+    // Units, waves and span come from the shared prefill policy and the
+    // descriptor (two units in flight, one target pass per slot).
+    let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
+        capacities: &V41_UNIT_ROWS,
+        ..crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41)
+    };
+    let prefill = super::resolve_prefill(report, options, report.placement.spark_ranks(), limits)?;
+    let mut shape = Shape::resolve(report, model, options, ShapePolicy {
+        context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
     });
+    shape.prefill_rows = prefill.unit_rows;
+    report.prefill_span_rows = Some(prefill.span_rows);
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
     ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    if options.prefill_waves == 1 && !explicit_unit { options.prefill_unit_rows = Some(rows); }
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
     ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
         "V4.1 prefix slots must be zero or 2 * retained turns + 2 (at most 258)");

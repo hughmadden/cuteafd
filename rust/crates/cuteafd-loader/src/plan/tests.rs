@@ -937,8 +937,9 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
                         let ingress = if nvfp4 { cuteafd_core::SparkIngress::Bf16 }
                             else { cuteafd_core::SparkIngress::Fp8K32 };
+                        // Rings at the resolved unit, as the runtime transports open them.
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
-                            capacity: options.layout.as_ref().unwrap().spark_capacity_rows as u32,
+                            capacity: report.prefill_unit_rows.unwrap() as u32,
                             ingress
                         }; 2];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(

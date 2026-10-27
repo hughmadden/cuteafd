@@ -1281,8 +1281,10 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
 fn measured_initial_unit_is_step_only_and_preserves_explicit_shapes() {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides, PrefillPlan};
     for family in crate::plan::family::registry() {
+        // Step-5 (kernel row cliff) and V4.1 (its measured 2048-row unit; the
+        // ~2 MiB/row lane workspace keeps the pool where its CED chunk had it).
         assert_eq!(family.prefill_limits().initial_unit_rows,
-            (family.id() == "step5").then_some(2048), "{}", family.id());
+            matches!(family.id(), "step5" | "deepseek_v41").then_some(2048), "{}", family.id());
     }
     let limits = crate::plan::Family::prefill_limits(&super::STEP5);
     assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows), (4096, 4, 8256));

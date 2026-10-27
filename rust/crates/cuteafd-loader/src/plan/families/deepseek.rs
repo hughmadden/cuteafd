@@ -19,19 +19,26 @@ pub struct DeepSeek {
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
     /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
     decode_rows: u32,
-    spark_prefill: crate::plan::spark_executions::SparkPrefill,
+    /// In-flight prefill units the executor holds (V4.1: one target pass per slot).
+    max_waves: u64,
+    /// Measured starting unit (V4.1: its CED chunk, 2048 rows).
+    initial_unit_rows: Option<u64>,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
-    // Legacy CED executor: not advertised as an adaptive shared-prefill port.
-    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::Unmeasured,
+    // Two units in flight, one layer apart: the measured depth of its earlier
+    // two-lane CED executor at every topology (#668, #815).
+    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
+        waves: 2, reference_ranks: 4, larger_topology_waves: 2,
+        source: "https://github.com/tpurtell/cuteafd/issues/668; V4.1 two in-flight CED units at TP4 and TP6",
+    },
     decode_lanes: crate::plan::decode_lanes::LaneSupport::FixedTwo,
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
-    // The CED executor's two encoder streams queue its live chunk.
-    spark_prefill: crate::plan::spark_executions::SparkPrefill::Streams(2),
+    max_waves: 2,
+    initial_unit_rows: Some(2048),
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
@@ -45,7 +52,8 @@ pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
         reason: "the second lane is not wired yet: V4 Flash, the closest shape to V4.1, is the OneOrTwo candidate awaiting its A/B on its own decode endpoint (#744)" },
     // Installed V4 coordinator manifests fix `decode_rows`; serve passes it.
     decode_rows: 64,
-    spark_prefill: crate::plan::spark_executions::SparkPrefill::Ladder,
+    max_waves: crate::serving_capacity::prefill_waves::MAX_WAVES,
+    initial_unit_rows: None,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -57,13 +65,13 @@ fn usize_list(config: &Value, key: &str) -> Vec<usize> {
 }
 
 impl Family for DeepSeek {
-    fn spark_prefill(&self) -> crate::plan::spark_executions::SparkPrefill { self.spark_prefill }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, ..Default::default() }
+        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, max_waves: self.max_waves,
+            initial_unit_rows: self.initial_unit_rows, ..Default::default() }
     }
     fn id(&self) -> &'static str {
         self.id
