@@ -92,6 +92,10 @@ pub struct WaveReceipt {
     /// Bit r: rank r's whole plane landed in its device range (GPU landing);
     /// the sink saw none of its rows. Other ranks' rows all went to the sink.
     pub landed: u8,
+    /// Per rank: the worker's measured (busy µs, idle µs) for this unit on
+    /// its prefill owner, from the reply header (#762); None for decode
+    /// owners and for workers that report none.
+    pub pace: [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD],
 }
 
 impl SparkExperts {
@@ -323,7 +327,7 @@ impl SparkExperts {
         ensure!(self.open_waves.is_empty() || self.clients.max_waves() == 1,
             "a borrowed Spark dispatch cannot follow outstanding waves");
         if !self.open_waves.is_empty() { self.open_waves.clear(); self.reset_connections(); }
-        let receiver = self.post(request)?;
+        let receiver = self.post(request, None)?;
         Ok(SparkExpertPending {
             receiver,
             poll_quantum: poll_quantum(&request.rows),
@@ -337,7 +341,16 @@ impl SparkExperts {
     /// keep their own copy of the request, so it need not outlive the wave.
     /// Up to [`Self::max_waves`] may be outstanding; receive them in dispatch order.
     pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<SparkExpertWave> {
-        let receiver = self.post(request)?;
+        self.dispatch_wave_at(request, None)
+    }
+
+    /// [`Self::dispatch_wave`] whose payload lands, on every rank with a
+    /// placed GPU landing ([`DeviceLanding::placed`]), at that rank's
+    /// `landing` slice of its registered range. A transport with a placed
+    /// landing requires the slices; other ranks ignore theirs.
+    pub fn dispatch_wave_at(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[crate::LandingSlice]>)
+        -> Result<SparkExpertWave> {
+        let receiver = self.post(request, landing)?;
         self.wave_sequence += 1;
         self.open_waves.push_back(self.wave_sequence);
         Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows), sequence: self.wave_sequence,
@@ -419,7 +432,14 @@ impl SparkExperts {
                 let rank = wave.receiver.push_landed(&chunk)?;
                 ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
                 receipt.landed |= 1 << rank;
+                receipt.pace[rank] = chunk.header.pace;
                 return Ok(());
+            }
+            if let Some(pace) = chunk.header.pace {
+                // Every chunk of a unit's reply follows its fence; keep the last.
+                let rank = chunk.stream_id;
+                ensure!(rank < receipt.pace.len(), "Spark reply rank {rank} outside the world");
+                receipt.pace[rank] = Some(pace);
             }
             let mut location = None;
             wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
@@ -464,7 +484,8 @@ impl SparkExperts {
         self.clients.egress_arenas()
     }
 
-    fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {
+    fn post(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[crate::LandingSlice]>)
+        -> Result<V41Tp4ChunkReceiver> {
         crate::health::ensure_available()?;
         // A dropped wave is not received; at single-wave admission the next
         // post resets its QPs as before. Past the admitted count, refuse.
@@ -513,7 +534,7 @@ impl SparkExperts {
                 }
             }
         };
-        self.clients.dispatch(request)?;
+        self.clients.dispatch(request, landing)?;
         if let Some(tap) = &mut self.route_tap {
             tap.record(request, self.executors.len());
         }
@@ -944,6 +965,37 @@ mod tests {
         }
         assert!(receiver.complete());
         assert_eq!(receipt.landed, u8::MAX);
+        Ok(())
+    }
+
+    /// #762: a worker's paced reply passes the coordinator's whole-plane and
+    /// chunk receivers unchanged and its pace reaches the header both ways.
+    #[test]
+    fn paced_replies_keep_their_receivers_and_carry_the_pace() -> Result<()> {
+        let request = super::super::tests::request(2);
+        let frame = request.encode()?;
+        let native = BackboneRequest::parse(&frame, 2)?;
+        let plane = vec![7u8; native.plane_bytes()?];
+        let mut landed = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        let mut host = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        for rank in 0..4 {
+            let encoded = native.response(rank as u64 + 1, &plane)?.to_owned()?
+                .with_pace(Some((1_000 + rank, rank))).encode()?;
+            let header = crate::ExpertProtocolV2ResponseView::parse_landed_header(
+                &encoded[..crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?;
+            assert_eq!(header.pace, Some((1_000 + rank, rank)));
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank as usize, header: header.clone(),
+                row_indices: None, partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(Vec::new()),
+                wire_bytes: encoded.len(), landed: true };
+            assert_eq!(landed.push_landed(&chunk)?, rank as usize);
+            let view = crate::ExpertProtocolV2ResponseView::parse(&encoded)?;
+            assert_eq!(view.header.pace, Some((1_000 + rank, rank)));
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank as usize, header: view.header.clone(),
+                row_indices: None, partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(
+                    view.partial_output_payload().to_vec()), wire_bytes: encoded.len(), landed: false };
+            host.push_rdma(&chunk, |_, _, _| Ok(()))?;
+        }
+        assert!(landed.complete() && host.complete());
         Ok(())
     }
 

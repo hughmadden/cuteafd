@@ -41,6 +41,10 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight on one transport; unset follows the shared six-Spark policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
+    /// Admitted prefill slots of a resolved deployment (#762; unset resolves them):
+    /// `--prefill-waves` starts the depth, more slots let the executor choose.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_slots: Option<u8>,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -63,6 +67,7 @@ impl ServeArgs {
         Ok(prefill_shape(6, cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None,
+            slots: self.prefill_slots.map(u64::from),
         })?)
     }
 
@@ -125,13 +130,15 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
                 rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
-                prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
+                prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
+                prefill_slots: usize::try_from(prefill.slots)?, slots, marks,
                 max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
             })?;
             crate::shared::memory_report::release_load_staging(&library);
-            let backend = KimiBackend::new(&loaded.engine)?;
+            let backend = KimiBackend::new(&loaded.engine)?.with_identity(
+                crate::shared::prefill_depth::DeploymentIdentity::new(&library, &worker_args.peers, "tp2-head-split"));
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device)?;
@@ -222,14 +229,15 @@ mod tests {
         testing::write_kimi_snapshot(snapshot.path(), true);
         let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
-        for (extra, expected) in [
-            (vec![], (2752, 3, 8256)),
+        for (extra, expected, slots) in [
+            // Unpinned: admit four 4096-row slots, start at 3 (2752-row cuts) (#762).
+            (vec![], (4096, 3, 8256), 4),
             // Units are the 8192-row reserve divided by k.
-            (vec!["--prefill-waves", "2"], (4096, 2, 8192)),
-            (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192)),
-            (vec!["--prefill-waves", "3"], (2752, 3, 8256)),
-            (vec!["--prefill-waves", "4"], (2048, 4, 8192)),
-            (vec!["--prefill-rows", "1024", "--prefill-waves", "2"], (1024, 2, 2048)),
+            (vec!["--prefill-waves", "2"], (4096, 2, 8192), 2),
+            (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192), 2),
+            (vec!["--prefill-waves", "3"], (2752, 3, 8256), 3),
+            (vec!["--prefill-waves", "4"], (2048, 4, 8192), 4),
+            (vec!["--prefill-rows", "1024", "--prefill-waves", "2"], (1024, 2, 2048), 2),
         ] {
             let mut argv = vec!["--peers", peers];
             argv.extend(extra);
@@ -237,8 +245,13 @@ mod tests {
             args.validate()?;
             let shape = args.prefill()?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), expected);
+            assert_eq!(shape.slots, slots, "{expected:?}");
+            // The Spark reserve the runtime charges is the planner's admitted one.
+            assert_eq!(cuteafd_loader::families::kimi_k3::spark_reserve_bytes(shape.slots, shape.unit_rows)?,
+                cuteafd_loader::families::kimi_k3::spark_reserve_bytes(shape.admitted().waves, shape.admitted().unit_rows)?);
             assert_eq!(allocation::prefill_shape_with(shape.span_rows as usize, shape.waves as usize,
-                Some(shape.unit_rows as usize))?, shape.units());
+                Some(shape.unit_rows as usize))?, cuteafd_loader::serving_capacity::PrefillShape {
+                    unit_rows: shape.unit_rows, waves: shape.waves });
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], host_memory: Some((128 << 30, 128 << 30)),
                     host_cache_bytes: Some(0), prefill_rows: args.prefill_rows.unwrap_or(0) as u64,

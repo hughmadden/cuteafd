@@ -220,13 +220,15 @@ pub fn a8_scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize,
     (rows.div_ceil(16) * (max_k / 32) * 528).next_multiple_of(256)
 }
 
-/// One coordinator's native dense charge: decode scratch, plus every prefill lane's scratch and,
-/// with opt-in A8 prefill, its MX8 records. `cuteafd plan` and runtime admission both charge this.
+/// One coordinator's native dense charge: decode scratch, plus the prefill scratch every slot
+/// shares (hook-local: each native projection reads and writes it within one unit's hook, on the
+/// GPU's one stream; #762) and, with opt-in A8 prefill, its MX8 records. `cuteafd plan` and
+/// runtime admission both charge this.
 pub fn lane_charge_bytes(cfg: &crate::families::glm5::GlmDsaConfig, gpus: usize, decode_rows: usize,
-    prefill_rows: usize, lanes: usize, a8: bool) -> usize {
+    prefill_rows: usize, a8: bool) -> usize {
     let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
     let a8 = if a8 { a8_scratch_bytes(cfg, heads, inter, prefill_rows) } else { 0 };
-    scratch_bytes(cfg, heads, inter, decode_rows) + lanes * (scratch_bytes(cfg, heads, inter, prefill_rows) + a8)
+    scratch_bytes(cfg, heads, inter, decode_rows) + scratch_bytes(cfg, heads, inter, prefill_rows) + a8
 }
 
 /// Read headers and tiny record tables only. The official checkpoint is not an input.
@@ -999,13 +1001,13 @@ mod tests {
         }
         // Full width: K 16384.
         assert_eq!(a8_scratch_bytes(&cfg, cfg.heads, cfg.dense_intermediate, 4096), 256 * (16384 / 32) * 528);
-        // The shared lane charge is decode plus lanes x (prefill scratch [+ records]).
-        for (gpus, lanes) in [(1, 1), (2, 3)] {
+        // The charge is decode plus one prefill scratch [+ records] every slot shares (#762).
+        for gpus in [1, 2] {
             let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
             let (decode, prefill) = (scratch_bytes(&cfg, heads, inter, 64), scratch_bytes(&cfg, heads, inter, 4096));
             let a8 = a8_scratch_bytes(&cfg, heads, inter, 4096);
-            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, lanes, false), decode + lanes * prefill);
-            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, lanes, true), decode + lanes * (prefill + a8));
+            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, false), decode + prefill);
+            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, true), decode + prefill + a8);
         }
     }
 

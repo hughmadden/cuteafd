@@ -60,6 +60,9 @@ pub struct LayoutOptions {
     pub prefill_span_rows: Option<u64>,
     /// Continuous row-unit waves on one transport.
     pub prefill_waves: u64,
+    /// Admitted in-flight slots (#762): the deepest depth an adaptive executor
+    /// may run inside the same reserve; equals `prefill_waves` when static.
+    pub prefill_slots: u64,
     /// Family-resolved decode views; unrelated to prefill wave depth.
     pub decode_lanes: u8,
     /// Native EXLR8 trellis prefill activations: A8 also charges every prefill lane's MX8 records.
@@ -200,6 +203,7 @@ impl Default for LayoutOptions {
             prefill_unit_rows: None,
             prefill_span_rows: None,
             prefill_waves: 1,
+            prefill_slots: 1,
             decode_lanes: 1,
             exlr8_prefill_activations: Default::default(),
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
@@ -414,7 +418,9 @@ pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: 
 pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
     decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
-    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit, options.prefill_waves)
+    // Spark owners buffer every admitted slot (#762).
+    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit,
+        options.prefill_slots.max(options.prefill_waves))
 }
 
 #[cfg(test)]
@@ -690,15 +696,17 @@ pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     let unit_rows = (options.prefill_rows > 0).then_some(options.prefill_rows)
         .or(options.prefill_unit_rows);
     let shape = prefill_shape(spark_ranks, limits, PrefillOverrides {
-        unit_rows, waves, span_rows: options.prefill_span_rows,
+        unit_rows, waves, span_rows: options.prefill_span_rows, slots: None,
     })?;
     options.prefill_rows = shape.unit_rows;
     options.prefill_unit_rows = Some(shape.unit_rows);
     options.prefill_lanes = shape.waves;
     options.prefill_waves = shape.waves;
+    options.prefill_slots = shape.slots;
     options.spark_capacity_rows = shape.unit_rows;
     report.prefill_unit_rows = Some(shape.unit_rows);
     report.prefill_waves = Some(shape.waves);
+    report.prefill_slots = Some(shape.slots);
     report.prefill_span_rows = Some(shape.span_rows);
     report.prefill_transports = Some(u64::from(spark_ranks > 0));
     Ok(shape)
@@ -1378,6 +1386,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         ensure!(ranks == 0 || (1..=4096).contains(&unit_rows),
             "{family} Spark host admission needs prefill_unit_rows in 1..=4096, got {unit_rows}");
         unit_rows
+    } else if options.prefill_slots > options.prefill_waves {
+        // Adaptive depth (#762): every admitted depth is cut from one reserve.
+        crate::serving_capacity::wave_control::reserve_rows(options.prefill_slots, unit_rows)
     } else {
         crate::serving_capacity::PrefillShape { unit_rows, waves: options.prefill_waves }.validate()?.slot_rows()
     };
@@ -1422,7 +1433,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
         let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
             !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
-        let egress = (egress_request as u64).checked_mul(options.prefill_waves)
+        let egress = (egress_request as u64).checked_mul(options.prefill_slots.max(options.prefill_waves))
             .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?;
         push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.

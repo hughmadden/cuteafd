@@ -3925,6 +3925,60 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
 }  // namespace
 #endif
 
+// One receive whose payload lands at an explicit slice of the registered
+// GPU landing range: [landing_ptr + landing_offset, + landing_bytes). The
+// rotation of `post_recv_at` is untouched, so a caller that places every
+// wave itself (a prefill link whose wave geometry changes between prompts)
+// never depends on the order receives were posted in.
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_landing_at(
+    void* handle, size_t offset_bytes, size_t bytes, uint64_t wr_id, size_t landing_offset,
+    size_t landing_bytes) {
+  if (handle == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
+  }
+  if (bytes == 0 || bytes > std::numeric_limits<uint32_t>::max() || landing_bytes == 0 ||
+      landing_bytes > std::numeric_limits<uint32_t>::max()) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint landing recv byte size is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->landing_mr == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint has no GPU landing range");
+  }
+  if (bytes > endpoint->recv_frame_bytes || offset_bytes > endpoint->recv_registered_span_bytes ||
+      bytes > endpoint->recv_registered_span_bytes - offset_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC endpoint recv slot exceeds registered span");
+  }
+  if (landing_offset > endpoint->landing_bytes ||
+      landing_bytes > endpoint->landing_bytes - landing_offset) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing slice exceeds its registered range");
+  }
+  ibv_sge recv_sge[2] = {};
+  recv_sge[0].addr = reinterpret_cast<uintptr_t>(endpoint->recv_buffer + offset_bytes);
+  recv_sge[0].length = static_cast<uint32_t>(std::min(bytes, endpoint->landing_header_bytes));
+  recv_sge[0].lkey = endpoint->recv_mr->lkey;
+  recv_sge[1].addr = reinterpret_cast<uintptr_t>(endpoint->landing_ptr + landing_offset);
+  recv_sge[1].length = static_cast<uint32_t>(landing_bytes);
+  recv_sge[1].lkey = endpoint->landing_mr->lkey;
+  ibv_recv_wr recv_wr = {};
+  recv_wr.wr_id = wr_id;
+  recv_wr.sg_list = recv_sge;
+  recv_wr.num_sge = 2;
+  ibv_recv_wr* bad_recv = nullptr;
+  if (ibv_post_recv(endpoint->qp, &recv_wr, &bad_recv) != 0) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_recv failed for RC endpoint landing slice");
+  }
+  return ok();
+#else
+  (void)offset_bytes;
+  (void)wr_id;
+  (void)landing_offset;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint landing recv requires CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
     void* handle, void* device_ptr, size_t bytes, size_t header_bytes, size_t slot_bytes) {
   if (handle == nullptr) {

@@ -71,6 +71,13 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0,
         value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_waves: u8,
+    /// Admitted prefill slots of a resolved deployment (#762; 0 resolves them):
+    /// `--prefill-waves` starts the depth, more slots let the executor choose.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
+    pub prefill_slots: u8,
+    /// The resolved admitted slots (equal to the waves when pinned).
+    #[arg(skip)]
+    pub admitted_slots: u8,
     /// Pool-first by default; local requests require an exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
     pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
@@ -128,19 +135,24 @@ pub(crate) struct EngineArgs {
 fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
     use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides, MAX_WAVES};
     let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
-    cuteafd_loader::placement::attention::parse(&args.attention_placement)
-        .map_err(anyhow::Error::msg)?;
+    let layers = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+        .map_err(anyhow::Error::msg)? == Some(cuteafd_loader::placement::AttentionPlacement::Layers);
+    let family = cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::glm::GLM5);
     let shape = prefill_shape(ranks, PrefillLimits {
         max_waves: if ranks == 0 { 1 } else { MAX_WAVES },
-        ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::glm::GLM5)
+        // Owned attention runs one unit per slot at a fixed depth.
+        adaptive: family.adaptive && !layers,
+        ..family
     }, PrefillOverrides {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(u64::from(args.prefill_waves)),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
+        slots: (args.prefill_slots > 0).then_some(u64::from(args.prefill_slots)),
     })?;
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = u8::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    args.admitted_slots = u8::try_from(shape.slots)?;
     Ok(())
 }
 
@@ -170,11 +182,10 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
 }
 
 /// Bytes one coordinator GPU admits for native dense execution before any allocation: decode
-/// scratch plus every prefill lane's scratch and, with A8 prefill, its MX8 records.
+/// scratch plus the prefill scratch every slot shares and, with A8 prefill, its MX8 records.
 /// `cuteafd plan --layout` charges the same bytes (`plan::layout::glm5::native_layout`).
 fn native_dense_charge(cfg: &GlmDsaConfig, gpus: usize, args: &EngineArgs) -> u64 {
-    let lanes = usize::from(args.prefill_waves);
-    cuteafd_loader::plan::exlr8::dense::lane_charge_bytes(cfg, gpus, engine::DECODE_ROWS, args.prefill_rows, lanes,
+    cuteafd_loader::plan::exlr8::dense::lane_charge_bytes(cfg, gpus, engine::DECODE_ROWS, args.prefill_rows,
         args.exlr8_prefill_activations == Exlr8PrefillActivations::A8) as u64
 }
 
@@ -290,6 +301,39 @@ mod draft_cli_tests {
         }
     }
 
+    /// #762: an unpinned GLM 5 deployment admits four slots of its unit in
+    /// one reserve and starts at the estimate; a pinned depth, owned
+    /// attention or a Spark-free run admits only its own waves.
+    #[test]
+    fn unpinned_prefill_admits_four_slots_and_pins_stay_static() {
+        let peers = (0..6).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(",");
+        let resolve = |extra: &[&str]| {
+            let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--peers", peers.as_str()];
+            argv.extend_from_slice(extra);
+            let mut args = Parse::try_parse_from(argv).unwrap().engine;
+            resolve_prefill(&mut args).unwrap();
+            (args.prefill_rows, args.prefill_waves, args.prefill_span_rows, args.admitted_slots)
+        };
+        assert_eq!(resolve(&[]), (4096, 3, 8256, 4));
+        assert_eq!(resolve(&["--prefill-waves", "3"]), (2752, 3, 8256, 3));
+        assert_eq!(resolve(&["--prefill-waves", "4"]), (2048, 4, 8192, 4));
+        assert_eq!(resolve(&["--attention-placement", "layers", "--split-device", "1"]), (2752, 3, 8256, 3));
+        // A golden pins the starting depth at its own cut; with_engine keeps it.
+        let mut args = Parse::try_parse_from(["test", "--snapshot", "/c", "--native-lib", "/n", "--peers",
+            peers.as_str()]).unwrap().engine;
+        resolve_prefill(&mut args).unwrap();
+        args.prefill_rows = cuteafd_loader::serving_capacity::wave_control::unit_for(
+            u64::from(args.prefill_waves), args.prefill_rows as u64) as usize;
+        args.prefill_span_rows = args.prefill_rows * usize::from(args.prefill_waves);
+        resolve_prefill(&mut args).unwrap();
+        assert_eq!((args.prefill_rows, args.prefill_waves, args.admitted_slots), (2752, 3, 3));
+        // A launch passes its deployment's slots back: adaptive stays adaptive.
+        assert_eq!(resolve(&["--prefill-rows", "4096", "--prefill-waves", "3", "--prefill-span-rows", "8256",
+            "--prefill-slots", "4"]), (4096, 3, 8256, 4));
+        assert_eq!(resolve(&["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-span-rows", "8256",
+            "--prefill-slots", "3"]), (2752, 3, 8256, 3));
+    }
+
     #[test]
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
@@ -367,10 +411,10 @@ mod draft_cli_tests {
                     }
                     admitted.push(charge);
                 }
-                // 4 or 6 Sparks: lanes are the requested waves (1..=4), each carrying its own records.
+                // Every slot shares one prefill scratch and its records (#762).
                 let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
                 let records = cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&cfg, heads, inter, rows.parse().unwrap());
-                assert_eq!(admitted[1] - admitted[0], waves.parse::<u64>().unwrap() * records as u64, "{gpus} RTX/{rows}/{waves}");
+                assert_eq!(admitted[1] - admitted[0], records as u64, "{gpus} RTX/{rows}/{waves}");
             }
         }
     }
@@ -778,7 +822,9 @@ impl Opened {
             self.library.cuda_set_device(args.device)?;
             context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
         }
-        let prefill_lanes = usize::from(args.prefill_waves);
+        // Admitted slots (#762): every per-slot owner covers the deepest depth
+        // the executor may run; a pinned or one-wave shape admits its waves.
+        let prefill_lanes = usize::from(args.admitted_slots.max(args.prefill_waves));
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
             "layer-owned prefill lacks capacity for {prefill_lanes} waves");
         let exchange_f32 = glm::local_exchange_f32()?;
@@ -1022,8 +1068,12 @@ impl Opened {
                 draft_head = "tensor", "DFlash2 drafter resident");
             Some(drafter)
         } else { None };
+        // The runtime depth inside the admitted slots: the planner's estimate to
+        // start; an explicit --prefill-waves (or a one-slot shape) pins it.
+        let depth = crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves).min(prefill_lanes),
+            prefill_lanes, args.prefill_rows, prefill_lanes == usize::from(args.prefill_waves))?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
+            max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
         engine.exlr8_prefill_activations = args.exlr8_prefill_activations;
         engine.native_experts = native_owners;
         engine.spark_bf16 = spark_bf16;
@@ -1104,14 +1154,20 @@ impl Opened {
             link.bootstrap(&warm()?)?;
             Ok(link)
         }).transpose()?;
-        // One prefill transport with `prefill_lanes` waves in flight (PLAN "Prefill
-        // contract"): each in-flight unit lands in its own return slot.
+        // One prefill transport with up to `prefill_lanes` admitted waves in flight
+        // (PLAN "Prefill contract"): each in-flight unit lands in its own return
+        // slot, cut per call from one reserve range per rank (#762).
         let mut prefill_link = match selected_peers.filter(|_| prefill_lanes > 1) {
             Some(peers) => {
                 let (peers, world) = ranks(peers)?;
-                let mut link = SparkLink::new_waves(&self.library, world, &peers, 4096, config.clone(), row_bytes,
-                    prefill_lanes, u32::try_from(args.prefill_rows)?)?;
+                let reserve = cuteafd_loader::placement::families::glm5::prefill_span(args.prefill_rows as u64,
+                    prefill_lanes as u64);
+                let mut link = SparkLink::new_reserve(&self.library, world, &peers, 4096, config.clone(), row_bytes,
+                    prefill_lanes, u32::try_from(args.prefill_rows)?, usize::try_from(reserve)?)?;
                 link.bootstrap(&warm()?)?;
+                // The warm-up wave is one admitted unit wide: one slot of it (each
+                // prefill re-cuts to its own depth at rest).
+                link.set_geometry(1, args.prefill_rows)?;
                 Some(link)
             }
             None => None,
@@ -1558,8 +1614,12 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
-    // Reject invalid explicit geometry before checkpoint I/O.
+    // Reject invalid explicit geometry before checkpoint I/O. Goldens pin the
+    // starting depth at its own unit (an adaptive unit cut at that depth).
     resolve_prefill(&mut args.engine)?;
+    args.engine.prefill_rows = usize::try_from(cuteafd_loader::serving_capacity::wave_control::unit_for(
+        u64::from(args.engine.prefill_waves), args.engine.prefill_rows as u64))?;
+    args.engine.prefill_span_rows = args.engine.prefill_rows * usize::from(args.engine.prefill_waves);
     // Validate the scoring call before opening CUDA or loading any weights.
     let rows = args.engine.prefill_rows;
     crate::shared::prefill_pipeline::retained_logits_units(rows, rows,

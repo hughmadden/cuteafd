@@ -18,16 +18,40 @@ pub struct DeviceLanding {
     pub ptr: usize,
     pub bytes: usize,
     pub slot_bytes: usize,
+    /// Every request names its own [`LandingSlice`] of the range, and its
+    /// receive is posted with that request: no receive is posted ahead and
+    /// there is no rotation, so the wave geometry inside the range may change
+    /// between waves and a session may (re)open at any wave slot.
+    pub placed: bool,
+}
+
+/// Where one wave's payload lands inside a placed [`DeviceLanding`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LandingSlice {
+    /// Byte offset from the start of the rank's landing range.
+    pub offset: usize,
+    /// Payload bytes the receive accepts there.
+    pub bytes: usize,
 }
 
 impl DeviceLanding {
     pub fn new(buffer: CuteafdDeviceBuffer) -> Self {
-        Self { ptr: buffer.ptr as usize, bytes: buffer.bytes, slot_bytes: buffer.bytes }
+        Self { ptr: buffer.ptr as usize, bytes: buffer.bytes, slot_bytes: buffer.bytes, placed: false }
     }
     pub fn with_slots(buffer: CuteafdDeviceBuffer, slots: usize) -> Result<Self> {
         anyhow::ensure!((1..=4).contains(&slots) && buffer.bytes > 0 && buffer.bytes % slots == 0,
             "GPU landing requires equally sized slots");
         Ok(Self { slot_bytes: buffer.bytes / slots, ..Self::new(buffer) })
+    }
+    /// The whole range, registered once; each wave lands at the slice its
+    /// request names ([`LandingSlice`]).
+    pub fn placed(buffer: CuteafdDeviceBuffer) -> Result<Self> {
+        anyhow::ensure!(buffer.bytes > 0, "GPU landing range is empty");
+        Ok(Self { placed: true, ..Self::new(buffer) })
+    }
+    /// Whether `slice` lies inside the range.
+    pub fn holds(&self, slice: LandingSlice) -> bool {
+        slice.bytes > 0 && slice.offset.checked_add(slice.bytes).is_some_and(|end| end <= self.bytes)
     }
     fn buffer(self) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: self.ptr as *mut c_void, bytes: self.bytes, ..Default::default() }
@@ -37,12 +61,14 @@ impl DeviceLanding {
 /// Registers `landing` on `endpoint` before its receives are posted; false
 /// (with the reason logged) keeps the session on host receives.
 pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr: SocketAddr) -> bool {
+    // A placed range is one slot: its receives name their own slices.
+    let slot_bytes = if landing.placed { landing.bytes } else { landing.slot_bytes };
     // SAFETY: `SparkExperts::set_gpu_landing`'s contract makes its caller keep
     // the range allocated, and unread while a receive may write it, for as
     // long as this endpoint (owned by the session) exists.
     let attached = unsafe {
         endpoint.library.rdma_rc_endpoint_set_recv_landing(endpoint.info.handle, Some(landing.buffer()),
-            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, landing.slot_bytes)
+            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, slot_bytes)
     };
     match attached {
         Ok(()) => {
@@ -94,8 +120,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
         self.endpoint.traffic.received(wire_bytes);
         // Native posts rotate the N landing slots in request order. The owner
         // fences a slot's consumer before posting its replacement request.
-        self.endpoint.post_recv_at(recv_offset, self.response_ring.slot_capacity_bytes,
-            VERBS_HOST_RECV_WR_ID + recv_slot as u64)?;
+        // A placed landing posts each receive with its own request instead.
+        if !self.placed_landing {
+            self.endpoint.post_recv_at(recv_offset, self.response_ring.slot_capacity_bytes,
+                VERBS_HOST_RECV_WR_ID + recv_slot as u64)?;
+        }
         self.response_recv_sequence = self.response_recv_sequence.wrapping_add(1);
         let mut completed = pending.pop_front()
             .context("persistent verbs-host response arrived without a pending request")?;
@@ -170,6 +199,23 @@ pub fn gpu_landing_probe(library: &NativeLibrary, rdma_device: Option<&str>, byt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_landing_registers_the_whole_range_and_checks_slices() {
+        let range = CuteafdDeviceBuffer { ptr: 4096usize as *mut c_void, bytes: 8256 * 128, ..Default::default() };
+        let landing = DeviceLanding::placed(range).unwrap();
+        assert!(landing.placed && landing.slot_bytes == landing.bytes);
+        // 3×2752 and 4×2048 and 2×4096 slots all fit one reserve range.
+        for (waves, rows) in [(3usize, 2752usize), (4, 2048), (2, 4096), (1, 4096)] {
+            for slot in 0..waves {
+                assert!(landing.holds(LandingSlice { offset: slot * rows * 128, bytes: rows * 128 }));
+            }
+        }
+        assert!(!landing.holds(LandingSlice { offset: 8256 * 128 - 64, bytes: 128 }));
+        assert!(!landing.holds(LandingSlice { offset: 0, bytes: 0 }));
+        assert!(!landing.holds(LandingSlice { offset: usize::MAX, bytes: 2 }));
+        assert!(DeviceLanding::placed(CuteafdDeviceBuffer::default()).is_err());
+    }
 
     #[test]
     fn landing_slots_partition_the_rank_allocation() {

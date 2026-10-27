@@ -18,9 +18,9 @@ impl<'a> GlmEngine<'a> {
         ensure!(
             self.tp2.is_none()
                 && self.decode_workspace.borrow().is_none()
-                && self.lane_workspaces.borrow().is_empty()
+                && self.prefill_slots.borrow().is_empty()
                 && peer.decode_workspace.borrow().is_none()
-                && peer.lane_workspaces.borrow().is_empty(),
+                && peer.prefill_slots.borrow().is_empty(),
             "install TP2 before graph/workspace allocation"
         );
         let devices = [
@@ -159,18 +159,16 @@ impl<'a> GlmEngine<'a> {
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
         }
-        while self.lane_workspaces.borrow().len() < self.prefill_lanes {
-            let w = self.workspace(self.prefill_rows, false)?;
-            self.lane_workspaces.borrow_mut().push(w);
-        }
+        self.ensure_prefill_slots()?;
         drop(self.peer_workspaces(true, 1)?);
-        drop(self.peer_workspaces(false, self.prefill_lanes)?);
         for rank in 0..2 {
+            // Depth 1's slot: one unit's rows, the widest a backend sees.
             let owned = if rank == 0 {
-                self.lane_workspaces.borrow()
+                self.prefill_slots.borrow()
             } else {
-                self.peer()?.lane_workspaces.borrow()
+                self.peer()?.prefill_slots.borrow()
             };
+            let owned = &owned[0];
             let decode = if rank == 0 {
                 self.decode_workspace.borrow()
             } else {

@@ -421,6 +421,7 @@ impl<'a> BackboneRequest<'a> {
             // Request-only admission flags never appear in a response.
             flags: header.flags & !V41_NATIVE_GROUP_REQUEST_FLAG,
             executor_id,
+            pace: None,
         })
     }
     pub fn response_device(
