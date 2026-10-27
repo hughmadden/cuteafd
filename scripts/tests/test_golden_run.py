@@ -272,6 +272,7 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert [call[i + 1] for i, a in enumerate(call) if a == '--device'
                 and call[i + 1].startswith('nvidia.com/gpu=')] == ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']
         assert call[call.index('--ipc') + 1] == 'host' and 'memlock=-1:-1' in call
+        assert call[call.index('--security-opt') + 1].endswith('/docker/seccomp-code-bench.json')
         mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
         assert "/mnt/sparknest:/mnt/sparknest:ro" in mounts
         assert f"{env['tmp'] / 'hub'}:{env['tmp'] / 'hub'}:ro" in mounts
