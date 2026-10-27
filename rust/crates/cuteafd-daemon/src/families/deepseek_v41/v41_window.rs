@@ -431,6 +431,12 @@ impl<'a> WindowScratch<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only negative control: the commit stages through the producer's
+    /// position staging (the pre-#815 bug).
+    pub(crate) static SHARED_COMMIT_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub(crate) struct WindowWave<'w, 'a> {
     stream: LoadStream<'a>,
     shared: std::rc::Rc<WindowScratch<'a>>,
@@ -883,6 +889,16 @@ impl WindowWave<'_, '_> {
         self.graphs.retire_all();
         drop(self.graphs.drain_retired(|| Ok(()))?);
         Ok(())
+    }
+}
+impl<'w, 'a> WindowWave<'w, 'a> {
+    /// The commit's pinned host staging: its own buffer, never the
+    /// producer's position staging, which a queued H2D may still read (#815).
+    /// The test-only negative control reuses the producer's, as before the fix.
+    fn commit_host(&mut self) -> &mut HostAllocation<'a> {
+        #[cfg(test)]
+        if SHARED_COMMIT_STAGING.with(|shared| shared.get()) { return &mut self.staging; }
+        &mut self.commit_staging
     }
 }
 impl Drop for WindowWave<'_, '_> {

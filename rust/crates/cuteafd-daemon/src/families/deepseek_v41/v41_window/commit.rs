@@ -86,7 +86,7 @@ impl<'a> WindowWave<'_, 'a> {
             }
             ends.push(c.position + n as u64);
         }
-        let staging = self.commit_staging.bytes_mut();
+        let staging = self.commit_host().bytes_mut();
         for (i, d) in destinations.iter().enumerate() {
             staging[i * 8..i * 8 + 8].copy_from_slice(&d.to_ne_bytes());
         }
@@ -119,13 +119,14 @@ impl<'a> WindowWave<'_, 'a> {
         self.pending_commit = Some(PendingCommit { prepared: p, ends, accepted: accepted.to_vec(),
             external, _reservation: WriteReservation { flags: state.writing.clone(), mask } });
         if batched.is_some() { return Ok(batched); }
+        // The H2D source: the commit staging written above (raw view, so the
+        // closure below can borrow the wave).
+        let host = self.commit_host().buffer;
         let p = &self.pending_commit.as_ref().unwrap().prepared;
         (|| -> Result<()> {
             unsafe {
-                self.stream.library.copy_h2d_async(
-                    self.destinations.buffer,
-                    &self.commit_staging.bytes_mut()[..p.rows * 8],
-                    self.stream.raw,
+                self.stream.library.copy_host_buffer_h2d_async(
+                    self.destinations.buffer, host, p.rows * 8, self.stream.raw,
                 )?;
                 self.kv.store(
                     self.values.buffer,
@@ -138,10 +139,11 @@ impl<'a> WindowWave<'_, 'a> {
                     self.stream.raw,
                 )?;
                 for (i, c) in p.chunks.iter().enumerate() {
-                    self.stream.library.copy_h2d_async(
-                        slice(state.ends.buffer, c.lease.slot * 8, 8),
-                        &self.commit_staging.bytes_mut()[p.rows * 8 + i * 8..p.rows * 8 + i * 8 + 8],
-                        self.stream.raw,
+                    let mut end = host;
+                    end.ptr = host.ptr.cast::<u8>().wrapping_add(p.rows * 8 + i * 8).cast();
+                    end.bytes = 8;
+                    self.stream.library.copy_host_buffer_h2d_async(
+                        slice(state.ends.buffer, c.lease.slot * 8, 8), end, 8, self.stream.raw,
                     )?;
                 }
                 if let Some((replica,publication)) = self.replica.as_mut() {
@@ -253,7 +255,13 @@ mod tests {
     /// pinned staging).
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
-    fn native_commit_staging_survives_a_queued_producer_upload() -> Result<()> {
+    fn native_commit_staging_survives_a_queued_producer_upload() -> Result<()> { commit_behind_queued_upload(false) }
+    /// Negative control: staging the commit through the producer's position
+    /// staging (the pre-#815 layout) must clobber the queued upload.
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn native_shared_commit_staging_clobbers_a_queued_producer_upload() -> Result<()> { commit_behind_queued_upload(true) }
+    fn commit_behind_queued_upload(shared_staging: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
         let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
@@ -270,7 +278,23 @@ mod tests {
             let value = ((i % 23) as f32 / 23.0).to_bits();
             ((value >> 16) as u16).to_ne_bytes()
         }).collect();
-        let chunk = |lease| WindowChunk { lease, position: 0, tokens: rows as u32 };
+        // Positions start past the 128-row window so the commit's destinations
+        // ((300 + j) % 128) differ from the producer's positions (300 + j):
+        // at position 0 both are 0..rows, and a clobber would be invisible.
+        let chunk = |lease| WindowChunk { lease, position: 300, tokens: rows as u32 };
+        // Advance both windows to position 300 (ungated; also warms every kernel).
+        for start in (0..300u64).step_by(15) {
+            let tokens = (300 - start).min(15) as u32;
+            let warm: Vec<u8> = (0..tokens as usize * 5120).flat_map(|i| {
+                let value = ((i % 19) as f32 / 19.0 - 0.3).to_bits();
+                ((value >> 16) as u16).to_ne_bytes()
+            }).collect();
+            lib.copy_h2d(direct.input(), &warm)?;
+            for (window, held) in [(&mut reference, original), (&mut state, lease)] {
+                unsafe { direct.execute(window, &[WindowChunk { lease: held, position: start, tokens }])?; }
+                direct.commit(window, &[tokens])?;
+            }
+        }
         lib.copy_h2d(direct.input(), &input)?;
         unsafe { direct.execute(&reference, &[chunk(original)])?; }
         direct.commit(&mut reference, &[rows as u32])?;
@@ -282,18 +306,36 @@ mod tests {
             unsafe { gated.enqueue(prepared.rows)?; }
             gated.ready = Some(prepared);
             // The commit stages on the host while the upload above is still queued.
-            unsafe { gated.enqueue_commit(&state, &[rows as u32])?; }
+            crate::families::deepseek_v41::v41_window::SHARED_COMMIT_STAGING.with(|shared| shared.set(shared_staging));
+            let staged = unsafe { gated.enqueue_commit(&state, &[rows as u32]) };
+            crate::families::deepseek_v41::v41_window::SHARED_COMMIT_STAGING.with(|shared| shared.set(false));
+            staged?;
             drop(gate);
         }
         gated.synchronize()?;
+        // The bug's direct observable: the positions the queued upload delivered.
+        // (The packed window values do not change with these positions at this
+        // layer, so they alone cannot detect the clobber.)
+        let mut device = vec![0u8; rows * 8];
+        lib.copy_d2h(&mut device, slice(gated.shared.positions.buffer, 0, rows * 8))?;
+        let delivered: Vec<u64> = device.chunks_exact(8).map(|b| u64::from_ne_bytes(b.try_into().unwrap())).collect();
+        let intended: Vec<u64> = (300..300 + rows as u64).collect();
         gated.commit(&mut state, &[rows as u32])?;
         let (actual, expected) = (state.view(lease)?, reference.view(original)?);
+        let mut equal = true;
         for (a, b, width) in [(actual.values, expected.values, 512), (actual.scales, expected.scales, 16)] {
             let mut left = vec![0; rows * width];
             let mut right = left.clone();
             lib.copy_d2h(&mut left, slice(a, 0, rows * width))?;
             lib.copy_d2h(&mut right, slice(b, 0, rows * width))?;
-            assert_eq!(left, right, "queued producer positions were overwritten by commit staging");
+            equal &= left == right;
+        }
+        if shared_staging {
+            assert_ne!(delivered, intended,
+                "sharing the producer's staging did not clobber the queued upload: the test cannot detect #815");
+        } else {
+            assert_eq!(delivered, intended, "queued producer positions were overwritten by commit staging");
+            assert!(equal, "committed window differs from the direct run");
         }
         Ok(())
     }
