@@ -6025,3 +6025,15 @@ an interrupted reserved run explicitly with `--resume --foreground
 --use-held-lock` under a newly acquired enclosing lease; ordinary detached
 recovery without a reservation still uses `--resume`. Publication remains
 separate and requires TJ's confirmation once the completed artifact is ready.
+
+The monitoring server restarted on 2026-10-28 04:40 Taipei. The foreground
+SSH reservation's hangup guard stopped its container cleanly; all 66 completed
+layers and 48,846 projections survived. Resumed at layer 66 (zero-based) as
+detached attempt `1793133687423980344`, using the normal launcher `--resume`
+path and its own fair-queued gpu1 lease. The supervisor owns a separate session,
+independent of the monitoring connection; the actual GPU flock is verified
+held. Only the uncommitted current capture phase is repeated. For production
+that must survive monitoring-session loss, prefer the normal detached launcher
+once advance reservation/preparation has finished; foreground reservation mode
+deliberately tears down on its enclosing session's hangup. The numerical plan,
+producer, source, tokens and fork pin are unchanged.
