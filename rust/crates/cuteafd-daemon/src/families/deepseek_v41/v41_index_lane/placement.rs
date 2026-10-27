@@ -85,6 +85,25 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         }
         Ok(bytes)
     }
+    pub fn placed_storage_bytes(library: &NativeLibrary, placement: CachePlacement,
+        rows: u32, unit: u32, gpu: usize) -> Result<[usize; 3]> {
+        ensure!(gpu < 2, "invalid index storage GPU");
+        let mut bytes = Self::storage_bytes(library, rows, unit)?;
+        if placement.attention(20)? != gpu { bytes[2] = 0; }
+        if !LAYERS.iter().any(|&layer| placement.attention(layer).ok() == Some(gpu)) { bytes = [0; 3]; }
+        Ok(bytes)
+    }
+    pub fn storage_on_device(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32,
+        gpu: usize) -> Result<DeviceOwner<'a, Rc<IndexLaneStorage<'a>>>> {
+        ensure!(gpu < 2 && weights.placement.is_some(), "placed index storage requires distributed weights");
+        let device = Device { library: weights.library, id: gpu as i32 };
+        device.own(|| Self::storage_inner(weights, rows, unit, Some(device.id)))
+    }
+    pub fn on_storage_on_device(weights: &'w IndexLaneWeights<'a>,
+        storage: Rc<IndexLaneStorage<'a>>) -> Result<DeviceOwner<'a, Self>> {
+        let id = storage.device.context("placed index storage absent")?;
+        Device { library: weights.library, id }.own(|| Self::on_storage(weights, storage))
+    }
     /// Each request lane has independent selection state on each participating
     /// GPU. Source 20 and all decoder reindex layers remain on the same GPU, so
     /// the retained source-20 candidates never need a peer copy.
