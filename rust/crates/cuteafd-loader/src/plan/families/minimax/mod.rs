@@ -221,6 +221,11 @@ fn spec(cfg: &MiniMaxM3Config, vision: bool, draft: Option<&MiniMaxM3DsparkConfi
 }
 
 impl Family for MiniMaxM3 {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "decode shares the one Spark link with every prefill wave: a second lane needs its own decode link, decode \
+                workspaces and drafter scratch, and no two-lane A/B exists yet (#744)" }
+    }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
         // Unmeasured on the shared executor: no S/T timing and no wave-count comparison exists for

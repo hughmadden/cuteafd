@@ -494,6 +494,23 @@ mod tests {
         }
     }
 
+    /// MiniMax decodes on the shared Qwen scheduler, whose decode round is lane 0 of a shared LaneSet
+    /// (`decode_runs_as_lane_zero_of_a_shared_lane_set`): no MiniMax source runs a decode loop, a lane
+    /// set or a commit of its own, and its descriptor runs one lane.
+    #[test]
+    fn minimax_decodes_as_lane_zero_of_the_shared_scheduler() {
+        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(serve.matches("scheduler::schedule(&backend,").count(), 1);
+        for source in [serve, include_str!("backend.rs"), include_str!("execution.rs"), include_str!("execution/units.rs")] {
+            let source = source.split("#[cfg(test)]").next().unwrap();
+            for private in ["LaneSet", "run_one(", "lanes::commit(", "decode_round("] {
+                assert!(!source.contains(private), "{private}");
+            }
+        }
+        let family = cuteafd_loader::plan::spark_executions::descriptor("minimax_m3").unwrap();
+        assert!(matches!(family.decode_lanes(), cuteafd_loader::plan::decode_lanes::LaneSupport::One { .. }));
+    }
+
     #[test]
     fn minimax_serves_two_three_four_or_six_distinct_spark_ranks() {
         assert_eq!(admission::spark_worlds(), [2, 3, 4, 6]);
