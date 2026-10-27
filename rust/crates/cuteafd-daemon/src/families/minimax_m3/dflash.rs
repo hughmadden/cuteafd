@@ -190,7 +190,7 @@ mod tests {
         // Page-aligned uneven units: the tail starts inside the first unit.
         assert_eq!(unit_tail(0, 2240, 4412, 4096), Some((316, 0, 1924)));
         assert_eq!(unit_tail(2240, 2172, 4412, 4096), Some((0, 1924, 2172)));
-        // Three units of 2752 (six Sparks, an 8256-row span): the tail starts inside the second.
+        // Three units of 2752 (a pinned 3 x 2752, an 8256-row span): the tail starts inside the second.
         assert_eq!(unit_tail(0, 2752, 8256, 4096), None);
         assert_eq!(unit_tail(2752, 2752, 8256, 4096), Some((1408, 0, 1344)));
         assert_eq!(unit_tail(5504, 2752, 8256, 4096), Some((0, 1344, 2752)));

@@ -6,7 +6,7 @@ use cuteafd_loader::{
     plan::{checkpoint::Checkpoint, families::minimax::admission::{self, Reservations}},
 };
 use std::path::{Path, PathBuf};
-pub(super) use admission::{spark_worlds, LocalLayers, Request, RuntimeLedger, RuntimeSizing};
+pub(super) use admission::{prefill_shape, spark_worlds, LocalLayers, Request, RuntimeLedger, RuntimeSizing};
 
 pub(super) struct Admitted {
     pub cache: admission::Admission,
@@ -124,8 +124,8 @@ mod tests {
         Ok(())
     }
 
-    /// A plan of the test snapshot on `ranks` Sparks at #762's shape (2 x 4096 below six Sparks,
-    /// 3 x 2752 at six), and the sizing serve runs it with.
+    /// A plan of the test snapshot on `ranks` Sparks at the descriptor's shape (two 4096-row waves
+    /// while MiniMax's prefill estimate is unmeasured), and the sizing serve runs it with.
     fn planned(ranks: usize) -> Result<(tempfile::TempDir, cuteafd_loader::plan::PlanReport, RuntimeSizing)> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
@@ -154,7 +154,7 @@ mod tests {
     /// (`minimax_spark_intake_allocates_the_planned_return_slots_in_both_modes`, CPU fixture).
     #[test]
     fn minimax_planner_charges_the_link_return_slots_at_the_adaptive_shapes() -> Result<()> {
-        for (ranks, unit, waves) in [(2, 4096, 2), (3, 4096, 2), (4, 4096, 2), (6, 2752, 3)] {
+        for (ranks, unit, waves) in [(2, 4096, 2), (3, 4096, 2), (4, 4096, 2), (6, 4096, 2)] {
             let (_dir, report, sizing) = planned(ranks)?;
             assert_eq!((sizing.unit_rows, sizing.waves, report.prefill_unit_rows, report.prefill_waves),
                 (unit, waves, Some(unit as u64), Some(waves as u64)), "TP{ranks}");

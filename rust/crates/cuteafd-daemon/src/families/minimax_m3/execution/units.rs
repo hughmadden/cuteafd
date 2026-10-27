@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, Step};
 
-    /// Unit shapes the planner and launcher admit (#762's 2 x 4096 and 3 x 2752, a pinned 4 x 2048, smaller units).
+    /// Unit shapes the planner and launcher admit (the descriptor's 2 x 4096, pinned 3 x 2752 and 4 x 2048, smaller units).
     const SHAPES: [(usize, usize); 6] = [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (1024, 2), (256, 2)];
 
     fn source(text: &'static str) -> &'static str { text.split("#[cfg(test)]").next().unwrap() }

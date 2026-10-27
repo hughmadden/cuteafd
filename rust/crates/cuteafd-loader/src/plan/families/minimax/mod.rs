@@ -221,6 +221,13 @@ fn spec(cfg: &MiniMaxM3Config, vision: bool, draft: Option<&MiniMaxM3DsparkConfi
 }
 
 impl Family for MiniMaxM3 {
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
+        // Unmeasured on the shared executor: no S/T timing and no wave-count comparison exists for
+        // MiniMax units yet, so the shared policy keeps its conservative two waves at every Spark count.
+        // The executor's caps are the shared ones (1..=4 waves of page-aligned units up to 4096 rows).
+        PrefillLimits { estimate: PrefillEstimate::Unmeasured, ..Default::default() }
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // MiniMax decode/verify steps send at most `admission::DECODE_ROWS` (64) rows.
         Some(crate::plan::spark_executions::SparkDecode { rows: admission::DECODE_ROWS as u32 })

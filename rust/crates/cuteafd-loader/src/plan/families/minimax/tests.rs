@@ -414,7 +414,7 @@ fn pro6000_plans_tp2_tp3_tp4_and_tp6_on_prefill_units() {
     let dir = snapshot(true, false);
     let drafter = tempfile::tempdir().unwrap();
     std::fs::write(drafter.path().join("config.json"), testing::minimax_dflash2_config().to_string()).unwrap();
-    for (ranks, unit, waves) in [(2usize, 4096u64, 2u64), (3, 4096, 2), (4, 4096, 2), (6, 2752, 3)] {
+    for (ranks, unit, waves) in [(2usize, 4096u64, 2u64), (3, 4096, 2), (4, 4096, 2), (6, 4096, 2)] {
         let mut options = native_options(dir.path(), ranks);
         let mut package = admission::tests::expert_manifest();
         package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
@@ -560,10 +560,11 @@ fn tp6_holds_every_routed_layer_in_six_equal_slices() {
     assert!(ranks.iter().all(|d| item(d, "routed expert weights") == experts));
     assert!(experts < item(&sparks(&tp4)[1], "routed expert weights"));
     // The package exports tp6: each rank's owners take its capacities (decode m256, prefill m4096), not the estimate.
-    let owners = admission::RuntimeSizing { unit_rows: 2752, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
-        logit_rows: 64, waves: 3 }.spark_executions().unwrap();
-    assert_eq!((owners.decode[0].capacity, owners.prefill.unit_rows, owners.prefill.buffered_units), (64, 2752, 3));
+    assert_eq!((tp6.prefill_unit_rows, tp6.prefill_waves), (Some(4096), Some(2)));
+    let owners = admission::RuntimeSizing { unit_rows: 4096, decode_rows: 64, sequences: 64, context: 1 << 20, spark_ranks: 6,
+        logit_rows: 64, waves: 2 }.spark_executions().unwrap();
+    assert_eq!((owners.decode[0].capacity, owners.prefill.unit_rows, owners.prefill.buffered_units), (64, 4096, 2));
     let row = 6144 * 2 + 4 * 8 + 6144 * 2;
-    assert!(ranks.iter().all(|d| item(d, "execution owners") == 102_837_248 + 64 * row + 987_654_321 + 2752 * row));
+    assert!(ranks.iter().all(|d| item(d, "execution owners") == 102_837_248 + 64 * row + 987_654_321 + 4096 * row));
     assert_eq!(tp6.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
 }

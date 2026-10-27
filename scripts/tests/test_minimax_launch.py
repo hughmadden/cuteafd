@@ -43,8 +43,9 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--spark-budget-bytes") == str(108 << 30)
     assert _flag(serve, "--max-sequences") == _flag(plan, "--concurrency") == "64"
-    # Prefill units: the plan resolves #762's shape (no key pins it) and serve runs what it resolved.
-    unit, waves = ("2752", "3") if ranks == 6 else ("4096", "2")
+    # Prefill units: the plan resolves MiniMax's descriptor shape (no key pins it; the estimate is
+    # unmeasured, so two 4096-row waves at every Spark count) and serve runs what it resolved.
+    unit, waves = ("4096", "2")
     assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == (unit, waves)
     assert _flag(plan, "--prefill-rows") is None and _flag(plan, "--prefill-waves") is None
     assert not any(flag in serve + plan for flag in ("--prefill-lanes", "--prefill-batch-tokens", "--prefill-span-rows"))

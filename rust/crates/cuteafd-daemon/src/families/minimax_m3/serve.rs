@@ -32,9 +32,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     max_context: u64,
     /// Rows of one prefill unit: one Spark wave, and the most rows a program launch takes. Several waves
-    /// need whole 64-row pages (the plan's unit shape).
-    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
-    prefill_rows: u32,
+    /// need whole 64-row pages (the plan's unit shape). Unset, the shared prefill policy picks it.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    prefill_rows: Option<u32>,
     #[arg(long, default_value = "auto")]
     rtx_expert_layers: String,
     /// The bundled DSpark (`dspark/`), a DFlash2 checkpoint (`dflash2`, with --draft) on the
@@ -74,10 +74,10 @@ pub(crate) struct ServeArgs {
     model_id: Option<String>,
     /// Spark waves a prefill call keeps in flight (1 to 4): a call of up to this many units of
     /// --prefill-rows rows runs on the shared executor, each unit's routed wave in flight on the one
-    /// Spark link while other units' GPU layers run. The launcher passes the plan's resolved shape.
-    #[arg(long, default_value_t = 2,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_waves::MAX_WAVES))]
-    prefill_waves: usize,
+    /// Spark link while other units' GPU layers run. The launcher passes the plan's resolved shape;
+    /// unset, the shared prefill policy picks it from MiniMax's descriptor, as the plan does.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=prefill_waves::MAX_WAVES))]
+    prefill_waves: Option<usize>,
     /// Project every prefill row's logits (prefill-shaped probe scoring);
     /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
@@ -110,7 +110,17 @@ pub(crate) struct ServeArgs {
     api: crate::shared::api::ApiArgs,
 }
 impl ServeArgs {
+    /// The prefill shape (unit rows, waves): the launch's pins (the launcher passes the plan's
+    /// resolved shape; one wave may take any rows a launch holds), and the plan's own resolution
+    /// (`admission::prefill_shape`, MiniMax's descriptor estimate) for whatever is not pinned.
+    pub(crate) fn shape(&self) -> Result<(usize, usize)> {
+        if let (Some(rows), Some(waves)) = (self.prefill_rows, self.prefill_waves) { return Ok((rows as usize, waves)); }
+        let shape = admission::prefill_shape(self.prefill_rows.map_or(0, u64::from), self.prefill_waves.map_or(0, |w| w as u64),
+            self.peers.len())?;
+        Ok((usize::try_from(shape.unit_rows)?, usize::try_from(shape.waves)?))
+    }
     pub(crate) fn validate(&self) -> Result<Option<usize>> {
+        let (rows, _) = self.shape()?;
         // The Spark worlds the expert package ships (the shared Spark-range policy).
         let worlds = admission::spark_worlds();
         if self.device < 0 || !worlds.contains(&self.peers.len())
@@ -122,14 +132,14 @@ impl ServeArgs {
         if !matches!(self.speculator.as_str(),"off"|"dspark"|"dflash2") {
             return Err(MiniMaxError::Unsupported("speculator must be dspark, dflash2 or off").into());
         }
-        if self.speculator=="dspark" && self.prefill_rows<7 {return Err(MiniMaxError::Invalid("DSpark needs at least seven scratch rows").into());}
+        if self.speculator=="dspark" && rows<7 {return Err(MiniMaxError::Invalid("DSpark needs at least seven scratch rows").into());}
         if (self.speculator=="dflash2") != self.draft.is_some() {
             return Err(MiniMaxError::Invalid("--speculator dflash2 takes its drafter snapshot with --draft, and only it does").into());
         }
         if matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")) {
             return Err(MiniMaxError::Unsupported("Spark write mode has no MiniMax allocation ledger").into());
         }
-        if self.max_sequences as u32 > self.prefill_rows || self.max_context > 1_048_576 {
+        if self.max_sequences as usize > rows || self.max_context > 1_048_576 {
             return Err(MiniMaxError::Invalid("request context or row capacity").into());
         }
         if self.draft_context_slots.is_some_and(|n| n == 0 || n > self.max_sequences as usize) {
@@ -281,12 +291,12 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     super::routed::require_device_landing(&library, args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
-    let (rows, sequences) = (args.prefill_rows as usize, args.max_sequences as usize);
+    let ((rows, waves), sequences) = (args.shape()?, args.max_sequences as usize);
     // The prefill shape the launch resolved (the plan's units): `--prefill-waves` units of
     // `--prefill-rows` in flight. Head rows follow once the drafter's block is known.
     let mut sizing = RuntimeSizing { unit_rows: rows, decode_rows: rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS),
         sequences, context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context},
-        spark_ranks: args.peers.len(), logit_rows: 0, waves: args.prefill_waves };
+        spark_ranks: args.peers.len(), logit_rows: 0, waves };
     let span = sizing.slot_rows();
     let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::plan::families::minimax::admission::default_draft_rings(
         sequences, rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS)));
@@ -459,15 +469,23 @@ mod tests {
     }
 
     /// `--prefill-waves` is the waves the one Spark link keeps in flight (1 to 4, the plan's shape with
-    /// `--prefill-rows`); the lane flags and their aliases are gone.
+    /// `--prefill-rows`); unpinned, serve resolves the plan's shape from MiniMax's descriptor (two 4096-row
+    /// waves while its estimate is unmeasured, at every Spark count). The lane flags and their aliases are gone.
     #[test]
     fn minimax_prefill_waves_take_one_to_four_without_lane_aliases() {
-        let waves = |extra: &[&str]| match crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot",
-            "/model", "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2"].into_iter().chain(extra.iter().copied())) {
-            Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) => Some((a.prefill_rows, a.prefill_waves)),
+        let parse = |peers: &str, extra: &[&str]| match crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot",
+            "/model", "--native-lib", "/lib.so", "--peers", peers].into_iter().chain(extra.iter().copied())) {
+            Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) => a.shape().ok(),
             _ => None,
         };
+        let waves = |extra: &[&str]| parse("127.0.0.1:1,127.0.0.1:2", extra);
         assert_eq!(waves(&[]), Some((4096, 2)));
+        let six = (1..=6).map(|port| format!("127.0.0.1:{port}")).collect::<Vec<_>>().join(",");
+        assert_eq!(parse(&six, &[]), Some((4096, 2)));
+        assert_eq!(parse(&six, &["--prefill-waves", "3"]), Some((2752, 3)));
+        for (rows, waves) in [(4096, 2), (2752, 3)] {
+            assert_eq!(cuteafd_loader::plan::families::minimax::admission::prefill_shape(0, waves, 6).unwrap().unit_rows, rows);
+        }
         assert_eq!(waves(&["--prefill-rows", "2048", "--prefill-waves", "3"]), Some((2048, 3)));
         assert_eq!(waves(&["--prefill-rows", "2752", "--prefill-waves", "4"]), Some((2752, 4)));
         for refused in ["0", "5"] { assert_eq!(waves(&["--prefill-waves", refused]), None, "{refused} waves"); }

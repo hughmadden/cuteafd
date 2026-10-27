@@ -324,7 +324,7 @@ mod tests {
     use scheduler::Placement as _;
 
     /// The scheduler chunks prompts at the span the planner admits (8192 rows at 2 x 4096 and 4 x 2048, 8256 at
-    /// six Sparks' 3 x 2752, from `slot_rows`), or at one unit when every prefill row's logits are served.
+    /// a pinned 3 x 2752, from `slot_rows`), or at one unit when every prefill row's logits are served.
     #[test]
     fn minimax_scheduler_prefill_rows_are_the_span_unless_every_row_is_scored() {
         use cuteafd_loader::plan::families::minimax::admission::RuntimeSizing;

@@ -106,15 +106,16 @@ impl RuntimeSizing {
     }
 }
 
-/// The prefill shape a plan or server admits when it names none, after #762: the 8192-row reserve
-/// split into `planned_waves(spark_ranks)` units of `unit_rows(k)` (2 x 4096 below six Sparks,
-/// 3 x 2752 at six). Explicit waves pin k, and their unit follows k unless the rows are pinned too.
-/// A 2752-row wave runs on the expert package's 4096-row programs, which take any rows up to their
-/// capacity, so six Sparks need no other export.
+/// The prefill shape a plan or server admits (PLAN "Prefill contract"): the shared policy
+/// (`prefill_waves::prefill_shape`) over MiniMax's descriptor limits, with `rows` and `waves` (0 =
+/// unpinned) as pins. Unpinned, the descriptor's estimate picks the waves (it is unmeasured: two at
+/// every Spark count, one without Sparks) and the unit follows them inside the 8192-row reserve.
+/// A 2752- or 2048-row unit runs on the expert package's 4096-row programs, which take any rows up
+/// to their capacity.
 pub fn prefill_shape(rows: u64, waves: u64, spark_ranks: usize) -> anyhow::Result<PrefillShape> {
-    let waves = if waves > 0 { waves } else { match spark_ranks { 0 => 1, 1..=5 => 2, _ => 3 } };
-    let unit_rows = if rows > 0 { rows } else { prefill_waves::unit_rows(waves) };
-    PrefillShape { unit_rows, waves }.validate()
+    let pins = prefill_waves::PrefillOverrides { unit_rows: (rows > 0).then_some(rows),
+        waves: (waves > 0).then_some(waves), span_rows: None };
+    Ok(prefill_waves::prefill_shape(spark_ranks, crate::plan::Family::prefill_limits(&super::MINIMAX_M3), pins)?.units())
 }
 
 pub const PROGRAM_NAMES: &[&str] = &[
@@ -722,14 +723,18 @@ pub(crate) mod tests {
         assert!(RuntimeSizing { unit_rows: 4160, waves: 1, ..sizing() }.validate(&config()).is_err());
     }
 
-    /// #762 picks the waves for the topology and the unit for the waves; explicit waves or rows pin
-    /// them. Six Sparks run three 2752-row waves, the 8192-row reserve rounded up to whole pages.
+    /// The shared policy picks the waves from MiniMax's descriptor estimate and the unit for the
+    /// waves; explicit waves or rows pin them. The estimate is unmeasured, so every Spark count runs
+    /// two 4096-row waves until a measured MiniMax estimate lands; three 2752-row waves (the 8192-row
+    /// reserve rounded up to whole pages) remain a pin.
     #[test]
-    fn prefill_shape_follows_the_adaptive_wave_defaults_unless_pinned() {
+    fn prefill_shape_follows_the_descriptor_estimate_unless_pinned() {
         let shape = |rows, waves, ranks| prefill_shape(rows, waves, ranks).map(|s| (s.unit_rows, s.waves, s.slot_rows()));
-        for ranks in [2, 3, 4] { assert_eq!(shape(0, 0, ranks).unwrap(), (4096, 2, 8192)); }
-        assert_eq!(shape(0, 0, 6).unwrap(), (2752, 3, 8256));
+        for ranks in [2, 3, 4, 6] { assert_eq!(shape(0, 0, ranks).unwrap(), (4096, 2, 8192), "TP{ranks}"); }
+        assert_eq!(shape(0, 3, 6).unwrap(), (2752, 3, 8256));
         assert_eq!(shape(0, 0, 0).unwrap(), (4096, 1, 4096));
+        assert!(matches!(crate::plan::Family::prefill_limits(&super::super::MINIMAX_M3).estimate,
+            prefill_waves::PrefillEstimate::Unmeasured));
         // Pinned waves take their own unit; pinned rows keep theirs.
         assert_eq!(shape(0, 2, 6).unwrap(), (4096, 2, 8192));
         assert_eq!(shape(0, 4, 4).unwrap(), (2048, 4, 8192));

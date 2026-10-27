@@ -951,7 +951,8 @@ gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "minimax_m3"}
 waves = int(value("--prefill-waves", "0")) or (1 if not shared or ranks == 0 else 2 if ranks < 6 else 3)
-if "--prefill-waves" not in args and family in {"qwen4", "step5"}:
+# Qwen4's two-slot ring, Step-5's stub and MiniMax's unmeasured estimate keep two automatic waves.
+if "--prefill-waves" not in args and family in {"qwen4", "step5", "minimax_m3"}:
     waves = min(waves, 2)
 unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]
 span = int(value("--prefill-span-rows", "0")) or unit * waves
