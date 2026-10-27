@@ -171,7 +171,16 @@ impl<'a, R> Pass<'a, R> {
         Ok(Some(chain.handle()))
     }
 
-    fn drain_chain(&self) -> Result<()> {
+    /// A prefill unit's device-ordered chain (shared executor): every hook of
+    /// the unit polls in this scope, so its stages order on the device and no
+    /// hook waits on the host for its own GPU or Spark work (#815). Drained
+    /// with [`Self::drain_chain`] at the unit's end.
+    pub(super) fn unit_chain(&self) -> Result<crate::shared::memory::chain::ChainHandle<'a>> {
+        let chain = self.chain.as_ref().context("prefill units need the stage chain (CUTEAFD_STAGE_CHAIN)")?;
+        chain.set_device_order(true);
+        Ok(chain.handle())
+    }
+    pub(super) fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
         chain.drain_bounded(Duration::from_secs(60))
     }

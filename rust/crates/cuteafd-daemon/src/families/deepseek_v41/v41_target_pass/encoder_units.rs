@@ -48,6 +48,19 @@ struct UnitSlot<'s, 'w, 'a> {
     batch: Option<RequestBatch>,
     prepared: Option<UnitPreparedLayer>,
     started: Instant,
+    /// Recorded after this slot's unit published a layer's KV (its attention
+    /// hook); the next unit's attention orders after it on the device.
+    published: Option<OwnedEvent<'a>>,
+}
+/// An ordering event owned by a unit slot.
+struct OwnedEvent<'a> { library: &'a cuteafd_ffi::NativeLibrary, raw: *mut std::ffi::c_void }
+impl Drop for OwnedEvent<'_> {
+    fn drop(&mut self) {
+        // SAFETY: created by this owner; slots drain their chains before drop.
+        if let Err(error) = unsafe { self.library.cuda_event_destroy(self.raw) } {
+            tracing::error!(%error, "destroying prefill unit event");
+        }
+    }
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
@@ -70,16 +83,8 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         }
     }
 }
-impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
-    type Ticket = UnitPendingLayer;
-    fn route(&self, layer: usize) -> FfnRoute {
-        if self.slots[0].transport.has_local_layer(layer) {
-            FfnRoute::Local
-        } else {
-            FfnRoute::Spark
-        }
-    }
-    async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+impl<'a> UnitHooks<'_, '_, '_, 'a> {
+    async fn begin_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         ensure!(
             slot.batch.is_none() && slot.prepared.is_none(),
@@ -124,7 +129,18 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         }
         Ok(())
     }
-    async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+    async fn attention_inner(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        // Unit k+1 attends layer L after unit k published L (the schedule's
+        // order on the host); on the device it follows that publication.
+        if let Some(previous) = unit.index.checked_sub(1) {
+            let other = (unit.slot + self.slots.len() - 1) % self.slots.len();
+            if previous % self.slots.len() == other && other != unit.slot {
+                if let Some(event) = &self.slots[other].published {
+                    // SAFETY: a live event on this device, recorded by the predecessor's chain.
+                    unsafe { crate::shared::memory::chain::depend(event.library, event.raw)?; }
+                }
+            }
+        }
         let slot = &mut self.slots[unit.slot];
         ensure!((self.keep_running)(), "client disconnected");
         ensure!(slot.prepared.is_none(), "encoder attention still pending");
@@ -145,9 +161,13 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
             )?
         };
         slot.prepared = Some(prepared.into_unit().await?);
+        if let Some(event) = &slot.published {
+            // SAFETY: a live event on this chain's device.
+            unsafe { crate::shared::memory::chain::record_into(event.library, event.raw)?; }
+        }
         Ok(())
     }
-    async fn local_ffn(&mut self, _layer: usize, unit: &Unit) -> Result<()> {
+    async fn local_ffn_inner(&mut self, _layer: usize, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         let prepared = slot.prepared.take().context("encoder attention absent")?;
         let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
@@ -172,7 +192,7 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         }
         Ok(())
     }
-    async fn send_experts(&mut self, _layer: usize, unit: &Unit) -> Result<Self::Ticket> {
+    async fn send_experts_inner(&mut self, _layer: usize, unit: &Unit) -> Result<UnitPendingLayer> {
         let slot = &mut self.slots[unit.slot];
         let prepared = slot.prepared.take().context("encoder attention absent")?;
         let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
@@ -188,11 +208,11 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
                 .await
         }
     }
-    async fn land_experts(
+    async fn land_experts_inner(
         &mut self,
         _layer: usize,
         unit: &Unit,
-        ticket: Self::Ticket,
+        ticket: UnitPendingLayer,
     ) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
@@ -213,7 +233,7 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         }
         Ok(())
     }
-    async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+    async fn end_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         ensure!((self.keep_running)(), "client disconnected");
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
@@ -231,7 +251,7 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         slot.pass.state = State::Encoded(batch.cache()?.identity());
         Ok(())
     }
-    async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
+    async fn commit_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         slot.pass.commit(
@@ -252,6 +272,58 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         Ok(())
     }
 }
+impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
+    type Ticket = UnitPendingLayer;
+    fn route(&self, layer: usize) -> FfnRoute {
+        if self.slots[0].transport.has_local_layer(layer) {
+            FfnRoute::Local
+        } else {
+            FfnRoute::Spark
+        }
+    }
+    // Every hook polls in its unit's device-ordered chain scope (#815): the
+    // stages it queues order on the device and it waits on the host for none
+    // of them, so the executor's next hook issues at once.
+    async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.begin_unit_inner(unit)).await
+    }
+    async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.attention_inner(layer, unit)).await
+    }
+    async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.local_ffn_inner(layer, unit)).await
+    }
+    async fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.send_experts_inner(layer, unit)).await
+    }
+    async fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.land_experts_inner(layer, unit, ticket)).await
+    }
+    async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+        // The suffix capture copies the encoder output synchronously: the
+        // unit's chained layers complete first (once per unit). The boundary
+        // publication then chains again.
+        self.slots[unit.slot].pass.drain_chain()?;
+        crate::shared::spark_waves::healthy()?;
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.end_unit_inner(unit)).await
+    }
+    async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
+        // The unit's chained work completes before its commit reads it; a
+        // failed Spark wire released its waits over garbage planes.
+        let slot = &mut self.slots[unit.slot];
+        slot.pass.drain_chain()?;
+        crate::shared::spark_waves::healthy()?;
+        slot.pass.resources.lane.drain_route_ring()?;
+        self.commit_unit_inner(unit).await
+    }
+}
+
 impl<'w, 'a> TargetPass<'w, 'a> {
     /// Prepare a chunk's next query only when its execution lane is available.
     async unsafe fn prepare_encoder_query(&mut self, requests: &RefCell<&mut Requests<'a>>,
@@ -288,10 +360,16 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             ensure!(first.has_local_layer(layer) == second.has_local_layer(layer),
                 "encoder slot expert placement differs");
         }
+        let library = self.resources.upload.library();
+        let event = || -> Result<OwnedEvent<'a>> {
+            Ok(OwnedEvent { library, raw: library.cuda_event_create_ordering()? })
+        };
         let mut hooks = UnitHooks {
             slots: vec![
-                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now() },
-                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now() },
+                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now(),
+                    published: Some(event()?) },
+                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now(),
+                    published: Some(event()?) },
             ],
             requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
         };

@@ -401,6 +401,51 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
     }
 }
 
+/// Records the current chain head into `event` (no host wait): another
+/// chain's stages ordered after it with [`depend`] follow everything chained
+/// here so far. No-op outside a scope or before any stage finished.
+/// # Safety
+/// `event` is a live event on the chain's head device.
+pub(crate) unsafe fn record_into(library: &NativeLibrary, event: *mut c_void) -> Result<bool> {
+    let Some(current) = current() else { return Ok(false) };
+    let Some(head) = current.head.get() else { return Ok(false) };
+    let device = current.events[head].0;
+    let fence = current.fences.iter().find(|f| f.device == device).copied()
+        .ok_or_else(|| anyhow::anyhow!("chain has no fence stream on device {device}"))?;
+    let previous = library.cuda_get_device()?;
+    library.cuda_set_device(device)?;
+    // SAFETY: the fence stream and head event belong to this chain's device;
+    // `event` lives on the same device (caller contract).
+    let recorded = unsafe { library.cuda_stream_wait_event(fence.stream, current.events[head].1)
+        .and_then(|()| library.cuda_event_record(event, fence.stream)) };
+    library.cuda_set_device(previous)?;
+    recorded.map(|()| true)
+}
+
+/// Orders the current chain after `event` (recorded by another chain with
+/// [`record_into`]): every later stage of this scope joins a head that
+/// includes it. No host wait.
+/// # Safety
+/// `event` is a live event recorded on the chain's current device.
+pub(crate) unsafe fn depend(library: &NativeLibrary, event: *mut c_void) -> Result<()> {
+    let Some(current) = current() else { return Ok(()) };
+    let device = library.cuda_get_device()?;
+    let index = current.events.iter().position(|&(d, _)| d == device)
+        .ok_or_else(|| anyhow::anyhow!("chain has no event on device {device}"))?;
+    let fence = current.fences.iter().find(|f| f.device == device).copied()
+        .ok_or_else(|| anyhow::anyhow!("chain has no fence stream on device {device}"))?;
+    // SAFETY: the fence stream and events belong to this chain's device.
+    unsafe {
+        if let Some(head) = current.head.get() {
+            library.cuda_stream_wait_event(fence.stream, current.events[head].1)?;
+        }
+        library.cuda_stream_wait_event(fence.stream, event)?;
+        library.cuda_event_record(current.events[index].1, fence.stream)?;
+    }
+    current.head.set(Some(index));
+    Ok(())
+}
+
 /// Host wait for all chained work before a host-synchronous operation (legacy
 /// stream copies do not order with the non-blocking stage streams).
 pub(crate) fn settle(library: &NativeLibrary) -> Result<()> {
