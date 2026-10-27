@@ -40,6 +40,10 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight: Spark waves outstanding on the one transport.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     prefill_waves: u8,
+    /// Admitted prefill slots of a resolved deployment (#762); 0/unset resolves
+    /// them. Equal to the waves on a static family.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
+    prefill_slots: u8,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -65,9 +69,6 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
-    /// One prefill call's rows: `--prefill-waves` units of `--prefill-rows`.
-    fn span(&self) -> u32 { self.prefill_rows * u32::from(self.prefill_waves) }
-
     fn endpoint(&self, bf16: bool) -> SparkEndpoint {
         SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Native } }
     }
@@ -77,7 +78,7 @@ impl ServeArgs {
         Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
-            span_rows: None,
+            span_rows: None, slots: (self.prefill_slots != 0).then_some(u64::from(self.prefill_slots)),
         })?)
     }
 
@@ -141,6 +142,7 @@ fn with_backend<T>(args: &ServeArgs,
     let mut resolved = args.clone();
     resolved.prefill_rows = u32::try_from(shape.unit_rows)?;
     resolved.prefill_waves = u8::try_from(shape.waves)?;
+    resolved.prefill_slots = u8::try_from(shape.slots)?;
     let args = &resolved;
     args.validate()?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
@@ -186,9 +188,10 @@ fn with_backend<T>(args: &ServeArgs,
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
     let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
-        spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.span() as usize,
+        spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         full_prefill_logits: args.full_prefill_logits,
-        waves: usize::from(args.prefill_waves),
+        // Admitted slots and unit (#762): the depth starts at --prefill-waves.
+        waves: usize::from(args.prefill_slots), unit: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
@@ -213,7 +216,7 @@ fn with_backend<T>(args: &ServeArgs,
     let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
         rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
-        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
+        spark_model(&exports, endpoint, u64::from(args.prefill_slots), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
@@ -316,13 +319,16 @@ fn with_backend<T>(args: &ServeArgs,
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let transport = devices[0].own(|| {
-        // One return slot per prefill unit in flight, each holding one unit.
-        let mut link = if args.prefill_waves > 1 {
-            SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
-                usize::from(args.prefill_waves), args.prefill_rows)?
+        // Return slots cut per call from one reserve range per rank (#762).
+        let slots = usize::from(args.prefill_slots);
+        let mut link = if slots > 1 {
+            SparkLink::new_reserve(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
+                slots, args.prefill_rows, inputs.rows)?
         } else { SparkLink::new(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2)? };
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&super::execution::bootstrap_request(inputs.unit_rows(), 1)?)?;
+        // One admitted unit until the first prefill re-cuts to its depth.
+        if slots > 1 { link.set_geometry(1, args.prefill_rows as usize)?; }
         Ok(link)
     })?;
     library.cuda_set_device(args.device)?;
@@ -333,7 +339,10 @@ fn with_backend<T>(args: &ServeArgs,
         usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
-        .with_prefill_units(args.prefill_rows as usize, usize::from(args.prefill_waves))?;
+        .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
+            usize::from(args.prefill_slots), args.prefill_rows as usize, args.prefill_slots == args.prefill_waves)?)?
+        .with_identity(crate::shared::prefill_depth::DeploymentIdentity::new(&library, &args.peers,
+            format!("tp{}-split{}", args.peers.len(), args.split_device.is_some())));
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
@@ -483,7 +492,7 @@ mod tests {
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
+            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),
@@ -700,16 +709,17 @@ mod tests {
 
     #[test]
     fn topology_shapes_and_explicit_units_match_admission() -> Result<()> {
-        for (sparks, unit, waves, span) in [(4, 2048, 4, 8192), (6, 2048, 4, 8192)] {
+        // Four admitted 4096-row slots (#762), starting at the A8 wire's 3 x 2752.
+        for (sparks, unit, waves, slots, span) in [(4, 4096, 3, 4, 8256), (6, 4096, 3, 4, 8256)] {
             let mut args = args();
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
             let shape = args.shape()?;
-            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
+            assert_eq!((shape.unit_rows, shape.waves, shape.slots, shape.span_rows), (unit, waves, slots, span));
             args.prefill_rows = unit as u32;
-            args.prefill_waves = waves as u8;
-            assert_eq!(args.span(), span as u32);
+            // Spark owners buffer every admitted slot.
+            let waves = slots;
             let exports = [1, 16, 80, 256, 1024, 4096];
             let model = spark_model(&exports, args.endpoint(false), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
             // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
@@ -717,7 +727,6 @@ mod tests {
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });
             assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution { capacity: 64, compiled_capacity: 80 }]);
             assert_eq!(model.endpoints[0].capacity, unit as u32);
-            assert!(model.endpoints[0].capacity < args.span());
             for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
                 args.prefill_rows = unit;
                 args.prefill_waves = waves;

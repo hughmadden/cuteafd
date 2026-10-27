@@ -373,18 +373,18 @@ impl<'w, 'a> Execution<'w, 'a> {
         }
         Ok(())
     }
-    /// Publish the oldest completed unit's bookkeeping and timing before emission.
-    pub(super) fn complete(&mut self) -> Result<()> {
+    /// Publish the oldest completed unit's bookkeeping and timing before
+    /// emission; returns its measured pace on the owner stream (#762).
+    pub(super) fn complete(&mut self) -> Result<Option<crate::shared::experts::execution::timing::UnitPace>> {
         match self {
             Self::Exlr8(execution) => execution.complete(),
             Self::Exl3(execution) => execution.complete(),
             Self::Full(execution) => execution.complete(),
             Self::Fp8(groups) => {
-                if let Some(group) = groups.pending_groups.front().copied() {
-                    groups.workers[group].complete()?;
-                    groups.pending_groups.pop_front();
-                }
-                Ok(())
+                let Some(group) = groups.pending_groups.front().copied() else { return Ok(None) };
+                let pace = groups.workers[group].complete()?;
+                groups.pending_groups.pop_front();
+                Ok(pace)
             },
         }
     }

@@ -362,13 +362,13 @@ impl<'a> Exl3Worker<'a> {
 
     /// Publish the oldest unit's timing after its own fence completes, even
     /// while later units remain queued on the same stream.
-    pub(crate) fn complete(&mut self) -> Result<()> {
-        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
+    pub(crate) fn complete(&mut self) -> Result<Option<super::super::execution::timing::UnitPace>> {
+        let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
         if let Some(timing) = &mut self.worker_timing {
             // SAFETY: the unit's completed fence follows both timing records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exl3")?; }
         }
-        Ok(())
+        Ok(Some(pace))
     }
 
     pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
@@ -506,6 +506,8 @@ impl<'a> Exl3Worker<'a> {
         let decodes = self.executions[selected].decodes_wire_rows();
         let device = self.inputs[0].buffer.device_id;
         let mut hidden = self.inputs[0].buffer;
+        // SAFETY: the owner stream outlives every queued unit (#762 pace).
+        unsafe { self.pending.arrive(self.stream.raw)?; }
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
             Some(view) if self.host_path == HostPath::Async && decodes && view.ptr as usize % 16 == 0
                 && view.device_id == device => hidden = CuteafdDeviceBuffer { bytes: hidden_bytes, ..view },
