@@ -119,6 +119,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
             "--prefill-waves", value("--prefill-waves"),
             "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
+        # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
+        if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
+            expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
         assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above
