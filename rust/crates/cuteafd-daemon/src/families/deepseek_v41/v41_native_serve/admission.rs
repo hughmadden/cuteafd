@@ -355,20 +355,21 @@ pub(super) fn local_workspace(
         return Ok(0);
     }
     use crate::families::deepseek_v41::v41_experts::local::LocalExpertWave;
-    let lane = if let Some(exl3) = catalog.exl3() {
+    let lane = |rows: u32| -> Result<usize> { if let Some(exl3) = catalog.exl3() {
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
             &args.native_lib,
             exl3.decoder_tiers(),
             "rtx-tp1",
         );
-        LocalExpertWave::exl3_device_bytes(&directory, rows)?
+        LocalExpertWave::exl3_device_bytes(&directory, rows)
     } else {
-        LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some())?
-    };
-    // One local expert wave per target pass (two decode lanes, more prefill slots).
-    Ok(lane
-        .checked_mul(usize::from(args.prefill_waves).max(2))
-        .context("local serving lanes overflow")? as u64)
+        LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some())
+    } };
+    // One local expert wave per prefill slot at the unit, one per decode lane
+    // at decode width.
+    let slots = usize::from(args.prefill_waves).max(2);
+    Ok((lane(rows)?.checked_mul(slots).context("local serving lanes overflow")?
+        + 2 * lane(super::DECODE_LANE_ROWS)?) as u64)
 }
 
 /// With `draft`, the sample must precede all draft weights, runtime buffers and
@@ -731,8 +732,8 @@ pub(super) fn preload(
 mod admission_tests {
 
     /// The planner's transport charge is exactly what serve allocates: two
-    /// decode lanes' linked waves, each further slot's unlinked reduce output
-    /// and the one prefill link's intake over the shared reserve.
+    /// decode lanes' linked waves, every prefill slot's reduce output (slot 0
+    /// holds the link) and the one prefill link's intake over the shared reserve.
     #[test]
     fn transport_charge_equals_serve_allocation() -> anyhow::Result<()> {
         use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, V41Link};
@@ -740,7 +741,7 @@ mod admission_tests {
             for slots in 2..=4usize {
                 let reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(rows));
                 let runtime = 2 * NativeTp4Wave::device_bytes_for(rows, ranks)?
-                    + (slots - 2) * rows as usize * 5120 * 2
+                    + slots * rows as usize * 5120 * 2
                     + V41Link::prefill_device_bytes(reserve as usize, ranks)?;
                 assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(rows), ranks, slots)?, runtime as u64,
                     "{slots} x {rows} rows on {ranks} ranks");

@@ -119,6 +119,19 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
             publication: None,
         })
     }
+    /// Every prefill slot's producers on one placed storage set per GPU.
+    pub fn on_storage(weights: &'w CacheProducerWeights<'a>, storage: &super::PlacedProducerStorage<'a>) -> Result<Self> {
+        Ok(Self {
+            weights,
+            producers: PlacedProducerWaves::on_storage(weights, storage)?,
+            progress: PassProgress::default(),
+            produced: None,
+            publication: None,
+        })
+    }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        self.producers.select_window(window)
+    }
     /// All external readers/writers have completed or drained before restarting.
     pub fn restart_for(&mut self, stage: CacheStage) {
         self.progress = PassProgress::for_stage(stage);

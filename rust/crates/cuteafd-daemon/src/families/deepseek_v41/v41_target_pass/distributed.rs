@@ -208,6 +208,44 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             sampled: None,
         })
     }
+    /// Selects this prefill slot's rows in every component's shared row planes
+    /// on both GPUs (`shared::memory::row_window`), at rest.
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        ensure!(self.state == State::Idle, "prefill slot window changes only at rest");
+        let resources = &mut self.resources;
+        for lane in &mut resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().select_window(window.clone()))?;
+        }
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.get_mut().select_window(window.clone()))?;
+        }
+        resources.execution.select_window(window.clone())?;
+        let device = resources.embedding.device;
+        device.run(|| resources.embedding.get_mut().select_window(window.clone()))?;
+        resources.engram.select_window(window.clone())?;
+        let device = resources.taps.device;
+        device.run(|| resources.taps.get_mut().select_window(window))
+    }
+    /// A prefill unit's input (`Requests::prepare_unit_input`) on layer 0's GPU.
+    /// # Safety
+    /// As `begin_stage`: the unit owns its batch and its rows.
+    pub(super) fn prepare_unit_input(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch) -> Result<()> {
+        self.resources.execution.restart_for(CacheStage::Encoder);
+        for index in self.resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.restart())?;
+        }
+        let gpu = self.resources.map.attention(0)?;
+        let device = self.resources.lanes[gpu].device;
+        ensure!(self.resources.embedding.device.id == device.id, "embedding and layer 0 differ in GPU");
+        device.run(|| self.resources.lanes[gpu].restart())?;
+        let (embedding, lane) = (self.resources.embedding.get_mut(), self.resources.lanes[gpu].get_mut());
+        // SAFETY: the unit owns its rows of the block planes (caller contract).
+        device.run(|| unsafe { requests.borrow().prepare_unit_input(batch, embedding, lane) })
+    }
     /// `--l2-prefetch` on both GPUs' lanes, each for the layers it holds.
     pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
         for lane in &mut self.resources.lanes {
@@ -959,6 +997,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
     use cuteafd_ffi::NativeLibrary;
     use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::SparkExperts};
+    use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
     use std::rc::Rc;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
@@ -1118,6 +1157,47 @@ mod tests {
                     DistributedTargetHead::device_bytes(16, 64640)?)?,
                 devices[1]
                     .own(|| TargetTapWave::new(&lib, 16, TargetTapWave::device_bytes(16)?))?,
+                Duration::from_secs(120),
+            )?;
+            let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+            let modes = (0..40).map(|layer| Ok(cuteafd_loader::placement::LayerMode::Whole {
+                gpu: map.attention(layer)? as u8, ffn: cuteafd_loader::placement::FfnMode::Owner,
+            })).collect::<Result<Vec<_>>>()?;
+            let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
+            for (gpu, transfer) in pass.resources.transfers.iter_mut().enumerate() {
+                let incoming: Vec<_> = hops.iter().filter(|hop| usize::from(hop.to) == gpu).copied().collect();
+                transfer.bind(&incoming, spec)?;
+            }
+            Ok(pass)
+        };
+        // Two prefill slots on one storage set per GPU (reserve 32, unit 16),
+        // as serve assembles them (`shared::memory::row_window`).
+        let slot_storage = || -> Result<_> {
+            let both = [0, 1];
+            Ok((
+                [devices[0].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, 32, 16, &both))?,
+                 devices[1].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, 32, 16, &both))?],
+                [IndexLane::storage_on_device(&iw, 32, 16, 0, &both)?, IndexLane::storage_on_device(&iw, 32, 16, 1, &both)?],
+                crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(&lib, map, 32, 16)?,
+                devices[0].own(|| TargetEmbeddingWave::storage(&lib, 32, 16))?,
+                PlacedEngram::storage(&ew, 32, 16)?,
+                devices[1].own(|| TargetTapWave::storage(&lib, 32, 16))?,
+            ))
+        };
+        let (lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage) = slot_storage()?;
+        let make_slot = || -> Result<DistributedTargetPass<'_, '_>> {
+            let mut pass = DistributedTargetPass::new(
+                map,
+                devices[0].own(|| TargetEmbeddingWave::on_storage(&lib, &table, embedding_storage.get().clone()))?,
+                [BackboneLane::on_storage_on_device(&weights, lane_storage[0].get().clone())?,
+                 BackboneLane::on_storage_on_device(&weights, lane_storage[1].get().clone())?],
+                [Some(IndexLane::on_storage_on_device(&iw, index_storage[0].get().clone())?),
+                 Some(IndexLane::on_storage_on_device(&iw, index_storage[1].get().clone())?)],
+                DistributedExecution::on_storage(&producers, &producer_storage)?,
+                PlacedEngram::on_storage(&ew, &engram_storage)?,
+                DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], 16,
+                    DistributedTargetHead::device_bytes(16, 64640)?)?,
+                devices[1].own(|| TargetTapWave::on_storage(tap_storage.get().clone()))?,
                 Duration::from_secs(120),
             )?;
             let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
@@ -1349,14 +1429,21 @@ mod tests {
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;
-        other_transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 20, 16, [None, None])?)?;
-        // The one prefill link (execution lane 2), two return slots of 16 rows.
+        other_transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
+        // The prefill slots: two passes on shared storage; slot 0's FFN owner
+        // holds the one prefill link (execution lane 2), two return slots of
+        // 16 rows; one TP2 FFN arena for both (reserve 32, unit 16).
+        let ffn_storage = tp2_ffn::Storage::new(routed, shared, 20, 32, 16, [None, None])?;
+        let link = devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16,
+                TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
+                    timeout: Duration::from_secs(120), max_frame_bytes: 2 << 20 }, 2)?, 2, 16, 32))?;
+        let mut slot_transports = [devices[1].own(|| NativeTp4Wave::with_link(&lib, link.into_inner()))?,
+            devices[1].own(|| NativeTp4Wave::unlinked(&lib, 16))?];
+        for transport in &mut slot_transports { transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?; }
+        let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
-            link: devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
-                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16,
-                    TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                        timeout: Duration::from_secs(120), max_frame_bytes: 2 << 20 }, 2)?, 2, 16, 32))?,
-            extra: Vec::new(),
+            slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
         };
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;
@@ -1389,8 +1476,7 @@ mod tests {
                 devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
             draft.admit(id)?;
             let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
-                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], &mut prefill_slots, lease,
-                &prompt, chunk_rows, 2, Some(draft.get_mut()))?;
+                &mut requests, &mut prefill_slots, lease, &prompt, chunk_rows, 2, Some(draft.get_mut()))?;
             assert_eq!(anchor, reference_anchor, "serving prefill anchor differs from matching sequential chunks");
             draft.validate_position(id, 7)?;
             let proposed = loop {
@@ -1401,8 +1487,7 @@ mod tests {
                 "serving prefill to draft handoff differs");
             let continued: Vec<_> = prompt.into_iter().chain([800, 900]).collect();
             let next = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
-                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], &mut prefill_slots, lease,
-                &continued, chunk_rows, 2, Some(draft.get_mut()))?;
+                &mut requests, &mut prefill_slots, lease, &continued, chunk_rows, 2, Some(draft.get_mut()))?;
             ensure!(next < 129280, "invalid continuation anchor");
             assert_eq!(requests.cache().committed_end(lease)?, 9);
             draft.validate_position(id, 9)?;
@@ -1493,9 +1578,13 @@ mod tests {
                 let mut suffix = devices[map.attention(19)?]
                     .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
                 if interleaved {
-                    runtime.block_on(unsafe {
-                        DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut prefill_slots.link, &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(()))
-                    })?;
+                    let mut link = DistributedTargetPass::take_link(&mut prefill_slots.slots[0].1)?;
+                    let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
+                    let result = runtime.block_on(unsafe {
+                        DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(()))
+                    });
+                    DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
+                    result?;
                 } else {
                     for chunk in &chunks {
                         let mut batch =
@@ -1659,16 +1748,20 @@ mod tests {
         let mut cancelled_suffix = devices[map.attention(19)?]
             .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
         let calls = std::cell::Cell::new(0);
-        let result = runtime.block_on(unsafe {
-            DistributedTargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut other_transport)], &mut prefill_slots.link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &|| {
-                    calls.set(calls.get() + 1);
-                    calls.get() < 12
-                }, &|| Ok(()))
-        });
+        let mut link = DistributedTargetPass::take_link(&mut prefill_slots.slots[0].1)?;
+        let result = {
+            let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
+            runtime.block_on(unsafe {
+                DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &|| {
+                        calls.set(calls.get() + 1);
+                        calls.get() < 12
+                    }, &|| Ok(()))
+            })
+        };
+        DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
         assert!(result.is_err(), "disconnected encoder units succeeded");
         assert!(requests.cache().request_id(lease).is_err());
-        assert_eq!(pass.state, State::Idle);
-        assert_eq!(other.state, State::Idle);
+        assert!(prefill_slots.slots.iter().all(|(slot, _)| slot.state == State::Idle));
         assert_eq!(lib.cuda_get_device()?, 0);
         eprintln!("PASS disconnected distributed encoder stream revoked both active chunks");
         // Cancel a reserved pass at a cooperative suspension. The guard revokes

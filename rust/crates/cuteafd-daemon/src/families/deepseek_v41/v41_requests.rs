@@ -544,6 +544,29 @@ impl<'a> Requests<'a> {
         }
         Ok(())
     }
+    /// A prefill unit's input hook: the embedding (text or image rows) written
+    /// straight into the lane's layer-0 block planes, the lane prepared at
+    /// layer 0 without its query (`BackboneLane::prepare_embedded`); the
+    /// embedding's guarded scratch is released once the block's copy joined.
+    /// # Safety
+    /// As [`Self::begin_input`]; inside the unit's chain scope.
+    pub unsafe fn prepare_unit_input(
+        &self,
+        batch: &RequestBatch,
+        embedding: &mut TargetEmbeddingWave<'_, '_>,
+        lane: &mut BackboneLane<'_, '_>,
+    ) -> Result<()> {
+        self.validate(batch)?;
+        let positions = batch.cache.positions();
+        let features = if batch.image_mask.iter().all(|&b| b == 0) { Vec::new() }
+            else { self.embedding_features(batch)? };
+        // SAFETY: the block planes are this unit's window, retained through
+        // the unit's chain drain.
+        let embedded = unsafe { embedding.execute_with_images_into(&batch.tokens, &positions, &features,
+            lane.input_planes())? };
+        lane.prepare_embedded(&embedded)?;
+        embedding.release_scratch()
+    }
     /// # Safety
     /// This lane was initialized/advanced for batch and all device producers have
     /// completed. Poll on the CUDA-owning thread. False means I/O is still pending.

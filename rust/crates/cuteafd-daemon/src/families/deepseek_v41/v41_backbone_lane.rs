@@ -871,6 +871,20 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.phase = Phase::Prepared;
         Ok(())
     }
+    /// The layer-0 block's input planes (residual, pre) in this lane's window.
+    pub(crate) fn input_planes(&self) -> [CuteafdDeviceBuffer; 2] { self.block.inputs() }
+    /// A prefill unit's layer 0, prepared from its embedding without the query
+    /// (`BackboneBlockWave::prepare_embedding`): the attention hook begins it
+    /// with [`Self::begin_prepared_cooperative`].
+    pub fn prepare_embedded(&mut self, embedding: &TargetEmbedding<'_>) -> Result<()> {
+        self.enter(Phase::Idle)?;
+        ensure!(self.layer == 0, "embedding requires layer zero");
+        // The embedding has no producing layer: the binding names layer -1's
+        // place (no tap or Engram reads it at layer 0).
+        self.block.prepare_embedding(embedding, QueryBinding::new(0)?)?;
+        self.phase = Phase::Prepared;
+        Ok(())
+    }
     /// # Safety
     /// Same finite, completed embedding and exclusive-storage contract as the
     /// component owners. This text entry does not implement vision replacement.

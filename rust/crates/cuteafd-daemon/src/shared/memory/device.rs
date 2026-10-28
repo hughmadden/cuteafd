@@ -78,6 +78,13 @@ impl<T> DeviceOwner<'_, T> {
     /// Metadata access is ordinary; GPU work must use this owner's device scope.
     pub fn get(&self) -> &T { &self.value }
     pub fn get_mut(&mut self) -> &mut T { &mut self.value }
+    /// The owned value, to be dropped by the caller in this owner's device
+    /// scope (moved into another device-scoped owner).
+    pub fn into_inner(self) -> T {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped; the value is moved out exactly once.
+        unsafe { ManuallyDrop::take(&mut this.value) }
+    }
 }
 impl<T> std::ops::Deref for DeviceOwner<'_, T> {
     type Target = T;

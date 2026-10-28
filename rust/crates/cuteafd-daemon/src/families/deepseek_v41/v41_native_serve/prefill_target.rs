@@ -13,16 +13,14 @@ use std::time::Duration;
 
 #[cfg(test)]
 pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
-    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, pass: &mut P, other: &mut P,
-    requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], prefill: &mut PrefillSlots<'a, P>,
-    lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
+    prefill: &mut PrefillSlots<'a, P>, lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize,
+    draft: Option<&mut DraftRuntime<'_, 'a, C>>,
 ) -> Result<u32> {
     let (events, _receive) = mpsc::unbounded_channel();
     let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
-    let [first_transport, second_transport] = transports;
-    ensure!(waves <= 2, "the test fixture builds the two decode lanes' slots only");
-    super::prefill(lib, runtime, pass, other, requests, first_transport, second_transport, prefill,
-        lease, tokens, super::PrefillShape { rows: chunk_rows, waves }, &job, draft, &mut || Ok(()))?.select(None)
+    super::prefill(lib, runtime, requests, prefill, lease, tokens, super::PrefillShape { rows: chunk_rows, waves },
+        &job, draft, &mut || Ok(()))?.select(None)
 }
 
 /// Only request-owned state survives a unit; both execution lanes are drained.
@@ -116,17 +114,13 @@ impl V41PrefillTimes {
 pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain<'a>> {
     pub(crate) lib: &'a NativeLibrary,
     pub(crate) runtime: &'s tokio::runtime::Runtime,
-    pub(crate) pass: &'s mut P,
-    pub(crate) other: &'s mut P,
     pub(crate) requests: &'s mut Requests<'a>,
-    pub(crate) transport: &'s mut P::Transport,
-    pub(crate) other_transport: &'s mut P::Transport,
     pub(crate) lease: CacheLease,
     pub(crate) tokens: &'s [u32],
     pub(crate) chunk_rows: usize,
     /// Units in flight on the shared executor.
     pub(crate) waves: usize,
-    /// The prefill link and the slots beyond the two decode lanes' passes.
+    /// The prefill slots: slot 0 (with the prefill link) runs non-unit work.
     pub(crate) prefill: &'s mut PrefillSlots<'a, P>,
     pub(crate) job: &'s NativeRequest,
     pub(crate) draft: Option<&'s mut DraftRuntime<'w, 'a, C>>,
@@ -149,7 +143,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
             cursor.state = PrefillState::Continuation { next: cached };
             return Ok(());
         }
-        let suffix = self.pass.new_suffix(self.lib, end)?;
+        let suffix = self.prefill.slot0().0.new_suffix(self.lib, end)?;
         let next = if stage == CacheStage::EncoderReplay {
             let start = self.requests.cache().history_end(self.lease)? as usize;
             ensure!(cached - start <= 128, "encoder prefix replay exceeds one window");
@@ -220,13 +214,14 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let mut batch = self.requests.prepare(&[RequestTokens { lease: self.lease, tokens: chunk,
                     image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
                 let started = Instant::now();
+                let (pass, transport) = self.prefill.slot0();
                 let result = (|| -> Result<()> {
                     // SAFETY: the live request owns the batch/suffix until execution and commit drain.
-                    self.runtime.block_on(unsafe { self.pass.encoder_part(self.requests, &mut batch, self.transport, suffix) })?;
+                    self.runtime.block_on(unsafe { pass.encoder_part(self.requests, &mut batch, transport, suffix) })?;
                     ensure!(!self.job.events.is_closed(), "client disconnected");
-                    self.runtime.block_on(self.pass.commit_prefill::<C>(self.requests, &mut batch, None, chunk.len() as u32))
+                    self.runtime.block_on(pass.commit_prefill::<C>(self.requests, &mut batch, None, chunk.len() as u32))
                 })();
-                if result.is_err() { self.pass.discard(&mut batch)?; }
+                if result.is_err() { pass.discard(&mut batch)?; }
                 result?;
                 if matches!(unit.work, V41Unit::Single(_)) {
                     console::totals::prefill(chunk.len());
@@ -240,17 +235,21 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let started = Instant::now();
                 let hold = RefCell::new(&mut *self.hold);
                 let before_unit = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
-                // Slots 0 and 1 are the decode lanes' passes; any further slot
-                // is a prefill-only pass with its own link.
-                let mut slots: Vec<(&mut P, &mut P::Transport)> = vec![(&mut *self.pass, &mut *self.transport),
-                    (&mut *self.other, &mut *self.other_transport)];
-                slots.extend(self.prefill.extra.iter_mut().map(|(pass, transport)| (pass, transport)));
-                slots.truncate(self.waves);
                 let keep_running = || !self.job.events.is_closed();
-                // SAFETY: every slot's pass and link retain the request and
-                // suffix through drained completion or cancellation.
-                self.runtime.block_on(unsafe { P::encoder_units(slots, &mut self.prefill.link, self.requests, self.lease, &chunks, suffix,
-                    &keep_running, &before_unit) })?;
+                // Slot 0 lends the prefill link to the call; every slot's waves
+                // go out on it. It returns even when the call fails.
+                let mut link = P::take_link(&mut self.prefill.slots[0].1)?;
+                let result = {
+                    let mut slots: Vec<(&mut P, &mut P::Transport)> = self.prefill.slots.iter_mut()
+                        .map(|(pass, transport)| (pass, transport)).collect();
+                    slots.truncate(self.waves);
+                    // SAFETY: every slot's pass and the link retain the request
+                    // and suffix through drained completion or cancellation.
+                    self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
+                        self.lease, &chunks, suffix, &keep_running, &before_unit) })
+                };
+                P::restore_link(&mut self.prefill.slots[0].1, link)?;
+                result?;
                 tracing::debug!(target: "cuteafd::timing", rows=chunks.iter().map(|c| c.len()).sum::<usize>(),
                     units=chunks.len(), waves=self.waves, total_us=started.elapsed().as_micros() as u64,
                     "target encoder units");
@@ -262,16 +261,17 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let rows = (self.tokens.len() as u64 - start) as u32;
                 let mut batch = self.requests.prepare_replay(&[CacheWork { lease: self.lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
                 let started = Instant::now();
+                let (pass, transport) = self.prefill.slot0();
                 let result = (|| -> Result<RetainedScores> {
                     // SAFETY: all encoder rows committed and the retained suffix matches this replay.
-                    let bytes = self.runtime.block_on(unsafe { self.pass.prefill_logits(self.lib, self.requests,
-                        &mut batch, self.transport, &[rows as usize - 1], Some(suffix)) })?;
+                    let bytes = self.runtime.block_on(unsafe { pass.prefill_logits(self.lib, self.requests,
+                        &mut batch, transport, &[rows as usize - 1], Some(suffix)) })?;
                     let scores = RetainedScores::new(scores::VOCAB, bytes)?;
                     ensure!(!self.job.events.is_closed(), "client disconnected");
-                    self.runtime.block_on(self.pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
+                    self.runtime.block_on(pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
                     Ok(scores)
                 })();
-                if result.is_err() { self.pass.discard(&mut batch)?; }
+                if result.is_err() { pass.discard(&mut batch)?; }
                 console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
                 tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
                 let scores = result?;
@@ -279,8 +279,9 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 return Ok(Some(scores));
             }
             (V41Unit::Continuation(range), PrefillState::Continuation { next }) => {
-                let scores = super::prefill_continuation(self.lib, self.runtime, self.pass, self.requests,
-                    self.transport, self.lease, &self.tokens[range.clone()], self.chunk_rows, self.job,
+                let (pass, transport) = self.prefill.slot0();
+                let scores = super::prefill_continuation(self.lib, self.runtime, pass, self.requests,
+                    transport, self.lease, &self.tokens[range.clone()], self.chunk_rows, self.job,
                     self.draft.as_deref_mut(), self.hold)?;
                 *next = range.end;
                 if range.end == self.tokens.len() {
@@ -308,20 +309,29 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 }
 
-/// Serving prefill beyond the decode lanes (PLAN "Prefill contract"): the one
-/// prefill link whose return slots hold the in-flight units, and the slot
-/// passes beyond the two decode lanes' (waves - 2 of them; their FFN owners
-/// have no link of their own).
+/// The prefill slots (PLAN "Prefill contract"), apart from the decode lanes:
+/// `slots` passes on one shared storage set per GPU (row planes at the
+/// reserve, scratch at the unit cap), each slot's FFN owner beside it. Slot
+/// 0's FFN owner holds the one prefill link, whose return slots hold the
+/// in-flight units' waves; slot 0 also runs every non-unit prefill step
+/// (replay, continuation, scoring, cold steps) at rows from 0.
 pub(crate) struct PrefillSlots<'a, P: PrefillTarget<'a>> {
-    pub link: P::PrefillLink,
-    pub extra: Vec<(P, P::Transport)>,
+    pub slots: Vec<(P, P::Transport)>,
+}
+impl<'a, P: PrefillTarget<'a>> PrefillSlots<'a, P> {
+    pub(crate) fn slot0(&mut self) -> (&mut P, &mut P::Transport) {
+        let (pass, transport) = &mut self.slots[0];
+        (pass, transport)
+    }
 }
 
 pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type Suffix;
     /// The one prefill transport (PLAN "Prefill contract"): its return slots
-    /// hold the in-flight units' waves.
+    /// hold the in-flight units' waves. Slot 0's FFN owner holds it.
     type PrefillLink;
+    fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink>;
+    fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
@@ -350,6 +360,10 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     type Suffix = EncoderSuffix<'a>;
     type PrefillLink = crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>;
+    fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink> { transport.take_link() }
+    fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
+        transport.restore_link(link)
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -386,6 +400,15 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
 impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     type Suffix = DeviceOwner<'a, EncoderSuffix<'a>>;
     type PrefillLink = DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>;
+    fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink> {
+        let device = transport.device;
+        device.own(|| transport.get_mut().take_link())
+    }
+    fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
+        let device = transport.device;
+        ensure!(link.device.id == device.id, "prefill link device differs from slot 0's");
+        device.run(|| transport.get_mut().restore_link(link.into_inner()))
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
     }

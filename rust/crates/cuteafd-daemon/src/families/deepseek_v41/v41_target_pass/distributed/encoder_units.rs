@@ -19,7 +19,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         batch: &mut RequestBatch, layer: usize) -> Result<UnitPreparedLayer> {
         let gpu = self.resources.map.attention(layer)?;
         let device = self.resources.lanes[gpu].device;
-        if layer != 0 {
+        if layer == 0 {
+            // Prepared at begin (`prepare_unit_input`): the query here.
+            device.future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() }).await?;
+        } else {
             unsafe { self.advance(layer).await?; }
             if (2..14).contains(&layer) && !self.resources.engram.staged(1)
                     && self.resources.engram.can_enqueue(1)? {
@@ -67,6 +70,17 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         Ok(prepared)
     }
 
+    /// After a unit's attention hook joined every fork reader on the chain:
+    /// release the shared scratch of the layer's lane and index lane.
+    pub(super) fn release_attention_scratch(&self, layer: usize) -> Result<()> {
+        let gpu = self.resources.map.attention(layer)?;
+        let lane = &self.resources.lanes[gpu];
+        lane.device.run(|| lane.release_scratch())?;
+        if let Some(index) = self.resources.indices[gpu].as_ref() {
+            index.device.run(|| index.release_scratch())?;
+        }
+        Ok(())
+    }
     /// Completes a unit's layer from its FFN result and publishes its KV.
     /// # Safety
     /// `completed` is this unit's layer result; the batch is reserved.
@@ -89,6 +103,8 @@ struct UnitSlot<'s, 'w, 'a> {
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
+    /// The call's unit: slot `k`'s window is rows `k * unit_rows` onward.
+    unit_rows: usize,
     /// The one prefill transport (on the transports' GPU): every unit's wave
     /// lands in its own return slot.
     prefill: &'s mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>,
@@ -151,9 +167,12 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         // needs it, which left GPU0 idle ~14 ms per Engram layer).
         self.requests.borrow_mut().prefetch_encoder(self.lease, &self.chunks[unit.index + 1..])?;
         let batch = slot.batch.insert(batch);
+        // The slot is at rest (drained in `begin_unit`): select this unit's
+        // rows in every shared plane, then prepare layer 0's input. Its query
+        // runs in its attention hook (the query outputs are shared scratch).
+        slot.pass.select_window(super::super::encoder_units::unit_window(unit, self.unit_rows)?)?;
         slot.pass.state.begin()?;
-        // SAFETY: the unit exclusively owns its batch and the pass's input storage.
-        unsafe { slot.pass.begin_stage(&self.requests, batch, CacheStage::Encoder, None).await }
+        slot.pass.prepare_unit_input(&self.requests, batch)
     }
     async fn attention_inner(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         ensure!((self.keep_running)(), "client disconnected");
@@ -162,6 +181,8 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         // SAFETY: the preceding hook consumed the previous layer's output.
         slot.prepared = Some(unsafe { slot.pass.prepare_unit_layer(&self.requests, batch, layer).await? });
+        // Every fork reader of the attention's shared scratch joined the chain head.
+        slot.pass.release_attention_scratch(layer)?;
         Ok(())
     }
     async fn local_ffn_inner(&mut self, layer: usize, unit: &Unit) -> Result<()> {
@@ -330,8 +351,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         let map = slots[0].0.resources.map;
         let library = slots[0].0.resources.lanes[0].device.library;
+        let unit_rows = chunks.iter().map(|chunk| chunk.len()).max().unwrap_or(0);
         let mut hooks = UnitHooks {
             prefill,
+            unit_rows,
             slots: slots.into_iter().map(|(pass, transport)| {
                 pass.set_attention_decode(false);
                 let published = super::super::encoder_units::PublishedLayers::on_devices(library,
@@ -345,6 +368,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         for slot in &hooks.slots { if slot.pass.chain.is_some() { slot.pass.drain_chain()?; } }
         crate::shared::spark_waves::healthy()?;
         hooks.complete = true;
+        // Non-unit work (replay, continuation, scoring) runs at rows from 0.
+        for slot in &mut hooks.slots {
+            slot.pass.select_window(crate::shared::memory::row_window::RowWindow::NONE)?;
+        }
         Ok(())
     }
 }

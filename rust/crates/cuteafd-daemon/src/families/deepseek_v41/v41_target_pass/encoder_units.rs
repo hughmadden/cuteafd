@@ -10,6 +10,7 @@ use crate::families::deepseek_v41::v41_requests::RequestTokens;
 use crate::shared::prefill_pipeline::{run_prefill_units_async, AsyncPrefillHooks, FfnRoute, Unit};
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
+use crate::shared::memory::row_window::RowWindow;
 
 /// Encoder layers 0..20 publish at attention; the boundary (source 20, the
 /// ratio-two carry the next unit's boundary reads) publishes at the unit's end.
@@ -82,6 +83,15 @@ pub(super) fn previous_slot(unit: &Unit, waves: usize) -> Option<usize> {
     unit.index.checked_sub(1).map(|index| index % waves).filter(|&slot| slot != unit.slot)
 }
 
+/// A unit's rows in its slot's shared planes: slot `k` holds rows
+/// `k * unit_rows ..` (`shared::memory::row_window`; every depth's slots are
+/// views of the one reserve).
+pub(super) fn unit_window(unit: &Unit, unit_rows: usize) -> Result<RowWindow> {
+    let start = unit.slot * unit_rows;
+    ensure!(unit.rows.len() <= unit_rows, "encoder unit wider than the call's unit");
+    Ok(RowWindow::rows(start..start + unit.rows.len()))
+}
+
 pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
     ensure!(!chunks.is_empty(), "empty encoder unit span");
     let mut start = 0;
@@ -125,6 +135,8 @@ struct UnitSlot<'s, 'w, 'a> {
 }
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
+    /// The call's unit: slot `k`'s window is rows `k * unit_rows` onward.
+    unit_rows: usize,
     /// The one prefill transport: every unit's wave lands in its own return slot.
     prefill: &'s mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>,
     requests: RefCell<&'r mut Requests<'a>>,
@@ -194,7 +206,8 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                 first = positions.first().copied(), last = positions.last().copied(), rows = positions.len(),
                 "V4.1 encoder unit cut");
         }
-        slot.pass.state.begin()?;
+        // The slot is at rest (drained in `begin_unit`): restart its owners,
+        // then select this unit's rows in every shared row plane.
         slot.pass
             .resources
             .execution
@@ -202,9 +215,13 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         slot.pass.resources.lane.restart()?;
         slot.pass.resources.index.restart()?;
         slot.pass.resources.taps.reset();
-        // SAFETY: the unit exclusively owns its batch and the pass's input storage.
+        slot.pass.select_window(unit_window(unit, self.unit_rows)?)?;
+        slot.pass.state.begin()?;
+        // SAFETY: the unit exclusively owns its batch and its rows of the
+        // shared planes. Layer 0's query runs in its attention hook: the query
+        // outputs are scratch shared by every slot.
         unsafe {
-            self.requests.borrow_mut().begin_input(
+            self.requests.borrow_mut().prepare_unit_input(
                 batch,
                 &mut slot.pass.resources.embedding,
                 &mut slot.pass.resources.lane,
@@ -233,6 +250,10 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
             )?
         };
         slot.prepared = Some(prepared.into_unit().await?);
+        // Every fork reader of the attention's shared scratch (query outputs,
+        // sparse query/output, index selection) joined the chain head.
+        slot.pass.resources.lane.release_scratch()?;
+        slot.pass.resources.index.release_scratch()?;
         Ok(())
     }
     async fn local_ffn_inner(&mut self, _layer: usize, unit: &Unit) -> Result<()> {
@@ -425,7 +446,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// Prepare a chunk's next query only when its execution lane is available.
     async unsafe fn prepare_encoder_query(&mut self, requests: &RefCell<&mut Requests<'a>>,
         batch: &mut RequestBatch, layer: usize) -> Result<()> {
-        if layer == 0 { return Ok(()); }
+        if layer == 0 {
+            // Prepared at begin (`Requests::prepare_unit_input`): the query here.
+            unsafe { self.resources.lane.begin_prepared_cooperative().await?; }
+            return Ok(());
+        }
         self.resources.lane.advance()?;
         // The cooperative forms join the unit's chain (its previous layer's
         // mHC output is not complete on the host).
@@ -474,8 +499,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             ensure!(slots.iter().all(|(_, transport)| transport.has_local_layer(layer) == slots[0].1.has_local_layer(layer)),
                 "encoder slot expert placement differs");
         }
+        let unit_rows = chunks.iter().map(|chunk| chunk.len()).max().unwrap_or(0);
         let mut hooks = UnitHooks {
             prefill,
+            unit_rows,
             slots: slots.into_iter().map(|(pass, transport)| {
                 pass.set_attention_decode(false);
                 Ok(UnitSlot { published: PublishedLayers::new(pass.library()?)?, pass, transport,
@@ -487,7 +514,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Every unit's chained work completes before the decoder replay (or a
         // caller) reads what the units published.
         for slot in &hooks.slots { slot.pass.drain_chain()?; }
-        crate::shared::spark_waves::healthy()
+        crate::shared::spark_waves::healthy()?;
+        // Non-unit work (replay, continuation, scoring) runs at rows from 0.
+        for slot in &mut hooks.slots { slot.pass.select_window(RowWindow::NONE)?; }
+        Ok(())
     }
 }
 

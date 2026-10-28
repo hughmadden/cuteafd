@@ -477,18 +477,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
                 ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
-                    P::begin_request(first_transport)?; P::begin_request(second_transport)?;
-                    for (_, transport) in prefill_slots.extra.iter_mut() { P::begin_request(transport)?; }
-                    super::score(lib, runtime, first, second, requests, first_transport, second_transport, &mut *prefill_slots, lease,
+                    for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
+                    super::score(lib, runtime, requests, &mut *prefill_slots, lease,
                         &prompt, from, super::PrefillShape::from_args(args), &job, draft.as_deref_mut(),
                         &mut || prefixes.prefill_hold())?;
                 }
-                P::begin_request(first_transport)?; P::begin_request(second_transport)?;
-                for (_, transport) in prefill_slots.extra.iter_mut() { P::begin_request(transport)?; }
+                for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
                 let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
-                else { prefill(lib, runtime, first, second, requests, first_transport,
-                    second_transport, &mut *prefill_slots, lease, &prompt, super::PrefillShape::from_args(args), &job,
-                    draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
+                else { prefill(lib, runtime, requests, &mut *prefill_slots, lease, &prompt,
+                    super::PrefillShape::from_args(args), &job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
                 requests.record_state(lease, &job.probe, "prompt")?;
                 if crate::shared::probe::wants_first(&job.probe) {
                     crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
@@ -536,8 +533,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     requests.release_if_present(lease)?;
                     if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
                     P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
-                    for (_, transport) in prefill_slots.extra.iter_mut() { P::reset_connections(transport)?; }
-                    P::reset_prefill(&mut prefill_slots.link)?;
+                    for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
                 }
             }
         }
@@ -591,8 +587,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if let Err(error) = result {
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
-                    for (_, transport) in prefill_slots.extra.iter_mut() { P::reset_connections(transport)?; }
-                    P::reset_prefill(&mut prefill_slots.link)?;
+                    for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
             for request in active.iter_mut().flatten() {
                 let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;

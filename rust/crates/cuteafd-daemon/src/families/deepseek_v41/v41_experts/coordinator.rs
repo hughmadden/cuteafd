@@ -263,6 +263,12 @@ impl<'a> NativeTp4Wave<'a> {
         self.tp2 = Some(Box::new(wave));
         Ok(())
     }
+    /// Selects a prefill slot's rows in its TP2 FFN's shared planes, at rest
+    /// (`shared::memory::row_window`); the reduce output is the slot's own.
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        if let Some(tp2) = self.tp2.as_mut() { tp2.select_window(window)?; }
+        Ok(())
+    }
     pub fn has_tp2_layer(&self, layer: usize) -> bool {
         self.tp2.as_ref().is_some_and(|wave| wave.contains(layer))
     }
@@ -383,6 +389,24 @@ impl<'a> NativeTp4Wave<'a> {
     /// Opens the lane's own link ([`V41Link::bootstrap`]).
     pub(crate) fn bootstrap(&mut self, layer: u32, nvfp4: bool) -> Result<()> {
         self.own_link()?.bootstrap(layer, nvfp4)
+    }
+    /// Prefill slot 0 owns the one prefill link (its non-unit work sends on
+    /// it). A units call borrows it for every slot's waves
+    /// ([`Self::dispatch_unit`]) and returns it ([`Self::restore_link`]).
+    pub(crate) fn take_link(&mut self) -> Result<V41Link<'a>> {
+        self.ready_rows = None;
+        self.link.take().context("prefill slot 0 has no link to lend")
+    }
+    pub(crate) fn restore_link(&mut self, link: V41Link<'a>) -> Result<()> {
+        ensure!(self.link.is_none(), "prefill slot 0 already holds a link");
+        self.link = Some(link);
+        Ok(())
+    }
+    /// A prefill slot 0's FFN owner around the one prefill `link`.
+    pub(crate) fn with_link(library: &'a NativeLibrary, link: V41Link<'a>) -> Result<Self> {
+        let mut wave = Self::unlinked(library, link.capacity())?;
+        wave.link = Some(link);
+        Ok(wave)
     }
 
     /// Sends a remote layer's wave on the link's exchange: the router's route

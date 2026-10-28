@@ -38,16 +38,16 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
     Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
 }
 
-/// Every Spark transport of `slots` target passes (PLAN "Prefill contract"):
-/// the two decode lanes' links ([`transport_bytes`]), each further prefill
-/// slot's reduce output, and the one prefill link's intake: every rank's
-/// partial-sum plane over the reserve its return slots are cut from
-/// (`wave_control::reserve_rows`).
+/// Every Spark transport (PLAN "Prefill contract"): the two decode lanes'
+/// links ([`transport_bytes`]), each of the `slots` prefill slots' reduce
+/// output (slot 0's FFN owner also holds the link), and the one prefill
+/// link's intake: every rank's partial-sum plane over the reserve its return
+/// slots are cut from (`wave_control::reserve_rows`).
 pub fn transports_bytes(rows: u64, ranks: usize, slots: usize) -> Result<u64> {
     ensure!((2..=4).contains(&slots), "invalid V4.1 prefill slots");
     let reserve = crate::serving_capacity::wave_control::reserve_rows(slots as u64, rows);
     let lanes = 2 * transport_bytes(rows, ranks)?;
-    let outputs = (slots as u64 - 2) * rows * 5120 * 2;
+    let outputs = slots as u64 * rows * 5120 * 2;
     Ok(lanes + outputs + reserve * ranks as u64 * 5120 * 2)
 }
 

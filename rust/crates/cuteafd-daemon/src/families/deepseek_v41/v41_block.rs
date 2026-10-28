@@ -280,6 +280,22 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         self.copy_inputs_ordered(&[embedding.residual, embedding.pre], &self.inputs())?;
         Ok(())
     }
+    /// A prefill unit's layer-0 input, without its query: the embedding lands in
+    /// this block's planes (its window, a row plane) and the block waits
+    /// prepared at layer 0. The unit's attention hook runs the query there, so
+    /// no other unit's hook writes the shared query scratch in between
+    /// (`shared::memory::row_window`: the query outputs are guarded scratch
+    /// consumed within the attention hook).
+    pub fn prepare_embedding(
+        &mut self,
+        embedding: &crate::families::deepseek_v41::v41_target_embedding::TargetEmbedding<'_>,
+        binding: QueryBinding,
+    ) -> Result<()> {
+        self.initialize_embedding(embedding)?;
+        self.tokens.extend_from_slice(embedding.positions);
+        self.phase = Phase::Prepared(binding, embedding.positions.len(), true);
+        Ok(())
+    }
     /// Join producers before copying into the windowed input planes. The legacy
     /// stream does not order with our non-blocking component streams.
     fn copy_inputs_ordered(&self, sources: &[CuteafdDeviceBuffer],

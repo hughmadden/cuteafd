@@ -4,7 +4,7 @@ use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 mod distributed;
 pub(crate) use distributed::{DistributedExecution, PendingDistributedProduction};
-pub(crate) use placement::PlacedProducerWaves;
+pub(crate) use placement::{PlacedProducerStorage, PlacedProducerWaves};
 use crate::families::deepseek_v41::v41_backbone_lane::{BackboneLane, LaneFfn, PendingLaneFfn};
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_compressor::{CompressorWave, CompressorWeights};
@@ -318,6 +318,38 @@ struct Produced {
     producer_us: u64,
     indexed: bool,
 }
+/// One RTX's cache-producer storage shared by every prefill slot
+/// (`shared::memory::row_window`): the window storage (one shared stream,
+/// each layer's proposal plane at the reserve) and one compressor storage per
+/// source layer's wave (one storage holding all four source layers' planes at
+/// the reserve, carry and plain scratch at the unit, one stream). A private
+/// pass builds its own with rows == unit (one compressor storage per layer).
+pub(crate) struct ProducerStorage<'a> {
+    windows: std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowStorage<'a>>,
+    sources: Vec<std::rc::Rc<crate::families::deepseek_v41::v41_compressor::CompressorStorage<'a>>>,
+    /// Rows of each slot's window batch table (full-phase commits only).
+    batch_rows: usize,
+}
+impl<'a> ProducerStorage<'a> {
+    /// Planes over `rows` reserve rows, scratch for units of up to `unit` rows,
+    /// every wave on the storage's shared stream.
+    pub(crate) fn new(library: &'a NativeLibrary, rows: usize, unit: usize) -> Result<Self> {
+        Ok(Self {
+            windows: crate::families::deepseek_v41::v41_window::WindowStorage::new(library, rows, unit,
+                &(0..40).collect::<Vec<_>>(), true)?,
+            // One compressor storage for the four source layers: one stream
+            // orders every slot's productions, scratch is shared (WP2 contract).
+            sources: vec![crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+                library, rows, unit, &SOURCES)?; SOURCES.len()],
+            batch_rows: unit,
+        })
+    }
+}
+impl Clone for ProducerStorage<'_> {
+    fn clone(&self) -> Self {
+        Self { windows: self.windows.clone(), sources: self.sources.clone(), batch_rows: self.batch_rows }
+    }
+}
 pub(crate) struct BackboneExecution<'w, 'a> {
     weights: &'w CacheProducerWeights<'a>,
     windows: Vec<WindowWave<'w, 'a>>,
@@ -496,31 +528,45 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             Self::workspace_bytes(weights.library, capacity)? <= budget,
             "cache producer workspace exceeds budget"
         );
+        // A private pass: its layers share scratch, each wave keeps its own stream.
+        let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
+            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>(), false)?;
+        let sources = SOURCES.iter().map(|&layer| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+            weights.library, capacity as usize, capacity as usize, &[layer])).collect::<Result<Vec<_>>>()?;
+        Self::on_storage(weights, ProducerStorage { windows, sources, batch_rows: capacity as usize })
+    }
+    /// Bytes of one prefill slot set's producer storage on one RTX
+    /// ([`ProducerStorage::new`]): window planes and compressed-source planes
+    /// at the `rows` reserve, scratch at the `unit` cap, and the window batch
+    /// table at the unit (only full-phase commits use it).
+    pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<usize> {
+        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+            library, rows as usize, unit, 40)?
+            + crate::families::deepseek_v41::v41_compressor::CompressorStorage::device_bytes(&SOURCES, rows as usize, unit as usize)?;
+        if Self::window_batch_enabled() { total += WindowBatch::bytes(unit as usize); }
+        Ok(total)
+    }
+    /// Every prefill slot's producers on one shared storage set
+    /// ([`ProducerStorage`]); `select_window` places each slot's unit.
+    pub fn on_storage(weights: &'w CacheProducerWeights<'a>, storage: ProducerStorage<'a>) -> Result<Self> {
+        ensure!(weights.placement.is_none(), "distributed producer weights require placed execution workspaces");
         ensure!(
-            weights.windows.len() == 40 && weights.sources.len() == 4,
+            weights.windows.len() == 40 && weights.sources.len() == SOURCES.len() && storage.sources.len() == SOURCES.len(),
             "cache producer weight owners incomplete"
         );
-        // The pass's layers share scratch; each wave keeps its own stream.
-        let storage = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
-            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>(), false)?;
         let windows = weights
             .windows
             .iter()
-            .map(|w| w.on_storage(storage.clone()))
+            .map(|w| w.on_storage(storage.windows.clone()))
             .collect::<Result<Vec<_>>>()?;
         let sources = weights
             .sources
             .iter()
-            .zip(SOURCES)
-            .map(|(w, layer)| {
-                w.wave(
-                    capacity as usize,
-                    CompressorWave::device_bytes(layer, capacity as usize)?,
-                )
-            })
+            .zip(&storage.sources)
+            .map(|(w, storage)| w.on_storage(storage.clone()))
             .collect::<Result<Vec<_>>>()?;
         let window_batch = Self::window_batch_enabled()
-            .then(|| WindowBatch::new(weights.library, capacity as usize)).transpose()?;
+            .then(|| WindowBatch::new(weights.library, storage.batch_rows)).transpose()?;
         Ok(Self {
             weights,
             windows,
@@ -569,6 +615,13 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
     pub fn restart_for(&mut self, stage: CacheStage) {
         self.queued_production = None;
         self.progress = PassProgress::for_stage(stage);
+    }
+    /// Selects this slot's unit rows in every producer's shared planes, at
+    /// rest (`shared::memory::row_window`).
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        for wave in &mut self.windows { wave.select_window(window.clone())?; }
+        for wave in &mut self.sources { wave.select_window(window.clone())?; }
+        Ok(())
     }
     /// Publish source 20 after a complete reserved encoder chunk.
     /// # Safety

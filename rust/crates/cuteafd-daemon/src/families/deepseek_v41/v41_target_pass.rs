@@ -34,7 +34,7 @@ pub(crate) use distributed::DistributedTargetPass;
 mod verification;
 pub(crate) use verification::VerificationTarget;
 mod encoder_units;
-pub(crate) use taps::{TargetTapWave, TargetTaps};
+pub(crate) use taps::{TargetTapStorage, TargetTapWave, TargetTaps};
 
 /// Target cache publication used by the independent scheduler's queued dSpark
 /// transaction. Static dispatch keeps ordinary serving on its existing path.
@@ -275,6 +275,21 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// `--l2-prefetch` with `budget` bytes per layer (see [`BackboneLane::enable_l2_prefetch`]).
     pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
         self.resources.lane.enable_l2_prefetch(budget)
+    }
+    /// Selects this prefill slot's rows in every component's shared row planes
+    /// (`shared::memory::row_window`), at rest: before a unit begins (its
+    /// window) and before non-unit prefill work (`RowWindow::NONE`). The slot's
+    /// previous work has drained ([`Pass::drain_chain`]).
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        ensure!(self.state == State::Idle, "prefill slot window changes only at rest");
+        let resources = &mut self.resources;
+        resources.lane.select_window(window.clone())?;
+        resources.index.select_window(window.clone())?;
+        resources.execution.select_window(window.clone())?;
+        resources.embedding.select_window(window.clone())?;
+        resources.upload.select_window(window.clone())?;
+        for gate in &mut resources.gates { gate.select_window(window.clone())?; }
+        resources.taps.select_window(window)
     }
     /// # Safety
     /// All components belong to the same device, capacity and official model.
