@@ -1138,3 +1138,14 @@ impl Transport for StaggerSwitch {
     fn abandon(&mut self) {}
     fn retained_reply_slots(&self) -> Vec<usize> { self.echo.retained_reply_slots() }
 }
+
+/// A link's first `waves` sends wait for sequence 0 (landed at start), never
+/// on a wrapped value; later sends wait for the slot's previous wave.
+#[test]
+fn a_slots_first_use_waits_for_nothing_beyond_the_initial_landing() {
+    for waves in 1..=4usize {
+        for sequence in 1..=waves as u32 { assert_eq!(super::staging_reuse(sequence, waves), 0, "{waves} {sequence}"); }
+        assert_eq!(super::staging_reuse(waves as u32 + 1, waves), 1);
+        assert_eq!(super::staging_reuse(100, waves), 100 - waves as u32);
+    }
+}

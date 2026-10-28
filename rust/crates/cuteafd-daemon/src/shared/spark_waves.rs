@@ -140,6 +140,15 @@ pub(crate) enum WaveError {
 }
 
 /// Whether cyclic counter `value` has reached `target`.
+/// The landed sequence a wave's request staging waits for before its slot
+/// is rewritten: the slot's previous wave, `sequence - waves`. A slot's first
+/// use (the link's first `waves` sequences) waits for 0, landed at start.
+/// (`cuStreamWaitValue32` GEQ is cyclic, so a wrapped value would also pass;
+/// the explicit floor keeps the first use readable without that reasoning.)
+pub(crate) fn staging_reuse(sequence: u32, waves: usize) -> u32 {
+    sequence.checked_sub(waves as u32).unwrap_or(0)
+}
+
 pub(crate) fn reached(value: u32, target: u32) -> bool {
     (value.wrapping_sub(target) as i32) >= 0
 }
@@ -926,7 +935,7 @@ impl<'a> Waves<'a> {
                 Ok(((alias + offsets[i]) as *mut c_void, sources[i].ptr.cast_const(), sizes[i] as u64))
             }).collect::<Result<_>>()?;
             unsafe {
-                let previous = sequence.wrapping_sub(cut.waves as u32);
+                let previous = staging_reuse(sequence, cut.waves);
                 self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), previous)?;
                 self.library.sm_copy_regions(&regions, stream)?;
                 self.library.cuda_stream_write_value32(stream, self.words.ptr(Counter::Staged(slot)), sequence)?;
