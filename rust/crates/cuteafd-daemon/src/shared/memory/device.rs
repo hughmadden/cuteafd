@@ -414,6 +414,10 @@ mod peer_copy_choice_tests {
         assert!(!sm_peer_copy_for(true, glmf_decode + 1, glmf_decode));
         assert!(!sm_peer_copy_for(true, 2752 * 4096 * 2, glmf_decode));
         assert!(!sm_peer_copy_for(true, 4096 * 4 * 4096 * 2, glmf_decode));
+        for row_bytes in [8192, 10240, 12288] {
+            assert!(sm_peer_copy_for(true, 80 * row_bytes, 80 * row_bytes));
+            assert!(!sm_peer_copy_for(true, 81 * row_bytes, 80 * row_bytes));
+        }
     }
 }
 

@@ -30,6 +30,8 @@ pub fn unit_rows(waves: u64) -> u64 { unit_rows_in(waves, RESERVE_ROWS) }
 /// Memory admission supplies the available arena extent, not a scheduling row cap.
 #[derive(Debug, Clone, Copy)]
 pub struct PrefillLimits {
+    /// Lowest unit considered by automatic reserve admission; explicit pins stay exact.
+    pub min_unit_rows: u64,
     pub max_unit_rows: u64,
     pub max_span_rows: u64,
     /// The deepest depth the family's executor holds; the depth is
@@ -40,7 +42,7 @@ pub struct PrefillLimits {
 
 impl Default for PrefillLimits {
     fn default() -> Self {
-        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64,
+        Self { min_unit_rows: ROW_PAGE, max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64,
             max_waves: MAX_WAVES, capacities: &cuteafd_core::EXL3_CAPACITIES }
     }
 }

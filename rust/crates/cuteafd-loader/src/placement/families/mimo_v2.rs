@@ -45,7 +45,7 @@ impl<'a> MimoInputs<'a> {
         let remote = working_set.includes(WorkingSetComponent::SparkExperts);
         MimoInputs { profile: if remote { self.profile } else { no_spark },
             spark_ranks: working_set.selected_ranks().len(),
-            lanes: if remote { working_set.prefill_lanes } else { 1 },
+            lanes: working_set.prefill_lanes,
             startup_probe_bytes: if remote { self.startup_probe_bytes } else { 0 },
             ..self.clone() }
     }
@@ -79,7 +79,7 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
         let remote = !spark_layers.is_empty();
         let working_set = SparkWorkingSet { rtx_layers: routed[..n].to_vec(), spark_layers,
             spark_ranks: if remote { inputs.spark_ranks } else { 0 },
-            prefill_lanes: if remote { inputs.lanes } else { 1 } };
+            prefill_lanes: inputs.lanes };
         let selected = inputs.selected(no_spark, &working_set);
         let result = (|| {
             let mut request = request(&selected)?;
@@ -201,7 +201,7 @@ mod tests {
             for lanes in [1, 2, 3] {
                 let payload = (rows * 8 * 4u64).div_ceil(16) * 32;
                 assert_eq!(route_exchange_bytes(rows, 8, lanes).unwrap(),
-                    lanes * 2 * payload.max(256) + ((lanes * 2 + 1) * 16).max(256) + 256);
+                    lanes * 2 * payload.max(256) + 2 * 64 * 8 * 8 + ((lanes * 2 + 3) * 16).max(256) + 256);
             }
         }
         for (rows, topk, lanes) in [(u64::MAX, 8, 3), (64, u64::MAX, 3), (64, 8, u64::MAX)] {
@@ -240,7 +240,7 @@ mod tests {
             let all = solve_working_set(&inputs, &local).unwrap();
             assert_eq!(all.placement.onboard_layers, 3);
             assert_eq!(all.working_set, SparkWorkingSet { rtx_layers: vec![1, 2, 3],
-                spark_layers: vec![], spark_ranks: 0, prefill_lanes: 1 });
+                spark_layers: vec![], spark_ranks: 0, prefill_lanes: 3 });
             assert!(all.working_set.includes(WorkingSetComponent::RtxExperts));
             assert!(!all.working_set.includes(WorkingSetComponent::SparkExperts));
             assert!(all.working_set.selected_ranks().is_empty());
@@ -258,7 +258,7 @@ mod tests {
             let configured_only = inputs.selected(&local, &SparkWorkingSet { spark_ranks: 6,
                 prefill_lanes: 3, ..SparkWorkingSet::default() });
             assert_eq!((configured_only.spark_ranks, configured_only.lanes,
-                configured_only.startup_probe_bytes), (0, 1, 0));
+                configured_only.startup_probe_bytes), (0, 3, 0));
             assert!(std::ptr::eq(configured_only.profile, &local));
             assert_eq!(resolved_capacity(&selected, &all.request, &all.placement, 16, 16).unwrap().devices[0]
                 .reservations[0].name, "workspace.local");
@@ -379,14 +379,19 @@ mod tests {
 
 /// Ready route exchange includes receive slots, control and abort words on each rank.
 pub fn route_exchange_bytes(rows: u64, topk: u64, lanes: u64) -> anyhow::Result<u64> {
-    let section = rows.checked_mul(topk).and_then(|bytes| bytes.checked_mul(4))
-        .ok_or_else(|| anyhow::anyhow!("MiMo route exchange overflow"))?;
-    let slots = lanes.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
-    let slot = section.div_ceil(16).checked_mul(32).ok_or_else(|| anyhow::anyhow!("MiMo route slot overflow"))?;
+    let slot = |rows: u64| -> anyhow::Result<u64> {
+        rows.checked_mul(topk).and_then(|n| n.checked_mul(4)).map(|n| n.div_ceil(16))
+            .and_then(|n| n.checked_mul(32)).map(|n| n.max(256))
+            .ok_or_else(|| anyhow::anyhow!("MiMo route slot overflow"))
+    };
+    let prefill_slots = lanes.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
+    let slots = prefill_slots.checked_add(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
     let control = slots.checked_add(1).and_then(|words| words.checked_mul(16))
         .ok_or_else(|| anyhow::anyhow!("MiMo route control overflow"))?;
-    slots.checked_mul(slot.max(256)).and_then(|bytes| bytes.checked_add(control.max(256)))
-        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| anyhow::anyhow!("MiMo route exchange bytes overflow"))
+    let decode = slot(64)?.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo decode routes overflow"))?;
+    prefill_slots.checked_mul(slot(rows)?).and_then(|bytes| bytes.checked_add(decode))
+        .and_then(|bytes| bytes.checked_add(control.max(256))).and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| anyhow::anyhow!("MiMo route exchange bytes overflow"))
 }
 
 /// Keep the allocation names in the ready ledger; category mapping is shared

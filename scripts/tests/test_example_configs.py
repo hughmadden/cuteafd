@@ -177,7 +177,7 @@ print(json.dumps(dict(report, version=1, family=family, executable=True, report=
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
     spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
-    speculator=value("--speculator", "off"))))
+    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096)))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
             .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
         docker.write_text(docker.read_text() + f'case "$*" in *"cuteafd plan"*) exec python3 "{stub}" "$@" ;; esac\n')

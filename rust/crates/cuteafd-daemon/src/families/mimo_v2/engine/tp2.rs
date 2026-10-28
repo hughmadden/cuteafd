@@ -9,10 +9,28 @@ impl<'a> MimoEngine<'a> {
         ensure!(layers == ranks[1].layers() && !layers.is_empty(), "MiMo TP2 halves disagree");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let route_bytes = (rows * self.cfg.topk * 4).next_multiple_of(16) * 2;
-        let routes = PeerExchange::new_abortable(self.library,
+        let route_sizes = [vec![(DECODE_ROWS * self.cfg.topk * 4).next_multiple_of(16) * 2; 2],
+            vec![route_bytes; 2 * self.prefill_waves()]].concat();
+        let routes = {
+            let _owner = cuteafd_ffi::memory_ledger::owner("mimo/transport/tp2-routes");
+            let routes = PeerExchange::new_abortable_sized(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: self.peer.as_ref().context("MiMo peer")?.device, stream: self.stream_of(1) }],
-            2 * self.transport_lanes(), route_bytes)?;
+            &route_sizes)?.with_decode_lane_bytes((80 * self.cfg.topk * 4).next_multiple_of(16) * 2)?;
+            let planned = cuteafd_loader::placement::families::mimo_v2::route_exchange_bytes(
+                rows as u64, self.cfg.topk as u64, self.prefill_waves() as u64)?;
+            let diagnostics = if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
+                ((route_sizes.len() + 1) * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) as u64
+            } else { 0 };
+            let ledger = cuteafd_ffi::memory_ledger::snapshot();
+            for gpu in [self.device, self.peer.as_ref().context("MiMo peer")?.device] {
+                let actual = ledger.by_owner(cuteafd_ffi::memory_ledger::Space::Device, gpu)
+                    .get("mimo/transport/tp2-routes").copied().unwrap_or(0) as u64;
+                ensure!(actual == planned + diagnostics,
+                    "MiMo TP2 route owner GPU {gpu}: allocated {actual}, planned {planned} + diagnostics {diagnostics}");
+            }
+            routes
+        };
         let combine = FusedCombine::new(self.library, ExchangeDtype::Bf16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|value| value.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
@@ -71,7 +89,7 @@ impl<'a> MimoEngine<'a> {
                 let section = rows * self.cfg.topk * 4;
                 let aligned = section.next_multiple_of(16);
                 let total = (aligned + section).next_multiple_of(16);
-                let slot = 2 * lane + index % 2;
+                let slot = if w.decode { index % 2 } else { 2 + 2 * lane + index % 2 };
                 if rank == 0 {
                     ensure!(total <= w.router_logits.buffer.bytes, "MiMo route packing exceeds admitted logits");
                     // SAFETY: the consumed router logits hold both padded route
@@ -106,13 +124,13 @@ impl<'a> MimoEngine<'a> {
                 self.library.copy_d2d_async(w.delta.buffer, cuteafd_ffi::CuteafdDeviceBuffer {
                     ptr: experts.output(), bytes, ..w.delta.buffer }, bytes, stream)?;
             }
-            self.push(rank, lane_slot(index, true, lane), w.delta.buffer.ptr, bytes)
+            self.push(rank, if w.decode { slot(index, true, true) } else { unit_slot(index, true, lane) }, w.delta.buffer.ptr, bytes)
         })
     }
 
     pub(super) fn tp2_post(&self, rank: usize, index: usize, lane: usize,
         w: &Workspace<'_>, rows: usize) -> Result<()> {
-        let slot = lane_slot(index, true, lane);
+        let slot = if w.decode { slot(index, true, true) } else { unit_slot(index, true, lane) };
         self.wait(rank, slot)?;
         let received = self.recv(rank, slot);
         let (rank0, rank1) = if rank == 0 { (w.delta.buffer.ptr, received) } else { (received, w.delta.buffer.ptr) };
@@ -154,7 +172,7 @@ impl<'a> MimoEngine<'a> {
         let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
         if !tp2.checking.get() { return Ok(()); }
         let checks = tp2.checks.borrow();
-        let check = checks.get(&(layer, lane)).context("MiMo route diagnostics were not admitted")?;
+        let check = checks.get(&(layer, self.unit_index.get().unwrap_or(lane))).context("MiMo route diagnostics were not admitted")?;
         ensure!(rows == check.rows, "MiMo route diagnostic shape changed");
         let host = &check.ranks[rank];
         let bytes = rows * self.cfg.topk * 4;
@@ -228,22 +246,22 @@ mod tests {
     enum Home { Dense, Tp2, Spark }
 
     fn attention(s: &mut Schedule, rank: usize, layer: usize, lane: usize) {
-        let slot = lane_slot(layer, false, lane);
+        let slot = unit_slot(layer, false, lane);
         s.push(rank, "main", slot, format!("attention push {rank}/{layer}/{lane}"));
         s.wait(rank, "main", slot, format!("attention wait {rank}/{layer}/{lane}"));
     }
 
     fn experts(s: &mut Schedule, rank: usize, layer: usize, lane: usize, broadcast: bool) {
         if broadcast {
-            let slot = 2 * lane + layer % 2;
+            let slot = 2 + 2 * lane + layer % 2;
             if rank == 0 { s.push(0, "routes", slot, "canonical routes"); }
             else { s.wait(1, "routes", slot, "canonical routes"); }
         }
-        s.push(rank, "main", lane_slot(layer, true, lane), "TP2 partial");
+        s.push(rank, "main", unit_slot(layer, true, lane), "TP2 partial");
     }
 
     fn post(s: &mut Schedule, rank: usize, layer: usize, lane: usize) {
-        s.wait(rank, "main", lane_slot(layer, true, lane), "FFN combine");
+        s.wait(rank, "main", unit_slot(layer, true, lane), "FFN combine");
     }
 
     // Mirror eager peer_layer lookahead and the lane producer/post split.
@@ -253,7 +271,7 @@ mod tests {
         let peer = |s: &mut Schedule, layer: usize, lane| {
             attention(s, 1, layer, lane);
             match homes[layer] {
-                Home::Dense => s.push(1, "main", lane_slot(layer, true, lane), "dense partial"),
+                Home::Dense => s.push(1, "main", unit_slot(layer, true, lane), "dense partial"),
                 Home::Tp2 => experts(s, 1, layer, lane, broadcast),
                 Home::Spark => {},
             }
@@ -266,10 +284,10 @@ mod tests {
                 attention(s, 0, layer, lane);
                 if ahead && layer + 1 < homes.len() { peer(s, layer + 1, lane); }
                 match home {
-                    Home::Dense => s.push(0, "main", lane_slot(layer, true, lane), "dense partial"),
+                    Home::Dense => s.push(0, "main", unit_slot(layer, true, lane), "dense partial"),
                     Home::Tp2 => experts(s, 0, layer, lane, broadcast),
                     Home::Spark if layer + 1 < homes.len() =>
-                        s.push(0, "main", lane_slot(layer, true, lane), "landed Spark sum"),
+                        s.push(0, "main", unit_slot(layer, true, lane), "landed Spark sum"),
                     Home::Spark => {},
                 }
                 if !ahead && (*home != Home::Spark || layer + 1 < homes.len()) { post(s, 1, layer, lane); }
@@ -281,29 +299,41 @@ mod tests {
     // Decode consumes the previous FFN in the next segment. Rank 1 has no
     // tail segment, so the last TP2 post is explicitly queued by decode_layers.
     fn decode(s: &mut Schedule, homes: &[Home], broadcast: bool) {
+        let decode_post = |s: &mut Schedule, rank, layer| s.wait(rank, "main", slot(layer, true, true), "FFN combine");
+        let decode_attention = |s: &mut Schedule, rank, layer| {
+            s.push(rank, "main", slot(layer, false, true), "decode attention");
+            s.wait(rank, "main", slot(layer, false, true), "decode attention sum");
+        };
+        let decode_experts = |s: &mut Schedule, rank, layer, broadcast| {
+            if broadcast {
+                if rank == 0 { s.push(0, "routes", layer % 2, "decode canonical routes"); }
+                else { s.wait(1, "routes", layer % 2, "decode canonical routes"); }
+            }
+            s.push(rank, "main", slot(layer, true, true), "decode TP2 partial");
+        };
         for layer in 0..=homes.len() {
             if layer == 0 { s.push(0, "main", DIRECT, "decode embedded rows"); }
             else {
                 match homes[layer - 1] {
-                    Home::Dense | Home::Tp2 => post(s, 0, layer - 1, 0),
-                    Home::Spark if layer < homes.len() => s.push(0, "main", slot(layer - 1, true), "Spark sum"),
+                    Home::Dense | Home::Tp2 => decode_post(s, 0, layer - 1),
+                    Home::Spark if layer < homes.len() => s.push(0, "main", slot(layer - 1, true, true), "Spark sum"),
                     Home::Spark => {},
                 }
             }
             if layer == homes.len() { break; }
-            attention(s, 0, layer, 0);
+            decode_attention(s, 0, layer);
             if homes[layer] == Home::Dense && layer + 1 < homes.len() {
-                s.push(0, "main", slot(layer, true), "dense partial");
+                s.push(0, "main", slot(layer, true, true), "dense partial");
             }
             if layer == 0 { s.wait(1, "main", DIRECT, "decode embedded rows"); }
-            else { post(s, 1, layer - 1, 0); }
-            attention(s, 1, layer, 0);
+            else { decode_post(s, 1, layer - 1); }
+            decode_attention(s, 1, layer);
             match homes[layer] {
-                Home::Dense => s.push(1, "main", slot(layer, true), "dense partial"),
+                Home::Dense => s.push(1, "main", slot(layer, true, true), "dense partial"),
                 Home::Tp2 => {
-                    experts(s, 0, layer, 0, broadcast);
-                    experts(s, 1, layer, 0, broadcast);
-                    if layer + 1 == homes.len() { post(s, 1, layer, 0); }
+                    decode_experts(s, 0, layer, broadcast);
+                    decode_experts(s, 1, layer, broadcast);
+                    if layer + 1 == homes.len() { decode_post(s, 1, layer); }
                 },
                 Home::Spark => {},
             }
@@ -321,19 +351,19 @@ mod tests {
             schedule.push(0, "main", DIRECT, "embedded residual");
             schedule.wait(1, "main", DIRECT, "embedded residual");
             for rank in [1, 0] {
-                schedule.push(rank, "main", slot(0, false), "layer 0 attention partial");
-                schedule.wait(rank, "main", slot(0, false), "layer 0 attention sum");
+                schedule.push(rank, "main", slot(0, false, true), "layer 0 attention partial");
+                schedule.wait(rank, "main", slot(0, false, true), "layer 0 attention sum");
             }
-            schedule.push(1, "main", slot(0, true), "layer 0 peer dense partial");
-            schedule.wait(1, "main", slot(0, true), "layer 0 lead dense partial");
+            schedule.push(1, "main", slot(0, true, true), "layer 0 peer dense partial");
+            schedule.wait(1, "main", slot(0, true, true), "layer 0 lead dense partial");
             // peer_layer(1) is queued before rank 0's layer 0 FFN push.
-            schedule.push(1, "main", slot(1, false), "layer 1 peer attention partial");
-            schedule.wait(1, "main", slot(1, false), "layer 1 lead attention partial");
+            schedule.push(1, "main", slot(1, false, true), "layer 1 peer attention partial");
+            schedule.wait(1, "main", slot(1, false, true), "layer 1 lead attention partial");
             if !preloaded { schedule.sync(1, "lazy native router first use"); }
-            schedule.push(0, "main", slot(0, true), "layer 0 lead dense partial");
-            schedule.wait(0, "main", slot(0, true), "layer 0 peer dense partial");
-            schedule.push(0, "main", slot(1, false), "layer 1 lead attention partial");
-            schedule.wait(0, "main", slot(1, false), "layer 1 peer attention partial");
+            schedule.push(0, "main", slot(0, true, true), "layer 0 lead dense partial");
+            schedule.wait(0, "main", slot(0, true, true), "layer 0 peer dense partial");
+            schedule.push(0, "main", slot(1, false, true), "layer 1 lead attention partial");
+            schedule.wait(0, "main", slot(1, false, true), "layer 1 peer attention partial");
             assert_eq!(check(&schedule.streams()), Ok(()));
             if preloaded { assert_eq!(check_host(&schedule), Ok(())); }
             else {

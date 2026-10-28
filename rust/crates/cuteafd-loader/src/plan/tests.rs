@@ -88,7 +88,7 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         assert_eq!(report.host_budget_bytes, expected << 30);
         assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
         assert!(host.items.iter().all(|i| i.lifetime == ItemLifetime::PostReadyReserve));
-        for owner in ["workspace/router", "staging/tables-and-sync", "scoring/full-logits"] {
+        for owner in ["mimo/owner-0/prefill.ordered-tables", "scoring/full-logits"] {
             assert!(host.items.iter().any(|i| i.group == owner && i.bytes > 0), "{owner}");
         }
         assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
@@ -147,6 +147,47 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
 }
 
 #[test]
+fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
+    use crate::families::mimo_v2::{admission, MimoExpertInput, MimoKvFormats, MimoPrefillOutput};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+    let geometry = ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+    for rows in [64usize, 2048, 4096] {
+        for waves in [1usize, 2, 3] {
+            for input in [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode] {
+                let host = admission::future_host_workspaces(&cfg, rows, waves, 2, 0, 4096, 6,
+                    input, MimoKvFormats::default(), MimoPrefillOutput::LastRow, true, 0, 0).unwrap();
+                let bytes = |name: &str| host.iter().find(|(n, _)| n == name).unwrap().1;
+                let ingress = match input { MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
+                    MimoExpertInput::Bf16 => SparkIngress::Bf16,
+                    MimoExpertInput::Bf16Decode => SparkIngress::Fp8K32 };
+                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None };
+                let decode = SparkEndpoint { capacity: 64, ingress: if input.bf16(true) { SparkIngress::Bf16 }
+                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1) };
+                assert_eq!(admission::spark_endpoints(rows, input).unwrap(), [decode, endpoint]);
+                let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+                assert_eq!(layout::spark_endpoints("mimo_v2", waves as u64), 2);
+                assert_eq!(bytes("mimo/transport/rdma-rings"), (endpoint.ring_bytes(geometry, rings).unwrap() + decode.ring_bytes(geometry, rings).unwrap()) as u64 * 6);
+                assert_eq!(bytes("mimo/transport/response-prefix"), (endpoint.response_prefix_bytes().unwrap() + decode.response_prefix_bytes().unwrap()) as u64 * 6);
+                let plane = rows as u64 * cfg.hidden as u64 * 2;
+                assert_eq!(bytes("mimo/spark-intake-upper-bound"), (plane * waves as u64 + 64 * cfg.hidden as u64 * 2) * 6);
+                assert_eq!(bytes("mimo/transport/egress"),
+                    (geometry.compact_wire_bytes(rows as u32, input.bf16(false)).unwrap().0 * waves
+                        + geometry.compact_wire_bytes(64, input.bf16(true)).unwrap().0) as u64);
+                let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6).unwrap();
+                let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
+                assert_eq!(intake.bytes, (rows.max(64) as u64 * waves as u64 + 64) * cfg.hidden as u64 * 2 * 6);
+                let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6).unwrap();
+                assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
+            }
+        }
+    }
+}
+
+#[test]
 fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
@@ -172,7 +213,17 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
                 assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
-                let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
+                let bytes = |name: &str| host.items.iter().find(|i| i.group == name).unwrap().bytes;
+                if family == "mimo_v2" {
+                    let cfg = MimoV2Config::from_hf(&input.checkpoint().config).unwrap();
+                    let expected = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
+                        unit as usize, waves as usize, 1, 0, options.context_tokens.max(1) as usize,
+                        4, options.mimo_expert_input, crate::families::mimo_v2::MimoKvFormats::default(),
+                        crate::families::mimo_v2::MimoPrefillOutput::AllRows, true, unit.min(256) as usize, 0).unwrap();
+                    for (name, expected) in expected { assert_eq!(bytes(&name), expected, "{name}"); }
+                    assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
+                    continue;
+                }
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
                 let ingress = if !native && family == "glm5" { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
                 let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress };
@@ -345,6 +396,45 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
         let error = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap_err();
         assert!(matches!(error.downcast_ref::<PrefillError>(),
             Some(PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. })), "{}: {error}", family.id());
+    }
+}
+
+#[test]
+fn every_family_caps_the_shared_reserve_only_to_fit_a_fake_card() {
+    use crate::serving_capacity::prefill_waves::{depth, unit_rows_in, RESERVE_ROWS, ROW_PAGE};
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let template = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    for family in family::registry() {
+        let limits = family.prefill_limits();
+        let waves = depth(6, limits);
+        let candidates: Vec<_> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
+            .filter(|&reserve| unit_rows_in(waves, reserve) >= limits.min_unit_rows).collect();
+        // Fixed owners plus one byte per live row: no KV target influences fit.
+        for capacity in [16384, 4096] {
+            let mut tried = Vec::new();
+            let selected = largest_fitting_prefill(&candidates, |reserve| {
+                tried.push(reserve);
+                let mut report = template.clone();
+                let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
+                options.prefill_reserve_rows = Some(reserve);
+                let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+                assert_eq!(shape.waves, waves, "{}", family.id());
+                assert_eq!(options.spark_capacity_rows, shape.unit_rows);
+                Ok((1024 + shape.span_rows <= capacity).then_some((reserve, shape)))
+            }).unwrap().unwrap();
+            let (reserve, shape) = selected;
+            assert_eq!(reserve % ROW_PAGE, 0, "{}", family.id());
+            assert!(shape.unit_rows >= limits.min_unit_rows, "{}", family.id());
+            assert_eq!(shape.unit_rows, unit_rows_in(waves, reserve));
+            if capacity == 16384 {
+                assert_eq!(reserve, RESERVE_ROWS, "{}", family.id());
+                assert_eq!(tried, [RESERVE_ROWS]);
+            } else {
+                assert!(reserve < RESERVE_ROWS, "{}", family.id());
+                assert!(1024 + waves * unit_rows_in(waves, reserve + ROW_PAGE) > capacity,
+                    "{} must select the largest fitting reserve", family.id());
+            }
+        }
     }
 }
 

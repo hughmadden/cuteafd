@@ -46,6 +46,14 @@ fn usize_list(config: &Value, key: &str) -> Vec<usize> {
 }
 
 impl Family for DeepSeek {
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        crate::serving_capacity::prefill_waves::PrefillLimits {
+            min_unit_rows: if self.id == "deepseek_v41" {
+                u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS)
+            } else { 64 },
+            ..Default::default()
+        }
+    }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })

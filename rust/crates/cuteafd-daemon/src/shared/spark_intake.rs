@@ -1583,6 +1583,11 @@ impl<'a> SparkLink<'a> {
         self.transport.as_mut().context("Spark link has no transport")
     }
 
+    /// Bind the admitted endpoint before bootstrap starts its exchange worker.
+    pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        self.idle_transport()?.bind_model_endpoint(endpoint)
+    }
+
     /// Completes every rank's persistent bootstrap without dispatching a wave,
     /// so the workers' immutable installed grouping is readable before the
     /// first request and the rings its widest wave needs are already

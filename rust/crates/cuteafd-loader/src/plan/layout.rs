@@ -329,8 +329,9 @@ mod scoring_workspace_tests {
 }
 
 /// Ring endpoints a family's coordinator opens to each selected Spark rank,
-/// given its prefill lanes (GLM 5.3: one decode plus one prefill endpoint,
-/// including pinned one-wave layouts; Qwen and GLM Flash: one).
+/// given its prefill lanes (V4.1: three fixed; V4: two fixed; GLM 5.3 and
+/// MiMo: one decode plus one prefill endpoint, including pinned one-wave
+/// layouts; Qwen and GLM Flash: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         // The two decode lanes' links and one prefill link (its waves share
@@ -340,7 +341,7 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 2,
         "glm5_flash" => 1,
-        "mimo_v2" => lanes as usize,
+        "mimo_v2" => 2,
         "qwen4" => 1,
         _ => 0,
     }
@@ -436,7 +437,6 @@ mod selected_spark_io_tests {
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
             // Decode link + one prefill link (formerly one endpoint per lane: 2459697152).
             ("glm5", ExpertGeometry::GLM5, 3, 1229848576),
-            ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 1844772864),
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
                 prefill_lanes: lanes, ..Default::default() };
@@ -535,6 +535,19 @@ mod selected_spark_io_tests {
                     "pre-solver Spark overhead and the final ledger must count each owner once");
             }
         }
+    }
+
+    #[test]
+    fn mimo_decode_endpoint_has_one_small_ring_slot() {
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+            prefill_lanes: 2, ..Default::default() };
+        let endpoints = crate::families::mimo_v2::admission::spark_endpoints(4096,
+            crate::families::mimo_v2::MimoExpertInput::Fp8).unwrap();
+        let io = working.rank_endpoints_io(0, ExpertGeometry::MIMO_V26_PRO, &endpoints,
+            cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 }).unwrap();
+        assert_eq!(io.mapped_rings, 614924288 + (16 << 20));
+        assert_eq!(io.endpoint_staging, (4096 * 4 + 128) + (64 * 4 + 128));
     }
 
     #[test]
@@ -1394,14 +1407,11 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     let rows = report.prefill_span_rows.unwrap_or(options.prefill_rows.max(4096));
     // Scoring retains the span; wire/router scratch serves one explicit unit.
     // The live return slots alone multiply by the number of waves.
-    // MiMo retains its own row/transport geometry pending #709; it has no
-    // shared-wave unit metadata until its executor is ported.
-    let legacy_mimo = family == "mimo_v2";
-    ensure!(legacy_mimo || ranks == 0 || options.prefill_unit_rows.is_some(),
+    ensure!(ranks == 0 || options.prefill_unit_rows.is_some(),
         "{family} Spark host admission requires family-resolved prefill_unit_rows (span {rows}, waves {})",
         options.prefill_waves);
-    let unit_rows = if legacy_mimo { rows } else { options.prefill_unit_rows.unwrap_or(rows) };
-    let intake_rows = if legacy_mimo { rows } else if options.prefill_waves == 1 {
+    let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
+    let intake_rows = if options.prefill_waves == 1 {
         ensure!(ranks == 0 || (1..=4096).contains(&unit_rows),
             "{family} Spark host admission needs prefill_unit_rows in 1..=4096, got {unit_rows}");
         unit_rows
@@ -1412,12 +1422,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         Some(transports) => transports,
         None => match family {
             "glm5" | "glm5_flash" => u64::from(ranks > 0),
-            "mimo_v2" => {
-                let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
-                let configured = (options.prefill_lanes > 0).then(|| options.prefill_lanes.to_string());
-                crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
-                    cfg.program_family()?, configured.as_deref())? as u64
-            }
+            "mimo_v2" => u64::from(ranks > 0),
             _ => 1,
         },
     };
@@ -1429,78 +1434,98 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         items.push(Item::new(category, group, format, bytes, basis)
             .with_lifetime(ItemLifetime::PostReadyReserve));
     };
-    if ranks > 0 {
-        let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
-            experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
-            topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
-            layers: u32::try_from(spec.layers.len())? };
-        let endpoints = spark_endpoints(family, lanes);
-        let bf16 = native || matches!(family, "glm5" | "qwen4");
-        let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
-            else { SparkIngress::Fp8K32 };
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
-        let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
-        let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
-            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-        let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
-            .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
-            .context("coordinator host rings overflow")?;
-        push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
-        let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
-            !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
-        let egress = if family == "deepseek_v4" {
-            let decode = options.workspace_manifest.as_deref().or_else(|| {
-                let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
-                path.is_file().then_some(path)
-            }).and_then(|path| std::fs::read(path).ok())
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
-            let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
-                .context("V4 decode egress geometry overflow")?.0 as u64;
-            (egress_request as u64).checked_mul(options.prefill_waves)
-                .and_then(|bytes| bytes.checked_add(decode_request))
-                .context("V4 registered egress overflow")?
-        } else {
-            (egress_request as u64).checked_mul(options.prefill_waves)
-                .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?
-        };
-        push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
-        // Host-mode intake is the upper bound; auto/GPU landing can use less.
-        let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
-            .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
-            .context("coordinator intake overflow")?;
-        push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
+    if family == "mimo_v2" {
+        let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
+        let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
+        let local_ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
+        let demands = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
+            usize::try_from(unit_rows)?, usize::try_from(options.prefill_waves)?, local_ranks,
+            pool, usize::try_from(options.context_tokens.max(1))?, ranks, options.mimo_expert_input,
+            crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
+            if options.full_prefill_logits { crate::families::mimo_v2::MimoPrefillOutput::AllRows }
+                else { crate::families::mimo_v2::MimoPrefillOutput::LastRow }, true,
+            usize::try_from(unit_rows.min(256))?, report.solver_placement.as_ref()
+                .and_then(|p| p.tp2).map_or(0, |tp2| tp2.layers))?;
+        for (name, bytes) in demands {
+            let category = if name.starts_with("mimo/transport/") { Category::Transport } else { Category::Staging };
+            push(category, &name, "pinned", bytes, Basis::Formula);
+        }
+    } else {
+        if ranks > 0 {
+            let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
+                experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
+                topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
+                layers: u32::try_from(spec.layers.len())? };
+            let endpoints = spark_endpoints(family, lanes);
+            let bf16 = native || matches!(family, "glm5" | "qwen4");
+            let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
+                else { SparkIngress::Fp8K32 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
+            let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
+            let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
+                .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
+                .context("coordinator host rings overflow")?;
+            push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
+            let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
+                !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
+            let egress = if family == "deepseek_v4" {
+                let decode = options.workspace_manifest.as_deref().or_else(|| {
+                    let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+                    path.is_file().then_some(path)
+                }).and_then(|path| std::fs::read(path).ok())
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
+                let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
+                    .context("V4 decode egress geometry overflow")?.0 as u64;
+                (egress_request as u64).checked_mul(options.prefill_waves)
+                    .and_then(|bytes| bytes.checked_add(decode_request))
+                    .context("V4 registered egress overflow")?
+            } else {
+                (egress_request as u64).checked_mul(options.prefill_waves)
+                    .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?
+            };
+            push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
+            // Host-mode intake is the upper bound; auto/GPU landing can use less.
+            let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+                .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
+                .context("coordinator intake overflow")?;
+            push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
+        }
+        let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
+        // GLM route staging lives in the exchange slots already charged above;
+        // standalone router_host storage is allocated only by diagnostics.
+        if family != "qwen4" && family != "glm5" {
+            let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
+                .context("host routing stride overflow")?).context("host routing workspace overflow")?;
+            push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
+        }
+        let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
+        if family == "qwen4" {
+            use crate::families::qwen4::{Qwen4Config, upload_shape, mtp_upload_shape, VERIFY_ROWS};
+            use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
+            let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
+            let pool = usize::try_from(report.memory_layout.as_ref().context("Qwen upload arena needs a KV layout")?.pool_tokens)?;
+            let pages = qwen_pool_pages(pool).context("Qwen host page tables overflow")?.max(QWEN_UNIT_PAGES);
+            let ple_ids = !cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len());
+            let units = if ranks > 0 && options.prefill_waves > 1 { usize::try_from(options.prefill_waves)? } else { 0 };
+            let mtp = cfg.mtp_layers > 0 && options.native_mtp_layers > 0;
+            let prefill = upload_shape(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES,
+                cfg.ple_rows(), cfg.layers, units, ranks > 0, mtp, ple_ids)?;
+            let decode = upload_shape(VERIFY_ROWS, true, pages, pages / QWEN_UNIT_PAGES,
+                cfg.ple_rows(), cfg.layers, 0, ranks > 0, mtp, ple_ids)?;
+            let separate_mtp = if units > 0 && mtp { mtp_upload_shape(usize::try_from(unit_rows)?,
+                pages, pages / QWEN_UNIT_PAGES, units)?.capacity_bytes()? } else { 0 };
+            staging = prefill.capacity_bytes()?.checked_add(decode.capacity_bytes()?).and_then(|n| n.checked_add(separate_mtp))
+                .and_then(|n| n.checked_mul(options.rtx_bytes.len())).context("Qwen retained uploads overflow")? as u64;
+        }
+        push(Category::Staging, "staging/tables-and-sync", "row metadata", staging,
+            if family == "qwen4" { Basis::Formula } else { Basis::Estimated });
+
     }
-    let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
-    // GLM route staging lives in the exchange slots already charged above;
-    // standalone router_host storage is allocated only by diagnostics.
-    if family != "qwen4" && family != "glm5" {
-        let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
-            .context("host routing stride overflow")?).context("host routing workspace overflow")?;
-        push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
-    }
-    let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
-        .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
-    if family == "qwen4" {
-        use crate::families::qwen4::{Qwen4Config, upload_shape, mtp_upload_shape, VERIFY_ROWS};
-        use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
-        let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
-        let pool = usize::try_from(report.memory_layout.as_ref().context("Qwen upload arena needs a KV layout")?.pool_tokens)?;
-        let pages = qwen_pool_pages(pool).context("Qwen host page tables overflow")?.max(QWEN_UNIT_PAGES);
-        let ple_ids = !cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len());
-        let units = if ranks > 0 && options.prefill_waves > 1 { usize::try_from(options.prefill_waves)? } else { 0 };
-        let mtp = cfg.mtp_layers > 0 && options.native_mtp_layers > 0;
-        let prefill = upload_shape(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES,
-            cfg.ple_rows(), cfg.layers, units, ranks > 0, mtp, ple_ids)?;
-        let decode = upload_shape(VERIFY_ROWS, true, pages, pages / QWEN_UNIT_PAGES,
-            cfg.ple_rows(), cfg.layers, 0, ranks > 0, mtp, ple_ids)?;
-        let separate_mtp = if units > 0 && mtp { mtp_upload_shape(usize::try_from(unit_rows)?,
-            pages, pages / QWEN_UNIT_PAGES, units)?.capacity_bytes()? } else { 0 };
-        staging = prefill.capacity_bytes()?.checked_add(decode.capacity_bytes()?).and_then(|n| n.checked_add(separate_mtp))
-            .and_then(|n| n.checked_mul(options.rtx_bytes.len())).context("Qwen retained uploads overflow")? as u64;
-    }
-    push(Category::Staging, "staging/tables-and-sync", "row metadata", staging,
-        if family == "qwen4" { Basis::Formula } else { Basis::Estimated });
+
     if family == "qwen4" {
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
         if cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len()) {

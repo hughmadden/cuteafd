@@ -205,9 +205,14 @@ impl<'a> PeerExchange<'a> {
         slots: usize,
         slot_bytes: usize,
     ) -> Result<Self> {
+        Self::new_sized(library, ranks, &vec![slot_bytes; slots])
+    }
+
+    fn new_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize]) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
+        let slots = sizes.len();
         ensure!(
-            ranks[0].device != ranks[1].device && slots > 0 && slot_bytes % 16 == 0,
+            ranks[0].device != ranks[1].device && slots > 0 && sizes.iter().all(|bytes| *bytes > 0 && bytes % 16 == 0),
             "a head split exchanges between two GPUs in 16-byte rows"
         );
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
@@ -229,8 +234,8 @@ impl<'a> PeerExchange<'a> {
                     Ok(allocation)
                 };
                 Ok(End {
-                    recv: (0..slots)
-                        .map(|_| zeroed(slot_bytes))
+                    recv: sizes.iter()
+                        .map(|&bytes| zeroed(bytes))
                         .collect::<Result<_>>()?,
                     control: zeroed((slots + 1) * 16)?,
                     progress: if diagnostics { Some(zeroed((slots + 1) * std::mem::size_of::<PeerProgress>())?) } else { None },
@@ -262,9 +267,14 @@ impl<'a> PeerExchange<'a> {
         slots: usize,
         slot_bytes: usize,
     ) -> Result<Self> {
+        Self::new_abortable_sized(library, ranks, &vec![slot_bytes; slots])
+    }
+
+    /// Receive extents are admitted per slot, including private decode slots.
+    pub fn new_abortable_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize]) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         library.peer_abort_available()?;
-        let mut exchange = Self::new(library, ranks, slots, slot_bytes)?;
+        let mut exchange = Self::new_sized(library, ranks, sizes)?;
         let side = |rank: usize| {
             on_device(library, ranks[rank].device, || {
                 let probe = |stage| crate::shared::inventory::startup_probe(
@@ -535,10 +545,9 @@ impl<'a> PeerExchange<'a> {
         source: *const c_void,
         bytes: usize,
     ) -> Result<()> {
-        ensure!(
-            bytes <= self.slot_bytes(),
-            "push of {bytes} bytes past the exchange slots"
-        );
+        let capacity = self.ends.get(1 - from).and_then(|end| end.recv.get(slot))
+            .context("peer receive slot")?.buffer.bytes;
+        ensure!(bytes <= capacity, "push of {bytes} bytes past the {capacity}-byte exchange slot");
         self.push_to(from, slot, source, self.recv(1 - from, slot)?, bytes)
     }
 
@@ -736,6 +745,44 @@ mod tests {
         assert!(panic.is_err());
         assert_eq!(library.cuda_get_device()?, 1);
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn heterogeneous_slots_keep_decode_and_prefill_extents_separate() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let ranks = [RankDevice { device: 0, stream: std::ptr::null_mut() },
+            RankDevice { device: 1, stream: std::ptr::null_mut() }];
+        let sizes = [256, 256, 1024, 1024, 1024];
+        let exchange = PeerExchange::new_sized(&library, ranks, &sizes)?;
+        for rank in 0..2 {
+            for (slot, &bytes) in sizes.iter().enumerate() {
+                assert_eq!(exchange.ends[rank].recv[slot].buffer.bytes, bytes);
+                for other in 0..sizes.len() {
+                    assert_eq!(exchange.recv(rank, slot)? == exchange.recv(rank, other)?, slot == other);
+                }
+            }
+        }
+        let source = DeviceAllocation::new(&library, 1024)?;
+        assert!(exchange.push(0, 0, source.buffer.ptr, 272).is_err());
+        assert!(exchange.push(0, sizes.len(), source.buffer.ptr, 16).is_err());
+        assert!(PeerExchange::new_sized(&library, ranks, &[0]).is_err());
+        assert!(PeerExchange::new_sized(&library, ranks, &[17]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sender_stream_wide_push_uses_p2p_d2d_entry_point() {
+        let source = include_str!("peer_split.rs");
+        let push = source.split("    pub fn push_to(").nth(1).unwrap()
+            .split("    /// Push strided planes").next().unwrap();
+        assert!(push.contains("self.on(from, || unsafe"));
+        assert!(push.contains("self.library.copy_d2d_async(buffer(destination, self.device(1 - from)),"));
+        assert!(!push.contains("copy_peer_async"));
+        assert!(push.contains("buffer(source.cast_mut(), self.device(from)), bytes, self.stream(from))?"));
+        assert!(push.find("copy_d2d_async").unwrap() < push.find("peer_push_signal(").unwrap());
     }
 
     #[test]

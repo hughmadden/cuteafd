@@ -77,6 +77,34 @@ int cuteafd_rdma_rc_endpoint_try_poll(void *handle, uint32_t sends,
 }
 
 int cuteafd_set_expert_hidden(uint32_t hidden) { (void)hidden; return 0; }
+int cuteafd_cuda_enable_peer(int peer) { (void)peer; return 0; }
+int cuteafd_tp2_native_initialize(void) { return 0; }
+int cuteafd_peer_exchange_initialize(void) { return 0; }
+
+
+/* Head fixture records the scratch selected by the real Rust handle binding. */
+struct fixture_head { void *workspace; int width, rows, vocab; };
+int cuteafd_vocabulary_head_create_vocab(void *workspace, uint64_t bytes,
+        int width, int rows, int vocab, void **out) {
+    if (!workspace || bytes < (4u << 20) || width <= 0 || rows <= 0 || vocab <= 0) return 1;
+    struct fixture_head *head = malloc(sizeof(*head));
+    if (!head) return 1;
+    *head = (struct fixture_head){workspace, width, rows, vocab};
+    *out = head;
+    return 0;
+}
+int cuteafd_vocabulary_head_launch_width(void *opaque, const uint16_t *input,
+        const uint16_t *weight, float *output, int rows, void *stream) {
+    (void)weight; (void)stream;
+    struct fixture_head *head = opaque;
+    if (!head || rows <= 0 || rows > head->rows) return 1;
+    /* Identity marker proves both the input and per-handle scratch window. */
+    ((uint16_t *)head->workspace)[0] = input[0];
+    output[0] = (float)input[0];
+    return 0;
+}
+int cuteafd_v41_markov_destroy(void *head) { free(head); return 0; }
+
 
 /* Static native expert ABI: CPU slot-ownership tests allocate real fake-device
  * buffers but never launch expert math. Each loaded module caches these words. */
