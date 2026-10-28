@@ -668,4 +668,39 @@ mod unit_exit_tests {
         assert!(finish.find("finish_decoder_source").unwrap() < finish.find("lane.release_scratch()").unwrap(),
             "2 RTX: the boundary must release the lane's scratch after its production (C2)");
     }
+
+    /// Review 1.1 (v41-final-deltas): remote layers always download their
+    /// routes to the router ring, and a router refuses a window change while
+    /// its ring is undrained. So every pass and unit settles its rings: 2 RTX
+    /// units drain at commit as 1 RTX units do, both distributed pass exits
+    /// drain a success and discard a failure (no success-only guard), the
+    /// units' Drop discards before it resets the windows, and the router's
+    /// discard lets its ring copies finish before the ring is reused.
+    #[test]
+    fn route_rings_settle_on_every_unit_and_pass_exit() {
+        fn body<'s>(source: &'s str, start: &str) -> &'s str {
+            let at = &source[source.find(start).unwrap_or_else(|| panic!("{start}"))..];
+            &at[..at.find("\n    }\n").unwrap()]
+        }
+        let one = include_str!("../v41_target_pass/encoder_units.rs");
+        let two = include_str!("../v41_target_pass/distributed/encoder_units.rs");
+        let commit = body(one, "async fn commit_unit(");
+        assert!(commit.find("drain_route_ring()").unwrap() < commit.find("commit_unit_inner").unwrap(), "1 RTX: {commit}");
+        let commit = body(two, "async fn commit_unit(");
+        assert!(commit.find("drain_route_rings()").is_some_and(|at| at < commit.find("commit_unit_inner").unwrap()),
+            "2 RTX units must drain their route rings before committing: {commit}");
+        let drop_impl = &two[two.find("impl Drop for UnitHooks").unwrap()..];
+        let drop_body = &drop_impl[..drop_impl.find("\n}\n").unwrap()];
+        assert!(drop_body.find("discard_route_rings()").is_some_and(|at| at < drop_body.find("RowWindow::NONE").unwrap()),
+            "2 RTX: a failed or cancelled unit's captures are dropped before the window reset: {drop_body}");
+        let pass = include_str!("../v41_target_pass/distributed.rs");
+        let execute = body(pass, "pub async unsafe fn execute(");
+        assert_eq!(execute.matches("self.settle_route_rings(result)").count(), 2, "{execute}");
+        assert!(!execute.contains("if result.is_ok() { self.drain_route_rings()"), "{execute}");
+        let settle = body(pass, "fn settle_route_rings(");
+        assert!(settle.contains("self.discard_route_rings()?"), "{settle}");
+        let router = include_str!("../v41_backbone_router.rs");
+        let discard = body(router, "pub fn discard_ring(");
+        assert!(discard.find("self.synchronize()?").unwrap() < discard.find("self.ring_pending.clear()").unwrap(), "{discard}");
+    }
 }
