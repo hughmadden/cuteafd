@@ -733,6 +733,8 @@ mod window_graph_tests {
         let result = (|| -> Result<Vec<Vec<u8>>> {
             let mut got = Vec::new();
             for (seed, offset) in [(1u8, 2 * rows as usize), (2, rows as usize)] {
+                // As the lane does before a window change: the previous output is consumed.
+                slot.discard_ready();
                 slot.select_window(crate::shared::memory::row_window::RowWindow::within(offset..offset + rows as usize,
                     4 * rows as usize)?)?;
                 library.copy_h2d(slot.input(), &input(seed))?;
