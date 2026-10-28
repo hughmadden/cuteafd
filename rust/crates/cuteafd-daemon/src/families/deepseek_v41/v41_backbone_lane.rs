@@ -247,7 +247,8 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let producer=lane.sparse.as_ref().map(|s|s.chain_stream());
             let weights=&lane.weights.layers[lane.layer].hc;
             let graphs=lane.tp2_ffn_graphs.as_mut().context("TP2 FFN graph owner absent")?;
-            let cached=graphs.bank.get_shape(lane.layer,weights,rows as u32);
+            let windowed=lane.window.is_windowed();
+            let cached=if windowed { None } else { graphs.bank.get_shape(lane.layer,weights,rows as u32) };
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {
@@ -258,7 +259,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
                         cached.map(|(raw,_)|raw), || lane.block.enqueue_ffn(binding,rows,projected,stream).map(|_| ()))?;
                     Ok((lane.block.graph_normalized_storage(rows),stream,projected))
                 }).await? };
-            if cached.is_none() && !crate::shared::decode_graph::census::eager("layer_row") {
+            if cached.is_none() && !windowed && !crate::shared::decode_graph::census::eager("layer_row") {
                 // Warm output is complete. Recording the next invocation restores
                 // host phase without executing the FFN prefix a second time.
                 unsafe {graphs.capture_ready(&mut lane.block,weights,binding,rows,projected,stream)?;}
@@ -676,6 +677,9 @@ impl<'a> LaneStorage<'a> {
 
 pub(crate) struct BackboneLane<'w, 'a> {
     tp2_ffn_graphs: Option<Tp2FfnGraphs<'w,'a>>,
+    /// The selected row window: windowed (shared-storage) units never replay
+    /// or capture the TP2 FFN graphs (row_window: capture uses rows from 0).
+    window: crate::shared::memory::row_window::RowWindow,
     // Destroy containing graphs before their captured consumer allocations.
     sparse: Option<SparseAttentionWave<'a>>,
     dual_sparse: Option<crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave<'a>>,
@@ -744,6 +748,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         let first = weights.layers.get(first_layer).context("lane weights are empty")?;
         Ok(Self {
             tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),
+            window: crate::shared::memory::row_window::RowWindow::NONE,
             weights,
             block: first.hc.block(capacity as usize, sizes[0])?,
             query: first.query.wave(capacity, sizes[1])?,
@@ -771,7 +776,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(weights.layers.len() == 40 && first.device.id == storage.device.id
             && std::ptr::eq(weights.library, storage.device.library), "lane weights/storage differ");
         Ok(Self {
-            tp2_ffn_graphs: None,
+            // Each slot owns its TP2 FFN graph owner (host-only), as the private lane does.
+            tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),
+            window: crate::shared::memory::row_window::RowWindow::NONE,
             weights,
             block: first.hc.block_on_storage(storage.hc[0].clone(), storage.hc[1].clone(), storage.unit as usize)?,
             query: first.query.on_storage(storage.query.clone())?, tp2_query: None, tp2_output: None,
@@ -803,7 +810,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if let Some(sparse) = &mut self.sparse { sparse.select_window(window.clone())?; }
         if let Some(sparse) = &mut self.dual_sparse { sparse.select_window(window.clone())?; }
         if let Some(projection) = &mut self.tp2_query { projection.select_window(window.clone())?; }
-        if let Some(projection) = &mut self.tp2_output { projection.select_window(window)?; }
+        if let Some(projection) = &mut self.tp2_output { projection.select_window(window.clone())?; }
+        self.window = window;
         Ok(())
     }
     pub(crate) fn release_scratch(&self) -> Result<()> {
@@ -1523,6 +1531,27 @@ impl BackboneLaneWeights<'_> {
             if let Some(shared) = &w.shared { shared.visit(&p("shared"), f); }
             w.router.visit(&p("router"), f);
         }
+    }
+}
+
+#[cfg(test)]
+mod split_output_tests {
+    /// Every lane constructor that can later take an output split (private
+    /// `new_inner` and shared-storage `on_storage`) owns its TP2 FFN graph
+    /// owner when the weights split output_b; `complete` refuses without it
+    /// (Astra review of 15b4ad52a: on_storage set None, so any
+    /// --tp2-output-projection serve failed on its first prefill unit).
+    #[test]
+    fn every_lane_constructor_owns_the_tp2_ffn_graph_owner_for_split_output() {
+        let source = include_str!("v41_backbone_lane.rs");
+        let owner = "tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),";
+        for constructor in ["fn new_inner(", "pub(crate) fn on_storage("] {
+            let start = source.find(constructor).unwrap();
+            let body = &source[start..start + source[start..].find("\n    }\n").unwrap()];
+            assert!(body.contains(owner), "{constructor} lacks the TP2 FFN graph owner");
+        }
+        let dropped = ["tp2_ffn_graphs", ": None"].concat();
+        assert_eq!(source.matches(dropped.as_str()).count(), 0, "a lane constructor drops the graph owner");
     }
 }
 

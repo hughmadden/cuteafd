@@ -11,6 +11,8 @@ use cuteafd_ffi::{
 use cuteafd_loader::OfficialV41Catalog;
 use std::marker::PhantomData;
 const ROW_BYTES: [usize; 5] = [65536, 16384, 10240, 8, 256];
+#[cfg(test)]
+thread_local! { static IGNORE_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub(crate) struct AttentionOutputWeights<'a> {
     library: &'a NativeLibrary,
     layer: usize,
@@ -259,6 +261,30 @@ impl AttentionOutputWave<'_, '_> {
     pub fn device_bytes_with_split(library:&NativeLibrary,capacity:u32,split_output_b:bool)->Result<usize> {
         AttentionOutputStorage::storage_bytes(library, capacity, capacity, split_output_b)
     }
+    /// Graphs bake in row-plane addresses (row_window: capture uses rows from
+    /// 0), so a selected prefill window always executes eagerly.
+    fn graphed(&self, rows: u32) -> bool {
+        #[cfg(test)]
+        if IGNORE_WINDOW.with(|ignore| ignore.get()) { return super::graph_policy::captures_shape(rows); }
+        !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+    }
+    /// `execute_attention`'s graph decision over inputs already in `input()`
+    /// and `positions()` (the window test drives exactly that branch).
+    #[cfg(test)]
+    unsafe fn run_unit(&mut self, rows: u32) -> Result<AttentionOutput<'_>> {
+        if self.graphed(rows) {
+            if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
+                unsafe { self.capture_ready_on(rows, self.storage.stream.raw)?; }
+            }
+            let (graph, _) = self.graphs.get_shape(self.weights.layer, self.weights, rows).context("graph missing")?;
+            unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw)?; }
+            self.synchronize()?;
+            self.ready = Some(rows);
+            self.output()
+        } else {
+            unsafe { self.execute(rows) }
+        }
+    }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         self.window.apply(self.storage.buffers[i].buffer, ROW_BYTES[i])
     }
@@ -351,6 +377,7 @@ impl AttentionOutputWave<'_, '_> {
     /// # Safety
     /// Same inputs as execute. Warmup is drained but not published after capture.
     pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
+        ensure!(!self.window.is_windowed(), "attention output graphs never capture a row window");
         self.ready = None;
         self.origin = None;
         ensure!(
@@ -397,6 +424,7 @@ impl AttentionOutputWave<'_, '_> {
     /// # Safety
     /// Same matching initialized inputs as execute. Captured live row count is fixed.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<AttentionOutput<'_>> {
+        ensure!(!self.window.is_windowed(), "attention output graphs never replay into a row window");
         self.validate(rows)?;
         let (graph, count) = self
             .graphs
@@ -441,7 +469,7 @@ impl AttentionOutputWave<'_, '_> {
                 )?;
             }
             let rows = attention.rows as u32;
-            if super::graph_policy::captures_shape(rows) {
+            if self.graphed(rows) {
                 if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
                     unsafe { self.capture(rows)?; }
                 }
@@ -485,7 +513,7 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
-        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row") {
+        if !self.graphed(rows) || crate::shared::decode_graph::census::eager("layer_row") {
             let library = self.storage.stream.library;
             unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 None, || self.enqueue_on(rows, stream))?; }
@@ -529,6 +557,12 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
+        if self.window.is_windowed() {
+            // A windowed (shared-storage) unit: no captured addresses, eager.
+            unsafe { self.enqueue_on(rows, stream)?; }
+            let mut output = self.b(2); output.bytes = attention.rows * ROW_BYTES[2];
+            return Ok(Some(output));
+        }
         if crate::shared::decode_graph::census::enabled() && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_some() {
             let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows).map(|(raw, _)| raw);
             let library = self.storage.stream.library;
@@ -555,6 +589,7 @@ impl AttentionOutputWave<'_, '_> {
         unsafe { self.capture_ready_on(rows, stream)?; self.replay_prepared(rows, stream) }
     }
     unsafe fn replay_prepared(&self, rows: u32, stream: *mut std::ffi::c_void) -> Result<CuteafdDeviceBuffer> {
+        ensure!(!self.window.is_windowed(), "attention output graphs never replay into a row window");
         let (graph, count) = self.graphs.get_shape(self.weights.layer, self.weights, rows)
             .context("prepared output graph missing")?;
         ensure!(count == rows, "prepared output graph shape differs");
@@ -662,6 +697,67 @@ impl Drop for AttentionOutputWave<'_, '_> {
             crate::shared::decode_graph::fatal_drain(Err(error), "attention output");
         }
     }
+}
+
+#[cfg(test)]
+mod window_graph_tests {
+    use super::*;
+    /// Two equal-row units at two window offsets on one shared-storage slot
+    /// each equal a private eager run of the same input. With the window gate
+    /// removed (negative control) the second unit replays the first unit's
+    /// captured graph, which reads and writes the first window's rows.
+    fn run(gated: bool) -> Result<()> {
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let layer = 2;
+        let weights = AttentionOutputWeights::load(&library, &catalog, layer,
+            AttentionOutputWeights::device_bytes(&library, &catalog, layer)?, 1 << 20)?;
+        let rows = 16u32;
+        let input = |seed: u8| -> Vec<u8> { (0..rows as usize * 32768).flat_map(|i| {
+            let v = ((i * 37 + seed as usize * 101) % 61) as u16; (0x3c00u16 ^ (v << 3)).to_ne_bytes() }).collect() };
+        let positions: Vec<u8> = (0..rows as u64).flat_map(|p| (p * 3 + 100).to_ne_bytes()).collect();
+        let mut private = weights.wave(rows, usize::MAX)?;
+        let mut expect = Vec::new();
+        for seed in [1u8, 2] {
+            library.copy_h2d(private.input(), &input(seed))?;
+            library.copy_h2d(private.positions(), &positions)?;
+            let out = unsafe { private.execute(rows)? };
+            let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h(&mut bytes, out.projected)?;
+            expect.push(bytes);
+        }
+        assert_ne!(expect[0], expect[1], "distinct inputs must project differently");
+        let storage = weights.storage(4 * rows, rows)?;
+        let mut slot = weights.on_storage(storage)?;
+        IGNORE_WINDOW.with(|ignore| ignore.set(!gated));
+        let result = (|| -> Result<Vec<Vec<u8>>> {
+            let mut got = Vec::new();
+            for (seed, offset) in [(1u8, 2 * rows as usize), (2, rows as usize)] {
+                slot.select_window(crate::shared::memory::row_window::RowWindow::within(offset..offset + rows as usize,
+                    4 * rows as usize)?)?;
+                library.copy_h2d(slot.input(), &input(seed))?;
+                library.copy_h2d(slot.positions(), &positions)?;
+                let out = unsafe { slot.run_unit(rows)? };
+                let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h(&mut bytes, out.projected)?;
+                got.push(bytes);
+            }
+            Ok(got)
+        })();
+        IGNORE_WINDOW.with(|ignore| ignore.set(false));
+        let got = result?;
+        eprintln!("attention output window graphs gated={gated}: unit A exact={} unit B exact={}",
+            got[0] == expect[0], got[1] == expect[1]);
+        assert_eq!(got[0], expect[0], "first windowed unit differs from its private run");
+        if gated { assert_eq!(got[1], expect[1], "second windowed unit differs from its private run"); }
+        else { assert_ne!(got[1], expect[1], "ungated replay at a moved window did not go stale"); }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a CUDA GPU"]
+    fn windowed_units_never_replay_a_graph_captured_at_another_offset() -> Result<()> { for _ in 0..3 { run(true)?; } Ok(()) }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a CUDA GPU"]
+    fn without_the_window_gate_a_moved_window_replays_stale_rows() -> Result<()> { for _ in 0..3 { run(false)?; } Ok(()) }
 }
 
 #[cfg(test)]
