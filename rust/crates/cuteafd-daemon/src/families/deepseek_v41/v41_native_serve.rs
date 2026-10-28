@@ -841,8 +841,10 @@ pub(crate) fn calibrate_prefill_depth<'w, 'a: 'w, P: scheduler::layout::ServingT
             prefill::<P, P::Chain>(lib, runtime, requests, prefill_slots, None, lease, tokens, shape, &job, None,
                 &mut || Ok(())).map(|_| ())
         })();
-        requests.release(lease)?;
-        ran
+        // A failed call's units may already have revoked the request: its
+        // error is the one to report, never the release's.
+        let released = if requests.cache().request_id(lease).is_ok() { requests.release(lease) } else { Ok(()) };
+        ran.and(released)
     })
 }
 
