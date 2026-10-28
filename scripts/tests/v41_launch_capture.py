@@ -120,9 +120,12 @@ if tool == "docker":
             ranks = args[args.index("--spark-ranks") + 1]
         rows = args[args.index("--prefill-rows") + 1] if "--prefill-rows" in args else "0"
         family = os.environ.get("CAPTURE_FAMILY", "deepseek_v41")
-        default_rows = 4096 if family == "qwen4" else 2048
+        # The planner's fixed depth: three units of the reserve with Sparks.
+        waves = 3 if int(ranks) else 1
+        default_rows = 2752 if waves == 3 else 4096
         response = {"spark_ranks": int(ranks), "prefill_unit_rows": int(rows) or default_rows,
-                    "prefill_waves": 1, "prefill_span_rows": int(rows) or default_rows, "prefill_reserve_rows": 8192,
+                    "prefill_waves": waves, "prefill_span_rows": (int(rows) or default_rows) * waves,
+                    "prefill_reserve_rows": 8192,
                     "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
                     "encoder_plan_hash": "ab" * 32, "placement_supported": True, "fits": True}
         if "--deployment" in args:
@@ -137,11 +140,9 @@ if tool == "docker":
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
             if family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mimo_v2"}:
-                # Mirror the shared topology policy, including the declared PLE/FP8 holds.
-                waves = int(value("--prefill-waves", "0")) or (1 if int(ranks) == 0 else 2 if int(ranks) < 6 else 3)
-                native_glm = family in {"glm5", "glm5_flash"} and os.environ.get("CAPTURE_EXL3") != "1"
-                if "--prefill-waves" not in args and (family in {"qwen4", "step5"} or native_glm):
-                    waves = min(waves, 2)
+                # Mirror the planner (prefill_waves::depth): a fixed three units
+                # of the reserve with Sparks, one without (TJ 2026-10-28).
+                waves = int(value("--prefill-waves", "0")) or (1 if int(ranks) == 0 else 3)
                 if family == "mimo_v2":
                     waves = 3
                 unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]

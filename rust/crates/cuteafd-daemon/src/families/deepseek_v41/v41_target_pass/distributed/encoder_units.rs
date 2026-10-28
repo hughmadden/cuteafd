@@ -142,9 +142,15 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
         // Device-ordered units leave queued work (and cross-slot waits) on
         // every slot's chain: drain them all before any storage is released.
-        for slot in &self.slots {
+        for slot in &mut self.slots {
             if slot.pass.chain.is_some() {
                 crate::shared::decode_graph::fatal_drain(slot.pass.drain_chain(), "cancelled prefill unit chain");
+            }
+            // A completed prompt drained every unit's ring at its commit; a
+            // failed or cancelled unit's captures are dropped, so the window
+            // reset below finds every router at rest.
+            if let Err(error) = slot.pass.discard_route_rings() {
+                tracing::error!(%error, "discarding a cancelled prefill unit's route captures");
             }
         }
         // A failed or cancelled prefill revokes the whole request (its later
@@ -357,9 +363,13 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         // commit is host bookkeeping. Without a device order (host-ordered peer
         // transfers) the unit's work is drained first, as before.
         crate::shared::spark_waves::healthy()?;
-        if self.slots[unit.slot].pass.chain.is_some() && unit_chain(self.slots[unit.slot].pass)?.is_none() {
-            self.slots[unit.slot].pass.drain_chain()?;
+        let pass = &mut *self.slots[unit.slot].pass;
+        // As on one RTX: a unit captured with routes drains before its ring
+        // is read, and the ring is drained before the unit commits.
+        if pass.chain.is_some() && (pass.resources.capture_routes || unit_chain(pass)?.is_none()) {
+            pass.drain_chain()?;
         }
+        pass.drain_route_rings()?;
         self.commit_unit_inner(unit).await
     }
 }

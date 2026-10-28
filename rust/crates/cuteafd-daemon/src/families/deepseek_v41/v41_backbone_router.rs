@@ -472,6 +472,15 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     pub fn ring_capture(&self) -> bool {
         self.ring_capture && (self.full_request || crate::shared::memory::chain::deferred())
     }
+    /// After a failed or cancelled pass: its ring copies complete (the pinned
+    /// ring is reused) and its captures are dropped, so the router can move
+    /// to another window; a failed pass's routes describe nothing.
+    pub fn discard_ring(&mut self) -> Result<()> {
+        if self.ring_pending.is_empty() { return Ok(()); }
+        self.synchronize()?;
+        self.ring_pending.clear();
+        Ok(())
+    }
     /// After the pass drained: every ring-captured layer's routes into `output[layer]`.
     pub fn drain_ring(&mut self, output: &mut [Vec<[u32; 6]>]) -> Result<Vec<usize>> {
         self.synchronize()?;

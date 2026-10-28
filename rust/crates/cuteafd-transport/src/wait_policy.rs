@@ -118,13 +118,38 @@ pub fn spin_window<E>(mut ready: impl FnMut() -> Result<bool, E>) -> Result<bool
 /// them instead of sleeping past every completion once its first 10 ms passed.
 pub struct Backoff { block: bool, started: Option<Instant>, active: u64 }
 
+thread_local! {
+    /// Pacers polling on this thread right now ([`Paced`]).
+    static PACED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While alive, an outer pacer owns this thread's waits: it polls a future
+/// whose inner waits yield back to it, and sleeps once per pending poll
+/// itself. An inner [`Backoff`] then only spins, so a pending poll pays one
+/// [`BLOCK_SLEEP`], not one per nested backoff.
+pub struct Paced(());
+
+impl Paced {
+    pub fn enter() -> Self {
+        PACED.with(|depth| depth.set(depth.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for Paced {
+    fn drop(&mut self) { PACED.with(|depth| depth.set(depth.get() - 1)); }
+}
+
+fn paced_here() -> bool { PACED.with(|depth| depth.get() > 0) }
+
 impl Backoff {
     pub fn new() -> Self {
         Self { block: wait_policy().wait == HostWait::Block, started: None, active: 0 }
     }
-    /// One pass of the wait: spin, or sleep once the spin budget is spent.
+    /// One pass of the wait: spin, or sleep once the spin budget is spent
+    /// (unless an outer pacer sleeps for this poll, [`Paced`]).
     pub fn pause(&mut self) {
-        if self.sleeps() { std::thread::sleep(BLOCK_SLEEP) } else { std::hint::spin_loop() }
+        if self.sleeps() && !paced_here() { std::thread::sleep(BLOCK_SLEEP) } else { std::hint::spin_loop() }
     }
     /// Whether this pass sleeps (block mode, past [`BLOCK_SPIN`] since the
     /// first pause after the last progress).
@@ -152,15 +177,6 @@ static LAST_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// Records that a request is active now (admission, every step, every wave).
 pub fn note_active() { LAST_ACTIVE.store(now_ns().max(1), Ordering::Relaxed); }
-
-/// How long no request has been active (the whole process lifetime if none was).
-pub fn idle_for() -> Duration {
-    let now = now_ns();
-    Duration::from_nanos(now.saturating_sub(LAST_ACTIVE.load(Ordering::Relaxed)))
-}
-
-/// Whether the engine has been idle long enough for polling threads to park.
-pub fn parked() -> bool { idle_for() >= wait_policy().idle_park }
 
 #[cfg(test)]
 mod tests {
@@ -262,11 +278,44 @@ mod tests {
     }
 
     #[test]
-    fn activity_resets_the_idle_clock() {
+    fn activity_moves_the_clock_backoffs_read() {
+        let before = LAST_ACTIVE.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_micros(10));
         note_active();
-        assert!(idle_for() < Duration::from_secs(1));
-        assert!(!parked(), "just active: not parked under the default 30 s");
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(idle_for() >= Duration::from_millis(5));
+        assert!(LAST_ACTIVE.load(Ordering::Relaxed) > before);
+    }
+
+    /// A wait nested in a pacer (an Engram or reply wait inside the lane
+    /// loop's `paced`) yields its pending poll back to the pacer, which sleeps
+    /// once; past its own budget the inner backoff only spins. Outside any
+    /// pacer (prefill's plain `block_on`) it still sleeps.
+    #[test]
+    fn a_wait_inside_a_pacer_leaves_the_sleep_to_it() {
+        let past_budget = || Backoff { block: true, started: Instant::now().checked_sub(BLOCK_SPIN),
+            active: LAST_ACTIVE.load(Ordering::Relaxed) };
+        let fast = |backoff: &mut Backoff| {
+            // Another test may record activity concurrently (the inner then
+            // spins anyway); only time the passes where it did not.
+            let started = Instant::now();
+            for _ in 0..50 { backoff.started = Instant::now().checked_sub(BLOCK_SPIN); backoff.pause(); }
+            started.elapsed()
+        };
+        {
+            let _outer = Paced::enter();
+            let mut inner = past_budget();
+            assert!(fast(&mut inner) < BLOCK_SLEEP * 50, "a paced inner wait never sleeps");
+            {
+                let _nested = Paced::enter();
+                assert!(paced_here());
+            }
+            assert!(paced_here(), "leaving a nested pacer keeps the outer one");
+        }
+        assert!(!paced_here());
+        let mut alone = past_budget();
+        let before = LAST_ACTIVE.load(Ordering::Relaxed);
+        let slept = fast(&mut alone);
+        if LAST_ACTIVE.load(Ordering::Relaxed) == before {
+            assert!(slept >= BLOCK_SLEEP * 50, "outside a pacer the wait sleeps");
+        }
     }
 }

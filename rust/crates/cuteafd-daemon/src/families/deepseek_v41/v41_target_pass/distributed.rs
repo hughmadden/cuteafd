@@ -414,8 +414,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             // A failed Spark wire released its waits over garbage planes.
             let result = result.and_then(|()| crate::shared::spark_waves::healthy());
             // Remote layers left their captured routes in the routers' rings.
-            if result.is_ok() { self.drain_route_rings()?; }
-            return result;
+            return self.settle_route_rings(result);
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
@@ -431,15 +430,31 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         let ring_timed = timed.map(|_| Instant::now());
         // Remote and device-ordered local layers left their routes in the routers' rings.
-        if result.is_ok() { self.drain_route_rings()?; }
+        let result = self.settle_route_rings(result);
         if let Some(t) = ring_timed {
             tracing::debug!(target: "cuteafd::timing", route_ring_us=t.elapsed().as_micros() as u64,
                 "distributed route ring drain");
         }
         result
     }
+    /// After a pass: a successful one's ring captures into the history; a
+    /// failed one's dropped, so no router is left with an undrained ring (its
+    /// next window change would refuse). Returns the pass's result first.
+    pub(super) fn settle_route_rings(&mut self, result: Result<()>) -> Result<()> {
+        if result.is_ok() { return self.drain_route_rings(); }
+        self.discard_route_rings()?;
+        result
+    }
+    /// Every lane's undrained ring captures dropped (failed or cancelled work).
+    pub(super) fn discard_route_rings(&mut self) -> Result<()> {
+        for lane in &mut self.resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().discard_route_ring())?;
+        }
+        Ok(())
+    }
     /// After a drained pass: every ring-captured layer's routes into the capture.
-    fn drain_route_rings(&mut self) -> Result<()> {
+    pub(super) fn drain_route_rings(&mut self) -> Result<()> {
         if !self.resources.capture_routes { return Ok(()); }
         for gpu in 0..self.resources.lanes.len() {
             let device = self.resources.lanes[gpu].device;

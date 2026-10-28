@@ -73,8 +73,6 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
             if entry["family"] == "mimo_v2":
-                # The prefill-lanes environment knob is gone: the family default stands.
-                before["env"].pop("CUTEAFD_MIMO_PREFILL_LANES", None)
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
@@ -83,13 +81,14 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 position = before["command"].index("--prefill-waves") + 2
                 before["command"][position:position] = ["--prefill-span-rows", "16384"]
             ranks = int(selected["set"]["SPARK_COUNT"])
+            # The planner's fixed depth (TJ 2026-10-28): three units of the
+            # reserve with Sparks, one 4096-row unit without.
+            waves = 3 if ranks else 1
+            unit = 2752 if waves == 3 else 4096
             if entry["family"] == "qwen4":
-                # Local stays one wave; remote PLE admits at most two waves.
                 position = before["command"].index("--console-secret-file")
-                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "1" if ranks == 0 else "2"]
+                before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves)]
             if entry["family"] == "glm5":
-                waves = 3 if ranks >= 6 and "nvfp4" not in entry["name"] else 2
-                unit = 2752 if waves == 3 else 4096
                 for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves),
                                     ("--prefill-span-rows", unit * waves)]:
                     before["command"][before["command"].index(flag) + 1] = str(value)
@@ -97,15 +96,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 # V4 forwards the planner's resolved unit and wave defaults.
                 anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
                 position = before["command"].index(anchor) + 2
-                waves = 3 if ranks >= 6 else 2
-                before["command"][position:position] = ["--prefill-rows", "2752" if waves == 3 else "4096", "--prefill-waves", str(waves)]
+                before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves)]
             if entry["family"] == "glm5_flash":
-                # Remote cards keep 2x4096; local EXL3 uses 1x4096. Both now
-                # reserve exactly the live rows instead of the old 16384 span.
-                waves = "1" if selected["set"]["SPARK_COUNT"] == "0" else "2"
+                # The span is exactly the live rows (no old 16384 span).
                 position = before["command"].index("--console-secret-file")
-                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", waves,
-                    "--prefill-span-rows", "4096" if waves == "1" else "8192"]
+                before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves),
+                    "--prefill-span-rows", str(unit * waves)]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
@@ -119,12 +115,15 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             before["command"][position:position] = ["--mapped-scale-preload-gib", "0"]
             command = after["command"]
             waves = command[command.index("--prefill-waves") + 1]
-            assert waves in ("1", "2"), (entry["name"], waves)
+            assert waves == ("3" if int(selected["set"]["SPARK_COUNT"]) else "1"), (entry["name"], waves)
             anchor = "--decode-lanes" if "--decode-lanes" in before["command"] else "--mapped-scale-preload-gib"
             position = before["command"].index(anchor) + 2
             # The reserve the units cut.
             reserve = command[command.index("--prefill-reserve-rows") + 1]
             before["command"][position:position] = ["--prefill-waves", waves, "--prefill-reserve-rows", reserve]
+            # Serve's unit is the planner's: a third of the reserve with Sparks.
+            if waves == "3":
+                before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"
 
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
@@ -193,7 +192,7 @@ def test_exlr8_forwards_checkpoint_native_selection(manifest: str) -> None:
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
             assert "--exlr8-dense-from" not in command
-            assert command[command.index("--prefill-waves") + 1] == "2"
+            assert command[command.index("--prefill-waves") + 1] == "3"
             assert "CUTEAFD_GLM_PREFILL_LANES" not in parsed["env"]
         else:
             assert "expertd-native" in command

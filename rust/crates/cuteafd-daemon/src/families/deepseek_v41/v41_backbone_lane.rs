@@ -1291,6 +1291,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if !self.capture_routes { return Ok(Vec::new()); }
         self.router.drain_ring(&mut self.route_capture)
     }
+    /// After a failed or cancelled pass: drops its ring captures (see
+    /// `BackboneRouterWave::discard_ring`).
+    pub fn discard_route_ring(&mut self) -> Result<()> { self.router.discard_ring() }
     /// Host FFN stage split of the last captured pass on this lane.
     pub fn captured_ffn_split(&self) -> FfnSplit { self.ffn_split }
     /// Opt-in TP2 attention or projection owners, whose peer transfers are

@@ -1682,9 +1682,10 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn reset_connections(&mut self) -> Result<()> {
         if let Some(exchange) = self.exchange.take() {
             // A failed exchange already abandoned its waves; a cancelled one
-            // still holds the engine's unlanded tickets, which are dropped.
-            // Either way the worker hands its transport back (#784).
-            let (transport, frames, result) = exchange.close::<SparkExperts>()?;
+            // gives up the engine's unlanded waves without a failure (the
+            // process stays healthy) and releases their waits. Either way the
+            // worker hands its transport back (#784).
+            let (transport, frames, result) = exchange.cancel::<SparkExperts>()?;
             self.intake.keep_frames(frames)?;
             self.transport = Some(transport);
             if let Err(error) = result {
