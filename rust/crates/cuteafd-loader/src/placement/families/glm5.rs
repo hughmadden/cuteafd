@@ -202,6 +202,7 @@ pub fn step_shared(lead: bool, native_head: bool, scratch: GlmScratch) -> u64 {
 
 /// Device bytes beside a step's pool-dependent page table. Every allocation
 /// has the engine's 256-byte floor; pinned router staging is not GPU storage.
+/// Peer local-router rows are a separate `local_extra_workspace` backend delta.
 pub fn step_bytes(cfg: &GlmDsaConfig, rows: u64, lead: bool, split: bool,
     decode: bool, full_logits: bool, native_head: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
     step_rows(cfg, rows, lead, split, false, logits_rows(rows, decode, full_logits))?
@@ -1228,13 +1229,56 @@ mod tests {
             let logits = if lead { DECODE_ROWS * cfg.vocab_size as u64 * 4 } else { FLOOR };
             let runtime = arenas + logits + span * 8 + step_shared(lead, native_head, scratch);
             assert_eq!(prefill_bytes(&cfg, unit, slots, lead, true, router, false, native_head, scratch).unwrap(), runtime);
-            // The former per-slot workspaces charged the shared storage every slot.
-            let per_slot = slots * step_bytes(&cfg, unit, lead, true, false, false, native_head, scratch).unwrap();
-            assert!(runtime + (slots - 1) * (scratch.programs + scratch.topk) <= per_slot, "lead {lead}");
+            // Compare identical router ownership; step_bytes excludes the local-backend delta.
+            let per_slot = slots * (step_rows(&cfg, unit, lead, true, router,
+                logits_rows(unit, false, false)).unwrap() + step_shared(lead, native_head, scratch));
+            assert!(runtime + (slots - 1) * (scratch.programs + scratch.topk) <= per_slot,
+                "lead {lead}, router {router}, native head {native_head}");
         }
         assert_eq!(prefill_span(4096, 2), 8192);
         assert_eq!(prefill_span(4096, 1), 4096);
         assert_eq!(slot_views(4096, 1), vec![0..4096]);
+    }
+
+    #[test]
+    fn local_router_rows_are_charged_once_beside_the_base_steps() {
+        let cfg = config();
+        for unit in [1, 63, 64, 2752, 4096] {
+            for slots in 1..=4 {
+                for native_head in [false, true] {
+                    for exchange_f32 in [false, true] {
+                        let mut input = inputs(&cfg, &[96 * GIB; 2]);
+                        input.prefill_rows = unit;
+                        input.prefill_lanes = slots;
+                        input.native_head = native_head;
+                        input.onboard = Onboard::Layers(1);
+                        let local = LocalInventory { package: Default::default(), format: GlmLocalFormat::Exl3,
+                            experts: input.experts.clone(), backend_workspace: 17 << 20,
+                            extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64,
+                                cfg.topk as u64, unit, slots, exchange_f32) };
+                        input.tp2_workspace = local.workspace();
+                        let selected = request(&input).unwrap();
+                        assert_eq!(selected.tp2_workspace, local.workspace());
+                        let base_steps = selected.fixed.iter()
+                            .find(|row| row.gpu == 1 && row.group == "steps").unwrap().bytes;
+                        let [decode, prefill] = input.scratch.unwrap();
+                        let runtime = step_rows(&cfg, DECODE_ROWS, false, true, true, DECODE_ROWS).unwrap()
+                            + step_shared(false, native_head, decode)
+                            + prefill_bytes(&cfg, unit, slots, false, true, true, false, native_head, prefill).unwrap();
+                        // Payload, route exchange and backend scratch are symmetric across ranks.
+                        let peer_router = selected.tp2_workspace[1] - selected.tp2_workspace[0];
+                        assert!(peer_router > 0);
+                        assert_eq!(base_steps + peer_router, runtime,
+                            "unit {unit}, slots {slots}, native head {native_head}, F32 {exchange_f32}");
+                        input.onboard = Onboard::Layers(0);
+                        let remote = request(&input).unwrap();
+                        assert_eq!(remote.tp2_workspace, [0; 2]);
+                        assert_eq!(remote.fixed.iter()
+                            .find(|row| row.gpu == 1 && row.group == "steps").unwrap().bytes, base_steps);
+                    }
+                }
+            }
+        }
     }
 
     /// The engine builds its prefill arenas from the planner's field list and
