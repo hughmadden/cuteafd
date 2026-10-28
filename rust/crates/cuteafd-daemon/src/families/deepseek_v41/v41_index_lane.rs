@@ -136,7 +136,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
     }
     /// Select at rest, after the previous unit and all its readers have drained.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
-        ensure!(!self.invalid && self.ready.is_none(), "index lane window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.invalid || self.ready.is_some(), "index lane", "a restart is incomplete or an output unconsumed")?;
         self.query.select_window(window.clone())?;
         self.source.select_window(window.clone())?;
         if let Some(reindex) = &mut self.reindex { reindex.select_window(window)?; }

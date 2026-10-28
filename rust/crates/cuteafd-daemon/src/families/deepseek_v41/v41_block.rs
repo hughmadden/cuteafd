@@ -166,7 +166,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// Selects this slot's unit rows in both boundaries' shared planes
     /// (`shared::memory::row_window`), at rest.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(matches!(self.phase, Phase::Idle), "block window changes only at rest");
+        crate::shared::memory::row_window::require_rest(!matches!(self.phase, Phase::Idle), "mHC block", "a layer is in progress")?;
         self.attention.select_window(window.clone())?;
         self.ffn.select_window(window)
     }

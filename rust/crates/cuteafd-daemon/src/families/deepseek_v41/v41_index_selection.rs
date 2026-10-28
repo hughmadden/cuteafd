@@ -296,7 +296,7 @@ impl<'a> IndexSelectionWave<'a> {
         unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
     }
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
-        ensure!(!self.in_flight && self.ready.is_none(), "selection window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.in_flight || self.ready.is_some(), "index selection", "a selection is in flight or unconsumed")?;
         if let Some(range) = window.range() {
             ensure!(range.start < range.end && range.end <= self.storage.rows
                 && range.len() <= self.capacity, "selection window outside reserve or unit");

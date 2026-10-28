@@ -98,7 +98,7 @@ impl<'a> DualAttentionWave<'a> {
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(self.pending.is_none(), "dual attention window changes while pending");
+        crate::shared::memory::row_window::require_rest(self.pending.is_some(), "dual attention", "work is pending")?;
         for half in &mut self.halves { half.select_window(window.clone())?; }
         self.window = window; Ok(())
     }

@@ -446,7 +446,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
 
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
-        ensure!(self.ring_pending.is_empty(), "router window changes before route-ring drain");
+        crate::shared::memory::row_window::require_rest(!self.ring_pending.is_empty(), "router", "its route ring is undrained")?;
         if let Some(range) = window.range() {
             ensure!(range.start < range.end && range.end <= self.storage.rows as usize
                 && range.len() <= self.capacity as usize, "router window outside storage/unit");

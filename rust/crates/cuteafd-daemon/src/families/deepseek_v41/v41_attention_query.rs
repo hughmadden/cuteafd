@@ -282,6 +282,8 @@ impl AttentionQueryWave<'_, '_> {
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         self.storage.buffers[i].as_ref().expect("query buffer is allocated").buffer
     }
+    /// Drops a finished output (the slot is at rest: its readers drained).
+    pub(crate) fn discard_ready(&mut self) { self.ready = None; }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
         if let Some(range) = window.range() {
             ensure!(range.start < range.end && range.len() <= self.capacity as usize, "query window exceeds unit");

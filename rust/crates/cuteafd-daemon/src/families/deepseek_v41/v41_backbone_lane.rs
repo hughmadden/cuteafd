@@ -788,7 +788,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(weights.placement.is_some(), "GPU-owned shared lane requires placed weights");
         storage.device.own(|| Self::on_storage(weights, storage.clone()))
     }
+    /// Selects a prefill slot's rows, at rest: the previous unit committed
+    /// and its chain drained, so its finished outputs (the block's last
+    /// layer, the query/output readiness) are dropped as `invalidate` does;
+    /// the next use restarts the lane. Pending work still refuses.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        self.invalidate();
+        self.query.discard_ready();
+        self.projection.discard_ready();
         self.block.select_window(window.clone())?;
         self.query.select_window(window.clone())?; self.projection.select_window(window.clone())?;
         self.router.select_window(window.clone())?;

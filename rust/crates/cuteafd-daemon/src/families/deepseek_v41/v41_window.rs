@@ -556,8 +556,8 @@ impl WindowWave<'_, '_> {
     /// Selects this slot's unit rows in the storage's planes, at rest
     /// (`shared::memory::row_window`). Windowed production runs eagerly.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
-        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none(),
-            "window producer window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.ready.is_some() || self.pending_query.is_some() || self.pending_commit.is_some(),
+            "window producer", "a proposal or commit is pending")?;
         if let Some(range) = window.range() {
             ensure!(range.end <= self.storage.rows && range.len() <= self.capacity,
                 "window producer window {range:?} outside {} rows or wider than the {}-row unit",

@@ -688,8 +688,8 @@ impl<'a> CompressorWave<'_, 'a> {
     /// Selects this slot's unit rows in the storage's planes, at rest
     /// (`shared::memory::row_window`). Windowed production runs eagerly.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
-        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none(),
-            "compressor window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.ready.is_some() || self.pending_query.is_some() || self.pending_commit.is_some(),
+            "compressor", "a proposal or commit is pending")?;
         if let Some(range) = window.range() {
             ensure!(range.end <= self.storage.rows && range.len() <= self.capacity,
                 "compressor window {range:?} outside {} rows or wider than the {}-row unit",

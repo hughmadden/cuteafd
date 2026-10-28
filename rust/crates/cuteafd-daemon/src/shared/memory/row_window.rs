@@ -64,6 +64,19 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::ops::Range;
 
+/// A slot's window changed while one of its owners still holds pending
+/// work (an ordering bug: the slot was not drained and at rest). Finished
+/// outputs are dropped at rest; pending work always refuses, loudly.
+#[derive(Debug, thiserror::Error)]
+#[error("{owner} window changed while {state} (the slot is not at rest)")]
+pub(crate) struct WindowNotAtRest { pub owner: &'static str, pub state: &'static str }
+
+/// Refuses a window change while `pending`.
+pub(crate) fn require_rest(pending: bool, owner: &'static str, state: &'static str) -> Result<()> {
+    if pending { return Err(WindowNotAtRest { owner, state }.into()); }
+    Ok(())
+}
+
 /// The widest reserve a row plane spans (`wave_control::reserve_rows` at
 /// four slots of 4096-row units).
 pub(crate) const MAX_RESERVE_ROWS: usize = 8256;

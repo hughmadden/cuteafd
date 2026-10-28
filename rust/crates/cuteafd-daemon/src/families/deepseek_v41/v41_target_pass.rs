@@ -281,8 +281,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// window) and before non-unit prefill work (`RowWindow::NONE`). The slot's
     /// previous work has drained ([`Pass::drain_chain`]).
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(self.state == State::Idle, "prefill slot window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.state != State::Idle, "prefill slot", "a pass is running or uncommitted")?;
         let resources = &mut self.resources;
+        // At rest the previous unit's finished outputs are dropped (the next
+        // use restarts every owner); pending work still refuses.
+        resources.index.restart()?;
+        resources.execution.restart();
         resources.lane.select_window(window.clone())?;
         resources.index.select_window(window.clone())?;
         resources.execution.select_window(window.clone())?;

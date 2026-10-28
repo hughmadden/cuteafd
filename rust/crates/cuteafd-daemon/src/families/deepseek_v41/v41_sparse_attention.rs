@@ -192,7 +192,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(self.cold.is_none(), "sparse window changes while cold preparation pending");
+        crate::shared::memory::row_window::require_rest(self.cold.is_some(), "sparse attention", "cold preparation is pending")?;
         if let Some(range) = window.range() {
             ensure!(range.start < range.end && range.len() <= self.capacity, "sparse window exceeds unit");
         }

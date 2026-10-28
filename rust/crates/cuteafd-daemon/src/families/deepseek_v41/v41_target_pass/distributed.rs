@@ -211,8 +211,15 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     /// Selects this prefill slot's rows in every component's shared row planes
     /// on both GPUs (`shared::memory::row_window`), at rest.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(self.state == State::Idle, "prefill slot window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.state != State::Idle, "prefill slot", "a pass is running or uncommitted")?;
         let resources = &mut self.resources;
+        // At rest the previous unit's finished outputs are dropped (the next
+        // use restarts every owner); pending work still refuses.
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.restart())?;
+        }
+        resources.execution.restart_for(CacheStage::Encoder);
         for lane in &mut resources.lanes {
             let device = lane.device;
             device.run(|| lane.get_mut().select_window(window.clone()))?;

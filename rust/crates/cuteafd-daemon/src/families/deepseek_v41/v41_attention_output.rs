@@ -264,8 +264,10 @@ impl AttentionOutputWave<'_, '_> {
     }
     /// Selects this slot's unit rows in the shared planes, at rest
     /// (`shared::memory::row_window`).
+    /// Drops a finished output (the slot is at rest: its readers drained).
+    pub(crate) fn discard_ready(&mut self) { self.ready = None; }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(self.ready.is_none(), "attention output window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.ready.is_some(), "attention output", "an output is unconsumed")?;
         if let Some(range) = window.range() {
             ensure!(range.end <= self.storage.rows as usize && range.len() <= self.capacity as usize,
                 "attention output window {range:?} outside {} rows or wider than the {}-row unit",

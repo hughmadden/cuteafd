@@ -206,8 +206,9 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                 first = positions.first().copied(), last = positions.last().copied(), rows = positions.len(),
                 "V4.1 encoder unit cut");
         }
-        // The slot is at rest (drained in `begin_unit`): restart its owners,
-        // then select this unit's rows in every shared row plane.
+        // The slot is at rest (drained in `begin_unit`): select this unit's
+        // rows in every shared row plane, then restart its owners on them.
+        slot.pass.select_window(unit_window(unit, self.unit_rows)?)?;
         slot.pass
             .resources
             .execution
@@ -215,7 +216,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         slot.pass.resources.lane.restart()?;
         slot.pass.resources.index.restart()?;
         slot.pass.resources.taps.reset();
-        slot.pass.select_window(unit_window(unit, self.unit_rows)?)?;
         slot.pass.state.begin()?;
         // SAFETY: the unit exclusively owns its batch and its rows of the
         // shared planes. Layer 0's query runs in its attention hook: the query

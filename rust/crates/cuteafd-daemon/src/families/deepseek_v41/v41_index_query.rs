@@ -224,7 +224,7 @@ impl IndexQueryWave<'_, '_> {
         unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
     }
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
-        ensure!(self.pending.is_none() && self.ready.is_none(), "index query window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.pending.is_some() || self.ready.is_some(), "index query", "a query is pending or unconsumed")?;
         if let Some(range) = window.range() {
             ensure!(range.start < range.end && range.end <= self.storage.rows as usize
                 && range.len() <= self.capacity as usize, "index query window outside reserve or unit");

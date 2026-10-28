@@ -188,7 +188,7 @@ impl HcSublayer<'_, '_> {
     /// Selects this slot's unit rows in the shared planes (row_window
     /// contract), at rest: `RowWindow::NONE` uses rows from 0.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
-        ensure!(self.begun.is_none() && self.pending.is_none(), "mHC window changes only at rest");
+        crate::shared::memory::row_window::require_rest(self.begun.is_some() || self.pending.is_some(), "mHC sublayer", "work is begun or pending")?;
         if let Some(range) = window.range() {
             ensure!(range.end <= self.storage.rows && range.len() <= self.capacity,
                 "mHC window {range:?} outside {} rows or wider than the {}-row unit", self.storage.rows, self.capacity);
