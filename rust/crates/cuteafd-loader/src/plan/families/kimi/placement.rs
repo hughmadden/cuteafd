@@ -20,8 +20,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
     };
     let shape = prefill.units();
-    // Slot-owned Spark charges cover every depth the executor may run (#762).
-    let admitted = prefill.admitted();
+    let admitted = shape;
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();

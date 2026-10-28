@@ -135,10 +135,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         )?,
         Duration::from_secs(120),
     )?;
-    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-            timeout: Duration::from_secs(120),
-            max_frame_bytes: 2 * 1024 * 1024,
-        }, 0)?;
+    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, crate::families::deepseek_v41::v41_native_serve::transport_config(false), 0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
     if std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some()
         || std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
@@ -155,14 +152,12 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             Duration::from_secs(120),
         )?;
         let mut second_transport = NativeTp4Wave::new(&lib,
-            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-                timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
-            }, 0)?, NativeTp4Wave::device_bytes(80)?)?;
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, crate::families::deepseek_v41::v41_native_serve::transport_config(false), 0)?, NativeTp4Wave::device_bytes(80)?)?;
         // The one prefill link (execution lane 2): two return slots of 80 rows.
         let mut prefill_link = crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
             SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80,
-                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024 }, 2)?,
-            2, 80, 160)?;
+                crate::families::deepseek_v41::v41_native_serve::transport_config(false), 2)?,
+            2, 80)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         if std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
             let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(

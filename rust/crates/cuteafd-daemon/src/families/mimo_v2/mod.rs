@@ -1281,8 +1281,7 @@ impl Opened {
         };
         crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, Flash 2 / Pro 3 by default,
-        // 1 keeps it serial):
+        // Pipelined prefill (Flash 2 / Pro 3 lanes by default):
         // one more transport per earlier row lane.
         ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
         let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;

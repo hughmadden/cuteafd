@@ -479,7 +479,7 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B-FP8"])
 def test_dense_qwen_requires_resolved_coordinator_prefill_unit(tmp_path, model):
-    shape = {"prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_slots": 1, "prefill_span_rows": 4096}
+    shape = {"prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096}
     result = _family_launch_result(tmp_path, DENSE_CONFIG, model,
         "SPARK_COUNT=0\nSPECULATOR=off\n", extra_args=("--wip", "dense-test"),
         deployment_overrides=shape,
@@ -502,7 +502,7 @@ def test_dense_qwen_rejects_unused_worker_configuration(tmp_path, key, value):
     assert "serve-qwen35 --snapshot" not in result.stderr
 
 
-@pytest.mark.parametrize("missing", ["prefill_unit_rows", "prefill_waves", "prefill_slots"])
+@pytest.mark.parametrize("missing", ["prefill_unit_rows", "prefill_waves"])
 def test_dense_qwen_does_not_bypass_shared_prefill_contract(tmp_path, missing):
     result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
         "SPARK_COUNT=0\n", extra_args=("--wip", "dense-test"),
@@ -890,7 +890,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
             stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
                 stub += ('case "$*" in container\\ inspect*|inspect\\ *) ' + ('if [[ "$*" == *-wip* ]]; then exit 0; else exit 1; fi' if wip else 'exit 1') + ' ;; image\\ inspect*) echo test-pin ;; esac\n'
-                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_unit_rows":4096,"prefill_waves":1,"prefill_slots":1,"prefill_span_rows":4096}\\n\' '
+                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_unit_rows":4096,"prefill_waves":1,"prefill_span_rows":4096}\\n\' '
                          '"$STUB_SPARK_COUNT" ;; esac\n')
             if program_manifest is None:
                 stub += 'case "$*" in *"PROGRAMS.json"*) exit 1 ;; esac\n'
@@ -955,12 +955,12 @@ if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41"
     sys.exit("unsupported --decode-lanes for " + family)
 if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
-report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_slots=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
-    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_slots=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
+    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
@@ -1037,8 +1037,7 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
     result = _family_launch_result(tmp_path, family_config, model, keys,
         extra_args=("--wip", "prefill-shape"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30},
-        deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves, "prefill_slots": waves + 1,
-                              "prefill_span_rows": 32768})
+        deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves, "prefill_span_rows": 32768})
     assert result.returncode == 0, result.stderr
     plan = next(shlex.split(line) for line in result.stderr.splitlines()
                 if "cuteafd plan" in line and "--deployment" in line)
@@ -1050,14 +1049,13 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
         family_config["model_type"], "serve-step5")
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and command_name in line)
-    assert serve.count("--prefill-rows") == serve.count("--prefill-waves") == serve.count("--prefill-slots") == 1
+    assert serve.count("--prefill-rows") == serve.count("--prefill-waves") == 1
+    assert "--prefill-slots" not in serve
     assert serve[serve.index("--prefill-rows") + 1] == str(unit)
     assert serve[serve.index("--prefill-waves") + 1] == str(waves)
-    # The deployment's admitted slots go back to serve with its waves (#762).
-    assert serve[serve.index("--prefill-slots") + 1] == str(waves + 1)
     assert "--prefill-span-rows" not in serve
     assert "PREFILL_SPAN_ROWS" not in result.stdout + result.stderr
-    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves} PREFILL_SLOTS={waves + 1}" in result.stdout
+    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves}\n" in result.stdout + "\n"
 
 
 @pytest.mark.parametrize("family_config", [
@@ -1066,7 +1064,7 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
 def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
     result = _family_launch_result(tmp_path, family_config, "test/model",
         "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
-        deployment_overrides={"prefill_unit_rows": 1024, "prefill_waves": 3, "prefill_slots": 3, "prefill_span_rows": 32768})
+        deployment_overrides={"prefill_unit_rows": 1024, "prefill_waves": 3, "prefill_span_rows": 32768})
     assert result.returncode == 0, result.stderr
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and "cuteafd serve-" in line)
@@ -1351,7 +1349,6 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     ({"model_type": "qwen4_exp"}, "", {}, 1),
     ({"model_type": "mimo_v2_flash"}, "", {}, 2),
     ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
-    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {"CUTEAFD_MIMO_PREFILL_LANES": "4"}, 4),
 ])
 def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, config, keys, env, endpoints):
     dense_layers = config.get("first_k_dense_replace", 0)
@@ -1514,11 +1511,11 @@ def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, ex
     assert "--prefill-lanes" not in plan
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and "serve-glm" in line)
-    for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-slots", waves),
-                        ("--prefill-span-rows", span)]:
+    for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
         assert serve.count(flag) == 1 and serve[serve.index(flag) + 1] == str(value)
     assert not any("CUTEAFD_PREFILL_SPAN_ROWS" in arg or "CUTEAFD_GLM_PREFILL_LANES" in arg for arg in serve)
-    assert (f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves} PREFILL_SLOTS={waves} "
+    assert "--prefill-slots" not in serve
+    assert (f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves} "
             f"PREFILL_SPAN_ROWS={span}") in result.stdout
 
 

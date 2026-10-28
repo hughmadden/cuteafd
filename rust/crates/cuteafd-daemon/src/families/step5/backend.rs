@@ -146,11 +146,9 @@ pub(super) struct Step5Backend<'e, 'a> {
     mtp: Option<&'e super::mtp::Runtime<'a>>,
     full_prefill_logits: bool,
     /// Prefill unit rows and units in flight (PLAN "Prefill contract").
-    /// Prefill units: the admitted unit and slots, and the runtime depth (#762).
+    /// Prefill units: the unit and the waves in flight.
     prefill: (usize, usize),
     depth: Option<crate::shared::prefill_depth::PrefillDepth>,
-    /// The deployment's identity for the prefill depth calibration key (#762).
-    identity: Option<crate::shared::prefill_depth::DeploymentIdentity>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -183,15 +181,13 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false, prefill: (rows, 1), depth: None, identity: None })
+            full_prefill_logits: false, prefill: (rows, 1), depth: None })
     }
 
-    /// Prefill units: `depth`'s admitted slots of its unit cut from the
-    /// step's rows (the reserve every depth fits, #762).
+    /// Prefill units: `depth`'s waves of its unit, cut from the step's rows.
     pub(super) fn with_prefill_depth(mut self, depth: crate::shared::prefill_depth::PrefillDepth) -> Result<Self> {
-        let (unit, slots) = (depth.unit_cap(), depth.slots());
-        ensure!(slots > 0 && (slots == 1 || unit % 64 == 0)
-            && (unit * slots == self.rows || depth.reserve_rows() == self.rows),
+        let (unit, slots) = (depth.unit_rows, depth.waves);
+        ensure!(slots > 0 && (slots == 1 || unit % 64 == 0) && depth.reserve_rows() == self.rows,
             "Step-5 prefill units differ from the admitted span");
         self.prefill = (unit, slots);
         self.depth = Some(depth);
@@ -199,11 +195,6 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     }
 
 
-    /// Calibrates the adaptive prefill depth before readiness, keyed by `identity` (#762).
-    pub(super) fn with_identity(mut self, identity: crate::shared::prefill_depth::DeploymentIdentity) -> Self {
-        self.identity = Some(identity);
-        self
-    }
 
     /// The head was admitted at chunk width: all-row prefill scoring is served.
     pub(super) fn with_full_prefill_logits(mut self, enabled: bool) -> Self {
@@ -279,36 +270,15 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         // waves in flight; every other step runs whole (at most one unit).
         let (unit, _) = self.prefill;
         if kind == cuteafd_transport::ExpertV2SourceKind::Prefill && descriptors.len() == 1 && first_row > unit
-            && self.depth.as_ref().is_some_and(|depth| depth.slots() > 1) {
-            // A prefill call boundary (#762): finished calls' Spark paces (no
-            // host wait), this call's depth, the link re-cut to it at rest.
-            let depth = self.depth.as_ref().context("Step-5 prefill depth")?;
-            let (key, start) = (descriptors[0].sequence, descriptors[0].base);
-            let next = match self.execution.with_link(|link| {
-                depth.report(link.exchange()?.take_prefill()?);
-                let next = depth.start(key, start, first_row);
-                link.set_geometry(next.waves, next.unit_rows)?;
-                link.exchange()?.begin_prefill(next.call)?;
-                Ok(next)
-            })? { Some(next) => next, None => depth.start(key, start, first_row) };
+            && self.depth.as_ref().is_some_and(|depth| depth.waves > 1) {
+            let next = *self.depth.as_ref().context("Step-5 prefill depth")?;
             let units = crate::shared::prefill_pipeline::prefill_units(first_row, next.unit_rows, next.waves, 64)?
                 .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index,
                     sequence: 0, rows, layers: 0..92, slot: index % next.waves, barrier: false }).collect::<Vec<_>>();
-            depth.ran(next, units.len(), first_row);
-            let ran = self.execution.enqueue_units(&mut step, &input.residual, kind, &units, next.waves);
-            // The call's last wave is sent: later waves are not its.
-            self.execution.with_link(|link| { link.exchange()?.stop_prefill(); Ok(()) })?;
-            ran?;
+            self.execution.enqueue_units(&mut step, &input.residual, kind, &units, next.waves)?;
         } else {
-            // Each return slot and hop lane holds one unit; a step wider than the
-            // last prefill's cut runs on one admitted unit (at rest, #762).
+            // Each return slot and hop lane holds one unit.
             ensure!(first_row <= unit, "Step-5 {first_row}-row step exceeds one prefill unit of {unit}");
-            if self.depth.as_ref().is_some_and(|depth| depth.slots() > 1) {
-                self.execution.with_link(|link| {
-                    if first_row > link.exchange()?.geometry().rows { link.set_geometry(1, unit)?; }
-                    Ok(())
-                })?;
-            }
             self.execution.enqueue(&mut step, &input.residual, kind)?;
         }
         let (device, output) = self.execution.terminal_output()?;
@@ -379,7 +349,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "step5", vocab_size: V, max_context: self.context,
             slots: self.sequences,
-            // A call is whole units at every depth the controller may run (#762).
+            // A call is the slots' units.
             prefill_rows: self.depth.as_ref().map_or(self.rows, |depth| depth.call_rows().min(self.rows)),
             decode_rows: self.rows.min(64),
             full_prefill_logits: self.full_prefill_logits }
@@ -525,10 +495,6 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn probe_begin(&self, _rows: usize) {}
     fn probe_end(&self) {}
     fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
-    fn prefill_depth(&self) -> Option<(&crate::shared::prefill_depth::PrefillDepth,
-        crate::shared::prefill_depth::DeploymentIdentity)> {
-        Some((self.depth.as_ref()?, self.identity.clone()?))
-    }
 }
 
 #[cfg(test)]

@@ -72,12 +72,10 @@ pub struct DeploymentSpec<'a> {
     pub spark_ranks: usize,
     pub prefill_unit_rows: u64,
     pub prefill_waves: u64,
-    /// Admitted prefill slots (#762): launches pass them back with the waves.
-    pub prefill_slots: u64,
     pub decode_lanes: u8,
     pub prefill_span_rows: u64,
-    /// The reserve an adaptive executor's depths cut (the standard 8192, or
-    /// the planner's fit cap below it); launches pass it back.
+    /// The reserve the depth cuts (the standard 8192, or the planner's fit
+    /// cap below it); launches pass it back.
     pub prefill_reserve_rows: u64,
     pub topology: Topology,
     pub roles: Vec<SparkRole>,
@@ -168,7 +166,6 @@ impl<'a> DeploymentSpec<'a> {
             rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
             prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
             prefill_waves: report.prefill_waves.unwrap_or(0),
-            prefill_slots: report.prefill_slots.or(report.prefill_waves).unwrap_or(0),
             decode_lanes: report.decode_lanes,
             prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
             prefill_reserve_rows: report.prefill_reserve_rows
@@ -249,14 +246,13 @@ mod tests {
                     report.prefill_waves = Some(waves);
                     report.prefill_span_rows = Some(span);
                     report.prefill_transports = Some(transports);
-                    report.prefill_slots = Some(waves + 1);
                     let options = DeploymentOptions { rtx_gpus: gpus, ..Default::default() };
                     let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
-                    assert_eq!((deployment.prefill_unit_rows, deployment.prefill_waves, deployment.prefill_span_rows,
-                        deployment.prefill_slots), (unit, waves, span, waves + 1), "{family} {gpus}+{ranks}");
+                    assert_eq!((deployment.prefill_unit_rows, deployment.prefill_waves, deployment.prefill_span_rows),
+                        (unit, waves, span), "{family} {gpus}+{ranks}");
                     let value = serde_json::to_value(deployment).unwrap();
                     assert_eq!(value["report"]["prefill_transports"], transports);
-                    for legacy in ["prefill_rows", "prefill_lanes"] {
+                    for legacy in ["prefill_rows", "prefill_lanes", "prefill_slots"] {
                         assert!(value.get(legacy).is_none());
                         assert!(value["report"].get(legacy).is_none());
                     }

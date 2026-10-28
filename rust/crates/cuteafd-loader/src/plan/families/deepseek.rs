@@ -15,51 +15,26 @@ pub struct DeepSeek {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
-    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate,
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
     /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
     decode_rows: u32,
-    /// In-flight prefill units the executor holds.
-    max_waves: u64,
-    /// Measured starting unit, when a kernel needs one.
-    initial_unit_rows: Option<u64>,
-    /// The executor re-cuts its slots per prefill call (#762).
-    adaptive: bool,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
-    // The shared default (TJ 2026-10-27): three units of 2752 rows in the
-    // 8192-row reserve, one layer apart; the shape never shrinks for KV.
-    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
-        waves: 3, reference_ranks: 4, larger_topology_waves: 3,
-        source: "TJ 2026-10-27: V4.1 takes the shared 3 x 2752 default like every shared-executor family (#815, #744)",
-    },
     decode_lanes: crate::plan::decode_lanes::LaneSupport::FixedTwo,
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
-    max_waves: crate::serving_capacity::prefill_waves::MAX_WAVES,
-    initial_unit_rows: None,
-    // Adaptive inside its reserve (#762, #744 WP5): four slots, the widest
-    // unit half the reserve, starting at the estimate's depth.
-    adaptive: true,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
     architecture: "DeepseekV4ForCausalLM",
     runtime: RuntimeStatus::Serving,
-    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
-        waves: 3, reference_ranks: 6, larger_topology_waves: 3,
-        source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; Pro EXL3 six-Spark k3 versus k2, no independent S/T",
-    },
     decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
         reason: "the second lane is not wired yet: V4 Flash, the closest shape to V4.1, is the OneOrTwo candidate awaiting its A/B on its own decode endpoint (#744)" },
     // Installed V4 coordinator manifests fix `decode_rows`; serve passes it.
     decode_rows: 64,
-    max_waves: crate::serving_capacity::prefill_waves::MAX_WAVES,
-    initial_unit_rows: None,
-    adaptive: false,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -74,10 +49,6 @@ impl Family for DeepSeek {
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
-    }
-    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, max_waves: self.max_waves,
-            initial_unit_rows: self.initial_unit_rows, adaptive: self.adaptive, ..Default::default() }
     }
     fn id(&self) -> &'static str {
         self.id

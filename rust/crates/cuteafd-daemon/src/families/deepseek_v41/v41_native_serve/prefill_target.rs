@@ -20,7 +20,7 @@ pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     let (events, _receive) = mpsc::unbounded_channel();
     let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     super::prefill(lib, runtime, requests, prefill, None, lease, tokens,
-        super::PrefillShape { rows: chunk_rows, waves, adaptive_calls: false }, &job, draft, &mut || Ok(()))?.select(None)
+        super::PrefillShape { rows: chunk_rows, waves }, &job, draft, &mut || Ok(()))?.select(None)
 }
 
 /// [`exercise_prefill`] whose client disconnects at the first unit's begin
@@ -36,7 +36,7 @@ pub(crate) fn exercise_cancelled_prefill<'a, P: PrefillTarget<'a>, C: DraftChain
     let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     let mut receive = Some(receive);
     match super::prefill::<P, C>(lib, runtime, requests, prefill, None, lease, tokens,
-        super::PrefillShape { rows: chunk_rows, waves, adaptive_calls: false }, &job, None,
+        super::PrefillShape { rows: chunk_rows, waves }, &job, None,
         &mut || { receive.take(); Ok(()) }) {
         Ok(_) => anyhow::anyhow!("cancelled prefill unexpectedly finished"),
         Err(error) => error,
@@ -138,11 +138,8 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
     pub(crate) lease: CacheLease,
     pub(crate) tokens: &'s [u32],
     pub(crate) chunk_rows: usize,
-    /// Units in flight on the shared executor (a fixed cut: tests, pinned).
+    /// Units in flight on the shared executor.
     pub(crate) waves: usize,
-    /// Each window cycle takes its depth from the slots' controller (#762);
-    /// off, the stream runs at `waves` x `chunk_rows` (test fixtures).
-    pub(crate) adaptive_calls: bool,
     /// The prefill slots: slot 0 (with the prefill link) runs non-unit work.
     pub(crate) prefill: &'s mut PrefillSlots<'a, P>,
     pub(crate) job: &'s NativeRequest,
@@ -153,11 +150,8 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
 
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
     /// Whether `rows` uncached prompt rows run as units on the shared
-    /// executor: more than one unit. Adaptive calls compare with the
-    /// controller's current unit (it re-cuts each call), not the unit cap (P2).
-    fn streams(&self, rows: usize) -> bool {
-        streams(rows, self.adaptive_calls.then(|| self.prefill.depth.current().1), self.chunk_rows)
-    }
+    /// executor: more than one unit.
+    fn streams(&self, rows: usize) -> bool { rows.div_ceil(self.chunk_rows.max(1)) > 1 }
     fn encoder_unit(&self, next: usize, replay_end: usize, streamed: bool,
         budget: ChunkBudget) -> V41Unit {
         self.times.encoder_unit(self.tokens.len(), self.chunk_rows, self.waves, next, replay_end, streamed, budget)
@@ -268,29 +262,20 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 // slot's waves go out on it. Nothing fallible runs between the
                 // take and the loop, and every error inside the loop lands in
                 // `result`, so the link returns on every exit (D1).
-                let key = self.requests.cache().request_id(self.lease)?;
                 let mut link = P::take_link(&mut self.prefill.slots[0].1)?;
                 let mut result = Ok(());
                 let mut at = span.start;
-                // One call per window cycle (#762): each call's depth from the
-                // controller, its units cut at that depth, the link re-cut.
+                let (waves, call_rows) = (self.waves, self.waves * self.chunk_rows);
+                // One call per window cycle: `waves` units of `chunk_rows` rows.
                 while at < span.end && result.is_ok() {
-                    let rows = (span.end - at).min(if self.adaptive_calls { self.prefill.depth.call_rows() } else { span.end - at });
-                    let mut started_call = false;
+                    let rows = (span.end - at).min(call_rows);
                     result = (|| -> Result<()> {
-                        let (waves, unit_rows) = if self.adaptive_calls {
-                            let depth = P::start_prefill(&mut link, &self.prefill.depth, key, at, rows)?;
-                            started_call = true;
-                            let units = crate::shared::prefill_pipeline::prefill_units(rows, depth.unit_rows, depth.waves,
-                                cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize)?;
-                            self.prefill.depth.ran(depth, units.len(), rows);
-                            (depth.waves, units)
-                        } else {
-                            (self.waves, ranges.iter().map(|range| range.start - at..range.end - at).collect())
-                        };
+                        ensure!(waves <= self.prefill.slots.len(), "{waves} prefill waves exceed the {} slots",
+                            self.prefill.slots.len());
+                        let unit_rows = crate::shared::prefill_pipeline::prefill_units(rows, self.chunk_rows, waves,
+                            cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize)?;
                         let chunks: Vec<_> = unit_rows.iter().map(|range| &self.tokens[at + range.start..at + range.end]).collect();
-                        // The next call's first units at this call's unit width
-                        // (a depth change only turns the prefetch into a miss).
+                        // The next call's first units at this call's unit width.
                         let width = unit_rows.first().map_or(1, |range| range.len());
                         let ahead: Vec<&[u32]> = lookahead(at + rows..span.end, width, waves)
                             .map(|range| &self.tokens[range]).collect();
@@ -299,19 +284,12 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                         slots.truncate(waves);
                         // SAFETY: every slot's pass and the link retain the request
                         // and suffix through drained completion or cancellation.
-                        let ran = self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
-                            self.lease, &chunks, suffix, &ahead, &keep_running, &before_unit) });
-                        started_call = false;
-                        let stopped = if self.adaptive_calls { P::stop_prefill(&mut link) } else { Ok(()) };
-                        ran.and(stopped)?;
+                        self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
+                            self.lease, &chunks, suffix, &ahead, &keep_running, &before_unit) })?;
                         tracing::debug!(target: "cuteafd::timing", rows, units=chunks.len(), waves,
                             total_us=started.elapsed().as_micros() as u64, "target encoder units");
                         Ok(())
                     })();
-                    // A call that started but failed before its units ran still stops.
-                    if started_call { if let Err(error) = P::stop_prefill(&mut link) {
-                        tracing::error!(%error, "stopping a failed prefill call");
-                    } }
                     at += rows;
                 }
                 P::restore_link(&mut self.prefill.slots[0].1, link)?;
@@ -380,8 +358,6 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
 /// (replay, continuation, scoring, cold steps) at rows from 0.
 pub(crate) struct PrefillSlots<'a, P: PrefillTarget<'a>> {
     pub slots: Vec<(P, P::Transport)>,
-    /// The runtime depth controller over these slots (#762).
-    pub depth: std::rc::Rc<crate::shared::prefill_depth::PrefillDepth>,
 }
 impl<'a, P: PrefillTarget<'a>> PrefillSlots<'a, P> {
     pub(crate) fn slot0(&mut self) -> (&mut P, &mut P::Transport) {
@@ -397,10 +373,6 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type PrefillLink;
     fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink>;
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()>;
-    /// A prefill call boundary on the link (`V41Link::start_prefill`).
-    fn start_prefill(link: &mut Self::PrefillLink, depth: &crate::shared::prefill_depth::PrefillDepth,
-        key: u64, start: usize, rows: usize) -> Result<crate::shared::prefill_depth::Depth>;
-    fn stop_prefill(link: &mut Self::PrefillLink) -> Result<()>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
@@ -433,11 +405,6 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
         transport.restore_link(link)
     }
-    fn start_prefill(link: &mut Self::PrefillLink, depth: &crate::shared::prefill_depth::PrefillDepth,
-        key: u64, start: usize, rows: usize) -> Result<crate::shared::prefill_depth::Depth> {
-        link.start_prefill(depth, key, start, rows)
-    }
-    fn stop_prefill(link: &mut Self::PrefillLink) -> Result<()> { link.stop_prefill() }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -482,15 +449,6 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         let device = transport.device;
         ensure!(link.device.id == device.id, "prefill link device differs from slot 0's");
         device.run(|| transport.get_mut().restore_link(link.into_inner()))
-    }
-    fn start_prefill(link: &mut Self::PrefillLink, depth: &crate::shared::prefill_depth::PrefillDepth,
-        key: u64, start: usize, rows: usize) -> Result<crate::shared::prefill_depth::Depth> {
-        let device = link.device;
-        device.run(|| link.get_mut().start_prefill(depth, key, start, rows))
-    }
-    fn stop_prefill(link: &mut Self::PrefillLink) -> Result<()> {
-        let device = link.device;
-        device.run(|| link.get_mut().stop_prefill())
     }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
@@ -653,29 +611,8 @@ fn lookahead(span: Range<usize>, width: usize, units: usize) -> impl Iterator<It
     (span.start..span.end).step_by(width).take(units).map(move |start| start..(start + width).min(span.end))
 }
 
-/// More than one unit of `rows`: the controller's current unit for adaptive
-/// calls (`adaptive`), else the configured chunk.
-fn streams(rows: usize, adaptive: Option<usize>, chunk_rows: usize) -> bool {
-    rows.div_ceil(adaptive.unwrap_or(chunk_rows).max(1)) > 1
-}
-
 #[cfg(test)]
 mod stream_tests {
-    /// P2: an adaptive call at a 2048-row unit streams a 3000-row prompt even
-    /// though the unit cap (4096) would fit it in one Single; fixed calls keep
-    /// their configured chunk.
-    #[test]
-    fn adaptive_calls_stream_past_the_controllers_unit_not_the_cap() {
-        assert!(super::streams(3000, Some(2048), 4096));
-        assert!(!super::streams(3000, None, 4096));
-        assert!(!super::streams(2048, Some(2048), 4096));
-        assert!(super::streams(2049, Some(2048), 4096));
-        // The prefill call boundary takes the absolute prompt row (as GLM
-        // does), so a span after a cached prefix is not an opening at row 0.
-        let step = include_str!("prefill_target.rs");
-        assert!(step.contains("P::start_prefill(&mut link, &self.prefill.depth, key, at, rows)"));
-    }
-
     /// A call's last units prefetch the next call's first units (#762 window
     /// cycles; prof39: each cycle's first Engram layer-1 gathers waited
     /// 40-150 ms cold, ~2.3 s of a 64K prefill on max).
@@ -703,7 +640,6 @@ mod unit_exit_tests {
         let between = &step[take..restore];
         let loop_start = between.find("while at < span.end && result.is_ok() {").unwrap();
         assert!(!between[..loop_start].contains('?'), "a fallible step between taking and lending the link (D1)");
-        assert!(between.contains("if started_call { if let Err(error) = P::stop_prefill("), "a started call must stop (D1)");
         for (name, source) in [("1 RTX", include_str!("../v41_target_pass/encoder_units.rs")),
             ("2 RTX", include_str!("../v41_target_pass/distributed/encoder_units.rs"))] {
             let drop_impl = &source[source.find("impl Drop for UnitHooks").unwrap()..];

@@ -248,27 +248,22 @@ is large (≈10 ms at 1024 rows).
 
 This is all in [loader/serving_capacity/prefill_waves.rs](../../rust/crates/cuteafd-loader/src/serving_capacity/prefill_waves.rs).
 
-- **The reserve and units:**
-  - One fixed `RESERVE_ROWS` = 8192 (`:6`) for every family. Units are
-    reserve / k, on exact export capacities: k = 2/3/4 gives 4096 / 2752 /
-    2048 rows (`unit_rows`, `:11`).
-  - Three 2752-row units round up to an 8256-row span, which is why the cap
-    is `RESERVE_ROWS + 64`.
-  - `MAX_WAVES` = 4 (`:7`).
-- **Choosing k:**
-  - `PrefillEstimate::waves` (`:43`) scales the descriptor's S to the deployed
-    Spark count (S = S_ref × N_ref / N) and calls `waves_for` (`:218`), which
-    computes **k = ⌈T/S⌉ + 1, clamped to 2..4**.
-  - `MeasuredWaves` returns its measured k, or `larger_topology_waves` above
-    its reference count.
-  - Zero Sparks means one wave.
-- **Fitting:** `prefill_shape` (`:136`) lowers an automatic k until the shape
-  fits the admitted arena and the executor caps. An explicit pin
-  (`PREFILL_WAVES`/`PREFILL_ROWS`) never moves; it either fits or fails with a
-  typed `PrefillError` (`:81`).
-- **Short prompts:** `waves_used` (`:226`) uses fewer waves when a prompt cannot
-  keep each unit at least `MIN_FILL` = 50% full. Storage is not reallocated and
+- **The reserve and units:** one fixed `RESERVE_ROWS` = 8192 for every
+  family, or the planner's fit cap on a card that cannot hold it (the largest
+  64-row multiple that fits; never shrunk for KV or onboarded layers). The
+  depth is a fixed `DEPTH` = 3 (TJ 2026-10-28): units of roundup64(reserve / 3)
+  rows, 3 × 2752 = 8256 in the standard reserve (the `RESERVE_ROWS + 64` cap).
+  Zero Sparks use one unit; a family's hard executor capacity
+  (`PrefillLimits::max_waves`, e.g. Qwen 4's two-slot PLE ring) caps it.
+- **Pins:** `PREFILL_WAVES`/`PREFILL_ROWS` are plain config for measurement
+  arms; a pin either fits or fails with a typed `PrefillError`.
+- **Short prompts:** `waves_used` uses fewer waves when a prompt cannot keep
+  each unit at least `MIN_FILL` = 50% full. Storage is not reallocated and
   graphs are not recaptured.
+- **Why fixed:** the #762 adaptive controller (calibration, serving
+  re-tests, per-call re-cut, four admitted slots) was removed after every
+  measured layout ran best at three and the controller itself cost 5–7%
+  (PLAN "Prefill contract").
 
 **What waves assume of kernels.** A unit's Spark time must scale roughly
 linearly with its rows across the whole 2048–4096 band. If a kernel has a
@@ -283,93 +278,31 @@ The guard is the kernel row-curve rule in
 cliff, add a descriptor preference such as `initial_unit_rows` that avoids the
 bad unit.
 
-### Deployment contract: units, span, slots
+### Deployment contract: units and span
 
 `cuteafd plan --deployment` publishes:
 
-- `prefill_unit_rows`, `prefill_waves`, `prefill_slots`, `prefill_span_rows`
-  and `decode_lanes` (`DeploymentSpec`, [loader/plan/deployment.rs:67](../../rust/crates/cuteafd-loader/src/plan/deployment.rs#L67));
+- `prefill_unit_rows`, `prefill_waves`, `prefill_span_rows`,
+  `prefill_reserve_rows` and `decode_lanes` (`DeploymentSpec`,
+  [loader/plan/deployment.rs](../../rust/crates/cuteafd-loader/src/plan/deployment.rs));
 - typed topology, roles and admission (the same struct).
 
 The launcher reads those fields back in `release_prefill_shape`
-([scripts/launch/run-family.sh:402](../../scripts/launch/run-family.sh#L402)).
-It refuses a plan that names no positive unit, wave or slot count. The family's mode
-comes from `family_prefill_mode` (`:395`):
+([scripts/launch/run-family.sh](../../scripts/launch/run-family.sh)) and
+refuses a plan that names no positive unit or wave count. The family's mode
+comes from `family_prefill_mode`:
 
 | Mode | Families | Serve flags |
 |---|---|---|
-| `units` | step5, kimi_k3, qwen4, deepseek_v4, deepseek_v41 | `--prefill-rows` (admitted unit; V4.1 `--prefill-batch-tokens`), `--prefill-waves` (starting depth), `--prefill-slots` |
-| `units-span` | glm5, glm5_flash | the above plus `--prefill-span-rows`: the rows every per-slot plane spans. Static: unit × waves; adaptive: `reserve_rows(slots, unit)` (`IntakeSpan`, `prefill_waves.rs:89`). |
-| `legacy` | mimo_v2 | not on the shared executor |
+| `units` | step5, kimi_k3, qwen4, deepseek_v4, deepseek_v41 | `--prefill-rows` (V4.1 `--prefill-batch-tokens`), `--prefill-waves` (V4.1 also `--prefill-reserve-rows`) |
+| `units-span` | glm5, glm5_flash | the above plus `--prefill-span-rows`: unit × waves |
+| `legacy` | mimo_v2 | not on the shared executor (#671) |
 
-A new family opts in here once its serve CLI accepts the shape.
-
-**`--prefill-slots` and runtime depth (#762).** The deployment publishes
-`prefill_slots`, and the launcher passes `--prefill-slots` to every `units`
-and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
-
-- **slots == waves** pins the depth (static families, and any user
-  `PREFILL_WAVES`, which makes the plan admit only its own waves).
-- **slots > waves** is an adaptive family (GLM 5, Kimi and Step today;
-  GLM Flash and V4 to follow). It admits four slots of the widest unit the
-  reserve allows, `ADAPTIVE_UNIT_ROWS` = reserve / 2 = 4096 rows
-  (`prefill_waves.rs:134`), bounded by the compiled capacity. Its plan names
-  that unit as `prefill_unit_rows`, starts at the estimate's depth cut from it
-  (`wave_control::unit_for`; 3 × 2752 at six Sparks), and spans
-  `reserve_rows(4, 4096)` = 8256 rows
-  ([loader/serving_capacity/wave_control.rs:72](../../rust/crates/cuteafd-loader/src/serving_capacity/wave_control.rs#L72)).
-  The controller can then run any depth from 2 to 4.
-- **At each prefill call** (one window cycle) the engine reports every
-  finished call's pace to its `PrefillDepth`
-  ([daemon/shared/prefill_depth.rs:27](../../rust/crates/cuteafd-daemon/src/shared/prefill_depth.rs#L27))
-  and takes this call's depth. A finished call's pace is read without a host
-  wait, as soon as its last wave has landed (`Waves::take_prefill`,
-  [daemon/shared/spark_waves.rs:1093](../../rust/crates/cuteafd-daemon/src/shared/spark_waves.rs#L1093)).
-  Each call's waves sum into the call's own accumulator. A pace has three parts:
-  - the call's own wall time, from its start (or the previous call's last
-    landing, if later) to its last landing;
-  - the Sparks' busy and idle time per unit, from the reply header;
-  - the coordinator's reply wait: GPU timing events around the consuming
-    stream's wait in `Waves::land`
-    ([spark_waves.rs:957](../../rust/crates/cuteafd-daemon/src/shared/spark_waves.rs#L957)).
-- **Samples.** `WaveControl`
-  ([wave_control.rs:186](../../rust/crates/cuteafd-loader/src/serving_capacity/wave_control.rs#L186))
-  counts each call as a sample of its period per prompt row (wall / rows) for
-  the depth it ran. Two kinds of call are not samples: transition calls (a
-  running call whose depth changed) and calls under 60% of the smallest unit.
-  A call is *opening* (a prefill's first) or *running* (it continues the same
-  sequence where the previous call ended). Each depth keeps its last two
-  samples per class, and a sample expires after 15 calls of any size.
-- **Decisions.** Widening (fewer units) happens only at an opening call;
-  deepening (more units) can happen at any call, in place. The latest sample
-  at the current depth points at a neighbour: Spark idle above 5% means fewer,
-  wider units; coordinator reply wait above 5% means more units; if both
-  fire, the larger share wins. The call steps there once to measure it if the
-  boundary allows that direction and the neighbour has no fresh evidence.
-  Otherwise it runs the best fresh depth with a 1% margin: at an opening call
-  by the mean of recent opening calls, all of which start at context 0; at a
-  running call by each depth's newest running call (adjacent calls of one
-  prompt). There is no other exploration.
-- **Caveat.** On a model whose per-call cost rises with context (Kimi), a
-  mid-prompt trial's sample comes two calls after its reference, so the trial
-  tends to lose. Kimi's depths tie at long context, so the loss is cheap.
-- **Wiring.** The engine re-cuts the prefill link's return slots at rest and
-  brackets the call: GLM 5 in `start_prefill`
-  ([daemon/families/glm5/engine.rs:1367](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1367)),
-  Kimi in `RoutedLane::start_prefill`
-  ([daemon/families/kimi_k3/spark.rs:140](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/spark.rs#L140)),
-  and Step in its backend's prefill path
-  ([daemon/families/step5/backend.rs:275](../../rust/crates/cuteafd-daemon/src/families/step5/backend.rs#L275)).
-- **One call** is `call_rows` (`wave_control.rs:80`): the smallest
-  k × unit over the candidate depths, 8192 rows at U = 4096. Every depth
-  therefore cuts whole units.
-- **Storage never changes.** Every depth's slots are views at
-  `slot * unit_for(k)` inside per-field arenas spanning the reserve. Hook-local
-  scratch is shared by the slots on a GPU (GLM 5: one step's program and top-k
-  scratch, LM head, logits rows, EXLR8 execution and native dense scratch).
-  Per-slot owners (peer exchange, TP2 route slots, commit blocks, KV tables,
-  Spark owners) cover the admitted slots, and the planner charges exactly that.
-- **Goldens** pin the starting depth at its own cut.
+A new family opts in here once its serve CLI accepts the shape. Each slot's
+storage is a view at `slot * unit` inside per-field arenas spanning the
+slots' units; hook-local scratch is shared by the slots on a GPU, and the
+planner charges exactly that. One prefill call is one window cycle of
+`waves * unit` rows.
 
 ## 4. Spark exchange and typed owners
 

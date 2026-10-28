@@ -193,10 +193,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
     let mut gate = EngramGate::new(&engram_weights, 80, 128 * 1024 * 1024)?;
     let mut gate14 = EngramGate::new(&engram14_weights, 80, 128 * 1024 * 1024)?;
     let mut upload = EngramDeviceRows::new(&lib, 80, EngramDeviceRows::device_bytes(80)?)?;
-    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-            timeout: Duration::from_secs(120),
-            max_frame_bytes: 2 * 1024 * 1024,
-        }, 0)?;
+    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, crate::families::deepseek_v41::v41_native_serve::transport_config(false), 0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
     use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
     let local_budget = ExpertWeights::plan(&lib, &catalog, ExpertLayer::BackboneFull { layer: 0 })?;

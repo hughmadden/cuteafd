@@ -1,7 +1,7 @@
 //! Windowed prefill row planes (PLAN "Prefill contract", #762, #744 (b)).
 //!
-//! A prefill call of `waves` units cuts one reserve of rows, and storage
-//! never changes with the depth. Each prefill slot keeps its own component
+//! A prefill call of `waves` units cuts one reserve of rows (slot `s` at rows
+//! `s * unit`). Each prefill slot keeps its own component
 //! objects (host phase, weight bindings, its unit's [`RowWindow`]). Every
 //! slot's objects on a GPU share one storage set through `Rc`: the streams,
 //! the row planes sized for the reserve, and scratch sized for the widest
@@ -11,14 +11,14 @@
 //! # Contract (every component that serves prefill units)
 //!
 //! **Row planes.** A buffer that another *hook* of the same unit reads is a
-//! [`RowPlane`] sized for the reserve (`wave_control::reserve_rows`): the
+//! [`RowPlane`] sized for the reserve (`waves * unit` rows): the
 //! HC residual and boundary state, the FFN input, router ids/weights/wire,
 //! the shared result, window proposals, compressor destinations and taps. A
 //! unit only touches its own rows (`RowWindow`), so in-flight units never
 //! share a byte of a row plane.
 //!
 //! **Scratch.** A buffer written and fully consumed inside one hook is
-//! scratch, sized once for the widest admitted unit (`PrefillDepth::unit_cap`)
+//! scratch, sized once for the unit (`PrefillDepth::unit_rows`)
 //! and shared by all slots. There are two kinds:
 //! - Plain scratch: written and read only on the component's own shared
 //!   stream (GEMM workspaces, split-K partials). That stream's order is the
@@ -77,8 +77,8 @@ pub(crate) fn require_rest(pending: bool, owner: &'static str, state: &'static s
     Ok(())
 }
 
-/// The widest reserve a row plane spans (`wave_control::reserve_rows` at
-/// four slots of 4096-row units).
+/// The widest reserve a row plane spans (three 2752-row units; four 2048-row
+/// units span 8192).
 pub(crate) const MAX_RESERVE_ROWS: usize = 8256;
 
 fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -233,12 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_tile_the_reserve_at_every_depth() -> Result<()> {
-        use cuteafd_loader::serving_capacity::wave_control::{reserve_rows, unit_for};
-        let reserve = reserve_rows(4, 4096) as usize;
-        let p = plane(reserve, 40960);
+    fn windows_tile_the_reserve_at_every_pinned_depth() -> Result<()> {
+        use cuteafd_loader::serving_capacity::prefill_waves::unit_rows;
         for k in 1..=4u64 {
-            let unit = unit_for(k, 4096) as usize;
+            let unit = unit_rows(k) as usize;
+            let reserve = k as usize * unit;
+            assert!(reserve <= MAX_RESERVE_ROWS, "depth {k} exceeds the row planes");
+            let p = plane(reserve, 40960);
             let mut end = 0;
             for slot in 0..k as usize {
                 let window = RowWindow::rows(slot * unit..(slot + 1) * unit);

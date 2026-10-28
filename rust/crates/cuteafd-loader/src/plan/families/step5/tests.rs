@@ -718,8 +718,8 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let dir = snapshot("fp8");
     let r = report_context(dir.path(), 2, 96, 6, Some(262_144), 262_144);
     assert!(r.wip_launchable(), "{:?}", r.hints);
-    assert_eq!((r.prefill_unit_rows, r.prefill_waves, r.prefill_slots, r.prefill_span_rows),
-        (Some(4096), Some(3), Some(4), Some(8256)));
+    assert_eq!((r.prefill_unit_rows, r.prefill_waves, r.prefill_span_rows),
+        (Some(2752), Some(3), Some(8256)));
     assert!(!r.executable());
     assert!(r.native_serving_admitted);
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
@@ -776,13 +776,13 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
-        // The endpoint's frames hold one admitted unit; the intake holds the
-        // reserve of four slots, with one scratch owner (#762).
+        // The endpoint's frames hold one unit; the intake holds the three
+        // slots, with one scratch owner.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
-        assert_eq!(rows, 4096);
-        assert_eq!((result.prefill_waves, result.prefill_slots), (Some(3), Some(4)));
+        assert_eq!(rows, 2752);
+        assert_eq!(result.prefill_waves, Some(3));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
-        assert_eq!(span, crate::serving_capacity::wave_control::reserve_rows(4, rows));
+        assert_eq!(span, 3 * rows);
         let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
         let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -1278,28 +1278,23 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
 }
 
 #[test]
-fn step_admits_four_4096_row_slots_and_preserves_explicit_shapes() {
+fn step_runs_the_fixed_three_units_and_preserves_explicit_shapes() {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides, PrefillPlan};
-    // No family narrows the admitted unit (#762: reserve / 2 for every adaptive family).
-    for family in crate::plan::family::registry() {
-        assert_eq!(family.prefill_limits().initial_unit_rows, None, "{}", family.id());
-    }
     let limits = crate::plan::Family::prefill_limits(&super::STEP5);
-    assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows, limits.adaptive), (4096, 4, 8256, true));
+    assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows), (4096, 4, 8256));
     for ranks in [4, 6] {
-        // The A8 wire's measured start (3 x 2752) inside four 4096-row slots.
         assert_eq!(prefill_shape(ranks, limits, Default::default()).unwrap(),
-            PrefillPlan { unit_rows: 4096, waves: 3, span_rows: 8256, slots: 4 });
+            PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
         for (unit, waves) in [(256, 3), (2752, 3), (4096, 2)] {
             assert_eq!(prefill_shape(ranks, limits, PrefillOverrides {
-                unit_rows: Some(unit), waves: Some(waves), span_rows: None, slots: None, reserve_rows: None,
-            }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves, slots: waves });
+                unit_rows: Some(unit), waves: Some(waves), span_rows: None, reserve_rows: None,
+            }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves });
         }
     }
 }
 
 #[test]
-fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
+fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
     for (kind, gpus, sparks) in [("nvfp4", 1, 4), ("fp8", 2, 6)] {
         let snapshot = snapshot(kind);
         let manifest = native_manifest(snapshot.path());
@@ -1307,7 +1302,7 @@ fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity(
             let shape = crate::serving_capacity::prefill_waves::prefill_shape(sparks,
                 crate::plan::Family::prefill_limits(&super::STEP5),
                 crate::serving_capacity::prefill_waves::PrefillOverrides {
-                    unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None, slots: None,
+                    unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
                     reserve_rows: None,
                 }).unwrap();
             let (expected_unit, expected_waves, expected_span) = (shape.unit_rows, shape.waves, shape.span_rows);

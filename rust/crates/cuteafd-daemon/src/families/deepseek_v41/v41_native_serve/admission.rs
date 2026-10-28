@@ -44,7 +44,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         ensure!(local_layers == geometry.layers as usize, "V4.1 remote layers require Spark peers");
         return Ok(None);
     }
-    let slots = super::AdmittedPrefill::resolve(args)?.slots;
+    let slots = super::AdmittedPrefill::resolve(args)?.waves;
     spark_admission(&args.snapshot, catalog, local_layers, args.peers.len(), capacity, slots, topology).map(Some)
 }
 
@@ -288,7 +288,7 @@ pub(super) fn admit_startup(
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
     // Every owner serve allocates: two decode lanes, the prefill slots' storage.
     let shape = super::AdmittedPrefill::resolve(args)?;
-    let passes = shape.slots;
+    let passes = shape.waves;
     let mut target = programs.target(u64::from(super::DECODE_LANE_ROWS), shape.reserve_rows() as u64,
         u64::from(capacity), 1, passes,
         crate::families::deepseek_v41::v41_tensors::fp8_head()
@@ -307,7 +307,7 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes, u64::from(args.prefill_reserve_rows))?, slots)?;
+        owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes)?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
@@ -376,11 +376,10 @@ fn local_vision_owner(enabled: bool, remote: bool) -> bool {
 #[cfg(test)]
 mod startup_tests {
     /// The planner's own target list (decode lanes + prefill slot set) passes
-    /// the Engram check at every admitted depth, and the check still refuses a
+    /// the Engram check at every pinned depth, and the check still refuses a
     /// missing, mis-sized or misplaced owner.
     #[test]
     fn engram_row_admission_matches_the_slot_set_and_decode_lanes() -> anyhow::Result<()> {
-        use cuteafd_loader::serving_capacity::wave_control::reserve_rows;
         let dir = tempfile::tempdir()?;
         let manifest = cuteafd_loader::plan::testing::write_v41_workspaces(dir.path());
         let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(
@@ -388,8 +387,8 @@ mod startup_tests {
         let programs = super::families::deepseek_v41::owners::NativePrograms::new(&fp8, 188)?;
         for k in 2..=4u64 {
             let unit = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(k);
-            let reserve = reserve_rows(4, 4096) as usize;
-            let target = programs.target(80, reserve as u64, unit, 1, 4, false, true)?;
+            let reserve = (k * unit) as usize;
+            let target = programs.target(80, reserve as u64, unit, 1, k as usize, false, true)?;
             super::validate_engram_rows(&target, reserve, 80)?;
             assert!(super::validate_engram_rows(&target, reserve - 64, 80).is_err(), "reserve mismatch");
             let missing: Vec<_> = target.iter().filter(|d| d.group != "lane 1 engram rows").cloned().collect();
@@ -488,7 +487,7 @@ pub(super) fn local_workspace(
     } };
     // One local expert wave per prefill slot at the unit, one per decode lane
     // at decode width.
-    let slots = super::AdmittedPrefill::resolve(args)?.slots;
+    let slots = super::AdmittedPrefill::resolve(args)?.waves;
     Ok((lane(rows)?.checked_mul(slots).context("local serving lanes overflow")?
         + 2 * lane(super::DECODE_LANE_ROWS)?) as u64)
 }
@@ -854,17 +853,17 @@ mod admission_tests {
 
     /// The planner's transport charge is exactly what serve allocates: two
     /// decode lanes' linked waves, every prefill slot's reduce output (slot 0
-    /// holds the link) and the one prefill link's intake over the shared reserve.
+    /// holds the link) and the one prefill link's intake over its slots.
     #[test]
     fn transport_charge_equals_serve_allocation() -> anyhow::Result<()> {
         use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, V41Link};
         for (rows, ranks) in [(1024u32, 3usize), (1408, 3), (2752, 4), (2752, 6), (4096, 4)] {
             for slots in 2..=4usize {
-                let reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(rows));
+                let reserve = slots as u64 * u64::from(rows);
                 let runtime = 2 * NativeTp4Wave::device_bytes_for(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS, ranks)?
                     + slots * rows as usize * 5120 * 2
                     + V41Link::prefill_device_bytes(reserve as usize, ranks)?;
-                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS), u64::from(rows), ranks, slots, 8192)?, runtime as u64,
+                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS), u64::from(rows), ranks, slots)?, runtime as u64,
                     "{slots} x {rows} rows on {ranks} ranks");
             }
         }

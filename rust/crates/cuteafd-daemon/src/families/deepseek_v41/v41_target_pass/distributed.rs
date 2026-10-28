@@ -1252,10 +1252,7 @@ mod tests {
             &catalog, 20, peers.len(), cuteafd_core::V41_VERIFY_ROWS as u32, 2,
             // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
             Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;
-        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                timeout: Duration::from_secs(120),
-                max_frame_bytes: 2 << 20,
-            }, 0)?;
+        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
@@ -1444,10 +1441,7 @@ mod tests {
         let mut other_transport = devices[1].own(|| {
             NativeTp4Wave::new(
                 &lib,
-                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                        timeout: Duration::from_secs(120),
-                        max_frame_bytes: 2 << 20,
-                    }, 0)?,
+                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?,
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;
@@ -1459,8 +1453,7 @@ mod tests {
         let ffn_storage = tp2_ffn::Storage::new(routed, shared, 20, 32, 16, [None, None])?;
         let link = devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
             SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16,
-                TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                    timeout: Duration::from_secs(120), max_frame_bytes: 2 << 20 }, 2)?, 2, 16, 32))?;
+                crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 2)?, 2, 16))?;
         let mut slot_transports = [devices[1].own(|| NativeTp4Wave::with_link(&lib, link.into_inner()))?,
             devices[1].own(|| NativeTp4Wave::unlinked(&lib, 16))?];
         for transport in &mut slot_transports { transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?; }
@@ -1468,7 +1461,6 @@ mod tests {
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
             slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
-            depth: std::rc::Rc::new(crate::shared::prefill_depth::PrefillDepth::in_reserve(2, 2, 16, 64, true)?),
         };
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;

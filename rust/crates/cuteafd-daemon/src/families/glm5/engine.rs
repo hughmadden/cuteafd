@@ -265,9 +265,8 @@ struct Workspace<'a> {
     _head_workspace: Buf<'a>,
 }
 
-/// A GPU's prefill slots (#762): per admitted depth `k` (index `k - 1`), its
-/// `k` slot views; every depth's slots are views into the same arenas.
-type SlotViews<'a> = Vec<Vec<Workspace<'a>>>;
+/// A GPU's prefill slots: one view per slot into the same arenas.
+type SlotViews<'a> = Vec<Workspace<'a>>;
 
 /// A GPU's hook-local step storage ([`Workspace`]), shared by its prefill slots.
 struct SharedStep<'a> {
@@ -396,15 +395,15 @@ pub(crate) struct GlmEngine<'a> {
     index: Vec<Option<Dev<'a>>>,
     cos_sin: Dev<'a>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
-    /// Prefill slot views per admitted depth (a serial prefill uses depth 1's
-    /// slot): every unit in flight on the one Spark transport owns a slot
-    /// (PLAN "Prefill contract"), whose rows are views at `slot * unit` into
-    /// arenas spanning the admitted reserve (#762).
+    /// Prefill slot views (a serial prefill uses slot 0): every unit in
+    /// flight on the one Spark transport owns a slot (PLAN "Prefill
+    /// contract"), whose rows are views at `slot * unit` into arenas spanning
+    /// the slots' units.
     prefill_slots: RefCell<SlotViews<'a>>,
-    /// Admitted prefill slots: the deepest depth the executor may run (and
-    /// every per-slot owner: exchange slots, commit blocks, KV tables, TP2).
+    /// Prefill slots (every per-slot owner: exchange slots, commit blocks,
+    /// KV tables, TP2).
     prefill_lanes: usize,
-    /// The runtime depth inside the admitted slots (#762 stages 2-4).
+    /// The prefill shape: `prefill_lanes` units of `prefill_rows`.
     depth: crate::shared::prefill_depth::PrefillDepth,
     /// Recorded after a unit's route/wire copies to its pinned staging: the
     /// host waits for these copies only, never the whole stream.
@@ -522,10 +521,10 @@ impl<'a> GlmEngine<'a> {
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         embedding: TokenEmbedding<'a>, depth: crate::shared::prefill_depth::PrefillDepth,
         context_mode: Option<GlmContext>) -> Result<Self> {
-        let prefill_lanes = depth.slots();
+        let prefill_lanes = depth.waves;
         ensure!((1..=4).contains(&prefill_lanes), "GLM prefill lanes must match admitted inventory");
-        ensure!(depth.unit_cap() == prefill_rows, "GLM prefill depth admits {}-row units, the engine {prefill_rows}",
-            depth.unit_cap());
+        ensure!(depth.unit_rows == prefill_rows, "GLM prefill depth runs {}-row units, the engine {prefill_rows}",
+            depth.unit_rows);
         ensure!(context_mode.is_none() || pages % 2 == 0, "a context pool has two equal halves, not {pages} pages");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
@@ -837,9 +836,9 @@ impl<'a> GlmEngine<'a> {
             page_tables: (0..slots).map(|_| self.alloc(tables).map(Buf::owned)).collect::<Result<_>>()? })
     }
 
-    /// Builds both ranks' prefill slot views once (#762): one shared step
-    /// storage and one set of row arenas spanning the admitted reserve per
-    /// GPU, and for each admitted depth `k` its `k` slot views. The ordered
+    /// Builds both ranks' prefill slot views once: one shared step storage
+    /// and one set of row arenas spanning the slots' units per GPU, and one
+    /// view per slot. The ordered
     /// upload staging of every view's address is reserved at its widest
     /// extent here, so no prefill call allocates.
     fn ensure_prefill_slots(&self) -> Result<()> {
@@ -862,14 +861,14 @@ impl<'a> GlmEngine<'a> {
         let logits = if self.full_prefill_logits { unit } else { unit.min(DECODE_ROWS) };
         let arenas = self.rows_slots_here(rank, reserve, logits, self.pages * 4, slots)?;
         let views = cuteafd_loader::placement::families::glm5::slot_views(unit as u64, slots as u64).into_iter()
-            .map(|depth| depth.into_iter().enumerate().map(|(slot, rows)| arenas.view(&shared, rows.start as usize,
-                (rows.end - rows.start) as usize, arenas.page_tables[slot].clone())).collect::<Result<Vec<_>>>())
+            .enumerate().map(|(slot, rows)| arenas.view(&shared, rows.start as usize,
+                (rows.end - rows.start) as usize, arenas.page_tables[slot].clone()))
             .collect::<Result<SlotViews<'a>>>()?;
         // Ordered uploads key their pinned staging by destination address and
         // size it on first use: reserve each address at its widest view.
         let stream = self.stream_of(rank);
         let mut widest = std::collections::BTreeMap::<usize, cuteafd_ffi::CuteafdDeviceBuffer>::new();
-        for w in views.iter().flatten() {
+        for w in &views {
             for buffer in [w.positions.buffer, w.slots.buffer, w.page_table.buffer, w.cache_lengths.buffer,
                 w.lengths.buffer, w.ids.buffer] {
                 let entry = widest.entry(buffer.ptr as usize).or_insert(buffer);
@@ -939,11 +938,8 @@ impl<'a> GlmEngine<'a> {
         self.prefill_lanes > 1 && self.weights.layers.len() == self.cfg.layers && self.prefill_link.borrow().is_some()
     }
 
-    /// The runtime prefill depth controller (#762).
-    pub(crate) fn prefill_depth(&self) -> &crate::shared::prefill_depth::PrefillDepth { &self.depth }
-
-    /// Longest chunk one prefill call takes, bounded by the shared admitted span:
-    /// whole units at every depth the controller may choose (#762).
+    /// Longest chunk one prefill call takes, bounded by the shared span: the
+    /// slots' units.
     pub fn prefill_capacity(&self) -> usize {
         if self.pipelined() { self.prefill_span_rows().min(self.depth.call_rows()) }
         else { self.prefill_rows }
@@ -990,10 +986,8 @@ impl<'a> GlmEngine<'a> {
             ensure!(start + t <= self.max_context, "prefill of {t} rows at {start} exceeds the context");
             let mut link = self.prefill_link.borrow_mut();
             let link = link.as_mut().context("GLM prefill units need the prefill link")?;
-            // A prefill call boundary (#762): finished calls' paces, this
-            // call's depth (a sequence's first page keys it), the link re-cut.
-            let key = placement.pages.first().map_or(u64::MAX, |&page| u64::from(page));
-            let depth = self.start_prefill(link, key, start, t)?;
+            let depth = self.depth;
+            ensure!(depth.waves <= link.waves(), "{} prefill waves exceed the link's {} slots", depth.waves, link.waves());
             let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
                 MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
@@ -1001,12 +995,8 @@ impl<'a> GlmEngine<'a> {
                 lanes.push(self.prefill_tables(placement, start + rows.start, rows.len())?);
                 chunks.push(&tokens[rows]);
             }
-            self.depth.ran(depth, lanes.len(), t);
             let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
-            let logits = self.step_lanes(&lanes, &chunks, depth, logit_rows, link, runtime);
-            // The call's last wave is sent: later waves are not its.
-            link.exchange()?.stop_prefill();
-            let logits = logits?;
+            let logits = self.step_lanes(&lanes, &chunks, depth, logit_rows, link, runtime)?;
             placement.len += t;
             return Ok(logits);
         }
@@ -1172,7 +1162,7 @@ impl<'a> GlmEngine<'a> {
         }
         if !tables.decode { self.ensure_prefill_slots()?; }
         let (decode_workspace, prefill_slots) = (self.decode_workspace.borrow(), self.prefill_slots.borrow());
-        let w = if tables.decode { decode_workspace.as_ref().context("workspace")? } else { &prefill_slots[0][0] };
+        let w = if tables.decode { decode_workspace.as_ref().context("workspace")? } else { &prefill_slots[0] };
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
         ensure!(tables.decode || self.full_prefill_logits || logit_rows <= DECODE_ROWS,
             "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
@@ -1339,8 +1329,8 @@ impl<'a> GlmEngine<'a> {
     }
 
 
-    /// Rank 1's workspaces (the decode one, or depth `depth`'s prefill slots), created on first use.
-    fn peer_workspaces(&self, decode: bool, depth: usize)
+    /// Rank 1's workspaces (the decode one, or its first `count` prefill slots), created on first use.
+    fn peer_workspaces(&self, decode: bool, count: usize)
         -> Result<Option<PeerWorkspaces<'_, 'a>>> {
         let Some(peer) = &self.peer else { return Ok(None) };
         if decode {
@@ -1350,32 +1340,17 @@ impl<'a> GlmEngine<'a> {
             return Ok(Some(PeerWorkspaces::Decode(peer.decode_workspace.borrow())));
         }
         self.ensure_prefill_slots()?;
-        ensure!((1..=self.prefill_lanes).contains(&depth), "prefill depth {depth} outside the admitted {} slots",
+        ensure!((1..=self.prefill_lanes).contains(&count), "{count} prefill slots outside the {} slots",
             self.prefill_lanes);
-        Ok(Some(PeerWorkspaces::Lanes(std::cell::Ref::map(peer.prefill_slots.borrow(), |views| &views[depth - 1][..]))))
+        Ok(Some(PeerWorkspaces::Lanes(std::cell::Ref::map(peer.prefill_slots.borrow(), |views| &views[..count]))))
     }
 
-    /// Rank 0's prefill slots at depth `depth`, created on first use.
-    fn slot_workspaces(&self, depth: usize) -> Result<std::cell::Ref<'_, [Workspace<'a>]>> {
+    /// Rank 0's first `count` prefill slots, created on first use.
+    fn slot_workspaces(&self, count: usize) -> Result<std::cell::Ref<'_, [Workspace<'a>]>> {
         self.ensure_prefill_slots()?;
-        ensure!((1..=self.prefill_lanes).contains(&depth), "prefill depth {depth} outside the admitted {} slots",
+        ensure!((1..=self.prefill_lanes).contains(&count), "{count} prefill slots outside the {} slots",
             self.prefill_lanes);
-        Ok(std::cell::Ref::map(self.prefill_slots.borrow(), |views| &views[depth - 1][..]))
-    }
-
-    /// A prefill call boundary (#762): every finished call's pace (no host
-    /// wait) to the depth controller, this call's depth (sequence `key` from
-    /// row `start`), the link re-cut to it at rest, and this call's waves
-    /// flagged as its own.
-    fn start_prefill(&self, link: &mut SparkLink<'_>, key: u64, start: usize, rows: usize)
-        -> Result<crate::shared::prefill_depth::Depth> {
-        self.depth.report(link.exchange()?.take_prefill()?);
-        let next = self.depth.start(key, start, rows);
-        ensure!(next.waves <= link.slots() && next.unit_rows <= self.prefill_rows,
-            "prefill depth {next:?} outside the link's {} admitted slots", link.slots());
-        link.set_geometry(next.waves, next.unit_rows)?;
-        link.exchange()?.begin_prefill(next.call)?;
-        Ok(next)
+        Ok(std::cell::Ref::map(self.prefill_slots.borrow(), |views| &views[..count]))
     }
 
     /// Rank 1's attention half of unit (`index`, `lane`): (layer 0: the embedded
@@ -1957,7 +1932,7 @@ impl<'a> GlmEngine<'a> {
     /// posted and received on its thread while this thread queues the other
     /// lanes' GPU layers. Returns the last `logit_rows` rows' logits.
     #[allow(clippy::too_many_arguments)]
-    fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], depth: crate::shared::prefill_depth::Depth,
+    fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth,
         logit_rows: usize, link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || {
@@ -1969,10 +1944,10 @@ impl<'a> GlmEngine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
-        chunks: &[&[u32]], depth: crate::shared::prefill_depth::Depth, logit_rows: usize, link: &mut SparkLink<'_>,
+        chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth, logit_rows: usize, link: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
         // `lanes` are the call's units in order; at most `waves` are in flight,
-        // unit `u` holding slot `u % waves` of depth `depth.waves`'s views on both ranks.
+        // unit `u` holding slot `u % waves` on both ranks.
         let waves = depth.waves.min(lanes.len()).max(1);
         ensure!(waves <= link.waves(), "{waves} prefill units in flight exceed the link's {} waves", link.waves());
         let owned = self.slot_workspaces(depth.waves)?;

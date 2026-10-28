@@ -67,7 +67,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let prefill_shape = super::AdmittedPrefill::resolve(&args)?;
     ensure!(prefill_shape.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         prefill_shape.unit_cap);
-    let slots = prefill_shape.slots;
+    let slots = prefill_shape.waves;
     let decode_rows = super::DECODE_LANE_ROWS;
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
@@ -388,7 +388,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, prefill_shape.reserve as u64)?)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots)?)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -500,7 +500,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     };
     let [mut transport, mut second_transport] = lanes.try_map(|lane| decode_transport(lane.index()))?;
     let mut prefill_link = Some(devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
-        super::spark_transport(&args.peers, capacity, timing, spark_world, 2)?, slots, capacity, reserve))?);
+        super::spark_transport(&args.peers, capacity, timing, spark_world, 2)?, slots, capacity))?);
     let slot_transports = (0..slots).map(|slot| -> Result<_> {
         let mut transport = match slot {
             0 => devices[1].own(|| NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?.into_inner()))?,
@@ -517,8 +517,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
     }
-    let mut prefill_slots = super::prefill_target::PrefillSlots { slots: slot_passes.into_iter().zip(slot_transports).collect(),
-        depth: std::rc::Rc::new(prefill_shape.depth()?) };
+    let mut prefill_slots = super::prefill_target::PrefillSlots { slots: slot_passes.into_iter().zip(slot_transports).collect() };
     if expert_layers < 40 {
         let link = &mut prefill_slots.slots[0].1;
         devices[1].run(|| link.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
@@ -555,10 +554,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let mut prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
-    // The prefill depth controller (#762): evidence or calibration before readiness.
-    super::calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefixes, &mut prefill_slots,
-        format!("2rtx-tp{}x{}", spark_world.topology().tp(), spark_world.topology().ep()))?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;

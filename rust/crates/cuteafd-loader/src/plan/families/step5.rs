@@ -345,15 +345,6 @@ impl Family for Step5 {
         // Step-5 decode/verify steps send at most 64 rows (`rows.min(64)`).
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
-    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
-        // A8 wire (#802): 3 x 2752 delivered most at 8K/64K (2720/2425 tok/s vs
-        // 4 x 2048 2483/2357, 2 x 4096 2347/2253); adaptive inside 4 x 4096 (#762).
-        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
-            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
-            source: "https://github.com/tpurtell/cuteafd/pull/802; A8 wire unit runs: 3x2752 best at 8K/64K",
-        }, adaptive: true, ..Default::default() }
-    }
     fn id(&self) -> &'static str { "step5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

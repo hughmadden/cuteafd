@@ -339,9 +339,8 @@ pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, wa
 
 /// One transport's rank planes and the machinery that fills them.
 ///
-/// Each rank owns one reserve range; the intake admits `slots` return slots
-/// of up to `rows` rows and cuts the range into the current `waves` slots
-/// ([`SlotGeometry`], re-cut at rest with [`Self::set_geometry`]). Waves take
+/// Each rank owns one range of `waves` return slots of `rows` rows
+/// ([`SlotGeometry`], fixed for the intake's lifetime). Waves take
 /// slots in dispatch order (`sequence % waves`), the same order the transport
 /// receives them; a slot is reused only after the reduce that read its
 /// previous wave (its own consumed event).
@@ -434,22 +433,14 @@ impl<'a> SparkIntake<'a> {
     }
 
     /// `waves` return slots of `rows` rows, registered as one contiguous
-    /// range per rank (the reserve is exactly `waves * rows`).
+    /// range of `waves * rows` rows per rank.
     pub(crate) fn with_waves(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize,
         row_bytes: usize, waves: usize) -> Result<Self> {
-        Self::with_reserve(library, mode, ranks, rows, row_bytes, waves, waves * rows)
-    }
-
-    /// Up to `slots` return slots of up to `rows` rows inside a reserve of
-    /// `reserve_rows` rows per rank, cut at first into `slots` slots of the
-    /// widest rows that fit; [`Self::set_geometry`] re-cuts it at rest.
-    pub(crate) fn with_reserve(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize,
-        row_bytes: usize, slots: usize, reserve_rows: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        let waves = slots;
         ensure!((1..=8).contains(&ranks), "{ranks} Spark ranks are outside the one-through-eight transport worlds");
         ensure!((1..=4).contains(&waves), "Spark intake admits 1..=4 return slots");
-        let geometry = SlotGeometry::new(waves, rows, reserve_rows, waves, rows.min(reserve_rows / waves))?;
+        let geometry = SlotGeometry::new(waves, rows)?;
+        let reserve_rows = geometry.reserve_rows();
         let plane_bytes = rows * row_bytes;
         let planes = (0..ranks).map(|_| DeviceAllocation::new(library, (reserve_rows * row_bytes).max(256)))
             .collect::<Result<Vec<_>>>()?;
@@ -482,32 +473,14 @@ impl<'a> SparkIntake<'a> {
         }).collect())
     }
 
-    /// Multi-slot links place each wave's GPU landing slice per request, so
-    /// their cut may change; a single-slot link keeps one rotating range.
+    /// Multi-slot links place each wave's GPU landing slice per request; a
+    /// single-slot link keeps one rotating range.
     pub(crate) fn placed(&self) -> bool { self.waves > 1 }
 
     /// Each rank's whole reserve range.
     pub(crate) fn ranges(&self) -> Vec<CuteafdDeviceBuffer> { self.planes.iter().map(|plane| plane.buffer).collect() }
-    /// The admitted slots and rows, and the current cut.
+    /// The return slots and their rows.
     pub(crate) fn geometry(&self) -> SlotGeometry { self.geometry.borrow().clone() }
-
-    /// Re-cuts the reserve into `waves` slots of `rows` rows. Legal only at
-    /// rest: no upload or reduce pending, no receive slot held, and dispatch
-    /// and receive at the same slot. Rotation restarts at slot 0.
-    pub(crate) fn set_geometry(&self, waves: usize, rows: usize) -> Result<()> {
-        // A single-slot intake lands every wave in its one rotating range: a
-        // one-window call (any admitted rows) leaves it as it is.
-        if !self.placed() { return self.geometry.borrow().one_window(waves, rows); }
-        ensure!(!self.state.copies_pending.get() && self.state.consumed_pending.iter().all(|p| !p.get())
-            && self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.is_empty()
-            && self.state.dispatch_slot.get() == self.state.receive_slot.get(),
-            "the Spark intake re-cuts its return slots only at rest");
-        if self.geometry.borrow_mut().set(waves, rows)? {
-            self.state.dispatch_slot.set(0);
-            self.state.receive_slot.set(0);
-        }
-        Ok(())
-    }
 
     /// Return slots of the current cut.
     pub(crate) fn waves(&self) -> usize { self.geometry.borrow().cut().waves }
@@ -1544,46 +1517,16 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn new_waves(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
         peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
         row_bytes: usize, waves: usize, wave_rows: u32) -> Result<Self> {
-        Self::new_reserve(library, world, peers, capacity, config, row_bytes, waves, wave_rows,
-            waves * wave_rows as usize)
-    }
-
-    /// A link admitting up to `slots` outstanding waves of up to `wave_rows`
-    /// rows, whose return slots are cut from one `reserve_rows`-row range per
-    /// rank ([`SparkIntake::with_reserve`]); the cut starts at `slots` slots of
-    /// the widest rows that fit and changes at rest with [`Self::set_geometry`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_reserve(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
-        peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
-        row_bytes: usize, slots: usize, wave_rows: u32, reserve_rows: usize) -> Result<Self> {
         ensure!((1..=capacity).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         let timing = config.timing;
         let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
-        transport.set_max_waves(slots)?;
-        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, slots, wave_rows,
-            reserve_rows, timing)
+        transport.set_max_waves(waves)?;
+        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, waves, wave_rows, timing)
     }
 
-    /// Return slots of the current cut.
+    /// Return slots.
     pub(crate) fn waves(&self) -> usize { self.intake.waves() }
-    /// Admitted return slots (the most [`Self::set_geometry`] accepts).
     pub(crate) fn slots(&self) -> usize { self.intake.slots() }
-
-    /// Re-cuts the return slots into `waves` slots of `rows` rows (#762):
-    /// the intake and the running exchange together, at rest (every wave
-    /// landed and consumed). Nothing is allocated, registered or reconnected.
-    pub(crate) fn set_geometry(&mut self, waves: usize, rows: usize) -> Result<()> {
-        let previous = self.intake.geometry().cut();
-        self.intake.set_geometry(waves, rows)?;
-        if let Some(exchange) = self.exchange.as_mut() {
-            if let Err(error) = exchange.set_geometry(waves, rows) {
-                // Both are at rest, so the intake can return to the cut the exchange kept.
-                self.intake.set_geometry(previous.waves, previous.rows)?;
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
     pub(crate) fn world_size(&self) -> usize { self.world_size }
     pub(crate) fn world(&self) -> cuteafd_transport::expert::SparkWorld { self.world }
     /// The most rows any request on this link may carry.
@@ -1596,32 +1539,29 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn from_transport(library: &'a NativeLibrary, transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, timing: bool) -> Result<Self> {
         let capacity = transport.capacity();
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, capacity as usize, timing)
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, timing)
     }
 
-    /// [`Self::from_transport`] admitting up to `slots` outstanding waves of up
-    /// to `wave_rows` rows, cut from one `reserve_rows`-row range per rank
-    /// (one prefill transport with N waves, PLAN "Prefill contract").
-    #[allow(clippy::too_many_arguments)]
+    /// [`Self::from_transport`] with `waves` outstanding waves of `wave_rows`
+    /// rows (one prefill transport with N waves, PLAN "Prefill contract").
     pub(crate) fn from_transport_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
-        row_bytes: usize, preference: IntakePreference, slots: usize, wave_rows: u32, reserve_rows: usize,
-        timing: bool) -> Result<Self> {
+        row_bytes: usize, preference: IntakePreference, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
         ensure!((1..=transport.capacity()).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
-        transport.set_max_waves(slots)?;
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, slots, wave_rows, reserve_rows, timing)
+        transport.set_max_waves(waves)?;
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, waves, wave_rows, timing)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, enable_egress: bool, waves: usize, wave_rows: u32,
-        reserve_rows: usize, timing: bool) -> Result<Self> {
+        timing: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let ranks = transport.world_size();
         let capacity = transport.capacity();
         library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
         let (mode, reason) = choose_preferred_mode(library, preference)?.mode_for(ranks * capacity as usize * row_bytes);
         tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
-        let intake = SparkIntake::with_reserve(library, mode, ranks, wave_rows as usize, row_bytes, waves, reserve_rows)?;
+        let intake = SparkIntake::with_waves(library, mode, ranks, wave_rows as usize, row_bytes, waves)?;
         // SAFETY: the link drops its transport (and its exchange's) before its
         // intake, and every wave's planes are read only between its landing
         // and its consume, both ordered by the exchange.

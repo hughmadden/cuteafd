@@ -338,7 +338,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     let capacity = if let Some(unit) = args.prefill_units {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
-            unit_rows: Some(unit as u64), waves: Some(u64::from(args.prefill_waves)), span_rows: None, slots: None, reserve_rows: None,
+            unit_rows: Some(unit as u64), waves: Some(u64::from(args.prefill_waves)), span_rows: None, reserve_rows: None,
         })?.span_rows as usize
     } else { 4096 };
     ensure!((1..=capacity).contains(&rows) && rows <= tokens.len(),
@@ -800,7 +800,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     if args.prefill_units.is_some() {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         let shape = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
-            unit_rows: Some(unit as u64), waves: Some(waves as u64), span_rows: None, slots: None, reserve_rows: None,
+            unit_rows: Some(unit as u64), waves: Some(waves as u64), span_rows: None, reserve_rows: None,
         })?;
         ensure!(rows as u64 <= shape.span_rows, "Step-5 golden rows exceed the admitted unit span");
     }

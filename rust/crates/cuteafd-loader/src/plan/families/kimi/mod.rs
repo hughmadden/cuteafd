@@ -260,13 +260,6 @@ impl Family for KimiK3 {
         // Kimi decode/verify steps send at most 64 rows (`rows.min(64)`).
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
-    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
-        PrefillLimits { estimate: PrefillEstimate::MeasuredWaves {
-            waves: 3, reference_ranks: 6, larger_topology_waves: 3,
-            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; K6/BF16 k3 versus legacy k2, no independent S/T",
-        }, adaptive: true, ..Default::default() }
-    }
     fn id(&self) -> &'static str { "kimi_k3" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

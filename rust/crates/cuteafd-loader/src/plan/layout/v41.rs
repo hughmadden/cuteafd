@@ -50,11 +50,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mode = Fp8Head::configured();
     let fp8_head = mode.target();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
-    // Admitted slots (#762): the deepest depth the controller may run, on one
-    // storage set over the reserve; two decode lanes at decode width.
-    let slots = usize::try_from(prefill.slots)?;
-    let reserve = options.prefill_reserve_rows.unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS);
-    let span = crate::serving_capacity::wave_control::reserve_rows_in(slots as u64, rows, reserve);
+    // The prefill slots, one storage set over their units; two decode lanes
+    // at decode width.
+    let slots = usize::try_from(prefill.waves)?;
+    let span = slots as u64 * rows;
     let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, fp8_head, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
@@ -83,7 +82,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let spark_ranks = report.placement.spark_ranks();
     // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
-    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots, reserve)? } else { 0 };
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots)? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",

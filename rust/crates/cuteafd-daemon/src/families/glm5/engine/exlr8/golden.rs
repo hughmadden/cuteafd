@@ -547,9 +547,8 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<
                 let mut link = engine.prefill_link.borrow_mut();
                 let link = link.as_mut().context("EXLR8 lane golden needs the prefill link")?;
                 let runtime = engine.prefill_runtime.as_ref().context("prefill runtime")?;
-                // Pinned waves: the admitted depth, at its full unit.
-                let (waves, unit_rows) = engine.depth.current();
-                let depth = crate::shared::prefill_depth::Depth { waves, unit_rows, call: 0 };
+                // Pinned waves: the engine's shape, at its full unit.
+                let depth = engine.depth;
                 let logits = engine.host_logits(engine.step_lanes(tables, chunks, depth, usize::from(last), link, runtime)?)?;
                 if last { pipelined = logits; }
                 else { ensure!(logits.is_none(), "zero-row pipeline prefill returned logits"); }

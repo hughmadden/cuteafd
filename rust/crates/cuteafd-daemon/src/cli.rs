@@ -1125,16 +1125,11 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u32).range(80..=4096))]
     pub prefill_batch_tokens: u32,
 
-    /// Prefill units in flight at the first call (the deployment's
-    /// prefill_waves); with more admitted slots the runtime controller (#762)
-    /// chooses each call's depth. Equal to the slots it pins the depth.
+    /// Prefill units in flight (the deployment's prefill_waves): one slot
+    /// pass each on the shared storage set.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: u8,
-    /// Admitted prefill slots (the deployment's prefill_slots): one slot pass
-    /// each on the shared storage set; 0 resolves them from the family.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
-    pub prefill_slots: u8,
-    /// The reserve every depth's units are cut from (the deployment's
+    /// The reserve the units are cut from (the deployment's
     /// prefill_reserve_rows: 8192, or the planner's fit cap below it).
     #[arg(long, default_value_t = 8192, value_parser = clap::value_parser!(u32).range(64..=8192))]
     pub prefill_reserve_rows: u32,

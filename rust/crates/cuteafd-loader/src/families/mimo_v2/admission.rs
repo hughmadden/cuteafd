@@ -17,7 +17,7 @@ pub fn resolve_transport_lanes(spark: bool, family: &str, configured: Option<&st
         // Flash TP4 prefill is faster with two larger waves; the Pro TP6
         // measurement above does not apply to its smaller expert geometry.
         None => Ok(if matches!(family, "mimo" | "mimo2" | "mimof" | "mimof2") { 2 } else { 3 }),
-        Some(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
+        Some(other) => anyhow::bail!("MiMo prefill lanes are 1, 2, 3 or 4, not {other}"),
     }
 }
 

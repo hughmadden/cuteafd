@@ -77,14 +77,10 @@ fn deployment_validates_admission_before_checkpoint_access() {
 
 fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
     let value: serde_json::Value = serde_json::from_slice(deployment).unwrap();
-    for field in ["prefill_unit_rows", "prefill_waves", "prefill_slots"] {
+    for field in ["prefill_unit_rows", "prefill_waves"] {
         assert!(value[field].as_u64().is_some_and(|n| n > 0), "{field}: {value}");
     }
-    // Admitted slots (#762): at least the starting depth; more only where the
-    // family's executor chooses its depth at runtime.
-    let (waves, slots) = (value["prefill_waves"].as_u64().unwrap(), value["prefill_slots"].as_u64().unwrap());
-    let adaptive = matches!(value["family"].as_str(), Some("glm5" | "kimi_k3" | "step5"));
-    assert!(slots == waves || (adaptive && slots > waves && slots <= 4), "prefill_slots {slots} for {waves} waves: {value}");
+    assert!(value.get("prefill_slots").is_none(), "{value}");
     // Exercise the launcher's actual consumer, not a copied jq predicate or a
     // fabricated plan. Sourcing the whole launcher would start containers.
     let source = include_str!("../../../../scripts/launch/run-family.sh");
@@ -93,15 +89,15 @@ fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
         let end = source[start..].find("\n}\n").unwrap() + start + 3;
         &source[start..end]
     };
-    let script = format!("set -euo pipefail\nrelease_die() {{ echo \"$*\" >&2; exit 1; }}\n{}\n{}\nrelease_prefill_shape \"$(cat \"$1\")\" \"$2\"\nprintf '%s %s %s\\n' \"$PREFILL_ROWS\" \"$PREFILL_WAVES\" \"$PREFILL_SLOTS\"",
+    let script = format!("set -euo pipefail\nrelease_die() {{ echo \"$*\" >&2; exit 1; }}\n{}\n{}\nrelease_prefill_shape \"$(cat \"$1\")\" \"$2\"\nprintf '%s %s\\n' \"$PREFILL_ROWS\" \"$PREFILL_WAVES\"",
         function("family_prefill_mode"), function("release_prefill_shape"));
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), deployment).unwrap();
     let result = Command::new("bash").args(["-c", &script, "prefill-contract"])
         .arg(file.path()).arg(value["family"].as_str().unwrap()).output().unwrap();
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
-    assert!(String::from_utf8_lossy(&result.stdout).ends_with(&format!("{} {} {}\n",
-        value["prefill_unit_rows"], value["prefill_waves"], value["prefill_slots"])));
+    assert!(String::from_utf8_lossy(&result.stdout).ends_with(&format!("{} {}\n",
+        value["prefill_unit_rows"], value["prefill_waves"])));
     value
 }
 
@@ -127,11 +123,10 @@ fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
     assert_eq!(deployment["spark_ranks"], 6);
     assert_eq!(deployment["prefill_unit_rows"], 4096);
     assert_eq!(deployment["prefill_waves"], 1);
-    assert_eq!(deployment["prefill_slots"], 1);
 }
 
 #[test]
-fn glm53_max_deployment_admits_four_4096_row_slots_starting_at_three() {
+fn glm53_max_deployment_runs_three_2752_row_units() {
     use cuteafd_loader::plan::testing;
     let snapshot = tempfile::tempdir().unwrap();
     testing::write_snapshot(snapshot.path(), &testing::glm5_config(),
@@ -144,10 +139,9 @@ fn glm53_max_deployment_admits_four_4096_row_slots_starting_at_three() {
             "--speculator", "off", "--workspace-manifest"]).arg(manifest).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let deployment = release_accepts_prefill(&output.stdout);
-    // The admitted unit (reserve / 2); the depth starts at 3 (2752-row cuts).
-    assert_eq!(deployment["prefill_unit_rows"], 4096);
+    // The fixed depth: three units of the 8192-row reserve.
+    assert_eq!(deployment["prefill_unit_rows"], 2752);
     assert_eq!(deployment["prefill_waves"], 3);
-    assert_eq!(deployment["prefill_slots"], 4);
     assert_eq!(deployment["prefill_span_rows"], 8256);
 }
 

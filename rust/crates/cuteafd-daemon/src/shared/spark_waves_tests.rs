@@ -52,14 +52,14 @@ impl Backend for Fake {
         occupied[job.slot] = Some(job.sequence);
         Ok(FakeWave { sequence: job.sequence, slot: job.slot, polls: 0 })
     }
-    fn poll(&mut self, wave: &mut FakeWave, _info: &WaveInfo) -> Result<Option<RankPace>> {
+    fn poll(&mut self, wave: &mut FakeWave, _info: &WaveInfo) -> Result<bool> {
         let slot = wave.slot;
         self.world.polls.fetch_add(1, Ordering::Relaxed);
         wave.polls += 1;
         if self.world.fail_poll == Some(wave.sequence) && wave.polls == 2 { anyhow::bail!("injected receive failure"); }
-        if wave.polls < 3 { return Ok(None); }
+        if wave.polls < 3 { return Ok(false); }
         self.world.occupied.lock().unwrap()[slot] = None;
-        Ok(Some(Default::default()))
+        Ok(true)
     }
     fn publish(&mut self, sequence: u32) {
         if !reached(self.world.load(Counter::Landed), sequence) { self.world.store(Counter::Landed, sequence); }
@@ -68,7 +68,7 @@ impl Backend for Fake {
 }
 
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
-    Job { sequence, slot, rows: 1, prefill: None, consumed: vec![(slot, consumed)], slice: (slot * 64, 64),
+    Job { sequence, slot, rows: 1, consumed: vec![(slot, consumed)], slice: (slot * 64, 64),
         release: consumed + 1, sent: Instant::now(),
         source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
             build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
@@ -97,7 +97,7 @@ fn drive(world: &Arc<World>, slots: usize, layers: u32, timeout: Duration)
     let (ops, queue) = mpsc::channel::<Op>();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, timeout, false, &LinkPace::default()));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, timeout, false));
         let stream = scope.spawn(|| -> Result<()> {
             for op in queue {
                 match op {
@@ -148,7 +148,7 @@ fn a_wave_waits_for_its_staged_copies_and_its_slots_previous_reduce() {
     let (jobs, inbox) = mpsc::channel();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
         // Wave 2 reuses slot 0, whose wave 1 is landed but not yet reduced.
         world.store(Counter::Staged(0), 1);
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
@@ -167,44 +167,6 @@ fn a_wave_waits_for_its_staged_copies_and_its_slots_previous_reduce() {
     });
 }
 
-/// #762: the first wave after a re-cut waits for every old slot's reduce,
-/// not only its own slot's: the new slot overlaps the old ones' planes.
-#[test]
-fn the_first_wave_after_a_re_cut_waits_for_every_old_slots_reduce() {
-    let world = World::new(4);
-    let (jobs, inbox) = mpsc::channel();
-    std::thread::scope(|scope| {
-        let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
-        let mut geometry = SlotGeometry::new(4, 4096, 8256, 2, 4096).unwrap();
-        let mut uses = [0u32; 4];
-        for (sequence, slot) in [(1u32, 0usize), (2, 1)] {
-            world.store(Counter::Staged(slot), sequence);
-            let mut job = job(sequence, slot, 0);
-            job.consumed = geometry.fences(slot, &uses);
-            jobs.send(Command::Wave(job)).unwrap();
-        }
-        wait(&world, Counter::Landed, 2).unwrap();
-        // Slot 0's reduce is done, slot 1's is still queued on the stream.
-        uses[0] = 1;
-        world.store(Counter::Consumed(0), 1);
-        uses[1] = 1;
-        geometry.set(4, 2048).unwrap();
-        world.store(Counter::Staged(0), 3);
-        let mut job = job(3, 0, 0);
-        job.consumed = geometry.fences(0, &uses);
-        assert_eq!(job.consumed, [(0, 1), (1, 1), (2, 0), (3, 0)]);
-        jobs.send(Command::Wave(job)).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(world.posted.lock().unwrap().len(), 2, "posted into planes old slot 1's reduce still reads");
-        world.store(Counter::Consumed(1), 1);
-        wait(&world, Counter::Landed, 3).unwrap();
-        drop(jobs);
-        let (result, _) = worker.join().unwrap();
-        result.unwrap();
-    });
-}
-
 #[test]
 fn a_failure_releases_every_queued_and_later_wait() {
     for (fail_post, fail_poll) in [(Some(3), None), (None, Some(2)), (Some(1), None), (None, Some(40))] {
@@ -216,7 +178,7 @@ fn a_failure_releases_every_queued_and_later_wait() {
             let world2 = world.clone();
             let worker = scope.spawn(move || {
                 let mut backend = Fake { world: world2 };
-                let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default());
+                let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
                 assert!(result.is_err());
                 release_until_closed(&mut backend, &inbox, highest);
             });
@@ -245,7 +207,7 @@ fn closing_with_waves_in_flight_fails_instead_of_hanging() {
     let (jobs, inbox) = mpsc::channel();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
         // Wave 2's copies never complete: the engine errored before.
         world.store(Counter::Staged(0), 1);
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
@@ -263,7 +225,7 @@ fn a_stalled_gpu_times_out_instead_of_hanging() {
     let (jobs, inbox) = mpsc::channel();
     let (result, _) = std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_millis(50), false, &LinkPace::default()));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_millis(50), false));
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
         let joined = worker.join().unwrap();
         drop(jobs);
@@ -278,7 +240,7 @@ fn an_idle_worker_blocks_instead_of_spinning() {
     let (jobs, inbox) = mpsc::channel();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
         world.store(Counter::Staged(0), 1);
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
         wait(&world, Counter::Landed, 1).unwrap();
@@ -481,7 +443,7 @@ impl Transport for EchoWorld {
             posted: Instant::now(), sent: 0 })
     }
     fn poll(&mut self, wave: &mut EchoWave, sink: &mut dyn FnMut(usize, u32, EchoFrame) -> Result<()>)
-        -> Result<Option<(u8, RankPace)>> {
+        -> Result<Option<u8>> {
         wave.polls += 1;
         if wave.polls < 3 { return Ok(None); }
         let age = wave.posted.elapsed();
@@ -505,11 +467,7 @@ impl Transport for EchoWorld {
         if let Some((cpu, wall)) = self.cpu {
             self.spent = Some((cuteafd_ffi::thread_cpu_seconds()? - cpu, wall.elapsed().as_secs_f64()));
         }
-        let mut pace = RankPace::default();
-        for (rank, sample) in pace.iter_mut().enumerate().take(self.ranks) {
-            *sample = Some((100 * (rank as u32 + 1), (wave.offset % 997) as u32));
-        }
-        Ok(Some((self.landing, pace)))
+        Ok(Some(self.landing))
     }
     fn timeout(&self) -> Duration { Duration::from_secs(10) }
     fn abandon(&mut self) {}
@@ -523,9 +481,8 @@ impl Transport for EchoWorld {
 /// (several slots) queued ahead on one stream through the real exchange:
 /// counters in mapped memory, stream waits and writes, staging copies,
 /// pinned-rank uploads behind the wait, and the reduce. Each case runs its
-/// layers under a sequence of cuts of one reserve (#762: re-cut at rest
-/// between prefills, slices placed per wave); the reduced output of every
-/// layer must equal the host reference byte for byte. Opt in with
+/// layers at its fixed cut (slices placed per wave); the reduced output of
+/// every layer must equal the host reference byte for byte. Opt in with
 /// `CUTEAFD_PLANE_UPLOAD_LIBRARY` (the built native library).
 #[test]
 #[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY)"]
@@ -541,21 +498,21 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     // staging copy (24-byte route rows are not 16-byte multiples).
     let (hidden, topk) = (5120usize, 6usize);
     let row_bytes = hidden * 2;
-    // (ranks, landing ranks, admitted slots, max rows, reserve rows, cuts as
-    // (waves, rows), layers per cut, delay, per-rank stagger). The 800 us case
-    // models a Spark round trip and reports the worker thread's CPU share.
-    // Cut rows scale the shared 4096/2752/2048 reserve down to test size; 128
-    // rows x 10 KiB x 4 pinned ranks crosses the per-rank pull threshold
-    // (#815), so those waves pull rank by rank as each arrives (staggered).
-    let recut = vec![(2usize, 128usize), (3, 86), (4, 64), (2, 128), (1, 128), (4, 64)];
-    for (ranks, landing, slots, max_rows, reserve, cuts, layers, delay_us, stagger_us) in [
-        (3usize, 0u8, 1usize, 16usize, 16usize, vec![(1usize, 16usize)], 80u32, 0u64, 0u64),
-        (4, 0b0101, 1, 64, 64, vec![(1, 64)], 80, 0, 0), (3, 0b111, 1, 1, 1, vec![(1, 1)], 80, 0, 0),
-        (4, 0, 4, 128, 258, recut.clone(), 12, 0, 0), (4, 0, 4, 128, 258, recut.clone(), 12, 200, 300),
-        (6, 0b100001, 4, 128, 258, recut.clone(), 12, 0, 100),
-        (4, 0b1111, 4, 128, 258, recut, 12, 0, 0), (3, 0b111, 1, 1, 1, vec![(1, 1)], 80, 800, 0)] {
+    // (ranks, landing ranks, slots, rows, layers, delay, per-rank stagger).
+    // The 800 us case models a Spark round trip and reports the worker
+    // thread's CPU share. Slot rows scale the shared 2752-row unit down to
+    // test size; 128 rows x 10 KiB x 4 pinned ranks crosses the per-rank pull
+    // threshold (#815), so those waves pull rank by rank as each arrives.
+    for (ranks, landing, slots, max_rows, layers, delay_us, stagger_us) in [
+        (3usize, 0u8, 1usize, 16usize, 80u32, 0u64, 0u64),
+        (4, 0b0101, 1, 64, 80, 0, 0), (3, 0b111, 1, 1, 80, 0, 0),
+        (4, 0, 3, 128, 36, 0, 0), (4, 0, 3, 128, 36, 200, 300), (4, 0, 4, 64, 36, 0, 0),
+        (6, 0b100001, 3, 128, 36, 0, 100),
+        (4, 0b1111, 3, 128, 36, 0, 0), (3, 0b111, 1, 1, 80, 800, 0)] {
         let (delay, stagger) = (Duration::from_micros(delay_us), Duration::from_micros(stagger_us));
-        let total = layers as usize * cuts.len();
+        let cuts = [(slots, max_rows)];
+        let reserve = slots * max_rows;
+        let total = layers as usize;
         let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes))
             .collect::<Result<Vec<_>>>()?;
         let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
@@ -578,8 +535,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         let echo = EchoWorld::new(library.clone(), ranks, row_bytes, landing,
             ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(), delay, stagger,
             slots, max_rows.div_ceil(2) * row_bytes)?;
-        let (first_waves, first_rows) = cuts[0];
-        let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows, reserve, first_waves, first_rows)?;
+        let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows)?;
         let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
         let _ = words.set(exchange.words());
@@ -613,10 +569,6 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             exchange.consumed(slot, stream.raw())
         };
         for (index, &(waves, rows)) in cuts.iter().enumerate() {
-            // A re-cut happens at rest: every wave landed and consumed (the
-            // decode→prefill boundary), with the reduces still queued.
-            while let Some((layer, ticket)) = tickets.pop_front() { land(&mut exchange, layer, ticket)?; }
-            exchange.set_geometry(waves, rows)?;
             assert_eq!(exchange.waves(), waves);
             let layout = RouteStaging::new(rows, topk, row_bytes)?;
             // The host queues every layer of this cut before the GPU runs the
@@ -691,7 +643,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     // Replies take a second: every wave is still in flight when teardown closes.
     let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 0, ranges.iter().map(|range| range.ptr as usize).collect(),
         hosts, words.clone(), Duration::from_secs(1), Duration::ZERO, waves, rows * row_bytes)?;
-    let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows, waves * rows, waves, rows)?;
+    let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows)?;
     let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
     let _ = words.set(exchange.words());
@@ -744,19 +696,6 @@ fn link_teardown_and_reset_take_the_transport_back_from_the_exchange() {
     }
 }
 
-/// #762: the worker's idle signal is zero while a wave is always queued
-/// behind the one in flight, and positive when the engine posts late.
-#[test]
-fn link_pace_measures_spark_idle_between_waves() {
-    let pace = LinkPace::default();
-    pace.record(0.010, Some(0.0));
-    assert_eq!(pace.sample(), (10_000, 0, 1));
-    for _ in 0..64 { pace.record(0.010, Some(0.004)); }
-    let (round_trip, idle, waves) = pace.sample();
-    assert_eq!((round_trip, waves), (10_000, 65));
-    assert!((3_900..=4_000).contains(&idle), "{idle}");
-}
-
 /// Block-mode pacing spins through the hybrid window: a decode wave (Kimi
 /// K3's 0.6-0.7 ms per-layer round) never sleeps, however early it is in its
 /// expected duration; only a wait past 10 ms sleeps, and only while early.
@@ -774,86 +713,6 @@ fn pacing_spins_through_the_hybrid_window_before_sleeping() {
     assert!(!Pace::early(Some(0.050), 0.040));
     // No mean yet: never sleeps.
     assert!(!Pace::early(None, 0.020));
-}
-
-/// #762: a prefill call's pace sums every rank's reported busy/idle after
-/// its first unit, counts the rows of those units, and ignores ranks that
-/// report nothing (decode owners) and waves sent outside the call.
-#[test]
-fn prefill_accumulator_skips_each_ranks_first_unit() {
-    let mut sums = PrefillAccumulator::default();
-    let wave = |busy: u32, idle: u32| {
-        let mut pace = RankPace::default();
-        pace[0] = Some((busy, idle));
-        pace[1] = Some((busy + 1, idle + 1));
-        pace
-    };
-    sums.add(2048, &wave(9_000, 5_000));
-    assert_eq!(sums.finish(None).rows, 0, "the first unit's idle is the call boundary");
-    sums.add(2048, &wave(8_000, 100));
-    sums.add(1024, &wave(4_000, 0));
-    let pace = sums.finish(None);
-    assert_eq!(pace.rows, 3072);
-    assert_eq!(pace.ranks, vec![(12_000, 100), (12_002, 102)]);
-    sums.add(64, &RankPace::default());
-    assert_eq!(sums.finish(None).ranks, pace.ranks, "a wave without reports adds nothing");
-    assert_eq!(sums.finish(None).rows, pace.rows);
-}
-
-/// The worker adds a prefill wave's reported pace to its own call before
-/// publishing its landing, and only for waves of a prefill call: two calls'
-/// waves never mix (#762, per-call samples).
-#[test]
-fn worker_sums_prefill_wave_pace_before_publishing_landed() -> Result<()> {
-    struct Paced { world: Arc<World>, polls: usize }
-    impl Backend for Paced {
-        type Wave = (u32, usize);
-        fn counter(&self, counter: Counter) -> u32 { self.world.load(counter) }
-        fn post(&mut self, job: Job) -> Result<(u32, usize)> { Ok((job.sequence, job.slot)) }
-        fn poll(&mut self, wave: &mut (u32, usize), _info: &WaveInfo) -> Result<Option<RankPace>> {
-            self.polls += 1;
-            let mut pace = RankPace::default();
-            pace[0] = Some((1_000 * wave.0, 10 * wave.0));
-            Ok(Some(pace))
-        }
-        fn publish(&mut self, sequence: u32) { self.world.store(Counter::Landed, sequence); }
-    }
-    let world = World::new(2);
-    let link = LinkPace::default();
-    let (jobs, inbox) = mpsc::channel();
-    std::thread::scope(|scope| -> Result<()> {
-        let mut backend = Paced { world: world.clone(), polls: 0 };
-        let link = &link;
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, link));
-        for (sequence, prefill) in [(1, None), (2, Some(7)), (3, Some(7)), (4, Some(7)), (5, Some(8)), (6, Some(8)),
-            (7, None)] {
-            let mut job = job(sequence, (sequence as usize) % 2, 0);
-            job.rows = 100;
-            job.prefill = prefill;
-            world.store(Counter::Staged(job.slot), sequence);
-            jobs.send(Command::Wave(job)).unwrap();
-            wait(&world, Counter::Landed, sequence)?;
-            if let Some(call) = prefill {
-                // Visible as soon as the landing is.
-                assert!(link.prefill().iter().any(|(id, sums)| *id == call && sums.seen[0]));
-            }
-        }
-        drop(jobs);
-        worker.join().unwrap().0
-    })?;
-    // Call 7: wave 2 is rank 0's first unit; waves 3 and 4 count. Call 8:
-    // wave 5 is its first, wave 6 counts. Without a start the wall time is 0.
-    let first = link.take_prefill(7).finish(None);
-    assert_eq!((first.rows, first.ranks, first.wall_us), (200, vec![(7_000, 70)], 0));
-    let second = link.take_prefill(8).finish(None);
-    assert_eq!((second.rows, second.ranks), (100, vec![(6_000, 60)]));
-    assert!(link.prefill().is_empty(), "taken calls are gone");
-    let start = std::time::Instant::now();
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let mut timed = PrefillAccumulator::default();
-    timed.add(100, &[Some((10, 1)), None, None, None, None, None, None, None]);
-    assert!(timed.finish(Some(start)).wall_us >= 2_000, "the call's wall time runs from its start to its last landing");
-    Ok(())
 }
 
 /// A CPU receive ring for the [`Native`] backend tests (#815): each rank holds
@@ -913,7 +772,7 @@ impl Transport for Ring {
         Ok(RingWave { passes: 0, sent: 0, bytes: request.header.row_count as usize * self.row_bytes })
     }
     fn poll(&mut self, wave: &mut RingWave, sink: &mut dyn FnMut(usize, u32, RingFrame) -> Result<()>)
-        -> Result<Option<(u8, RankPace)>> {
+        -> Result<Option<u8>> {
         wave.passes += 1;
         if let Some(limit) = self.fail_poll_after { ensure!(wave.passes <= limit, "injected receive failure"); }
         for rank in 0..self.ranks {
@@ -924,7 +783,7 @@ impl Transport for Ring {
             ensure!(wave.bytes <= bytes, "reply larger than its receive");
             sink(rank, 0, RingFrame { address, bytes: wave.bytes, capacity: bytes, free: self.free[rank].clone() })?;
         }
-        Ok((wave.sent.count_ones() as usize == self.ranks).then(|| (0, RankPace::default())))
+        Ok((wave.sent.count_ones() as usize == self.ranks).then_some(0))
     }
     fn timeout(&self) -> Duration { Duration::from_secs(5) }
     fn abandon(&mut self) {}
@@ -950,7 +809,7 @@ fn built_job(sequence: u32, slot: usize, rows: usize, uses: &[u32], fences: Vec<
         Vec::new(), Vec::new(), bytes::Bytes::new()).unwrap();
     // The fake ring sizes each reply by the request's rows.
     request.header.row_count = rows as u32;
-    Job { sequence, slot, rows, prefill: None, source: Source::Built(request), consumed: fences, slice: (0, rows * 16),
+    Job { sequence, slot, rows, source: Source::Built(request), consumed: fences, slice: (0, rows * 16),
         release: uses[slot] + 1, sent: Instant::now() }
 }
 
@@ -975,7 +834,7 @@ fn retained_frames_never_starve_the_ring_at_the_deepest_admission() {
         let total = 40u32;
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
-                let result = run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default());
+                let result = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
                 (result, backend)
             });
             // The engine: every slot's wave queued at once (as prefill units
@@ -1040,7 +899,7 @@ fn one_receive_fewer_than_the_admitted_slots_runs_the_ring_dry() {
         let info = WaveInfo { sequence, slot, rows: job.rows, slice: job.slice, release: 1 };
         match backend.post(job) {
             Ok(mut wave) => {
-                while backend.poll(&mut wave, &info).unwrap().is_none() {}
+                while backend.poll(&mut wave, &info).unwrap() == false {}
                 held.push(sequence);
             }
             Err(error) => {
@@ -1077,15 +936,15 @@ fn each_pinned_rank_publishes_its_frames_before_the_wave_lands() {
     let info = WaveInfo { sequence: 1, slot: 0, rows, slice: (0, rows * row_bytes), release: 1 };
     let mut wave = backend.post(job).unwrap();
     // Pass 1: rank 0 only.
-    assert!(backend.poll(&mut wave, &info).unwrap().is_none());
+    assert!(backend.poll(&mut wave, &info).unwrap() == false);
     assert!(reached(backend.words.load(Counter::Arrived(0)), 1) && !reached(backend.words.load(Counter::Arrived(1)), 1));
     // SAFETY: the test's descriptor block.
     let published = unsafe { *backend.pulls.at(0, 0) };
     assert_eq!(published.count, 1);
     assert_eq!((published.frame[0].offset, published.frame[0].bytes), (0, (rows * row_bytes) as u64));
     assert_eq!(unsafe { *backend.pulls.at(0, 1) }.count, 0, "rank 1 not published before it arrived");
-    assert!(backend.poll(&mut wave, &info).unwrap().is_none());
-    assert!(backend.poll(&mut wave, &info).unwrap().is_some(), "the third pass completes the wave");
+    assert!(backend.poll(&mut wave, &info).unwrap() == false);
+    assert!(backend.poll(&mut wave, &info).unwrap(), "the third pass completes the wave");
     assert_eq!(backend.retained.len(), 1);
     assert_eq!(backend.retained[0].frames.len(), ranks, "the frames stay until the reduce");
     assert!(!backend.release_consumed(), "not consumed yet");
@@ -1109,7 +968,7 @@ fn a_failure_mid_wave_clears_the_pulls_and_hands_the_frames_back() {
     let (jobs, inbox) = mpsc::channel();
     jobs.send(Command::Wave(built_job(1, 0, rows, &[0, 0], vec![(0, 0), (1, 0)]))).unwrap();
     jobs.send(Command::Wave(built_job(2, 1, rows, &[0, 0], vec![(1, 0)]))).unwrap();
-    let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default());
+    let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
     assert!(format!("{:#}", result.unwrap_err()).contains("injected receive failure"));
     // Ranks 0 and 1 arrived (passes 1-2) and published; rank 2 never did.
     for rank in 0..2 { assert!(reached(words.load(Counter::Arrived(rank)), 1)); }
@@ -1178,7 +1037,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         }
         let buffers = echo.buffers.clone();
         echo.stagger = Duration::ZERO;
-        let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows, rows, 1, rows)?;
+        let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows)?;
         let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
         let stagger = Arc::new(AtomicUsize::new(0));
         let mut exchange = Waves::start(&library, intake, StaggerSwitch { echo, stagger: stagger.clone() }, Vec::new(),
@@ -1214,7 +1073,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
                 // SAFETY: the test's live planes and descriptors; the control
                 // reads rank 1's receive slot before its reply is in.
                 unsafe { exchange.pull(ticket.sequence, slot, rows, 0b11, false, stream.raw())? };
-                exchange.outstanding.front_mut().unwrap().3 = 0b11;
+                exchange.outstanding.front_mut().unwrap().2 = 0b11;
             }
             exchange.land(ticket, stream.raw())?;
             // SAFETY: planes, output and the null shared plane are live.
@@ -1274,7 +1133,7 @@ impl Transport for StaggerSwitch {
         self.echo.dispatch(request, landing)
     }
     fn poll(&mut self, wave: &mut EchoWave, sink: &mut dyn FnMut(usize, u32, EchoFrame) -> Result<()>)
-        -> Result<Option<(u8, RankPace)>> { self.echo.poll(wave, sink) }
+        -> Result<Option<u8>> { self.echo.poll(wave, sink) }
     fn timeout(&self) -> Duration { self.echo.timeout() }
     fn abandon(&mut self) {}
     fn retained_reply_slots(&self) -> Vec<usize> { self.echo.retained_reply_slots() }
