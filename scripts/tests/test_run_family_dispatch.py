@@ -615,11 +615,12 @@ def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None
     pair = source.split("    fn tp2_pair(", 1)[1].split("    fn tp2_publish(", 1)[0]
     assert "self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;" in pair
     assert "self.tp2_rank(1, layer, lane, w1, rows, w1.shared.buffer.ptr)" not in pair
-    assert pair.index("self.tp2_rank(1,") < pair.index("self.library.copy_d2d_async(")
-    assert "self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer," in pair
-    assert "rows * self.cfg.hidden * 2, self.stream_of(1)" in pair
+    assert "self.ffn_on(1, w1, &peer.layers[layer], self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, scalar)?;" in pair
+    assert pair.index("self.ffn_on(1,") < pair.index("self.tp2_rank(1,")
+    assert "copy_d2d_async" not in pair
     publish = source.split("    fn tp2_publish(", 1)[1].split("    fn router_on(", 1)[0]
-    assert "w1.shared.buffer.ptr" in publish
+    assert 'self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.delta.buffer.ptr, rows * self.cfg.hidden * 2)' in publish
+    assert "w1.shared.buffer.ptr" not in publish
     for body in (pair, publish):
         assert "tp2_prepared_peer(prepared_peer)?" in body
         assert "self.peer_workspaces(" not in body

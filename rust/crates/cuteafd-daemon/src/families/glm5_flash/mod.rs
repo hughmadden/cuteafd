@@ -1197,7 +1197,7 @@ pub(crate) struct GoldenArgs {
     /// candidates).
     #[arg(long, hide = true, requires = "resume_at")]
     pub resume_poison_unit0: bool,
-    /// Compare executor N=1 and N=2 at identical row cuts, including recycled slots:
+    /// Compare executor N=1 and the admitted depth at identical cuts, including recycled slots:
     /// every row's logits, KDA state and paged bytes must be identical.
     #[arg(long)]
     pub unit_check: bool,
