@@ -49,7 +49,7 @@ impl<'a> CorePrograms<'a> {
         }
         // Neutral projection and GLM stage namespaces are distinct; both must
         // resolve on this rank before an unmatched peer wait or graph capture.
-        programs.load_matching(|name| name.starts_with("glm_stage_") || name.starts_with("glm2_stage_"))?;
+        programs.load_matching(|name| stage_program(name, ranks))?;
         let owned = layers.iter().any(|layer| layer.attention_owner.is_some());
         for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
             let prefix = if ranks == 2 { "glm2" } else { "glm" };
@@ -83,6 +83,9 @@ impl CoreScratch<'_> {
     pub(crate) fn stage(&self, name: &str) -> Result<Buffer> {
         Ok(self.stages.get(name).with_context(|| format!("GLM K6 missing stage {name}"))?.buffer)
     }
+}
+fn stage_program(name: &str, ranks: usize) -> bool {
+    name.starts_with("glm_stage_") || (ranks == 2 && name.starts_with("glm2_stage_"))
 }
 fn projection_key(weights: &CoreWeights<'_>) -> (usize, usize, usize, &'static str) {
     use cuteafd_loader::formats::dense_trellis::TrellisSide;
@@ -141,6 +144,28 @@ pub(crate) fn pack_layout(rows: usize, stored: usize, logical: usize, pitch: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eager_stages_stay_in_the_admitted_rank_namespaces() {
+        let manifest = serde_json::json!({"programs": [
+            {"name": "glm_stage_rank_pack_m64"},
+            {"name": "glm_stage_swiglu_i2048"},
+            {"name": "glm2_stage_rank_pack_m64"},
+            {"name": "glm2_stage_swiglu_i1024"},
+            {"name": "dense_trellis_k6_input_k6144"},
+            {"name": "kimi_stage_rank_pack_m64"}
+        ]});
+        for ranks in [1, 2] {
+            let admitted = cuteafd_loader::placement::ProgramSet::from_manifest(&manifest,
+                if ranks == 2 { &["glm", "glm2"] } else { &["glm"] });
+            let loaded = manifest["programs"].as_array().unwrap().iter()
+                .filter_map(|p| p["name"].as_str()).filter(|name| stage_program(name, ranks)).collect::<Vec<_>>();
+            assert_eq!(loaded.len(), ranks * 2);
+            assert!(loaded.iter().all(|name| admitted.names.iter().any(|p| p == name)));
+        }
+        assert!(!stage_program("glm2_stage_swiglu_i1024", 1));
+        assert!(stage_program("glm2_stage_swiglu_i1024", 2));
+    }
 
     #[test]
     fn split_shared_core_rounds_once_and_contributes_once() {
