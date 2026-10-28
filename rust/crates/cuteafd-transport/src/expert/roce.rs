@@ -481,6 +481,15 @@ impl SparkExperts {
         self.reset_connections();
     }
 
+    /// Gives up every outstanding wave for a deliberate reset (a cancelled
+    /// request): the QPs reset as [`Self::abandon_waves`] does, but nothing
+    /// failed, so the process stays healthy. The link reconnects next.
+    pub fn cancel_waves(&mut self) {
+        if self.open_waves.is_empty() { return; }
+        self.open_waves.clear();
+        self.reset_connections();
+    }
+
     /// The registered zero-copy request ring, one staging arena per admitted
     /// wave slot (empty before bootstrap or without egress): requests whose
     /// payload views a slot go out from it on every rank without a per-rank

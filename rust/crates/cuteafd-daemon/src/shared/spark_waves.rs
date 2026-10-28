@@ -246,6 +246,9 @@ pub(crate) struct WaveInfo {
 /// A command to the worker.
 pub(crate) enum Command {
     Wave(Job),
+    /// A deliberate stop (a link reset after a cancelled request): waves
+    /// still outstanding are given up without marking the process unhealthy.
+    Cancel,
 }
 
 /// Host seconds of one wave on the worker (the transport-timing profile).
@@ -332,8 +335,17 @@ impl Pace {
 /// blocks on one condition while another could progress: it posts the oldest
 /// job once its staging is complete and its slot's planes are free, and
 /// progresses the oldest wave meanwhile. Returns the highest sequence sent.
+/// How a worker that did not fail stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The link closed the channel at rest.
+    Closed,
+    /// The link cancelled (a reset): waves may still be outstanding.
+    Cancelled,
+}
+
 pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Command>, timeout: Duration,
-    timing: bool) -> (Result<()>, Option<u32>) {
+    timing: bool) -> (Result<Stop>, Option<u32>) {
     let mut queued = VecDeque::<Job>::new();
     let mut inflight = VecDeque::<Inflight<B::Wave>>::new();
     let mut highest: Option<u32> = None;
@@ -355,7 +367,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     let mut last_landed = Instant::now();
     // Sleeps taken and seconds slept (the CPU the pacing saved).
     let mut sleeps = (0u64, 0.0f64);
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Stop> {
         loop {
             let mut progressed = false;
             let mut closed = false;
@@ -364,16 +376,19 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 // Nothing outstanding: block until the engine sends.
                 match inbox.recv() {
                     Ok(Command::Wave(job)) => { highest = Some(job.sequence); queued.push_back(job); progressed = true; }
+                    Ok(Command::Cancel) => { backend.release_consumed(); return Ok(Stop::Cancelled); }
                     Err(_) => {
                         // At rest: the frames of reduces already consumed go back now.
                         backend.release_consumed();
-                        return Ok(());
+                        return Ok(Stop::Closed);
                     }
                 }
             }
             loop {
                 match inbox.try_recv() {
                     Ok(Command::Wave(job)) => { highest = Some(job.sequence); queued.push_back(job); progressed = true; }
+                    // Outstanding waves are given up by the caller (`finish_worker`).
+                    Ok(Command::Cancel) => return Ok(Stop::Cancelled),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => { closed = true; break; }
                 }
@@ -428,7 +443,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 // waves it will never land.
                 ensure!(empty, "Spark exchange closed with {} waves outstanding", queued.len() + inflight.len());
                 backend.release_consumed();
-                return Ok(());
+                return Ok(Stop::Closed);
             }
             if progressed {
                 idle_since = None;
@@ -479,8 +494,32 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
 /// the engine still sends, so no stream waits forever, until the channel closes.
 fn release_until_closed<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Command>, highest: Option<u32>) {
     if let Some(highest) = highest { backend.fail(highest); }
-    while let Ok(Command::Wave(job)) = inbox.recv() {
-        backend.fail(job.sequence);
+    while let Ok(command) = inbox.recv() {
+        if let Command::Wave(job) = command { backend.fail(job.sequence); }
+    }
+}
+
+/// The worker's exit: a failure marks the process unhealthy (other lanes may
+/// still own queued work from the failed pass) and abandons the transport's
+/// waves; a cancel gives its outstanding waves up without a failure. Either
+/// way every queued wait is released (no stream waits on a wave that will
+/// never land) until the link closes the channel.
+fn finish_worker<T: Transport>(native: &mut Native<T>, inbox: &mpsc::Receiver<Command>,
+    result: Result<Stop>, highest: Option<u32>) -> Result<()> {
+    match result {
+        Ok(Stop::Closed) => Ok(()),
+        Ok(Stop::Cancelled) => {
+            native.transport.cancel();
+            release_until_closed(native, inbox, highest);
+            Ok(())
+        }
+        Err(error) => {
+            cuteafd_transport::health::record_failure(format!("Spark exchange: {error:#}"));
+            tracing::error!(error = %format!("{error:#}"), "Spark exchange failed");
+            native.transport.abandon();
+            release_until_closed(native, inbox, highest);
+            Err(error)
+        }
     }
 }
 
@@ -518,6 +557,8 @@ pub(crate) trait Transport: Send + 'static {
     fn timeout(&self) -> Duration;
     /// Gives up every outstanding wave (after a failure).
     fn abandon(&mut self);
+    /// Gives up every outstanding wave for a deliberate reset: nothing failed.
+    fn cancel(&mut self) { self.abandon() }
     /// Per rank: reply frames its receive ring lets consumers keep at once
     /// (0: frames are copies, which keep no receive).
     fn retained_reply_slots(&self) -> Vec<usize>;
@@ -538,6 +579,7 @@ impl Transport for SparkExperts {
     }
     fn timeout(&self) -> Duration { SparkExperts::timeout(self) }
     fn abandon(&mut self) { self.abandon_waves("Spark exchange failed with waves in flight"); }
+    fn cancel(&mut self) { self.cancel_waves(); }
     fn retained_reply_slots(&self) -> Vec<usize> { SparkExperts::retained_reply_slots(self) }
 }
 
@@ -867,12 +909,7 @@ impl<'a> Waves<'a> {
                 tracing::warn!("Spark exchange worker keeps the default timer slack: {error:#}");
             }
             let (result, highest) = run_worker(&mut native, &inbox, timeout, timing);
-            if let Err(error) = &result {
-                cuteafd_transport::health::record_failure(format!("Spark exchange: {error:#}"));
-                tracing::error!(error = %format!("{error:#}"), "Spark exchange failed");
-                native.transport.abandon();
-                release_until_closed(&mut native, &inbox, highest);
-            }
+            let result = finish_worker(&mut native, &inbox, result, highest);
             // Frames still held (a failure, or waves never consumed) go back
             // with the transport: the link keeps them until its streams drained.
             let frames = native.frames();
@@ -1152,7 +1189,22 @@ impl<'a> Waves<'a> {
     /// engine will never land: the worker then abandons them and releases
     /// every queued wait), with the worker's result, so the link can quiesce
     /// and release the QPs itself. Only a panicked worker loses the transport.
-    pub(crate) fn close<T: Transport>(mut self) -> Result<(T, Vec<T::Frame>, Result<()>)> {
+    pub(crate) fn close<T: Transport>(self) -> Result<(T, Vec<T::Frame>, Result<()>)> {
+        self.join_worker(false)
+    }
+
+    /// A reset's stop (a cancelled request, #784): as [`Self::close`], but
+    /// waves still outstanding are given up without marking the process
+    /// unhealthy; the worker releases every queued wait over them.
+    pub(crate) fn cancel<T: Transport>(self) -> Result<(T, Vec<T::Frame>, Result<()>)> {
+        self.join_worker(true)
+    }
+
+    fn join_worker<T: Transport>(mut self, cancel: bool) -> Result<(T, Vec<T::Frame>, Result<()>)> {
+        if cancel {
+            // A worker that already failed has hung up; its result says so.
+            if let Some(jobs) = &self.jobs { let _ = jobs.send(Command::Cancel); }
+        }
         drop(self.jobs.take());
         let worker = self.worker.take().context("Spark exchange already stopped")?;
         let (transport, result) = worker.join().map_err(|_| {
