@@ -120,6 +120,13 @@ fn same_logits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
 }
 
+fn changed_partner(prompts: &[Vec<u32>], target: usize, vocab_size: usize) -> Vec<Vec<u32>> {
+    let mut changed = prompts.to_vec();
+    let partner = (target + 1) % prompts.len();
+    for token in &mut changed[partner] { *token = ((*token as usize + 1) % vocab_size) as u32; }
+    changed
+}
+
 pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Result<()> {
     ensure!(!tokens.is_empty() && tokens.iter().all(|&t| (t as usize) < engine.cfg.vocab_size), "invalid packed-check tokens");
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--packed-check requires every layer");
@@ -127,9 +134,6 @@ pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Re
     let prompts = chunks.iter().enumerate().map(|(i, &(start, rows))| prompt(tokens, i, start + rows)).collect::<Vec<_>>();
     let packed = arm(engine, &prompts, &chunks, true)?;
     let alone = arm(engine, &prompts, &chunks, false)?;
-    let mut changed = prompts.clone();
-    for token in &mut changed[1] { *token = ((*token as usize + 1) % engine.cfg.vocab_size) as u32; }
-    let partner = arm(engine, &changed, &chunks, true)?;
     let mut exact = true;
     for (i, (a, b)) in packed.iter().zip(&alone).enumerate() {
         let logits = same_logits(&a.logits, &b.logits);
@@ -138,10 +142,16 @@ pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Re
         println!("MiMo packed check: member {i} rows {} start {}: logits {logits}, KV {kv}, frontier {frontier}", chunks[i].1, chunks[i].0);
         exact &= logits && kv && frontier;
     }
-    let isolated = same_logits(&packed[0].logits, &partner[0].logits)
-        && packed[0].kv == partner[0].kv && packed[0].frontier == partner[0].frontier;
-    println!("MiMo packed check: A unchanged with B replaced at fixed geometry: {isolated}");
-    ensure!(isolated, "packed partner isolation failed");
+    // Exercise both a fresh target and the resumed final member at fixed geometry.
+    for target in [0, members - 1] {
+        let changed = changed_partner(&prompts, target, engine.cfg.vocab_size);
+        let partner = arm(engine, &changed, &chunks, true)?;
+        let isolated = same_logits(&packed[target].logits, &partner[target].logits)
+            && packed[target].kv == partner[target].kv
+            && packed[target].frontier == partner[target].frontier;
+        println!("MiMo packed check: member {target} start {} unchanged with partner replaced at fixed geometry: {isolated}", chunks[target].0);
+        ensure!(isolated, "packed partner isolation failed for member {target}");
+    }
     ensure!(exact, "packed differs from alone; characterize expert route changes before accepting numerical differences");
     Ok(())
 }
@@ -149,6 +159,30 @@ pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partner_changes_preserve_fresh_and_resumed_target_geometry() {
+        let limits = Limits { rows: 4096, chunk_rows: 4096, max_context: 4096, taps: Some(1024) };
+        for members in 2..=10 {
+            let chunks = geometry(members, &limits).unwrap();
+            let prompts = chunks.iter().enumerate()
+                .map(|(i, &(start, rows))| prompt(&[0, 1, 2, 3], i, start + rows)).collect::<Vec<_>>();
+            for target in [0, members - 1] {
+                let changed = changed_partner(&prompts, target, 4);
+                assert_eq!(changed[target], prompts[target]);
+                assert_eq!(changed.iter().map(Vec::len).collect::<Vec<_>>(), prompts.iter().map(Vec::len).collect::<Vec<_>>());
+                let partner = (target + 1) % members;
+                for (i, (before, after)) in prompts.iter().zip(&changed).enumerate() {
+                    if i == partner {
+                        assert!(before.iter().zip(after).all(|(a, b)| a != b));
+                    } else {
+                        assert_eq!(before, after);
+                    }
+                }
+            }
+            assert_eq!(chunks[members - 1].0, PREFIX);
+        }
+    }
+
     #[test]
     fn mixed_geometry_keeps_resumed_member_and_capacity_bound() {
         let limits = Limits { rows: 4096, chunk_rows: 4096, max_context: 4096, taps: Some(1024) };
