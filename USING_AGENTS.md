@@ -466,6 +466,19 @@ For a second opinion on a risky branch, have a different model review it
 than the one that wrote it (Opus or Astra reviewing Sol), given the diff and
 the gates, not the author's conclusion.
 
+Every big integration, port or shared-mechanism change gets a Gemini 4 Argon
+review before merge, as a standing step (TJ, 2026-10-28). Run it read-only on
+pinned SHAs, give it the problem classes seen so far as examples rather than
+limits, and run it alongside the A/B cards, not after them. It always runs
+through a DeepSeek Flash driver that checks every finding at the pinned SHA
+(VERIFIED, WRONG or UNVERIFIABLE) before reporting: about one finding in eight
+is wrong and line references are sometimes off. Gemini reads differently from
+the rest of the roster, finding dead callers, unread copies and code that
+contradicts its own comments. On the V4.1 shared-prefill port it found a 2-RTX
+TP2 FFN that never received its row window and decode transports built about
+500 MB too large, both missed by an Astra review of the same SHA. Pair it with a
+second viewpoint (Astra or Sol) on the riskiest changes.
+
 ## Keeping this guide current
 
 This file is the source of truth for agent usage. When the orchestrator
