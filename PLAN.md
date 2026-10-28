@@ -6051,3 +6051,11 @@ and numerical producer identities are unchanged. Completed artifact and
 model card remain at the export path above. Publication is not started:
 the brief explicitly requires TJ's confirmation before upload. Full-model
 quality, long-context behavior and serving qualification remain separate work.
+
+TJ approved publication with "Yep publish it" on 2026-10-28. The publisher
+groups flat diagnostic records under `quantization-errors/layer-NNN/` and
+`head/` to respect the Hub's 10,000-entry folder ceiling; it preserves every
+record's bytes and rejects symlinks, collisions and unreviewed layer names.
+Publication checks pass 29 CPU cases, including real metadata relocation,
+remote audits, cache hardlinks and repeat completion. This publication-only
+change does not alter the completed numerical identity or any weight shard.

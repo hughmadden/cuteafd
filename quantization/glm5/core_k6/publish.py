@@ -74,6 +74,40 @@ def _metadata_digests(path):
     return sha256.hexdigest(), blob.hexdigest()
 
 
+def _prepare_error_layout(export):
+    """Keep diagnostics below the Hub's 10,000-entry folder limit."""
+    errors=export/"quantization-errors"
+    if errors.is_symlink():
+        raise ValueError("refuse symlink diagnostic directory")
+    if not errors.exists():
+        return
+    changed=set()
+    for path in errors.iterdir():
+        if path.is_symlink():
+            raise ValueError("refuse symlink diagnostic payload")
+        if not path.is_file():
+            continue
+        match=re.fullmatch(r"model\.layers\.([0-9]+)\..+\.json",path.name)
+        if match and 0<=int(match[1])<=78:
+            directory=errors/f"layer-{int(match[1]):03d}"
+        elif path.name=="lm_head.json":
+            directory=errors/"head"
+        else:
+            raise ValueError(f"unreviewed flat diagnostic file: {path.name}")
+        if directory.is_symlink():
+            raise ValueError("refuse symlink diagnostic destination")
+        directory.mkdir(exist_ok=True)
+        target=directory/path.name
+        if target.exists():
+            raise ValueError(f"diagnostic publication path collision: {target}")
+        os.rename(path,target)
+        changed.add(directory)
+    for directory in changed:
+        fsync_directory(directory)
+    if changed:
+        fsync_directory(errors)
+
+
 def _collect_local(export, identity):
     files = {}
     # Prune upload caches before walking, and never follow a symlink into
@@ -184,6 +218,7 @@ def publish(export, root, repo_id):
         raise ValueError("publication roots must be regular directories")
     export, root = export.resolve(), root.resolve()
     identity = _complete_plan(export, root, repo_id)
+    _prepare_error_layout(export)
     files = _collect_local(export, identity)
     LOCAL_HUB_CACHE.mkdir(parents=True, exist_ok=True)
     if LOCAL_HUB_CACHE.is_symlink() or export.stat().st_dev != LOCAL_HUB_CACHE.stat().st_dev:

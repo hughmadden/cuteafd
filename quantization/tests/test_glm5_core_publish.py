@@ -136,6 +136,42 @@ def test_publish_audits_hardlinks_offline_cache_and_idempotent_completion(finish
     assert len(fake_hub["uploads"])==1
 
 
+def test_flat_diagnostics_move_by_layer_without_changing_bytes(finished,fake_hub):
+    errors=finished.export/"quantization-errors"
+    names={"model.layers.0.self_attn.q_a_proj.json":"layer-000",
+           "model.layers.78.mlp.experts.255.down_proj.json":"layer-078",
+           "lm_head.json":"head"}
+    original={}
+    for name in names:
+        data=json.dumps(dict(module=name.removesuffix('.json'),metric=.0001)).encode()
+        (errors/name).write_bytes(data);original[name]=data
+    publication.publish(finished.export,finished.root,publication.TARGET_REPO)
+    for name,directory in names.items():
+        assert not (errors/name).exists()
+        assert (errors/directory/name).read_bytes()==original[name]
+    marker=json.loads((finished.root/"publication-complete.json").read_text())
+    snapshot=Path(marker["local_snapshot"])
+    for name,directory in names.items():
+        assert os.path.samefile(snapshot/"quantization-errors"/directory/name,errors/directory/name)
+    assert publication.publish(finished.export,finished.root,publication.TARGET_REPO)==REVISION
+    assert len(fake_hub["uploads"])==1
+
+
+@pytest.mark.parametrize("damage",["collision","symlink","unreviewed-layer"])
+def test_diagnostic_layout_rejects_unsafe_destinations_before_hub(finished,fake_hub,damage,tmp_path):
+    errors=finished.export/"quantization-errors"
+    name="model.layers.0.self_attn.q_a_proj.json"
+    (errors/name).write_text('{"metric":0.001}')
+    if damage=="collision":
+        (errors/"layer-000").mkdir();(errors/"layer-000"/name).write_text('other evidence')
+    elif damage=="symlink":
+        outside=tmp_path/"outside";outside.mkdir();(errors/"layer-000").symlink_to(outside,target_is_directory=True)
+    else:
+        (errors/name).rename(errors/"model.layers.79.self_attn.q_a_proj.json")
+    with pytest.raises(ValueError):publication.publish(finished.export,finished.root,publication.TARGET_REPO)
+    assert not fake_hub["instances"]
+
+
 @pytest.mark.parametrize("damage",["identity","summary","paths","target","index","provenance","receipt","missing","checksum"])
 def test_uncompleted_or_changed_runs_fail_before_any_hub_call(finished,fake_hub,damage):
     root,export=finished.root,finished.export
