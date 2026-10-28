@@ -120,6 +120,39 @@ fn same_logits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
 }
 
+#[derive(Debug)]
+struct LogitDifference {
+    rows: usize,
+    max_abs: f64,
+    mean_kl: f64,
+    top1_agree: usize,
+}
+
+fn logit_difference(packed: &[f32], alone: &[f32], vocab: usize) -> Result<LogitDifference> {
+    ensure!(vocab > 0 && !packed.is_empty() && packed.len() == alone.len() && packed.len() % vocab == 0,
+        "packed diagnostic requires matching nonempty whole logit rows");
+    ensure!(packed.iter().chain(alone).all(|x| x.is_finite()), "packed diagnostic has nonfinite logits");
+    let log_partition = |row: &[f32]| {
+        let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        top + row.iter().map(|&x| (f64::from(x) - top).exp()).sum::<f64>().ln()
+    };
+    let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let rows = packed.len() / vocab;
+    let mut diff = LogitDifference { rows, max_abs: 0.0, mean_kl: 0.0, top1_agree: 0 };
+    for (ours, reference) in packed.chunks_exact(vocab).zip(alone.chunks_exact(vocab)) {
+        let (ours_z, reference_z) = (log_partition(ours), log_partition(reference));
+        diff.top1_agree += usize::from(argmax(ours) == argmax(reference));
+        for (&ours, &reference) in ours.iter().zip(reference) {
+            let (ours, reference) = (f64::from(ours), f64::from(reference));
+            diff.max_abs = diff.max_abs.max((ours - reference).abs());
+            let log_p = reference - reference_z;
+            diff.mean_kl += log_p.exp() * (log_p - (ours - ours_z));
+        }
+    }
+    diff.mean_kl /= rows as f64;
+    Ok(diff)
+}
+
 fn changed_partner(prompts: &[Vec<u32>], target: usize, vocab_size: usize) -> Vec<Vec<u32>> {
     let mut changed = prompts.to_vec();
     let partner = (target + 1) % prompts.len();
@@ -140,6 +173,15 @@ pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Re
         let kv = a.kv == b.kv;
         let frontier = a.frontier == b.frontier && a.frontier == prompts[i].len();
         println!("MiMo packed check: member {i} rows {} start {}: logits {logits}, KV {kv}, frontier {frontier}", chunks[i].1, chunks[i].0);
+        if !(logits && kv && frontier) {
+            // The checker saves the terminal logit row, not every input token's row.
+            let diff = logit_difference(&a.logits, &b.logits, engine.cfg.vocab_size)?;
+            ensure!(a.kv.len() == b.kv.len() && !a.kv.is_empty(), "packed diagnostic KV lengths differ or are empty");
+            let kv_diff = a.kv.iter().zip(&b.kv).filter(|(a, b)| a != b).count();
+            println!("MiMo packed difference: member {i}: saved_rows={} max_abs={:.9e} mean_KL(alone||packed)={:.9e} top1_agreement={}/{} KV_differing_bytes={}/{} KV_diff_fraction={:.9e}",
+                diff.rows, diff.max_abs, diff.mean_kl, diff.top1_agree, diff.rows,
+                kv_diff, a.kv.len(), kv_diff as f64 / a.kv.len() as f64);
+        }
         exact &= logits && kv && frontier;
     }
     // Exercise both a fresh target and the resumed final member at fixed geometry.
@@ -159,6 +201,35 @@ pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logit_diagnostics_score_every_saved_row_with_alone_as_reference() {
+        let alone = [0.0, 0.0, 4.0, 0.0];
+        let packed = [4.0, 0.0, 0.0, 4.0];
+        let diff = logit_difference(&packed, &alone, 2).unwrap();
+        let p = 4f64.exp() / (4f64.exp() + 1.0);
+        let first_kl = -2.0 + (4f64.exp() + 1.0).ln() - 2f64.ln();
+        assert_eq!(diff.rows, 2);
+        assert_eq!(diff.max_abs, 4.0);
+        assert_eq!(diff.top1_agree, 0);
+        assert!((diff.mean_kl - (first_kl + 4.0 * (2.0 * p - 1.0)) / 2.0).abs() < 1e-12);
+        let identical = logit_difference(&alone, &alone, 2).unwrap();
+        assert_eq!(identical.max_abs, 0.0);
+        assert_eq!(identical.mean_kl, 0.0);
+        assert_eq!(identical.top1_agree, 2);
+        let shifted = logit_difference(&[1000.0, 1000.0, 1004.0, 1000.0], &alone, 2).unwrap();
+        assert!(shifted.mean_kl.abs() < 1e-12);
+        assert_eq!(shifted.top1_agree, 2);
+    }
+
+    #[test]
+    fn logit_diagnostics_reject_invalid_or_nonfinite_rows() {
+        for (packed, alone, vocab) in [(&[][..], &[][..], 2), (&[0.0][..], &[0.0][..], 0),
+            (&[0.0][..], &[0.0][..], 2), (&[0.0][..], &[0.0, 1.0][..], 1),
+            (&[f32::NAN][..], &[0.0][..], 1), (&[0.0][..], &[f32::INFINITY][..], 1)] {
+            assert!(logit_difference(packed, alone, vocab).is_err());
+        }
+    }
+
     #[test]
     fn partner_changes_preserve_fresh_and_resumed_target_geometry() {
         let limits = Limits { rows: 4096, chunk_rows: 4096, max_context: 4096, taps: Some(1024) };
