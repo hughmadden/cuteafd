@@ -155,6 +155,14 @@ pub(super) fn startup_phase(
     Ok(())
 }
 
+/// Runs `build` with its device allocations under the ledger scope
+/// `"{scope}/{component}"` (the plan == runtime check sums a scope's
+/// components and reports each).
+pub(super) fn scoped<T>(scope: &str, component: &str, build: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _scope = cuteafd_ffi::memory_ledger::scope_owned(&format!("{scope}/{component}"));
+    build()
+}
+
 /// Plan == runtime (WP6): the decode lanes' and prefill slots' device
 /// allocations on each of `gpus` (their ledger scopes) are exactly what the
 /// planner charges (`NativePrograms::target`). A retained temporary or an
@@ -173,13 +181,32 @@ pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib
     let ledger = snapshot();
     for (rank, &gpu) in gpus.iter().enumerate() {
         let scopes = ledger.by_scope(Space::Device, gpu);
-        let charged = |demands: &[Demand]| demands.iter().filter(|d| usize::from(d.gpu) == rank).map(|d| d.bytes).sum::<u64>();
-        for (scope, demands) in [(super::DECODE_LANES_SCOPE, &lanes), (super::PREFILL_SLOTS_SCOPE, &prefill)] {
-            let live = scopes.get(scope).copied().unwrap_or(0) as u64;
-            let plan = charged(demands);
-            tracing::info!(gpu, scope, live, plan, "V4.1 target owners: plan == runtime");
-            ensure!(live == plan, "V4.1 {scope} on GPU {gpu}: allocated {live} B, planned {plan} B ({:+} B)",
-                live as i64 - plan as i64);
+        for (scope, demands, prefix) in [(super::DECODE_LANES_SCOPE, &lanes, "lane "), (super::PREFILL_SLOTS_SCOPE, &prefill, "prefill slots ")] {
+            // Live bytes per component (`scoped`), and the plan's per group
+            // (decode lanes' groups summed over both lanes).
+            let mut live = std::collections::BTreeMap::<String, u64>::new();
+            // Engram rows and gates are charged apart but one owner allocates both on two RTX.
+            let component = |name: &str| if name.starts_with("engram") { "engram".to_string() } else { name.to_string() };
+            for (label, &bytes) in scopes.iter().filter(|(label, _)| label.starts_with(scope)) {
+                let name = label.strip_prefix(scope).unwrap_or(label).trim_start_matches('/');
+                *live.entry(if name.is_empty() { "(unscoped)".into() } else { component(name) }).or_default() += bytes as u64;
+            }
+            let mut plan = std::collections::BTreeMap::<String, u64>::new();
+            for demand in demands.iter().filter(|d| usize::from(d.gpu) == rank) {
+                let group = demand.group.strip_prefix(prefix).unwrap_or(&demand.group);
+                let group = if prefix == "lane " { group.split_once(' ').map_or(group, |(_, g)| g) } else { group };
+                // The decode lanes' window batch table belongs to their producers.
+                let group = if group == "window batch table" { "cache producers" } else { group };
+                *plan.entry(component(group)).or_default() += demand.bytes;
+            }
+            let (live_total, plan_total) = (live.values().sum::<u64>(), plan.values().sum::<u64>());
+            let differing: Vec<_> = live.keys().chain(plan.keys()).collect::<std::collections::BTreeSet<_>>().into_iter()
+                .filter_map(|group| { let (l, p) = (live.get(group).copied().unwrap_or(0), plan.get(group).copied().unwrap_or(0));
+                    (l != p).then(|| format!("{group}: live {l} plan {p} ({:+})", l as i64 - p as i64)) }).collect();
+            tracing::info!(gpu, scope, live = live_total, plan = plan_total, ?differing, "V4.1 target owners: plan == runtime");
+            ensure!(live_total == plan_total && differing.is_empty(),
+                "V4.1 {scope} on GPU {gpu}: allocated {live_total} B, planned {plan_total} B ({:+} B); {}",
+                live_total as i64 - plan_total as i64, differing.join("; "));
         }
     }
     Ok(())
@@ -1221,6 +1248,39 @@ mod admission_tests {
             1_000_000,
         ));
         assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0, None).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plan_runtime_breakdown {
+    /// Prints the decode lane's planner groups beside the runtime owners'
+    /// own byte functions at decode width (CUTEAFD_NATIVE_LIB: a WIP or image
+    /// library; no device work).
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB"]
+    fn decode_lane_groups_against_runtime_byte_functions() -> anyhow::Result<()> {
+        use crate::families::deepseek_v41::*;
+        let path = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIB")?);
+        // SAFETY: trusted native library; only plan metadata is read.
+        let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&path)? };
+        let manifest = super::families::deepseek_v41::owners::native_manifest(&path, "V41_FP8_AOT.json")?;
+        let programs = super::families::deepseek_v41::owners::NativePrograms::new(&manifest, 188)?;
+        let rows = 80u32;
+        let plan = programs.decode_lanes(rows as u64, 1, false, true)?;
+        for d in plan.iter().filter(|d| d.group.starts_with("lane 0 ")) { eprintln!("PLAN {} {}", d.group, d.bytes); }
+        let r = rows as usize;
+        let lane: usize = v41_backbone_lane::BackboneLane::workspace_bytes(&lib, rows)?.into_iter().sum();
+        let index: usize = v41_index_lane::IndexLane::workspace_bytes(&lib, rows)?.into_iter().sum();
+        let producers = v41_backbone_execution::BackboneExecution::workspace_bytes(&lib, rows)?;
+        let gates = 2 * v41_engram::layer::EngramGate::device_bytes(&lib, r)?;
+        let head = v41_target_head::TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?;
+        for (name, bytes) in [("backbone", lane), ("index", index), ("cache producers+batch", producers),
+            ("embedding", v41_target_embedding::TargetEmbeddingWave::device_bytes(r)?),
+            ("engram rows", v41_engram::EngramDeviceRows::device_bytes(r)?), ("engram gates", gates),
+            ("target head", head), ("target taps", v41_target_pass::TargetTapWave::device_bytes(r)?)] {
+            eprintln!("RUNTIME {name} {bytes}");
+        }
         Ok(())
     }
 }

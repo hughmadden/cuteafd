@@ -190,7 +190,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // A decode lane: every owner private at decode width.
     let make_pass = |capacity: u32| -> Result<DistributedTargetPass<'_, '_>> {
         let decoder_capacity = capacity;
-        let mut lanes = [
+        let d = super::DECODE_LANES_SCOPE;
+        let mut lanes = admission::scoped(d, "backbone", || Ok([
             BackboneLane::new_on_device(
                 &weights,
                 capacity,
@@ -203,7 +204,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                 BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
                 1,
             )?,
-        ];
+        ]))?;
         if let Some(shards)=&query_shards {
             use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Wave};
             for (owner,lane) in lanes.iter_mut().enumerate() {
@@ -220,7 +221,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                 tracing::info!(owner,capacity,per_gpu_bytes=?budgets,"TP2 output projection workspace");
             }
         }
-        let indices = [
+        let indices = admission::scoped(d, "index", || Ok([
             Some(IndexLane::new_on_device(
                 &iw,
                 capacity,
@@ -237,62 +238,58 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                     .sum(),
                 1,
             )?),
-        ];
+        ]))?;
         DistributedTargetPass::new(
             map,
-            devices[0].own(|| {
+            admission::scoped(d, "embedding", || devices[0].own(|| {
                 TargetEmbeddingWave::new(
                     &lib,
                     &table,
                     capacity as usize,
                     TargetEmbeddingWave::device_bytes(capacity as usize)?,
                 )
-            })?,
+            }))?,
             lanes,
             indices,
-            DistributedExecution::new(
+            admission::scoped(d, "cache producers", || DistributedExecution::new(
                 &producers,
                 capacity,
                 crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(
                     &lib, map, capacity,
                 )?,
-            )?,
-            PlacedEngram::new(&ew, capacity as usize, PlacedEngram::device_bytes(&lib, map, capacity as usize)?)?,
-            DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
-                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?)?,
-            devices[1]
-                .own(|| TargetTapWave::new(&lib, decoder_capacity as usize, TargetTapWave::device_bytes(decoder_capacity as usize)?))?,
+            ))?,
+            admission::scoped(d, "engram", || PlacedEngram::new(&ew, capacity as usize, PlacedEngram::device_bytes(&lib, map, capacity as usize)?))?,
+            admission::scoped(d, "target head", || DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
+                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?))?,
+            admission::scoped(d, "target taps", || devices[1]
+                .own(|| TargetTapWave::new(&lib, decoder_capacity as usize, TargetTapWave::device_bytes(decoder_capacity as usize)?)))?,
             Duration::from_secs(120),
         )
     };
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
         args.attention_plan_rows)?;
-    let decode_scope = cuteafd_ffi::memory_ledger::scope(super::DECODE_LANES_SCOPE);
     let mut pass = make_pass(decode_rows).context("constructing first distributed decode lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
-    drop(decode_scope);
     memory_checkpoint("decode lanes")?;
     // The prefill slots: one storage set per GPU (row planes at the reserve,
     // scratch at the unit cap), each slot's host objects on it.
     let reserve = prefill_shape.reserve_rows();
     let prefill_reserve = reserve as u64;
     let both = [0, 1];
-    let slot_scope = cuteafd_ffi::memory_ledger::scope(super::PREFILL_SLOTS_SCOPE);
-    let lane_storage = [0usize, 1].map(|gpu| devices[gpu].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(
-        &weights, prefill_reserve as u32, capacity, &both)));
-    let [lane0, lane1] = lane_storage;
-    let lane_storage = [lane0?, lane1?];
-    let index_storage = [0usize, 1].map(|gpu| IndexLane::storage_on_device(&iw, prefill_reserve as u32, capacity, gpu, &both));
-    let [index0, index1] = index_storage;
-    let index_storage = [index0?, index1?];
-    let producer_storage = crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(
-        &lib, map, reserve, capacity as usize)?;
-    let embedding_storage = devices[0].own(|| TargetEmbeddingWave::storage(&lib, reserve, capacity as usize))?;
-    let engram_storage = PlacedEngram::storage(&ew, reserve, capacity as usize)?;
-    let tap_storage = devices[1].own(|| TargetTapWave::storage(&lib, reserve, capacity as usize))?;
+    let p = super::PREFILL_SLOTS_SCOPE;
+    let lane_storage = admission::scoped(p, "lane", || { let [a, b] = [0usize, 1].map(|gpu| devices[gpu].own(||
+        crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, prefill_reserve as u32, capacity, &both)));
+        Ok([a?, b?]) })?;
+    let index_storage = admission::scoped(p, "index", || { let [a, b] = [0usize, 1].map(|gpu|
+        IndexLane::storage_on_device(&iw, prefill_reserve as u32, capacity, gpu, &both)); Ok([a?, b?]) })?;
+    let producer_storage = admission::scoped(p, "cache producers", ||
+        crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(&lib, map, reserve, capacity as usize))?;
+    let embedding_storage = admission::scoped(p, "embedding", || devices[0].own(|| TargetEmbeddingWave::storage(&lib, reserve, capacity as usize)))?;
+    let engram_storage = admission::scoped(p, "engram", || PlacedEngram::storage(&ew, reserve, capacity as usize))?;
+    let tap_storage = admission::scoped(p, "target taps", || devices[1].own(|| TargetTapWave::storage(&lib, reserve, capacity as usize)))?;
     use crate::families::deepseek_v41::v41_projection_tp2::{Kind, Storage as ProjectionStorage};
     let projection_storage = |kind: Kind, enabled: bool| -> Result<Option<[Rc<ProjectionStorage<'_>>; 2]>> {
         if !enabled { return Ok(None); }
@@ -328,8 +325,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             indices,
             DistributedExecution::on_storage(&producers, &producer_storage)?,
             PlacedEngram::on_storage(&ew, &engram_storage)?,
-            DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
-                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?)?,
+            admission::scoped(p, "target heads", || DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]],
+                cuteafd_core::V41_VERIFY_ROWS, DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?))?,
             devices[1].own(|| TargetTapWave::on_storage(tap_storage.get().clone()))?,
             Duration::from_secs(120),
         )
@@ -338,7 +335,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // more (WP7: a held LaneStorage would keep the replaced sparse arena alive).
     drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,
         query_storage, output_storage, dual_storage));
-    drop(slot_scope);
     // Plan == runtime (WP6), unless the experimental TP2 attention/projections
     // replace or add owners the planner does not model.
     if !(args.tp2_attention || args.tp2_query_projection || args.tp2_output_projection) {

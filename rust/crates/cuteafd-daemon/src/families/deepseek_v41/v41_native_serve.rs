@@ -417,53 +417,61 @@ fn worker(
         TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?);
     // A decode lane: every owner private at decode width.
     let decode_rows_usize = decode_rows as usize;
+    // Each component under its own ledger scope (the plan == runtime check
+    // names the one that differs).
     let make_decode_pass = || TargetPass::new(
-        TargetEmbeddingWave::new(&lib, &table, decode_rows_usize, TargetEmbeddingWave::device_bytes(decode_rows_usize)?)?,
-        BackboneLane::new(&weights, decode_rows, BackboneLane::workspace_bytes(&lib, decode_rows)?.into_iter().sum())?,
-        IndexLane::new(&index_weights, decode_rows, IndexLane::workspace_bytes(&lib, decode_rows)?.into_iter().sum())?,
-        BackboneExecution::new(&producers, decode_rows, BackboneExecution::workspace_bytes(&lib, decode_rows)?)?,
-        EngramDeviceRows::new(&lib, decode_rows_usize, EngramDeviceRows::device_bytes(decode_rows_usize)?)?,
-        [EngramGate::new(&engram_weights[0], decode_rows_usize, 1024 * 1024 * 1024)?,
-         EngramGate::new(&engram_weights[1], decode_rows_usize, 1024 * 1024 * 1024)?],
-        head()?,
-        TargetTapWave::new(&lib, decode_rows_usize, TargetTapWave::device_bytes(decode_rows_usize)?)?,
+        admission::scoped(DECODE_LANES_SCOPE, "embedding", || TargetEmbeddingWave::new(&lib, &table, decode_rows_usize,
+            TargetEmbeddingWave::device_bytes(decode_rows_usize)?))?,
+        admission::scoped(DECODE_LANES_SCOPE, "backbone", || BackboneLane::new(&weights, decode_rows,
+            BackboneLane::workspace_bytes(&lib, decode_rows)?.into_iter().sum()))?,
+        admission::scoped(DECODE_LANES_SCOPE, "index", || IndexLane::new(&index_weights, decode_rows,
+            IndexLane::workspace_bytes(&lib, decode_rows)?.into_iter().sum()))?,
+        admission::scoped(DECODE_LANES_SCOPE, "cache producers", || BackboneExecution::new(&producers, decode_rows,
+            BackboneExecution::workspace_bytes(&lib, decode_rows)?))?,
+        admission::scoped(DECODE_LANES_SCOPE, "engram rows", || EngramDeviceRows::new(&lib, decode_rows_usize,
+            EngramDeviceRows::device_bytes(decode_rows_usize)?))?,
+        admission::scoped(DECODE_LANES_SCOPE, "engram gates", || Ok([
+            EngramGate::new(&engram_weights[0], decode_rows_usize, 1024 * 1024 * 1024)?,
+            EngramGate::new(&engram_weights[1], decode_rows_usize, 1024 * 1024 * 1024)?]))?,
+        admission::scoped(DECODE_LANES_SCOPE, "target head", head)?,
+        admission::scoped(DECODE_LANES_SCOPE, "target taps", || TargetTapWave::new(&lib, decode_rows_usize,
+            TargetTapWave::device_bytes(decode_rows_usize)?))?,
         Duration::from_secs(120),
     );
-    let (mut pass, mut second) = {
-        let _scope = cuteafd_ffi::memory_ledger::scope(DECODE_LANES_SCOPE);
-        (make_decode_pass()?, make_decode_pass()?)
-    };
+    let (mut pass, mut second) = (make_decode_pass()?, make_decode_pass()?);
     admission::startup_phase(&lib, "v41/workspace:decode-lanes", device_total)?;
     // The prefill slots: one storage set (row planes at the reserve, scratch
     // at the unit), each slot's host objects on it (`shared::memory::row_window`).
     let reserve = admitted.reserve_rows();
     let prefill_reserve = reserve as u64;
     let readers = [lib.cuda_get_device()?];
-    let slot_scope = cuteafd_ffi::memory_ledger::scope(PREFILL_SLOTS_SCOPE);
+    let p = PREFILL_SLOTS_SCOPE;
     let slot_storage = SlotStorage {
-        lane: crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, prefill_reserve as u32, capacity, &readers)?,
-        index: IndexLane::storage(&index_weights, prefill_reserve as u32, capacity, &readers)?,
-        producers: crate::families::deepseek_v41::v41_backbone_execution::ProducerStorage::new(&lib, reserve, rows)?,
-        embedding: TargetEmbeddingWave::storage(&lib, reserve, rows)?,
-        upload: EngramDeviceRows::storage(&lib, reserve, rows)?,
-        gates: [EngramGate::storage(&lib, reserve, rows)?, EngramGate::storage(&lib, reserve, rows)?],
-        taps: TargetTapWave::storage(&lib, reserve, rows)?,
+        lane: admission::scoped(p, "lane", || crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(
+            &weights, prefill_reserve as u32, capacity, &readers))?,
+        index: admission::scoped(p, "index", || IndexLane::storage(&index_weights, prefill_reserve as u32, capacity, &readers))?,
+        producers: admission::scoped(p, "cache producers", || crate::families::deepseek_v41::v41_backbone_execution::ProducerStorage::new(
+            &lib, reserve, rows))?,
+        embedding: admission::scoped(p, "embedding", || TargetEmbeddingWave::storage(&lib, reserve, rows))?,
+        upload: admission::scoped(p, "engram rows", || EngramDeviceRows::storage(&lib, reserve, rows))?,
+        gates: admission::scoped(p, "engram gates", || Ok([EngramGate::storage(&lib, reserve, rows)?, EngramGate::storage(&lib, reserve, rows)?]))?,
+        taps: admission::scoped(p, "target taps", || TargetTapWave::storage(&lib, reserve, rows))?,
     };
     let mut slot_passes = (0..slots).map(|_| TargetPass::new(
         TargetEmbeddingWave::on_storage(&lib, &table, slot_storage.embedding.clone())?,
         BackboneLane::on_storage(&weights, slot_storage.lane.clone())?,
         IndexLane::on_storage(&index_weights, slot_storage.index.clone())?,
-        BackboneExecution::on_storage(&producers, slot_storage.producers.clone())?,
+        // Each slot's window batch table at the unit (charged with the producers).
+        admission::scoped(p, "cache producers", || BackboneExecution::on_storage(&producers, slot_storage.producers.clone()))?,
         EngramDeviceRows::on_storage(slot_storage.upload.clone())?,
         [EngramGate::on_storage(&engram_weights[0], slot_storage.gates[0].clone())?,
          EngramGate::on_storage(&engram_weights[1], slot_storage.gates[1].clone())?],
-        head()?,
+        admission::scoped(p, "target heads", head)?,
         TargetTapWave::on_storage(slot_storage.taps.clone())?,
         Duration::from_secs(120),
     )).collect::<Result<Vec<_>>>()?;
     // The slots hold their components' storage; the set itself is no owner.
     drop(slot_storage);
-    drop(slot_scope);
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
     // planner's charges, nothing retained beyond them.
     admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots)?;
