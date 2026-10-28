@@ -1849,7 +1849,7 @@ impl<'a> GlmEngine<'a> {
         let route_bytes = layout.route_bytes;
         let mut staging = w.router_host.borrow_mut();
         if staging.as_ref().is_none_or(|pinned| pinned.buffer.bytes < layout.bytes) {
-            *staging = Some(HostAllocation::new(self.library, layout.bytes)?);
+            *staging = Some(HostAllocation::new(w.x._owner.library, layout.bytes)?);
         }
         let staging = staging.as_ref().context("GLM diagnostic route staging")?;
         let timer = std::time::Instant::now();
@@ -2772,7 +2772,7 @@ mod prefill_unit_tests {
             .split("fn ").next().unwrap();
         assert!(shared.contains("router_host: Rc::new(RefCell::new(None))"));
         let stage = source.split("fn moe_stage(").nth(1).unwrap().split("fn moe_wave(").next().unwrap();
-        assert!(stage.contains("HostAllocation::new(self.library, layout.bytes)?"));
+        assert!(stage.contains("HostAllocation::new(w.x._owner.library, layout.bytes)?"));
     }
 
     #[test]
