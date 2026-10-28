@@ -916,6 +916,8 @@ mod tests {
         assert_eq!((shape.unit_rows, shape.waves), (2752, 3));
         assert_eq!(super::prefill_shape(6, Some(1024)).unwrap().waves, 3);
         assert!(super::prefill_shape(6, Some(4096)).is_err());
+        let local = super::prefill_shape(0, None).unwrap();
+        assert_eq!((local.unit_rows, local.waves), (4096, 1));
     }
 
     #[test]

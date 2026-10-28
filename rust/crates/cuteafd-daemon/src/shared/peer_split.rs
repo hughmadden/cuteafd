@@ -774,6 +774,18 @@ mod tests {
     }
 
     #[test]
+    fn sender_stream_wide_push_uses_p2p_d2d_entry_point() {
+        let source = include_str!("peer_split.rs");
+        let push = source.split("    pub fn push_to(").nth(1).unwrap()
+            .split("    /// Push strided planes").next().unwrap();
+        assert!(push.contains("self.on(from, || unsafe"));
+        assert!(push.contains("self.library.copy_d2d_async(buffer(destination, self.device(1 - from)),"));
+        assert!(!push.contains("copy_peer_async"));
+        assert!(push.contains("buffer(source.cast_mut(), self.device(from)), bytes, self.stream(from))?"));
+        assert!(push.find("copy_d2d_async").unwrap() < push.find("peer_push_signal(").unwrap());
+    }
+
+    #[test]
     fn peer_scopes_restore_the_caller_instead_of_a_fixed_home() {
         let source = include_str!("peer_split.rs");
         let helper = source.split("pub(crate) fn on_device<T>").nth(1).unwrap()
