@@ -63,7 +63,12 @@ impl<'a> PlacedEngramWeights<'a> {
         Ok(Self { weights })
     }
 }
-/// Per-request-lane uploads are shared between gates on the same GPU only.
+/// One reserve's upload row planes and unit-cap gate scratch, shared by slots.
+pub(crate) struct PlacedEngramStorage<'a> {
+    gates: [DeviceOwner<'a, Rc<layer::EngramGateStorage<'a>>>; 2],
+    uploads: [Option<DeviceOwner<'a, Rc<EngramRowsStorage<'a>>>>; 2],
+}
+/// Per-unit streams, readiness and windows; only immutable storage is shared.
 pub(crate) struct PlacedEngram<'w, 'a> {
     gates: [DeviceOwner<'a, EngramGate<'w, 'a>>; 2],
     uploads: [Option<DeviceOwner<'a, EngramDeviceRows<'a>>>; 2],
@@ -74,8 +79,15 @@ impl<'w, 'a> PlacedEngram<'w, 'a> {
         map: CachePlacement,
         capacity: usize,
     ) -> Result<[usize; 2]> {
-        let gate = EngramGate::device_bytes(library, capacity)?;
-        let upload = EngramDeviceRows::device_bytes(capacity)?;
+        Self::device_bytes_windowed(library, map, capacity, capacity)
+    }
+    /// Upload row planes span the whole reserve once per GPU hosting a gate;
+    /// the gates' guarded scratch is shared at the widest unit, not k times.
+    pub fn device_bytes_windowed(library: &NativeLibrary, map: CachePlacement,
+        reserve: usize, unit: usize) -> Result<[usize; 2]> {
+        ensure!(unit <= reserve, "Engram unit exceeds reserve");
+        let gate = EngramGate::device_bytes(library, unit)?;
+        let upload = EngramDeviceRows::device_bytes(reserve)?;
         let mut bytes = [0usize; 2];
         for layer in [1, 14] {
             let gpu = map.attention(layer)?;
@@ -131,6 +143,85 @@ impl<'w, 'a> PlacedEngram<'w, 'a> {
             }
         }
         Ok(Self { gates, uploads })
+    }
+    pub(crate) fn storage(weights: &PlacedEngramWeights<'a>, reserve: usize, unit: usize)
+        -> Result<PlacedEngramStorage<'a>> {
+        let gates = weights.weights.iter().map(|w| w.device.own(||
+            EngramGate::storage(w.device.library, reserve, unit)))
+            .collect::<Result<Vec<_>>>()?.try_into().ok().expect("two Engram gate storages");
+        let mut uploads = [None, None];
+        for weight in &weights.weights {
+            let device = weight.device;
+            if uploads[device.id as usize].is_none() {
+                uploads[device.id as usize] = Some(device.own(||
+                    EngramDeviceRows::storage(device.library, reserve, unit))?);
+            }
+        }
+        Ok(PlacedEngramStorage { gates, uploads })
+    }
+    pub(crate) fn on_storage(weights: &'w PlacedEngramWeights<'a>, storage: &PlacedEngramStorage<'a>) -> Result<Self> {
+        let gates = weights.weights.iter().zip(&storage.gates).map(|(w, s)| {
+            ensure!(w.device.id == s.device.id, "Engram gate storage placement differs");
+            w.device.own(|| EngramGate::on_storage(w, s.get().clone()))
+        }).collect::<Result<Vec<_>>>()?.try_into().ok().expect("two Engram gates");
+        let mut uploads = [None, None];
+        for (gpu, stored) in storage.uploads.iter().enumerate() {
+            if let Some(stored) = stored {
+                uploads[gpu] = Some(stored.device.own(|| EngramDeviceRows::on_storage(stored.get().clone()))?);
+            }
+        }
+        Ok(Self { gates, uploads })
+    }
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        for gate in &mut self.gates {
+            let device = gate.device;
+            device.run(|| gate.get_mut().select_window(window.clone()))?;
+        }
+        for upload in self.uploads.iter_mut().flatten() {
+            let device = upload.device;
+            device.run(|| upload.get_mut().select_window(window.clone()))?;
+        }
+        Ok(())
+    }
+    pub fn reset_uploads(&mut self) -> Result<()> {
+        for upload in self.uploads.iter_mut().flatten() {
+            let device = upload.device;
+            device.run(|| upload.get_mut().reset())?;
+        }
+        Ok(())
+    }
+    pub fn staged(&self, layer: usize) -> bool {
+        self.uploads[self.gates[layer].device.id as usize].as_ref().is_some_and(|u| u.staged(layer))
+    }
+    pub fn can_enqueue(&self, layer: usize) -> Result<bool> {
+        let device = self.gates[layer].device;
+        let upload = self.uploads[device.id as usize].as_ref().context("Engram upload GPU absent")?;
+        device.run(|| upload.can_enqueue(layer))
+    }
+    pub async fn wait_enqueue(&self, layer: usize, timeout: std::time::Duration) -> Result<()> {
+        let device = self.gates[layer].device;
+        let upload = self.uploads[device.id as usize].as_ref().context("Engram upload GPU absent")?;
+        device.future(upload.wait_enqueue(layer, timeout)).await
+    }
+    pub fn enqueue_lease(&mut self, lease: EngramGatherLease, wave: &EngramWave) -> Result<()> {
+        let layer = lease.view()?.layer_index;
+        let device = self.gates[layer].device;
+        let upload = self.uploads[device.id as usize].as_mut().context("Engram upload GPU absent")?;
+        device.run(|| upload.get_mut().enqueue_lease(lease, wave))
+    }
+    /// # Safety
+    /// The lane's pending gate matches the uploaded lease and unit window.
+    pub async unsafe fn apply_staged(&mut self, lane: &mut DeviceOwner<'a, BackboneLane<'_, 'a>>, layer: usize) -> Result<()> {
+        let gate = &mut self.gates[layer];
+        let device = gate.device;
+        ensure!(device.id == lane.device.id, "Engram lane/GPU mismatch");
+        let upload = self.uploads[device.id as usize].as_mut().context("Engram upload GPU absent")?;
+        device.future(async {
+            let rows = upload.get_mut().consume(layer)?;
+            // SAFETY: uploaded unit and lane remain exclusively owned here.
+            unsafe { lane.get_mut().apply_engram_cooperative(gate.get_mut(), &rows).await?; }
+            upload.release_scratch()
+        }).await
     }
     /// # Safety
     /// The gathered CPU rows identify this prepared lane's pending Engram layer

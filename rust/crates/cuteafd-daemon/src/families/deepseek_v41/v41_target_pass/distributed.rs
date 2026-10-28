@@ -480,6 +480,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             "invalid distributed head selection"
         );
         self.state.begin()?;
+        self.resources.engram.reset_uploads()?;
         let guard = BatchGuard {
             batch,
             completed: false,
@@ -498,25 +499,25 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 unsafe {
                     self.advance(layer).await?;
                 }
+                if (2..14).contains(&layer) && !self.resources.engram.staged(1)
+                    && self.resources.engram.can_enqueue(1)? {
+                    if let cuteafd_loader::EngramGatherPoll::Ready(lease) = requests.with_requests(|r| r.poll_engram_layer(guard.batch, 1))? {
+                        self.resources.engram.enqueue_lease(lease, guard.batch.engram_wave()?)?;
+                    }
+                }
                 if [1, 14].contains(&layer) {
                     let gate = usize::from(layer == 14);
-                    guard.batch.wait_engram_gather(gate, self.resources.timeout).await?;
-                    let gathered = requests.with_requests(|r| {
-                        r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
-                    })?;
-                    match gathered {
-                        cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                            unsafe {
-                                self.resources.engram
-                                    .apply(&mut self.resources.lanes[gpu], &lease.view()?)
-                                    .await?;
-                            }
+                    if !self.resources.engram.staged(gate) {
+                        guard.batch.wait_engram_gather(gate, self.resources.timeout).await?;
+                    self.resources.engram.wait_enqueue(gate, self.resources.timeout).await?;
+                        match requests.with_requests(|r| r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu]))? {
+                            cuteafd_loader::EngramGatherPoll::Ready(lease) => self.resources.engram.enqueue_lease(lease, guard.batch.engram_wave()?)?,
+                            cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("distributed Engram gather cancelled"),
+                            cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                         }
-                        cuteafd_loader::EngramGatherPoll::Cancelled => {
-                            anyhow::bail!("distributed Engram gather cancelled")
-                        }
-                        cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                     }
+                    unsafe { self.resources.engram.apply_staged(&mut self.resources.lanes[gpu], gate).await?; }
+                    if gate == 0 { guard.batch.start_later_engram()?; }
                 }
                 if layer >= 37 {
                     let input = self.resources.lanes[gpu].prepared_input()?;
@@ -1135,7 +1136,7 @@ mod tests {
             &std::path::Path::new(&snapshot).join("tokenizer.json"),
         )?;
         let pipeline =
-            unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, 16, 2, 8 << 20, 0)? };
+            unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, cuteafd_loader::EngramStagingShape::new(16, 2)?, 0)? };
         let pages = [4, 4, 4, 8];
         let mut requests = Requests::new_distributed(
             &lib,

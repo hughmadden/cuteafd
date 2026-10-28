@@ -3,11 +3,18 @@ use crate::{EngramEncoding, EngramTable};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramBatch, ENGRAM_ROWS};
 
+enum StagingBytes {
+    Host(Vec<u8>),
+    Pinned(cuteafd_ffi::PinnedBytes),
+}
+impl StagingBytes {
+    fn bytes(&self) -> &[u8] { match self { Self::Host(v) => v, Self::Pinned(v) => v.bytes() } }
+    fn bytes_mut(&mut self) -> &mut [u8] { match self { Self::Host(v) => v, Self::Pinned(v) => v.bytes_mut() } }
+}
+
 pub struct EngramBatchStaging {
     capacity: usize,
-    weights: Vec<u8>,
-    scales: Vec<u8>,
-    text_mask: Vec<u8>,
+    payload: StagingBytes,
     order: Vec<(u64, usize)>,
     ready: Option<(usize, usize, EngramEncoding, f32)>,
 }
@@ -40,12 +47,50 @@ impl EngramBatchStaging {
         );
         Ok(Self {
             capacity,
-            weights: vec![0; capacity * 24 * 256],
-            scales: vec![127; capacity * 24 * 8],
-            text_mask: vec![0; capacity],
+            payload: StagingBytes::Host(vec![0; Self::payload_bytes(capacity)]),
             order: Vec::with_capacity(capacity * 24),
             ready: None,
         })
+    }
+    /// Peak per gather worker, not per staging lease. At most 24 distinct table
+    /// rows per token. Charge 1024 bytes per lookup for the address/slot vectors,
+    /// mapped-table validation tree + read descriptors, selected/unsupported
+    /// rows, residency flags and retained TLS page vectors, and io_uring's slot
+    /// hash set. This conservative bound includes vector growth (at most 2x),
+    /// two pages per <=256-byte table row, and tree/hash allocation slack.
+    ///
+    /// The fixed 1 MiB additionally covers MAX_BATCH=4096: one SQ ring (64-byte
+    /// SQEs + 4-byte indices), default 2x CQ (16-byte CQEs), rounded ring headers,
+    /// retry/done/nowait/missed arrays (18 bytes/entry), 4096 mincore bytes and
+    /// <=16 borrowed batch references. Weights/scales and L1/L14 run serially,
+    /// so these terms occur once per worker. Thread stacks, request batches,
+    /// allocator bookkeeping and OS page cache are not staging workspace.
+    pub fn worker_bytes(rows: usize) -> Result<usize> {
+        Self::storage_bytes(rows)?;
+        Ok(rows * 24 * 1024 + (1 << 20))
+    }
+    pub fn payload_bytes(rows: usize) -> usize { rows * (24 * (256 + 8) + 1) }
+    pub fn new_pinned(library: &cuteafd_ffi::NativeLibrary, capacity: usize) -> Result<Self> {
+        Self::storage_bytes(capacity)?;
+        Ok(Self { capacity, payload: StagingBytes::Pinned(library.pinned_bytes(Self::payload_bytes(capacity))?),
+            order: Vec::with_capacity(capacity * 24), ready: None })
+    }
+    pub fn host_buffer(&self) -> Option<cuteafd_ffi::CuteafdHostBuffer> {
+        match &self.payload { StagingBytes::Pinned(p) => Some(p.buffer()), _ => None }
+    }
+    /// # Safety
+    /// The copy stream contains every H2D reader of this slot's pinned bytes.
+    pub unsafe fn copied_on(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
+        match &mut self.payload {
+            StagingBytes::Pinned(p) => {
+                // SAFETY: forwarded from this method's stream ownership contract.
+                unsafe { p.copied_on(stream) }
+            },
+            _ => anyhow::bail!("asynchronous gather upload requires pinned staging"),
+        }
+    }
+    pub fn copy_ready(&mut self) -> Result<bool> {
+        match &mut self.payload { StagingBytes::Pinned(p) => p.copy_ready(), _ => Ok(true) }
     }
     /// Concatenate request-owned batches without committing their histories.
     /// Read each distinct table row once, in address order, then scatter duplicates
@@ -77,12 +122,15 @@ impl EngramBatchStaging {
             rows > 0 && rows <= self.capacity,
             "engram wave exceeds staging capacity"
         );
+        let payload = self.payload.bytes_mut();
+        let (weights, rest) = payload.split_at_mut(self.capacity * 24 * 256);
+        let (scales, text_mask) = rest.split_at_mut(self.capacity * 24 * 8);
         self.order.clear();
         let mut token = 0;
         for batch in batches {
             for (row, hashes) in batch.hashes().iter().enumerate() {
                 let text = batch.is_image(row) == Some(false);
-                self.text_mask[token] = u8::from(text);
+                text_mask[token] = u8::from(text);
                 if text {
                     for (head, &address) in hashes[layer_index].iter().enumerate() {
                         ensure!(address < expected_rows, "engram hash is outside its table");
@@ -98,11 +146,11 @@ impl EngramBatchStaging {
         // FP4's packed weights and scales fit in the original FP8 weight arena.
         // Keep the FP8 allocation/budget unchanged and never expand mapped rows.
         let scale_base = self.capacity * 24 * 128;
-        self.weights[..rows * 24 * weight_bytes].fill(0);
+        weights[..rows * 24 * weight_bytes].fill(0);
         if encoding == EngramEncoding::Fp8 {
-            self.scales[..rows * 24 * scale_bytes].fill(127);
+            scales[..rows * 24 * scale_bytes].fill(127);
         } else {
-            self.weights[scale_base..scale_base + rows * 24 * scale_bytes].fill(0x38);
+            weights[scale_base..scale_base + rows * 24 * scale_bytes].fill(0x38);
         }
         self.order.sort_unstable();
         let mut addresses = Vec::with_capacity(self.order.len());
@@ -115,19 +163,21 @@ impl EngramBatchStaging {
         }
         // Both backends read the same distinct rows into the same canonical
         // slots; batching is not an io_uring-only optimization.
-        table.weights().gather_slots(&addresses, &slots, &mut self.weights[..rows * 24 * weight_bytes])?;
-        let scales = if encoding == EngramEncoding::Fp8 { &mut self.scales[..rows * 24 * scale_bytes] }
-            else { &mut self.weights[scale_base..scale_base + rows * 24 * scale_bytes] };
-        table.scales().gather_slots(&addresses, &slots, scales)?;
+        table.weights().gather_slots(&addresses, &slots, &mut weights[..rows * 24 * weight_bytes])?;
+        if encoding == EngramEncoding::Fp8 {
+            table.scales().gather_slots(&addresses, &slots, &mut scales[..rows * 24 * scale_bytes])?;
+        } else {
+            table.scales().gather_slots(&addresses, &slots, &mut weights[scale_base..scale_base + rows * 24 * scale_bytes])?;
+        }
         let mut previous = None;
         for &(address, slot) in &self.order {
             if let Some((last_address, source)) = previous {
                 if last_address == address {
-                    self.weights.copy_within(source * weight_bytes..(source + 1) * weight_bytes, slot * weight_bytes);
+                    weights.copy_within(source * weight_bytes..(source + 1) * weight_bytes, slot * weight_bytes);
                     if encoding == EngramEncoding::Fp8 {
-                        self.scales.copy_within(source * scale_bytes..(source + 1) * scale_bytes, slot * scale_bytes);
+                        scales.copy_within(source * scale_bytes..(source + 1) * scale_bytes, slot * scale_bytes);
                     } else {
-                        self.weights.copy_within(scale_base + source * scale_bytes..scale_base + (source + 1) * scale_bytes,
+                        weights.copy_within(scale_base + source * scale_bytes..scale_base + (source + 1) * scale_bytes,
                             scale_base + slot * scale_bytes);
                     }
                     continue;
@@ -141,12 +191,14 @@ impl EngramBatchStaging {
     pub fn view(&self) -> Result<EngramGatherView<'_>> {
         let (rows, layer_index, encoding, global_scale) = self.ready.context("engram staging is not complete")?;
         let scale_base = self.capacity * 24 * 128;
+        let (weights, rest) = self.payload.bytes().split_at(self.capacity * 24 * 256);
+        let (scales, text_mask) = rest.split_at(self.capacity * 24 * 8);
         Ok(EngramGatherView {
             encoding, global_scale,
-            weights: &self.weights[..rows * 24 * encoding.weight_bytes()],
-            scales: if encoding == EngramEncoding::Fp8 { &self.scales[..rows * 24 * 8] }
-                else { &self.weights[scale_base..scale_base + rows * 24 * 16] },
-            text_mask: &self.text_mask[..rows],
+            weights: &weights[..rows * 24 * encoding.weight_bytes()],
+            scales: if encoding == EngramEncoding::Fp8 { &scales[..rows * 24 * 8] }
+                else { &weights[scale_base..scale_base + rows * 24 * 16] },
+            text_mask: &text_mask[..rows],
             rows,
             layer_index,
         })
@@ -159,11 +211,33 @@ mod tests {
     use std::os::unix::fs::FileExt;
 
     #[test]
+    fn engram_worker_bound_covers_row_scaled_and_fixed_backend_scratch() -> Result<()> {
+        let word = std::mem::size_of::<usize>();
+        // Sum simultaneous capacities (including geometric growth), rather than
+        // multiplying a transient worker allocation by the number of leases.
+        let per_lookup = 8 + word // distinct addresses and canonical slots
+            + 256 + 2 * (std::mem::size_of::<u64>() + 2 * word) // validation tree, reads
+            + 2 * word + 2 * 8 + 2 // unsupported indices, selected rows, hit flags
+            + 2 * (2 * 2 * word + 2) + 2 // TLS pages/residency and returned hits
+            + 2 * (8 + 2 * word) + 2 + 64; // pending reads/hits and hash slots
+        let fixed = 4096 * (64 + 4 + 2 * 16 + 18) + 3 * 65536 + 4096 + 16 * word;
+        assert!(per_lookup <= 1024);
+        assert!(fixed <= 1 << 20);
+        for rows in [1, 256, 2048, 2752, 4096] {
+            assert_eq!(EngramBatchStaging::worker_bytes(rows)?, rows * 24 * 1024 + (1 << 20));
+            assert!(EngramBatchStaging::worker_bytes(rows)? >= rows * 24 * per_lookup + fixed);
+        }
+        assert!(EngramBatchStaging::worker_bytes(0).is_err());
+        assert!(EngramBatchStaging::worker_bytes(4097).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn packed_ple_gather_preserves_rows_duplicates_masks_and_reuse() -> Result<()> {
         let history = cuteafd_core::EngramHistory::new(0)?;
         let batch = history.prepare(0, &[Some(7), None, Some(31)], 3)?;
         let mut staging = EngramBatchStaging::new(8)?;
-        let addresses_before = (staging.weights.as_ptr(), staging.scales.as_ptr());
+        let addresses_before = staging.payload.bytes().as_ptr();
         for encoding in [EngramEncoding::Fp8, EngramEncoding::Nvfp4, EngramEncoding::Fp8] {
             let weights = tempfile::NamedTempFile::new()?;
             let scales = tempfile::NamedTempFile::new()?;
@@ -213,7 +287,7 @@ mod tests {
             }
             assert!(staging.gather(&table, &[],0).is_err());
             assert!(staging.view().is_err());
-            assert_eq!(addresses_before,(staging.weights.as_ptr(),staging.scales.as_ptr()));
+            assert_eq!(addresses_before,staging.payload.bytes().as_ptr());
         }
         Ok(())
     }

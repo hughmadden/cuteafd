@@ -14,8 +14,10 @@ fn main() -> Result<()> {
     let cap = cuteafd_loader::plan::mapped_scale_preload_bytes(cap)?;
     let catalog = read_official_v41_catalog(snapshot)?;
     let map = EngramTokenMap::from_file(&snapshot.join("tokenizer.json"))?;
-    // SAFETY: the checkpoint snapshot is immutable while this process runs.
-    let pipeline = unsafe { EngramPipeline::new(&catalog, map, 256, 4, 256 * 64 * 1024, cap)? };
+    // SAFETY: the configured native library and snapshot remain immutable.
+    let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map,
+        cuteafd_loader::EngramStagingShape::new(256, 2)?, cap)? };
     let mut histories = [pipeline.new_history()?, pipeline.new_history()?];
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {

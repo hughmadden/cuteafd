@@ -8,6 +8,7 @@ pub mod serving_capacity;
 pub use families::deepseek_v41::engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
 pub use families::deepseek_v41::engram_gather::{
     EngramGatherer, EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherTiming,
+    EngramStagingShape, EngramStagingError, ENGRAM_DEVICE_ROW_BYTES,
 };
 pub use families::deepseek_v41::engram_staging::{EngramBatchStaging, EngramGatherView};
 pub use families::deepseek_v41::v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};

@@ -200,7 +200,8 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         let logits = cuteafd_core::memory_layout::host_logits_bytes(
             u64::from(rows), u64::from(rows),
             super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
-        crate::shared::prefix::budget::admit(config.bytes, logits, 8 << 30)?;
+        crate::shared::memory::budget::admit_host_memory_with_resident_formulas(config.bytes, &requests.engram_host_workspace(),
+            &requests.engram_host_formulas(), logits, 8 << 30)?;
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");

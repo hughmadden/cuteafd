@@ -43,23 +43,25 @@ impl Requests<'_> {
         unsafe { execution.prepare_encoder_layer(&mut self.cache, batch.cache()?, lane, index) }
     }
 
-    /// Starts the next encoder unit's Engram gather now (#815): `tokens`
-    /// follow the request's reserved prefill frontier. The next
-    /// `reserve_encoder` of exactly these tokens adopts it. Any other
-    /// reservation cancels it. Text-only units; image requests prepare at
-    /// reservation.
-    /// Enables `prefetch_encoder`: only when the Engram gather pool was sized
-    /// for one more wave than the in-flight slots (else a prefetched wave can
-    /// hold the slots an in-flight unit's gather waits for).
-    pub fn set_prefetch(&mut self, enabled: bool) { self.prefetch_enabled = enabled; }
-    pub fn prefetch_encoder(&mut self, lease: CacheLease, tokens: &[u32]) -> Result<()> {
-        self.prefetched.cancel();
-        if !self.prefetch_enabled || tokens.is_empty() || self.image_requests > 0 { return Ok(()); }
+    /// Start the entire mandatory burst before the executor can begin it.
+    /// A private cursor hashes later known chunks without publishing history.
+    /// Image requests intentionally prepare at reservation instead.
+    pub fn prefetch_encoder(&mut self, lease: CacheLease, chunks: &[&[u32]]) -> Result<()> {
+        self.pipeline.reclaim_copies()?;
+        if chunks.is_empty() || self.image_requests > 0 { return Ok(()); }
         let live = self.request(lease)?;
-        let history = live.prefill.as_ref().map_or(&live.history, |p| p.history());
-        let position = history.position();
-        let wave = self.pipeline.prepare(&[EngramRequestTokens { history, token_ids: tokens, image_mask: None }])?;
-        self.prefetched.hold(prefetch::PrefetchKey { lease, position, tokens: tokens.to_vec() }, wave);
+        let mut cursor = live.prefill.as_ref().map_or(&live.history, |p| p.history()).prefill_cursor();
+        for tokens in chunks.iter().take(self.pipeline.shape().prefetch_units()) {
+            let key = prefetch::PrefetchKey { lease, position: cursor.history().position(), tokens: tokens.to_vec() };
+            if let Some(wave) = self.prefetched.matching(&key) {
+                cursor.advance_full(&wave.batches()[0])?;
+            } else {
+                let wave = self.pipeline.prepare(&[EngramRequestTokens {
+                    history: cursor.history(), token_ids: tokens, image_mask: None }])?;
+                cursor.advance_full(&wave.batches()[0])?;
+                self.prefetched.hold(key, wave);
+            }
+        }
         Ok(())
     }
 
@@ -91,11 +93,17 @@ impl Requests<'_> {
             history: p.history(), token_ids: r.tokens,
             image_mask: masks.as_ref().map_or(r.image_mask, |m| m[i].as_deref()),
         }).collect::<Vec<_>>();
-        // A matching prefetch (`prefetch_encoder`) already started this I/O;
-        // anything else cancels it.
+        // Adopt this reservation's exact wave, or cancel only its participants'
+        // stale lookahead; unrelated requests retain their mandatory burst.
         let key = (requests.len() == 1 && masks.is_none()).then(|| prefetch::PrefetchKey {
             lease: requests[0].lease, position: prepared[0].history().position(), tokens: requests[0].tokens.to_vec() });
-        let adopted = match &key { Some(key) => self.prefetched.take_matching(key), None => { self.prefetched.cancel(); None } };
+        let adopted = match &key {
+            Some(key) => self.prefetched.take_matching(key),
+            None => {
+                for request in requests { self.prefetched.cancel_owner(&request.lease); }
+                None
+            }
+        };
         let mut engram = match adopted { Some(wave) => wave, None => self.pipeline.prepare(&inputs)? };
         let advanced = prepared.iter().zip(engram.batches()).map(|(p, b)| {
             let mut next = p.history().prefill_cursor();

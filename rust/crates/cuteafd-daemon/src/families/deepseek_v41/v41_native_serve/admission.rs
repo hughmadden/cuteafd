@@ -185,6 +185,7 @@ pub(super) fn admit_startup(
         crate::families::deepseek_v41::v41_tensors::fp8_head()
             == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
         BackboneExecution::window_batch_enabled())?;
+    validate_engram_rows(&target, cuteafd_loader::EngramStagingShape::new(capacity as usize, passes)?)?;
     // Test builds retain the materialized query reference buffer; production
     // intentionally has no such owner.
     #[cfg(test)]
@@ -239,6 +240,18 @@ pub(super) fn admit_startup(
     Ok(())
 }
 
+/// Each prefill unit's upload planes are a formula owner, separate from its
+/// gates. The private-lane base and shared reserve assembly both allocate
+/// exactly k * unit_rows rows; sharing must never turn this into unit scratch.
+fn validate_engram_rows(target: &[Demand], shape: cuteafd_loader::EngramStagingShape) -> Result<()> {
+    use cuteafd_core::memory_layout::Basis;
+    let rows = target.iter().filter(|d| d.group.ends_with(" engram rows")).collect::<Vec<_>>();
+    ensure!(rows.len() == shape.units() && rows.iter().all(|d| d.gpu == 0 && d.basis == Basis::Formula)
+        && rows.iter().map(|d| d.bytes).sum::<u64>() == shape.device_bytes() as u64,
+        "V4.1 Engram upload admission differs from required unit row planes");
+    Ok(())
+}
+
 // Remote vision reserves its tower on the Spark, never in the RTX startup bound.
 fn local_vision_owner(enabled: bool, remote: bool) -> bool {
     enabled && !remote
@@ -246,6 +259,27 @@ fn local_vision_owner(enabled: bool, remote: bool) -> bool {
 
 #[cfg(test)]
 mod startup_tests {
+    #[test]
+    fn engram_row_admission_requires_every_unit_and_formula_basis() -> anyhow::Result<()> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        use cuteafd_loader::{EngramStagingShape, ENGRAM_DEVICE_ROW_BYTES};
+        use cuteafd_loader::placement::Demand;
+        for k in 2..=4 {
+            let rows = 8192usize.div_ceil(k).div_ceil(64) * 64;
+            let shape = EngramStagingShape::new(rows, k)?;
+            let target = (0..k).map(|slot| Demand::new(0, Category::Staging,
+                format!("lane {slot} engram rows"), (rows * ENGRAM_DEVICE_ROW_BYTES) as u64,
+                Basis::Formula)).collect::<Vec<_>>();
+            super::validate_engram_rows(&target, shape)?;
+            assert!(super::validate_engram_rows(&target[..k - 1], shape).is_err());
+            let mut wrong = target.clone(); wrong[0].bytes -= 1;
+            assert!(super::validate_engram_rows(&wrong, shape).is_err());
+            let mut wrong = target.clone(); wrong[0].gpu = 1;
+            assert!(super::validate_engram_rows(&wrong, shape).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn verifier_extent_matches_heads_sparse_admission_and_planner() -> anyhow::Result<()> {
         use crate::families::deepseek_v41::graph_policy;
