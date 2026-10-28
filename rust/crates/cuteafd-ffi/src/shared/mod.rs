@@ -1,7 +1,9 @@
 //! Bindings every family uses (program table, expert kernels, FP8 GEMV/MoE,
-//! L2 prefetch, vocabulary head, peer copy, EXL3 wire and packages).
+//! L2 prefetch, vocabulary head, packed 12-bit head, peer copy, EXL3 wire and
+//! packages).
 
 pub(crate) mod fp8_gemv;
+pub(crate) mod packed_head;
 pub mod fp8_moe;
 pub mod programs;
 pub mod mla_draft;

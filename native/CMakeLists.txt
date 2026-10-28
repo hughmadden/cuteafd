@@ -353,6 +353,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/load_scale_gather.cu
     shared/cuda/fp8_load_quant.cu
     shared/cuda/fp8_gemv.cu
+    shared/cuda/packed_head.cu
     shared/cuda/l2_prefetch.cu
     families/deepseek_v41/cuda/v41_dspark_cache.cu
     families/deepseek_v41/cuda/v41_dspark_attention.cu

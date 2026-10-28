@@ -8,6 +8,7 @@ pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, Ki
 pub use families::kimi_k3_split::{KimiSplitError, KimiMlaSplit, KimiMlaRankBatch,
     KimiKdaCore, KimiKdaCoreWeights, KimiKdaCoreBatch};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
+pub use shared::packed_head::PackedHeadPlanes;
 pub use shared::v41_device_ops::{Bf16Add, F32Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
