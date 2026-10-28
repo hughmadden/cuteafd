@@ -6169,3 +6169,23 @@ Run/token/pilot state: `~/.cache/cuteafd/quantization/glm53-flash-k4-core-k6/`.
 Output: `~/.cache/huggingface/cuteafd-exports/GLM-5.3-Flash-EXL3-K4-Core-K6/`.
 Report layer progress and ETA every 30 minutes once the full run is stable.
 Raptor quality/serving qualification and engine K6 shape support are separate.
+
+The short pilot is accepted after an audited reporting-only decision change:
+all native/reconstructed KDA, mHC, MLA/indexer and MTP checks passed; the
+absolute K6 activation-weighted NMSE bound is 1e-3. FP8 comparison remains
+informational because actual dense/MLA source weights re-encode to it almost
+losslessly. No numerical producer or observation changed, and no GPU work
+was repeated for this decision. The original capture commit is retained in
+Git ancestry; `finalization-audit.json` binds every historical candidate,
+Hessian, receipt and proof event. Completed pilot activation frontiers,
+proof-input banks and candidate payloads are retired; scalar evidence and
+receipts remain. Production admission still passes after retirement.
+
+Full production started 2026-10-28 11:26:55 UTC under durable user unit
+`glmf-core-k6-1793186791227193462`, with automatic CPU publication enabled.
+The initial launch was rejected before GPU work by a direct-script import
+bug; its regression and corrected launcher are committed. Draft PR #835
+holds current continuation state; issue #836 holds the recipe/research and
+separate engine follow-up. Numerical code/pin and production identity are
+frozen while the job runs. Do not restart a live attempt or change these
+inputs; recover through its existing launcher and latest durable frontier.
