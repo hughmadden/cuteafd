@@ -232,7 +232,7 @@ impl<'a> Engine<'a> {
         let units = crate::shared::prefill_pipeline::prefill_units(rows, depth.unit_rows, depth.waves, 256)?;
         // Every unit's rows lie in the lane; a slot is the unit's row range.
         Ok(units.into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit {
-            index, sequence: 0, rows, layers: 0..layers, slot: index % depth.waves, barrier: false }).collect())
+            index, sequence: 0, segments: Vec::new(), rows, layers: 0..layers, slot: index % depth.waves, barrier: false }).collect())
     }
 
     pub(crate) fn geometry(&self) -> Result<crate::shared::qwen::scheduler::Geometry> {

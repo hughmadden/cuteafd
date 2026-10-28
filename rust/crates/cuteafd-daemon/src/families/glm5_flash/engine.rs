@@ -341,19 +341,19 @@ pub(crate) const MAX_PREFILL_WAVES: usize = 4;
 /// What a packed pass's `on_logits` returns for one sequence ([`GlmfEngine::prefill_packed`]):
 /// `Err` is a failure the pass shares (the engine's), which ends it for every sequence;
 /// `Ok(Err)` is that sequence's own (its grammar, its sampling), which fails it alone.
-pub(crate) type PackedOutcome = Result<Result<()>>;
+pub(crate) use crate::shared::prefill_packing::MemberOutcome as PackedOutcome;
 
 /// A packed pass once its step has run: the step wrote every sequence's KDA state and pages, so
 /// every placement advances first, then each sequence's `head(i)` logits go to `on_logits` in
 /// order. A sequence's own failure does not stop the others'; it is returned among the outcomes,
 /// and its caller releases or resets that placement.
-fn packed_tail<L>(sequences: &mut [(&mut GlmfPlacement, &[u32])], mut head: impl FnMut(usize) -> Result<L>,
+fn packed_tail<L>(sequences: &mut [(&mut GlmfPlacement, &[u32])], head: impl FnMut(usize) -> Result<L>,
     on_logits: &mut dyn FnMut(usize, L) -> PackedOutcome) -> Result<Vec<Result<()>>> {
     for (placement, tokens) in sequences.iter_mut() {
         placement.len += tokens.len();
         placement.kda_len = placement.len;
     }
-    (0..sequences.len()).map(|i| on_logits(i, head(i)?)).collect()
+    crate::shared::prefill_packing::finish_members(sequences.len(), head, on_logits)
 }
 
 /// Routed experts on this GPU from the TP1 package. All layers stay resident

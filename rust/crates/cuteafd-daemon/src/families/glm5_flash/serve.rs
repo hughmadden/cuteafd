@@ -1105,7 +1105,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
             let finished = if policy.batch && engine.packs_prefill() {
                 let limits = engine.packed_limits();
-                prefills.round_groups(DECODE_ROWS, |group, next| packable(group, next, &limits),
+                prefills.round_packed(limits.rows, DECODE_ROWS,
+                    |p| packs(p).then(|| chunk_end(p) - p.done), |group, next| packable(group, next, &limits),
                     |group| if group.len() == 1 {
                         vec![prefill_chunk(&cx, &mut selector, &mut cache, &mut group[0])]
                     } else {
@@ -1819,25 +1820,7 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
 /// engine's step or head, a selection, the drafter's context) fails every member; otherwise each
 /// member has its own, so one prompt's grammar or sampling failure leaves the others' first
 /// tokens, drafter context and snapshot points as their own passes would.
-fn member_outcomes(members: usize, pass: Result<Vec<Result<()>>>) -> Vec<Result<()>> {
-    match pass {
-        Ok(outcomes) => {
-            let mut outcomes = outcomes.into_iter();
-            (0..members).map(|_| outcomes.next()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("a packed prefill gave no outcome")))).collect()
-        }
-        Err(error) => {
-            let message = format!("packed prefill of {members} prompts: {error:#}");
-            (0..members).map(|_| Err(anyhow::anyhow!("{message}"))).collect()
-        }
-    }
-}
-
-/// Each member's share of a packed pass's time: its rows over the pass's (even when no rows).
-fn row_shares(rows: &[usize]) -> Vec<f64> {
-    let total: usize = rows.iter().sum();
-    rows.iter().map(|&r| if total == 0 { 1.0 / rows.len() as f64 } else { r as f64 / total as f64 }).collect()
-}
+use crate::shared::prefill_packing::{member_outcomes, row_shares};
 
 #[cfg(test)]
 mod lane_tests {

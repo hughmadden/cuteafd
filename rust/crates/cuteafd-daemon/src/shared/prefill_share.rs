@@ -233,6 +233,19 @@ impl<P> PrefillQueue<P> {
         out
     }
 
+    /// Greedily pack only already-queued adjacent chunks into the admitted unit.
+    /// `rows` returns None for a member that must use the singleton path. Family
+    /// resource checks can further bound taps/tables without adding a wait policy.
+    pub fn round_packed(&mut self, cap: usize, most: usize, rows: impl Fn(&P) -> Option<usize>,
+        fits: impl Fn(&[P], &P) -> bool,
+        chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
+        self.round_groups(most, |group, next| {
+            group.iter().chain([next]).try_fold(0usize, |total, p|
+                rows(p).filter(|&n| n > 0).and_then(|n| total.checked_add(n)))
+                .is_some_and(|total| total <= cap) && fits(group, next)
+        }, chunk)
+    }
+
     /// Opt-in groups of adjacent prompts, [`Self::round_pairs`] for up to `most`: the oldest
     /// prompt always runs; each next one joins while `eligible(group, next)` accepts it. `chunk`
     /// receives the group and returns one outcome per member (a member without one fails). No
