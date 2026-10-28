@@ -35,6 +35,8 @@ impl Space {
 #[derive(Default)]
 struct Context {
     scopes: Vec<&'static str>,
+    /// The owner tag ([`owner`]): survives nested category scopes.
+    owner: Option<&'static str>,
     tensor: Option<&'static str>,
     /// The full checkpoint name behind `tensor` (dual-format detection per tensor).
     name: Option<&'static str>,
@@ -58,6 +60,9 @@ pub struct Key {
     pub space: Space,
     pub device: i32,
     pub scope: &'static str,
+    /// The enclosing [`owner`] tag, if any. Category scopes nested inside an
+    /// owner (`sampler`, `workspace/fp8-linear`) relabel `scope` but keep it.
+    pub owner: Option<&'static str>,
     pub tensor: Option<&'static str>,
     pub format: Option<&'static str>,
 }
@@ -133,6 +138,23 @@ impl Drop for Scope {
     }
 }
 
+/// Owner guard: allocations on this thread carry `label` as their owner until
+/// it drops, whatever category scopes nest inside it (the innermost owner wins
+/// and the previous one is restored). Plan == runtime checks sum by owner.
+#[must_use = "the owner tag ends when the guard drops"]
+pub struct Owner(Option<&'static str>);
+
+pub fn owner(label: &str) -> Owner {
+    let label = intern(label);
+    CONTEXT.with(|context| Owner(context.borrow_mut().owner.replace(label)))
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        CONTEXT.with(|context| context.borrow_mut().owner = self.0);
+    }
+}
+
 /// Names the checkpoint tensor the next allocations on this thread hold.
 /// Cleared by the enclosing [`scope`] when it ends.
 pub fn tensor(name: &str) {
@@ -167,6 +189,7 @@ fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
             space,
             device,
             scope: context.scopes.last().copied().unwrap_or("other"),
+            owner: context.owner,
             tensor: context.tensor,
             format: context.format,
         }, context.name)
@@ -285,6 +308,17 @@ impl Snapshot {
         let mut out = BTreeMap::new();
         for row in self.rows.iter().filter(|r| r.key.space == space && r.key.device == device) {
             *out.entry(row.key.scope).or_default() += row.bytes;
+        }
+        out
+    }
+
+    /// Bytes by [`owner`] tag for one pool and device (untagged rows omitted).
+    pub fn by_owner(&self, space: Space, device: i32) -> BTreeMap<&'static str, usize> {
+        let mut out = BTreeMap::new();
+        for row in self.rows.iter().filter(|r| r.key.space == space && r.key.device == device) {
+            if let Some(owner) = row.key.owner {
+                *out.entry(owner).or_default() += row.bytes;
+            }
         }
         out
     }
@@ -418,6 +452,29 @@ mod tests {
         }
         assert_eq!(snapshot().total(Space::Device, 9), 0);
         assert_eq!(snapshot().peak[&(Space::Device, 9)], 3015);
+    }
+
+    /// A category scope nested inside an owner relabels the category but keeps
+    /// the owner, so plan == runtime sums every allocation a component makes.
+    #[test]
+    fn owners_survive_nested_category_scopes() {
+        let base = 0x7100_0000_0000usize;
+        {
+            let _owner = owner("test/lanes/head");
+            let _outer = scope("test/lanes/head");
+            record_alloc(Space::Device, 11, base, 100);
+            {
+                let _inner = scope("test/sampler");
+                record_alloc(Space::Device, 11, base + 1, 20);
+            }
+        }
+        record_alloc(Space::Device, 11, base + 2, 3);
+        let snap = snapshot();
+        assert_eq!(snap.by_owner(Space::Device, 11).into_iter().collect::<Vec<_>>(), vec![("test/lanes/head", 120)]);
+        assert_eq!(snap.by_scope(Space::Device, 11)["test/sampler"], 20);
+        for ptr in base..base + 3 {
+            record_free(ptr);
+        }
     }
 
     #[test]

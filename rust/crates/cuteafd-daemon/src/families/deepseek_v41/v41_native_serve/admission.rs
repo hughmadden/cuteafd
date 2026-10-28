@@ -155,16 +155,19 @@ pub(super) fn startup_phase(
     Ok(())
 }
 
-/// Runs `build` with its device allocations under the ledger scope
-/// `"{scope}/{component}"` (the plan == runtime check sums a scope's
-/// components and reports each).
+/// Runs `build` with its device allocations owned by `"{scope}/{component}"`
+/// (ledger owner tag and default category). Category scopes nested inside
+/// (`sampler`, `workspace/fp8-linear`) keep the owner, so the plan == runtime
+/// check sums every byte the component allocates and reports each component.
 pub(super) fn scoped<T>(scope: &str, component: &str, build: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _scope = cuteafd_ffi::memory_ledger::scope_owned(&format!("{scope}/{component}"));
+    let label = format!("{scope}/{component}");
+    let _owner = cuteafd_ffi::memory_ledger::owner(&label);
+    let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
     build()
 }
 
 /// Plan == runtime (WP6): the decode lanes' and prefill slots' device
-/// allocations on each of `gpus` (their ledger scopes) are exactly what the
+/// allocations on each of `gpus` (their ledger owners) are exactly what the
 /// planner charges (`NativePrograms::target`). A retained temporary or an
 /// unmodelled owner fails startup instead of silently shrinking the pool.
 pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib: &std::path::Path, gpus: &[i32],
@@ -180,14 +183,14 @@ pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib
     let prefill = programs.prefill_slots(reserve, u64::from(unit), ranks, slots, fp8_head, window_batch)?;
     let ledger = snapshot();
     for (rank, &gpu) in gpus.iter().enumerate() {
-        let scopes = ledger.by_scope(Space::Device, gpu);
+        let owners = ledger.by_owner(Space::Device, gpu);
         for (scope, demands, prefix) in [(super::DECODE_LANES_SCOPE, &lanes, "lane "), (super::PREFILL_SLOTS_SCOPE, &prefill, "prefill slots ")] {
             // Live bytes per component (`scoped`), and the plan's per group
             // (decode lanes' groups summed over both lanes).
             let mut live = std::collections::BTreeMap::<String, u64>::new();
             // Engram rows and gates are charged apart but one owner allocates both on two RTX.
             let component = |name: &str| if name.starts_with("engram") { "engram".to_string() } else { name.to_string() };
-            for (label, &bytes) in scopes.iter().filter(|(label, _)| label.starts_with(scope)) {
+            for (label, &bytes) in owners.iter().filter(|(label, _)| label.starts_with(scope)) {
                 let name = label.strip_prefix(scope).unwrap_or(label).trim_start_matches('/');
                 *live.entry(if name.is_empty() { "(unscoped)".into() } else { component(name) }).or_default() += bytes as u64;
             }
