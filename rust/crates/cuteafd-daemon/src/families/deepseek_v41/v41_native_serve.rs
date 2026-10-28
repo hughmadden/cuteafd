@@ -1014,6 +1014,35 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
 }
 
 #[cfg(test)]
+mod one_window_tests {
+    use super::*;
+    fn resolve(extra: &[&str]) -> AdmittedPrefill {
+        use clap::Parser;
+        let mut argv = vec!["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        argv.extend_from_slice(extra);
+        let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected serve-native");
+        };
+        AdmittedPrefill::resolve(&args).unwrap()
+    }
+    /// Depth 1 is a first-class shape (TJ 2026-10-28): the Spark-free default
+    /// 1 x 4096 resolves to one slot, a 4096-row reserve and the single
+    /// candidate {1}; an explicit depth 3 keeps 3 x 2752 on the 8256-row reserve.
+    #[test]
+    fn one_window_resolves_one_slot_at_the_widest_unit_and_pins_keep_their_reserve() {
+        let one = resolve(&["--prefill-slots", "1", "--prefill-waves", "1", "--prefill-batch-tokens", "4096"]);
+        assert_eq!((one.unit_cap, one.waves, one.slots, one.reserve_rows()), (4096, 1, 1, 4096));
+        let depth = one.depth().unwrap();
+        assert_eq!(depth.candidates(), [1]);
+        assert_eq!(depth.current(), (1, 4096));
+        let three = resolve(&["--prefill-slots", "3", "--prefill-waves", "3", "--prefill-batch-tokens", "2752"]);
+        assert_eq!((three.unit_cap, three.waves, three.slots, three.reserve_rows()), (2752, 3, 3, 8256));
+        // Transports and Spark endpoints admit one slot too.
+        assert!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(80, 4096, 4, 1, 8192).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod spark_lane_tests {
     use super::*;
 

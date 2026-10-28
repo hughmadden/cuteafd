@@ -71,7 +71,7 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
 /// rank's partial-sum plane over the reserve its return slots are cut from
 /// (`wave_control::reserve_rows`).
 pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize, reserve: u64) -> Result<u64> {
-    ensure!((2..=4).contains(&slots), "invalid V4.1 prefill slots");
+    ensure!((1..=4).contains(&slots), "invalid V4.1 prefill slots");
     let reserve = crate::serving_capacity::wave_control::reserve_rows_in(slots as u64, rows, reserve);
     let lanes = 2 * transport_bytes(decode_rows, ranks)?;
     let outputs = slots as u64 * rows * 5120 * 2;

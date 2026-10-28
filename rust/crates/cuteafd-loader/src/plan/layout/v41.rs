@@ -52,7 +52,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     // Admitted slots (#762): the deepest depth the controller may run, on one
     // storage set over the reserve; two decode lanes at decode width.
-    let slots = usize::try_from(prefill.slots.max(2))?;
+    let slots = usize::try_from(prefill.slots)?;
     let reserve = options.prefill_reserve_rows.unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS);
     let span = crate::serving_capacity::wave_control::reserve_rows_in(slots as u64, rows, reserve);
     let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, fp8_head, window_batch)?;

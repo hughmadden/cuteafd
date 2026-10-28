@@ -263,6 +263,25 @@ pub fn waves_used(rows: u64, waves: u64, unit: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// TJ 2026-10-28: a Spark-free prefill path (no Spark ranks in prefill:
+    /// GLM Flash / dense Qwen 0-Spark, or a family planning its fully
+    /// onboarded prefill path as such) runs one window at the widest unit,
+    /// for static and adaptive families alike; an explicit depth still pins.
+    #[test]
+    fn spark_free_prefill_is_one_window_at_the_widest_unit() {
+        for adaptive in [false, true] {
+            let limits = PrefillLimits { adaptive, ..Default::default() };
+            let plan = prefill_shape(0, limits, PrefillOverrides::default()).unwrap();
+            assert_eq!((plan.unit_rows, plan.waves, plan.slots, plan.span_rows), (4096, 1, 1, 4096), "adaptive={adaptive}");
+            let pinned = prefill_shape(0, limits, PrefillOverrides { waves: Some(3), ..Default::default() }).unwrap();
+            assert_eq!((pinned.unit_rows, pinned.waves, pinned.slots), (2752, 3, 3), "adaptive={adaptive}");
+        }
+        // Depth 1 is a valid explicit pin with Sparks too.
+        let one = prefill_shape(4, PrefillLimits { adaptive: true, ..Default::default() },
+            PrefillOverrides { unit_rows: Some(4096), waves: Some(1), ..Default::default() }).unwrap();
+        assert_eq!((one.unit_rows, one.waves, one.slots, one.span_rows), (4096, 1, 1, 4096));
+    }
+
     fn measured(waves: u64) -> PrefillLimits {
         PrefillLimits { estimate: PrefillEstimate::MeasuredWaves { waves, reference_ranks: 6, larger_topology_waves: waves, source: "test comparison" },
             ..Default::default() }
