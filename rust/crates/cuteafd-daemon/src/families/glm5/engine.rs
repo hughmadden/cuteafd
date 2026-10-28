@@ -1243,6 +1243,7 @@ impl<'a> GlmEngine<'a> {
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                 self.moe(w, index, layer, t, cap, tables.decode, transport)?;
             }
+            if !layer.dense { self.tap_width(w, index, tables.exchange_rows)?; }
             // h += ffn; x = next input_layernorm(h) (or the final norm). Under a head split
             // the FFN output is this GPU's partial plus rank 1's (dense), or the routed sum
             // with this GPU's shared-expert half plus rank 1's half (sent to rank 1 first).
@@ -1263,6 +1264,7 @@ impl<'a> GlmEngine<'a> {
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
+            if !layer.dense { self.finish_width_tap(w, index, tables.exchange_rows)?; }
             if let Some(drafter) = &self.drafter {
                 let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
                 drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
@@ -1808,6 +1810,29 @@ impl<'a> GlmEngine<'a> {
         }
         skip.upload_zeros(t, self.stream)?;
         Ok(SKIP_RANKS)
+    }
+
+    /// Width diagnostics only: read the live route operands, not skip-mode staging.
+    fn tap_width(&self, w: &Workspace<'_>, layer: usize, rows: usize) -> Result<()> {
+        if self.width_taps.borrow().is_none() { return Ok(()); }
+        let route_bytes = rows * self.cfg.topk * 4;
+        let mut routes = self.download(&w.route_ids, route_bytes)?;
+        routes.extend(self.download(&w.route_weights, route_bytes)?);
+        let bytes = rows * self.cfg.hidden * 2;
+        let tap = WidthTap { layer, x: self.download(&w.x, bytes)?, routes,
+            delta: if self.tp2_layer(layer) { Vec::new() } else { self.download(&w.delta, bytes)? } };
+        self.width_taps.borrow_mut().as_mut().unwrap().push(tap);
+        Ok(())
+    }
+
+    fn finish_width_tap(&self, w: &Workspace<'_>, layer: usize, rows: usize) -> Result<()> {
+        if self.width_taps.borrow().is_none() { return Ok(()); }
+        let output = self.download(&w.h, rows * self.cfg.hidden * 2)?;
+        let mut taps = self.width_taps.borrow_mut();
+        let tap = taps.as_mut().unwrap().last_mut().context("missing width diagnostic input")?;
+        ensure!(tap.layer == layer, "width diagnostic layer changed before its output");
+        tap.delta = output;
+        Ok(())
     }
 
     /// Routes and wire rows down to this workspace's pinned staging (the host

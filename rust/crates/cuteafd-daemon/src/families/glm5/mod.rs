@@ -205,6 +205,27 @@ mod draft_cli_tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn width_diagnostics_fail_closed_and_detect_live_route_changes() {
+        let tap = || engine::WidthTap { layer: 3, x: vec![0; 4], routes: vec![0; 16], delta: vec![0; 4] };
+        assert!(validate_width_taps(&[], &[3], 2, 1, 1).is_err());
+        assert!(validate_width_taps(&[tap()], &[4], 2, 1, 1).is_err());
+        assert!(validate_width_taps(&[tap()], &[3], 1, 1, 1).is_err());
+        assert!(validate_width_taps(&[tap()], &[3], 2, 1, 1).is_ok());
+        let base = engine::WidthTap { layer: 3, x: vec![0; 2], routes: vec![0; 8], delta: vec![0; 2] };
+        assert!(tap_split(&[tap()], std::slice::from_ref(&base), 1, 1, 1).is_empty());
+        for (offset, label) in [(4, "ids differ"), (12, "weights differ")] {
+            let mut changed = tap();
+            changed.routes[offset] = 1;
+            assert!(tap_split(&[changed], std::slice::from_ref(&base), 1, 1, 1).contains(label));
+        }
+        let source = include_str!("engine.rs");
+        let tap = source.split("fn tap_width(").nth(1).unwrap().split("fn finish_width_tap(").next().unwrap();
+        assert!(tap.find("if self.width_taps.borrow().is_none()").unwrap() < tap.find("self.download(").unwrap());
+        assert!(tap.contains("self.download(&w.route_ids,") && tap.contains("self.download(&w.route_weights,"));
+        assert!(!tap.contains("router_host"));
+    }
+
     #[derive(Parser)]
     struct Parse {
         #[command(flatten)]
@@ -1370,9 +1391,21 @@ fn hooked_verify(engine: &engine::GlmEngine<'_>, placement: &mut engine::GlmPlac
     let logits = engine.verify(&mut [(placement, rows)], tokens, transport.as_deref_mut().map(|t| (t, runtime)),
         Some(&mut hook));
     let taps = engine.width_taps.borrow_mut().take().unwrap_or_default();
-    let logits = logits?.context("width invariance needs every layer")?;
     placement.len = start;
+    let logits = logits?.context("width invariance needs every layer")?;
+    let expected = engine.weights.layers.iter().enumerate().filter_map(|(i, layer)| (!layer.dense).then_some(i))
+        .collect::<Vec<_>>();
+    validate_width_taps(&taps, &expected, rows, engine.cfg.hidden, engine.cfg.topk)?;
     Ok((layers, logits, taps))
+}
+
+fn validate_width_taps(taps: &[engine::WidthTap], expected: &[usize], rows: usize, hidden: usize, topk: usize) -> Result<()> {
+    ensure!(taps.len() == expected.len() && !expected.is_empty(), "width diagnostics missed MoE layer taps");
+    for (tap, &layer) in taps.iter().zip(expected) {
+        ensure!(tap.layer == layer && tap.x.len() == rows * hidden * 2 && tap.delta.len() == tap.x.len()
+            && tap.routes.len() == rows * topk * 8, "incomplete width diagnostic tap for MoE layer {layer}");
+    }
+    Ok(())
 }
 
 /// Where a differing row first departs inside its first differing MoE layer:
@@ -1405,7 +1438,10 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     let max_rows = *args.width_invariance.iter().max().unwrap();
     ensure!(args.width_invariance.iter().all(|&w| (1..=engine::DECODE_ROWS).contains(&w)),
         "--width-invariance takes widths 1..={}", engine::DECODE_ROWS);
-    ensure!(transport.is_some() || engine.skip_routed(), "--width-invariance needs Spark peers or --skip-routed-experts");
+    ensure!(transport.is_some() || engine.skip_routed()
+        || engine.weights.layers.iter().enumerate().all(|(i, layer)| layer.dense
+            || engine.tp2_layers().is_some_and(|layers| layers.contains(&i))),
+        "--width-invariance needs Spark peers, local experts, or --skip-routed-experts");
     let prefill = args.prefill.unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
     let mut placement = engine::PageAllocator::new(engine).admit(prefill + max_rows)?;

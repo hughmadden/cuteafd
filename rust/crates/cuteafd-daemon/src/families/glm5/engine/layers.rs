@@ -310,12 +310,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             Ticket::Complete => None,
         };
         if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
-        if e.width_taps.borrow().is_some() {
-            let bytes = real * e.cfg.hidden * 2;
-            let routes = w.router_host.borrow().bytes()[..real * e.cfg.topk * 8].to_vec();
-            let tap = super::WidthTap { layer: index, x: e.download(&w.x, bytes)?, routes, delta: e.download(&w.delta, bytes)? };
-            e.width_taps.borrow_mut().as_mut().unwrap().push(tap);
-        }
+        if !self.layer(0, index).dense { e.tap_width(w, index, real)?; }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
             for rank in 0..2 {
@@ -325,6 +320,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             }
         }
         self.join(index)?;
+        if !self.layer(0, index).dense { e.finish_width_tap(w, index, real)?; }
         let bytes = self.rows() * e.cfg.hidden * 2;
         if let Some(callback) = self.on_layer.as_mut() { callback(index, &e.download(&w.h, bytes)?)?; }
         if let Some(probe) = e.draft_probe.borrow_mut().as_mut() {
