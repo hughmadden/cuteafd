@@ -223,7 +223,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         // a head-only K6 scratch on the head rank.
         if let Some(manifest) = &manifest {
             fixed.extend(crate::families::kimi_k3::core::draft_head_demand(&model.core,
-                layout.capacity().block_rows, &manifest["families"]["kimi_k6_dense"])?);
+                layout.capacity().block_rows, &manifest["families"]["dense_trellis_k6"])?);
         }
         let bytes = layout.window_mark_bytes()? as u64;
         if bytes > 0 && legacy_marks > 0 {

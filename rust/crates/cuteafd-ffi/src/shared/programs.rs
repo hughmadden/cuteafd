@@ -214,7 +214,7 @@ impl<'a> Programs<'a> {
                 self.card_specs.insert(name.to_string(), specs);
             }
             if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
-                super::glm_stage::validate_entry(spec, entry)?;
+                validate_glm_stage_entry(spec, entry)?;
             } else if name.starts_with("exlr8_dense_") {
                 // Companions (transforms, unpack, prefill GEMM, glue) by their op; the
                 // ABI-v1 linears and the embedding gather by name.
@@ -355,6 +355,28 @@ impl Program<'_> {
     }
 }
 
+fn validate_glm_stage_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
+    let (name, widths) = if let Some(name) = spec.name.strip_prefix("glm_stage_") {
+        (name, [2048, 12288])
+    } else if let Some(name) = spec.name.strip_prefix("glm2_stage_") {
+        (name, [1024, 6144])
+    } else {
+        bail!("{}: unknown GLM stage table", spec.name);
+    };
+    if let Some(width) = name.strip_prefix("swiglu_i") {
+        let inter: u32 = width.parse().context("invalid GLM split-SwiGLU width")?;
+        ensure!(widths.contains(&inter) && name == format!("swiglu_i{inter}"),
+            "{}: unsupported GLM split-SwiGLU width", spec.name);
+        let op = super::native_dense_glue::validate_entry(spec, entry)?;
+        ensure!(op == super::native_dense_glue::Op::SwigluSplit { inter },
+            "{}: split-SwiGLU name and operation disagree", spec.name);
+    } else {
+        ensure!(entry["op"] == "attention_stage", "{}: expected GLM attention stage operation", spec.name);
+        super::glm_stage::validate_entry(spec, entry)?;
+    }
+    Ok(())
+}
+
 fn validate_exlr8_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
     super::exlr8::validate_entry(spec, entry)?;
     let expected: &[(&str, &str)] = match spec.name.as_str() {
@@ -380,6 +402,54 @@ fn c_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_glm_stage_manifest_passes_runtime_dispatch() {
+        // Real exporter output; the Python catalogue test also rebuilds its ABI
+        // from the pinned fork's manifest builders to catch fixture drift.
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/glm_stage_programs_sm120.json"
+        )).unwrap();
+        let entries = manifest["programs"].as_array().unwrap();
+        assert_eq!(entries.len(), 38);
+        let mut swiglu = 0;
+        for entry in entries {
+            let spec = ProgramSpec {
+                name: entry["name"].as_str().unwrap().to_owned(),
+                pointers: entry["pointers"].as_array().unwrap().iter()
+                    .map(|p| p["name"].as_str().unwrap().to_owned()).collect(),
+                scalar_kinds: b"i".to_vec(),
+                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                geometry: entry["geometry"].clone(),
+            };
+            validate_glm_stage_entry(&spec, entry).unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            swiglu += usize::from(entry["op"] == "swiglu_split");
+            for field in ["dtype", "shape", "role"] {
+                let mut broken = entry.clone();
+                broken["pointers"][0][field] = "invalid".into();
+                assert!(validate_glm_stage_entry(&spec, &broken).is_err(), "{}: {field}", spec.name);
+            }
+            let mut broken = entry.clone();
+            broken["scalars"][0]["type"] = "int64".into();
+            assert!(validate_glm_stage_entry(&spec, &broken).is_err(), "{}: scalar", spec.name);
+            broken = entry.clone();
+            broken["op"] = "unknown".into();
+            assert!(validate_glm_stage_entry(&spec, &broken).is_err(), "{}: op", spec.name);
+            let mut wrong_capacity = spec.clone();
+            wrong_capacity.capacity_rows = 0;
+            assert!(validate_glm_stage_entry(&wrong_capacity, entry).is_err(), "{}: capacity", spec.name);
+            let mut wrong_name = spec.clone();
+            wrong_name.name = if entry["op"] == "swiglu_split" {
+                "glm_stage_swiglu_i6144".into()
+            } else {
+                spec.name.replacen("_stage_", "_stage_unknown_", 1)
+            };
+            assert!(validate_glm_stage_entry(&wrong_name, entry).is_err(), "{}: name", spec.name);
+        }
+        assert_eq!(swiglu, 4);
+    }
 
     #[test]
     fn exported_exlr8_grouped_manifest_requires_runtime_l2_scalar() {

@@ -2,6 +2,7 @@
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::plan::Checkpoint;
 use cuteafd_core::DType;
+use anyhow::Context;
 use std::collections::BTreeMap;
 
 use super::*;
@@ -61,9 +62,30 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
+    let core = (|| -> anyhow::Result<_> {
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+        let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        if core.projections.is_empty() { return Ok(None); }
+        let owners = layers.then(|| crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)).transpose()?;
+        let (_, _, _, draft_rows) = drafter_admission(options)?;
+        anyhow::ensure!(options.glm5_drafter_disabled || draft_rows.is_some(),
+            "native K6 drafter head needs its actual DFlash config, not a bytes-only override");
+        Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
+            ranks, owners.as_deref(), shape.prefill_rows as usize, prefill.waves as usize, draft_rows,
+            shape.manifest.as_ref().context("GLM K6 requires PROGRAMS.json with native exports")?)?))
+    })();
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
-        device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
-            local_package(report), split, index, options.rtx_bytes[index]));
+        let item = match (core.as_ref().ok().and_then(Option::as_ref), shape.manifest.as_ref()) {
+            (Some(core), Some(manifest)) => {
+                let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[index], None);
+                let allowance = crate::placement::inventory::loaded_code_allowance("glm-k6", local_package(report), split,
+                    index as u8, &arch, Some(&core.program_set(manifest, split)));
+                Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
+            }
+            _ => runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
+                local_package(report), split, index, options.rtx_bytes[index]),
+        };
+        device.items.push(item);
     }
     let lanes = prefill.waves;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
@@ -73,8 +95,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         spark_endpoints("glm5", lanes), &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
-    match placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(), shape.prefill_rows,
-        shape.context_tokens) {
+    match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(),
+        shape.prefill_rows, shape.context_tokens, core.as_ref())) {
         Ok((placement, selected)) => {
             report.solver_placement = Some(placement.clone());
             // The solver resolved auto against this build's programs.
@@ -134,6 +156,8 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
     -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
     anyhow::ensure!((1..=2).contains(&ranks), "GLM coordinator ranks");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+    let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+    let trellis = !core.projections.is_empty();
     anyhow::ensure!(layers <= cfg.layers, "GLM resident layer extent exceeds checkpoint");
     anyhow::ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == layers
         && owners.iter().all(|&owner| owner < 2)), "GLM attention owner inventory");
@@ -150,8 +174,12 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         let qkv = [format!("{attn}.q_a_proj.weight"), format!("{attn}.kv_a_proj_with_mqa.weight")];
         let attention = [qkv[0].clone(), qkv[1].clone(), format!("{attn}.q_b_proj.weight"),
             format!("{attn}.kv_b_proj.weight"), format!("{attn}.o_proj.weight")];
-        let bf16 = native && attention.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16));
-        let qkv_rows: u64 = qkv.iter().map(|n| tensor(n).map(|t| t.shape[0] as u64)).sum::<anyhow::Result<_>>()?;
+        let core_attention = core.get_weight(&qkv[0]).is_some();
+        let bf16 = native && attention.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16))
+            || core_attention && tensor(&format!("{attn}.kv_b_proj.weight"))?.dtype == DType::Bf16;
+        let qkv_rows: u64 = if core_attention { 0 } else {
+            qkv.iter().map(|n| tensor(n).map(|t| t.shape[0] as u64)).sum::<anyhow::Result<_>>()?
+        };
         let h = cfg.hidden as u64;
         let projection = |name: &str| -> anyhow::Result<(u64, u64)> {
             let t = tensor(name)?;
@@ -167,16 +195,23 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
                 for name in [format!("{attn}.q_a_layernorm.weight"), format!("{attn}.kv_a_layernorm.weight")] {
                     put(rank, "norm", "bf16", tensor(&name)?.byte_length);
                 }
-                put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, qkv_rows * h * if bf16 { 2 } else { 1 });
-                if !bf16 {
-                    let grid = qkv.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
-                    put(rank, "attention", "fp8-scale", grid);
-                    put(rank, "attention", "fp8-scale", qkv_rows * h.div_ceil(128) * 4);
-                }
-                for name in [format!("{attn}.q_b_proj.weight"), format!("{attn}.o_proj.weight")] {
-                    let (values, scales) = projection(&name)?;
-                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values / attention_ranks as u64 * if bf16 { 2 } else { 1 });
-                    if !bf16 { put(rank, "attention", "fp8-scale", scales / attention_ranks as u64); }
+                if core_attention {
+                    for name in [&qkv[0], &qkv[1], &format!("{attn}.q_b_proj.weight"), &format!("{attn}.o_proj.weight")] {
+                        let projection = core.get_weight(name).context("complete GLM native attention group")?;
+                        put(rank, "attention", "exl3-k6", projection.resident_bytes(attention_ranks)?);
+                    }
+                } else {
+                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, qkv_rows * h * if bf16 { 2 } else { 1 });
+                    if !bf16 {
+                        let grid = qkv.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
+                        put(rank, "attention", "fp8-scale", grid);
+                        put(rank, "attention", "fp8-scale", qkv_rows * h.div_ceil(128) * 4);
+                    }
+                    for name in [format!("{attn}.q_b_proj.weight"), format!("{attn}.o_proj.weight")] {
+                        let (values, scales) = projection(&name)?;
+                        put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values / attention_ranks as u64 * if bf16 { 2 } else { 1 });
+                        if !bf16 { put(rank, "attention", "fp8-scale", scales / attention_ranks as u64); }
+                    }
                 }
                 for width in [cfg.qk_nope_head_dim, cfg.v_head_dim] {
                     let values = cfg.heads as u64 / attention_ranks as u64 * cfg.kv_lora_rank as u64 * width as u64;
@@ -185,7 +220,7 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
                 }
                 if cfg.indexers[layer] == GlmIndexer::Full {
                     let name = format!("{attn}.indexer.wq_b.weight");
-                    let index_bf16 = native && tensor(&name)?.dtype == DType::Bf16;
+                    let index_bf16 = (native || trellis) && tensor(&name)?.dtype == DType::Bf16;
                     let (values, scales) = projection(&name)?;
                     put(rank, "indexer", if index_bf16 { "bf16" } else { "fp8" }, values * if index_bf16 { 2 } else { 1 });
                     if !index_bf16 { put(rank, "indexer", "fp8-scale", scales); }
@@ -202,11 +237,18 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
             let names = [format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight"), format!("{mlp}.down_proj.weight")];
             let shared_bf16 = !dense && native && names.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16));
             let group = if dense { "dense" } else { "shared_expert" };
-            let gu = names[..2].iter().map(|n| projection(n)).collect::<anyhow::Result<Vec<_>>>()?;
-            let down = projection(&names[2])?;
-            for (values, scales) in [(gu[0].0 + gu[1].0, gu[0].1 + gu[1].1), down] {
-                put(rank, group, if shared_bf16 { "bf16" } else { "fp8" }, values / ranks as u64 * if shared_bf16 { 2 } else { 1 });
-                if !shared_bf16 { put(rank, group, "fp8-scale", scales / ranks as u64); }
+            if core.get_weight(&names[0]).is_some() {
+                for name in &names {
+                    put(rank, group, "exl3-k6", core.get_weight(name)
+                        .context("complete GLM native FFN group")?.resident_bytes(ranks)?);
+                }
+            } else {
+                let gu = names[..2].iter().map(|n| projection(n)).collect::<anyhow::Result<Vec<_>>>()?;
+                let down = projection(&names[2])?;
+                for (values, scales) in [(gu[0].0 + gu[1].0, gu[0].1 + gu[1].1), down] {
+                    put(rank, group, if shared_bf16 { "bf16" } else { "fp8" }, values / ranks as u64 * if shared_bf16 { 2 } else { 1 });
+                    if !shared_bf16 { put(rank, group, "fp8-scale", scales / ranks as u64); }
+                }
             }
             if dense && names.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::F8E4M3)
                 && tensors.contains_key(format!("{n}_scale").as_str())) {
@@ -221,6 +263,10 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         }
     }
     for (name, group) in [("model.embed_tokens.weight", "embedding"), ("model.norm.weight", "norm"), ("lm_head.weight", "lm_head")] {
+        if let Some(projection) = core.get_weight(name) {
+            put(0, group, "exl3-k6", projection.resident_bytes(1)?);
+            continue;
+        }
         let t = tensor(name)?;
         let bytes = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 { t.shape.iter().product::<usize>() as u64 * 2 } else { t.byte_length };
         put(0, group, "bf16", bytes);
@@ -255,10 +301,10 @@ fn failure_hint(mode: crate::placement::AttentionPlacement) -> String {
     }
 }
 
-fn drafter_admission(options: &LayoutOptions) -> anyhow::Result<(u64, u64, Option<usize>)> {
+fn drafter_admission(options: &LayoutOptions) -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>)> {
     use crate::placement::families::glm5 as glm;
-    Ok(if options.glm5_drafter_disabled { (0, 0, None) }
-        else if options.drafter_bytes > 0 { (options.drafter_bytes, 0, None) }
+    Ok(if options.glm5_drafter_disabled { (0, 0, None, None) }
+        else if options.drafter_bytes > 0 { (options.drafter_bytes, 0, None, None) }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
@@ -273,12 +319,14 @@ fn drafter_admission(options: &LayoutOptions) -> anyhow::Result<(u64, u64, Optio
                 .ok_or_else(|| anyhow::anyhow!("GLM draft block must include an anchor"))?;
             (glm::drafter_bytes(&snapshot, slots, sequences,
                 options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as u64,
-                options.glm5_draft_bf16, options.draft_kv_cache)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?, Some(drafts))
+                options.glm5_draft_bf16, options.draft_kv_cache)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?, Some(drafts),
+                Some(sequences.checked_mul(usize::try_from(block)?).context("GLM native draft head row extent")?))
         })
 }
 
 fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &LayoutOptions,
-    devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64)
+    devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64,
+    core: Option<&crate::families::glm5::core::CoreCharges>)
     -> anyhow::Result<(crate::placement::Placement, crate::placement::families::glm5::GlmWorkingSet)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     let checkpoint = input.checkpoint();
@@ -288,7 +336,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
-    let (draft, draft_staging, active_drafts) = drafter_admission(options)?;
+    let (draft, draft_staging, active_drafts, _) = drafter_admission(options)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
@@ -319,7 +367,9 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-        headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
+        headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0,
+        native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(),
+        native_head: core.is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
@@ -352,7 +402,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
-    let (draft, draft_staging, active_drafts) = drafter_admission(options)?;
+    let (draft, draft_staging, active_drafts, _) = drafter_admission(options)?;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();
@@ -385,10 +435,12 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             .map(|(group, format, bytes)| Item::new(if group == "embedding" { Category::Embedding }
                 else { Category::Weights }, group, format, bytes, Basis::Exact)).collect();
         items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes[rank], Basis::Exact));
-        let mut programs = program_families("glm", split);
-        programs.push("exlr8".into());
-        let mut runtime = runtime_item(Some(&manifest), &programs, "glm:exlr8", split,
-            rank, options.rtx_bytes[rank]);
+        let set = crate::families::glm5::DensePrograms::Exlr8.program_set(&manifest, split);
+        let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[rank], None);
+        let allowance = crate::placement::inventory::loaded_code_allowance("glm", "glm:exlr8", split,
+            rank as u8, &arch, Some(&set));
+        let mut runtime = Item::new(Category::Runtime, "context+modules", "",
+            arch.context_bytes + allowance.bytes, allowance.basis);
         runtime.group = "EXLR8 context+modules".into();
         items.push(runtime);
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
@@ -415,7 +467,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
-        native_workspace: workspace, native_dense: dense_scratch, skip_routed_experts: false, prefill_rows: rows,
+        native_workspace: workspace, native_dense: dense_scratch, native_head: false, skip_routed_experts: false, prefill_rows: rows,
         prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch: Some(scratch), drafter_bytes: draft,
         drafter_staging: draft_staging, pending_code: Vec::new(), experts: local.as_ref().map_or_else(Vec::new, |local| local.experts.clone()), expert_workspace: 0,
@@ -445,6 +497,84 @@ mod tests {
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
     fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
+
+    #[test]
+    fn exlr8_explicit_stages_preserve_the_pre_namespace_fix_module_charge() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k|
+            crate::plan::testing::exl3(n, r, k, 4)), None);
+        let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
+        let mut manifest = native_manifest();
+        let entries = manifest["programs"].as_array_mut().unwrap();
+        // Match the sealed p0 namespace census without embedding a local build.
+        for (family, count) in [("glm", 42), ("glm2", 18), ("exlr8", 84)] {
+            let actual = entries.iter().filter(|p|
+                cuteafd_core::coordinator_programs::program_namespace(p["name"].as_str().unwrap()) == Some(family)).count();
+            assert!(actual <= count);
+            entries.extend((actual..count).map(|i| serde_json::json!({"name":format!("{family}_fixture_{i}")})));
+        }
+        for prefix in ["glm", "glm2"] {
+            for rows in [64, 4096] {
+                for stage in ["rank_pack", "query_rope", "index_post", "absorb_bf16", "absorb", "values_bf16", "values"]
+                    .into_iter().chain((prefix == "glm2").then_some("query_rope_context"))
+                    .chain((prefix == "glm2").then_some("absorb_context")) {
+                    entries.push(serde_json::json!({"name":format!("{prefix}_stage_{stage}_m{rows}")}));
+                }
+            }
+        }
+        assert_eq!(entries.len(), 176);
+        let mut expanded = manifest.clone();
+        let entries = expanded["programs"].as_array_mut().unwrap();
+        entries.extend((0..42).map(|i| serde_json::json!({"name":format!("dense_trellis_k6_fixture_{i}")})));
+        let k6_only = ["glm2_stage_absorb_bf16_context_m64", "glm2_stage_absorb_bf16_context_m4096",
+            "glm_stage_swiglu_i2048", "glm_stage_swiglu_i12288", "glm2_stage_swiglu_i1024", "glm2_stage_swiglu_i6144"];
+        entries.extend(k6_only.iter().map(|name| serde_json::json!({"name":name,
+            "scratch_bytes_at_capacity":{"scratch":999_999}})));
+        assert_eq!(entries.len(), 224);
+        use crate::families::glm5::DensePrograms;
+        // Runtime intentionally retains p0's split module set even on one GPU.
+        let old_runtime = DensePrograms::Exlr8.program_set(&manifest, true);
+        let runtime = DensePrograms::Exlr8.program_set(&expanded, true);
+        assert_eq!(runtime, old_runtime);
+        assert_eq!(runtime.names.len(), 176);
+        assert_eq!(runtime.module_bytes(), 56_623_104);
+        let broad = crate::placement::ProgramSet::from_manifest(&expanded,
+            &["glm", "glm2", "exlr8", "glm_stage", "glm2_stage"]);
+        assert_eq!(broad.names.len(), 182);
+        assert_eq!(broad.module_bytes() - runtime.module_bytes(), 2 << 20);
+        assert!(runtime.scratch.iter().all(|(_, bytes)| *bytes != 999_999));
+        assert!(k6_only.iter().all(|name| DensePrograms::Trellis.stage(name, true)));
+        assert!(k6_only.iter().all(|name| !DensePrograms::Exlr8.stage(name, true)));
+        assert!(DensePrograms::Fp8.program_set(&expanded, true).names.iter().all(|name| !name.contains("_stage_")));
+        for gpus in [1, 2] {
+            let old_set = DensePrograms::Exlr8.program_set(&manifest, gpus == 2);
+            let new_set = DensePrograms::Exlr8.program_set(&expanded, gpus == 2);
+            assert_eq!(new_set, old_set);
+            assert_eq!(new_set.names.len(), if gpus == 2 { 176 } else { 140 });
+            let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: 512,
+                prefill_lanes: 3, prefill_waves: 3, context_tokens: 8192, pool_tokens: Some(262144),
+                onboard: Some(crate::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                ..Default::default() };
+            let (layout, _) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4,
+                &expanded, None).unwrap();
+            let families = if gpus == 2 { vec!["glm", "glm2", "exlr8"] } else { vec!["glm", "exlr8"] };
+            // This was the exact selector before compound namespace separation.
+            let names = manifest["programs"].as_array().unwrap().iter()
+                .filter_map(|p| p["name"].as_str()).filter(|name|
+                    name.split_once('_').is_some_and(|(prefix, _)| families.contains(&prefix)))
+                .map(str::to_string).collect();
+            let old = crate::placement::ProgramSet { families: families.iter().map(|f| f.to_string()).collect(),
+                names, scratch: Vec::new() };
+            assert!(old.names.iter().any(|name| name.starts_with("glm_stage_")));
+            for (rank, device) in layout.devices.iter().enumerate().take(gpus) {
+                let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[rank], None);
+                let allowance = crate::placement::inventory::loaded_code_allowance("glm", "glm:exlr8",
+                    gpus == 2, rank as u8, &arch, Some(&old));
+                let actual = device.items.iter().find(|i| i.group == "EXLR8 context+modules").unwrap();
+                assert_eq!(actual.bytes, arch.context_bytes + allowance.bytes);
+            }
+        }
+    }
 
     #[test]
     fn exlr8_min_max_prefill_matches_exl3_and_charges_every_wave() {
@@ -633,7 +763,7 @@ mod tests {
                             baseline + 256 * (1 + lanes), Basis::Exact)], kv_tokens: 0, ..device.clone() }
                     }).collect();
                     let (ordinary, _) = placement(&report, &input, &options, &devices, Some(&manifest),
-                        4096, 1 << 20).unwrap();
+                        4096, 1 << 20, None).unwrap();
                     assert_eq!(native.pool_tokens, ordinary.pool_tokens, "{gpus} RTX/{sparks} Sparks/{lanes} lanes");
                 }
                 let explicit = LayoutOptions { pool_tokens: Some(default), ..options.clone() };

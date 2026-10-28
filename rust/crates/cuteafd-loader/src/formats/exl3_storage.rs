@@ -496,7 +496,10 @@ pub fn check_quantization_config(quant: &Value) -> Result<(), Exl3StorageError> 
             // kernels apply svh per channel either way.
             "out_scales" => matches!(value.as_str(), Some("auto" | "never")),
             "group_size" => value == -1,
-            "desc_act" | "lm_head" => value == false,
+            "desc_act" => value == false,
+            "lm_head" => value.is_boolean(),
+            "sym" => value == true,
+            "per_module_metadata" => value == "quantize_config.json:tensor_storage",
             "pack_dtype" => value == "int32",
             "head_bits" => value.as_f64().is_some_and(|bits| bits > 0.0),
             "tensor_storage" => false,

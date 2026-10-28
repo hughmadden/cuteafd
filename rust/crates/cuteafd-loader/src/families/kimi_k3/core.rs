@@ -1,13 +1,10 @@
 //! Header-native Kimi core trellis inventory. Source bytes and resident bytes
 //! differ: a TP shard replicates the opposite-side H128 sign/scale vector.
 use super::config::KimiK3Config;
-use crate::{formats::exl3_storage::exl3_module, plan::{checkpoint::Checkpoint, format}};
+use crate::plan::checkpoint::Checkpoint;
+pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScratchLayout, ProjectionStorageLayout};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
-
-/// How the current TP2 engine owns each eligible projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoreSplit { Output, Input, Whole }
 
 /// Only this explicit list can replace a BF16 core matrix. Everything else
 /// (including layer-zero dense FFN, kv_b, KDA recurrence, router and embedding)
@@ -26,117 +23,6 @@ pub fn split(stem: &str) -> Option<CoreSplit> {
         "block_sparse_moe.shared_experts.down_proj" if layer > 0 => Some(CoreSplit::Input),
         "block_sparse_moe.routed_expert_down_proj" | "block_sparse_moe.routed_expert_up_proj" if layer > 0 => Some(CoreSplit::Whole),
         _ => None,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CoreProjection {
-    pub stem: String,
-    pub bits: usize,
-    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
-    /// Logical checkpoint shape [N,K], before any explicit output padding.
-    pub shape: [usize; 2],
-    pub stored_outputs: usize,
-    pub split: CoreSplit,
-    pub source_bytes: u64,
-}
-
-impl CoreProjection {
-    /// Payload and vectors only; the four-byte codebook marker stays on host.
-    pub fn resident_bytes(&self, ranks: usize) -> Result<u64> {
-        ensure!(matches!(ranks, 1 | 2), "Kimi core supports one or two coordinator ranks");
-        let [_, k] = self.shape;
-        let n = self.stored_outputs;
-        let payload = k as u64 * n as u64 * self.bits as u64 / 8;
-        Ok(match self.split {
-            CoreSplit::Whole => payload + 2 * (k + n) as u64,
-            CoreSplit::Output => {
-                ensure!(n % ranks == 0, "{} output cannot split TP{ranks}", self.stem);
-                payload / ranks as u64 + 2 * (k + n / ranks) as u64
-            }
-            CoreSplit::Input => {
-                ensure!(k % ranks == 0, "{} input cannot split TP{ranks}", self.stem);
-                payload / ranks as u64 + 2 * (k / ranks + n) as u64
-            }
-        })
-    }
-
-    /// Model residency's split total and replicated amount. A Whole projection
-    /// is later assigned to the existing MLA or latent owner, never duplicated.
-    pub fn residency(&self) -> (u64, u64) {
-        let [_, k] = self.shape;
-        let n = self.stored_outputs;
-        let payload = k as u64 * n as u64 * self.bits as u64 / 8;
-        match self.split {
-            CoreSplit::Output => (payload + 2 * n as u64, 2 * k as u64),
-            CoreSplit::Input => (payload + 2 * k as u64, 2 * n as u64),
-            CoreSplit::Whole => (0, payload + 2 * (k + n) as u64),
-        }
-    }
-}
-
-/// Physical owners and bounded route-exclusive views for serialized projections.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectionStorageLayout {
-    pub owners: BTreeMap<&'static str, usize>,
-    pub route_offsets: BTreeMap<&'static str, usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectionScratchLayout {
-    pub extents: BTreeMap<&'static str, usize>,
-    pub rows: usize,
-}
-impl ProjectionScratchLayout {
-    pub fn new(k: usize, n: usize, rows: usize) -> Result<Self> {
-        ensure!((1..=4096).contains(&rows) && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
-            "Kimi K6 scratch geometry");
-        let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
-            .context("Kimi K6 scratch overflow");
-        let extents = BTreeMap::from([
-            ("rotated", product(&[rows, k, 2])?), ("table", 8), ("scales", k / 128 * 2),
-            ("partial", product(&[rows.min(129), k.div_ceil(1024), n, 4])?),
-            ("accumulator", product(&[rows, n, 4])?),
-        ]);
-        let layout = Self { extents, rows };
-        layout.bytes()?;
-        Ok(layout)
-    }
-    /// A grouped native launch (KDA q/k/v/g):
-    /// each member uses a fixed quarter of rotated/scales/accumulator, the
-    /// table names the quarters, and the core indexes one shared partial.
-    pub fn grouped(k: usize, n: usize, rows: usize, groups: usize) -> Result<Self> {
-        ensure!((1..=4096).contains(&rows) && groups == 4 && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
-            "Kimi K6 grouped scratch geometry");
-        let live = rows;
-        let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
-            .context("Kimi K6 grouped scratch overflow");
-        let layout = Self { rows, extents: BTreeMap::from([
-            ("rotated", product(&[groups, live, k, 2])?), ("table", groups * 8),
-            ("scales", groups * k / 128 * 2), ("partial", product(&[groups, live.min(129), k.div_ceil(1024), n, 4])?),
-            ("accumulator", product(&[groups, live, n, 4])?),
-        ]) };
-        layout.bytes()?;
-        Ok(layout)
-    }
-    pub fn merge(&mut self, other: &Self) -> Result<()> {
-        ensure!(self.rows == other.rows, "Kimi K6 scratch row capacities differ");
-        for (&name, &bytes) in &other.extents {
-            self.extents.entry(name).and_modify(|v| *v = (*v).max(bytes)).or_insert(bytes);
-        }
-        self.bytes()?;
-        Ok(())
-    }
-    pub fn storage(&self) -> Result<ProjectionStorageLayout> {
-        let mut owners = self.extents.clone();
-        let partial = owners.remove("partial").context("Kimi K6 native partial absent")?;
-        let route_offsets = BTreeMap::from([("partial", 0)]);
-        owners.insert("route arena", partial);
-        Ok(ProjectionStorageLayout { owners, route_offsets })
-    }
-    pub fn bytes(&self) -> Result<usize> {
-        self.storage()?.owners.values().try_fold(0usize, |a, b| a.checked_add(*b))
-            .context("Kimi K6 scratch sum overflow")
     }
 }
 
@@ -219,7 +105,7 @@ impl CoreCharges {
                 .context("Kimi core stage charge underflow")?
         };
         Ok(Self {
-            projection: projection_scratch(cfg,core,unit,&manifest["families"]["kimi_k6_dense"] )?,
+            projection: projection_scratch(cfg,core,unit,&manifest["families"]["dense_trellis_k6"] )?,
             stages, stage_bytes,
             receive: exchange_recv_bytes(unit,needs_f32_partials(cfg,core))?,
         })
@@ -317,54 +203,15 @@ impl CoreInventory {
     /// Both native MCG and MUL1 keep their own unpacked H128 vectors.
     pub fn from_checkpoint(cfg: &KimiK3Config, checkpoint: &Checkpoint,
         expected: &BTreeMap<String, Vec<usize>>) -> Result<Self> {
-        let mut inventory = Self::default();
-        let is_core = |name: &str| !name.contains(".experts.")
-            && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head."));
-        let mut selected = checkpoint.tensors.iter().filter(|t| is_core(&t.meta.name))
-            .cloned().collect::<Vec<_>>();
-        // Role selection starts from an index-only inventory. Read each missing
-        // core shard's bounded header once; never read weight payloads or use a side map.
-        let loaded = selected.iter().map(|t| format::split_stem(&t.meta.name).0)
-            .collect::<std::collections::BTreeSet<_>>();
-        let missing = checkpoint.weight_map.keys().filter(|name| is_core(name))
-            .filter_map(|name| name.strip_suffix(".trellis"))
-            .filter(|stem| !loaded.contains(stem)).collect::<std::collections::BTreeSet<_>>();
-        let mut shards = BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
-        for (name, shard) in &checkpoint.weight_map {
-            if missing.contains(format::split_stem(name).0) {
-                shards.entry(shard).or_default().insert(name);
-            }
-        }
-        for (shard, mut names) in shards {
-            for meta in crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))? {
-                if names.remove(meta.name.as_str()) {
-                    selected.push(crate::plan::checkpoint::CheckpointTensor { shard: shard.into(), meta });
-                }
-            }
-            ensure!(names.is_empty(), "Kimi core shard {shard} lacks indexed tensors: {}",
-                names.into_iter().collect::<Vec<_>>().join(", "));
-        }
-        for (stem, members) in format::group_by_stem(&selected) {
-            if !members.contains_key("trellis") { continue; }
-            let split = split(&stem).with_context(|| format!("{stem}: Kimi BF16/native keep-list forbids core quantization"))?;
-            let shape = expected.get(&format!("{stem}.weight"))
-                .with_context(|| format!("{stem}: outside the Kimi core tensor geometry"))?;
-            ensure!(shape.len() == 2, "{stem}: core projection must be a matrix");
-            let suffixes = members.keys().map(String::as_str).collect::<Vec<_>>();
-            let module = exl3_module(&stem, &suffixes, |suffix| members.get(suffix).map(|t| &t.meta))?;
-            ensure!(module.bits == 6, "{stem}: Kimi core requires K6, found K{}", module.bits);
-            let padded = stem.ends_with(".self_attn.kv_a_proj_with_mqa") && shape[0] == cfg.kv_lora_rank + cfg.qk_rope_dim
-                && module.output_features == shape[0].next_multiple_of(128);
-            ensure!(module.input_features == shape[1] && (module.output_features == shape[0] || padded),
-                "{stem}: core header shape [{},{}], expected {shape:?} (only MLA kv_a permits explicit N128 padding)",
-                module.output_features, module.input_features);
-            ensure!(!checkpoint.contains_tensor(&format!("{stem}.weight")),
-                "{stem}: checkpoint contains both BF16 and K6 storage");
-            inventory.projections.insert(stem.clone(), CoreProjection { stem, bits: module.bits, codebook: module.codebook,
-                shape: [shape[0], shape[1]], stored_outputs: module.output_features, split,
-                source_bytes: members.values().map(|t| t.meta.byte_length).sum() });
-        }
-        Ok(inventory)
+        let projections = crate::formats::trellis_core::read_projections(checkpoint, expected,
+            |name| !name.contains(".experts.")
+                && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head.")),
+            |stem| split(stem).map(|split| crate::formats::trellis_core::CoreContract {
+                split, bits: 6, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
+                    && expected.get(&format!("{stem}.weight")).is_some_and(|shape|
+                        shape.first() == Some(&(cfg.kv_lora_rank + cfg.qk_rope_dim))),
+            }))?;
+        Ok(Self { projections })
     }
 
     /// The current projected engine admits complete operator groups only. The

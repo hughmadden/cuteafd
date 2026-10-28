@@ -627,6 +627,35 @@
       }
     },
     {
+      "name": "glm53-exl3-k6core-min",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k6core-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8828",
+        "EXPERT_PORT": "19928",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_HOST": "emu",
+        "SPARK_2_LANE_A": "10.55.0.3",
+        "SPARK_3_HOST": "kiwi",
+        "SPARK_3_LANE_A": "10.55.0.4"
+      }
+    },
+    {
       "name": "glm53-exl3-max",
       "family": "glm5",
       "config": "examples/configs/glm53-exl3-max.config",
@@ -648,6 +677,42 @@
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8825",
         "EXPERT_PORT": "19925",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_HOST": "emu",
+        "SPARK_2_LANE_A": "10.55.0.3",
+        "SPARK_3_HOST": "kiwi",
+        "SPARK_3_LANE_A": "10.55.0.4",
+        "SPARK_4_HOST": "rhea",
+        "SPARK_4_LANE_A": "10.55.0.5",
+        "SPARK_5_HOST": "moa",
+        "SPARK_5_LANE_A": "10.55.0.6"
+      }
+    },
+    {
+      "name": "glm53-exl3-k6core-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k6core-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi",
+        "rhea",
+        "moa"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8829",
+        "EXPERT_PORT": "19929",
         "SPARK_0_HOST": "ostrich",
         "SPARK_0_LANE_A": "10.55.0.1",
         "SPARK_1_HOST": "dodo",

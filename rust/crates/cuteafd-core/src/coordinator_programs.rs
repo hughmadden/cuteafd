@@ -191,10 +191,21 @@ pub struct CoordinatorPrograms<'a> {
     pub split_family: Option<&'a str>,
 }
 
+/// Compound namespaces precede the ordinary first-underscore boundary. Keep
+/// runtime selection and manifest admission on the same namespace contract.
+pub fn program_namespace(name: &str) -> Option<&str> {
+    for family in ["glm_stage", "glm2_stage"] {
+        if name.strip_prefix(family).is_some_and(|suffix| suffix.starts_with('_') && suffix.len() > 1) {
+            return Some(&name[..family.len()]);
+        }
+    }
+    name.split_once('_').and_then(|(family, suffix)| (!suffix.is_empty()).then_some(family))
+}
+
 impl CoordinatorPrograms<'_> {
     /// Namespace boundaries matter: `glmf` must not select `glmf2` or `glm`.
     pub fn contains(self, name: &str) -> bool {
-        name.split_once('_').is_some_and(|(family, _)| {
+        program_namespace(name).is_some_and(|family| {
             family == self.family || self.split_family == Some(family)
         })
     }
@@ -672,6 +683,21 @@ mod tests {
                 assert!(!selected.workspace_program(&format!("{family}_index_topk_{other}_m{rows}"), rows, prefill));
             }
         }
+    }
+
+    #[test]
+    fn native_stages_are_not_plain_glm_programs_or_scratch() {
+        for split in [false, true] {
+            let selected = CoordinatorPrograms { family: "glm", split_family: split.then_some("glm2") };
+            assert!(!selected.contains("glm_stage_rank_pack_m64"));
+            assert!(!selected.contains("glm2_stage_swiglu_i1024"));
+            assert_eq!(selected.shared_scratch([("glm_producer_m64", 7),
+                ("glm_stage_rank_pack_m64", 900), ("glm2_stage_swiglu_i1024", 999)]), 7);
+        }
+        let stages = CoordinatorPrograms { family: "glm_stage", split_family: Some("glm2_stage") };
+        assert!(stages.contains("glm_stage_rank_pack_m64"));
+        assert!(stages.contains("glm2_stage_swiglu_i1024"));
+        assert!(!stages.contains("glm_producer_m64"));
     }
 
     #[test]

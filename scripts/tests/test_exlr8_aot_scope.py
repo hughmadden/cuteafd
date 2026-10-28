@@ -189,7 +189,8 @@ def test_release_derives_exlr8_and_passes_it_to_both_legs(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match='must be ON or OFF'):
         SCOPE.derive(tmp_path, matrix, 'glm-exlr8', {'CUTEAFD_RELEASE_EXLR8_AOT': 'yes'})
     requirement = SCOPE.requirements(tmp_path, matrix, 'glm-exlr8')[0]
-    assert requirement['exlr8'] and requirement['programs'] == ['glm']
+    assert requirement['exlr8'] and requirement['programs'] == [
+        'dense_trellis_k6', 'glm', 'glm_stage']
     build = (ROOT / 'build.sh').read_text()
     assert build.count('-e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}"') == 2
     artifacts = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
@@ -258,8 +259,8 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimi_k6_dense,kimi_split")' in block
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")' in block
 
 
 def test_kimi_native_key_preserves_off_and_keys_on():

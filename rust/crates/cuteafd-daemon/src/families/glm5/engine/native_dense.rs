@@ -303,6 +303,172 @@ impl<'a> GlmEngine<'a> {
     }
 }
 
+impl<'a> GlmEngine<'a> {
+    fn core_programs(&self, rank: usize) -> Result<&super::super::core_runtime::CorePrograms<'a>> {
+        self.core_programs.get(rank).and_then(Option::as_ref).context("GLM K6 programs not bound")
+    }
+
+    fn core_scratch<'w>(&self, w: &'w Workspace<'_>) -> Result<&'w super::super::core_runtime::CoreScratch<'w>> {
+        w.core.as_deref().context("GLM K6 scratch not admitted")
+    }
+
+    pub(super) fn core_split(layer: &GlmLayer<'_>, key: &str) -> bool {
+        layer.core.get(key).is_some_and(|weight|
+            weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
+    }
+
+    /// Native cores occupy a disjoint partition of each existing receive slot:
+    /// the following routed/BF16 publication must not overwrite a live core.
+    fn core_received(&self, rank: usize, slot: usize, rows: usize) -> Result<Buffer> {
+        let exchange = self.exchange()?;
+        let offset = self.prefill_rows.max(DECODE_ROWS) * self.cfg.hidden * self.tp2_exchange.element_bytes();
+        let bytes = rows * self.cfg.hidden * 4;
+        ensure!(offset + bytes <= exchange.slot_bytes(), "GLM K6 peer core exceeds admitted receive slot");
+        let base = Buffer { ptr: exchange.recv(rank, slot)?, bytes: exchange.slot_bytes(),
+            device_id: exchange.device(rank), flags: 0 };
+        crate::shared::prefix::view(base, offset, bytes)
+    }
+
+    pub(super) fn publish_projection(&self, rank: usize, index: usize, lane: usize,
+        w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str, rows: usize) -> Result<()> {
+        let at = slot(index, key == "down", lane);
+        if Self::core_split(layer, key) {
+            let core = &w.core_rows.as_ref().context("GLM K6 retained core rows")?[usize::from(key == "down")];
+            self.exchange()?.push_to(rank, at, core.buffer.ptr,
+                self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 4)
+        } else {
+            self.exchange()?.push(rank, at, w.delta.buffer.ptr, rows * self.cfg.hidden * 2)
+        }
+    }
+
+    fn reduce_projection(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
+        layer: &GlmLayer<'_>, key: &str, rows: usize, output: Buffer) -> Result<()> {
+        let weights = layer.core.get(key).context("GLM K6 split weights")?;
+        let programs = self.core_programs(rank)?;
+        let retained = w.core_rows.as_ref().context("GLM K6 retained core rows")?;
+        let local = retained[usize::from(key == "down")].buffer;
+        let peer = self.core_received(rank, slot(index, key == "down", lane), rows)?;
+        // Rank-ordered F32 addition precedes the one complete H128/svh egress.
+        let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
+        self.on(rank, || programs.projection(weights)?.reduced(&programs.add, rows,
+            first, second, retained[2].buffer, weights, output, self.stream_of(rank)))
+    }
+
+    /// The caller has consumed the projection's publication on this stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn projection_norm(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
+        layer: &GlmLayer<'_>, key: &str, weight: *mut c_void, rows: Scalar,
+        first: *mut c_void, second: *mut c_void) -> Result<()> {
+        if Self::core_split(layer, key) {
+            self.reduce_projection(rank, index, lane, w, layer, key, scalar_rows(rows)?, w.delta.buffer)?;
+            self.norm_full(rank, w, weight, 1, rows, w.delta.buffer.ptr, w.delta.buffer.ptr)
+        } else { self.norm_full(rank, w, weight, 2, rows, first, second) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ffn_norm(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
+        layer: &GlmLayer<'_>, weight: *mut c_void, rows: Scalar,
+        first: *mut c_void, second: *mut c_void) -> Result<()> {
+        if layer.dense { self.projection_norm(rank, index, lane, w, layer, "down", weight, rows, first, second) }
+        else { self.norm_full(rank, w, weight, 2, rows, first, second) }
+    }
+
+    pub(super) fn meet_shared_core(&self, rank: usize, index: usize, w: &Workspace<'_>,
+        layer: &GlmLayer<'_>, rows: usize) -> Result<()> {
+        if !Self::core_split(layer, "down") { return Ok(()); }
+        ensure!(!layer.dense, "GLM shared meet used for a dense FFN");
+        self.publish_projection(rank, index, w.lane, w, layer, "down", rows)?;
+        self.exchange()?.wait(rank, slot(index, true, w.lane))?;
+        if rank == 0 {
+            self.reduce_projection(rank, index, w.lane, w, layer, "down", rows, w.shared.buffer)
+        } else {
+            // SAFETY: only rank 0 contributes shared; this rank's combine reads
+            // its zeroed BF16 buffer after this operation on the same stream.
+            self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(w.shared.buffer,
+                rows * self.cfg.hidden * 2, self.stream_of(rank)) })
+        }
+    }
+
+    /// Input-side projections retain F32 cores before any following projection
+    /// reuses the serialized accumulator. Their caller owns the peer meet.
+    fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
+        input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
+        let weights = layer.core.get(key).with_context(|| format!("GLM K6 missing {key}"))?;
+        let programs = self.core_programs(rank)?;
+        let scratch = self.core_scratch(w)?;
+        let projection = programs.projection(weights)?;
+        let stream = self.stream_of(rank);
+        self.on(rank, || {
+            if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
+                let core = projection.core(rows, input, weights, &scratch.projection, stream)?;
+                let retained = retained.context("GLM K6 split core has no retained row storage")?;
+                // SAFETY: both rank-local extents remain live; this copy precedes
+                // subsequent projections and publication on the same stream.
+                unsafe { self.library.copy_d2d_async(retained, core, rows * weights.shape[0] * 4, stream) }
+            } else { projection.local(rows, input, weights, &scratch.projection, output, stream) }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn core_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
+        cap: &str, kv: Buffer, query: *mut c_void, context: bool) -> Result<()> {
+        let scratch = self.core_scratch(w)?;
+        let programs = self.core_programs(rank)?;
+        let (q, qkv) = (scratch.stage("q")?, scratch.stage("qkv")?);
+        let stream = self.stream_of(rank);
+        let pitch = self.cfg.q_lora_rank + self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
+        for (key, logical, column) in [("q_a", self.cfg.q_lora_rank, 0),
+            ("kv_a", self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim, self.cfg.q_lora_rank)] {
+            let stored = layer.core[key].shape[0];
+            self.core_linear(rank, w, layer, key, w.x.buffer, q, rows, None)?;
+            let (source_pitch, destination_pitch, width, offset) = super::super::core_runtime::pack_layout(
+                rows, stored, logical, pitch, column)?;
+            let destination = crate::shared::prefix::view(qkv, offset, qkv.bytes - offset)?;
+            // SAFETY: the complete stored-N output transform precedes this
+            // logical crop, with checked disjoint rank-local pitched extents.
+            self.on(rank, || unsafe { programs.copy.launch_rows(destination, q, width, rows,
+                destination_pitch, source_pitch, stream) })?;
+        }
+        let (_, _, cos_sin) = self.rank_caches(rank, 0);
+        let prefix = if layer.attention_split { "glm2" } else { "glm" };
+        let row = Scalar::I32(rows as i32);
+        self.run_on(rank, &format!("{prefix}_stage_rank_pack_{cap}"), &[("qkv", qkv.ptr),
+            ("q_norm", layer.ptr("q_a_norm")?), ("kv_norm", layer.ptr("kv_a_norm")?),
+            ("positions", w.positions.buffer.ptr), ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
+            ("q_resid", w.q_resid.buffer.ptr), ("cache", kv.ptr)], &[row])?;
+        self.core_linear(rank, w, layer, "q_b", w.q_resid.buffer, q, rows, None)?;
+        let suffix = if context { "_context" } else { "" };
+        self.run_on(rank, &format!("{prefix}_stage_absorb_bf16{suffix}_{cap}"), &[("a", q.ptr),
+            ("w", layer.ptr("w_uk")?), ("out", query)], &[row])?;
+        self.run_on(rank, &format!("{prefix}_stage_query_rope{suffix}_{cap}"), &[("q", q.ptr),
+            ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("query", query)], &[row])
+    }
+
+    pub(super) fn core_o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
+        cap: &str) -> Result<()> {
+        let values = self.core_scratch(w)?.stage("values")?;
+        let prefix = if layer.attention_split { "glm2" } else { "glm" };
+        self.run_on(rank, &format!("{prefix}_stage_values_bf16_{cap}"), &[("a", w.attn.buffer.ptr),
+            ("w", layer.ptr("w_uv")?), ("out", values.ptr)], &[Scalar::I32(rows as i32)])?;
+        self.core_linear(rank, w, layer, "o", values, w.delta.buffer, rows,
+            w.core_rows.as_ref().map(|rows| rows[0].buffer))
+    }
+
+    pub(super) fn core_ffn(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
+        out: Buffer) -> Result<()> {
+        let scratch = self.core_scratch(w)?;
+        let (gate, up, hidden) = (scratch.stage("gate")?, scratch.stage("up")?, scratch.stage("hidden")?);
+        self.core_linear(rank, w, layer, "gate", w.x.buffer, gate, rows, None)?;
+        self.core_linear(rank, w, layer, "up", w.x.buffer, up, rows, None)?;
+        let intermediate = layer.core["gate"].shape[0];
+        let prefix = if layer.split { "glm2" } else { "glm" };
+        self.run_on(rank, &format!("{prefix}_stage_swiglu_i{intermediate}"), &[("gate", gate.ptr),
+            ("up", up.ptr), ("hidden", hidden.ptr)], &[Scalar::I32(rows as i32)])?;
+        self.core_linear(rank, w, layer, "down", hidden, out, rows,
+            w.core_rows.as_ref().map(|rows| rows[1].buffer))
+    }
+}
+
 /// Where a native projection left its rows.
 pub(super) enum NativeOut {
     /// F32 `[rows, n]` in the lane accumulator (MXFP8 / int4).

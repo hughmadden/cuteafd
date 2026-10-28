@@ -51,6 +51,8 @@ CHECKPOINTS = {
     "deepseek-ai/DeepSeek-V4-Flash-0731": DSV4,
     "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1": {**DSV4, "quantization_config": {"quant_method": "exl3"}},
     "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1": GLM5,
+    "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6": {**GLM5, "quantization_config": {
+        "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
     "nvidia/GLM-5.3-NVFP4": GLM5,
     "zai-org/GLM-5.3-Flash": GLMF,
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8": GLMF,
@@ -214,7 +216,7 @@ def test_one_starting_config_per_release_card() -> None:
     names = {p.name for p in starting_configs()}
     expected = {f"{model}-{profile}.config" for model in (
         "deepseek-v41-mxfp4", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
-        "glm53-exl3", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
+        "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
         "glm53-flash-tr3", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
@@ -227,7 +229,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 26
+    assert len(entries) == 28
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -263,8 +265,27 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 13
+    assert len(models) == 14
     assert all(columns == {1, 2} for columns in models.values())
+
+
+def test_glm_k6_core_cards_preserve_native_checkpoint_and_topology() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
+    entries = {entry["name"]: entry for entry in matrix["entries"]}
+    for size, gpus, sparks in (("min", [1], 4), ("max", [0, 1], 6)):
+        name = f"glm53-exl3-k6core-{size}"
+        entry = entries[name]
+        values = keys(ROOT / entry["config"])
+        assert values["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6"
+        assert values["MODEL_REVISION"] == "5a4e83a09a11f3145332ed632d28a9894ea88225"
+        assert values["SPECULATOR"] == "dflash2"
+        assert values["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-DFlash2"
+        assert values["POOL_TOKENS"] == "auto"
+        assert "RTX_EXPERT_LAYERS" not in values
+        assert entry["gpus"] == gpus and len(entry["sparks"]) == sparks
+        baseline = entries[f"glm53-exl3-{size}"]
+        assert entry["sparks"] == baseline["sparks"]
+        assert entry["family"] == baseline["family"] == "glm5"
 
 
 def test_v41_max_uses_six_sparks_and_keeps_tp4_reference() -> None:

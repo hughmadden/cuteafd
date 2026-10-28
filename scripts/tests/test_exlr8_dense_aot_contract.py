@@ -112,10 +112,35 @@ def test_unpacked_prefill_only_covers_native_trellis(monkeypatch):
     assert entries["bf16_index_weights"][1] == dict(width=6144, outputs=32, output_dtype="torch.float32")
 
 
-def test_exlr8_coordinator_enables_dense_and_both_stage_geometries():
-    text = (ROOT / "native/cmake/shared/dsv4_programs.cmake").read_text()
-    assert 'if(CUTEAFD_EXLR8_ROLE STREQUAL "coordinator")' in text
-    assert '${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense,glm_stage,glm2_stage' in text
+def test_exlr8_coordinator_enables_dense_and_both_stage_geometries(tmp_path):
+    import subprocess
+
+    cmake = ROOT / "native/cmake/shared/dsv4_programs.cmake"
+    # The shared stages must be present exactly once with or without GLM.
+    for glm in (False, True):
+        source = tmp_path / str(glm)
+        source.mkdir()
+        (source / "CMakeLists.txt").write_text("\n".join([
+            "cmake_minimum_required(VERSION 3.18)",
+            "project(exlr8_scope NONE)",
+            "set(CUTEAFD_CUDA_ARCHITECTURES 120)",
+            "set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)",
+            'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")',
+            f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
+            "set(CUTEAFD_ENABLE_EXLR8_AOT ON)",
+            "add_custom_target(cuteafd_verify_sparkinfer_source)",
+            f'include("{cmake}")',
+            'file(WRITE "${CMAKE_BINARY_DIR}/scope.txt" "${CUTEAFD_PROGRAM_GEOMETRY}")',
+        ]))
+        build = source / "build"
+        result = subprocess.run(["cmake", "-S", str(source), "-B", str(build)],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        geometries = (build / "scope.txt").read_text().split(",")
+        assert len(geometries) == len(set(geometries))
+        for geometry in ("exlr8", "exlr8_dense", "glm_stage", "glm2_stage"):
+            assert geometries.count(geometry) == 1
+        assert ("glm" in geometries) == glm
 
 
 def test_bf16_core_is_static_and_matches_f16_geometry(monkeypatch):

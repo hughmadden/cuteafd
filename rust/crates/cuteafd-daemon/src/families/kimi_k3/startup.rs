@@ -129,7 +129,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
         if core.projections.contains_key("language_model.lm_head") {
             fixed.extend(cuteafd_loader::families::kimi_k3::core::draft_head_demand(&core,
-                layout.capacity().block_rows, programs.family_metadata("kimi_k6_dense")?)?);
+                layout.capacity().block_rows, programs.family_metadata("dense_trellis_k6")?)?);
         }
     }
     let selected = cuteafd_loader::placement::ProgramSet::from_names(

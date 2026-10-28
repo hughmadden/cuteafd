@@ -8,6 +8,7 @@ pub(crate) mod landing;
 pub(crate) mod native_dense;
 pub(crate) mod push;
 pub(crate) mod weights;
+pub(crate) mod core_runtime;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
@@ -743,10 +744,14 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
+        use cuteafd_loader::families::glm5::DensePrograms;
+        let dense_programs = if native { DensePrograms::Exlr8 } else { DensePrograms::Fp8 };
+        // Preserve EXLR8's eager split stages on one GPU. Their ABI still
+        // comes from this checkpoint, never from unrelated K6 exports.
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name)
-                || (native && (name.starts_with("exlr8_")
-                    || name.starts_with("exlr8_dense_") || name.starts_with("glm_stage_") || name.starts_with("glm2_stage_"))))?;
+                || (native && (cuteafd_core::coordinator_programs::program_namespace(name) == Some("exlr8")
+                    || dense_programs.stage(name, true))))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
@@ -821,12 +826,6 @@ impl Opened {
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
-        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*",
-                &cuteafd_loader::placement::ProgramSet::from_names(
-                    if native { &["glm", "glm2", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage"] } else { &["glm", "glm2"] },
-                    programs.names())))
-            .collect::<Result<Vec<_>>>()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
@@ -849,6 +848,25 @@ impl Opened {
         let prefill_lanes = usize::from(args.prefill_waves);
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
             "layer-owned prefill lacks capacity for {prefill_lanes} waves");
+        let core = checkpoint.as_ref().map(|checkpoint| -> Result<_> {
+            let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&self.cfg, checkpoint)?;
+            if core.projections.is_empty() { return Ok(None); }
+            let draft_rows = args.draft.as_deref().map(|snapshot| -> Result<_> {
+                let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+                let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
+                args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")
+            }).transpose()?;
+            Ok(Some(cuteafd_loader::families::glm5::core::CoreCharges::from_package(&self.cfg,
+                &core, layers, devices.len(), owners.as_deref(), args.prefill_rows, prefill_lanes,
+                draft_rows, &manifest)?))
+        }).transpose()?.flatten();
+        let native_dense_charge = if let Some(core) = &core { core.bytes(self.cfg.hidden)? }
+            else { native_dense_charge };
+        let code_set = core.as_ref().map(|core| core.program_set(&manifest, devices.len() == 2))
+            .unwrap_or_else(|| dense_programs.program_set(&manifest, true));
+        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
+            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
+                if core.is_some() { "glm-k6" } else { "glm" }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
@@ -878,7 +896,7 @@ impl Opened {
         let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
             args.prefill_rows as u64, 1, exchange_f32));
         let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
-            spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), skip_routed_experts: args.skip_routed_experts,
+            spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), native_head: core.as_ref().is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,
             max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),
@@ -1108,6 +1126,7 @@ impl Opened {
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
+        engine.bind_core(core)?;
         if native {
             // Bind each GPU before capture; all prefill scratch is lane-local.
             for rank in 0..engine.ranks() {
@@ -1131,6 +1150,7 @@ impl Opened {
             engine.skip_routed_experts()?;
         }
         engine.drafter = drafter;
+        engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(),
             active_drafts = ?engine.attention_plan.active_drafts(), "immutable attention reduction plan");
@@ -1593,7 +1613,7 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             for round in 0..9 {
                 let started = Instant::now();
                 let drafts = drafter.draft_device_diagnostic(&seqs, &engine.embedding,
-                    engine.weights.head.target())?;
+                    engine.draft_target_head()?)?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
                 }
@@ -1846,7 +1866,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let timer = Instant::now();
         let draft = drafter.draft_device_diagnostic(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.target())?;
+            &engine.embedding, engine.draft_target_head()?)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], transport.as_deref_mut().map(|t| (t, runtime)),
@@ -1925,7 +1945,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft_device_diagnostic(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.target())?.remove(0);
+            &engine.embedding, engine.draft_target_head()?)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);

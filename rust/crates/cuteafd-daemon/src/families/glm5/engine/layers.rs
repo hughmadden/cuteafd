@@ -173,7 +173,8 @@ impl Bindings<'_, '_, '_, '_, '_> {
                     let local = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
                     let peer = e.recv(rank, slot(index, true, self.lane))?;
                     let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
-                    e.norm_full(rank, w, weight, 2, Scalar::I32(self.rows() as i32), first, second)
+                    e.ffn_norm(rank, index, self.lane, w, self.layer(rank, index), weight,
+                        Scalar::I32(self.rows() as i32), first, second)
                 }
             })?;
         }
@@ -251,9 +252,13 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             e.tp2_rank(pair, 1, index, self.lane, w1, self.rows())?;
             return Ok(Ticket::Complete);
         }
-        self.segment(1, index, GlmOwnedPhase::FfnFront, || e.ffn_on(1, w1, self.layer(1, index),
-            if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate }, self.cap(),
-            if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr }, rows))?;
+        self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+            e.ffn_on(1, w1, self.layer(1, index),
+                if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate }, self.cap(),
+                if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr }, rows)?;
+            if !layer.dense { e.meet_shared_core(1, index, w1, self.layer(1, index), self.rows())?; }
+            Ok(())
+        })?;
         if self.tables[0].decode && !layer.dense {
             if let Some(l2) = &e.peer()?.l2 {
                 e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
@@ -311,8 +316,12 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             let bytes = self.rows() * e.cfg.hidden * 2;
             for rank in 0..2 {
                 let w = self.work[rank];
-                let out = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
-                e.exchange()?.push(rank, slot(index, true, self.lane), out, bytes)?;
+                let layer = self.layer(rank, index);
+                if layer.dense { e.publish_projection(rank, index, self.lane, w, layer, "down", self.rows())?; }
+                else {
+                    let out = if rank == 0 { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
+                    e.exchange()?.push(rank, slot(index, true, self.lane), out, bytes)?;
+                }
             }
         }
         self.join(index)?;
@@ -343,6 +352,7 @@ mod tests {
         lane: Cell<usize>,
         fail: Option<usize>,
         calls: Cell<usize>,
+        k6: bool,
     }
     struct Lane<'a> { trace: &'a Trace, lane: usize }
 
@@ -362,7 +372,7 @@ mod tests {
             let plan = LayerExecutionPlan::new(&placement, spec).unwrap();
             let owners = (0..modes.len()).map(|layer| plan.attention_owners(layer).unwrap()).collect();
             Self { plan, owners, schedule: RefCell::new(Default::default()), lane: Cell::new(0),
-                fail: None, calls: Cell::new(0) }
+                fail: None, calls: Cell::new(0), k6: false }
         }
         fn callback(&self) -> Result<()> {
             let call = self.calls.replace(self.calls.get() + 1);
@@ -427,8 +437,22 @@ mod tests {
                     schedule.push(0, "routes", at, "TP2 routes");
                     schedule.wait(1, "routes", at, "TP2 routes");
                 }
-                2 => schedule.sync(0, "Spark route staging"),
+                2 => {
+                    if self.trace.k6 {
+                        let at = slot(layer, true, self.lane);
+                        schedule.push_to(1, "main", at, 1, "K6 shared core");
+                        schedule.wait_for(1, "main", at, 1, "K6 shared meet");
+                    }
+                    schedule.sync(0, "Spark route staging");
+                }
                 _ => (),
+            }
+            if self.trace.k6 && layer % 3 != 0 {
+                let at = slot(layer, true, self.lane);
+                for rank in 0..if layer % 3 == 1 { 2 } else { 1 } {
+                    schedule.push_to(rank, "main", at, 1, "K6 shared core");
+                    schedule.wait_for(rank, "main", at, 1, "K6 shared meet");
+                }
             }
             if layer % 3 == 1 {
                 for rank in 0..2 { schedule.push(rank, "main", slot(layer, true, self.lane), "FFN publication"); }
@@ -439,10 +463,16 @@ mod tests {
             self.trace.callback()?;
             assert_eq!(layer, ticket);
             let mut schedule = self.trace.schedule.borrow_mut();
+            let at = slot(layer, true, self.lane);
+            let dense_core = self.trace.k6 && layer % 3 == 0;
             if layer % 3 != 1 {
-                for rank in 0..2 { schedule.push(rank, "main", slot(layer, true, self.lane), "FFN publication"); }
+                for rank in 0..2 {
+                    schedule.push_to(rank, "main", at, usize::from(dense_core), "FFN publication");
+                }
             }
-            for rank in 0..2 { schedule.wait(rank, "main", slot(layer, true, self.lane), "FFN join"); }
+            for rank in 0..2 {
+                schedule.wait_for(rank, "main", at, usize::from(dense_core), "FFN join");
+            }
             schedule.sync(0, "layer diagnostic download");
             Ok(())
         }
@@ -457,6 +487,45 @@ mod tests {
                 let schedule = trace.schedule.borrow();
                 check_host(&schedule).unwrap();
                 order::check_submission_faults(&schedule.streams()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn k6_meet_precedes_routed_publication_on_each_existing_ffn_slot() {
+        use crate::shared::peer_split::order::Op;
+        for first in [0, 1] {
+            for (lanes, lane_order) in [(1, LaneOrder::Independent),
+                (1, LaneOrder::OrderedChunks), (2, LaneOrder::OrderedChunks)] {
+                let mut trace = Trace::new(first, 2);
+                trace.k6 = true;
+                for _ in 0..3 { trace.run(lanes, lane_order).unwrap(); }
+                let host = trace.schedule.borrow();
+                check_host(&host).unwrap();
+                let schedule = host.streams();
+                order::check(&schedule).unwrap();
+                for rank in 0..2 {
+                    let stream = &schedule.streams[rank];
+                    let cores = stream.iter().filter(|(_, label)| label == "K6 shared core").count();
+                    assert_eq!(cores, 3 * lanes * 8, "all MoE layers meet, including the terminal layer");
+                    for at in (1..4 * lanes).step_by(2) {
+                        let publications = stream.iter().filter_map(|(op, _)| match op {
+                            Op::Push(flag) if flag.exchange == "main" && flag.slot == at => Some(flag.target),
+                            _ => None,
+                        }).collect::<Vec<_>>();
+                        assert!(!publications.is_empty());
+                        assert!(publications.windows(2).any(|pair| pair == [1, 0]),
+                            "the native F32 suffix precedes the ordinary routed prefix");
+                    }
+                }
+                // A consumer cannot skip the first sequence just because the
+                // following routed publication uses a different destination.
+                let mut crossed = schedule.clone();
+                let (op, _) = crossed.streams[1].iter_mut()
+                    .find(|(_, label)| label == "K6 shared meet").unwrap();
+                let Op::Wait(flag) = op else { unreachable!() };
+                flag.target = 0;
+                assert!(order::check(&crossed).unwrap_err().to_string().contains("crossed destination"));
             }
         }
     }
