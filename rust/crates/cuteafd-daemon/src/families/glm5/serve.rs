@@ -580,7 +580,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             Ok(engine.prefill_rows_logits(placement, chunk, experts, None, rows)?
                                 .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
                         } else {
-                            Ok(engine.prefill_device(placement, chunk, experts)?.map(probe::ScoreLogits::Device))
+                            Ok(engine.prefill_device(placement, chunk, experts, 1)?.map(probe::ScoreLogits::Device))
                         }
                     },
                     |(placement, transport), chunk| engine.verify_device(&mut [(&mut **placement, chunk.len())], chunk,
@@ -633,7 +633,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let start = p.placement.len;
                 cuteafd_transport::route_log::step(|| vec![(p.id, chunk.len() as u32)]);
                 let logits = engine.prefill_device(&mut p.placement, chunk,
-                    transport.as_deref_mut().map(|t| (t, runtime)))?;
+                    transport.as_deref_mut().map(|t| (t, runtime)), usize::from(end == p.tokens.len()))?;
                 if end == p.tokens.len() {
                     // The first token, while this prompt's logits are the workspace's; the
                     // prompt snapshot keeps that row (downloaded only when the cache retains).

@@ -326,6 +326,7 @@ impl<'a> StepRows<'a> {
 pub(crate) struct GlmPeer<'a> {
     pub device: i32,
     pub stream: *mut c_void,
+    released: crate::shared::memory::device::Event<'a>,
     pub layers: Vec<GlmLayer<'a>>,
     kv: Vec<Dev<'a>>,
     index: Vec<Option<Dev<'a>>>,
@@ -604,7 +605,9 @@ impl<'a> GlmEngine<'a> {
             let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm", split_family: Some("glm2") };
             self.programs.load_matching(|name| selected.contains(name))?;
             let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context)?;
-            Ok(GlmPeer { device, stream, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
+            let released = crate::shared::memory::device::Event::new(
+                crate::shared::memory::device::Device { library: self.library, id: device })?;
+            Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
                 prefill_slots: RefCell::new(Vec::new()), graphs: RefCell::new(std::collections::HashMap::new()),
                 l2: None })
         })?;
@@ -913,8 +916,8 @@ impl<'a> GlmEngine<'a> {
 
     /// [`Self::prefill`] leaving the last row's logits on the device.
     pub fn prefill_device(&self, placement: &mut GlmPlacement, tokens: &[u32],
-        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<Option<DeviceLogits>> {
-        match self.prefill_step(placement, tokens, experts, None, 1)? {
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize) -> Result<Option<DeviceLogits>> {
+        match self.prefill_step(placement, tokens, experts, None, logit_rows)? {
             Some(StepLogits::Device(logits)) => Ok(Some(logits)),
             Some(StepLogits::Host(_)) => anyhow::bail!("the last prefill row's logits span lanes"),
             None => Ok(None),
@@ -1279,11 +1282,7 @@ impl<'a> GlmEngine<'a> {
             crate::shared::console::layer_mark(index);
         }
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        if layers.len() < self.cfg.layers || logit_rows == 0 {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            return Ok(None);
-        }
+        if layers.len() < self.cfg.layers || logit_rows == 0 { return Ok(None); }
         self.launch_head(w, t, logit_rows)?;
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
@@ -1967,6 +1966,16 @@ impl<'a> GlmEngine<'a> {
             |scope| self.step_lanes_inner(scope, lanes, chunks, depth, logit_rows, link, runtime))
     }
 
+    fn join_peer_reader(&self) -> Result<()> {
+        if let Some(peer) = &self.peer {
+            // SAFETY: both streams and this persistent rank-1 event belong to
+            // the engine. Previous rank-1 waits already have their pushes queued.
+            self.on(1, || unsafe { self.library.cuda_event_record(peer.released.raw, peer.stream) })?;
+            unsafe { self.library.cuda_stream_wait_event(self.stream, peer.released.raw)?; }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
         chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth, logit_rows: usize, link: &mut SparkLink<'_>,
@@ -1990,12 +1999,9 @@ impl<'a> GlmEngine<'a> {
             "prefill unit exceeds its workspace");
         let peer_workspaces = self.peer_workspaces(false, depth.waves)?;
         let split = peer_workspaces.is_some();
-        // Both streams drain once per call: the units' tables are then queued in
-        // stream order as each unit starts ([`UnitHooks::begin_unit`]).
-        for rank in 0..self.ranks() {
-            // SAFETY: the engine owns both streams; nothing queued reads the tables written below.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
-        }
+        // A new cut can alias both ranks' previous slot views. Rank 0's new
+        // writes follow rank 1's last reader without draining either stream.
+        self.join_peer_reader()?;
         let pages = lanes.iter().map(placement_pages).collect::<Vec<_>>();
         let mut ranked = Vec::with_capacity(lanes.len());
         for tables in lanes {
@@ -2027,24 +2033,13 @@ impl<'a> GlmEngine<'a> {
         // workspace is rewritten only after the earlier unit's reads there. Every
         // rank-1 wait already queued has its rank-0 push queued earlier on rank 0's
         // stream, so this cross-GPU wait cannot close a cycle.
-        let peer_released: Vec<Option<crate::shared::memory::device::Event<'_>>> = match &self.peer {
-            Some(peer) => (0..waves).map(|_| crate::shared::memory::device::Event::new(
-                crate::shared::memory::device::Device { library: self.library, id: peer.device }).map(Some))
-                .collect::<Result<_>>()?,
-            None => (0..waves).map(|_| None).collect(),
-        };
         let begin = |unit: usize| -> Result<()> {
             let slot = unit % waves;
             let w = workspaces[slot];
             if unit >= waves {
                 // The slot's previous unit committed on rank 0 (stream order). Rank 1's
                 // queued work for it must finish before its peer workspace is rewritten.
-                if let (Some(event), Some(peer)) = (&peer_released[slot], &self.peer) {
-                    // SAFETY: rank 1's stream and this live event of its device.
-                    self.on(1, || unsafe { self.library.cuda_event_record(event.raw, peer.stream) })?;
-                    // SAFETY: rank 0's stream waits on the retained rank-1 event.
-                    unsafe { self.library.cuda_stream_wait_event(self.stream, event.raw)? };
-                }
+                self.join_peer_reader()?;
             }
             let ranked = &ranked[unit];
             if unit >= waves { self.put_tables_ordered(0, w, &ranked[0])?; } else { self.put_tables(w, &ranked[0])?; }
@@ -2171,11 +2166,7 @@ impl<'a> GlmEngine<'a> {
     fn prefill_logits(&self, work: &[&Workspace<'_>], counts: &[usize], wanted: usize) -> Result<Option<StepLogits>> {
         ensure!(work.len() == counts.len(), "prefill logits workspace geometry");
         match prefill_logits_plan(counts, wanted)? {
-            PrefillLogitsPlan::None => {
-                // SAFETY: the engine owns this stream and every queued prefill operand.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-                Ok(None)
-            }
+            PrefillLogitsPlan::None => Ok(None),
             PrefillLogitsPlan::Device { lane, rows } => {
                 self.launch_head(work[lane], counts[lane], rows)?;
                 Ok(Some(StepLogits::Device(self.device_logits(work[lane], rows, false))))
@@ -2759,6 +2750,27 @@ impl Drop for GlmEngine<'_> {
 
 #[cfg(test)]
 mod prefill_unit_tests {
+    #[test]
+    fn prefill_reuses_tables_after_device_ordered_peer_readers_without_a_host_drain() {
+        let source = include_str!("engine.rs");
+        let inner = source.split("fn step_lanes_inner(").nth(1).unwrap()
+            .split("fn prefill_logits(").next().unwrap();
+        assert!(!inner.contains("cuda_stream_synchronize("));
+        assert!(inner.find("self.join_peer_reader()?").unwrap() < inner.find("self.put_tables(").unwrap());
+        let join = source.split("fn join_peer_reader(").nth(1).unwrap().split("fn step_lanes_inner(").next().unwrap();
+        assert!(join.contains("cuda_event_record(peer.released.raw, peer.stream)"));
+        assert!(join.contains("cuda_stream_wait_event(self.stream, peer.released.raw)"));
+        assert!(!join.contains("synchronize("));
+        let head = source.split("fn prefill_logits(").nth(1).unwrap().split("fn reduce(").next().unwrap();
+        assert!(head.contains("PrefillLogitsPlan::None => Ok(None)"));
+        assert!(!head.contains("cuda_stream_synchronize("));
+        let serving = include_str!("serve.rs");
+        assert!(serving.contains("usize::from(end == p.tokens.len())"));
+        // A non-final chunk is explicitly headless, unlike the final one.
+        assert_eq!(usize::from(4096 == 8192), 0);
+        assert_eq!(usize::from(8192 == 8192), 1);
+    }
+
     #[test]
     fn context_plans_follow_the_unit_for_both_ranks_and_reset_for_single_steps() {
         // A unit-driven call selects the unit on both ranks; a single-pass step

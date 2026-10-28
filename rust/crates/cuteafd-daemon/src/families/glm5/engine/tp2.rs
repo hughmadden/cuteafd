@@ -371,6 +371,7 @@ impl<'a> GlmEngine<'a> {
                 &mut placement,
                 &tokens,
                 experts.as_mut().map(|(l, r)| (&mut **l, *r)),
+                1,
             )?;
             self.verify_device(
                 &mut [(&mut placement, 1)],

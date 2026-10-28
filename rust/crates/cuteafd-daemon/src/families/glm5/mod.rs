@@ -1482,12 +1482,13 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
                 != ref_layers[i][..row_bytes]);
             let logits_differ = logits[r * vocab..(r + 1) * vocab].iter().map(|v| v.to_bits())
                 .ne(ref_logits[..vocab].iter().map(|v| v.to_bits()));
-            if layer.is_some() || logits_differ {
+            let split = tap_split(&taps, ref_taps, r, engine.cfg.hidden, engine.cfg.topk);
+            if layer.is_some() || logits_differ || !split.is_empty() {
                 let max = logits[r * vocab..(r + 1) * vocab].iter().zip(&ref_logits[..vocab])
                     .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                 differing.push(format!("row {r}: layer {} (max |dlogit| {max:.3e}){}",
                     layer.map_or("L".to_string(), |i| i.to_string()),
-                    tap_split(&taps, ref_taps, r, engine.cfg.hidden, engine.cfg.topk)));
+                    split));
             }
         }
         clean &= differing.is_empty();
@@ -1495,6 +1496,7 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             if differing.is_empty() { "bitwise identical".to_string() } else { differing.join("; ") });
     }
     println!("width invariance: {}", if clean { "PASS" } else { "FAIL" });
+    ensure!(clean, "width invariance failed");
     Ok(())
 }
 
@@ -1981,7 +1983,7 @@ fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_
     let mut placement = allocator.admit(tokens.len() + steps + 1)?;
     let mut last = None;
     for chunk in tokens.chunks(engine.prefill_capacity()) {
-        last = engine.prefill_device(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)))?;
+        last = engine.prefill_device(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), 1)?;
     }
     let last = last.context("--token-check needs every layer")?.row_host(&opened.library, 0)?;
     let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
