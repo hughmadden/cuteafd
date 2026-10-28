@@ -80,7 +80,7 @@ pub const HOOK_SCRATCH: [&str; 3] = ["router logits", "latent input", "latent no
 impl NativeLaneLayout {
     fn metadata_banks_for(rows: usize, unit: usize) -> usize {
         if rows <= 64 { return 1; }
-        rows.div_ceil(unit).max(crate::serving_capacity::prefill_waves::MAX_WAVES as usize)
+        rows.div_ceil(unit)
     }
 
     pub fn metadata_banks(&self) -> usize { Self::metadata_banks_for(self.rows, self.unit) }
@@ -423,9 +423,13 @@ mod tests {
             "route ids", "expert wire"] {
             assert_eq!(two.operands[name], 2 * one.operands[name], "{name} spans the lane");
         }
-        for name in ["gate-up", "activated", "KDA normalized", "KDA slots", "KDA first", "MLA slots",
-            "MLA query", "MLA attention", "MLA page table", "MLA lengths"].into_iter().chain(HOOK_SCRATCH) {
+        for name in ["gate-up", "activated", "KDA normalized", "MLA query", "MLA attention"]
+            .into_iter().chain(HOOK_SCRATCH) {
             assert_eq!(two.operands[name], one.operands[name], "{name} is one unit's");
+        }
+        for name in ATTENTION_METADATA {
+            assert_eq!(two.metadata_extent(name, 0)?.1, one.metadata_extent(name, 0)?.1);
+            assert_eq!(two.operands[name], 2 * one.operands[name], "{name} has two unit banks");
         }
         // Units never exceed the kernels' 4096 rows nor the admitted lane.
         for (rows, unit) in [(LANE_ROWS_MAX + 1, 4096), (8192, 4097), (2048, 4096), (4096, 0)] {
@@ -448,6 +452,7 @@ mod tests {
             assert_eq!(shape, plan.units());
             let one = NativeLaneLayout::new(&cfg, unit as usize, unit as usize, 1_048_576, scratch)?;
             let lane = NativeLaneLayout::new(&cfg, rows as usize, unit as usize, 1_048_576, scratch)?;
+            assert_eq!(lane.metadata_banks(), waves as usize, "banks follow the admitted depth");
             assert_eq!(lane.arena_bytes, one.arena_bytes);
             for name in ["residual arena", "delta", "expert combined", "route ids", "expert wire"] {
                 assert_eq!(lane.operands[name], waves as usize * one.operands[name], "{name}");
@@ -482,6 +487,13 @@ mod tests {
     fn metadata_banks_are_disjoint_and_reject_undersized_or_unknown_planes() -> Result<()> {
         let layout = NativeLaneLayout::new(&cfg(), 8256, 2752, 1_048_576,
             NativeScratch { kda: 16, mla: [16; 3] })?;
+        assert_eq!(layout.metadata_banks(), 3);
+        assert_ne!(layout.metadata_banks(), 4, "negative control: no maximum-depth padding");
+        for rows in [1, 16, 64] {
+            let decode = NativeLaneLayout::new(&cfg(), rows, rows, 1_048_576,
+                NativeScratch { kda: 16, mla: [16; 3] })?;
+            assert_eq!(decode.metadata_banks(), 1, "decode rows {rows}");
+        }
         for name in ATTENTION_METADATA {
             let mut end = 0;
             for bank in 0..layout.metadata_banks() {

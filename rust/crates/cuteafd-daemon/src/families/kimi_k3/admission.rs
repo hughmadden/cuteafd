@@ -1345,8 +1345,10 @@ pub(super) mod tests {
                 let refused = plan_input.plan(&options)?;
                 assert!(!refused.fits, "planner must not shrink the explicit context floor");
             }
-            assert_eq!(lane_bytes[1] - lane_bytes[0], 1 << 20);
-            assert_eq!(lane_bytes[2] - lane_bytes[0], 3 << 20);
+            let i = inputs(&cfg);
+            let banks = i.lane_layouts[0][0].metadata_banks();
+            assert_eq!(lane_bytes[1] - lane_bytes[0], banks << 20);
+            assert_eq!(lane_bytes[2] - lane_bytes[0], 3 * banks << 20);
             assert_eq!(cache_bytes[1] - cache_bytes[0], 24 * (524_288 - 262_144) * format.record_bytes());
             assert_eq!(cache_bytes[2] - cache_bytes[0], 24 * (1_048_576 - 262_144) * format.record_bytes());
         }

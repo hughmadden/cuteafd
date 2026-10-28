@@ -380,7 +380,7 @@ impl<'a> Engine<'a> {
             let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
                 slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
             }).collect::<Vec<_>>();
-            // Unit calls stage each unit's metadata inside its hooks; a single
+            // Unit calls stage all metadata banks before the pipeline; a single
             // pass stages its whole step (at most one unit) here.
             let unit_call = !speculative && sequences.len() == 1 && rows > 64;
             if !unit_call { for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; } }
@@ -576,7 +576,7 @@ impl<'a> Engine<'a> {
                 for local in &mut lanes.local[lane] {
                     ensure!(sequences[lane].iter().map(|sequence| sequence.rows).sum::<usize>() == ids.len(),
                         "Kimi forward sequence rows differ from tokens");
-                    // Unit calls stage each unit's metadata inside its hooks.
+                    // Unit calls stage all metadata banks before the pipeline.
                     if !unit_call { local.stage_attention(&sequences[lane], pool)?; }
                 }
                 lanes.io[lane][0].embed(ids, lanes.local[lane][0].buffer("delta")?)?;
