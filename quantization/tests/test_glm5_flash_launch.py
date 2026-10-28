@@ -40,6 +40,7 @@ def test_pilot_has_short_timeout_and_fresh_qualification_admission():
 def test_qualification_rejects_failed_checks_changed_source_and_wrong_fork(tmp_path, monkeypatch):
     from glm5_flash.core_k6 import pilot
     monkeypatch.setattr(preflight, "REPO", tmp_path)
+    monkeypatch.setattr(pilot.subprocess, "check_output", lambda *a, **k: "fork\n")
     code = tmp_path / "run.py"
     code.write_text("producer version 1")
     proof = dict(status="passed", layers=[1, 4, 7],
@@ -59,7 +60,7 @@ def test_qualification_rejects_failed_checks_changed_source_and_wrong_fork(tmp_p
     proof["native_checks"]["mtp_boundary_byte_exact"] = True
     path.write_text(json.dumps(proof))
     code.write_text("different producer")
-    with pytest.raises(ValueError, match="changed after"):
+    with pytest.raises(ValueError, match="producer changed"):
         preflight.qualified(path, "fork")
 
 

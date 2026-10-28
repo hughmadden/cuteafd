@@ -43,7 +43,7 @@ def verify_fork():
 
 
 def qualified(report_path, fork_commit):
-    from .pilot import validate_qualification
+    from .pilot import validate_qualification, validate_report_code
     report = validate_qualification(json.loads(Path(report_path).read_text()))
     identity = report["identity"]
     if (report.get("status") != "passed" or identity.get("gptqmodel_commit") != fork_commit
@@ -53,10 +53,7 @@ def qualified(report_path, fork_commit):
     code = identity.get("code", {})
     if not code:
         raise ValueError("pilot has no immutable numerical source identity")
-    for name, digest in code.items():
-        path = (REPO / name).resolve()
-        if not path.is_relative_to(REPO.resolve()) or sha256_file(path) != digest:
-            raise ValueError(f"producer changed after Flash qualification: {name}")
+    validate_report_code(report, REPO)
     return report
 
 
