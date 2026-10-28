@@ -240,6 +240,60 @@ struct Regions {
   uint32_t count;
 };
 
+struct PullFrames {
+  const cuteafd_pull_frames_t* reply[CUTEAFD_PULL_MAX_RANKS];
+  uint8_t* plane[CUTEAFD_PULL_MAX_RANKS];
+  uint64_t capacity[CUTEAFD_PULL_MAX_RANKS];
+  uint32_t count;
+};
+
+constexpr uint32_t kPullEntries = CUTEAFD_PULL_MAX_RANKS * CUTEAFD_PULL_MAX_FRAMES;
+
+// Pulls each rank's published reply frames from mapped pinned memory into its
+// device plane. Thread r of every block loads rank r's descriptor (PCIe reads,
+// all ranks at once) into shared memory; a frame whose source, offset and size
+// are 16-byte aligned copies in uint4 units, otherwise in u32 units (a payload
+// follows its 96-byte header and 4-byte row indices). A frame past its plane,
+// misaligned, or of a cleared descriptor (count 0) copies nothing.
+__global__ void pull_frames(PullFrames pull) {
+  __shared__ uint64_t source[kPullEntries], destination[kPullEntries], units[kPullEntries], first[kPullEntries + 1];
+  __shared__ uint32_t vector[kPullEntries];
+  if (threadIdx.x < pull.count) {
+    const uint32_t r = threadIdx.x;
+    const volatile cuteafd_pull_frames_t* reply = pull.reply[r];
+    const uint32_t count = reply->count;
+    for (uint32_t f = 0; f < CUTEAFD_PULL_MAX_FRAMES; ++f) {
+      const uint32_t e = r * CUTEAFD_PULL_MAX_FRAMES + f;
+      uint64_t from = 0, offset = 0, bytes = 0;
+      if (f < count) { from = reply->frame[f].source; offset = reply->frame[f].offset; bytes = reply->frame[f].bytes; }
+      const bool fits = from && offset <= pull.capacity[r] && bytes <= pull.capacity[r] - offset &&
+          ((from | offset | bytes) & 3) == 0;
+      vector[e] = ((from | offset | bytes) & 15) == 0;
+      source[e] = from;
+      destination[e] = reinterpret_cast<uint64_t>(pull.plane[r]) + offset;
+      units[e] = fits ? (vector[e] ? bytes / 16 : bytes / 4) : 0;
+    }
+  }
+  __syncthreads();
+  const uint32_t entries = pull.count * CUTEAFD_PULL_MAX_FRAMES;
+  if (threadIdx.x == 0) {
+    first[0] = 0;
+    for (uint32_t e = 0; e < entries; ++e) first[e + 1] = first[e] + units[e];
+  }
+  __syncthreads();
+  const uint64_t total = first[entries], stride = uint64_t(gridDim.x) * blockDim.x;
+  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += stride) {
+    uint32_t e = 0;
+    while (i >= first[e + 1]) ++e;
+    const uint64_t unit = i - first[e];
+    if (vector[e]) {
+      reinterpret_cast<uint4*>(destination[e])[unit] = reinterpret_cast<const uint4*>(source[e])[unit];
+    } else {
+      reinterpret_cast<uint32_t*>(destination[e])[unit] = reinterpret_cast<const uint32_t*>(source[e])[unit];
+    }
+  }
+}
+
 __global__ void copy_regions(Regions regions) {
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   const uint64_t first = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -343,7 +397,7 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   for (const void* kernel : {reinterpret_cast<const void*>(push_signal<false>), reinterpret_cast<const void*>(push_planes<false>),
        reinterpret_cast<const void*>(wait_flag),
        reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
-       reinterpret_cast<const void*>(copy_regions)}) {
+       reinterpret_cast<const void*>(copy_regions), reinterpret_cast<const void*>(pull_frames)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
@@ -701,6 +755,29 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   *microseconds = median(samples);
   CHECK(cudaSetDevice(previous));
   return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, void* stream) {
+  if (!replies || !planes || !capacity || !count || count > CUTEAFD_PULL_MAX_RANKS || !stream)
+    return cudaErrorInvalidValue;
+  PullFrames pull{};
+  pull.count = count;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (!replies[r] || !planes[r] || (reinterpret_cast<uintptr_t>(planes[r]) & 15)) return cudaErrorInvalidValue;
+    pull.reply[r] = replies[r];
+    pull.plane[r] = static_cast<uint8_t*>(planes[r]);
+    pull.capacity[r] = capacity[r];
+  }
+  // Sized by the planes' capacity (an upper bound on the bytes): about eight
+  // 16-byte units per thread, up to 64 blocks of 256 threads per rank, which
+  // reach the mapped-memory read rate (~53 GB/s, PCIe gen5); a decode-sized
+  // wave takes a block or two.
+  uint64_t capacity_units = 0;
+  for (uint32_t r = 0; r < count; ++r) capacity_units += capacity[r] / 16;
+  const uint64_t blocks = std::min<uint64_t>(std::max<uint64_t>((capacity_units + 2047) / 2048, 1), 64ull * count);
+  pull_frames<<<unsigned(blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(pull);
+  return cudaGetLastError();
 }
 
 extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,

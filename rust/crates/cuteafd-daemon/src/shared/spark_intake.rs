@@ -532,6 +532,16 @@ impl<'a> SparkIntake<'a> {
         self.state.copies_pending.set(true);
         Ok(())
     }
+    /// Reply frames a stopped or closed exchange still held (its pulls may
+    /// have read them): kept until the link's reset or terminal release, which
+    /// follow the drain of its consuming streams, or the next exchange start
+    /// (only after a clean stop, whose consumers already drained).
+    pub(crate) fn keep_frames(&self, frames: Vec<VerbsHostProtocolV2ResponsePayload>) -> Result<()> {
+        if frames.is_empty() { return Ok(()); }
+        self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?
+            .extend(frames.into_iter().map(|frame| (0, 0, frame)));
+        Ok(())
+    }
     /// Device planes of return slot `slot`, in rank order.
     pub(crate) fn slot_buffers(&self, slot: usize) -> Vec<CuteafdDeviceBuffer> {
         self.slot_planes(slot).collect()
@@ -1706,7 +1716,8 @@ impl<'a> SparkLink<'a> {
     /// the consuming streams drained.
     fn stop(&mut self) -> Result<()> {
         if let Some(exchange) = self.exchange.take() {
-            let (transport, next) = exchange.stop::<SparkExperts>()?;
+            let (transport, frames, next) = exchange.stop::<SparkExperts>()?;
+            self.intake.keep_frames(frames)?;
             self.intake.resume_at(next);
             self.transport = Some(transport);
         }
@@ -1720,7 +1731,8 @@ impl<'a> SparkLink<'a> {
             // A failed exchange already abandoned its waves; a cancelled one
             // still holds the engine's unlanded tickets, which are dropped.
             // Either way the worker hands its transport back (#784).
-            let (transport, result) = exchange.close::<SparkExperts>()?;
+            let (transport, frames, result) = exchange.close::<SparkExperts>()?;
+            self.intake.keep_frames(frames)?;
             self.transport = Some(transport);
             if let Err(error) = result {
                 tracing::warn!(error = %format!("{error:#}"), "Spark exchange closed with a failure; resetting its transport");
@@ -1759,7 +1771,8 @@ impl<'a> SparkLink<'a> {
         if let Some(exchange) = self.exchange.take() {
             // Teardown may abandon waves; the worker then fails, releases its
             // waits and still hands the transport back.
-            let (transport, result) = exchange.close::<SparkExperts>()?;
+            let (transport, frames, result) = exchange.close::<SparkExperts>()?;
+            self.intake.keep_frames(frames)?;
             self.transport = Some(transport);
             if let Err(error) = result {
                 tracing::warn!(error = %format!("{error:#}"), "Spark exchange closed with a failure; quiescing its transport");

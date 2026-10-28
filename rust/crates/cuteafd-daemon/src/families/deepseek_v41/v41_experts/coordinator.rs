@@ -647,10 +647,14 @@ impl<'w> NativePendingFfn<'w, '_> {
         let host_ordered = !crate::shared::memory::chain::deferred();
         if host_ordered {
             // The shared host-wait pacing still applies (`--host-wait block`
-            // sleeps past its spin window), between yields.
+            // sleeps past its spin window), between yields. Pinned ranks that
+            // arrived are pulled meanwhile (#815) on the reduce stream (after
+            // the slot's previous reduce; no chain work touches the planes),
+            // so their PCIe transfer overlaps the ranks still on the wire.
             let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
             while !exchange.landed(&self.ticket) {
                 crate::shared::spark_waves::healthy()?;
+                exchange.pull_arrived(&self.ticket, self.stream.raw)?;
                 backoff.pause();
                 tokio::task::yield_now().await;
             }
