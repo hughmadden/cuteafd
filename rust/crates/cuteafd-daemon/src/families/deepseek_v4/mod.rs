@@ -260,7 +260,7 @@ impl EngineArgs {
             max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
                 waves: self.prefill_waves.map(|waves| waves as u64), span_rows,
-                slots: self.prefill_slots.map(|slots| slots as u64) })
+                slots: self.prefill_slots.map(|slots| slots as u64), reserve_rows: None })
     }
 
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.

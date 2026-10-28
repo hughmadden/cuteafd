@@ -245,7 +245,7 @@ impl RuntimeInputs {
         } else {
             prefill_shape(self.inventory.spark_ranks, crate::plan::Family::prefill_limits(&super::STEP5), PrefillOverrides {
                 unit_rows: Some(self.unit_rows() as u64), waves: Some(self.waves as u64),
-                span_rows: Some(self.rows as u64), slots: None,
+                span_rows: Some(self.rows as u64), slots: None, reserve_rows: None,
             })?;
         }
         ensure!(

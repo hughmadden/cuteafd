@@ -78,7 +78,7 @@ impl ServeArgs {
         Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
-            span_rows: None, slots: (self.prefill_slots != 0).then_some(u64::from(self.prefill_slots)),
+            span_rows: None, slots: (self.prefill_slots != 0).then_some(u64::from(self.prefill_slots)), reserve_rows: None,
         })?)
     }
 

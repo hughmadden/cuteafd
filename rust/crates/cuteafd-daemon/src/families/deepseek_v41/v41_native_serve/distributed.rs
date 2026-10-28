@@ -60,18 +60,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let compressed = format.is_exl3();
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp2");
-    if compressed {
-        let per_lane = crate::shared::experts::rtx::pair::OwnerPair::exl3_device_bytes(&exl3_directory, capacity, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
-        tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "EXL3 TP2 expert workspace plan");
-    } else if format.is_nvfp4() {
-        let per_lane = crate::shared::experts::rtx::pair::OwnerPair::device_bytes(&lib, capacity, true, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
-        tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
-    }
     let mut exl3_modules = [None, None];
     // Two private decode lanes at decode width, and `slots` prefill slots on
     // one shared storage set per GPU (PLAN "Prefill contract"). The prefill
     // slots' TP2 FFN is one execution arena per GPU at the unit cap.
-    let slots = usize::from(args.prefill_waves).max(2);
+    let prefill_shape = super::AdmittedPrefill::resolve(&args)?;
+    ensure!(prefill_shape.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
+        prefill_shape.unit_cap);
+    let slots = prefill_shape.slots;
     let decode_rows = super::DECODE_LANE_ROWS;
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
@@ -272,16 +268,19 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
         args.attention_plan_rows)?;
+    let decode_scope = cuteafd_ffi::memory_ledger::scope(super::DECODE_LANES_SCOPE);
     let mut pass = make_pass(decode_rows).context("constructing first distributed decode lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    drop(decode_scope);
     memory_checkpoint("decode lanes")?;
     // The prefill slots: one storage set per GPU (row planes at the reserve,
     // scratch at the unit cap), each slot's host objects on it.
-    let prefill_reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(capacity));
-    let reserve = usize::try_from(prefill_reserve)?;
+    let reserve = prefill_shape.reserve_rows();
+    let prefill_reserve = reserve as u64;
     let both = [0, 1];
+    let slot_scope = cuteafd_ffi::memory_ledger::scope(super::PREFILL_SLOTS_SCOPE);
     let lane_storage = [0usize, 1].map(|gpu| devices[gpu].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(
         &weights, prefill_reserve as u32, capacity, &both)));
     let [lane0, lane1] = lane_storage;
@@ -339,6 +338,12 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // more (WP7: a held LaneStorage would keep the replaced sparse arena alive).
     drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,
         query_storage, output_storage, dual_storage));
+    drop(slot_scope);
+    // Plan == runtime (WP6), unless the experimental TP2 attention/projections
+    // replace or add owners the planner does not model.
+    if !(args.tp2_attention || args.tp2_query_projection || args.tp2_output_projection) {
+        admission::verify_target_charges(&lib, &args.native_lib, &[0, 1], decode_rows, reserve as u64, capacity, slots)?;
+    }
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
     for slot in &mut slot_passes { slot.install_attention_plan(attention_plan)?; }
@@ -378,13 +383,15 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => tp2_ffn::Storage::storage_bytes(&lib, rows, unit, false),
     } };
     let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + 2 * ffn_bytes(decode_rows, decode_rows)?;
+    admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
+        slots, prefill_reserve, ffn_arenas as u64)?;
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
     let spark_ranks = args.peers.len();
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(capacity), spark_ranks, slots)?)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(capacity), spark_ranks, slots, prefill_shape.reserve as u64)?)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -513,7 +520,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
     }
-    let mut prefill_slots = super::prefill_target::PrefillSlots { slots: slot_passes.into_iter().zip(slot_transports).collect() };
+    let mut prefill_slots = super::prefill_target::PrefillSlots { slots: slot_passes.into_iter().zip(slot_transports).collect(),
+        depth: std::rc::Rc::new(prefill_shape.depth()?) };
     if expert_layers < 40 {
         let link = &mut prefill_slots.slots[0].1;
         devices[1].run(|| link.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
@@ -550,6 +558,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    // The prefill depth controller (#762): evidence or calibration before readiness.
+    super::calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefill_slots,
+        format!("2rtx-tp{}x{}", spark_world.topology().tp(), spark_world.topology().ep()))?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");

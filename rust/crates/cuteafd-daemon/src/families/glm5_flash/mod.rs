@@ -40,6 +40,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
         waves: (args.prefill_waves > 0).then_some(args.prefill_waves as u64),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
         slots: (args.prefill_slots > 0).then_some(args.prefill_slots as u64),
+        reserve_rows: None,
     })?;
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = usize::try_from(shape.waves)?;

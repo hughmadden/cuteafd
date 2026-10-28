@@ -76,6 +76,9 @@ pub struct DeploymentSpec<'a> {
     pub prefill_slots: u64,
     pub decode_lanes: u8,
     pub prefill_span_rows: u64,
+    /// The reserve an adaptive executor's depths cut (the standard 8192, or
+    /// the planner's fit cap below it); launches pass it back.
+    pub prefill_reserve_rows: u64,
     pub topology: Topology,
     pub roles: Vec<SparkRole>,
     pub peers: Vec<String>,
@@ -167,7 +170,9 @@ impl<'a> DeploymentSpec<'a> {
             prefill_waves: report.prefill_waves.unwrap_or(0),
             prefill_slots: report.prefill_slots.or(report.prefill_waves).unwrap_or(0),
             decode_lanes: report.decode_lanes,
-            prefill_span_rows: report.prefill_span_rows.unwrap_or(0), topology, roles, peers,
+            prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
+            prefill_reserve_rows: report.prefill_reserve_rows
+                .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS), topology, roles, peers,
             speculator: &options.speculator, admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),

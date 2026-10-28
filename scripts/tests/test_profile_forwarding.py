@@ -113,7 +113,7 @@ def test_v41_native_census_probes_cover_all_card_sizes():
     assert phase.index('crate::shared::inventory::startup_probe(') < phase.index('if device_total <= 32usize << 30')
     assert 'if small_card { admission::startup_phase(' not in single
     for stage in ('context', 'before native preload', 'after native preload', 'startup',
-                  'workspace:backbone-lanes', 'weights:head', 'drafter', 'vision',
+                  'workspace:decode-lanes', 'workspace:prefill-slots', 'weights:head', 'drafter', 'vision',
                   'prefix-snapshots', 'kv', 'local-experts', 'ready'):
         assert f'admission::startup_phase(&lib, "v41/{stage}", device_total)?;' in single
     assert single.index('"v41/before native preload"') < single.index('RuntimeInventory::measure(')

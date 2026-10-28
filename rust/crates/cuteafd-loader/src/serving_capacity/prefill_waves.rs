@@ -119,6 +119,9 @@ pub struct PrefillOverrides {
     /// depth, more slots let an adaptive executor choose. A launch passes the
     /// deployment's value back; equal to `waves` it pins the depth.
     pub slots: Option<u64>,
+    /// An adaptive family's reserve below the standard one (TJ's reserve
+    /// rule: the planner's fit cap); its depths cut it (`wave_control::unit_for_in`).
+    pub reserve_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +170,16 @@ pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
         if slots > slots_cap || waves < 1 {
             return Err(PrefillError::Slots { slots, waves, max_waves: slots_cap });
         }
-        let cap = ADAPTIVE_UNIT_ROWS.min(limits.max_unit_rows);
-        let unit = explicit.unit_rows.unwrap_or_else(|| limits.capacities.iter().copied()
-            .map(u64::from).filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= cap).max().unwrap_or(0));
+        let reserve = explicit.reserve_rows.unwrap_or(RESERVE_ROWS);
+        if reserve > RESERVE_ROWS || reserve % ROW_PAGE != 0 || reserve == 0 {
+            return Err(PrefillError::IntakeSpan { span_rows: reserve, slot_rows: reserve, max_span_rows: RESERVE_ROWS });
+        }
+        let cap = unit_rows_in(2, reserve).min(ADAPTIVE_UNIT_ROWS).min(limits.max_unit_rows);
+        // A planner-fit reserve admits its own widest unit (depth 2's) exactly;
+        // the standard reserve the widest compiled capacity under half of it.
+        let unit = explicit.unit_rows.unwrap_or_else(|| if explicit.reserve_rows.is_some() { cap } else {
+            limits.capacities.iter().copied().map(u64::from)
+                .filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= cap).max().unwrap_or(0) });
         if (super::PrefillShape { unit_rows: unit, waves: 1 }).validate().is_err() {
             return Err(PrefillError::InvalidShape { unit_rows: unit, waves });
         }
@@ -178,8 +188,8 @@ pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
                 max_unit_rows: cap, max_waves: slots_cap });
         }
         // The starting depth runs a valid static shape at its own cut.
-        let start = validate_shape(super::wave_control::unit_for(waves, unit), waves, limits, None)?;
-        let span = super::wave_control::reserve_rows(slots, unit);
+        let start = validate_shape(super::wave_control::unit_for_in(waves, unit, reserve), waves, limits, None)?;
+        let span = super::wave_control::reserve_rows_in(slots, unit, reserve);
         let max_span_rows = limits.max_span_rows.min(RESERVE_ROWS + 64);
         if explicit.span_rows.is_some_and(|given| given != span) || span > max_span_rows {
             return Err(PrefillError::IntakeSpan { span_rows: explicit.span_rows.unwrap_or(span),
@@ -447,9 +457,9 @@ mod tests {
             PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192, slots: 2 });
         // A resolved deployment's slots come back with its waves: adaptive
         // when more, pinned when equal, refused for static families.
-        let resolved = PrefillOverrides { unit_rows: Some(4096), waves: Some(3), span_rows: Some(8256), slots: Some(4) };
+        let resolved = PrefillOverrides { unit_rows: Some(4096), waves: Some(3), span_rows: Some(8256), slots: Some(4), reserve_rows: None };
         assert_eq!(prefill_shape(6, limits, resolved).unwrap(), plan);
-        let pinned = PrefillOverrides { unit_rows: Some(2752), waves: Some(3), span_rows: Some(8256), slots: Some(3) };
+        let pinned = PrefillOverrides { unit_rows: Some(2752), waves: Some(3), span_rows: Some(8256), slots: Some(3), reserve_rows: None };
         assert_eq!(prefill_shape(6, limits, pinned).unwrap().slots, 3);
         assert!(prefill_shape(6, measured(3), resolved).is_err(), "a static family has no 4096-row three-wave shape");
         assert!(matches!(prefill_shape(6, measured(3), PrefillOverrides { slots: Some(4), ..pinned }),

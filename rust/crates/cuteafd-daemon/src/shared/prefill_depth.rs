@@ -14,8 +14,9 @@
 //! loads its persisted evidence ([`CalibrationStore`]).
 
 use anyhow::Context;
-use cuteafd_loader::serving_capacity::wave_control::{call_rows, reserve_rows, Boundary, Decision, Evidence,
+use cuteafd_loader::serving_capacity::wave_control::{call_rows_in, reserve_rows_in, Boundary, Decision, Evidence,
     PrefillPace, WaveControl, REFERENCE_SHARE};
+use cuteafd_loader::serving_capacity::prefill_waves::RESERVE_ROWS;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,9 @@ const SAVE_EVERY: Duration = Duration::from_secs(600);
 pub(crate) struct PrefillDepth {
     slots: usize,
     unit_cap: usize,
+    /// The reserve every depth's units are cut from (the standard one, or
+    /// the largest that fits a smaller card).
+    reserve: usize,
     control: RefCell<WaveControl>,
     /// Started calls not yet reported: the decision and the rows the call ran.
     pending: RefCell<VecDeque<(Decision, u64)>>,
@@ -55,13 +59,20 @@ impl PrefillDepth {
     /// within `slots` admitted slots. `pinned` (an explicit wave count)
     /// keeps the initial depth.
     pub(crate) fn new(initial: usize, slots: usize, unit_cap: usize, pinned: bool) -> anyhow::Result<Self> {
+        Self::in_reserve(initial, slots, unit_cap, RESERVE_ROWS as usize, pinned)
+    }
+    /// [`Self::new`] for depths cut from a `reserve` of rows (TJ's reserve
+    /// rule: the planner's fit cap; `wave_control::unit_for_in`).
+    pub(crate) fn in_reserve(initial: usize, slots: usize, unit_cap: usize, reserve: usize, pinned: bool)
+        -> anyhow::Result<Self> {
         anyhow::ensure!((1..=4).contains(&slots) && (1..=slots).contains(&initial)
-            && unit_cap >= 64 && unit_cap % 64 == 0 && unit_cap <= 4096,
-            "prefill depth {initial} of {slots} slots x {unit_cap} rows outside the shared reserve");
-        let control = WaveControl::new(initial as u64, slots as u64, unit_cap as u64, pinned);
-        tracing::info!(slots, unit_cap, initial = control.waves(), pinned, candidates = ?control.candidates(),
-            reserve_rows = reserve_rows(slots as u64, unit_cap as u64), "prefill depth control");
-        Ok(Self { slots, unit_cap, control: RefCell::new(control), pending: RefCell::new(VecDeque::new()),
+            && unit_cap >= 64 && unit_cap % 64 == 0 && unit_cap <= 4096
+            && reserve % 64 == 0 && reserve <= RESERVE_ROWS as usize && unit_cap <= reserve,
+            "prefill depth {initial} of {slots} slots x {unit_cap} rows outside the {reserve}-row reserve");
+        let control = WaveControl::in_reserve(initial as u64, slots as u64, unit_cap as u64, reserve as u64, pinned);
+        tracing::info!(slots, unit_cap, reserve, initial = control.waves(), pinned, candidates = ?control.candidates(),
+            reserve_rows = reserve_rows_in(slots as u64, unit_cap as u64, reserve as u64), "prefill depth control");
+        Ok(Self { slots, unit_cap, reserve, control: RefCell::new(control), pending: RefCell::new(VecDeque::new()),
             last: Cell::new(None), calibration: Cell::new((0, 0)),
             calibration_calls: RefCell::new(Vec::new()), store: RefCell::new(None) })
     }
@@ -71,11 +82,13 @@ impl PrefillDepth {
     /// The widest unit admitted (fixed at startup).
     pub(crate) fn unit_cap(&self) -> usize { self.unit_cap }
     /// Rows every per-slot plane spans so any depth's slots are views in it.
-    pub(crate) fn reserve_rows(&self) -> usize { reserve_rows(self.slots as u64, self.unit_cap as u64) as usize }
+    pub(crate) fn reserve_rows(&self) -> usize {
+        reserve_rows_in(self.slots as u64, self.unit_cap as u64, self.reserve as u64) as usize
+    }
     /// Longest prefill call: whole units at every depth the controller may pick.
     pub(crate) fn call_rows(&self) -> usize {
         if self.control.borrow().pinned() { return self.reserve_rows(); }
-        call_rows(self.slots as u64, self.unit_cap as u64) as usize
+        call_rows_in(self.slots as u64, self.unit_cap as u64, self.reserve as u64) as usize
     }
     /// The candidate depths (ascending).
     pub(crate) fn candidates(&self) -> Vec<u64> { self.control.borrow().candidates().to_vec() }
@@ -312,7 +325,8 @@ impl<'a> CalibrationKey<'a> {
     /// The key of `depth` serving `snapshot` as `family` on `identity`.
     pub(crate) fn new(family: &'a str, snapshot: &'a Path, depth: &PrefillDepth, identity: DeploymentIdentity) -> Self {
         Self { family, snapshot, quant: checkpoint_quant(snapshot), gpus: identity.gpus, sparks: identity.sparks,
-            topology: identity.topology, slots: depth.slots(), unit_cap: depth.unit_cap(), candidates: depth.candidates() }
+            topology: identity.topology, slots: depth.slots(), unit_cap: depth.unit_cap(), reserve: depth.reserve,
+            candidates: depth.candidates() }
     }
 }
 
@@ -330,6 +344,8 @@ pub(crate) struct CalibrationKey<'a> {
     pub topology: String,
     pub slots: usize,
     pub unit_cap: usize,
+    /// The reserve depths are cut from.
+    pub reserve: usize,
     pub candidates: Vec<u64>,
 }
 
@@ -345,6 +361,7 @@ impl CalibrationStore {
     /// A store under `dir` for `build` (the release version plus the binary's identity).
     pub(crate) fn new(dir: &Path, build: &str, key: CalibrationKey<'_>) -> anyhow::Result<Self> {
         use sha2::Digest;
+        let key_reserve = key.reserve;
         let snapshot = std::fs::canonicalize(key.snapshot).unwrap_or_else(|_| key.snapshot.to_path_buf());
         let revision = snapshot.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
         let model = snapshot.parent().and_then(Path::parent).and_then(Path::file_name)
@@ -356,6 +373,9 @@ impl CalibrationStore {
             "gpus": key.gpus, "sparks": key.sparks, "topology": key.topology,
             "reserve": { "slots": key.slots, "unit_cap": key.unit_cap }, "candidates": key.candidates,
         });
+        // A smaller reserve cuts different units (the standard one keeps its key).
+        let mut key = key;
+        if key_reserve != RESERVE_ROWS as usize { key["reserve"]["rows"] = key_reserve.into(); }
         let digest = sha2::Sha256::digest(serde_json::to_vec(&key)?);
         let name: String = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Self { path: dir.join("prefill-depth").join(format!("{}-{name}.json", key["family"].as_str()
@@ -431,7 +451,7 @@ mod tests {
 
     fn key(dir: &Path) -> CalibrationKey<'_> {
         CalibrationKey { family: "glm5", snapshot: dir, quant: "exl3".into(), gpus: vec![("GPU-a".into(), 188)],
-            sparks: vec!["10.55.0.1:9000".into()], topology: "tp1".into(), slots: 4, unit_cap: 4096,
+            sparks: vec!["10.55.0.1:9000".into()], topology: "tp1".into(), slots: 4, unit_cap: 4096, reserve: 8192,
             candidates: vec![2, 3, 4] }
     }
 

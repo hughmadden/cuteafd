@@ -1570,8 +1570,7 @@ mod storage_bytes_tests {
             emit("tp2_ffn_mxfp4",Ffn::storage_bytes(&lib,r,u,false)?,Ffn::storage_bytes(&lib,u,u,false)?);
             emit("output",AttentionOutputStorage::storage_bytes(&lib,r,u,false)?,AttentionOutputStorage::storage_bytes(&lib,u,u,false)?);
             let exact=OwnerPair::device_bytes_for(&lib,u,geometry,OwnerPolicy::native(&lib,false)?)?;
-            let ceiling=OwnerPair::device_bytes(&lib,u,false,geometry)?;
-            eprintln!("WP7_OWNER k={k} unit={u} exact={exact} ceiling={ceiling} gap={} old_k_gap={}",ceiling-exact,(ceiling-exact)*k);
+            eprintln!("WP7_OWNER k={k} unit={u} exact={exact}");
             let new=LaneStorage::storage_bytes(&lib,r,u,false,false,false)?.into_iter().sum::<usize>();
             let old=LaneStorage::storage_bytes(&lib,u,u,false,false,false)?.into_iter().sum::<usize>();
             emit("lane_unplaced",new,old);

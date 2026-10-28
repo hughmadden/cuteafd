@@ -112,8 +112,10 @@ impl NativeWorkspace {
         })
     }
 
-    /// One lane, matching LocalExpertWave or OwnerPair respectively. The
-    /// owner path retains route planes even when a kernel can sum tokens.
+    /// One lane, matching LocalExpertWave or OwnerPair (`OwnerPair::
+    /// device_bytes_for` with `OwnerPolicy::native`): the TP2 owner keeps
+    /// BF16 route planes on NVFP4 and FP32 token sums on MXFP4 (the shipped
+    /// TP2 reducer sums routes; startup cross-checks the exact arena).
     pub fn lane_bytes(
         self,
         rows: u64,
@@ -123,8 +125,8 @@ impl NativeWorkspace {
         nvfp4: bool,
     ) -> anyhow::Result<u64> {
         use anyhow::Context;
-        let columns = if dual { topk.checked_mul(if nvfp4 { 2 } else { 4 })
-            .context("V4.1 expert route extent overflow")? } else { 2 };
+        let columns = if dual { if nvfp4 { topk.checked_mul(2).context("V4.1 expert route extent overflow")? } else { 4 } }
+            else { 2 };
         let output = rows
             .checked_mul(hidden)
             .and_then(|n| n.checked_mul(columns))
@@ -264,17 +266,46 @@ pub fn expert_cost(
 /// Expert costs per layer and the RTX expert workspace for `lanes` target
 /// passes (two decode lanes plus any further prefill slot), each with its own
 /// local or TP2 expert wave.
+/// Per-layer expert costs, and the coordinator's expert workspaces: the
+/// prefill slots' (one per slot on one RTX at the `rows` unit; one shared TP2
+/// arena on two, planes at the `reserve`) and the two decode lanes' at
+/// `decode_rows`.
 pub fn expert_inventory(
     catalog: &crate::OfficialV41Catalog,
     programs: &std::path::Path,
     rows: u64,
     gpus: usize,
     sms: u32,
-    lanes: usize,
+    slots: usize,
+    reserve: u64,
+    decode_rows: u64,
 ) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
     use anyhow::{ensure, Context};
     ensure!(matches!(gpus, 1 | 2), "V4.1 supports one or two RTX owners");
-    ensure!((2..=4).contains(&lanes), "V4.1 runs two to four target passes");
+    ensure!((1..=4).contains(&slots) && rows <= reserve, "V4.1 runs one to four prefill slots in the reserve");
+    // Slot arenas run live rows on the covering AOT capacity; decode lanes
+    // at their compiled width.
+    let slot_capacity = if gpus == 1 {
+        u64::from(cuteafd_core::coordinator_programs::v41_aot_rows(u32::try_from(rows)?)
+            .context("invalid V4.1 prefill rows")?)
+    } else { rows };
+    let (experts, slot) = expert_workspace(catalog, programs, slot_capacity, reserve, gpus, sms)?;
+    let (_, decode) = expert_workspace(catalog, programs, decode_rows, decode_rows, gpus, sms)?;
+    let slots = if gpus == 1 { slots as u64 } else { 1 };
+    Ok((experts, slot.checked_mul(slots).and_then(|n| n.checked_add(2 * decode))
+        .context("V4.1 expert workspaces overflow")?))
+}
+
+/// Per-layer costs, and one expert workspace at `rows` (TP2: planes at `reserve`).
+fn expert_workspace(
+    catalog: &crate::OfficialV41Catalog,
+    programs: &std::path::Path,
+    rows: u64,
+    reserve: u64,
+    gpus: usize,
+    sms: u32,
+) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
+    use anyhow::{ensure, Context};
     let shape = catalog.routed_experts();
     ensure!(
         shape.layers == 40 && shape.hidden == 5120,
@@ -285,12 +316,8 @@ pub fn expert_inventory(
         .context("program manifest has no parent")?;
     let local = gpus == 1;
     let role = if local { "rtx_backbone" } else { "rtx_tp2" };
-    let capacity = if local {
-        cuteafd_core::coordinator_programs::v41_aot_rows(u32::try_from(rows)?)
-            .context("invalid V4.1 prefill rows")? as u64
-    } else {
-        rows
-    };
+    // A compiled capacity on one RTX (the caller covers live rows); TP2 rows.
+    let capacity = rows;
     let (stored, routed) = if let Some(exl3) = catalog.exl3() {
         let tiers: String = exl3.decoder_tiers().iter().map(usize::to_string).collect();
         let layout = if local { "rtx-tp1" } else { "rtx-tp2" };
@@ -371,9 +398,11 @@ pub fn expert_inventory(
     } else {
         let fp8: serde_json::Value =
             serde_json::from_slice(&std::fs::read(parent.join("V41_FP8_AOT.json"))?)?;
+        // Shared TP2 (its sums a plane at the reserve) and the peer inputs
+        // and final output planes at the reserve (WP7 `tp2_ffn::Storage`).
         routed
-            .checked_add(shared_workspace(&fp8, rows, sms)?)
-            .and_then(|n| n.checked_add(rows * (10240 + 5280 + 24 + 24 + 10240)))
+            .checked_add(shared_workspace(&fp8, rows, sms)? - rows * 10240 + reserve * 10240)
+            .and_then(|n| n.checked_add(reserve * (10240 + 5280 + 24 + 24 + 10240)))
             .context("V4.1 FFN workspace overflow")?
     };
     let experts = (0..40)
@@ -394,10 +423,7 @@ pub fn expert_inventory(
             Ok(cost)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((
-        experts,
-        lane.checked_mul(lanes as u64).context("V4.1 serving lanes overflow")?,
-    ))
+    Ok((experts, lane))
 }
 
 pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64> {
@@ -817,7 +843,7 @@ mod tests {
                 "capacity_rows":c,"core_scratch_nbytes":if c == 16 { 99999 } else { c * 7 }})))});
         let demand = NativeWorkspace::from_manifest(&manifest,"rtx_tp2", 81,5120,1152,256,6).unwrap();
         assert_eq!(demand, NativeWorkspace { scratch_bytes:99999, kernel_intermediate:1280 });
-        assert_eq!(demand.lane_bytes(81,5120,6,true,false).unwrap(),99999+81*5120*(24+26));
+        assert_eq!(demand.lane_bytes(81,5120,6,true,false).unwrap(),99999+81*5120*(4+26));
         assert_eq!(demand.lane_bytes(81,5120,6,true,true).unwrap(),99999+81*5120*(12+26));
         assert_eq!(demand.lane_bytes(81,5120,6,false,false).unwrap(),99999+81*5120*2);
         manifest["variants"][2]["requested_rows"] = 80.into();

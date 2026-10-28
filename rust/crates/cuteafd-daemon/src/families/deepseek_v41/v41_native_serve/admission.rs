@@ -42,10 +42,11 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         return Ok(None);
     }
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
-        rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: u64::from(args.prefill_waves).max(2) };
+        rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(),
+        prefill_lanes: super::AdmittedPrefill::resolve(args)?.slots as u64 };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
-        spark_model(catalog, capacity, args.prefill_waves, catalog.nvfp4().is_some())?)?))
+        spark_model(catalog, capacity, u8::try_from(super::AdmittedPrefill::resolve(args)?.slots)?, catalog.nvfp4().is_some())?)?))
 }
 
 #[cfg(test)]
@@ -154,6 +155,54 @@ pub(super) fn startup_phase(
     Ok(())
 }
 
+/// Plan == runtime (WP6): the decode lanes' and prefill slots' device
+/// allocations on each of `gpus` (their ledger scopes) are exactly what the
+/// planner charges (`NativePrograms::target`). A retained temporary or an
+/// unmodelled owner fails startup instead of silently shrinking the pool.
+pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib: &std::path::Path, gpus: &[i32],
+    decode_rows: u32, reserve: u64, unit: u32, slots: usize) -> Result<()> {
+    use cuteafd_ffi::memory_ledger::{snapshot, Space};
+    let manifest = families::deepseek_v41::owners::native_manifest(native_lib, "V41_FP8_AOT.json")?;
+    let programs = families::deepseek_v41::owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
+    let fp8_head = crate::families::deepseek_v41::v41_tensors::fp8_head()
+        == crate::families::deepseek_v41::v41_tensors::Fp8Head::All;
+    let window_batch = gpus.len() == 1 && super::BackboneExecution::window_batch_enabled();
+    let ranks = gpus.len();
+    let lanes = programs.decode_lanes(u64::from(decode_rows), ranks, fp8_head, window_batch)?;
+    let prefill = programs.prefill_slots(reserve, u64::from(unit), ranks, slots, fp8_head, window_batch)?;
+    let ledger = snapshot();
+    for (rank, &gpu) in gpus.iter().enumerate() {
+        let scopes = ledger.by_scope(Space::Device, gpu);
+        let charged = |demands: &[Demand]| demands.iter().filter(|d| usize::from(d.gpu) == rank).map(|d| d.bytes).sum::<u64>();
+        for (scope, demands) in [(super::DECODE_LANES_SCOPE, &lanes), (super::PREFILL_SLOTS_SCOPE, &prefill)] {
+            let live = scopes.get(scope).copied().unwrap_or(0) as u64;
+            let plan = charged(demands);
+            tracing::info!(gpu, scope, live, plan, "V4.1 target owners: plan == runtime");
+            ensure!(live == plan, "V4.1 {scope} on GPU {gpu}: allocated {live} B, planned {plan} B ({:+} B)",
+                live as i64 - plan as i64);
+        }
+    }
+    Ok(())
+}
+
+/// Plan == runtime for the coordinator expert workspaces (WP6): the planner's
+/// charge (`expert_inventory`: slot arenas at the unit, decode lanes at their
+/// width) equals what serve admits and allocates (`exact`, from the native
+/// library's own plans and the TP2 owner policy).
+pub(super) fn verify_expert_charges(catalog: &cuteafd_loader::OfficialV41Catalog, native_lib: &std::path::Path,
+    sms: u32, ranks: usize, unit: u32, slots: usize, reserve: u64, exact: u64) -> Result<()> {
+    let directory = native_lib.parent().context("native library has no directory")?;
+    let programs = [directory.join("PROGRAMS.json"), directory.join("../share/PROGRAMS.json"),
+        directory.join("../../share/PROGRAMS.json")].into_iter().find(|path| path.is_file())
+        .context("missing PROGRAMS.json beside the native library or in its share directory")?;
+    let (_, planned) = families::deepseek_v41::expert_inventory(catalog, &programs, u64::from(unit), ranks, sms,
+        slots, reserve, u64::from(super::DECODE_LANE_ROWS))?;
+    tracing::info!(planned, exact, ranks, unit, slots, reserve, "V4.1 expert workspaces: plan == runtime");
+    ensure!(planned == exact, "V4.1 expert workspaces: planned {planned} B per GPU, serve admits {exact} B ({:+} B)",
+        exact as i64 - planned as i64);
+    Ok(())
+}
+
 /// Startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
 pub(super) fn admit_startup(
@@ -179,9 +228,11 @@ pub(super) fn admit_startup(
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
-    // Every target pass serve allocates: two decode lanes plus each further prefill slot.
-    let passes = usize::from(args.prefill_waves).max(2);
-    let mut target = programs.target(u64::from(capacity), 1, passes,
+    // Every owner serve allocates: two decode lanes, the prefill slots' storage.
+    let shape = super::AdmittedPrefill::resolve(args)?;
+    let passes = shape.slots;
+    let mut target = programs.target(u64::from(super::DECODE_LANE_ROWS), shape.reserve_rows() as u64,
+        u64::from(capacity), 1, passes,
         crate::families::deepseek_v41::v41_tensors::fp8_head()
             == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
         BackboneExecution::window_batch_enabled())?;
@@ -198,7 +249,7 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        owners::transports_bytes(u64::from(capacity), args.peers.len(), passes)?, slots)?;
+        owners::transports_bytes(u64::from(capacity), args.peers.len(), passes, u64::from(args.prefill_reserve_rows))?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
@@ -367,7 +418,7 @@ pub(super) fn local_workspace(
     } };
     // One local expert wave per prefill slot at the unit, one per decode lane
     // at decode width.
-    let slots = usize::from(args.prefill_waves).max(2);
+    let slots = super::AdmittedPrefill::resolve(args)?.slots;
     Ok((lane(rows)?.checked_mul(slots).context("local serving lanes overflow")?
         + 2 * lane(super::DECODE_LANE_ROWS)?) as u64)
 }
@@ -743,7 +794,7 @@ mod admission_tests {
                 let runtime = 2 * NativeTp4Wave::device_bytes_for(rows, ranks)?
                     + slots * rows as usize * 5120 * 2
                     + V41Link::prefill_device_bytes(reserve as usize, ranks)?;
-                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(rows), ranks, slots)?, runtime as u64,
+                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(rows), ranks, slots, 8192)?, runtime as u64,
                     "{slots} x {rows} rows on {ranks} ranks");
             }
         }
@@ -795,10 +846,10 @@ mod admission_tests {
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
                 let fixed = owners::TargetOwners::new(weights,
-                    programs.target(256, ranks, 2, true, ranks == 1)?, ranks,
+                    programs.target(80, 512, 256, ranks, 2, true, ranks == 1)?, ranks,
                     2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
-                    &catalog, &manifest, 256, ranks, 188, 2)?;
+                    &catalog, &manifest, 256, ranks, 188, 2, 512, 80)?;
                 // Deliberately synthetic pre-weight inventory, independent of
                 // planner output. This is not a CUDA sample or ready-parity gate.
                 let memory = vec![(80usize << 30, 96usize << 30); ranks];

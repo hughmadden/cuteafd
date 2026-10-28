@@ -50,8 +50,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mode = Fp8Head::configured();
     let fp8_head = mode.target();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
-    let slots = usize::try_from(prefill.waves.max(2))?;
-    let target = programs.target(rows, ranks, slots, fp8_head, window_batch)?;
+    // Admitted slots (#762): the deepest depth the controller may run, on one
+    // storage set over the reserve; two decode lanes at decode width.
+    let slots = usize::try_from(prefill.slots.max(2))?;
+    let reserve = options.prefill_reserve_rows.unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS);
+    let span = crate::serving_capacity::wave_control::reserve_rows_in(slots as u64, rows, reserve);
+    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, fp8_head, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
@@ -79,7 +83,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let spark_ranks = report.placement.spark_ranks();
     // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
-    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(rows, spark_ranks, slots)? } else { 0 };
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(rows, spark_ranks, slots, reserve)? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",
@@ -88,7 +92,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut owners = v41::owners::TargetOwners::new(fixed, target, ranks, transport, marks)?;
     let mut fixed = owners.fixed.clone();
     let catalog = input.expert_catalog()?;
-    let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots)?;
+    let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
+        v41::owners::DECODE_LANE_ROWS)?;
     let draft = if dspark {
         ensure!(catalog.native_dspark_experts(), "V4.1 compressed dSpark owner manifest is not supported by this adapter");
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))

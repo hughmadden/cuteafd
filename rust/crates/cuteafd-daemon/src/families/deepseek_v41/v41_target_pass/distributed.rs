@@ -1451,6 +1451,7 @@ mod tests {
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
             slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
+            depth: std::rc::Rc::new(crate::shared::prefill_depth::PrefillDepth::in_reserve(2, 2, 16, 64, true)?),
         };
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;

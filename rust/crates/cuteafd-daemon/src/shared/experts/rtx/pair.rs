@@ -776,49 +776,6 @@ impl<'a> OwnerPair<'a> {
         Ok([backend[0], backend[1], reduce[0], reduce[1]])
     }
 
-    pub(crate) fn device_bytes(
-        library: &NativeLibrary,
-        capacity: u32,
-        nvfp4: bool,
-        geometry: cuteafd_core::ExpertGeometry,
-    ) -> Result<usize> {
-        cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
-        super::native::NativeTp2::workspace_bytes_for_format(
-            library,
-            capacity as usize,
-            if nvfp4 {
-                super::RtxSelectionPolicy::FirstCapacity
-            } else {
-                super::RtxSelectionPolicy::CanonicalDecode
-            },
-            super::native::NativeOutputPolicy::KernelPlanes,
-            nvfp4,
-        )?
-        .checked_add(super::combine::OwnerReduce::workspace_bytes(
-            capacity, geometry,
-        )?)
-        .context("owner expert workspace overflow")
-    }
-
-    pub(crate) fn exl3_device_bytes(
-        package: &std::path::Path,
-        capacity: u32,
-        geometry: cuteafd_core::ExpertGeometry,
-    ) -> Result<usize> {
-        cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
-        super::exl3::Exl3Tp2::workspace_bytes_for_selection(
-            package,
-            geometry.hidden as usize,
-            capacity as usize,
-            cuteafd_core::Exl3RowPolicy::for_geometry(geometry),
-            super::RtxSelectionPolicy::FirstCapacity,
-        )?
-        .checked_add(super::combine::OwnerReduce::workspace_bytes(
-            capacity, geometry,
-        )?)
-        .context("owner EXL3 workspace overflow")
-    }
-
     pub(crate) fn new(
         weights: [OwnerWeights<'a>; 2],
         max_rows: u32,

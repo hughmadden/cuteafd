@@ -7,7 +7,7 @@
 //! coordinator's consuming stream waited on Spark replies. Pure arithmetic
 //! over the reported counters; no clock, no I/O.
 
-use super::prefill_waves::{unit_rows, MAX_WAVES};
+use super::prefill_waves::{unit_rows_in, MAX_WAVES, RESERVE_ROWS};
 
 /// A depth replaces the current one only if its ratio is lower by this
 /// share (hysteresis against noise).
@@ -69,29 +69,42 @@ impl PrefillPace {
 }
 
 /// The unit a depth runs at inside the admitted extent `unit_cap`: the
-/// shared reserve's unit for `k`, never wider than what was admitted.
-pub fn unit_for(k: u64, unit_cap: u64) -> u64 { unit_rows(k).min(unit_cap) }
+/// standard reserve's unit for `k`, never wider than what was admitted
+/// ([`unit_for_in`] at [`RESERVE_ROWS`]).
+pub fn unit_for(k: u64, unit_cap: u64) -> u64 { unit_for_in(k, unit_cap, RESERVE_ROWS) }
+
+/// The unit depth `k` runs at in a `reserve` of rows (TJ's reserve rule:
+/// `roundup64(reserve / k)`, depths 1 and 2 both at half), never wider than
+/// the admitted `unit_cap`. A card that cannot hold the standard reserve
+/// admits a smaller one; its depths cut that reserve.
+pub fn unit_for_in(k: u64, unit_cap: u64, reserve: u64) -> u64 { unit_rows_in(k, reserve).min(unit_cap) }
 
 /// Rows every per-slot plane spans so any depth up to `slots` fits as views
 /// at `slot * unit_for(k)`: the largest `k * unit_for(k)` (8256 at most).
-pub fn reserve_rows(slots: u64, unit_cap: u64) -> u64 {
-    (1..=slots.clamp(1, MAX_WAVES)).map(|k| k * unit_for(k, unit_cap)).max().unwrap_or(0)
+pub fn reserve_rows(slots: u64, unit_cap: u64) -> u64 { reserve_rows_in(slots, unit_cap, RESERVE_ROWS) }
+/// [`reserve_rows`] in a `reserve` of rows.
+pub fn reserve_rows_in(slots: u64, unit_cap: u64, reserve: u64) -> u64 {
+    (1..=slots.clamp(1, MAX_WAVES)).map(|k| k * unit_for_in(k, unit_cap, reserve)).max().unwrap_or(0)
 }
 
 /// Rows one prefill call takes so that every candidate depth cuts it into
 /// whole units: the smallest `k * unit_for(k)` over [`candidates`] (8192 for
 /// four slots of 2752: 3 x 2752 cuts it 2752/2752/2688, 4 x 2048 exactly),
 /// never the reserve itself (8256 at 4 x 2048 would cut eight 1088-row units).
-pub fn call_rows(slots: u64, unit_cap: u64) -> u64 {
-    candidates(slots, unit_cap).into_iter().map(|k| k * unit_for(k, unit_cap)).min().unwrap_or(0)
+pub fn call_rows(slots: u64, unit_cap: u64) -> u64 { call_rows_in(slots, unit_cap, RESERVE_ROWS) }
+/// [`call_rows`] in a `reserve` of rows.
+pub fn call_rows_in(slots: u64, unit_cap: u64, reserve: u64) -> u64 {
+    candidates_in(slots, unit_cap, reserve).into_iter().map(|k| k * unit_for_in(k, unit_cap, reserve)).min().unwrap_or(0)
 }
 
 /// The depths worth running under `slots` and `unit_cap`: for each distinct
 /// unit, its deepest depth (more units in flight at the same unit only hide
 /// more turnaround at the same Spark cost per row). Ascending.
-pub fn candidates(slots: u64, unit_cap: u64) -> Vec<u64> {
+pub fn candidates(slots: u64, unit_cap: u64) -> Vec<u64> { candidates_in(slots, unit_cap, RESERVE_ROWS) }
+/// [`candidates`] in a `reserve` of rows.
+pub fn candidates_in(slots: u64, unit_cap: u64, reserve: u64) -> Vec<u64> {
     let max = slots.clamp(1, MAX_WAVES);
-    (1..=max).filter(|&k| k == max || unit_for(k + 1, unit_cap) != unit_for(k, unit_cap)).collect()
+    (1..=max).filter(|&k| k == max || unit_for_in(k + 1, unit_cap, reserve) != unit_for_in(k, unit_cap, reserve)).collect()
 }
 
 /// Where a call starts. Fewer, wider units (a lower depth) only at an
@@ -218,6 +231,8 @@ pub struct Evidence {
 pub struct WaveControl {
     k: u64,
     unit_cap: u64,
+    /// The reserve every depth's units are cut from ([`unit_for_in`]).
+    reserve: u64,
     pinned: bool,
     candidates: Vec<u64>,
     /// Per depth: its period over the current depth's (the current at 1).
@@ -253,7 +268,11 @@ impl WaveControl {
     /// Start at the planner's estimate `initial`, moved to the deepest depth
     /// that runs the same unit.
     pub fn new(initial: u64, slots: u64, unit_cap: u64, pinned: bool) -> Self {
-        let candidates = candidates(slots, unit_cap);
+        Self::in_reserve(initial, slots, unit_cap, RESERVE_ROWS, pinned)
+    }
+    /// [`Self::new`] for depths cut from a `reserve` of rows ([`unit_for_in`]).
+    pub fn in_reserve(initial: u64, slots: u64, unit_cap: u64, reserve: u64, pinned: bool) -> Self {
+        let candidates = candidates_in(slots, unit_cap, reserve);
         let max = *candidates.last().expect("at least one depth");
         let initial = initial.clamp(1, max);
         let k = if pinned { initial } else {
@@ -261,14 +280,16 @@ impl WaveControl {
         };
         let mut ratios = [None; MAX_WAVES as usize];
         ratios[(k - 1) as usize] = Some(1.0);
-        Self { k, unit_cap, pinned, candidates, ratios, band: Vec::new(), outside: Vec::new(), trials: Vec::new(),
+        Self { k, unit_cap, reserve, pinned, candidates, ratios, band: Vec::new(), outside: Vec::new(), trials: Vec::new(),
             in_flight: Vec::new(), round: None, since_test: 0, backstop: BACKSTOP_FIRST, calibrating: None,
             direction: None, last: k, warm: None, dirty: false, calls: 0 }
     }
     /// The wave count of the next prefill call.
     pub fn waves(&self) -> u64 { self.k }
     /// Its unit inside the admitted extent.
-    pub fn unit_rows(&self) -> u64 { unit_for(self.k, self.unit_cap) }
+    pub fn unit_rows(&self) -> u64 { unit_for_in(self.k, self.unit_cap, self.reserve) }
+    /// The reserve depths are cut from.
+    pub fn reserve(&self) -> u64 { self.reserve }
     pub fn pinned(&self) -> bool { self.pinned }
     pub fn candidates(&self) -> &[u64] { &self.candidates }
     /// Every candidate's ratio to the current depth (None: no evidence).
@@ -378,7 +399,7 @@ impl WaveControl {
         let reference = reference && boundary == Boundary::Opening;
         let (waves, reason) = if self.pinned { (self.k, "pinned") } else { self.decide(boundary, reference, now) };
         let previous = std::mem::replace(&mut self.last, waves);
-        Decision { call: now, waves, unit_rows: unit_for(waves, self.unit_cap), boundary, reference,
+        Decision { call: now, waves, unit_rows: unit_for_in(waves, self.unit_cap, self.reserve), boundary, reference,
             transition: boundary == Boundary::Running && waves != previous, reason }
     }
 
@@ -842,6 +863,51 @@ mod tests {
         // One call is whole units at every candidate depth (never 8 x 1088 at 4 x 2048).
         assert_eq!((call_rows(4, 2752), call_rows(4, 4096), call_rows(4, 2048), call_rows(3, 2752), call_rows(2, 4096)),
             (8192, 8192, 8192, 8256, 8192));
+    }
+
+    /// The reserve-aware forms (TJ's reserve rule) reduce to the standard
+    /// arithmetic at the standard reserve for every admitted shape, so
+    /// families planned at 8192 pick identical depths and units.
+    #[test]
+    fn standard_reserve_forms_equal_the_fixed_reserve_arithmetic() {
+        // The fixed-reserve arithmetic as it was: unit_rows(k) capped.
+        let fixed = |k: u64, cap: u64| super::super::prefill_waves::unit_rows(k).min(cap);
+        for slots in 1..=4 {
+            for cap in (64..=4096).step_by(64) {
+                for k in 1..=4 {
+                    assert_eq!(unit_for_in(k, cap, RESERVE_ROWS), fixed(k, cap), "k {k} cap {cap}");
+                }
+                assert_eq!(candidates(slots, cap), candidates_in(slots, cap, RESERVE_ROWS));
+                assert_eq!(reserve_rows(slots, cap), reserve_rows_in(slots, cap, RESERVE_ROWS));
+                assert_eq!(call_rows(slots, cap), call_rows_in(slots, cap, RESERVE_ROWS));
+                for k in 1..=slots {
+                    for pinned in [false, true] {
+                        let (a, b) = (WaveControl::new(k, slots, cap, pinned),
+                            WaveControl::in_reserve(k, slots, cap, RESERVE_ROWS, pinned));
+                        assert_eq!((a.waves(), a.unit_rows(), a.candidates()), (b.waves(), b.unit_rows(), b.candidates()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A smaller reserve's depths cut it (5090 TP3: 4224 rows, cap 2112):
+    /// depth 3 runs 1408-row units, depth 4 1088, every depth inside the reserve.
+    #[test]
+    fn a_smaller_reserve_cuts_its_own_units() {
+        use super::super::prefill_waves::{charge_rows, unit_rows_in};
+        for reserve in [4224u64, 6144, 7872, RESERVE_ROWS] {
+            let cap = unit_rows_in(2, reserve);
+            assert_eq!(candidates_in(4, cap, reserve), [2, 3, 4]);
+            for k in 1..=4 {
+                let unit = unit_for_in(k, cap, reserve);
+                assert_eq!(unit, unit_rows_in(k, reserve));
+                assert!(unit * k <= reserve_rows_in(4, cap, reserve) && unit % 64 == 0);
+            }
+            assert_eq!(reserve_rows_in(4, cap, reserve), charge_rows(reserve));
+            assert_eq!(WaveControl::in_reserve(3, 4, cap, reserve, true).unit_rows(), unit_rows_in(3, reserve));
+        }
+        assert_eq!((unit_for_in(3, 2112, 4224), unit_for_in(4, 2112, 4224)), (1408, 1088));
     }
 
     #[test]

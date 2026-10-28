@@ -418,7 +418,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
     let prefill = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
         unit_rows: args.prefill_rows.map(|rows| rows as u64),
-        waves: Some(u64::from(args.prefill_waves)), span_rows: None, slots: None,
+        waves: Some(u64::from(args.prefill_waves)), span_rows: None, slots: None, reserve_rows: None,
     })?;
     let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);

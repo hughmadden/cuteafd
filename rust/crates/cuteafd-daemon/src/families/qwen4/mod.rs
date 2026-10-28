@@ -247,7 +247,7 @@ impl EngineArgs {
                 unit_rows: self.prefill_units.or((self.prefill_rows > 0).then_some(self.prefill_rows)).map(|r| r as u64),
                 waves: (self.prefill_waves > 0).then_some(u64::from(self.prefill_waves)),
                 span_rows: self.prefill_units.and_then(|_| (self.prefill_rows > 0).then_some(self.prefill_rows as u64)),
-                slots: (self.prefill_slots > 0).then_some(u64::from(self.prefill_slots)),
+                slots: (self.prefill_slots > 0).then_some(u64::from(self.prefill_slots)), reserve_rows: None,
             })?;
         ensure!(shape.waves == 1 || self.peers.is_some() || self.shared_only,
             "Qwen prefill units need Spark experts or shared-only diagnostics");

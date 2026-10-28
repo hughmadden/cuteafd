@@ -114,9 +114,12 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        # The planner's prefill waves reach the shared executor (V4.1 port).
-        expected_command = before["command"] + (["--mapped-scale-preload-gib", "0", "--prefill-waves",
-            after["command"][after["command"].index("--prefill-waves") + 1]] if role == "coordinator" else [])
+        # The planner's prefill waves, admitted slots and reserve reach the
+        # shared executor (V4.1 port, #762).
+        value = lambda flag: after["command"][after["command"].index(flag) + 1]
+        expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
+            "--prefill-waves", value("--prefill-waves"), "--prefill-slots", value("--prefill-slots"),
+            "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
         assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above

@@ -1244,6 +1244,11 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         // pool takes what remains and never shrinks the reserve. Explicit
         // PREFILL_ROWS / PREFILL_WAVES pin the shape.
         let layout = candidate.layout.as_ref().unwrap();
+        // An explicit reserve (a resolved deployment's, or a pin) plans at it.
+        if let Some(reserve) = layout.prefill_reserve_rows {
+            report.prefill_reserve_rows = Some(reserve);
+            return Ok(report);
+        }
         if layout.prefill_rows != 0 || layout.prefill_unit_rows.is_some() {
             if !report.executable() {
                 let (rows, waves) = (report.prefill_unit_rows.unwrap_or(0), report.prefill_waves.unwrap_or(0));
@@ -1255,33 +1260,32 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             return Ok(report);
         }
         // The largest page-multiple reserve that fits, by bisection (fit is
-        // monotone in the reserve). Units are roundup64(reserve / k); the
-        // charged rows are the largest split, k x unit (8192 charges 8256),
-        // planned at the configured k, whose split is the largest at the
-        // shared default k = 3.
-        use crate::serving_capacity::prefill_waves::{unit_rows_in, RESERVE_ROWS, ROW_PAGE};
-        let waves = report.prefill_waves.unwrap_or(2);
+        // monotone in the reserve). The adaptive executor admits four slots
+        // cut from it: depth k runs roundup64(reserve / k) rows, the widest
+        // unit (depth 2) is half the reserve, and the planner charges the
+        // largest split (8192 charges 8256).
+        use crate::serving_capacity::prefill_waves::{unit_rows_in, MAX_WAVES, RESERVE_ROWS, ROW_PAGE};
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
-                let layout = candidate.layout.as_mut().unwrap();
-                layout.prefill_rows = unit_rows_in(waves, reserve);
-                layout.prefill_waves = waves;
+                candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
                 input.plan(&candidate)?
             };
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
         };
-        // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`).
+        // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`)
+        // at every depth it may run.
         let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
-            .filter(|&reserve| unit_rows_in(waves, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
+            .filter(|&reserve| unit_rows_in(MAX_WAVES, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
             .collect();
+        let waves = report.prefill_waves.unwrap_or(2);
         let full = at(RESERVE_ROWS)?;
         if full.executable() { return Ok(full); }
         let smallest = at(*candidates.last().unwrap())?;
         if !smallest.executable() {
             let mut refused = full;
             refused.hints.push(Hint {
-                what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows ({waves} x {})",
+                what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
                     candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
                 how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
             });
@@ -1345,8 +1349,8 @@ pub fn render(report: &PlanReport) -> String {
     match report.family.as_deref() {
         Some("deepseek_v41") => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
             let reserve = report.prefill_reserve_rows.map_or("pinned".into(), |rows| format!("{rows}-row"));
-            let _ = writeln!(out, "prefill shape: {reserve} reserve, {waves} waves x {unit} unit rows; {} Spark transport(s)",
-                report.prefill_transports.unwrap_or(0));
+            let _ = writeln!(out, "prefill shape: {reserve} reserve, {} admitted slots of at most {unit} rows starting at {waves} waves; {} Spark transport(s)",
+                report.prefill_slots.unwrap_or(waves), report.prefill_transports.unwrap_or(0));
         },
         Some("mimo_v2") => {
             let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #671 / #709)");

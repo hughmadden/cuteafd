@@ -200,6 +200,25 @@ impl<'a> V41Link<'a> {
         reserve_rows.checked_mul(ranks * V41_PARTIAL_ROW_BYTES as usize).context("prefill link budget overflow")
     }
     pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
+    /// A prefill call boundary (#762): every finished call's pace to the
+    /// depth controller (no host wait), this call's depth (sequence `key`
+    /// from row `start`, `rows` rows), the return slots re-cut to it at rest,
+    /// and the call's waves flagged as its own.
+    pub(crate) fn start_prefill(&mut self, depth: &crate::shared::prefill_depth::PrefillDepth, key: u64,
+        start: usize, rows: usize) -> Result<crate::shared::prefill_depth::Depth> {
+        depth.report(self.link.exchange()?.take_prefill()?);
+        let next = depth.start(key, start, rows);
+        ensure!(next.waves <= self.link.slots() && next.unit_rows as u32 <= self.link.capacity(),
+            "prefill depth {next:?} outside the link's {} admitted slots", self.link.slots());
+        self.link.set_geometry(next.waves, next.unit_rows)?;
+        self.link.exchange()?.begin_prefill(next.call)?;
+        Ok(next)
+    }
+    /// The call's last wave is sent: later (decode) waves are not its.
+    pub(crate) fn stop_prefill(&mut self) -> Result<()> {
+        self.link.exchange()?.stop_prefill();
+        Ok(())
+    }
     pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }
     pub(crate) fn world_size(&self) -> usize { self.link.world_size() }
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> { self.native.as_ref().map(|(topology, _)| *topology) }

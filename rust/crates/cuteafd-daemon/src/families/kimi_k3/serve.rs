@@ -67,7 +67,7 @@ impl ServeArgs {
         Ok(prefill_shape(6, cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None,
-            slots: self.prefill_slots.map(u64::from),
+            slots: self.prefill_slots.map(u64::from), reserve_rows: None,
         })?)
     }
 

@@ -97,7 +97,11 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             assert waves in ("1", "2"), (entry["name"], waves)
             anchor = "--decode-lanes" if "--decode-lanes" in before["command"] else "--mapped-scale-preload-gib"
             position = before["command"].index(anchor) + 2
-            before["command"][position:position] = ["--prefill-waves", waves]
+            # The admitted slots and the reserve their depths cut (#762).
+            slots = command[command.index("--prefill-slots") + 1]
+            reserve = command[command.index("--prefill-reserve-rows") + 1]
+            before["command"][position:position] = ["--prefill-waves", waves, "--prefill-slots", slots,
+                "--prefill-reserve-rows", reserve]
 
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:

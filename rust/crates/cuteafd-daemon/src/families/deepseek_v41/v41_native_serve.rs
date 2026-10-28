@@ -334,8 +334,12 @@ fn worker(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
     // Two private decode lanes at decode width, and `slots` prefill slots on
-    // one shared storage set (PLAN "Prefill contract").
-    let slots = usize::from(args.prefill_waves).max(2);
+    // one shared storage set (PLAN "Prefill contract"), their depth chosen per
+    // call inside the admitted reserve (#762).
+    let admitted = AdmittedPrefill::resolve(&args)?;
+    ensure!(admitted.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
+        admitted.unit_cap);
+    let slots = admitted.slots;
     let decode_rows = DECODE_LANE_ROWS;
     let mut decode_exl3_modules = None;
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
@@ -425,15 +429,17 @@ fn worker(
         TargetTapWave::new(&lib, decode_rows_usize, TargetTapWave::device_bytes(decode_rows_usize)?)?,
         Duration::from_secs(120),
     );
-    let mut pass = make_decode_pass()?;
-    let mut second = make_decode_pass()?;
-    cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:decode-lanes");
+    let (mut pass, mut second) = {
+        let _scope = cuteafd_ffi::memory_ledger::scope(DECODE_LANES_SCOPE);
+        (make_decode_pass()?, make_decode_pass()?)
+    };
     admission::startup_phase(&lib, "v41/workspace:decode-lanes", device_total)?;
     // The prefill slots: one storage set (row planes at the reserve, scratch
     // at the unit), each slot's host objects on it (`shared::memory::row_window`).
-    let prefill_reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(slots as u64, u64::from(capacity));
-    let reserve = usize::try_from(prefill_reserve)?;
+    let reserve = admitted.reserve_rows();
+    let prefill_reserve = reserve as u64;
     let readers = [lib.cuda_get_device()?];
+    let slot_scope = cuteafd_ffi::memory_ledger::scope(PREFILL_SLOTS_SCOPE);
     let slot_storage = SlotStorage {
         lane: crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, prefill_reserve as u32, capacity, &readers)?,
         index: IndexLane::storage(&index_weights, prefill_reserve as u32, capacity, &readers)?,
@@ -457,7 +463,10 @@ fn worker(
     )).collect::<Result<Vec<_>>>()?;
     // The slots hold their components' storage; the set itself is no owner.
     drop(slot_storage);
-    cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-slots");
+    drop(slot_scope);
+    // Plan == runtime (WP6): the slot set and decode lanes are exactly the
+    // planner's charges, nothing retained beyond them.
+    admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots)?;
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
@@ -480,7 +489,8 @@ fn worker(
         0 => NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?),
         _ => NativeTp4Wave::unlinked(&lib, capacity),
     }).collect::<Result<Vec<_>>>()?;
-    let mut prefill_slots = prefill_target::PrefillSlots { slots: slot_passes.drain(..).zip(slot_transports).collect() };
+    let mut prefill_slots = prefill_target::PrefillSlots { slots: slot_passes.drain(..).zip(slot_transports).collect(),
+        depth: std::rc::Rc::new(admitted.depth()?) };
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
@@ -541,6 +551,10 @@ fn worker(
     let experts = if args.rtx_expert_layers == admission::LocalLayers::Count(0) { Vec::new() }
         else { admission::expert_demands(&lib, &catalog, aot_capacity, 1)? };
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
+    if local_workspace > 0 {
+        admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 1, capacity,
+            slots, reserve as u64, local_workspace)?;
+    }
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
     let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
@@ -640,6 +654,9 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    // The prefill depth controller (#762): evidence or calibration before readiness.
+    calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefill_slots,
+        format!("1rtx-tp{}x{}", spark_world.topology().tp(), spark_world.topology().ep()))?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
@@ -674,7 +691,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<RetainedScores> {
     use prefill_target::{V41Prefill, V41PrefillStep, V41PrefillTimes};
-    let PrefillShape { rows: chunk_rows, waves } = shape;
+    let PrefillShape { rows: chunk_rows, waves, .. } = shape;
     if let Some(probe) = job.probe.as_ref().filter(|probe| !probe.spec.cold_steps.is_empty()) {
         probe.spec.validate_cold_steps(tokens.len(), tokens.len(), 1)?;
         ensure!(!probe.spec.cold_steps[0].decode, "V4.1 cold replay must begin with encoder prefill");
@@ -686,7 +703,8 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
             if index == 0 {
                 let mut times = V41PrefillTimes::default();
                 let mut step = V41PrefillStep { lib, runtime, requests, prefill: &mut *prefill_slots, lease,
-                    tokens: chunk, chunk_rows, waves, job, draft: draft.as_deref_mut(), hold, times: &mut times };
+                    tokens: chunk, chunk_rows, waves, adaptive_calls: shape.adaptive_calls, job,
+                    draft: draft.as_deref_mut(), hold, times: &mut times };
                 scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
             } else if cold_step.decode {
                 let (pass, transport) = prefill_slots.slot0();
@@ -716,15 +734,18 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     }
     let mut times = V41PrefillTimes::default();
     let mut step = V41PrefillStep { lib, runtime, requests, prefill: prefill_slots, lease, tokens, chunk_rows, waves,
-        job, draft, hold, times: &mut times };
+        adaptive_calls: shape.adaptive_calls, job, draft, hold, times: &mut times };
     crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
 }
 
 /// Rows of a decode lane's private owners: the compiled cover of the widest
 /// decode/verify step (`V41_VERIFY_ROWS`, which every verify selection and
 /// draft trim already bounds).
-pub(crate) const DECODE_LANE_ROWS: u32 = 80;
-const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u32 <= DECODE_LANE_ROWS);
+pub(crate) const DECODE_LANE_ROWS: u32 = cuteafd_loader::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS as u32;
+
+/// Ledger scopes of the target owners the planner charges (WP6 plan == runtime).
+pub(crate) const DECODE_LANES_SCOPE: &str = "v41/workspace:decode-lanes";
+pub(crate) const PREFILL_SLOTS_SCOPE: &str = "v41/workspace:prefill-slots";
 
 /// One RTX's prefill-slot storage set (`shared::memory::row_window`): row
 /// planes at the reserve, scratch at the unit cap. Every slot's components
@@ -739,17 +760,92 @@ struct SlotStorage<'a> {
     taps: std::rc::Rc<crate::families::deepseek_v41::v41_target_pass::TargetTapStorage<'a>>,
 }
 
+/// The admitted prefill shape (#762): `slots` slot passes on one storage set,
+/// units of at most `unit_cap` rows cut from `reserve` rows, starting at
+/// `waves`; `pinned` when the depth cannot move (explicit PREFILL_WAVES).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmittedPrefill { pub unit_cap: usize, pub waves: usize, pub slots: usize, pub reserve: usize,
+    pub pinned: bool }
+
+impl AdmittedPrefill {
+    /// The serve's resolution of the deployment's shape through the shared
+    /// prefill policy (the planner's own resolution). The unit cap is
+    /// `--prefill-batch-tokens`; slots 0 (no deployment) admits the family's.
+    pub(crate) fn resolve(args: &crate::cli::NativeServeArgs) -> Result<Self> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides, RESERVE_ROWS};
+        let limits = cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V41);
+        let reserve = u64::from(args.prefill_reserve_rows);
+        let slots = (args.prefill_slots > 0).then_some(u64::from(args.prefill_slots));
+        let plan = prefill_shape(args.peers.len(), limits, PrefillOverrides {
+            unit_rows: Some(u64::from(args.prefill_batch_tokens)), waves: Some(u64::from(args.prefill_waves)),
+            span_rows: None, slots, reserve_rows: (reserve != RESERVE_ROWS).then_some(reserve),
+        })?;
+        let shape = Self { unit_cap: usize::try_from(plan.unit_rows)?, waves: usize::try_from(plan.waves)?,
+            slots: usize::try_from(plan.slots)?, reserve: usize::try_from(reserve)?, pinned: plan.slots == plan.waves };
+        // Every depth's slots are views inside the storage's reserve rows.
+        ensure!(shape.reserve_rows() <= crate::shared::memory::row_window::MAX_RESERVE_ROWS,
+            "V4.1 prefill reserve {} exceeds the row planes", shape.reserve_rows());
+        Ok(shape)
+    }
+    /// Rows every shared row plane spans: every admitted depth's slots fit.
+    pub(crate) fn reserve_rows(&self) -> usize {
+        cuteafd_loader::serving_capacity::wave_control::reserve_rows_in(self.slots as u64, self.unit_cap as u64,
+            self.reserve as u64) as usize
+    }
+    /// The runtime depth controller over exactly this admission.
+    pub(crate) fn depth(&self) -> Result<crate::shared::prefill_depth::PrefillDepth> {
+        let depth = crate::shared::prefill_depth::PrefillDepth::in_reserve(self.waves, self.slots, self.unit_cap,
+            self.reserve, self.pinned)?;
+        ensure!(depth.reserve_rows() == self.reserve_rows(), "V4.1 depth controller reserve differs from the storage");
+        Ok(depth)
+    }
+}
+
+/// Startup calibration of the prefill depth controller (#762), before
+/// readiness, as GLM's: persisted evidence for a release build, else one
+/// warm untimed full call and one reference call per candidate depth, each a
+/// cold sequence at row 0, admitted and released here (nothing retained, no
+/// drafter, no prefix snapshot).
+pub(crate) fn calibrate_prefill_depth<'w, 'a: 'w, P: scheduler::layout::ServingTarget<'w, 'a>>(lib: &'a NativeLibrary,
+    runtime: &tokio::runtime::Runtime, args: &crate::cli::NativeServeArgs, requests: &mut Requests<'a>,
+    prefill_slots: &mut prefill_target::PrefillSlots<'a, P>, topology: String) -> Result<()> {
+    let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&args.snapshot)?;
+    let identity = crate::shared::prefill_depth::DeploymentIdentity::new(lib, &args.peers, topology);
+    let depth = prefill_slots.depth.clone();
+    let key = crate::shared::prefill_depth::CalibrationKey::new("deepseek_v41", &args.snapshot, &depth, identity);
+    let shape = PrefillShape::from_args(args);
+    let mut id = u64::MAX - 1024;
+    crate::shared::prefill_depth::calibrate(&depth, key, &tokenizer, |_, tokens| {
+        id += 1;
+        let lease = requests.admit(0, id)?;
+        let (events, _receive) = mpsc::unbounded_channel();
+        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+            prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
+            max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
+        let ran = (|| -> Result<()> {
+            for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
+            prefill::<P, P::Chain>(lib, runtime, requests, prefill_slots, lease, tokens, shape, &job, None,
+                &mut || Ok(())).map(|_| ())
+        })();
+        requests.release(lease)?;
+        ran
+    })
+}
+
 /// The serving prefill shape: unit rows (`--prefill-batch-tokens`) and units
 /// in flight on the shared executor (`--prefill-waves`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrefillShape {
     pub rows: usize,
     pub waves: usize,
+    /// Each window cycle takes its depth and unit from the slots' depth
+    /// controller (#762; serving). Off: a fixed `waves` x `rows` cut.
+    pub adaptive_calls: bool,
 }
 
 impl PrefillShape {
     pub(crate) fn from_args(args: &crate::cli::NativeServeArgs) -> Self {
-        Self { rows: args.prefill_batch_tokens as usize, waves: usize::from(args.prefill_waves) }
+        Self { rows: args.prefill_batch_tokens as usize, waves: usize::from(args.prefill_waves), adaptive_calls: true }
     }
 }
 

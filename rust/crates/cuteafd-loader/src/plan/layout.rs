@@ -63,6 +63,9 @@ pub struct LayoutOptions {
     /// Admitted in-flight slots (#762): the deepest depth an adaptive executor
     /// may run inside the same reserve; equals `prefill_waves` when static.
     pub prefill_slots: u64,
+    /// The reserve an adaptive executor's depths cut (TJ's reserve rule: the
+    /// planner's fit cap below the standard one); None is the standard.
+    pub prefill_reserve_rows: Option<u64>,
     /// Family-resolved decode views; unrelated to prefill wave depth.
     pub decode_lanes: u8,
     /// Native EXLR8 trellis prefill activations: A8 also charges every prefill lane's MX8 records.
@@ -204,6 +207,7 @@ impl Default for LayoutOptions {
             prefill_span_rows: None,
             prefill_waves: 1,
             prefill_slots: 1,
+            prefill_reserve_rows: None,
             decode_lanes: 1,
             exlr8_prefill_activations: Default::default(),
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
@@ -700,6 +704,7 @@ pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
         .or(options.prefill_unit_rows);
     let shape = prefill_shape(spark_ranks, limits, PrefillOverrides {
         unit_rows, waves, span_rows: options.prefill_span_rows, slots: None,
+        reserve_rows: options.prefill_reserve_rows,
     })?;
     options.prefill_rows = shape.unit_rows;
     options.prefill_unit_rows = Some(shape.unit_rows);

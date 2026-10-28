@@ -23,6 +23,8 @@ pub struct DeepSeek {
     max_waves: u64,
     /// Measured starting unit, when a kernel needs one.
     initial_unit_rows: Option<u64>,
+    /// The executor re-cuts its slots per prefill call (#762).
+    adaptive: bool,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
@@ -39,6 +41,9 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
     max_waves: crate::serving_capacity::prefill_waves::MAX_WAVES,
     initial_unit_rows: None,
+    // Adaptive inside its reserve (#762, #744 WP5): four slots, the widest
+    // unit half the reserve, starting at the estimate's depth.
+    adaptive: true,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
@@ -54,6 +59,7 @@ pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     decode_rows: 64,
     max_waves: crate::serving_capacity::prefill_waves::MAX_WAVES,
     initial_unit_rows: None,
+    adaptive: false,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -71,7 +77,7 @@ impl Family for DeepSeek {
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, max_waves: self.max_waves,
-            initial_unit_rows: self.initial_unit_rows, ..Default::default() }
+            initial_unit_rows: self.initial_unit_rows, adaptive: self.adaptive, ..Default::default() }
     }
     fn id(&self) -> &'static str {
         self.id

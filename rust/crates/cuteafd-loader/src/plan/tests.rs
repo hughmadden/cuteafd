@@ -329,6 +329,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
             options.prefill_lanes = waves;
             let daemon = prefill_shape(6, limits, PrefillOverrides {
                 unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None, slots: None,
+                reserve_rows: None,
             }).unwrap();
             let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
             assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());
@@ -961,7 +962,10 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             || item.group.starts_with("TP2 expert layer halves")).unwrap();
                         let (costs, workspace) = crate::placement::families::deepseek_v41::expert_inventory(
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
-                            report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap().max(2) as usize).unwrap();
+                            report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_slots.unwrap().max(2) as usize,
+                            crate::serving_capacity::wave_control::reserve_rows_in(report.prefill_slots.unwrap().max(2),
+                                report.prefill_unit_rows.unwrap(), report.prefill_reserve_rows.unwrap_or(8192)),
+                            crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
@@ -3523,11 +3527,15 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     let default_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         prefill_rows: 0, ..options.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
+    // The default is adaptive (#762): four slots of at most 4096 rows starting
+    // at three waves; the same admission as passing that unit explicitly.
     let explicit_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        prefill_rows: 2752, prefill_waves: 3, ..default_prefill.layout.as_ref().unwrap().clone()
+        prefill_unit_rows: Some(4096), ..default_prefill.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
-    assert_eq!(plan(dir.path(), &default_prefill).unwrap().memory_layout,
-        plan(dir.path(), &explicit_prefill).unwrap().memory_layout);
+    let default_report = plan(dir.path(), &default_prefill).unwrap();
+    assert_eq!((default_report.prefill_unit_rows, default_report.prefill_waves, default_report.prefill_slots),
+        (Some(4096), Some(3), Some(4)));
+    assert_eq!(default_report.memory_layout, plan(dir.path(), &explicit_prefill).unwrap().memory_layout);
     let unavailable = plan_spark_count(dir.path(), &options, 4, Some(6)).unwrap();
     assert!(!unavailable.executable());
     assert_eq!(unavailable.spark_ranks, 6);
@@ -3547,21 +3555,21 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], ..layout.clone() }), ..sparks(4) };
     let roomy = plan_spark_count(dir.path(), &roomy, 6, Some(4)).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
-    assert_eq!((roomy.prefill_reserve_rows, roomy.prefill_unit_rows, roomy.prefill_waves), (Some(8192), Some(2752), Some(3)));
+    // Adaptive (#762): four slots, the widest unit (depth 2's) half the reserve.
+    assert_eq!((roomy.prefill_reserve_rows, roomy.prefill_unit_rows, roomy.prefill_waves, roomy.prefill_slots),
+        (Some(8192), Some(4096), Some(3), Some(4)));
     let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
     let capped = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
     assert!(capped.executable(), "{}", render(&capped));
     let reserve = capped.prefill_reserve_rows.unwrap();
-    assert_eq!(capped.prefill_waves, Some(3));
-    assert_eq!(capped.prefill_unit_rows, Some(unit_rows_in(3, reserve)), "{}", render(&capped));
+    assert_eq!((capped.prefill_waves, capped.prefill_slots), (Some(3), Some(4)));
+    assert_eq!(capped.prefill_unit_rows, Some(unit_rows_in(2, reserve)), "{}", render(&capped));
     if reserve < 8192 {
         assert_eq!(reserve % RESERVE_STEP_ROWS, 0);
-        // The next reserve with larger units does not fit: the cap is the largest.
-        let mut larger = reserve + RESERVE_STEP_ROWS;
-        while unit_rows_in(3, larger) == unit_rows_in(3, reserve) { larger += RESERVE_STEP_ROWS; }
-        let pinned = PlanOptions { layout: Some(layout::LayoutOptions {
-            prefill_rows: unit_rows_in(3, larger), prefill_waves: 3, ..layout.clone() }), ..sparks(4) };
-        assert!(!plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap().executable());
+        // The next larger reserve does not fit: the cap is the largest.
+        let larger = PlanOptions { layout: Some(layout::LayoutOptions {
+            prefill_reserve_rows: Some(reserve + RESERVE_STEP_ROWS), ..layout.clone() }), ..sparks(4) };
+        assert!(!plan_spark_count(dir.path(), &larger, 6, Some(4)).unwrap().executable());
     }
     // An explicit pin keeps its shape whether or not it fits.
     let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };

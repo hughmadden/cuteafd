@@ -314,7 +314,7 @@ pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
         .then_some(crate::serving_capacity::prefill_waves::MAX_WAVES);
     // The admitted unit (every unit-sized owner) and the starting depth.
     let plan = prefill_shape(6, PrefillLimits { adaptive: true, ..PrefillLimits::default() }, PrefillOverrides {
-        unit_rows: Some(unit), waves: Some(waves as u64), span_rows: Some(rows as u64), slots,
+        unit_rows: Some(unit), waves: Some(waves as u64), span_rows: Some(rows as u64), slots, reserve_rows: None,
     })?;
     Ok(crate::serving_capacity::PrefillShape { unit_rows: plan.unit_rows, waves: plan.waves })
 }

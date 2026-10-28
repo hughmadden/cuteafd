@@ -4,7 +4,7 @@ use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
 mod admission;
-mod layout;
+pub(crate) mod layout;
 use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
