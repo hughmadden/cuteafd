@@ -79,7 +79,7 @@ impl Family for Glm {
 
     fn classify(&self, spec: &ModelSpec, name: &str) -> Option<TensorRole> {
         use Component::*;
-        if name == "lm_head.weight" {
+        if name.starts_with("lm_head.") {
             return Some(TensorRole::new(LmHead));
         }
         if name.starts_with("model.visual.") || name.starts_with("visual.") || name.starts_with("model.vision") {

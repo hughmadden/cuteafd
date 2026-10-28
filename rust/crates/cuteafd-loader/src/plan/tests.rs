@@ -8,6 +8,31 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn glm5_native_head_members_classify_and_validate_as_one_operand() {
+    let mut config = glm5_config();
+    config["vocab_size"] = json!(128);
+    let mut tensors = glm5_tensors(|name, n, k| exl3(name, n, k, 4));
+    tensors.retain(|t| t.0 != "lm_head.weight");
+    tensors.extend(exl3("lm_head", 128, 6144, 6));
+    let dir = snapshot(config, &tensors);
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(report.unclassified.is_empty(), "{}", render(&report));
+    let head = component(&report, Component::LmHead);
+    assert_eq!(head.status, Status::Ready, "{}", render(&report));
+    assert_eq!(head.bytes, 128 * 6144 * 6 / 8 + (128 + 6144) * 2 + 4);
+    assert!(head.rejections.is_empty());
+
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let family = &families::glm::GLM5;
+    let model = family.open(&checkpoint).unwrap();
+    for suffix in ["trellis", "suh", "svh", "mcg", "weight", "unknown"] {
+        assert_eq!(family.classify(model.spec(), &format!("lm_head.{suffix}")).unwrap().component,
+            Component::LmHead);
+    }
+    assert!(family.classify(model.spec(), "lm_head_other.trellis").is_none());
+}
+
+#[test]
 fn planner_timings_charge_metadata_once_and_preserve_reports() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
