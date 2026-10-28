@@ -203,7 +203,7 @@ impl<'a> Mtp<'a> {
         self.pool.commit(row, 1)?;
         let destination = self.tail_hidden(frontier)?;
         // SAFETY: the admitted sidecar and target hidden are read and rewritten only on this stream.
-        unsafe { self.library.copy_d2d_async(destination, hidden, self.layout.hidden_bytes, self.stream) }
+        unsafe { crate::shared::memory::device::copy_device_ordered(self.library, destination, hidden, self.layout.hidden_bytes, self.stream) }
     }
 
     fn resolve_pending(&self, engine: &mut DenseEngine<'_>, token: u32, frontier: usize) -> Result<Vec<f32>> {
@@ -240,7 +240,7 @@ impl<'a> Mtp<'a> {
                 for step in 1..depth {
                     // pairs_device reuses norm for embeddings; preserve normalized MTP feedback first.
                     // SAFETY: the owned hidden row and norm plane remain live on the same producer stream.
-                    unsafe { self.library.copy_d2d_async(self.hidden.buffer, engine.planes.norm,
+                    unsafe { crate::shared::memory::device::copy_device_ordered(self.library, self.hidden.buffer, engine.planes.norm,
                         self.layout.hidden_bytes, self.stream)?; }
                     let logits = self.pairs_device(engine, self.hidden.buffer, &[tokens[step - 1]],
                         frontier + step - 1, vec![destinations[step - 1]], pages.clone())?;
@@ -262,8 +262,8 @@ impl<'a> Mtp<'a> {
             let destination = crate::shared::prefix::view(self.kv.buffer, copy.to as usize * bytes, source.bytes)?;
             // SAFETY: pool retains both complete owners through the final stream drain.
             unsafe {
-                self.library.copy_d2d_async(destination, source, source.bytes, self.stream)?;
-                self.library.copy_d2d_async(self.sidecar(copy.to as usize)?, self.sidecar(copy.from as usize)?,
+                crate::shared::memory::device::copy_device_ordered(self.library, destination, source, source.bytes, self.stream)?;
+                crate::shared::memory::device::copy_device_ordered(self.library, self.sidecar(copy.to as usize)?, self.sidecar(copy.from as usize)?,
                     self.layout.hidden_bytes, self.stream)?;
             }
         }
@@ -316,7 +316,7 @@ impl<'a> MtpCache<'a> {
         ensure!(target_hidden.bytes >= bytes, "dense MTP target hidden extent differs");
         // SAFETY: copy on the target producer stream before MTP reuses shared residual/norm planes.
         if mtp.hidden.buffer.ptr != target_hidden.ptr {
-            unsafe { mtp.library.copy_d2d_async(mtp.hidden.buffer, target_hidden, bytes, mtp.stream)?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(mtp.library, mtp.hidden.buffer, target_hidden, bytes, mtp.stream)?; }
         }
         mtp.norm(engine, mtp.hidden.buffer, engine.weights.norm.buffer, mtp.hidden.buffer, tokens.len())?;
         if start > 0 { mtp.resolve_pending_device(engine, tokens[0], start)?; }
@@ -335,7 +335,7 @@ impl<'a> MtpCache<'a> {
         ensure!(rows > 0 && bytes <= mtp.hidden.buffer.bytes && bytes <= source.bytes,
             "dense MTP hidden capture exceeds admission");
         // SAFETY: source is a live target producer plane; destination remains owned through stream drain.
-        unsafe { mtp.library.copy_d2d_async(mtp.hidden.buffer, source, bytes, mtp.stream) }
+        unsafe { crate::shared::memory::device::copy_device_ordered(mtp.library, mtp.hidden.buffer, source, bytes, mtp.stream) }
     }
 
     pub(crate) fn update_captured(&self, engine: &mut DenseEngine<'a>, slot: usize, start: usize,
@@ -669,7 +669,7 @@ mod tests {
                 let logits = target.prefill_tapped(0, &tokens[first..end], 1, |layer, hidden| {
                     if layer + 1 == cfg.attention.len() {
                         // SAFETY: capture before target scratch reuse; both owners survive drain.
-                        unsafe { library.copy_d2d_async(input.buffer, hidden,
+                        unsafe { crate::shared::memory::device::copy_device_ordered(&library, input.buffer, hidden,
                             (end - first) * layout.hidden_bytes, mtp.stream)?; }
                     }
                     Ok(())
@@ -726,7 +726,7 @@ mod tests {
                 let logits = target.prefill_tapped(slot, &[anchor], 1, |layer, hidden| {
                     if layer + 1 == cfg.attention.len() {
                         // SAFETY: capture target hidden on its producer stream before MTP reuses planes.
-                        unsafe { library.copy_d2d_async(input.buffer, hidden, layout.hidden_bytes, mtp.stream)?; }
+                        unsafe { crate::shared::memory::device::copy_device_ordered(&library, input.buffer, hidden, layout.hidden_bytes, mtp.stream)?; }
                     }
                     Ok(())
                 })?.to_host(&library)?;

@@ -374,6 +374,26 @@ pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize, decode_lane_bytes: 
     deferred && bytes <= decode_lane_bytes
 }
 
+/// Same-device handoff behind an upstream device wait. Decode-sized payloads
+/// use SM reads on the consumer stream rather than park a shared copy engine.
+///
+/// # Safety
+/// Both admitted buffers and stream survive completion, and stream order covers
+/// every source writer and destination reader/rewrite.
+pub(crate) unsafe fn copy_device_ordered(library: &NativeLibrary, destination: CuteafdDeviceBuffer,
+    source: CuteafdDeviceBuffer, bytes: usize, stream: *mut c_void) -> Result<()> {
+    ensure!(destination.device_id == source.device_id && bytes <= destination.bytes && bytes <= source.bytes,
+        "device-ordered copy exceeds admitted same-device buffers");
+    if bytes == 0 || destination.ptr == source.ptr { return Ok(()); }
+    if sm_peer_copy_for(true, bytes) {
+        // SAFETY: caller retains both regions; the issuing stream orders all readers.
+        unsafe { library.sm_copy_regions(&[(destination.ptr, source.ptr.cast_const(), bytes as u64)], stream) }
+    } else {
+        // SAFETY: caller retains both regions, as for the existing wide copy path.
+        unsafe { library.copy_d2d_async(destination, source, bytes, stream) }
+    }
+}
+
 #[cfg(test)]
 mod peer_copy_choice_tests {
     /// Decode-width device-ordered transfers run as SM copies (never parked on

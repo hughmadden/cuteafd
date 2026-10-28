@@ -4,6 +4,7 @@
 mod media;
 pub(crate) mod engine;
 mod admission;
+mod programs;
 mod dual;
 mod mtp_golden;
 pub(crate) mod ple;
@@ -347,7 +348,7 @@ mod weight_representation_tests {
             assert_eq!(parsed.prefill_shape()?, None);
             assert_eq!(parsed.prefill_wave_rows(), 4096);
         }
-        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2)] {
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2), (2048, 3), (2048, 4), (2752, 3)] {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
@@ -357,8 +358,6 @@ mod weight_representation_tests {
         }
         for extra in [
             vec!["--prefill-waves", "2"],
-            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
-            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "4"],
             vec!["--shared-only", "--prefill-units", "511"],
             vec!["--shared-only", "--prefill-units", "8192"],
             vec!["--shared-only", "--prefill-units", "4096", "--prefill-waves", "3"],
@@ -401,20 +400,20 @@ mod weight_representation_tests {
     }
 
     #[test]
-    fn six_spark_prefill_keeps_hard_two_slot_mapped_ple_constraint() -> Result<()> {
+    fn six_spark_prefill_charges_shared_token_table_depth() -> Result<()> {
         let mut parsed = args(&["--peers", "a:9870,b:9870,c:9870,d:9870,e:9870,f:9870"])?;
         let shape = parsed.resolved_prefill()?;
-        assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (4096, 2, 8192));
+        assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (2752, 3, 8256));
         parsed.prefill_rows = shape.span_rows as usize;
         parsed.prefill_units = Some(shape.unit_rows as usize);
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
         let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
         assert_eq!(inputs.prefill_shape, Some(shape.units()));
-        assert_eq!(inputs.prefill_rows, 8192);
+        assert_eq!(inputs.prefill_rows, 8256);
         let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(
-            4096 * cfg.ple_rows(), 2, 64 * cfg.ple_rows(), 160)?;
-        assert_eq!(staging.slot_bytes().count(), 3);
-        assert_eq!(staging.counter_bytes, 3 * 128);
+            2752 * cfg.ple_rows(), 3, 64 * cfg.ple_rows(), 160)?;
+        assert_eq!(staging.slot_bytes().count(), 8);
+        assert_eq!(staging.total_bytes, staging.slot_bytes().sum::<usize>() + staging.workspace_bytes);
         Ok(())
     }
 
@@ -575,6 +574,7 @@ impl Opened {
         }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
+        self::programs::validate_all(&self.cfg, &programs, args.max_context)?;
         let required = required_fp8_programs(args);
         for name in &required {
             programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \

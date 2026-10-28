@@ -917,7 +917,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         if source.ptr == destination.ptr { return Ok(()); }
         self.step.compose(rank, self.execution, |_, meta| meta.stream.device.run(|| {
             // SAFETY: the transaction borrows the complete execution owner; admitted disjoint rank planes survive drainage.
-            unsafe { meta.stream.device.library.copy_d2d_async(destination, source, meta.rows * H * 4, meta.stream.raw) }
+            unsafe { crate::shared::memory::device::copy_device_ordered(meta.stream.device.library, destination, source, meta.rows * H * 4, meta.stream.raw) }
         }))
     }
     fn attention(&mut self, rank: usize, layer: usize) -> Result<()> {

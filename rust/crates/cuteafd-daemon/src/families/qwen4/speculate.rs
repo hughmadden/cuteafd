@@ -50,10 +50,11 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
     let n = chunk.len();
     ensure!(placement.mtp_frontier.get() == start, "MTP prefill requires contiguous canonical history");
     ensure!(n > 0 && seq.pending.is_empty(), "MTP prefill of an empty chunk or behind pending rows");
-    let known = if next.is_some() { n } else { n - 1 };
+    let decode = engine.last_target_decode();
+    let (known, capacity) = prefill_rows(decode, n, next, engine.mtp_prefill_rows())?;
     if next.is_none() {
         // Stash first: the MTP step reuses the target streams' buffer.
-        engine.mtp_stash(false, &[(placement.slot, n - 1, 1, 0)])?;
+        engine.mtp_stash(decode, &[(placement.slot, n - 1, 1, 0)])?;
         seq.pending.push((start + n - 1, 0));
         seq.open = true;
         placement.mtp_snapshot_pending.set(true);
@@ -62,14 +63,20 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
         return Ok(());
     }
     let tokens: Vec<u32> = (0..known).map(|i| chunk.get(i + 1).copied().or(next).unwrap_or_default()).collect();
-    for first in (0..known).step_by(engine.mtp_prefill_rows()) {
-        let end = known.min(first + engine.mtp_prefill_rows());
+    for first in (0..known).step_by(capacity) {
+        let end = known.min(first + capacity);
         let rows = (first..end).map(|i| MtpRow { position: start + i, token: tokens[i], source: i as i32 }).collect();
-        engine.mtp_step(false, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens[first..end]),
+        engine.mtp_step(decode, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens[first..end]),
             MtpOut::Download { logits: false })?;
         placement.mtp_frontier.set(start + end);
     }
     Ok(())
+}
+
+fn prefill_rows(decode: bool, rows: usize, next: Option<u32>, prefill_capacity: usize) -> Result<(usize, usize)> {
+    let capacity = if decode { DECODE_ROWS } else { prefill_capacity };
+    ensure!(rows > 0 && capacity > 0 && (!decode || rows <= capacity), "MTP target chunk exceeds its workspace");
+    Ok((rows - usize::from(next.is_none()), capacity))
 }
 
 /// One sequence's part of a draft cycle.
@@ -280,6 +287,22 @@ fn stash_accepted(seq: &mut MtpSeq, start: usize, rows: &[u32], kept: Option<(us
 #[cfg(test)]
 mod request_state_tests {
     use super::*;
+
+    #[test]
+    fn cold_target_mtp_uses_target_workspace_capacity() -> Result<()> {
+        for next in [None, Some(7)] {
+            for rows in [1, 2, DECODE_ROWS] {
+                let known = rows - usize::from(next.is_none());
+                assert_eq!(prefill_rows(true, rows, next, 16)?, (known, DECODE_ROWS));
+                assert_eq!(prefill_rows(false, rows, next, 16)?, (known, 16));
+            }
+            // A decode chunk cannot borrow the larger prefill workspace.
+            assert!(prefill_rows(true, DECODE_ROWS + 1, next, 4096).is_err());
+            assert!(prefill_rows(false, 0, next, 4096).is_err());
+            assert!(prefill_rows(false, 1, next, 0).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn mtp_cache_hit_and_interleaved_probe_keep_request_local_stashes() -> Result<()> {

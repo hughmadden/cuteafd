@@ -38,29 +38,29 @@ pub(super) use cuteafd_loader::families::qwen4::StepTableBytes;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct HostWorkspaceBytes {
-    pub router: u64,
     pub staging: u64,
-    pub ordered: u64,
+    pub uploads: cuteafd_loader::shared::token_table::UploadShape,
     pub logits: u64,
 }
 
 impl HostWorkspaceBytes {
     #[allow(clippy::too_many_arguments)]
     pub fn new(cfg: &Qwen4Config, rows: usize, decode: bool, pages: usize, pool_pages: usize,
-        spark: bool, bf16: bool, ordered: bool, ple_ids: bool, logits: usize) -> Result<Self> {
+        units: usize, spark: bool, mtp: bool, ple_ids: bool, logits: usize) -> Result<Self> {
         use anyhow::Context;
-        let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen host workspace size overflow");
-        let add = |a: usize, b: usize| a.checked_add(b).context("Qwen host workspace size overflow");
-        let table_rows = if decode { rows } else { 1 };
-        let router = if spark { mul(rows, add(mul(cfg.topk, 8)?,
-            if bf16 { mul(cfg.hidden, 2)? } else { add(cfg.hidden, cfg.hidden / 32)? })?)? } else { 256 };
-        let row = add(8 * 3 + 4 * 4 + 24, add(mul(cfg.ple_rows(), 8)?, mul(5, mul(cfg.hidden, 2)?)?)?)?;
-        let staging = add(add(256, mul(rows, row)?)?, mul(mul(table_rows, add(pages, pool_pages)?)?, 4)?)?;
-        Ok(Self { router: router as u64, staging: staging as u64,
-            ordered: if ordered { StepTableBytes::new(rows, decode, pages, pool_pages, cfg.ple_rows())?
-                .ordered_bytes(ple_ids)? } else { 0 },
-            logits: mul(mul(logits, cfg.vocab_size)?, 4)? as u64 })
+        let uploads = cuteafd_loader::families::qwen4::upload_shape(rows, decode, pages, pool_pages,
+            cfg.ple_rows(), cfg.layers, units, spark, mtp, ple_ids)?;
+        Ok(Self { staging: uploads.capacity_bytes()? as u64, uploads,
+            logits: logits.checked_mul(cfg.vocab_size).and_then(|n| n.checked_mul(4))
+                .context("Qwen pinned logits overflow")? as u64 })
     }
+    pub fn mtp(cfg: &Qwen4Config, rows: usize, pages: usize, pools: usize, calls: usize) -> Result<Self> {
+        use anyhow::Context;
+        let uploads = cuteafd_loader::families::qwen4::mtp_upload_shape(rows, pages, pools, calls)?;
+        Ok(Self { staging: uploads.capacity_bytes()? as u64, uploads,
+            logits: cfg.vocab_size.checked_mul(4).context("Qwen MTP pinned logits overflow")? as u64 })
+    }
+
 }
 
 /// Admission follows the selected executor, not unused configured peers.
@@ -206,17 +206,15 @@ mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
 
     #[test]
-    fn host_tables_match_full_destination_extents_and_minimum_allocations() -> anyhow::Result<()> {
+    fn host_tables_match_full_destination_extents() -> anyhow::Result<()> {
         for rows in [1usize, 64, 512, 2048, 2752, 4096] {
             for decode in [false, true] {
                 let tables = super::StepTableBytes::new(rows, decode, 32768, 8192, 9)?;
-                let table_rows = if decode { rows } else { 1 };
-                let expected: usize = [rows * 8, rows * 12, rows * 12, rows * 8,
-                    rows * 4, rows * 4, rows * 8, rows * 4,
-                    table_rows * 32768 * 4, table_rows * 8192 * 4, rows * 4]
-                    .into_iter().map(|n| n.max(256)).sum();
-                assert_eq!(tables.ordered_bytes(false)?, expected as u64);
-                assert_eq!(tables.ordered_bytes(true)?, (expected + (rows * 9 * 8).max(256)) as u64);
+                assert_eq!(tables.positions, rows * 8);
+                assert_eq!(tables.rope_positions, rows * 12);
+                assert_eq!(tables.page_table, if decode { rows } else { 1 } * 32768 * 4);
+                assert_eq!(tables.pool_table, if decode { rows } else { 1 } * 8192 * 4);
+                assert_eq!(tables.ple_ids, rows * 9 * 8);
             }
         }
         assert!(super::StepTableBytes::new(usize::MAX, false, 1, 1, 1).is_err());
@@ -224,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn public_planner_ordered_tables_equal_runtime_at_forced_32gib() -> anyhow::Result<()> {
+    fn public_planner_retained_tables_equal_runtime_at_forced_32gib() -> anyhow::Result<()> {
         use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
         use cuteafd_loader::plan::layout::LayoutOptions;
         use cuteafd_loader::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
@@ -244,7 +242,7 @@ mod tests {
                     "F8_E4M3", &[100, 160]));
             }
             testing::write_snapshot(dir.path(), &config, &tensors, None);
-            // The mapped-PLE ring caps Qwen at two waves (#717).
+            // Exercise explicit serial and pipelined metadata owners.
             for (rows, waves) in [(4096, 1), (2048, 2), (4096, 2)] {
                 let report = plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks: 4 },
@@ -259,12 +257,17 @@ mod tests {
                 let pool = usize::try_from(report.memory_layout.as_ref().unwrap().pool_tokens)?;
                 let pages = qwen_pool_pages(pool).unwrap().max(QWEN_UNIT_PAGES);
                 let runtime = super::HostWorkspaceBytes::new(&cfg, rows as usize, false, pages, pages / QWEN_UNIT_PAGES,
-                    true, false, waves > 1, !mapped_ple, 1)?;
-                let items: Vec<_> = report.host_ledger.as_ref().unwrap().items.iter()
-                    .filter(|item| item.group == "staging/ordered-tables").collect();
-                assert_eq!(items.len(), usize::from(waves > 1));
-                assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), runtime.ordered,
-                    "{rows}x{waves}, mapped PLE {mapped_ple}");
+                    if waves > 1 { waves as usize } else { 0 }, true, false, !mapped_ple, 1)?;
+                let expected = cuteafd_loader::families::qwen4::upload_shape(rows as usize, false,
+                    pages, pages / QWEN_UNIT_PAGES, cfg.ple_rows(), cfg.layers,
+                    if waves > 1 { waves as usize } else { 0 }, true, false, !mapped_ple)?;
+                assert_eq!(runtime.staging as usize, expected.capacity_bytes()?);
+                let decode = super::HostWorkspaceBytes::new(&cfg, super::super::engine::DECODE_ROWS, true,
+                    pages, pages / QWEN_UNIT_PAGES, 0, true, false, !mapped_ple, 64)?;
+                let planned = report.host_ledger.as_ref().expect("host admission ledger").items.iter()
+                    .filter(|item| item.group == "staging/tables-and-sync").map(|item| item.bytes).sum::<u64>();
+                assert_eq!(planned, runtime.staging + decode.staging,
+                    "host source ledger must cover exactly the lazy runtime owners");
                 let shape = (waves > 1).then_some(cuteafd_loader::serving_capacity::PrefillShape {
                     unit_rows: rows, waves,
                 });
@@ -294,24 +297,20 @@ mod tests {
         for rows in [64usize, 512, 4096] {
             for decode in [false, true] {
                 for spark in [false, true] {
-                    for bf16 in [false, true] {
-                        let host = HostWorkspaceBytes::new(&cfg, rows, decode, pages, pools,
-                            spark, bf16, !decode && spark, false, if decode { 64 } else { 1 })?;
-                        let table_rows = if decode { rows } else { 1 };
-                        assert_eq!(host.staging as usize, 256 + rows * (8 * 3 + 4 * 4 + 24
-                            + cfg.ple_rows() * 8 + 5 * cfg.hidden * 2) + table_rows * (pages + pools) * 4);
-                        assert_eq!(host.router as usize, if spark { rows * (cfg.topk * 8
-                            + if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 }) } else { 256 });
-                        assert_eq!(host.logits as usize, (if decode { 64 } else { 1 }) * cfg.vocab_size * 4);
-                        assert_eq!(host.ordered > 0, !decode && spark);
-                    }
+                    let host = HostWorkspaceBytes::new(&cfg, rows, decode, pages, pools,
+                        if !decode && spark { 3 } else { 0 }, spark, true, false, if decode { 64 } else { 1 })?;
+                    let expected = cuteafd_loader::families::qwen4::upload_shape(rows, decode, pages, pools,
+                        cfg.ple_rows(), cfg.layers, if !decode && spark { 3 } else { 0 }, spark, true, false)?;
+                    assert_eq!(host.staging as usize, expected.capacity_bytes()?);
+                    assert_eq!(host.uploads, expected);
+                    assert_eq!(host.logits as usize, (if decode { 64 } else { 1 }) * cfg.vocab_size * 4);
                 }
             }
         }
-        let full = HostWorkspaceBytes::new(&cfg, 4096, false, pages, pools, true, true, true, false, 8192)?;
+        let full = HostWorkspaceBytes::new(&cfg, 4096, false, pages, pools, 3, true, true, false, 8192)?;
         assert_eq!(full.logits, 8192 * cfg.vocab_size as u64 * 4);
         assert!(HostWorkspaceBytes::new(&cfg, usize::MAX, false, pages, pools,
-            true, true, true, false, 1).is_err());
+            3, true, true, false, 1).is_err());
         Ok(())
     }
 

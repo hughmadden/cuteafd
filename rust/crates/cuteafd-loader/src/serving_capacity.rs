@@ -720,7 +720,7 @@ pub fn qwen_cache_geometry(
                 "Qwen full/MTP pools",
                 &[full + u64::from(mtp), 256 * (kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 + 256) + 64 * 256],
             )?,
-            pool_metadata_unit_bytes: 4,
+            pool_metadata_unit_bytes: 0,
             active_state_per_sequence_bytes: sum("Qwen active state", &[mark, mtp_pending])?,
             retained_mark_bytes: sum("Qwen retained MTP hidden row", &[mark, if mtp { hc_width * 2 } else { 0 }])?,
             speculative_replay_bytes: sum(
@@ -1132,6 +1132,8 @@ mod tests {
         let plain = qwen_cache_geometry(&cfg, 48, false, Qwen4KvCache::Bf16).unwrap();
         let mtp = qwen_cache_geometry(&cfg, 48, true, Qwen4KvCache::Bf16).unwrap();
         assert_eq!(plain.ranks[0].persistent_unit_bytes / 256, 28416);
+        assert_eq!(plain.ranks[0].pool_metadata_unit_bytes, 0);
+        assert_eq!(mtp.ranks[0].pool_metadata_unit_bytes, 0);
         assert_eq!(
             mtp.ranks[0].persistent_unit_bytes - plain.ranks[0].persistent_unit_bytes,
             256 * 2368

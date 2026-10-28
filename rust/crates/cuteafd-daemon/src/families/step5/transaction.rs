@@ -1098,7 +1098,7 @@ fn copy(
     stream.device.run(|| {
         // SAFETY: checked disjoint views and caller-owned inputs remain live through the step drain.
         unsafe {
-            stream.device.library.copy_d2d_async(
+            crate::shared::memory::device::copy_device_ordered(stream.device.library,
                 target,
                 source,
                 source.bytes,
@@ -1751,7 +1751,7 @@ pub(super) mod tests {
                 let failed: Result<()> = step.compose(0, &key, |owner, meta| {
                     meta.stream.device.run(|| {
                         // SAFETY: the transaction retains both disjoint owners through failure drainage.
-                        unsafe { library.copy_d2d_async(value.buffer, owner.buffer,
+                        unsafe { crate::shared::memory::device::copy_device_ordered(&library, value.buffer, owner.buffer,
                             owner.buffer.bytes, meta.stream.raw) }
                     })?;
                     anyhow::bail!("injected composition error")
