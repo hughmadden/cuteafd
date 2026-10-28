@@ -495,7 +495,9 @@ impl<'a> SparkIntake<'a> {
     /// rest: no upload or reduce pending, no receive slot held, and dispatch
     /// and receive at the same slot. Rotation restarts at slot 0.
     pub(crate) fn set_geometry(&self, waves: usize, rows: usize) -> Result<()> {
-        ensure!(self.placed(), "a single-slot intake has no cut to change");
+        // A single-slot intake lands every wave in its one rotating range: a
+        // one-window call (any admitted rows) leaves it as it is.
+        if !self.placed() { return self.geometry.borrow().one_window(waves, rows); }
         ensure!(!self.state.copies_pending.get() && self.state.consumed_pending.iter().all(|p| !p.get())
             && self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.is_empty()
             && self.state.dispatch_slot.get() == self.state.receive_slot.get(),

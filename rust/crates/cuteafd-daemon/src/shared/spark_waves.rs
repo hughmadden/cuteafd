@@ -1037,6 +1037,9 @@ impl<'a> Waves<'a> {
             "the Spark exchange re-cuts its return slots only at rest");
         let cut = self.geometry.cut();
         if cut.waves == waves && cut.rows == rows { return Ok(()); }
+        // One window: the single slot lands every call (any admitted rows) in
+        // its one rotating range; nothing to re-cut.
+        if !self.placed && self.geometry.slots() == 1 { return self.geometry.one_window(waves, rows); }
         ensure!(self.placed || self.landing == 0,
             "a rotating GPU landing fixes the wave geometry; re-cutting needs a placed landing");
         self.geometry.set(waves, rows)?;

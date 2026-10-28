@@ -62,6 +62,15 @@ impl SlotGeometry {
     pub(crate) fn max_rows(&self) -> usize { self.max_rows }
     pub(crate) fn reserve_rows(&self) -> usize { self.reserve_rows }
 
+    /// A one-window call on a single-slot link (k = 1): its slot lands every
+    /// call (any admitted rows) in one rotating range, so there is nothing to
+    /// re-cut. Errors for more waves, or rows past the admitted unit.
+    pub(crate) fn one_window(&self, waves: usize, rows: usize) -> Result<()> {
+        ensure!(self.slots == 1 && waves == 1, "a single-slot link runs one window, not {waves}");
+        ensure!((1..=self.max_rows).contains(&rows), "{rows}-row call exceeds the admitted {}-row unit", self.max_rows);
+        Ok(())
+    }
+
     /// Re-cut the reserve. The caller proves the link is at rest.
     pub(crate) fn set(&mut self, waves: usize, rows: usize) -> Result<bool> {
         self.check(waves, rows)?;
@@ -98,6 +107,17 @@ mod tests {
     /// Shared reserve: 8192 rows, plus the 64-row page rounding three 2752-row
     /// units need (8256), admitting four slots of up to 4096 rows.
     fn reserve() -> SlotGeometry { SlotGeometry::new(4, 4096, 8256, 2, 4096).unwrap() }
+
+    /// A k = 1 link (one slot of 4096 rows) accepts every prefill call's
+    /// start, full or tail, as a no-op, and refuses more waves or wider units.
+    #[test]
+    fn a_one_window_link_accepts_every_call_start() {
+        let one = SlotGeometry::new(1, 4096, 4096, 1, 4096).unwrap();
+        for rows in [4096, 4096, 2112, 1] { one.one_window(1, rows).unwrap(); }
+        assert!(one.one_window(2, 2048).is_err());
+        assert!(one.one_window(1, 4097).is_err());
+        assert!(reserve().one_window(1, 4096).is_err(), "multi-slot links re-cut instead");
+    }
 
     #[test]
     fn every_admitted_cut_fits_the_reserve_without_overlap() {
