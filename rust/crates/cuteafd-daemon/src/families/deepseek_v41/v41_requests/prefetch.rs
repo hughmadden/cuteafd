@@ -99,6 +99,24 @@ mod tests {
         }
     }
 
+    /// A call's lookahead holds the next call's first units at its own width;
+    /// when the next call's depth (unit width) changes, its first reservation
+    /// misses, cancels every held lookahead unit and frees their slots: a
+    /// depth change costs a cold gather, never a pinned slot or a stall.
+    #[test]
+    fn a_depth_change_cancels_the_whole_lookahead_on_its_first_miss() {
+        let log = Rc::default();
+        let mut slot = PrefetchSlot::default();
+        let tokens: Vec<u32> = (0..12).collect();
+        // Lookahead at width 4 (k3): three units from position 8256.
+        for (i, chunk) in tokens.chunks(4).enumerate() { slot.hold(key(1, 8256 + 4 * i as u64, chunk), wave(i as u32, &log)); }
+        // The next call runs k2 at width 6: its first unit misses.
+        assert!(slot.take_matching(&key(1, 8256, &tokens[..6])).is_none());
+        assert!(slot.is_empty(), "lookahead units held past a depth change");
+        assert!(!leaked(&log));
+        assert_eq!(log.borrow().iter().filter(|line| line.starts_with("cancel")).count(), 3);
+    }
+
     #[test]
     fn release_and_replay_cancel_only_their_own_lease() {
         let log = Rc::default();
