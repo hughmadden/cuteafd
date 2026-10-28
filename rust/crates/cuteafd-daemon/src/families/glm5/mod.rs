@@ -195,9 +195,17 @@ fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
     let rings = crate::shared::placement::spark_rings(if native {
         cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
     } else { 64 << 20 })?;
-    cuteafd_transport::worker_selection::ModelAdmission::new(
+    let model = cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress },
-            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)
+            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)?;
+    validate_spark_endpoint_count(model.endpoints.len(), waves)?;
+    Ok(model)
+}
+
+fn validate_spark_endpoint_count(endpoints: usize, waves: usize) -> Result<()> {
+    ensure!(endpoints == cuteafd_loader::plan::layout::spark_endpoints("glm5", waves as u64),
+        "GLM Spark endpoint count differs from the planner");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -285,6 +293,9 @@ mod draft_cli_tests {
                 cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity())?);
         }
         assert!(spark_model(SparkBackend::Fp8, 0, 4096, false).is_err());
+        assert!(validate_spark_endpoint_count(1, 1).is_err());
+        assert!(validate_spark_endpoint_count(3, 3).is_err());
+        assert!(validate_spark_endpoint_count(2, 1).is_ok());
         let source = include_str!("mod.rs");
         let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
             .split("let runtime = tokio::runtime::Builder").next().unwrap();

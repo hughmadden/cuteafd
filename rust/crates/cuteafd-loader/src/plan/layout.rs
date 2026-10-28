@@ -329,9 +329,8 @@ mod scoring_workspace_tests {
 }
 
 /// Ring endpoints a family's coordinator opens to each selected Spark rank,
-/// given its prefill lanes (V4/V4.1: two fixed; GLM 5.3: one decode endpoint
-/// plus one per lane when lanes run in parallel; GLM Flash/MiMo: one per lane;
-/// Qwen: one).
+/// given its prefill lanes (GLM 5.3: one decode plus one prefill endpoint,
+/// including pinned one-wave layouts; Qwen and GLM Flash: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         // The two decode lanes' links and one prefill link (its waves share
@@ -339,7 +338,7 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         "deepseek_v41" => 3,
         "deepseek_v4" => 2,
         // The decode link and one prefill link (its waves share that endpoint's rings).
-        "glm5" => 1 + usize::from(lanes > 1),
+        "glm5" => 2,
         "glm5_flash" => 1,
         "mimo_v2" => lanes as usize,
         "qwen4" => 1,
@@ -560,7 +559,7 @@ mod selected_spark_io_tests {
             assert!(device.items.is_empty());
         }
         assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::depth(4, Default::default())), 2);
-        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::depth(0, Default::default())), 1);
+        assert_eq!(spark_endpoints("glm5", 1), 2);
     }
 }
 
@@ -1473,7 +1472,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
     }
     let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
-    if family != "qwen4" {
+    // GLM route staging lives in the exchange slots already charged above;
+    // standalone router_host storage is allocated only by diagnostics.
+    if family != "qwen4" && family != "glm5" {
         let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
             .context("host routing stride overflow")?).context("host routing workspace overflow")?;
         push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
