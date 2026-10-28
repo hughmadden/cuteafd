@@ -14,6 +14,7 @@ struct RecordedExchange<'e, 'a> {
     engine: &'e GlmfEngine<'a>,
     execution: &'e Execution<'a>,
     entry: Cell<Option<*mut c_void>>,
+    work: Vec<(usize, [&'e Workspace<'a>; 2])>,
 }
 
 impl attention::LayerProtocol for RecordedExchange<'_, '_> {
@@ -42,7 +43,14 @@ impl attention::LayerProtocol for RecordedExchange<'_, '_> {
         let ordinal = self.execution.plan.hops()[..index].iter().filter(|h| h.charged() && h.to == hop.to).count();
         let slot = lane * cuteafd_loader::placement::HOP_SLOTS as usize + ordinal % per_lane;
         self.engine.record_exchange(hop.from as usize, "hop", slot, true);
-        Ok((self.execution.hops.send(index, lane, source, rows)?, hop.to as usize, slot))
+        let destination = match hop.at {
+            HopPoint::AfterAttention(_) | HopPoint::BeforeLayer(0) => {
+                let work = self.work.iter().find(|(at, _)| *at == lane).context("hop lane workspace")?.1;
+                Some(work[hop.to as usize].streams[usize::from(matches!(hop.at, HopPoint::AfterAttention(_)))].buffer)
+            }
+            _ => None,
+        };
+        Ok((self.execution.hops.send_into(index, lane, source, rows, destination)?, hop.to as usize, slot))
     }
 
     fn land(&self, (ticket, to, slot): Self::Ticket) -> Result<*mut c_void> {
@@ -97,7 +105,7 @@ impl<'a> GlmfEngine<'a> {
         let exchange = self.exchange()?;
         let mut hops = HopLink::new(self.library,
             [0, 1].map(|rank| RankDevice { device: exchange.device(rank), stream: exchange.stream(rank) }),
-            plan.hops(), plan.spec())?;
+            plan.hops(), plan.spec())?.with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 terminal owner")?,
             exchange.abort_word(1)?.context("rank 1 terminal owner")?])?;
         hops.validate_binding(&plan, exchange)?;
@@ -136,7 +144,8 @@ impl<'a> GlmfEngine<'a> {
         let execution = self.layer_execution.as_ref().context("per-layer execution binding")?;
         let rows = bindings.iter().map(|binding| binding.rows).collect::<Vec<_>>();
         execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
-        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None),
+            work: bindings.iter().map(|b| (b.lane, b.work)).collect() };
         attention::layer_pipeline_with(scope, &execution.plan, &exchange,
             LaneOrder::OrderedChunks, &rows, bindings)?;
         for binding in bindings.iter_mut() { binding.finish()?; }
@@ -181,7 +190,8 @@ impl<'a> GlmfEngine<'a> {
         consumed: &mut [usize]) -> Result<()> {
         let execution = self.layer_execution.as_ref().context("per-layer execution")?;
         execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
-        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None),
+            work: vec![(unit.slot, work)] };
         let mut binding = self.unit_binding(work, tables, unit, total, Some(layer));
         attention::pipeline_attention(&exchange, &execution.plan, layer, unit.slot, unit.rows.len(),
             &mut binding, consumed)?;
@@ -201,7 +211,8 @@ impl<'a> GlmfEngine<'a> {
     pub(super) fn unit_exit(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
         unit: &crate::shared::prefill_pipeline::Unit, total: usize, consumed: &mut [usize]) -> Result<()> {
         let execution = self.layer_execution.as_ref().context("per-layer execution")?;
-        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None),
+            work: vec![(unit.slot, work)] };
         let mut binding = self.unit_binding(work, tables, unit, total, Some(unit.layers.end));
         attention::pipeline_hops(&exchange, &execution.plan, HopPoint::Exit, unit.slot, unit.rows.len(),
             &mut binding, consumed)?;
@@ -323,26 +334,14 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         let rank = usize::from(hop.to);
         let w = self.work[rank];
         if let HopPoint::AfterAttention(layer) = hop.at {
-            let bytes = self.rows * HC * self.engine.cfg.hidden * 2;
-            self.engine.on(rank, || unsafe {
-                // SAFETY: the landed buffer and persistent streams hold exactly these admitted rows.
-                self.engine.library.copy_d2d_async(w.streams[1].buffer,
-                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: residual, bytes,
-                        device_id: self.engine.exchange()?.device(rank), flags: 0 }, bytes, self.engine.stream_of(rank))
-            })?;
+            ensure!(residual == w.streams[1].buffer.ptr, "FFN residual must land in its consumer operand");
             let weights = self.layer(rank, layer);
             self.engine.run_on(rank, false, "mhc_pre", &[("residual", w.streams[1].buffer.ptr),
                 ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?), ("base", weights.ptr("ffn.base")?),
                 ("norm", weights.ptr("post_norm")?), ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr),
                 ("y", w.x.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[Scalar::I32(self.rows as i32)])?;
         } else if hop.at == HopPoint::BeforeLayer(0) {
-            let bytes = self.rows * HC * self.engine.cfg.hidden * 2;
-            self.engine.on(rank, || unsafe {
-                // SAFETY: the initial ownership hop landed these rows before the first collapse.
-                self.engine.library.copy_d2d_async(w.streams[0].buffer,
-                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: residual, bytes,
-                        device_id: self.engine.exchange()?.device(rank), flags: 0 }, bytes, self.engine.stream_of(rank))
-            })?;
+            ensure!(residual == w.streams[0].buffer.ptr, "entry residual must land in its consumer operand");
         } else {
             ensure!(hop.at == HopPoint::Entry && residual == w.streams[0].buffer.ptr,
                 "split-FFN GLM executor has an unexpected boundary hop");
@@ -381,14 +380,14 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         ensure!(masked || layer.dense || real > 0, "per-layer MoE needs positive real rows");
         let mut spark = false;
         if !masked && !e.tp2_layer(index) {
-            let out = GlmfEngine::peer_ffn_out(w1, peer)?;
+            let out = e.peer_ffn_out(index, w1, peer)?;
             if !layer.dense || peer.has("w_gate_up_fp8") {
                 e.ffn_on(1, w1, peer, if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate },
                     self.cap(), out, rows)?;
             }
         }
         if masked {
-            for (rank, buffer) in [(0, w.delta.buffer), (1, w1.shared.buffer)] {
+            for (rank, buffer) in [(0, w.delta.buffer), (1, if e.tp2_layer(index) { w1.delta.buffer } else { w1.shared.buffer })] {
                 e.on(rank, || unsafe {
                     // SAFETY: masked startup owns both persistent FFN outputs of the bucket width.
                     e.library.cuda_zero_bytes_async(buffer, self.rows * e.cfg.hidden * 2, e.stream_of(rank))
@@ -433,6 +432,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             let peer = self.layer(1, index);
             let peer_buffer = if peer.dense && peer.has("w_gate_up_fp8") { self.work[1].delta.buffer }
                 else if peer.dense { self.work[1].zero.as_ref().context("peer zero rows")?.buffer }
+                else if e.tp2_layer(index) { self.work[1].delta.buffer }
                 else { self.work[1].shared.buffer };
             for (rank, buffer) in [(0, self.work[0].delta.buffer), (1, peer_buffer)] {
                 e.on(rank, || unsafe {
@@ -443,7 +443,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             }
         }
         e.exchange_push(e.exchange()?, "main", 1, slot(index, true, self.lane),
-            GlmfEngine::peer_ffn_out(self.work[1], self.layer(1, index))?, self.rows * e.cfg.hidden * 2)?;
+            e.peer_ffn_out(index, self.work[1], self.layer(1, index))?, self.rows * e.cfg.hidden * 2)?;
         crate::shared::console::layer_mark(index);
         e.probe_mark(index)?;
         if self.on_layer.is_some() && index + 1 < e.weights.layers.len() {

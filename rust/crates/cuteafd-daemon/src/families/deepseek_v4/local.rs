@@ -455,6 +455,19 @@ impl<'a> LocalExperts<'a> {
         shared: *mut c_void,
         stream: *mut c_void,
     ) -> Result<()> {
+        // SAFETY: this instance retains its private output through every queued reader.
+        unsafe { self.run_into(layer, rows, wire, ids, weights, shared, self.output.buffer.ptr, stream) }
+    }
+
+    /// As `run`, reducing directly into the consumer's output instead of copying it later.
+    ///
+    /// # Safety
+    /// The `run` input contract applies; `out` holds `rows * hidden` BF16 elements,
+    /// is disjoint from `shared`, and remains live through all queued consumers.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_into(&mut self, layer: LocalLayer, rows: usize, wire: *mut c_void,
+        ids: *mut c_void, weights: *mut c_void, shared: *mut c_void, out: *mut c_void,
+        stream: *mut c_void) -> Result<()> {
         let (backbone_ids, layers, stages, states, reduction_plan) = match &mut self.backend {
             Backend::Native { ids, layers, stages, states, reduction_plan, .. } =>
                 (ids, layers, stages, states, reduction_plan),
@@ -477,7 +490,7 @@ impl<'a> LocalExperts<'a> {
                 // this stream.
                 unsafe {
                     let values = execution.launch_layer(index, inputs, rows, stream)?;
-                    return self.reducer.finish(values.ptr.cast(), shared.cast(), self.output.buffer.ptr.cast(),
+                    return self.reducer.finish(values.ptr.cast(), shared.cast(), out.cast(),
                         rows as u32, true, stream);
                 }
             }
@@ -509,7 +522,7 @@ impl<'a> LocalExperts<'a> {
         // and this call's inputs; the stream orders everything.
         unsafe {
             state.kernel.launch(&args)?;
-            self.reducer.finish(state.slots[41].cast(), shared.cast(), self.output.buffer.ptr.cast(),
+            self.reducer.finish(state.slots[41].cast(), shared.cast(), out.cast(),
                 rows as u32, state.kernel.accumulates_tokens(), stream)
         }
     }

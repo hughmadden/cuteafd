@@ -48,7 +48,7 @@ impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_> {
         if let Some(w1) = self.peer(unit)? {
             if e.layer_execution.is_none() && !e.tp2_layer(layer) {
                 e.exchange_push(e.exchange()?, "main", 1, slot(layer, true, unit.slot),
-                    GlmfEngine::peer_ffn_out(w1, &e.peer()?.layers[layer])?, t * e.cfg.hidden * 2)?;
+                    e.peer_ffn_out(layer, w1, &e.peer()?.layers[layer])?, t * e.cfg.hidden * 2)?;
             }
         }
         let out = e.meet_ffn(w, layer, unit.slot, e.weights.layers.len(), t)?;

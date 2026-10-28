@@ -370,8 +370,8 @@ pub(crate) const DECODE_PEER_COPY_BYTES: usize = 80 * 10240;
 /// wait parks that engine and head-of-line blocks every other copy on it
 /// (Engram uploads, peer landings). Prefill-width transfers keep the copy
 /// engines (prof12: SM copies cost ~1.2 s of GPU0 per 64K prefill on two RTX).
-pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize) -> bool {
-    deferred && bytes <= DECODE_PEER_COPY_BYTES
+pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize, decode_lane_bytes: usize) -> bool {
+    deferred && bytes <= decode_lane_bytes
 }
 
 #[cfg(test)]
@@ -382,11 +382,18 @@ mod peer_copy_choice_tests {
     #[test]
     fn decode_width_device_ordered_copies_use_sm() {
         use super::{sm_peer_copy_for, DECODE_PEER_COPY_BYTES};
-        assert!(sm_peer_copy_for(true, 1 * 10240));
-        assert!(sm_peer_copy_for(true, DECODE_PEER_COPY_BYTES));
-        assert!(!sm_peer_copy_for(true, 2752 * 10240));
-        assert!(!sm_peer_copy_for(true, DECODE_PEER_COPY_BYTES + 1));
-        assert!(!sm_peer_copy_for(false, 1 * 10240));
+        for deferred in [false, true] {
+            for bytes in [0, 10240, 80 * 10240, 80 * 10240 + 1, 256 * 10240, 2752 * 10240] {
+                assert_eq!(sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES),
+                    deferred && bytes <= 80 * 10240, "V4.1 routing changed at {bytes}");
+            }
+        }
+        // mHC residuals have four BF16 hidden streams per row.
+        let glmf_decode = 64 * 4 * 4096 * 2;
+        assert!(sm_peer_copy_for(true, glmf_decode, glmf_decode));
+        assert!(!sm_peer_copy_for(true, glmf_decode + 1, glmf_decode));
+        assert!(!sm_peer_copy_for(true, 2752 * 4096 * 2, glmf_decode));
+        assert!(!sm_peer_copy_for(true, 4096 * 4 * 4096 * 2, glmf_decode));
     }
 }
 
@@ -457,7 +464,7 @@ impl<'a> PeerTransfer<'a> {
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
-        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for(deferred, bytes));
+        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES));
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
             // The destination's previous readers precede this write: the

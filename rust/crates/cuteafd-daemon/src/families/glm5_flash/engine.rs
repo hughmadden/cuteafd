@@ -784,11 +784,6 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    /// Admitted pinned route staging (the planner charges it); Spark waves
-    /// now stage in the link exchange's slots, so it stays unused until the
-    /// planner drops the charge.
-    #[allow(dead_code)]
-    router_host: RefCell<HostAllocation<'a>>,
     /// Shared by every prefill lane of this GPU (decode: its own).
     temps: Rc<Temporaries<'a>>,
 }
@@ -856,7 +851,6 @@ pub(crate) struct StepPlan<'p, 'a> {
     /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
     /// scratch is at least this large. 0 with records of their own.
     shared_records: u64,
-    spark_bf16: bool,
 }
 
 /// Expert buffers required by the admitted routed-layer homes.
@@ -874,7 +868,6 @@ pub(crate) struct StepSettings {
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
     pub full_prefill_logits: bool,
-    pub spark_bf16: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
     /// The DSA index cache: the compact one runs the `index_producer_c` programs, whose scratch
@@ -926,7 +919,6 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             },
             decode_rows: settings.decode_rows,
             shared_records,
-            spark_bf16: settings.spark_bf16,
         }
     }
 
@@ -1085,10 +1077,6 @@ impl<'a> StepPlan<'_, 'a> {
             route_ids: alloc(bytes.route_ids)?,
             route_weights: alloc(bytes.route_weights)?,
             wire: alloc(bytes.wire)?,
-            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(bytes.router_host)?
-                + if self.spark_bf16 && rank == 0 && self.shape.spark {
-                    rows * (self.cfg.hidden - self.cfg.hidden / 32)
-                } else { 0 })?),
             temps,
         })
     }
@@ -1997,7 +1985,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
-            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?;
+            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?
+            .with_decode_lane_bytes(PackedRoutes::new(self.decode_rows, self.cfg.topk).bytes)?;
         routes.trace_identity("glmf-tp2-routes");
         for (rank, producer) in [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device: peer.device, stream: peer.stream }].into_iter().enumerate() {
@@ -2551,19 +2540,12 @@ impl<'a> GlmfEngine<'a> {
         self.router_on(1, w1, &peer.layers[layer], rows, &[Span { first: 0, rows }])?;
         self.tp2_rank(0, layer, lane, w, rows, w.delta.buffer.ptr)?;
         self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;
-        // The native combine forbids input/output overlap. Keep the existing
-        // shared-slot exchange contract after consuming the shared input.
-        self.on(1, || unsafe {
-            // SAFETY: disjoint rank-local buffers stay live and are ordered after combine.
-            self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer,
-                rows * self.cfg.hidden * 2, self.stream_of(1))
-        })?;
         Ok(())
     }
 
     fn tp2_publish(&self, layer: usize, lane: usize, rows: usize, prepared_peer: Option<&Workspace<'_>>) -> Result<()> {
         let w1 = tp2_prepared_peer(prepared_peer)?;
-        self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.shared.buffer.ptr, rows * self.cfg.hidden * 2)
+        self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.delta.buffer.ptr, rows * self.cfg.hidden * 2)
     }
 
     fn router_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: usize, spans: &[Span]) -> Result<()> {
@@ -2590,14 +2572,13 @@ impl<'a> GlmfEngine<'a> {
                 let at = 2 * lane + layer % 2;
                 if rank == 0 {
                     ensure!(packed.bytes <= w.router_logits.buffer.bytes, "router scratch cannot pack routes");
-                    // SAFETY: aligned ids/weights and zero padding fit the consumed router logits.
+                    // SAFETY: the two canonical sections fit the consumed logits; padding is never read.
                     unsafe {
-                        self.library.cuda_zero_bytes_async(w.router_logits.buffer, packed.bytes, self.stream_of(rank))?;
-                        self.library.copy_d2d_async(w.router_logits.buffer, w.route_ids.buffer, packed.section, self.stream_of(rank))?;
-                        self.library.copy_d2d_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                            ptr: w.router_logits.buffer.ptr.cast::<u8>().add(packed.weights).cast(),
-                            bytes: w.router_logits.buffer.bytes - packed.weights, ..w.router_logits.buffer
-                        }, w.route_weights.buffer, packed.section, self.stream_of(rank))?;
+                        self.library.sm_copy_regions(&[
+                            (w.router_logits.buffer.ptr, w.route_ids.buffer.ptr.cast_const(), packed.section as u64),
+                            (w.router_logits.buffer.ptr.cast::<u8>().add(packed.weights).cast(),
+                                w.route_weights.buffer.ptr.cast_const(), packed.section as u64),
+                        ], self.stream_of(rank))?;
                     }
                     self.exchange_push(&tp2.routes, "routes", 0, at, w.router_logits.buffer.ptr, packed.bytes)?;
                 } else {
@@ -2673,7 +2654,8 @@ impl<'a> GlmfEngine<'a> {
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
-            rows * self.cfg.hidden * self.partial_bytes())?;
+            rows * self.cfg.hidden * self.partial_bytes())?
+            .with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
         ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some()
@@ -3142,7 +3124,7 @@ impl<'a> GlmfEngine<'a> {
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.step_experts,
-            StepSettings { spark_bf16: self.spark_bf16, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })
@@ -3811,7 +3793,8 @@ impl<'a> GlmfEngine<'a> {
 
     /// Rank 1's FFN output buffer of `layer`: its dense partial (`delta`; zero rows when rank
     /// 0 runs the MLP whole) or shared-expert half (`shared`).
-    fn peer_ffn_out(w1: &Workspace<'_>, layer: &GlmfLayer<'_>) -> Result<*mut c_void> {
+    fn peer_ffn_out(&self, index: usize, w1: &Workspace<'_>, layer: &GlmfLayer<'_>) -> Result<*mut c_void> {
+        if self.tp2_layer(index) { return Ok(w1.delta.buffer.ptr); }
         match (layer.dense, layer.has("w_gate_up_fp8")) {
             (true, true) => Ok(w1.delta.buffer.ptr),
             (true, false) => w1.zero_ptr(),
@@ -3851,7 +3834,7 @@ impl<'a> GlmfEngine<'a> {
             w1.sum_ptr()?
         };
         self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
-        let out = Self::peer_ffn_out(w1, layer)?;
+        let out = self.peer_ffn_out(index, w1, layer)?;
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
         match (layer.dense, layer.has("w_gate_up_fp8")) {
             (true, false) => {}
@@ -3871,7 +3854,7 @@ impl<'a> GlmfEngine<'a> {
         let Some(next) = peer.layers.get(index + 1) else { return Ok(()) };
         let ffn = slot(index, true, lane);
         self.exchange_wait(exchange, "main", 1, ffn)?;
-        exchange.add(1, exchange.recv(1, ffn)?, Self::peer_ffn_out(w1, &peer.layers[index])?, w1.sum_ptr()?,
+        exchange.add(1, exchange.recv(1, ffn)?, self.peer_ffn_out(index, w1, &peer.layers[index])?, w1.sum_ptr()?,
             t * self.cfg.hidden)?;
         self.post_pre_on(1, w1, w1.sum_ptr()?, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
     }
@@ -4948,11 +4931,10 @@ impl<'a> GlmfEngine<'a> {
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
                 // SAFETY: wire rows, routes and the shared-expert rows are complete in
-                // stream order; the output is copied before the window can change.
+                // stream order; delta retains the reduction through its consumers.
                 unsafe {
-                    experts.run(crate::families::deepseek_v4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.stream)?;
-                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream)?;
+                    experts.run_into(crate::families::deepseek_v4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, w.delta.buffer.ptr, self.stream)?;
                 }
                 return Ok(());
             }

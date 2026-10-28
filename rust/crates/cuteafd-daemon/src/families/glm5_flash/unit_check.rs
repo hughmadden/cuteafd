@@ -1,4 +1,4 @@
-//! Same-cut executor N=1/N=2 golden and shared token/cache diagnostics.
+//! Same-cut executor serial/admitted-depth golden and shared token/cache diagnostics.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use anyhow::{ensure, Context, Result};
 
@@ -57,16 +57,17 @@ pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--unit-check needs every layer");
     ensure!(engine.full_prefill_logits, "--unit-check needs every prefill row's logits");
     ensure!(engine.prefill_waves >= 2, "--unit-check needs at least two admitted slots");
-    let n = tokens.len().min(engine.prefill_capacity());
+    let depth = engine.prefill_waves;
+    let n = unit_check_rows(tokens.len(), engine.prefill_rows, depth, engine.max_context)?;
     let cuts = engine.prefill_cuts(n)?;
-    ensure!(cuts.len() > 2, "--unit-check needs more than two units to exercise slot reuse");
+    ensure!(cuts.len() > depth, "--unit-check must reuse an admitted slot");
     let mut allocator = Allocator::for_engine(engine);
     let (mut one, mut two) = (allocator.admit(n)?, allocator.admit(n)?);
     let started = std::time::Instant::now();
     let one_logits = engine.prefill_unit_width(&mut one, &tokens[..n], 1)?.context("unit golden needs the head")?;
     let one_seconds = started.elapsed().as_secs_f64();
     let started = std::time::Instant::now();
-    let two_logits = engine.prefill_unit_width(&mut two, &tokens[..n], 2)?.context("unit golden needs the head")?;
+    let two_logits = engine.prefill_unit_width(&mut two, &tokens[..n], depth)?.context("unit golden needs the head")?;
     let two_seconds = started.elapsed().as_secs_f64();
     let logits = one_logits.len() == two_logits.len()
         && one_logits.iter().zip(&two_logits).all(|(a, b)| a.to_bits() == b.to_bits());
@@ -74,12 +75,27 @@ pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     let paged = unit_bytes(engine, &one)? == unit_bytes(engine, &two)?;
     let verdict = |same: bool| if same { "identical" } else { "DIFFER" };
     println!("unit check: {n} tokens (same cuts {cuts:?}): logits {}, KDA state {}, paged units {} \
-        (N1 {:.0} ms, N2 {:.0} ms)", verdict(logits), verdict(state), verdict(paged),
+        (N1 {:.0} ms, N{depth} {:.0} ms)", verdict(logits), verdict(state), verdict(paged),
         1e3 * one_seconds, 1e3 * two_seconds);
     allocator.release(two);
     allocator.release(one);
-    ensure!(logits && state && paged, "executor N1 and N2 differ over the same cuts");
+    check_identity(logits, state, paged, depth)
+}
+
+fn check_identity(logits: bool, state: bool, paged: bool, depth: usize) -> Result<()> {
+    ensure!(logits && state && paged, "executor N1 and admitted N{depth} differ over the same cuts");
     Ok(())
+}
+
+/// The diagnostic may exceed one serving span: it needs a slot's second use,
+/// not just one fill of the admitted ring. Serving's span limit is unchanged.
+fn unit_check_rows(available: usize, unit_rows: usize, depth: usize, context: usize) -> Result<usize> {
+    ensure!(depth >= 2 && unit_rows > 0, "--unit-check needs at least two admitted slots");
+    let needed = unit_rows.checked_mul(depth).and_then(|n| n.checked_add(1))
+        .context("unit-check row count overflow")?;
+    ensure!(available >= needed && context >= needed,
+        "--unit-check needs at least {needed} tokens and context rows to reuse depth {depth}");
+    Ok(available.min(context).min(needed.next_multiple_of(256)))
 }
 
 /// Context units live on one rank; whole/head-owned layers use the global unit ID.
@@ -90,6 +106,32 @@ fn local_unit(global: u32, rank: usize, context: bool) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admitted_depth_check_requires_real_slot_reuse() -> Result<()> {
+        for depth in [2, 3, 4] {
+            let rows = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(depth as u64) as usize;
+            let available = (depth + 1) * rows;
+            let n = unit_check_rows(available, rows, depth, 1 << 20)?;
+            let cuts = crate::shared::prefill_pipeline::prefill_units(n, rows, depth, 256)?;
+            assert!(cuts.len() > depth);
+            // Negative control: the old serving-span clamp never reuses a slot.
+            assert!(unit_check_rows(depth * rows, rows, depth, 1 << 20).is_err());
+            assert!(unit_check_rows(available, rows, depth, depth * rows).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_depth_oracle_rejects_each_corrupted_component() -> Result<()> {
+        check_identity(true, true, true, 3)?;
+        for identity in [(false, true, true), (true, false, true), (true, true, false)] {
+            assert!(check_identity(identity.0, identity.1, identity.2, 3).is_err());
+        }
+        // Equal floating values still differ when the stored bits differ.
+        assert!(check_identity(0.0f32.to_bits() == (-0.0f32).to_bits(), true, true, 3).is_err());
+        Ok(())
+    }
+
     #[test]
     fn token_only_diagnostics_reject_truncated_or_out_of_vocabulary_inputs() {
         let dir = tempfile::tempdir().unwrap();
