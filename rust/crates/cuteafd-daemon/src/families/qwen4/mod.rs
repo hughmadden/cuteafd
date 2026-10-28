@@ -4,6 +4,7 @@
 mod media;
 pub(crate) mod engine;
 mod admission;
+mod programs;
 mod dual;
 mod mtp_golden;
 pub(crate) mod ple;
@@ -573,6 +574,7 @@ impl Opened {
         }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
+        self::programs::validate_all(&self.cfg, &programs, args.max_context)?;
         let required = required_fp8_programs(args);
         for name in &required {
             programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \

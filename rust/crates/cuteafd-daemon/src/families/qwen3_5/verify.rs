@@ -13,6 +13,14 @@ pub(crate) struct DenseMark<'a> {
     generation: u64,
     slots: Vec<(usize, rows::Slot)>,
     storage: Rc<Allocation<'a>>,
+    fresh: FreshMark,
+}
+
+struct FreshMark(std::cell::Cell<bool>);
+
+impl FreshMark {
+    fn needs_restore(&self) -> bool { !self.0.replace(false) }
+    fn used(&self) { self.0.set(false); }
 }
 
 pub(super) struct Verification<'a> {
@@ -309,7 +317,7 @@ impl<'a> DenseEngine<'a> {
             let saved = view(mark.storage.buffer, offset, bytes)?;
             let (dst, src) = if capture { (saved, region) } else { (region, saved) };
             // SAFETY: mark storage and the live bank are retained until the enclosing drain.
-            unsafe { self.stream.device.library.copy_d2d_async(dst, src, bytes, self.stream.raw)?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(self.stream.device.library, dst, src, bytes, self.stream.raw)?; }
         }
         // Every reader and writer of the mark and the live bank runs on this stream.
         Ok(())
@@ -317,6 +325,7 @@ impl<'a> DenseEngine<'a> {
 
     fn restore_mark(&mut self, mark: &DenseMark<'_>) -> Result<()> {
         self.verification.validate(mark)?;
+        mark.fresh.used();
         self.healthy = false;
         self.move_mark(mark, false)?;
         // Append-only records beyond each saved frontier are unreachable and overwritten.
@@ -375,7 +384,7 @@ impl<'a> DenseEngine<'a> {
                         let dst = view(self.verification.hidden.buffer, (tap * rows + row) * width, width)?;
                         let src = view(self.planes.residual, active * width, width)?;
                         // SAFETY: both admitted row slices outlive this ordered stream copy.
-                        unsafe { library.copy_d2d_async(dst, src, width, self.stream.raw)?; }
+                        unsafe { crate::shared::memory::device::copy_device_ordered(library, dst, src, width, self.stream.raw)?; }
                     }
                 }
             }
@@ -392,7 +401,7 @@ impl<'a> DenseEngine<'a> {
                 let dst = view(self.verification.logits.buffer, row * width, width)?;
                 let src = view(self.logits.buffer, active * width, width)?;
                 // SAFETY: admitted source and physical output rows remain live through the drain.
-                unsafe { library.copy_d2d_async(dst, src, width, self.stream.raw)?; }
+                unsafe { crate::shared::memory::device::copy_device_ordered(library, dst, src, width, self.stream.raw)?; }
             }
         }
         // The logits and taps carry this stream; selection and drafting wait on it.
@@ -418,7 +427,8 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         ensure!(self.healthy && self.verification.pending.is_none(), "dense checkpoint requires committed healthy state");
         self.verification.invalidate()?;
         let mark = DenseMark { owner: self.verification.owner, generation: self.verification.generation,
-            slots: slots.iter().map(|&slot| (slot, self.slots[slot].clone())).collect(), storage: self.verification.mark.clone() };
+            slots: slots.iter().map(|&slot| (slot, self.slots[slot].clone())).collect(), storage: self.verification.mark.clone(),
+            fresh: FreshMark(std::cell::Cell::new(true)) };
         self.move_mark(&mark, true)?;
         Ok(mark)
     }
@@ -427,7 +437,9 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         self.verification.validate(mark)?;
         let active = rows::Rows::new(&request, self.cfg.attention.len(), self.cfg.vocab, &mark.slots,
             self.cfg.max_context, self.pool_tokens);
-        self.restore_mark(mark)?;
+        // No target mutation can retain this generation between checkpoint and
+        // its first verify. Reused marks still restore, including invalid requests.
+        if mark.fresh.needs_restore() { self.restore_mark(mark)?; }
         let plan = active?;
         if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers, true) {
             self.restore_mark(mark).context("restoring dense checkpoint after failed verify")?;
@@ -476,6 +488,17 @@ mod tests {
             "rms_norm_eps":1e-6, "rope_parameters":{"rope_type":"default", "rope_theta":10000000.0,
                 "partial_rotary_factor":0.25, "mrope_section":[11,11,10], "mrope_interleaved":true}}});
         Qwen35Config::from_hf(&value).unwrap()
+    }
+
+    #[test]
+    fn only_the_first_fresh_verify_elides_checkpoint_restore() {
+        let fresh = FreshMark(std::cell::Cell::new(true));
+        assert!(!fresh.needs_restore());
+        assert!(fresh.needs_restore());
+        assert!(fresh.needs_restore());
+        let explicitly_restored = FreshMark(std::cell::Cell::new(true));
+        explicitly_restored.used();
+        assert!(explicitly_restored.needs_restore());
     }
 
     #[test]

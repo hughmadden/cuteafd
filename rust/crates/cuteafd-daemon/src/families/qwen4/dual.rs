@@ -25,6 +25,7 @@ impl Opened {
         }
         for program in &programs {
             program.capacities().require_context("qwen4", args.max_context)?;
+            super::programs::validate_all(&self.cfg, program, args.max_context)?;
             for name in required_fp8_programs(args) { program.spec(&name)?; }
         }
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library,

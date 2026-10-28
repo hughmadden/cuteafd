@@ -28,6 +28,72 @@ impl RowGather {
 
 }
 
+/// Inclusive upper bound for device-ordered mapped-pinned metadata copies.
+/// Larger payloads use the host-triggered copy engine after the previous reader.
+pub const METADATA_SM_COPY_BYTES: usize = 4 << 20;
+
+/// Exact pinned bytes and completion records for an admitted upload schedule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadShape { pub bytes: usize, pub ranges: usize, largest: usize }
+impl UploadShape {
+    pub fn append(&mut self, planes: &[usize], repetitions: usize) -> Result<()> {
+        for &bytes in planes.iter().filter(|&&bytes| bytes > 0) {
+            let aligned = bytes.checked_add(15).map(|n| n / 16 * 16).context("upload alignment overflow")?;
+            if repetitions > 0 { self.largest = self.largest.max(aligned); }
+            self.bytes = aligned.checked_mul(repetitions).and_then(|n| self.bytes.checked_add(n))
+                .context("retained upload bytes overflow")?;
+            self.ranges = self.ranges.checked_add(repetitions).context("retained upload fences overflow")?;
+        }
+        Ok(())
+    }
+    /// One circular tail gap can strand fewer than one largest aligned plane.
+    pub fn capacity_bytes(self) -> Result<usize> {
+        self.bytes.checked_add(self.largest.saturating_sub(16)).context("upload wrap slack overflow")
+    }
+}
+
+/// CPU ownership model: no range can wrap over an unfinished GPU source read.
+/// Completion records are FIFO because one arena serves one consumer stream.
+pub struct UploadCursor {
+    shape: UploadShape,
+    offset: usize,
+    pending: std::collections::VecDeque<(usize, std::ops::Range<usize>)>,
+    free: Vec<usize>,
+}
+impl UploadCursor {
+    pub fn new(shape: UploadShape) -> Result<Self> {
+        ensure!(shape.bytes > 0 && shape.ranges > 0, "empty retained upload arena");
+        let shape = UploadShape { bytes: shape.capacity_bytes()?, ..shape };
+        Ok(Self { shape, offset: 0, pending: std::collections::VecDeque::with_capacity(shape.ranges),
+            free: (0..shape.ranges).rev().collect() })
+    }
+    pub fn oldest(&self) -> Option<usize> { self.pending.front().map(|entry| entry.0) }
+    pub fn retire(&mut self, fence: usize) -> Result<()> {
+        ensure!(self.oldest() == Some(fence), "retained upload retired out of source-fence order");
+        self.pending.pop_front();
+        self.free.push(fence);
+        Ok(())
+    }
+    pub fn reserve(&mut self, bytes: usize) -> Result<Option<(usize, std::ops::Range<usize>)>> {
+        ensure!(bytes > 0, "empty retained upload");
+        let aligned = bytes.checked_add(15).map(|n| n / 16 * 16).context("upload alignment overflow")?;
+        ensure!(aligned <= self.shape.bytes, "upload exceeds retained arena admission");
+        if self.pending.is_empty() { self.offset = 0; }
+        let at = if self.offset <= self.shape.bytes - aligned { self.offset } else { 0 };
+        let range = at..at + aligned;
+        let blocked = self.pending.front().is_some_and(|(_, oldest)| {
+            if self.offset <= oldest.start { range.start < self.offset || range.end > oldest.start }
+            else if range.start == 0 { range.end > oldest.start }
+            else { false }
+        });
+        if self.free.is_empty() || blocked { return Ok(None); }
+        let fence = self.free.pop().expect("checked fence capacity");
+        self.pending.push_back((fence, range.clone()));
+        self.offset = range.end;
+        Ok(Some((fence, range)))
+    }
+}
+
 /// Exact active + equally deep lookahead slots, independently per consumer.
 #[derive(Clone, Copy, Debug)]
 pub struct TableShape { pub rows: usize, pub depth: usize, pub consumers: usize }
@@ -117,6 +183,51 @@ mod tests {
     use super::*;
     use crate::GatherPoll;
     use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+
+    #[test]
+    fn retained_upload_adversarial_schedule_never_reuses_live_sources() -> Result<()> {
+        let planes = [4096 * 8, 4096 * 12, 4096 * 12, 4096 * 8, 4096 * 4,
+            4096 * 4, 4096 * 8, 4096 * 4, 16384 * 4, 4096 * 4];
+        let groups = 3 * (2 + 3 * 48);
+        let mut shape = UploadShape::default();
+        shape.append(&planes, groups)?;
+        shape.append(&[4096 * 4], 3)?;
+        assert_eq!(shape.bytes, 143_572_992);
+        let mut cursor = UploadCursor::new(shape)?;
+        for _ in 0..groups {
+            for bytes in planes { assert!(cursor.reserve(bytes)?.is_some()); }
+        }
+        for _ in 0..3 { assert!(cursor.reserve(4096 * 4)?.is_some()); }
+        assert!(cursor.reserve(16)?.is_none(), "unfinished SM source read must refuse wrap");
+        let first = cursor.oldest().unwrap();
+        assert!(cursor.retire(first + 1).is_err(), "out-of-order event cannot retire source");
+        cursor.retire(first)?;
+        assert!(cursor.reserve(16)?.is_some());
+        assert_eq!(METADATA_SM_COPY_BYTES, 4_194_304);
+        assert!(shape.append(&[usize::MAX], 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retained_upload_wrap_never_overlaps_an_unfinished_range() -> Result<()> {
+        let mut shape = UploadShape::default();
+        shape.append(&[16, 32, 48, 64], 1)?;
+        assert_eq!(shape.capacity_bytes()?, 208);
+        let mut cursor = UploadCursor::new(shape)?;
+        let mut live = std::collections::VecDeque::new();
+        for n in 0..4096 {
+            let bytes = [16, 64, 32, 48][n % 4];
+            if let Some((fence, range)) = cursor.reserve(bytes)? {
+                assert!(live.iter().all(|(_, old): &(usize, std::ops::Range<usize>)|
+                    range.end <= old.start || old.end <= range.start));
+                live.push_back((fence, range));
+            } else {
+                let (fence, _) = live.pop_front().expect("only live sources can block admission");
+                cursor.retire(fence)?;
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn cancelled_request_cannot_publish_into_reused_slot() -> Result<()> {

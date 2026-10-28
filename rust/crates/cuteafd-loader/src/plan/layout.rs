@@ -1438,33 +1438,33 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
     }
     let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
-    let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
-        .context("host routing stride overflow")?).context("host routing workspace overflow")?;
-    push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
+    if family != "qwen4" {
+        let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
+            .context("host routing stride overflow")?).context("host routing workspace overflow")?;
+        push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
+    }
     let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
         .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
     if family == "qwen4" {
-        // A local owner has workspace tables even without a Spark transport.
-        let lanes = lanes.max(1);
-        let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64))
-            .context("Qwen host workspace rows overflow")?;
-        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
-        let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
-        // Decode owns a table per row; prefill owns one. Charge the full
-        // record and compressed-pool tables, even on partitioned owners.
-        let tables = pool.div_ceil(64).checked_add(pool.div_ceil(64 * 4))
-            .and_then(|n| n.checked_mul(64 + lanes)).and_then(|n| n.checked_mul(4))
-            .context("Qwen host page tables overflow")?;
-        let stride = (cfg.ple_rows() as u64).checked_mul(8)
-            .and_then(|n| n.checked_add(64))
-            .and_then(|n| hidden.checked_mul(10).and_then(|h| n.checked_add(h)))
-            .context("Qwen host row metadata overflow")?;
-        staging = work_rows.checked_mul(stride).and_then(|n| n.checked_add(tables))
-            .and_then(|n| n.checked_add(256 * (lanes + 1)))
-            .and_then(|n| n.checked_mul(options.rtx_bytes.len() as u64))
-            .context("Qwen host staging overflow")?;
+        use crate::families::qwen4::{Qwen4Config, upload_shape, mtp_upload_shape, VERIFY_ROWS};
+        use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
+        let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
+        let pool = usize::try_from(report.memory_layout.as_ref().context("Qwen upload arena needs a KV layout")?.pool_tokens)?;
+        let pages = qwen_pool_pages(pool).context("Qwen host page tables overflow")?.max(QWEN_UNIT_PAGES);
+        let ple_ids = !cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len());
+        let units = if ranks > 0 && options.prefill_waves > 1 { usize::try_from(options.prefill_waves)? } else { 0 };
+        let mtp = cfg.mtp_layers > 0 && options.native_mtp_layers > 0;
+        let prefill = upload_shape(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES,
+            cfg.ple_rows(), cfg.layers, units, ranks > 0, mtp, ple_ids)?;
+        let decode = upload_shape(VERIFY_ROWS, true, pages, pages / QWEN_UNIT_PAGES,
+            cfg.ple_rows(), cfg.layers, 0, ranks > 0, mtp, ple_ids)?;
+        let separate_mtp = if units > 0 && mtp { mtp_upload_shape(usize::try_from(unit_rows)?,
+            pages, pages / QWEN_UNIT_PAGES, units)?.capacity_bytes()? } else { 0 };
+        staging = prefill.capacity_bytes()?.checked_add(decode.capacity_bytes()?).and_then(|n| n.checked_add(separate_mtp))
+            .and_then(|n| n.checked_mul(options.rtx_bytes.len())).context("Qwen retained uploads overflow")? as u64;
     }
-    push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
+    push(Category::Staging, "staging/tables-and-sync", "row metadata", staging,
+        if family == "qwen4" { Basis::Formula } else { Basis::Estimated });
     if family == "qwen4" {
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
         if cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len()) {
@@ -1480,19 +1480,6 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 usize::try_from(decode)?, usize::try_from(row_bytes)?)?;
             push(Category::Staging, "staging/mapped-table", "PLE active/lookahead rows and worker workspace", staging.total_bytes as u64, Basis::Formula);
         }
-    }
-    if family == "qwen4" && ranks > 0 && options.prefill_waves > 1 {
-        use crate::families::qwen4::{Qwen4Config, StepTableBytes};
-        use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
-        let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
-        let pool = usize::try_from(report.memory_layout.as_ref().context("Qwen ordered tables need a KV layout")?.pool_tokens)?;
-        let pages = qwen_pool_pages(pool).context("Qwen host page tables overflow")?.max(QWEN_UNIT_PAGES);
-        let tables = StepTableBytes::new(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES, cfg.ple_rows())?;
-        // One unit workspace owns these destinations, shared by both waves.
-        // Mapped PLE uploads gathered rows, not the separate PLE-ID table.
-        let ple_ids = !cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len());
-        push(Category::Staging, "staging/ordered-tables", "full destination extents",
-            tables.ordered_bytes(ple_ids)?, Basis::Formula);
     }
     let score_lanes = if matches!(family, "glm5" | "glm5_flash") { lanes } else { 1 };
     let score_rows = if options.full_prefill_logits { rows.checked_mul(score_lanes).context("host scoring rows overflow")? }

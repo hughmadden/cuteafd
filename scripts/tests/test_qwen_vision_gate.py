@@ -208,29 +208,15 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     assert startup.index("engine.prepare_scoring_prefill()?") < startup.index("engine.prepare_prefill_units()?")
     assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
 
-    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    fn reserve_prefill_tables(")]
+    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    /// Pre-capture every reachable")]
     assert "let Some(shape) = self.prefill_shape else { return Ok(()) };" in prepare
     assert "self.workspace_rows(shape.unit_rows as usize, false," in prepare
     assert "shape.slot_rows() as usize" in prepare
-    assert "if self.full_prefill_logits { self.prefill_rows } else { 1 }" in prepare
-    assert prepare.index("self.workspace_rows(") < prepare.index("self.reserve_prefill_tables(")
-
-    destinations = engine[engine.index("    fn ordered_prefill_tables("):engine.index("    fn live_buffer(")]
-    stage = engine[engine.index("    fn stage_step_tables("):engine.index("    /// Unfused ownership transitions:")]
-    embedding = engine[engine.index("    fn stage_embedding("):engine.index("    /// Queues `bytes`")]
-    uploads = set(re.findall(r"self\.stage_table\(w, &w\.(\w+),", stage + embedding))
-    assert set(re.findall(r"&self\.(\w+)", destinations)) == uploads
-    assert "ple_ids.then_some(&self.ple_ids)" in destinations
-    assert ".map(|table| table.buffer)" in destinations
-    assert ".filter(|buffer| buffer.bytes > 0)" in destinations
-    assert "live_buffer" not in destinations and "region(" not in destinations
-    reserve = engine[engine.index("    fn reserve_prefill_tables("):engine.index("    /// Pre-capture every reachable")]
-    assert "self.ple.as_ref().map(|ple| ple.mapped()).is_none()" in reserve
-    assert "workspace.ordered_prefill_tables(ple_ids)" in reserve
-    assert "self.library.reserve_h2d_ordered(destination, self.execution_stream())?" in reserve
-
-    units = engine[engine.index("    fn prefill_units("):engine.index("    pub(crate) fn mtp_prefill_rows(")]
-    assert units.index("self.prepare_prefill_units()?") < units.index("run_prefill_units(&mut hooks")
+    assert "RetainedUploads::new(" in engine
+    stage = engine[engine.index("    fn stage(&self"):engine.index("    fn stage_table")]
+    assert "w.staging.borrow_mut().upload(dst, bytes, self.execution_stream())" in stage
+    assert "copy_h2d_ordered" not in stage
+    assert "begin_staging(" not in engine and "reserve_h2d_ordered(" not in engine
 
 
 def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
@@ -254,7 +240,7 @@ def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
     assert "for owner in 0..self.gdn_banks.len()" in future
     assert "for decode in [false, true]" in future
     assert "self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }" in future
-    for field in ["host.router", "host.staging", "host.ordered", "host.logits"]:
+    for field in ["host.staging", "host.logits"]:
         assert field in future
     assert "self.mtp_prefill_workspace.borrow().is_none()" in future
     assert "self.mtp_prefill_rows()" in future
@@ -375,3 +361,15 @@ def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
     source = (ROOT/"native/shared/cuda/vision_qwen.cuh").read_text()
     assert "__fdiv_rn(float(y)*47.f,float(gh-1))" in source
     assert "__fdiv_rn(float(x)*47.f,float(gw-1))" in source
+
+
+def test_qwen_dead_pool_map_and_route_staging_are_not_retained():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    admission = (root / "admission.rs").read_text()
+    prefix = (root / "prefix.rs").read_text()
+    for dead in ["pool_logical", "router_host", "map_pools("]:
+        assert dead not in engine
+    assert "map_pools(" not in prefix
+    assert "pub router:" not in admission
+    assert "host.router" not in engine

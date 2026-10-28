@@ -263,7 +263,6 @@ impl PrefixFamily<Frontier> for Qwen4Prefix<'_, '_> {
         if len == 0 || len.div_ceil(UNIT_ROWS) > placement.units.len() {
             return Err(format!("restore of {len} rows into {} units", placement.units.len()).into());
         }
-        self.engine.map_pools(placement)?;
         self.move_mark(slot, placement.slot, false)?;
         placement.len = len;
         placement.state_len = len;

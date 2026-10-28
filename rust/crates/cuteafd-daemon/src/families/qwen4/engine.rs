@@ -47,7 +47,7 @@ type Dev<'a> = Rc<Allocation<'a>>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-shaped programs (`_m64`).
-pub(crate) const DECODE_ROWS: usize = 64;
+pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::qwen4::VERIFY_ROWS;
 use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS};
 // Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
 const GLM_BF16_SKINNY_ROWS: usize = 0;
@@ -421,6 +421,22 @@ mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
 
     #[test]
+    fn mtp_source_charge_uses_scheduler_verify_budget() -> anyhow::Result<()> {
+        use super::{DECODE_ROWS, MTP_DEFERRED_STEPS};
+        use crate::shared::draft::resource::trim_budget;
+        assert_eq!(DECODE_ROWS, cuteafd_loader::families::qwen4::VERIFY_ROWS);
+        for requests in 1..=DECODE_ROWS {
+            let mut depths = vec![MTP_DEFERRED_STEPS; requests];
+            trim_budget(&mut depths, DECODE_ROWS);
+            assert!(depths.iter().map(|depth| depth + 1).sum::<usize>() <= DECODE_ROWS);
+        }
+        let mut negative = vec![MTP_DEFERRED_STEPS; DECODE_ROWS];
+        assert!(negative.iter().map(|depth| depth + 1).sum::<usize>() > DECODE_ROWS);
+        assert!(trim_budget(&mut negative, DECODE_ROWS));
+        Ok(())
+    }
+
+    #[test]
     fn padded_page_rows_match_clone_and_resize() {
         for (pages, stride) in [(vec![3, 1], 4), (vec![7, 8, 9], 3), (vec![5, 6, 7], 2), (vec![], 2)] {
             let mut table = vec![-1];
@@ -722,11 +738,6 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    /// Admitted pinned route staging (the planner charges it); Spark waves
-    /// now stage in the link exchange's slots, so it stays unused until the
-    /// planner drops the charge.
-    #[allow(dead_code)]
-    router_host: RefCell<HostAllocation<'a>>,
     /// MTP steps: the source row of each row's feedback, and the greedy draft
     /// (U32 token, FP32 logit) of each head row.
     hidden_rows: Dev<'a>,
@@ -736,9 +747,8 @@ struct Workspace<'a> {
     ids: Dev<'a>,
     /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
     select: Dev<'a>,
-    /// Pinned staging of a step's host tables and input rows (async uploads)
-    /// and its fill level.
-    staging: RefCell<(HostAllocation<'a>, usize)>,
+    /// Immutable pinned sources through every queued metadata read.
+    staging: RefCell<crate::shared::token_table::RetainedUploads<'a>>,
     /// Pinned landing of the logits rows.
     logits_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
@@ -750,15 +760,6 @@ impl Workspace<'_> {
         self.live_buffer(buffer, stride).ptr
     }
     fn unit_offset(slot: usize, unit_rows: usize) -> usize { slot * unit_rows }
-
-    fn ordered_prefill_tables(&self, ple_ids: bool)
-        -> impl Iterator<Item = cuteafd_ffi::CuteafdDeviceBuffer> + '_ {
-        [&self.positions, &self.rope_positions, &self.block_rope_positions,
-            &self.kv_slots, &self.slots, &self.seq_first, &self.pool_slots,
-            &self.cache_lengths, &self.page_table, &self.pool_table, &self.ids]
-            .into_iter().chain(ple_ids.then_some(&self.ple_ids))
-            .map(|table| table.buffer).filter(|buffer| buffer.bytes > 0)
-    }
 
     fn live_buffer(&self, buffer: &Dev<'_>, stride: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
         let offset = self.row_offset.get() * stride;
@@ -972,7 +973,7 @@ impl<'a> QwenTp2<'a> {
                     bytes, device_id: self.ranks[owner].id, ..Default::default() };
                 let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: source.cast_mut(), ..dst };
                 // SAFETY: documented owner inputs are live and destination spans are nonoverlapping.
-                unsafe { self.library.copy_d2d_async(dst, src, bytes, stream)?; }
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, bytes, stream)?; }
             }
             Ok(())
         })?;
@@ -1082,10 +1083,6 @@ pub(crate) struct Qwen4Engine<'a> {
     last_stream_offset: Cell<usize>,
     /// Where the last MTP step left its output streams (decode, stream buffer).
     mtp_streams: std::cell::Cell<(bool, usize)>,
-    /// Logical page of each pool-cache page within its sequence, and its host copy (a shared
-    /// pool page sits at the same logical page in every sequence that holds it).
-    pool_logical: Dev<'a>,
-    pool_logical_host: RefCell<Vec<i32>>,
     /// Pool-cache pages: one per allocation unit (`pages / UNIT_PAGES`).
     pub pool_pages: usize,
     workspace: RefCell<Option<Workspace<'a>>>,
@@ -1214,6 +1211,9 @@ impl<'a> Qwen4Engine<'a> {
             device.run(|| Ok(Fp8QuantizeGrid::new(library.sm_count()?, None)?))).collect::<Result<Vec<_>>>()?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
+        for &(_, programs, _) in ranks {
+            super::programs::validate_all(&cfg, programs, max_context)?;
+        }
         let kv_record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim);
         let kv_suffix = if kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
         for (owner, &(_, owner_programs, _)) in ranks.iter().enumerate() {
@@ -1282,11 +1282,10 @@ impl<'a> Qwen4Engine<'a> {
         } else {
             (None, None)
         };
-        let pool_logical = zeroed(pool_pages * 4)?;
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
-            last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
-            pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
+            last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
+            pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
             peer_decode_workspace: RefCell::new(None), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
             graphs: RefCell::new(std::collections::HashMap::new()),
@@ -1369,7 +1368,6 @@ impl<'a> Qwen4Engine<'a> {
         if let Some(ple) = &self.ple {
             demands.push(("staging/mapped-table-worker".to_owned(), ple.mapped().host_workspace_bytes() as u64));
         }
-        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
         let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
         for owner in 0..self.gdn_banks.len() {
             for decode in [false, true] {
@@ -1378,18 +1376,18 @@ impl<'a> Qwen4Engine<'a> {
                     .map_or(self.prefill_rows, |shape| shape.unit_rows as usize) };
                 let logits = if decode { DECODE_ROWS } else if full_logits { self.prefill_rows } else { 1 };
                 let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
-                    spark, self.spark_bf16, !decode && self.prefill_shape.is_some(), ple_ids, logits)?;
+                    if decode { 0 } else { self.prefill_shape.map_or(0, |shape| shape.waves as usize) },
+                    matches!(self.experts, Some(Experts::Spark { .. })), self.weights.mtp.is_some(), ple_ids, logits)?;
                 let label = format!("qwen4/owner-{owner}/{}", if decode { "decode" } else { "prefill" });
-                for (kind, bytes) in [("router", host.router), ("staging", host.staging),
-                    ("ordered-tables", host.ordered), ("pinned-logits", host.logits)] {
+                for (kind, bytes) in [("staging", host.staging), ("pinned-logits", host.logits)] {
                     if bytes > 0 { demands.push((format!("{label}/{kind}"), bytes)); }
                 }
             }
         }
         if self.prefill_shape.is_some() && self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
-            let host = HostWorkspaceBytes::new(&self.cfg, self.mtp_prefill_rows(), false,
-                self.pages, self.pool_pages, spark, self.spark_bf16, false, ple_ids, 1)?;
-            for (kind, bytes) in [("router", host.router), ("staging", host.staging), ("pinned-logits", host.logits)] {
+            let host = HostWorkspaceBytes::mtp(&self.cfg, self.mtp_prefill_rows(),
+                self.pages, self.pool_pages, self.prefill_rows.div_ceil(self.mtp_prefill_rows()))?;
+            for (kind, bytes) in [("staging", host.staging), ("pinned-logits", host.logits)] {
                 demands.push((format!("qwen4/owner-0/mtp-prefill/{kind}"), bytes));
             }
         }
@@ -1403,17 +1401,7 @@ impl<'a> Qwen4Engine<'a> {
         if self.workspace.borrow().is_none() {
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
                 if self.full_prefill_logits { self.prefill_rows } else { 1 }, shape.slot_rows() as usize,
-                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?);
-        }
-        let workspace = self.workspace.borrow();
-        self.reserve_prefill_tables(workspace.as_ref().context("Qwen prefill workspace")?)
-    }
-
-    fn reserve_prefill_tables(&self, workspace: &Workspace<'_>) -> Result<()> {
-        let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
-        for destination in workspace.ordered_prefill_tables(ple_ids) {
-            // SAFETY: the engine retains each full table and its stream through completion.
-            unsafe { self.library.reserve_h2d_ordered(destination, self.execution_stream())?; }
+                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
         }
         Ok(())
     }
@@ -1654,29 +1642,9 @@ impl<'a> Qwen4Engine<'a> {
         crate::shared::l2_prefetch::exchange_wait(self.library, mark)
     }
 
-    /// Before a sequence's first step: zeroes its state slot and maps its pool pages.
+    /// Before a sequence's first step: zeroes its state slot.
     pub(crate) fn start(&self, placement: &Qwen4Placement) -> Result<()> {
-        self.map_pools(placement)?;
         self.reset_slot(placement.slot)
-    }
-
-    /// Records each of `placement`'s pool pages' logical page (the index expansion reads it).
-    /// A restored sequence maps its pages before its first step as a fresh one does; shared
-    /// pages keep the value they have.
-    pub fn map_pools(&self, placement: &Qwen4Placement) -> Result<()> {
-        let mut host = self.pool_logical_host.borrow_mut();
-        let mut changed = false;
-        for (logical, &page) in placement.pool_pages.iter().enumerate() {
-            let page = usize::try_from(page)?;
-            ensure!(page < self.pool_pages, "pool page {page} out of range");
-            changed |= std::mem::replace(&mut host[page], logical as i32) != logical as i32;
-        }
-        if changed {
-            // Entries other sequences' queued steps read keep their values.
-            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..self.pool_logical.buffer },
-                bytes_of(&host[..]))?;
-        }
-        Ok(())
     }
 
     /// Every full-attention layer's paged buffers (the MTP layer's last, when loaded): K/V
@@ -1956,7 +1924,7 @@ impl<'a> Qwen4Engine<'a> {
             let dst = Self::region(pending, slot * MTP_PENDING_ROWS * row, row);
             let src = Self::region(pending, (slot * MTP_PENDING_ROWS + last) * row, row);
             // SAFETY: disjoint rows in retained stash storage, ordered after canonical forwards.
-            unsafe { self.library.copy_d2d_async(dst, src, row, self.execution_stream())?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, row, self.execution_stream())?; }
         }
         Ok(())
     }
@@ -2031,10 +1999,10 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn workspace(&self, t: usize, decode: bool, logit_rows: usize) -> Result<Workspace<'a>> {
-        self.workspace_rows(t, decode, logit_rows, t, 0)
+        self.workspace_rows(t, decode, logit_rows, t, 0, 0)
     }
 
-    fn workspace_rows(&self, t: usize, decode: bool, logit_rows: usize, span: usize, terminal_rows: usize)
+    fn workspace_rows(&self, t: usize, decode: bool, logit_rows: usize, span: usize, terminal_rows: usize, units: usize)
         -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
@@ -2053,10 +2021,14 @@ impl<'a> Qwen4Engine<'a> {
         let topk_scratch = self.scratch(&format!("qwen4_index_topk_{cap}")).unwrap_or(0);
         let blocks = self.cfg.index_budget / BLOCK;
         let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
-        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
         let tables = super::admission::StepTableBytes::new(t, decode, self.pages, self.pool_pages, self.cfg.ple_rows())?;
-        let host = super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
-            spark, self.spark_bf16, false, false, logit_rows)?;
+        let host = if !decode && self.prefill_shape.is_some() && units == 0 {
+            super::admission::HostWorkspaceBytes::mtp(&self.cfg, t, self.pages, self.pool_pages, self.prefill_rows.div_ceil(t))?
+        } else {
+            super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
+                units, matches!(self.experts, Some(Experts::Spark { .. })), self.weights.mtp.is_some(),
+                self.ple.as_ref().map(|ple| ple.mapped()).is_none(), logit_rows)?
+        };
         let (topk, heads, hd) = (self.cfg.topk, self.cfg.heads, self.cfg.head_dim);
         Ok(Workspace {
             rows: t, slot_rows: span, row_offset: Cell::new(0), position: Cell::new(0), units: Cell::new(false),
@@ -2107,13 +2079,13 @@ impl<'a> Qwen4Engine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.router)?)?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
             ids: self.alloc(tables.ids)?,
             select: self.alloc(logit_rows * 8)?,
             logits_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.logits)?)?),
-            staging: RefCell::new((HostAllocation::new(self.library, usize::try_from(host.staging)?)?, 0)),
+            staging: RefCell::new(crate::shared::token_table::RetainedUploads::new(
+                Device { library: self.library, id: self.library.cuda_get_device()? }, host.uploads)?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
                 self.cfg.vocab_size as u32)? },
@@ -2128,27 +2100,6 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(());
         }
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
-    }
-
-    /// Starts a step's staged uploads (the previous step's have drained).
-    fn begin_staging(&self, w: &Workspace<'_>) -> Result<()> {
-        if w.units.get() { return Ok(()); }
-        // SAFETY: the engine owns this stream; its earlier copies read the staging bytes.
-        unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
-        w.staging.borrow_mut().1 = 0;
-        Ok(())
-    }
-
-    /// Like [`Self::begin_staging`], but keeps appending to the staging (no
-    /// host wait) while `bytes` more still fit: queued steps (MTP draft
-    /// chains) then run back to back.
-    fn continue_staging(&self, w: &Workspace<'_>, bytes: usize) -> Result<()> {
-        if w.units.get() { return Ok(()); }
-        let (capacity, used) = { let staging = w.staging.borrow(); (staging.0.buffer.bytes, staging.1) };
-        if used + bytes > capacity {
-            self.begin_staging(w)?;
-        }
-        Ok(())
     }
 
     /// Stage the step's ids for a device gather from either table placement.
@@ -2167,29 +2118,9 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Queues `bytes` into `dst` through the workspace's pinned staging.
     fn stage(&self, w: &Workspace<'_>, dst: cuteafd_ffi::CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        ensure!(bytes.len() <= dst.bytes, "staged upload exceeds its buffer");
-        if w.units.get() {
-            // SAFETY: unit-table readers and rewrites use this stream; the
-            // library retains the upload's pinned source through its copy event.
-            return unsafe { self.library.copy_h2d_ordered(dst, bytes, self.execution_stream()) };
-        }
-        let mut staging = w.staging.borrow_mut();
-        let at = staging.1;
-        ensure!(at + bytes.len() <= staging.0.buffer.bytes, "step inputs exceed the staging buffer");
-        staging.0.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes);
-        let source = cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: `at` lies inside the pinned staging buffer.
-            ptr: unsafe { staging.0.buffer.ptr.cast::<u8>().add(at) }.cast(),
-            bytes: bytes.len(),
-            ..staging.0.buffer
-        };
-        // SAFETY: the staged bytes stay untouched until `begin_staging` drains the stream.
-        unsafe { self.library.copy_host_buffer_h2d_async(dst, source, bytes.len(), self.execution_stream())? };
-        staging.1 = (at + bytes.len()).div_ceil(16) * 16;
-        Ok(())
+        // SAFETY: this workspace and all table readers share the execution
+        // stream; the arena retains each immutable source through its read.
+        unsafe { w.staging.borrow_mut().upload(dst, bytes, self.execution_stream()) }
     }
 
     fn stage_table<T: Copy>(&self, w: &Workspace<'_>, dev: &Dev<'_>, values: &[T]) -> Result<()> {
@@ -2306,7 +2237,7 @@ impl<'a> Qwen4Engine<'a> {
             self.drain_state()?;
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
                 if self.full_prefill_logits { self.prefill_rows } else { logit_rows }, shape.slot_rows() as usize,
-                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?);
+                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
             self.prepare_prefill_units()?;
         }
         let workspace = self.workspace.borrow();
@@ -2484,6 +2415,10 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
+    pub(crate) fn last_target_decode(&self) -> bool {
+        self.last_streams.get().0
+    }
+
     /// Copies target stream rows of the last step (`decode`: the decode
     /// workspace, else the prefill one) into the MTP stash: `(state slot,
     /// first step row, rows, first stash row)` per sequence.
@@ -2507,7 +2442,7 @@ impl<'a> Qwen4Engine<'a> {
             } else { &w.streams[cur] };
             let src = Self::region(source, first * row, count * row);
             // SAFETY: both regions lie inside live buffers; the stream orders the copy.
-            unsafe { self.library.copy_d2d_async(dst, src, count * row, self.execution_stream())? };
+            unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, count * row, self.execution_stream())? };
         }
         Ok(())
     }
@@ -2608,10 +2543,6 @@ impl<'a> Qwen4Engine<'a> {
                 } else { (w.streams[cur].buffer.ptr, cur ^ 1) }
             }
         };
-        // Staged bytes (16-byte aligned tables, then the embedding rows at most).
-        let staged = 16 * 16 + t * (8 * 3 + 4 * 4 + 24) + (tables.page_table.len() + tables.pool_table.len()) * 4
-            + t * h * 2;
-        self.continue_staging(w, staged)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
         self.stage_table(w, &w.rope_positions, &tables.rope_positions)?;
         self.stage_table(w, &w.block_rope_positions, &tables.block_rope_positions)?;
@@ -2670,7 +2601,7 @@ impl<'a> Qwen4Engine<'a> {
             ensure!(r < t, "MTP head row {r} of {t}");
             // SAFETY: row r of `x` and row i of `delta` lie inside [t, H] buffers.
             unsafe {
-                self.library.copy_d2d_async(Self::region(&w.delta, i * row, row), Self::region(&w.x, r * row, row),
+                crate::shared::memory::device::copy_device_ordered(self.library, Self::region(&w.delta, i * row, row), Self::region(&w.x, r * row, row),
                     row, self.execution_stream())?;
             }
         }
@@ -2689,7 +2620,7 @@ impl<'a> Qwen4Engine<'a> {
                 ensure!(step < MTP_DEFERRED_STEPS, "deferred MTP step {step}");
                 let at = Self::region(&self.mtp_drafts, step * DECODE_ROWS * 4, n * 4);
                 // SAFETY: both regions are live; the stream orders the copy after the argmax.
-                unsafe { self.library.copy_d2d_async(at, Self::region(&w.argmax, 0, n * 4), n * 4, self.execution_stream())? };
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, at, Self::region(&w.argmax, 0, n * 4), n * 4, self.execution_stream())? };
                 return Ok((Vec::new(), None));
             }
             MtpOut::Download { logits } => logits,
@@ -2734,7 +2665,7 @@ impl<'a> Qwen4Engine<'a> {
     pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
         *self.workspace.borrow_mut() = Some(match self.prefill_shape {
             Some(shape) => self.workspace_rows(shape.unit_rows as usize, false, self.prefill_rows,
-                shape.slot_rows() as usize, if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?,
+                shape.slot_rows() as usize, if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?,
             None => self.workspace(self.prefill_rows, false, self.prefill_rows)?,
         });
         self.full_prefill_logits = true;
@@ -2772,7 +2703,6 @@ impl<'a> Qwen4Engine<'a> {
         let w = workspace.as_ref().context("workspace")?;
         w.position.set(tables.positions.first().copied().unwrap_or(0) as usize);
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
-        self.begin_staging(w)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
         self.stage_table(w, &w.rope_positions, &tables.rope_positions)?;
         self.stage_table(w, &w.block_rope_positions, &tables.block_rope_positions)?;
@@ -2862,7 +2792,6 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn stage_step_tables(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
-        self.begin_staging(w)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
         self.stage_table(w, &w.rope_positions, &tables.rope_positions)?;
         self.stage_table(w, &w.block_rope_positions, &tables.block_rope_positions)?;
@@ -2967,7 +2896,7 @@ impl<'a> Qwen4Engine<'a> {
                         let dst = work[next_owner].streams[cur[next_owner]].buffer;
                         let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..dst };
                         // SAFETY: hop wait precedes this same-owner copy into persistent streams.
-                        unsafe { self.library.copy_d2d_async(dst, src, t * HC * h * 2, self.execution_stream()) }
+                        unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, t * HC * h * 2, self.execution_stream()) }
                     })?;
                 }
                 self.on_owner(next_owner, || {
@@ -2984,7 +2913,7 @@ impl<'a> Qwen4Engine<'a> {
             let dst = work[0].streams[cur[0]].buffer;
             let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..dst };
             // SAFETY: exit wait precedes the head/MTP owner-zero stream copy.
-            unsafe { self.library.copy_d2d_async(dst, src, t * HC * h * 2, self.execution_stream())?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, t * HC * h * 2, self.execution_stream())?; }
             self.last_streams.set((tables.decode, cur[0]));
             if layers.len() < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?;
@@ -3022,7 +2951,7 @@ impl<'a> Qwen4Engine<'a> {
                     let dst = w.streams[cur[1]].buffer;
                     let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..dst };
                     // SAFETY: cutover land orders this copy before owner-one attention graph.
-                    unsafe { self.library.copy_d2d_async(dst, src, t * HC * self.cfg.hidden * 2, self.execution_stream()) }
+                    unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, t * HC * self.cfg.hidden * 2, self.execution_stream()) }
                 })?;
             }
             self.on_owner(owner, || {
@@ -3082,7 +3011,7 @@ impl<'a> Qwen4Engine<'a> {
             let dst = work[0].streams[cur[0]].buffer;
             let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..dst };
             // SAFETY: exit land precedes persistent root stream copy/head graph.
-            unsafe { self.library.copy_d2d_async(dst, src, t * HC * self.cfg.hidden * 2, self.execution_stream())?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, t * HC * self.cfg.hidden * 2, self.execution_stream())?; }
             self.replay(key(n), || {
                 if head {
                     self.head(work[0], &work[0].streams[cur[0]], t, rows, t)?;
@@ -3563,7 +3492,7 @@ impl<'a> Qwen4Engine<'a> {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                                 w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
-                            self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
+                            crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
@@ -3609,7 +3538,7 @@ impl<'a> Qwen4Engine<'a> {
                 unsafe {
                     experts.run(layer, t, w.wire.buffer.ptr,
                         w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
-                    self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
+                    crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                 }
                 return Ok(());
             }
@@ -3636,7 +3565,7 @@ impl<'a> Qwen4Engine<'a> {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                                 w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
-                            self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
+                            crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
@@ -3644,7 +3573,7 @@ impl<'a> Qwen4Engine<'a> {
             }
             Experts::SharedOnly => {
                 // SAFETY: both are live [t, H] BF16 buffers ordered on the stream.
-                unsafe { self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), w.live_buffer(&w.shared, self.cfg.hidden * 2), t * h * 2, self.execution_stream())? };
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), w.live_buffer(&w.shared, self.cfg.hidden * 2), t * h * 2, self.execution_stream())? };
                 return Ok(());
             }
         }
@@ -3839,7 +3768,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
             let src = self.w.live_buffer(&self.w.streams[cur], stride);
             let dst = Qwen4Engine::region(terminal, unit.rows.start * stride, bytes);
             // SAFETY: disjoint, admitted terminal and slot rows; the stream orders reuse.
-            unsafe { engine.library.copy_d2d_async(dst, src, bytes, engine.execution_stream())?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, dst, src, bytes, engine.execution_stream())?; }
         }
         let first = self.tokens.len() - self.logit_rows;
         let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
