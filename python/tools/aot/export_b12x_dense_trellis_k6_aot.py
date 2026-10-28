@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kimi K3 native K6 core projections (shared trellis ABI v1, opt-in).
+"""Shared native K6 core projections (trellis ABI v1).
 
 Dimensions are local [K,N] after TP2 placement, not the full checkpoint sizes.
 Whole/replicated MLA and latent operands retain their full dimensions. kv_a
@@ -23,7 +23,7 @@ import _pinned_sparkinfer
 
 # (name, K, N, shard side): side 1 = output units, side 2 = input units.
 # Whole/replicated tensors use output units, as their EXL3 payload is unsliced.
-TRELLIS_SHAPES = (
+KIMI_SHAPES = (
     ("kda_qkvg_tp2", 7168, 6144, 1),
     ("kda_o_tp2", 6144, 7168, 2),
     ("shared_gate_up_tp2", 7168, 3072, 1),
@@ -40,20 +40,54 @@ TRELLIS_SHAPES = (
 )
 
 
+# GLM 5.3 architecture, with whole and TP2 attention/FFN ownership. Builds do
+# not read checkpoints; runtime headers must match one of these exact shapes.
+GLM_SHAPES = (
+    ("glm_q_a", 6144, 2048, 1),
+    ("glm_kv_a_padded", 6144, 640, 1),
+    ("glm_q_b", 2048, 16384, 1),
+    ("glm_q_b_tp2", 2048, 8192, 1),
+    ("glm_o", 16384, 6144, 1),
+    ("glm_o_tp2", 8192, 6144, 2),
+    ("glm_dense_gate_up", 6144, 12288, 1),
+    ("glm_dense_gate_up_tp2", 6144, 6144, 1),
+    ("glm_dense_down", 12288, 6144, 1),
+    ("glm_dense_down_tp2", 6144, 6144, 2),
+    ("glm_shared_gate_up", 6144, 2048, 1),
+    ("glm_shared_gate_up_tp2", 6144, 1024, 1),
+    ("glm_shared_down", 2048, 6144, 1),
+    ("glm_shared_down_tp2", 1024, 6144, 2),
+    ("glm_lm_head", 6144, 154880, 1),
+)
+FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES}
+F32_OUTPUTS = (163840, 154880)
+
+
+def shapes_for(families):
+    """Canonicalize equal geometries so runtime lookup is never ambiguous."""
+    result, seen = [], set()
+    for family in families:
+        for item in FAMILY_SHAPES[family]:
+            if item[1:] not in seen:
+                result.append(item)
+                seen.add(item[1:])
+    return tuple(result)
+
+
 # Projections sharing one activation and geometry, launched as one group of four.
 GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
 GROUPED_MAX_ROWS = 4096
 
 
-def row_policies():
+def row_policies(families=("kimik3",)):
     result = []
-    for name, k, n, side in TRELLIS_SHAPES:
+    for name, k, n, side in shapes_for(families):
         for book in ("mcg", "mul1"):
             result.append(dict(shape=name, input_features=k, output_features=n,
                 sharded_side=side, codebook=book,
                 native_program=f"trellis_{name}_{book}",
                 native_input=f"trellis_input_k{k}_bf16",
-                output_program=f"trellis_output_n{n}_{'f32' if n == 163840 else 'bf16'}",
+                output_program=f"trellis_output_n{n}_{'f32' if n in F32_OUTPUTS else 'bf16'}",
                 **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {})))
     return result
 
@@ -66,11 +100,21 @@ def grouped_policy(name, k, n, book):
                 output_program=f"trellis_output_n{n}_bf16_g{groups}")
 
 
-def programs(*, input_dtype="f16"):
-    return programs_for_shapes(TRELLIS_SHAPES, input_dtype=input_dtype)
+def programs(*, families=("kimik3",), input_dtype="f16"):
+    # Keep all Kimi compile calls in their original order. Other families append
+    # only new geometry/transform entries, including in a multi-family build.
+    result, seen_names, seen_shapes = [], set(), set()
+    for family in families:
+        shapes = tuple(shape for shape in shapes_for((family,)) if shape[1:] not in seen_shapes)
+        seen_shapes.update(shape[1:] for shape in shapes)
+        for item in programs_for_shapes(shapes, input_dtype=input_dtype):
+            if item[0] not in seen_names:
+                result.append(item)
+                seen_names.add(item[0])
+    return result
 
 
-def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=(163840,), input_dtype="f16"):
+def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input_dtype="f16"):
     """Explicit-shape hook for small native fixture packages; production uses the table."""
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
     from b12x.integration.cuteafd.trellis_transform import (
@@ -122,7 +166,7 @@ def main():
     parser.add_argument("--only", help="comma-separated program names")
     args = parser.parse_args()
     from export_b12x_dsv4_aot import main as export
-    sys.argv = [sys.argv[0], "--geometry", "kimi_k6_dense", "--output-dir", str(args.output_dir)]
+    sys.argv = [sys.argv[0], "--geometry", "dense_trellis_k6", "--output-dir", str(args.output_dir)]
     if args.only:
         sys.argv += ["--only", args.only]
     export()

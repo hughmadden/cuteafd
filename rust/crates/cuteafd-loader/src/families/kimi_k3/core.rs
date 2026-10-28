@@ -105,7 +105,7 @@ impl CoreCharges {
                 .context("Kimi core stage charge underflow")?
         };
         Ok(Self {
-            projection: projection_scratch(cfg,core,unit,&manifest["families"]["kimi_k6_dense"] )?,
+            projection: projection_scratch(cfg,core,unit,&manifest["families"]["dense_trellis_k6"] )?,
             stages, stage_bytes,
             receive: exchange_recv_bytes(unit,needs_f32_partials(cfg,core))?,
         })

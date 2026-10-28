@@ -229,7 +229,7 @@ impl<'a> CorePrograms<'a> {
         }
         let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound projections");};
         let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch(cfg,inventory,rows,
-            programs.family_metadata("kimi_k6_dense")?)?.context("K6 planned scratch absent")?;
+            programs.family_metadata("dense_trellis_k6")?)?.context("K6 planned scratch absent")?;
         ensure!(layout.extents==planned.extents && layout.rows==planned.rows,
             "K6 runtime/planner aggregate scratch differs");
         let kda=[KimiKdaCore::load(programs,"kda_core_h48_m64",64,true)?,
@@ -344,7 +344,7 @@ mod runtime_layout_tests {
             }
         }
         let metadata=serde_json::json!({"abi_version":1,"row_policies":policies});
-        let manifest=serde_json::json!({"programs":programs,"families":{"kimi_k6_dense":metadata}});
+        let manifest=serde_json::json!({"programs":programs,"families":{"dense_trellis_k6":metadata}});
         // `rows` lane rows of `unit`-row units: one-unit lanes and the 4096 x 2 lane.
         for (rows,unit) in [(1,1),(16,16),(63,63),(64,64),(4096,4096),(8192,4096),(8256,2752),(8192,2048)] {
             for on in [false,true] {
@@ -380,8 +380,8 @@ mod runtime_layout_tests {
         }
         // A duplicate exact geometry is ambiguous, never selected by table order.
         let mut duplicate=manifest.clone();
-        let first=duplicate["families"]["kimi_k6_dense"]["row_policies"][0].clone();
-        duplicate["families"]["kimi_k6_dense"]["row_policies"].as_array_mut().unwrap().push(first);
+        let first=duplicate["families"]["dense_trellis_k6"]["row_policies"][0].clone();
+        duplicate["families"]["dense_trellis_k6"]["row_policies"].as_array_mut().unwrap().push(first);
         assert!(CoreCharges::from_package(&cfg,&inventory,64,64,&duplicate).is_err());
         Ok(())
     }

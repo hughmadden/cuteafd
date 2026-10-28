@@ -1,12 +1,17 @@
-"""CPU-only contracts for local Kimi core shapes and shared ABI exports."""
+"""CPU-only contracts for Kimi/GLM core shapes and shared ABI exports."""
 import ast
+import json
+import os
+import struct
+
+import pytest
 from pathlib import Path
 import runpy
 import sys
 from types import ModuleType
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPORTER = ROOT / "python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
+EXPORTER = ROOT / "python/tools/aot/export_b12x_dense_trellis_k6_aot.py"
 
 
 def load_exporter(monkeypatch):
@@ -17,7 +22,7 @@ def load_exporter(monkeypatch):
 
 
 def test_local_shapes_and_sides(monkeypatch):
-    shapes = load_exporter(monkeypatch)["TRELLIS_SHAPES"]
+    shapes = load_exporter(monkeypatch)["KIMI_SHAPES"]
     assert len({name for name, *_ in shapes}) == len(shapes)
     assert {(k, n, side) for _, k, n, side in shapes} == {
         (7168, 6144, 1), (6144, 7168, 2), (7168, 3072, 1), (3072, 7168, 2),
@@ -54,7 +59,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
             assert params["output_dtype"] == "bf16"
     programs = [item for item in programs if not item[2].get("groups")]
     core = [item for item in programs if item[1] == "trellis_linear"]
-    assert len(core) == 2 * len(module["TRELLIS_SHAPES"])
+    assert len(core) == 2 * len(module["KIMI_SHAPES"])
     for _, op, params, compile_program in core:
         assert op == "trellis_linear"
         assert params["bits"] == 6
@@ -105,7 +110,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
 def test_comparison_group_is_opt_in():
     groups = runpy.run_path(str(ROOT / "scripts/build/compare-sm-exports.py"))["jobs"]("all")
     group = next(row for row in groups if row[0] == "kimi-k6-dense")
-    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"])
+    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "dense_trellis_k6,kimi_split"])
 
 
 def test_native_only_policy_has_no_dequant_scratch(monkeypatch):
@@ -143,3 +148,96 @@ def test_bf16_diagnostic_specialization_preserves_stems_and_default(monkeypatch)
             assert original.get("output_dtype", "f16") == "f16"
         else:
             assert params == original
+
+
+def test_glm_architecture_geometries_and_unique_policy_lookup(monkeypatch):
+    module = load_exporter(monkeypatch)
+    shapes = module["shapes_for"](("glm",))
+    assert {(k, n, side) for _, k, n, side in shapes} == {
+        (6144, 2048, 1), (6144, 640, 1), (2048, 16384, 1), (2048, 8192, 1),
+        (16384, 6144, 1), (8192, 6144, 2), (6144, 12288, 1), (6144, 6144, 1),
+        (12288, 6144, 1), (6144, 6144, 2), (6144, 1024, 1), (2048, 6144, 1),
+        (1024, 6144, 2), (6144, 154880, 1),
+    }
+    policies = module["row_policies"](("kimik3", "glm"))
+    keys = [(p["input_features"], p["output_features"], p["sharded_side"], p["codebook"])
+            for p in policies]
+    assert len(set(keys)) == len(keys)
+    assert all(k % 128 == n % 128 == 0 for _, k, n, _ in shapes)
+    head = next(p for p in policies if p["shape"] == "glm_lm_head")
+    assert head["output_program"] == "trellis_output_n154880_f32"
+    assert (6144, 576, 1) not in {item[1:] for item in shapes}
+
+
+def test_adding_glm_preserves_every_kimi_compile_input_and_order(monkeypatch):
+    module = load_exporter(monkeypatch)
+    for name, methods in (
+        ("b12x.integration.cuteafd.trellis_linear", ("compile_trellis_linear_aot",)),
+        ("b12x.integration.cuteafd.trellis_transform", ("compile_trellis_input_aot", "compile_trellis_output_aot")),
+    ):
+        fake = ModuleType(name)
+        for method in methods:
+            setattr(fake, method, lambda **params: params)
+        monkeypatch.setitem(sys.modules, name, fake)
+    kimi = module["programs"](input_dtype="bf16")
+    combined = module["programs"](families=("kimik3", "glm"), input_dtype="bf16")
+    assert [p[:3] for p in combined[:len(kimi)]] == [p[:3] for p in kimi]
+    assert len({p[0] for p in combined}) == len(combined)
+    assert all(thunk() == params for _, _, params, thunk in combined)
+    names = {item[0] for item in combined}
+    for policy in module["row_policies"](("kimik3", "glm")):
+        assert all(policy[field] in names for field in ("native_program", "native_input", "output_program"))
+    assert not any(p[2].get("groups") for p in module["programs"](families=("glm",)))
+
+
+def test_glm_static_table_matches_installed_published_checkpoint_headers(monkeypatch):
+    module = load_exporter(monkeypatch)
+    home = Path(os.environ.get("HF_HOME", "/mnt/sparknest/hf-home"))
+    snapshot = (home / "hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6/snapshots"
+                / "5a4e83a09a11f3145332ed632d28a9894ea88225")
+    if not (snapshot / "model.safetensors.index.json").is_file():
+        pytest.skip("published GLM Core-K6 checkpoint is not installed")
+    config = json.loads((snapshot / "config.json").read_text())
+    h, heads = config["hidden_size"], config["num_attention_heads"]
+    expected = {"lm_head": (config["vocab_size"], h, "whole")}
+    for layer in range(config["num_hidden_layers"]):
+        root = f"model.layers.{layer}"
+        for leaf, n, k, split in (
+            ("q_a_proj", config["q_lora_rank"], h, "whole"),
+            ("kv_a_proj_with_mqa", config["kv_lora_rank"] + config["qk_rope_head_dim"], h, "whole"),
+            ("q_b_proj", heads * (config["qk_nope_head_dim"] + config["qk_rope_head_dim"]), config["q_lora_rank"], "output"),
+            ("o_proj", h, heads * config["v_head_dim"], "input"),
+        ):
+            expected[f"{root}.self_attn.{leaf}"] = (n, k, split)
+        dense = layer < config["first_k_dense_replace"]
+        inter = config["intermediate_size"] if dense else config["moe_intermediate_size"] * config["n_shared_experts"]
+        mlp = "mlp" if dense else "mlp.shared_experts"
+        for leaf, n, k, split in (("gate_proj", inter, h, "output"), ("up_proj", inter, h, "output"),
+                                  ("down_proj", h, inter, "input")):
+            expected[f"{root}.{mlp}.{leaf}"] = (n, k, split)
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+    wanted = {f"{stem}.{suffix}" for stem in expected for suffix in ("trellis", "suh", "svh", "mcg")}
+    assert wanted <= index.keys()
+    headers = {}
+    for shard in sorted({index[name] for name in wanted}):
+        path = snapshot / shard
+        if not path.is_file():
+            pytest.skip(f"published GLM Core-K6 shard is not installed: {shard}")
+        with path.open("rb") as stream:
+            size, = struct.unpack("<Q", stream.read(8))
+            assert 0 < size <= 64 * 1024 * 1024
+            header = json.loads(stream.read(size))
+        headers.update((name, header[name]) for name in wanted if index[name] == shard)
+    geometries = {shape[1:] for shape in module["shapes_for"](("glm",))}
+    for stem, (n, k, split) in expected.items():
+        stored = ((n + 127) // 128) * 128 if stem.endswith(".kv_a_proj_with_mqa") else n
+        for suffix, dtype, shape in (("trellis", "I16", [k // 16, stored // 16, 96]),
+                                     ("suh", "F16", [k]), ("svh", "F16", [stored]), ("mcg", "I32", [])):
+            tensor = headers[f"{stem}.{suffix}"]
+            assert (tensor["dtype"], tensor["shape"]) == (dtype, shape), (stem, suffix, tensor)
+        for world in ((1,) if split == "whole" else (1, 2)):
+            local_k = k // world if split == "input" else k
+            local_n = stored // world if split == "output" else stored
+            side = 2 if split == "input" and world == 2 else 1
+            assert (local_k, local_n, side) in geometries, (stem, local_k, local_n, side)
+    assert len(expected) == 547

@@ -824,7 +824,9 @@ def main() -> None:
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
                              "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
                              "glm_stage/glm2_stage (dormant full/TP2 GLM primitive boundaries), "
-                             "kimi_k6_dense (native K6 core projections)")
+                             "dense_trellis_k6 (native K6 core projections)")
+    parser.add_argument("--dense-trellis-families", default="kimik3",
+                        help="architecture tables for dense_trellis_k6: kimik3,glm (no checkpoint reads)")
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -852,10 +854,14 @@ def main() -> None:
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    requested_dense = set(args.dense_trellis_families.split(","))
+    if not requested_dense or requested_dense - {"kimik3", "glm"}:
+        raise SystemExit("--dense-trellis-families takes kimik3 and/or glm")
+    dense_families = tuple(name for name in ("kimik3", "glm") if name in requested_dense)
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimi_k6_dense", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, kimi_k6_dense, kimi_split and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -892,15 +898,15 @@ def main() -> None:
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
             continue
-        if name == "kimi_k6_dense":
-            from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs, row_policies
+        if name == "dense_trellis_k6":
+            from export_b12x_dense_trellis_k6_aot import programs as dense_programs, row_policies
             manifest["families"][name] = {
                 "abi_version": 1,
-                "row_policies": row_policies(),
+                "architectures": dense_families,
+                "row_policies": row_policies(dense_families),
                 "measured_not_exported": ["tiled_mcg"],
             }
-            # Diagnostic only: isolate activation range from native T2 integration.
-            work += [(name, *item) for item in kimi_dense_programs(input_dtype="bf16")]
+            work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
             continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs

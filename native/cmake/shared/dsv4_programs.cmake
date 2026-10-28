@@ -75,10 +75,21 @@ if(CUTEAFD_ENABLE_KIMIK3_AOT)
   # Kimi always packages the native K6 core programs; the runtime selects them
   # from the checkpoint's own headers.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimi_k6_dense,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")
   endif()
+endif()
+set(CUTEAFD_DENSE_TRELLIS_FAMILIES "")
+if(CUTEAFD_ENABLE_KIMIK3_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES kimik3)
+endif()
+if(CUTEAFD_ENABLE_GLM_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES glm)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+  set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glm_stage,glm2_stage")
 endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
   # Last: every family program keeps its object and table index.
@@ -88,7 +99,10 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8")
   endif()
   if(CUTEAFD_EXLR8_ROLE STREQUAL "coordinator")
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense,glm_stage,glm2_stage")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense")
+    if(NOT CUTEAFD_ENABLE_GLM_AOT)
+      set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glm_stage,glm2_stage")
+    endif()
   endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
@@ -100,6 +114,10 @@ set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
   --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}" --context-split "${context_split_aot}")
+if(CUTEAFD_DENSE_TRELLIS_FAMILIES)
+  string(REPLACE ";" "," dense_trellis_families "${CUTEAFD_DENSE_TRELLIS_FAMILIES}")
+  list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --dense-trellis-families "${dense_trellis_families}")
+endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
   # Without EXLR8 the export arguments (and the stamp) are unchanged.
   list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}")
@@ -122,7 +140,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_dense_aot.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dense_trellis_k6_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting coordinator programs (${CUTEAFD_PROGRAM_GEOMETRY})"
