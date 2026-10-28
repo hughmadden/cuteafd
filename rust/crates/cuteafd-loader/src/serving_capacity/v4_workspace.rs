@@ -6,16 +6,15 @@ use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Small cards reserve workspaces and graphs explicitly, with the shared
-/// free-memory floor. PRO cards retain the historical total reserve envelope.
+/// Exact workspaces and graphs sit beside a fixed free-memory floor.
+/// Larger caller-requested reserves retain their total-envelope semantics.
 pub fn deepseek_v4_headroom_bytes(total_bytes: u64, reserve_bytes: u64, workspace_bytes: u64,
     graph_bytes: u64) -> u64 {
     let small = cuteafd_core::serving_capacity::small_card_headroom_bytes(total_bytes);
-    let remainder = reserve_bytes.saturating_sub(workspace_bytes.saturating_add(graph_bytes));
-    if small > 0 {
-        // Preserve larger caller-requested envelopes; only the default shrinks.
-        if reserve_bytes > 10 << 30 { small.max(remainder) } else { small }
-    } else { remainder.max(3 << 30) }
+    let floor = if small > 0 { small } else { 3 << 30 };
+    if reserve_bytes > 10 << 30 {
+        floor.max(reserve_bytes.saturating_sub(workspace_bytes.saturating_add(graph_bytes)))
+    } else { floor }
 }
 
 /// C128 rows use the stride baked into the exported sparse MLA program,
@@ -345,22 +344,33 @@ mod tests {
     }
 
     #[test]
-    fn small_card_headroom_keeps_exact_workspaces_and_pro_envelope() {
+    fn fixed_headroom_returns_workspace_savings_to_admission() {
         use cuteafd_core::serving_capacity::{GpuMemoryBudget, SMALL_CARD_HEADROOM_BYTES};
         let reserve = 10 << 30;
-        let workspace = 4 << 30;
         let graph = 400 << 20;
-        for gib in [31.8, 32.0] {
+        let before_workspace = 4 << 30;
+        let after_workspace = 3 << 30;
+        for (gib, floor) in [(31.8, SMALL_CARD_HEADROOM_BYTES),
+            (32.0, SMALL_CARD_HEADROOM_BYTES), (95.5, 3 << 30)] {
             let total = GpuMemoryBudget::from_gib(gib).unwrap().0;
-            assert_eq!(deepseek_v4_headroom_bytes(total, reserve, workspace, graph),
-                SMALL_CARD_HEADROOM_BYTES);
-            assert_eq!(deepseek_v4_headroom_bytes(total, 20 << 30, workspace, graph),
-                (20 << 30) - workspace - graph);
+            let free = |workspace, requested| total - workspace - graph
+                - deepseek_v4_headroom_bytes(total, requested, workspace, graph);
+            for workspace in [0, after_workspace, before_workspace, 9 << 30] {
+                assert_eq!(deepseek_v4_headroom_bytes(total, reserve, workspace, graph), floor);
+            }
+            assert_eq!(free(after_workspace, reserve) - free(before_workspace, reserve),
+                before_workspace - after_workspace);
+            // The old total-envelope formula would hide every byte saved.
+            let old_free = |workspace: u64| total - workspace - graph
+                - reserve.saturating_sub(workspace + graph).max(floor);
+            assert_eq!(old_free(after_workspace), old_free(before_workspace));
+            assert_ne!(free(after_workspace, reserve), old_free(after_workspace));
+            // Explicit larger reserves still bound workspace + graphs + headroom.
+            assert_eq!(deepseek_v4_headroom_bytes(total, 20 << 30, before_workspace, graph),
+                (20 << 30) - before_workspace - graph);
+            assert_eq!(free(after_workspace, 20 << 30), free(before_workspace, 20 << 30));
+            assert_eq!(deepseek_v4_headroom_bytes(total, 20 << 30, 19 << 30, graph), floor);
         }
-        let pro = GpuMemoryBudget::from_gib(95.5).unwrap().0;
-        assert_eq!(deepseek_v4_headroom_bytes(pro, reserve, workspace, graph),
-            reserve - workspace - graph);
-        assert_eq!(deepseek_v4_headroom_bytes(pro, reserve, 9 << 30, graph), 3 << 30);
     }
 
     #[test]

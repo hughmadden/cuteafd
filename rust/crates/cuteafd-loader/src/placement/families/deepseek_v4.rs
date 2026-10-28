@@ -41,8 +41,8 @@ pub struct V4Inputs<'a> {
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
     /// dSpark stages that hold caches (all the checkpoint's stages).
     pub cache_stages: usize,
-    /// Per-GPU total bytes and baseline; one or two entries. The V4 reserve
-    /// becomes each GPU's headroom.
+    /// Per-GPU total bytes and baseline; one or two entries. Exact workspaces
+    /// use a fixed headroom floor unless the caller requests a larger envelope.
     pub gpus: Vec<(u64, Baseline)>,
     /// Lower bound for that reserve (`plan --headroom-gib`).
     pub headroom_floor: u64,
@@ -52,7 +52,7 @@ pub struct V4Inputs<'a> {
     pub prefill_waves: u64,
     pub decode_rows: u64,
     pub max_context: u64,
-    /// `--reserve-gib` in bytes.
+    /// `--reserve-gib` in bytes; values above the default retain a total envelope.
     pub reserve_bytes: u64,
     /// Prefix mark slots (`MarkArena::slots_for`), 0 without a prefix cache.
     pub mark_slots: u64,

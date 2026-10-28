@@ -2098,7 +2098,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             assert_eq!(records.bytes, (cache.ranks[0].persistent_unit_bytes
                 + cache.ranks[0].pool_metadata_unit_bytes + runtime[0].pool_unit_device_bytes) * (32768 / 256));
             let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
-            // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
+            // Default headroom is independent of the separately charged workspaces and code.
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
                 total, 10 << 30, steps.bytes + code, graph));
