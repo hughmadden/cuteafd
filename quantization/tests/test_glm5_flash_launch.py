@@ -107,3 +107,17 @@ def test_failed_gpu_job_cannot_publish(tmp_path, monkeypatch):
     monkeypatch.setattr(launch.signal, "signal", lambda *args: None)
     assert launch.supervise(path) == 2
     assert calls == [["leased-gpu"]]
+
+
+@pytest.mark.parametrize("lfs", [False, True])
+def test_source_audit_checks_hub_content_identity_and_rejects_corruption(tmp_path, lfs):
+    from glm5_flash.core_k6.source_audit import hash_file
+    data = b"original checkpoint bytes"
+    path = tmp_path / "weight-or-asset"
+    path.write_bytes(data)
+    expected = dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest() if lfs else None,
+        git_blob_sha1=hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest())
+    assert hash_file(path, expected)["sha256"] == hashlib.sha256(data).hexdigest()
+    path.write_bytes(b"X" + data[1:])
+    with pytest.raises(ValueError, match="checksum differs"):
+        hash_file(path, expected)

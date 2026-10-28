@@ -59,12 +59,25 @@ def qualified(report_path, fork_commit):
     return report
 
 
+def audited_source(path):
+    from .recipe import BASE_REPO, BASE_REVISION
+    report = json.loads(Path(path).read_text())
+    if (report.get("status") != "passed" or report.get("repo_id") != BASE_REPO
+            or report.get("revision") != BASE_REVISION or len(report.get("files", {})) != 130):
+        raise ValueError("complete pinned source checksum audit is required")
+    for name in ("config.json", "model.safetensors.index.json"):
+        if sha256_file(Path(report["source"]) / name) != report["files"][name]["sha256"]:
+            raise ValueError("source metadata changed after checksum audit")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qualification-only", action="store_true")
     parser.add_argument("--publication-only", action="store_true")
     parser.add_argument("--qualification-report", type=Path, default=Path.home() /
         ".cache/cuteafd/quantization/glm53-flash-k4-core-k6/pilot/qualification.json")
+    parser.add_argument("--source-audit", type=Path, default=Path.home() /
+        ".cache/cuteafd/builds/glmf-core-k6/source-audit.json")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
@@ -77,6 +90,7 @@ def main():
         require_local_source()
         if not args.qualification_only:
             qualified(args.qualification_report, commit)
+            audited_source(args.source_audit)
         smi = shutil.which("nvidia-smi") or "/usr/lib/wsl/lib/nvidia-smi"
         devices = subprocess.check_output([smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
                                           text=True, timeout=30).strip().splitlines()
