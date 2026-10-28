@@ -331,8 +331,10 @@ impl<'a> Execution<'a> {
                 PeerInputs::new(devices[1], reserve)?,
             ],
             shared: SharedWave::on_storage(crate::families::deepseek_v41::v41_backbone_shared::tp2::Storage::new(shared, reserve, capacity)?),
+            // One resident load serves every arena: each pair is admitted at
+            // its own capacity (prefill unit cap, or a decode lane's width).
             routed: OwnerPair::with_modules(
-                routed,
+                [routed[0].with_max_rows(capacity as usize)?, routed[1].with_max_rows(capacity as usize)?],
                 capacity,
                 cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
                 std::env::var_os("CUTEAFD_TP2_TIMING").is_some(),
@@ -1101,6 +1103,31 @@ mod shared_storage_tests {
     #[test]
     #[ignore = "requires actual TP2 routed/shared kernels, snapshot and two GPUs"]
     fn tp2_ffn_without_owner_guard_clobbers_gated_peer_reader()->Result<()> {for _ in 0..3 {run(false)?;}Ok(())}
+    /// 2-RTX assembly at k = 2/3/4: one routed load at the unit cap serves the
+    /// slots' shared arena (reserve 8192, unit U) and both decode lanes at
+    /// their own width, each pair admitted at its arena's capacity.
+    #[test]
+    #[ignore = "requires actual TP2 routed/shared kernels, snapshot and two GPUs"]
+    fn one_routed_load_builds_slot_storage_and_decode_lanes_at_every_k()->Result<()> {
+        let lib=unsafe {cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};lib.cuda_set_device(0)?;
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
+        let decode=crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS;
+        for unit in [4096u32,2752,2048] {
+            let routed=load_routed_weights(devices,&catalog,1,unit,[8_000_000_000;2],
+                std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()))?;
+            let shared=[Rc::new(vec![SharedWeights::load(devices[0],&catalog,0,SharedWeights::load_peak_device_bytes())?]),
+                Rc::new(vec![SharedWeights::load(devices[1],&catalog,0,SharedWeights::load_peak_device_bytes())?])];
+            let storage=Storage::new(routed.clone(),shared.clone(),1,8192,unit,[None,None])?;
+            let lanes=[Wave::new(routed.clone(),shared.clone(),1,decode,[None,None])?,
+                Wave::new(routed.clone(),shared.clone(),1,decode,[None,None])?];
+            assert_eq!(storage.execution.try_lock().unwrap().capacity,unit);
+            for lane in &lanes {assert_eq!(lane.storage.execution.try_lock().unwrap().capacity,decode);}
+            assert!(routed.iter().all(|w| w.max_rows()==unit as usize),"re-admission must not change the loaded handle");
+            eprintln!("k unit {unit}: slot storage + 2 decode lanes at {decode} built");
+        }
+        Ok(())
+    }
     #[test]
     fn peer_input_storage_bytes_equal_planned_allocations() {
         assert_eq!(PeerInputs::allocation_sizes(8192).into_iter().sum::<usize>(),8192*15568);

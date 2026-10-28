@@ -659,6 +659,14 @@ impl<'a> OwnerWeights<'a> {
             Self::Exl3(w) => w.max_rows(),
         }
     }
+    /// The same resident weights admitted at `max_rows` (one load serves the
+    /// prefill arena at the unit cap and the decode lanes at their width).
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        Ok(match self {
+            Self::Native(w) => Self::Native(w.with_max_rows(max_rows)?),
+            Self::Exl3(w) => Self::Exl3(w.with_max_rows(max_rows)?),
+        })
+    }
     fn execution(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<OwnerExecution<'a>> {
         Ok(match self {
             Self::Native(w) => {

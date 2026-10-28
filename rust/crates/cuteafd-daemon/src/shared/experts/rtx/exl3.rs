@@ -67,6 +67,13 @@ impl<'a> Exl3Tp2Weights<'a> {
     pub(crate) fn execution(&self) -> Result<Exl3Tp2<'a>> {
         self.execution_with_modules(None)
     }
+    /// The same resident weights admitted at another row capacity: lanes built
+    /// from it select packages, workspace and output at `max_rows`.
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        let workspace_bytes = Exl3Tp2::workspace_bytes_for_selection(&self.package, self.geometry.hidden as usize,
+            max_rows, self.row_policy, self.selection)?;
+        Ok(Self { max_rows, workspace_bytes, ..self.clone() })
+    }
     pub(crate) fn execution_with_modules(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<Exl3Tp2<'a>> {
         let reduction_plan = match self.selection {
             RtxSelectionPolicy::FirstCapacity => None,

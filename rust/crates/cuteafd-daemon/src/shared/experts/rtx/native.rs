@@ -179,6 +179,13 @@ impl<'a> NativeTp2Weights<'a> {
     pub(crate) fn uses_bf16_input(&self) -> bool {
         self.weights[0].is_nvfp4()
     }
+    /// The same resident weights admitted at another row capacity: executions
+    /// built from it size kernel capacities, scratch and output at `max_rows`.
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        let workspace_bytes = NativeTp2::workspace_bytes_for_format(self.device.library, max_rows,
+            self.selection, self.output_policy, self.uses_bf16_input())?;
+        Ok(Self { max_rows, workspace_bytes, ..self.clone() })
+    }
 }
 
 impl<'a> NativeTp2<'a> {
