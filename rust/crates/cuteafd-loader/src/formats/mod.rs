@@ -4,6 +4,7 @@ pub(crate) mod attention_format;
 pub mod block_dspark;
 pub mod dflash;
 pub mod dense_trellis;
+pub mod trellis_core;
 pub mod mla;
 pub(crate) mod dspark_format;
 pub(crate) mod exl3_format;
