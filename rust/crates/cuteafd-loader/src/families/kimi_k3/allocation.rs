@@ -92,6 +92,7 @@ impl NativeLaneLayout {
         let bytes = self.operands.get(name).context("Kimi metadata plane absent")?;
         ensure!(bytes % self.metadata_banks() == 0, "Kimi metadata bank stride");
         let stride = bytes / self.metadata_banks();
+        ensure!(stride >= 16 && stride % 16 == 0, "Kimi metadata bank alignment");
         Ok((bank * stride, stride))
     }
 
@@ -141,10 +142,12 @@ impl NativeLaneLayout {
             .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
         // A call stages each unit once. Metadata survives all its layers, so
         // in-flight units require disjoint banks, including a <=64-row tail.
+        // Native kernels require every bank pointer, not just its base, aligned.
         let banks = Self::metadata_banks_for(rows, unit);
         for name in ATTENTION_METADATA {
             let bytes = operands.get_mut(name).expect("attention metadata plane");
-            *bytes = bytes.checked_mul(banks).context("Kimi metadata banks overflow")?;
+            let stride = bytes.checked_add(15).context("Kimi metadata alignment overflow")? / 16 * 16;
+            *bytes = stride.checked_mul(banks).context("Kimi metadata banks overflow")?;
         }
         let mut arena_offsets = BTreeMap::new();
         let mut arena_bytes = 0;
@@ -500,6 +503,8 @@ mod tests {
                 let (offset, bytes) = layout.metadata_extent(name, bank)?;
                 assert_eq!(offset, end);
                 assert!(bytes >= 16);
+                assert_eq!(offset % 16, 0, "{name} bank {bank} offset");
+                assert_eq!(bytes % 16, 0, "{name} bank {bank} stride");
                 end += bytes;
             }
             assert_eq!(end, layout.operands[name]);
@@ -509,6 +514,37 @@ mod tests {
         let mut bad = layout.clone();
         *bad.operands.get_mut("KDA slots").unwrap() -= 1;
         assert!(bad.metadata_extent("KDA slots", 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_metadata_bank_is_aligned_even_for_odd_unit_and_context_extents() -> Result<()> {
+        for (rows, unit, context) in [(768, 256, 1_048_576), (8256, 2752, 1_048_576),
+            (195, 65, 65), (195, 65, 129), (9, 3, 65), (51, 17, 129)] {
+            let layout = NativeLaneLayout::new(&cfg(), rows, unit, context,
+                NativeScratch { kda: 16, mla: [16; 3] })?;
+            let requests = unit.min(64);
+            for (name, raw) in [("KDA slots", unit * 4), ("KDA first", unit * 4),
+                ("MLA slots", unit * 8), ("MLA page table", requests * context.div_ceil(64) * 4),
+                ("MLA lengths", requests * 4), ("MLA query offsets", (requests + 1) * 4)] {
+                let stride = raw.max(16).div_ceil(16) * 16;
+                assert_eq!(layout.operands[name], stride * layout.metadata_banks());
+                for bank in 0..layout.metadata_banks() {
+                    assert_eq!(layout.metadata_extent(name, bank)?, (bank * stride, stride));
+                    assert_eq!((bank * stride) % 16, 0, "{name} bank {bank}");
+                }
+            }
+        }
+        // Negative control: the former 65-i32 stride misaligned banks 1 and 2.
+        let mut old = NativeLaneLayout::new(&cfg(), 768, 256, 1_048_576,
+            NativeScratch { kda: 16, mla: [16; 3] })?;
+        let old_stride = 65 * 4;
+        old.operands.insert("MLA query offsets", old_stride * old.metadata_banks());
+        assert_eq!(old_stride, 260);
+        assert_ne!(old_stride % 16, 0);
+        for bank in 0..old.metadata_banks() {
+            assert!(old.metadata_extent("MLA query offsets", bank).is_err());
+        }
         Ok(())
     }
 
