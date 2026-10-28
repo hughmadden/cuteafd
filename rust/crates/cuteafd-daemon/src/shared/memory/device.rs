@@ -385,7 +385,7 @@ pub(crate) unsafe fn copy_device_ordered(library: &NativeLibrary, destination: C
     ensure!(destination.device_id == source.device_id && bytes <= destination.bytes && bytes <= source.bytes,
         "device-ordered copy exceeds admitted same-device buffers");
     if bytes == 0 || destination.ptr == source.ptr { return Ok(()); }
-    if sm_peer_copy_for(true, bytes) {
+    if sm_peer_copy_for(true, bytes, DECODE_PEER_COPY_BYTES) {
         // SAFETY: caller retains both regions; the issuing stream orders all readers.
         unsafe { library.sm_copy_regions(&[(destination.ptr, source.ptr.cast_const(), bytes as u64)], stream) }
     } else {
