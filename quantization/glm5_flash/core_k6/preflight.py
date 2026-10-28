@@ -43,7 +43,8 @@ def verify_fork():
 
 
 def qualified(report_path, fork_commit):
-    report = json.loads(Path(report_path).read_text())
+    from .pilot import validate_qualification
+    report = validate_qualification(json.loads(Path(report_path).read_text()))
     identity = report["identity"]
     if (report.get("status") != "passed" or identity.get("gptqmodel_commit") != fork_commit
             or any(report.get("native_checks", {}).get(name) is not True for name in CHECKS)

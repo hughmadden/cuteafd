@@ -38,11 +38,14 @@ def test_pilot_has_short_timeout_and_fresh_qualification_admission():
 
 
 def test_qualification_rejects_failed_checks_changed_source_and_wrong_fork(tmp_path, monkeypatch):
+    from glm5_flash.core_k6 import pilot
     monkeypatch.setattr(preflight, "REPO", tmp_path)
     code = tmp_path / "run.py"
     code.write_text("producer version 1")
     proof = dict(status="passed", layers=[1, 4, 7],
         native_checks={k: True for k in preflight.CHECKS},
+        results=[dict(tensor=name, arm=arm, nmse=0 if arm=="bf16" else 1e-4 if arm=="mcg-k6" else 5e-4)
+                 for layer in pilot.LAYERS for name in pilot.modules(layer) for arm in pilot.ARMS],
         identity=dict(gptqmodel_commit="fork", code={"run.py": hashlib.sha256(code.read_bytes()).hexdigest()}))
     path = tmp_path / "proof.json"
     path.write_text(json.dumps(proof))
@@ -51,7 +54,7 @@ def test_qualification_rejects_failed_checks_changed_source_and_wrong_fork(tmp_p
         preflight.qualified(path, "other-fork")
     proof["native_checks"]["mtp_boundary_byte_exact"] = False
     path.write_text(json.dumps(proof))
-    with pytest.raises(ValueError, match="incomplete"):
+    with pytest.raises(ValueError, match="qualification failed"):
         preflight.qualified(path, "fork")
     proof["native_checks"]["mtp_boundary_byte_exact"] = True
     path.write_text(json.dumps(proof))
