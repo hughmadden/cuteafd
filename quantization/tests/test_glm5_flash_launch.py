@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import shlex
+import runpy
 import sys
 from types import SimpleNamespace
 
@@ -10,6 +11,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from glm5_flash.core_k6 import launch, preflight
+
+
+def test_file_entrypoint_preserves_relative_qualification_imports():
+    namespace = runpy.run_path(str(Path(preflight.__file__)), run_name="preflight_cli_smoke")
+    assert namespace["__package__"] == "glm5_flash.core_k6"
 
 
 def test_gpu_lease_is_on_raptor_but_numerics_and_preflights_are_on_maxq():

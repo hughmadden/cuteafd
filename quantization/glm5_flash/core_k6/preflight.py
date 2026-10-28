@@ -12,6 +12,8 @@ import sys
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "quantization"))
+if __package__ in (None, ""):
+    __package__ = "glm5_flash.core_k6"
 from kimi_k3.uniform_k2.storage import sha256_file
 from kimi_k3.core_k6.container import IMAGE
 
