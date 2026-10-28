@@ -907,7 +907,7 @@ mod tests {
             exchange_f32: false,
             attention_placement: "auto".into(),
             context_tokens: 262144,
-            prefill_rows: 4096,
+            prefill_rows: 0,
             full_prefill_logits: false,
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,

@@ -55,6 +55,10 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
+                for flag, value in [("--prefill-rows", "2752"), ("--prefill-waves", "3")]:
+                    before["command"][before["command"].index(flag) + 1] = value
+                position = before["command"].index("--prefill-waves") + 2
+                before["command"][position:position] = ["--prefill-span-rows", "16384"]
             ranks = int(selected["set"]["SPARK_COUNT"])
             if entry["family"] == "qwen4":
                 # Local stays one wave; remote PLE admits at most two waves.

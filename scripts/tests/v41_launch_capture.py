@@ -136,16 +136,22 @@ if tool == "docker":
             response["decode_lanes"] = decode_lanes
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
-            if family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4"}:
+            if family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mimo_v2"}:
                 # Mirror the shared topology policy, including the declared PLE/FP8 holds.
                 waves = int(value("--prefill-waves", "0")) or (1 if int(ranks) == 0 else 2 if int(ranks) < 6 else 3)
                 native_glm = family in {"glm5", "glm5_flash"} and os.environ.get("CAPTURE_EXL3") != "1"
                 if "--prefill-waves" not in args and (family in {"qwen4", "step5"} or native_glm):
                     waves = min(waves, 2)
+                if family == "mimo_v2":
+                    waves = 3
                 unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]
                 span = int(value("--prefill-span-rows", "0")) or unit * waves
-                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
+                if family == "mimo_v2":
+                    span = 16384
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_slots=waves, prefill_span_rows=span)
             report = dict(response)
+            if family == "mimo_v2":
+                report["prefill_lanes"] = response["prefill_waves"]
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
             response.update(version=1, family=family, executable=True, wip_launchable=True,

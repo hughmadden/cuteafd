@@ -113,7 +113,7 @@ fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
         .join("../../../examples/configs/mimo-v26-pro-mxfp4-max.config");
     let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
         .arg("plan").arg(snapshot.path()).arg("--config").arg(example)
-        .args(["--deployment", "--rtx", "2", "--prefill-rows", "4096",
+        .args(["--deployment", "--rtx", "2", "--prefill-rows", "2752",
             "--vision", "off", "--audio", "off", "--speculator", "off",
             "--workspace-manifest"]).arg(manifest).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -121,8 +121,9 @@ fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
     assert_eq!(deployment["family"], "mimo_v2");
     assert_eq!(deployment["rtx_gpus"], 2);
     assert_eq!(deployment["spark_ranks"], 6);
-    assert_eq!(deployment["prefill_unit_rows"], 4096);
-    assert_eq!(deployment["prefill_waves"], 1);
+    assert_eq!(deployment["prefill_unit_rows"], 2752);
+    assert_eq!(deployment["prefill_waves"], 3);
+    assert!(deployment.get("prefill_slots").is_none());
 }
 
 #[test]
