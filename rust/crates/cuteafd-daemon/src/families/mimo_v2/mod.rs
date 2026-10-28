@@ -909,11 +909,9 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
         let automatic_context = args.max_context == 0;
-        let shape = cuteafd_loader::families::mimo_v2::admission::prefill_shape(
-            usize::from(args.peers.is_some()), (args.prefill_rows > 0).then_some(args.prefill_rows as u64))?;
+        let shape = admission::resolved_prefill_shape(usize::from(args.peers.is_some()),
+            args.prefill_rows, args.prefill_waves)?;
         let depth = shape.waves as usize;
-        anyhow::ensure!(args.prefill_waves == 0 || args.prefill_waves == depth,
-            "MiMo prefill waves must match shared topology depth {depth}");
         let mut resolved = args.clone();
         resolved.prefill_rows = shape.unit_rows as usize;
         resolved.prefill_waves = depth;

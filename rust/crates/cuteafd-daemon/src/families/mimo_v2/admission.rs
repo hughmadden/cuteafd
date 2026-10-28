@@ -156,38 +156,6 @@ mod draft_prefix_tests {
     }
 
     #[test]
-    fn admission_halves_units_without_changing_wave_count_and_stops_at_first_fit() {
-        use cuteafd_loader::serving_capacity::{select_prefill_shape, PrefillShape};
-        use cuteafd_core::serving_capacity::CapacityError;
-        for waves in [1, 2, 3] {
-            let mut tried = Vec::new();
-            let (selected, _) = select_prefill_shape(PrefillShape { unit_rows: 4096, waves }, false, |shape| {
-                let rows = shape.unit_rows;
-                tried.push(rows);
-                if rows > 1024 { return Err(CapacityError::ReservationsExceeded {
-                    device: 0, reserved: rows, budget: 1024,
-                }.into()); }
-                Ok(())
-            }, |_| 0, prefill_fit_error).unwrap();
-            assert_eq!(selected, PrefillShape { unit_rows: 1024, waves });
-            assert_eq!(tried, [4096, 2048, 1024]);
-        }
-        let mut tried = Vec::new();
-        let result = select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 3 }, false, |shape| {
-            tried.push(shape.unit_rows);
-            Err::<(), _>(anyhow::anyhow!("missing program metadata"))
-        }, |_| 0, prefill_fit_error);
-        assert!(result.unwrap_err().to_string().contains("missing program metadata"));
-        assert_eq!(tried, [4096]);
-        let mut tried = Vec::new();
-        assert!(select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 2 }, false, |shape| {
-            tried.push(shape.unit_rows);
-            Err::<(), _>(CapacityError::PoolExceeded { requested: 4096, feasible: 0 }.into())
-        }, |_| 0, prefill_fit_error).is_err());
-        assert_eq!(tried, [4096, 2048, 1024, 512]);
-    }
-
-    #[test]
     fn shared_sampler_contract_matches_allocator() {
         for vocab in [64, 152576, 153600] {
             assert_eq!(cuteafd_loader::families::mimo_v2::admission::sampling_wave_bytes(64, vocab),
@@ -213,6 +181,15 @@ mod draft_prefix_tests {
     }
 }
 
+pub(super) fn resolved_prefill_shape(spark_ranks: usize, rows: usize, waves: usize)
+    -> Result<cuteafd_loader::serving_capacity::PrefillShape> {
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    Ok(prefill_shape(spark_ranks, PrefillLimits::default(), PrefillOverrides {
+        unit_rows: (rows > 0).then_some(rows as u64),
+        waves: (waves > 0).then_some(waves as u64), ..Default::default()
+    })?.units())
+}
+
 /// Resolve physical reservations after module preload, before model allocations.
 /// The same profile can be serialized by a planner; explicit benchmark pool
 /// and context arguments are always preserved.
@@ -226,25 +203,8 @@ pub(super) fn preflight(
     prefix_draft: bool,
     automatic_context: bool,
 ) -> Result<Preflight> {
-    let shape = prefill_shape(usize::from(args.peers.is_some()), Some(args.prefill_rows as u64))?;
-    let (_, result) = cuteafd_loader::serving_capacity::select_prefill_shape(shape,
-        false, |candidate| {
-            let mut selected = args.clone();
-            selected.prefill_rows = usize::try_from(candidate.unit_rows)?;
-            preflight_shape(opened, &selected, programs, split_device, serving,
-                prefill_output, prefix_draft, automatic_context)
-        }, |result| result.capacity.allocated_gpu_kv_tokens, prefill_fit_error)?;
-    Ok(result)
-}
-
-fn prefill_fit_error(error: &anyhow::Error) -> bool {
-    use cuteafd_core::serving_capacity::CapacityError;
-    use cuteafd_loader::serving_capacity::CacheGeometryError;
-    matches!(error.downcast_ref::<CapacityError>(),
-        Some(CapacityError::GpuBudgetExceeded { .. } | CapacityError::ReservationsExceeded { .. }
-            | CapacityError::PoolExceeded { .. }))
-        || matches!(error.downcast_ref::<CacheGeometryError>(),
-            Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement")
+    preflight_shape(opened, args, programs, split_device, serving,
+        prefill_output, prefix_draft, automatic_context)
 }
 
 fn preflight_shape(
@@ -371,7 +331,8 @@ fn preflight_shape(
         .iter()
         .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
         .collect::<Vec<_>>();
-    let transport_lanes = prefill_shape(usize::from(args.peers.is_some()), None)?.waves as usize;
+    let transport_lanes = resolved_prefill_shape(usize::from(args.peers.is_some()),
+        args.prefill_rows, args.prefill_waves)?.waves as usize;
     let spark_ranks = match args
         .peers
         .as_deref()
@@ -918,6 +879,22 @@ mod tests {
         assert!(super::prefill_shape(6, Some(4096)).is_err());
         let local = super::prefill_shape(0, None).unwrap();
         assert_eq!((local.unit_rows, local.waves), (4096, 1));
+    }
+
+    #[test]
+    fn explicit_prefill_pins_match_shared_planner_without_fallback() {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        for ranks in [0, 2, 6] { for (rows, waves) in [(0, 0), (1024, 0), (4096, 2), (2752, 3), (2048, 4), (4096, 3)] {
+            let runtime = super::resolved_prefill_shape(ranks, rows, waves);
+            let planner = prefill_shape(ranks, PrefillLimits::default(), PrefillOverrides {
+                unit_rows: (rows > 0).then_some(rows as u64),
+                waves: (waves > 0).then_some(waves as u64), ..Default::default()
+            });
+            match planner {
+                Ok(shape) => assert_eq!(runtime.unwrap(), shape.units()),
+                Err(_) => assert!(runtime.is_err(), "invalid pin must not shrink"),
+            }
+        } }
     }
 
     #[test]

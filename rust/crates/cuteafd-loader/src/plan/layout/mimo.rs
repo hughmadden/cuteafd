@@ -7,13 +7,13 @@ use anyhow::{Context, Result};
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
-    let initial = match prefill_shape(spark_ranks, (options.prefill_rows > 0).then_some(options.prefill_rows).or(options.prefill_unit_rows)) {
-        Ok(shape) => shape,
-        Err(error) => return unsupported_prefill(report, error),
-    };
-    options.prefill_unit_rows = Some(initial.unit_rows);
-    options.prefill_waves = initial.waves;
-    options.prefill_lanes = initial.waves;
+    // MiMo's external chunk is independent of the shared live-slot arena.
+    let external_span = options.prefill_span_rows.take().unwrap_or(16384);
+    let selected = super::resolve_prefill(report, options, spark_ranks,
+        crate::serving_capacity::prefill_waves::PrefillLimits::default());
+    options.prefill_span_rows = Some(external_span);
+    if let Err(error) = selected { return unsupported_prefill(report, error); }
+    report.prefill_span_rows = Some(external_span);
     let shape = Shape::resolve(report, model, options,
         ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
     let (concurrency, context, manifest) = (shape.concurrency, shape.context_tokens,
@@ -57,7 +57,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // solve. An explicit POOL_TOKENS stays strict.
         media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
-        match select_and_apply(input, &mut media_options, &mut admission, spark_ranks, concurrency, context, manifest) {
+        match apply_resolved(input, &mut media_options, &mut admission, spark_ranks, concurrency, context, manifest) {
             Ok((placement, working)) => {
                 if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
@@ -94,9 +94,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     let mut pool_tokens = 0;
     let mut waste = Vec::new();
-    match select_and_apply(input, options, &mut devices, spark_ranks, concurrency, context, manifest) {
+    match apply_resolved(input, options, &mut devices, spark_ranks, concurrency, context, manifest) {
         Ok((placement, working)) => {
-            report.prefill_span_rows = Some(16384);
+            report.prefill_span_rows = Some(external_span);
             report.prefill_transports = Some(u64::from(spark_ranks > 0));
             report.prefill_unit_rows = options.prefill_unit_rows;
             report.prefill_waves = Some(options.prefill_waves);
@@ -366,36 +366,14 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     Ok((costs, workspace, tp2_workspace, onboard))
 }
 
-/// Retry every candidate from the same pre-admission inventory. Failed solves
-/// publish refusal reservations, so reusing their devices would double-charge.
+/// Admit the planner-selected rows exactly; only the shared reserve search retries.
 #[allow(clippy::too_many_arguments)]
-fn select_and_apply(input: &super::super::PlanInput, options: &mut LayoutOptions,
+fn apply_resolved(input: &super::super::PlanInput, options: &mut LayoutOptions,
     devices: &mut Vec<DeviceLayout>, spark_ranks: usize, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>)
     -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet)> {
-    use crate::serving_capacity::{select_prefill_shape, CacheGeometryError};
-    let shape = prefill_shape(spark_ranks, (options.prefill_rows > 0).then_some(options.prefill_rows).or(options.prefill_unit_rows))?;
-    let initial = devices.clone();
-    let (shape, (placement, working, admitted)) = select_prefill_shape(
-        shape, false, // Reserve shrinks only on allocation failure, never for KV.
-        |candidate| {
-            let mut trial = initial.clone();
-            let mut selected = options.clone();
-            selected.prefill_lanes = candidate.waves;
-            let result = apply_selected(input, &selected, &mut trial, spark_ranks,
-                candidate.unit_rows, concurrency, context, manifest);
-            match result {
-                Ok((placement, working)) => Ok((placement, working, trial)),
-                Err(error) => { *devices = trial; Err(error) }
-            }
-        }, |(placement, _, _)| placement.pool_tokens,
-        |error| matches!(error.downcast_ref::<CacheGeometryError>(),
-            Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement"))?;
-    options.prefill_unit_rows = Some(shape.unit_rows);
-    options.prefill_waves = working.prefill_lanes;
-    options.prefill_lanes = working.prefill_lanes;
-    *devices = admitted;
-    Ok((placement, working))
+    let rows = options.prefill_unit_rows.context("MiMo prefill shape must be resolved before admission")?;
+    apply_selected(input, options, devices, spark_ranks, rows, concurrency, context, manifest)
 }
 
 #[cfg(test)]
@@ -566,14 +544,15 @@ mod tests {
         let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path()).unwrap());
         for rows in [1024, 2048, 2752] {
             let mut options = LayoutOptions { rtx_bytes: vec![95 * GIB], pool_tokens: Some(32768),
-                prefill_rows: rows, concurrency: 4, ..Default::default() };
+                prefill_rows: rows, prefill_unit_rows: Some(rows), prefill_waves: 3, prefill_lanes: 3,
+                concurrency: 4, ..Default::default() };
             let initial = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
                 capacity_bytes: 95 * GIB, items: vec![], kv_tokens: 0 }];
             let mut expected = initial.clone();
             let (placement, working) = apply_selected(&input, &options, &mut expected,
                 4, rows, 4, 32768, None).unwrap();
             let mut actual = initial;
-            let selected = select_and_apply(&input, &mut options, &mut actual,
+            let selected = apply_resolved(&input, &mut options, &mut actual,
                 4, 4, 32768, None).unwrap();
             assert_eq!(selected.0, placement);
             assert_eq!(selected.1, working);

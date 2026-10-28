@@ -549,6 +549,7 @@ mod tests {
                     layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
                         onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
+                let capacity = u32::try_from(report.prefill_unit_rows.unwrap()).unwrap();
                 let layout = report.memory_layout.unwrap();
                 let sparks = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
                 assert_eq!(sparks.len(), ranks, "pro={pro} {input:?}: {}", layout.render());
@@ -557,12 +558,12 @@ mod tests {
                         .unwrap_or_else(|| panic!("pro={pro} {input:?} {}: no {group}", device.name())).bytes;
                     // Match the coordinator's heterogeneous decode/prefill endpoint admission.
                     let mut worker = config(ranks, device.index as usize, None);
-                    worker.capacity = 4096;
+                    worker.capacity = capacity;
                     worker.rdma_endpoints = 2;
                     worker.bf16_ingress = input.bf16(false);
-                    set_model(&mut worker, 4096, input.bf16(false), 2);
+                    set_model(&mut worker, capacity, input.bf16(false), 2);
                     worker.model_admission.as_mut().unwrap().endpoints =
-                        cuteafd_loader::families::mimo_v2::admission::spark_endpoints(4096, input)
+                        cuteafd_loader::families::mimo_v2::admission::spark_endpoints(capacity as usize, input)
                             .unwrap().to_vec();
                     let rings = worker_ring_geometry(&worker).unwrap();
                     let sample = selected_spark_io(&worker, geometry, rings).unwrap();

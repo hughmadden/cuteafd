@@ -400,6 +400,45 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
 }
 
 #[test]
+fn every_family_caps_the_shared_reserve_only_to_fit_a_fake_card() {
+    use crate::serving_capacity::prefill_waves::{depth, unit_rows_in, RESERVE_ROWS, ROW_PAGE};
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let template = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    for family in family::registry() {
+        let limits = family.prefill_limits();
+        let waves = depth(6, limits);
+        let candidates: Vec<_> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
+            .filter(|&reserve| unit_rows_in(waves, reserve) >= limits.min_unit_rows).collect();
+        // Fixed owners plus one byte per live row: no KV target influences fit.
+        for capacity in [16384, 4096] {
+            let mut tried = Vec::new();
+            let selected = largest_fitting_prefill(&candidates, |reserve| {
+                tried.push(reserve);
+                let mut report = template.clone();
+                let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
+                options.prefill_reserve_rows = Some(reserve);
+                let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+                assert_eq!(shape.waves, waves, "{}", family.id());
+                assert_eq!(options.spark_capacity_rows, shape.unit_rows);
+                Ok((1024 + shape.span_rows <= capacity).then_some((reserve, shape)))
+            }).unwrap().unwrap();
+            let (reserve, shape) = selected;
+            assert_eq!(reserve % ROW_PAGE, 0, "{}", family.id());
+            assert!(shape.unit_rows >= limits.min_unit_rows, "{}", family.id());
+            assert_eq!(shape.unit_rows, unit_rows_in(waves, reserve));
+            if capacity == 16384 {
+                assert_eq!(reserve, RESERVE_ROWS, "{}", family.id());
+                assert_eq!(tried, [RESERVE_ROWS]);
+            } else {
+                assert!(reserve < RESERVE_ROWS, "{}", family.id());
+                assert!(1024 + waves * unit_rows_in(waves, reserve + ROW_PAGE) > capacity,
+                    "{} must select the largest fitting reserve", family.id());
+            }
+        }
+    }
+}
+
+#[test]
 fn shared_prefill_reserve_refusals_are_typed() {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillError, PrefillLimits, PrefillOverrides};
     for waves in [3, 4] {

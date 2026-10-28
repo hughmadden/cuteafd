@@ -1207,6 +1207,20 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     report.experts = contract;
 }
 
+/// Descending reserve candidates; a failed smallest candidate ends admission.
+fn largest_fitting_prefill<T>(candidates: &[u64], mut admit: impl FnMut(u64)
+    -> Result<Option<T>, PlanError>) -> Result<Option<T>, PlanError> {
+    let Some(&full) = candidates.first() else { return Ok(None); };
+    if let Some(result) = admit(full)? { return Ok(Some(result)); }
+    let Some(mut best) = admit(*candidates.last().unwrap())? else { return Ok(None); };
+    let (mut lo, mut hi) = (candidates.len() - 1, 0);
+    while lo - hi > 1 {
+        let mid = (lo + hi) / 2;
+        if let Some(result) = admit(candidates[mid])? { lo = mid; best = result; } else { hi = mid; }
+    }
+    Ok(Some(best))
+}
+
 /// Plan an exact count, or the widest feasible count in the available inventory.
 /// Count policy never depends on card size; each candidate uses the same admission.
 pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize,
@@ -1229,7 +1243,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
         let mut report = input.plan(&candidate)?;
-        if report.family.as_deref() != Some("deepseek_v41") || candidate.layout.is_none() {
+        if ranks == 0 || candidate.layout.is_none() {
             return Ok(report);
         }
         // The prefill reserve is sized first (TJ 2026-10-27): the largest
@@ -1249,7 +1263,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             if !report.executable() {
                 let (rows, waves) = (report.prefill_unit_rows.unwrap_or(0), report.prefill_waves.unwrap_or(0));
                 report.hints.push(Hint {
-                    what: format!("explicit V4.1 prefill shape {waves} x {rows} rows refused by checkpoint or memory admission"),
+                    what: format!("explicit prefill shape {waves} x {rows} rows refused by checkpoint or memory admission"),
                     how: "Keep the requested shape with more memory, or omit PREFILL_ROWS for the automatic reserve.".into(),
                 });
             }
@@ -1269,30 +1283,19 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
         };
-        // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`).
+        let limits = family::registry().iter().find(|family| Some(family.id()) == report.family.as_deref())
+            .map(|family| family.prefill_limits()).unwrap_or_default();
         let waves = report.prefill_waves.unwrap_or(crate::serving_capacity::prefill_waves::DEPTH);
         let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
-            .filter(|&reserve| unit_rows_in(waves, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
+            .filter(|&reserve| unit_rows_in(waves, reserve) >= limits.min_unit_rows)
             .collect();
-        // The largest candidate (descending) that fits, by bisection; None
-        // when the smallest does not.
-        let mut largest = || -> Result<Option<PlanReport>, PlanError> {
-            let full = at(RESERVE_ROWS)?;
-            if full.executable() { return Ok(Some(full)); }
-            let smallest = at(*candidates.last().unwrap())?;
-            if !smallest.executable() { return Ok(None); }
-            let (mut lo, mut hi, mut best) = (candidates.len() - 1, 0, smallest);
-            while lo - hi > 1 {
-                let mid = (lo + hi) / 2;
-                let report = at(candidates[mid])?;
-                if report.executable() { lo = mid; best = report; } else { hi = mid; }
-            }
-            Ok(Some(best))
-        };
-        if let Some(best) = largest()? { return Ok(best); }
+        if let Some(best) = largest_fitting_prefill(&candidates, |reserve| {
+            let report = at(reserve)?;
+            Ok(report.executable().then_some(report))
+        })? { return Ok(best); }
         let mut refused = at(RESERVE_ROWS)?;
         refused.hints.push(Hint {
-            what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
+            what: format!("prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
                 candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
             how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
         });
