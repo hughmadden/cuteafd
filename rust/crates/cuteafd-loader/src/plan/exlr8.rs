@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::read_json;
-use super::spec::Family;
+use super::Family;
 use super::format::{
     BlockScale, Encoding, RowTiling, ScaleDirection, ScaleEncoding, TrellisCodebook,
 };
