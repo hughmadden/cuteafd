@@ -278,14 +278,15 @@ impl ProgramSet {
     /// Selected runtime program names use the same prefix filter as PROGRAMS.json.
     pub fn from_names<'a>(families: &[&str], names: impl IntoIterator<Item = &'a str>) -> Self {
         Self { families: families.iter().map(|f| f.to_string()).collect(),
-            names: names.into_iter().filter(|name| name.split_once('_')
-                .is_some_and(|(prefix, _)| families.contains(&prefix))).map(str::to_string).collect(),
+            names: names.into_iter().filter(|name| cuteafd_core::coordinator_programs::program_namespace(name)
+                .is_some_and(|prefix| families.contains(&prefix))).map(str::to_string).collect(),
             scratch: Vec::new() }
     }
 
     /// Programs of `families` in `manifest` (PROGRAMS.json).
     pub fn from_manifest(manifest: &Value, families: &[&str]) -> Self {
-        let keep = |name: &str| name.split_once('_').is_some_and(|(prefix, _)| families.contains(&prefix));
+        let keep = |name: &str| cuteafd_core::coordinator_programs::program_namespace(name)
+            .is_some_and(|prefix| families.contains(&prefix));
         let mut names = Vec::new();
         let mut scratch = Vec::new();
         for program in manifest["programs"].as_array().into_iter().flatten() {
@@ -363,7 +364,8 @@ impl ProgramSet {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        name.split_once('_').is_some_and(|(prefix, _)| self.families.iter().any(|f| f == prefix))
+        cuteafd_core::coordinator_programs::program_namespace(name)
+            .is_some_and(|prefix| self.families.iter().any(|f| f == prefix))
     }
 
     /// Module bytes the family's programs take on one device: measured
@@ -769,6 +771,28 @@ mod tests {
         assert_eq!(set.names, ["dsv4f_wo_m64", "dsv4f2_wo_m64"]);
         assert_eq!(set.scratch, [("dsv4f_wo_m64".to_string(), 7)]);
         assert!(!set.contains("glmf_kda_w8_m4096") && set.contains("dsv4f2_x"));
+    }
+
+    #[test]
+    fn plain_glm_excludes_native_stage_names_scratch_and_module_charge() {
+        let manifest = json!({"programs": std::iter::once(json!({"name": "glm_producer_m64",
+            "scratch_bytes_at_capacity": {"scratch": 7}})).chain((0..32).map(|i| json!({
+                "name": format!("glm_stage_native_{i}"), "scratch_bytes_at_capacity": {"scratch": 999}
+            }))).chain(std::iter::once(json!({"name": "glm2_stage_swiglu_i1024"}))).collect::<Vec<_>>()});
+        for families in [&["glm"][..], &["glm", "glm2"][..]] {
+            let set = ProgramSet::from_manifest(&manifest, families);
+            let from_names = ProgramSet::from_names(families,
+                manifest["programs"].as_array().unwrap().iter().filter_map(|p| p["name"].as_str()));
+            assert_eq!(set.names, ["glm_producer_m64"]);
+            assert_eq!(set.names, from_names.names);
+            assert_eq!(set.scratch, [("glm_producer_m64".into(), 7)]);
+            assert_eq!(set.module_bytes(), 34 * MIB);
+            assert!(!set.contains("glm_stage_native_0") && !set.contains("glm2_stage_swiglu_i1024"));
+        }
+        let native = ProgramSet::from_manifest(&manifest, &["glm", "glm2", "glm_stage", "glm2_stage"]);
+        assert_eq!(native.names.len(), 34);
+        assert_eq!(native.module_bytes(), 38 * MIB);
+        assert!(native.contains("glm_stage_native_0") && native.contains("glm2_stage_swiglu_i1024"));
     }
 
     #[test]

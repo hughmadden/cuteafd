@@ -110,6 +110,15 @@ string(TOLOWER "${CUTEAFD_CONTEXT_SPLIT_AOT}" context_split_aot)
 if(NOT context_split_aot MATCHES "^(off|on|only)$")
   message(FATAL_ERROR "CUTEAFD_CONTEXT_SPLIT_AOT must be OFF, ON or ONLY")
 endif()
+if(context_split_aot STREQUAL "only")
+  # ONLY has no family/TP2/native companions; the exporter accepts K1 bases.
+  string(REPLACE "," ";" context_geometries "${CUTEAFD_PROGRAM_GEOMETRY}")
+  list(FILTER context_geometries INCLUDE REGEX "^(flash|pro|glm|glmf)$")
+  if(NOT context_geometries)
+    message(FATAL_ERROR "context-split ONLY requires flash, pro, glm or glmf")
+  endif()
+  list(JOIN context_geometries "," CUTEAFD_PROGRAM_GEOMETRY)
+endif()
 set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"

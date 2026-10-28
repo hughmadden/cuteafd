@@ -22,7 +22,7 @@ use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
@@ -260,7 +260,7 @@ struct Workspace<'a> {
     select: Buf<'a>,
     /// The cuBLAS LM head (rank 0 only); dropped before its workspace.
     head: Option<Rc<VocabularyHead<'a>>>,
-    _head_workspace: Buf<'a>,
+    _head_workspace: Option<Buf<'a>>,
     core_head: Option<Rc<super::core_runtime::CoreHead<'a>>>,
     core: Option<Rc<super::core_runtime::CoreScratch<'a>>>,
     /// Attention core, down core, reduction target; private to this row slot.
@@ -278,7 +278,7 @@ struct SharedStep<'a> {
     native_dense: Option<Rc<native_dense::NativeScratch<'a>>>,
     router_host: Rc<RefCell<Option<HostAllocation<'a>>>>,
     head: Option<Rc<VocabularyHead<'a>>>,
-    head_workspace: Buf<'a>,
+    head_workspace: Option<Buf<'a>>,
     core_head: Option<Rc<super::core_runtime::CoreHead<'a>>>,
     core: Option<Rc<super::core_runtime::CoreScratch<'a>>>,
 }
@@ -394,6 +394,8 @@ pub(crate) struct GlmEngine<'a> {
     pub(crate) native_dense: Vec<Option<native_dense::NativePrograms<'a>>>,
     core_programs: Vec<Option<super::core_runtime::CorePrograms<'a>>>,
     core_admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>,
+    /// Target decode/prefill share one arena; CoreHead enforces same-stream FIFO.
+    target_core_head: Option<Rc<super::core_runtime::CoreHead<'a>>>,
     pub(crate) exlr8_prefill_activations: super::Exlr8PrefillActivations,
     pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
@@ -555,7 +557,7 @@ impl<'a> GlmEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(crate) fn bind_core(&mut self, admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>) -> Result<()> {
@@ -578,6 +580,12 @@ impl<'a> GlmEngine<'a> {
                     == Some(admitted.receive_suffix), "GLM K6 peer suffix differs from admission");
             }
             self.core_programs.push(programs);
+        }
+        if let super::weights::GlmHead::K6(weights) = &self.weights.head {
+            self.target_core_head = Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, DECODE_ROWS,
+                crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
+                admission.as_ref().and_then(|a| a.ranks[0].target_head.as_ref())
+                    .context("GLM K6 target head has no admitted scratch")?)?));
         }
         self.core_admission = admission;
         Ok(())
@@ -843,7 +851,9 @@ impl<'a> GlmEngine<'a> {
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
         let scratch = self.step_scratch(decode)?;
-        let head_workspace = Buf::owned(self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?);
+        let native_head = matches!(self.weights.head, super::weights::GlmHead::K6(_));
+        let head_workspace = cuteafd_loader::placement::families::glm5::head_workspace_bytes(lead, native_head)
+            .map(|bytes| self.alloc(bytes as usize).map(Buf::owned)).transpose()?;
         let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
         Ok(SharedStep {
@@ -859,19 +869,14 @@ impl<'a> GlmEngine<'a> {
             } else { None },
             router_host: Rc::new(RefCell::new(None)),
             // SAFETY: the head workspace lives in every workspace holding the head, which drops first.
-            head: if lead {
-                Some(Rc::new(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
+            head: if lead && !native_head {
+                Some(Rc::new(unsafe { self.library.vocabulary_head_rows(head_workspace.as_ref().context("LM head workspace")?.buffer.ptr, h as u32, t as u32,
                     self.cfg.vocab_size as u32)? }))
             } else {
                 None
             },
             head_workspace,
-            core_head: if let (true, super::weights::GlmHead::K6(weights)) = (lead, &self.weights.head) {
-                Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, t.min(DECODE_ROWS),
-                    crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
-                    self.core_admission.as_ref().and_then(|a| a.ranks[0].target_heads.get(usize::from(!decode)))
-                        .context("GLM K6 target head has no admitted scratch")?)?))
-            } else { None },
+            core_head: if lead { self.target_core_head.clone() } else { None },
             core: self.core_programs.get(rank).and_then(Option::as_ref).map(|programs|
                 programs.allocate(crate::shared::memory::device::Device { library: self.library,
                     id: self.exchange_device(rank)? }, t, decode).map(Rc::new)).transpose()?,
@@ -1822,14 +1827,10 @@ impl<'a> GlmEngine<'a> {
             _ => &self.weights.layers,
         };
         (0..layers.len()).map(|i| match layers.get(i + 1) {
-            // `operands` takes a weight's E4M3 copy and scales, else its BF16 operand.
-            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm",
-                "w_q_b", "w_iq", "w_ik", "k_norm_w", "k_norm_b", "w_uk", "w_uv", "w_o", "post_norm", "gate",
-                "gate.bias", "w_gate_up", "w_down"],
-                |n| next.range(n)),
-            None if rank == 1 => Vec::new(),
-            None => vec![(self.weights.norm.buffer.ptr.cast_const(), self.weights.norm.buffer.bytes),
-                self.weights.head.range()],
+            Some(next) => next.decode_read_order(),
+            None => super::weights::head_read_order(rank,
+                (self.weights.norm.buffer.ptr.cast_const(), self.weights.norm.buffer.bytes),
+                || self.weights.head.ranges()),
         }).collect()
     }
 

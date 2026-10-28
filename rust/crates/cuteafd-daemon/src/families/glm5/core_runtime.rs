@@ -85,7 +85,7 @@ impl CoreScratch<'_> {
     }
 }
 fn stage_program(name: &str, ranks: usize) -> bool {
-    name.starts_with("glm_stage_") || (ranks == 2 && name.starts_with("glm2_stage_"))
+    cuteafd_loader::families::glm5::DensePrograms::Trellis.stage(name, ranks == 2)
 }
 fn projection_key(weights: &CoreWeights<'_>) -> (usize, usize, usize, &'static str) {
     use cuteafd_loader::formats::dense_trellis::TrellisSide;
@@ -114,9 +114,9 @@ impl<'a> CoreHead<'a> {
 
     pub(crate) fn launch(&self, weights: &CoreWeights<'_>, input: Buffer, output: Buffer,
         rows: usize, stream: *mut c_void) -> Result<()> {
-        ensure!((1..=self.rows).contains(&rows) && stream == self.stream,
-            "GLM K6 head rows/stream differ from admitted scratch");
-        self.device.run(|| self.projection.local(rows, input, weights, &self.scratch, output, stream))
+        head_launch(self.rows, self.stream, rows, stream, || {
+            self.device.run(|| self.projection.local(rows, input, weights, &self.scratch, output, stream))
+        })
     }
 
     pub(crate) fn target<'s>(&'s self, weights: &'s CoreWeights<'_>) -> TargetHead<'s> {
@@ -126,6 +126,15 @@ impl<'a> CoreHead<'a> {
                 buffer(logits.cast(), rows * weights.shape[0] * 4), rows, stream)
         }))
     }
+}
+
+/// Target decode/prefill may enqueue before either finishes, but CUDA FIFO
+/// serializes their shared scratch only on this one bound stream.
+fn head_launch<T>(capacity: usize, bound: *mut c_void, rows: usize, stream: *mut c_void,
+    enqueue: impl FnOnce() -> Result<T>) -> Result<T> {
+    ensure!((1..=capacity).contains(&rows) && stream == bound,
+        "GLM K6 head rows/stream differ from admitted scratch");
+    enqueue()
 }
 
 /// Copy only logical columns after the complete stored-N transform has run.
@@ -146,6 +155,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_target_head_rejects_concurrent_foreign_stream_before_scratch_use() -> Result<()> {
+        let bound = std::ptr::without_provenance_mut::<c_void>(1);
+        let peer = std::ptr::without_provenance_mut::<c_void>(2);
+        let unit = std::ptr::without_provenance_mut::<c_void>(3);
+        // Pending GPU users do not finish between these host hooks. On the
+        // bound stream their execution is FIFO; a foreign stream could race.
+        let mut pending = Vec::new();
+        for (path, rows, stream) in [("decode", 1, bound), ("prefill", 64, bound),
+            ("prefill-peer", 32, peer), ("decode-unit", 1, unit), ("decode", 20, bound)] {
+            let result = head_launch(64, bound, rows, stream, || {
+                pending.push((path, stream));
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), stream == bound);
+        }
+        assert_eq!(pending.iter().map(|(path, _)| *path).collect::<Vec<_>>(), ["decode", "prefill", "decode"]);
+        assert!(pending.iter().all(|(_, stream)| *stream == bound));
+        for rows in [0, 65] {
+            assert!(head_launch(64, bound, rows, bound, || -> Result<()> {
+                panic!("invalid rows reached scratch")
+            }).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn eager_stages_stay_in_the_admitted_rank_namespaces() {
         let manifest = serde_json::json!({"programs": [
             {"name": "glm_stage_rank_pack_m64"},
@@ -157,7 +192,7 @@ mod tests {
         ]});
         for ranks in [1, 2] {
             let admitted = cuteafd_loader::placement::ProgramSet::from_manifest(&manifest,
-                if ranks == 2 { &["glm", "glm2"] } else { &["glm"] });
+                if ranks == 2 { &["glm", "glm2", "glm_stage", "glm2_stage"] } else { &["glm", "glm_stage"] });
             let loaded = manifest["programs"].as_array().unwrap().iter()
                 .filter_map(|p| p["name"].as_str()).filter(|name| stage_program(name, ranks)).collect::<Vec<_>>();
             assert_eq!(loaded.len(), ranks * 2);

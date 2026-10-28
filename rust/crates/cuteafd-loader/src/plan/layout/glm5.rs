@@ -368,7 +368,8 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0,
-        native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
+        native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(),
+        native_head: core.is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
@@ -434,10 +435,12 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             .map(|(group, format, bytes)| Item::new(if group == "embedding" { Category::Embedding }
                 else { Category::Weights }, group, format, bytes, Basis::Exact)).collect();
         items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes[rank], Basis::Exact));
-        let mut programs = program_families("glm", split);
-        programs.push("exlr8".into());
-        let mut runtime = runtime_item(Some(&manifest), &programs, "glm:exlr8", split,
-            rank, options.rtx_bytes[rank]);
+        let set = crate::families::glm5::DensePrograms::Exlr8.program_set(&manifest, split);
+        let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[rank], None);
+        let allowance = crate::placement::inventory::loaded_code_allowance("glm", "glm:exlr8", split,
+            rank as u8, &arch, Some(&set));
+        let mut runtime = Item::new(Category::Runtime, "context+modules", "",
+            arch.context_bytes + allowance.bytes, allowance.basis);
         runtime.group = "EXLR8 context+modules".into();
         items.push(runtime);
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
@@ -464,7 +467,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
-        native_workspace: workspace, native_dense: dense_scratch, skip_routed_experts: false, prefill_rows: rows,
+        native_workspace: workspace, native_dense: dense_scratch, native_head: false, skip_routed_experts: false, prefill_rows: rows,
         prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch: Some(scratch), drafter_bytes: draft,
         drafter_staging: draft_staging, pending_code: Vec::new(), experts: local.as_ref().map_or_else(Vec::new, |local| local.experts.clone()), expert_workspace: 0,
@@ -494,6 +497,84 @@ mod tests {
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
     fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
+
+    #[test]
+    fn exlr8_explicit_stages_preserve_the_pre_namespace_fix_module_charge() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k|
+            crate::plan::testing::exl3(n, r, k, 4)), None);
+        let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
+        let mut manifest = native_manifest();
+        let entries = manifest["programs"].as_array_mut().unwrap();
+        // Match the sealed p0 namespace census without embedding a local build.
+        for (family, count) in [("glm", 42), ("glm2", 18), ("exlr8", 84)] {
+            let actual = entries.iter().filter(|p|
+                cuteafd_core::coordinator_programs::program_namespace(p["name"].as_str().unwrap()) == Some(family)).count();
+            assert!(actual <= count);
+            entries.extend((actual..count).map(|i| serde_json::json!({"name":format!("{family}_fixture_{i}")})));
+        }
+        for prefix in ["glm", "glm2"] {
+            for rows in [64, 4096] {
+                for stage in ["rank_pack", "query_rope", "index_post", "absorb_bf16", "absorb", "values_bf16", "values"]
+                    .into_iter().chain((prefix == "glm2").then_some("query_rope_context"))
+                    .chain((prefix == "glm2").then_some("absorb_context")) {
+                    entries.push(serde_json::json!({"name":format!("{prefix}_stage_{stage}_m{rows}")}));
+                }
+            }
+        }
+        assert_eq!(entries.len(), 176);
+        let mut expanded = manifest.clone();
+        let entries = expanded["programs"].as_array_mut().unwrap();
+        entries.extend((0..42).map(|i| serde_json::json!({"name":format!("dense_trellis_k6_fixture_{i}")})));
+        let k6_only = ["glm2_stage_absorb_bf16_context_m64", "glm2_stage_absorb_bf16_context_m4096",
+            "glm_stage_swiglu_i2048", "glm_stage_swiglu_i12288", "glm2_stage_swiglu_i1024", "glm2_stage_swiglu_i6144"];
+        entries.extend(k6_only.iter().map(|name| serde_json::json!({"name":name,
+            "scratch_bytes_at_capacity":{"scratch":999_999}})));
+        assert_eq!(entries.len(), 224);
+        use crate::families::glm5::DensePrograms;
+        // Runtime intentionally retains p0's split module set even on one GPU.
+        let old_runtime = DensePrograms::Exlr8.program_set(&manifest, true);
+        let runtime = DensePrograms::Exlr8.program_set(&expanded, true);
+        assert_eq!(runtime, old_runtime);
+        assert_eq!(runtime.names.len(), 176);
+        assert_eq!(runtime.module_bytes(), 56_623_104);
+        let broad = crate::placement::ProgramSet::from_manifest(&expanded,
+            &["glm", "glm2", "exlr8", "glm_stage", "glm2_stage"]);
+        assert_eq!(broad.names.len(), 182);
+        assert_eq!(broad.module_bytes() - runtime.module_bytes(), 2 << 20);
+        assert!(runtime.scratch.iter().all(|(_, bytes)| *bytes != 999_999));
+        assert!(k6_only.iter().all(|name| DensePrograms::Trellis.stage(name, true)));
+        assert!(k6_only.iter().all(|name| !DensePrograms::Exlr8.stage(name, true)));
+        assert!(DensePrograms::Fp8.program_set(&expanded, true).names.iter().all(|name| !name.contains("_stage_")));
+        for gpus in [1, 2] {
+            let old_set = DensePrograms::Exlr8.program_set(&manifest, gpus == 2);
+            let new_set = DensePrograms::Exlr8.program_set(&expanded, gpus == 2);
+            assert_eq!(new_set, old_set);
+            assert_eq!(new_set.names.len(), if gpus == 2 { 176 } else { 140 });
+            let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: 512,
+                prefill_lanes: 3, prefill_waves: 3, context_tokens: 8192, pool_tokens: Some(262144),
+                onboard: Some(crate::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                ..Default::default() };
+            let (layout, _) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4,
+                &expanded, None).unwrap();
+            let families = if gpus == 2 { vec!["glm", "glm2", "exlr8"] } else { vec!["glm", "exlr8"] };
+            // This was the exact selector before compound namespace separation.
+            let names = manifest["programs"].as_array().unwrap().iter()
+                .filter_map(|p| p["name"].as_str()).filter(|name|
+                    name.split_once('_').is_some_and(|(prefix, _)| families.contains(&prefix)))
+                .map(str::to_string).collect();
+            let old = crate::placement::ProgramSet { families: families.iter().map(|f| f.to_string()).collect(),
+                names, scratch: Vec::new() };
+            assert!(old.names.iter().any(|name| name.starts_with("glm_stage_")));
+            for (rank, device) in layout.devices.iter().enumerate().take(gpus) {
+                let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[rank], None);
+                let allowance = crate::placement::inventory::loaded_code_allowance("glm", "glm:exlr8",
+                    gpus == 2, rank as u8, &arch, Some(&old));
+                let actual = device.items.iter().find(|i| i.group == "EXLR8 context+modules").unwrap();
+                assert_eq!(actual.bytes, arch.context_bytes + allowance.bytes);
+            }
+        }
+    }
 
     #[test]
     fn exlr8_min_max_prefill_matches_exl3_and_charges_every_wave() {

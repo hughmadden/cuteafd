@@ -353,6 +353,42 @@ def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kim
     assert 'snapshot' not in args and 'checkpoint' not in args
 
 
+@pytest.mark.parametrize('mode', ['OFF', 'ON', 'ONLY'])
+@pytest.mark.parametrize('kimi,exlr8', [(False, False), (True, False), (False, True), (True, True)])
+def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, kimi, exlr8):
+    cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
+    (tmp_path / 'CMakeLists.txt').write_text('\n'.join([
+        'cmake_minimum_required(VERSION 3.18)', 'project(context_scope NONE)',
+        'set(CUTEAFD_CUDA_ARCHITECTURES 120)',
+        f'set(CUTEAFD_CONTEXT_SPLIT_AOT {mode})',
+        'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")', 'set(CUTEAFD_ENABLE_GLM_AOT ON)',
+        f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
+        f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})',
+        'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
+        'file(WRITE "${CMAKE_BINARY_DIR}/args.txt" "${CUTEAFD_DSV4_EXPORT_ARGS}")',
+    ]))
+    build = tmp_path / 'build'
+    result = subprocess.run(['cmake', '-S', str(tmp_path), '-B', str(build)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (build / 'args.txt').read_text().split(';')
+    geometries = args[args.index('--geometry') + 1].split(',')
+    assert args[args.index('--context-split') + 1] == mode.lower()
+    if mode == 'ONLY':
+        assert geometries == ['glm']
+        assert set(geometries) <= {'flash', 'pro', 'glm', 'glmf'}
+    else:
+        expected = ['glm', 'glm2']
+        if kimi:
+            expected += ['kimik3', 'dense_trellis_k6', 'kimi_split']
+        else:
+            expected += ['dense_trellis_k6']
+        expected += ['glm_stage', 'glm2_stage']
+        if exlr8:
+            expected += ['exlr8', 'exlr8_dense']
+        assert geometries == expected
+
+
 def test_kimi_builds_always_package_k6_programs(tmp_path):
     path = config_file(tmp_path, 'kimi_k3', 'Kimi-K3-EXL3-K2', 6)
     _, scopes = aot.config_scopes(aot.read_config(path))

@@ -139,3 +139,62 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn native_decode_prefetch_keeps_projection_order_before_budget_and_peer_has_no_head() {
+    use crate::shared::l2_prefetch::{prefix, Range};
+    let range = |id: usize| -> Range { (std::ptr::without_provenance::<c_void>(id), 1 << 20) };
+    let expected = ["q_a", "kv_a", "q_b", "index_q", "index_k", "index_w", "o", "gate", "up", "down"];
+    for rank in 0..2 {
+        let base = 100 * (rank + 1);
+        let ordered = decode_ranges(|_| None, |name| {
+            let index = expected.iter().position(|&p| p == name).unwrap();
+            vec![range(base + index)]
+        });
+        assert_eq!(ordered, (0..expected.len()).map(|i| range(base + i)).collect::<Vec<_>>());
+        assert_eq!(prefix(&ordered, (2 << 20) + (1 << 19)),
+            [range(base), range(base + 1), (range(base + 2).0, 1 << 19)]);
+        let head = head_read_order(rank, range(1), || vec![range(2), range(3), range(4)]);
+        if rank == 0 { assert_eq!(head, [range(1), range(2), range(3), range(4)]); }
+        else { assert!(head.is_empty()); }
+    }
+    assert!(head_read_order(1, range(1), || panic!("rank 1 touched rank-0 head")).is_empty());
+    // Ordinary FP8 ordering remains unchanged, including payload then scales.
+    let names = ["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b", "w_iq", "w_ik",
+        "k_norm_w", "k_norm_b", "w_uk", "w_uv", "w_o", "post_norm", "gate", "gate.bias", "w_gate_up", "w_down"];
+    let fp8 = |name: &str| match name {
+        "w_qkv_a_fp8" => Some(range(10)), "w_qkv_a_scale" => Some(range(11)),
+        _ => names.iter().position(|&n| n == name).map(|i| range(20 + i)),
+    };
+    assert_eq!(decode_ranges(fp8, |_| Vec::new()), crate::shared::l2_prefetch::operands(&names, fp8));
+}
+
+#[test]
+fn exlr8_prefetch_enumerates_each_resident_encoding_in_read_order() {
+    use crate::shared::l2_prefetch::Range;
+    for rank in 0..2 {
+        for components in [vec!["suh", "trellis", "svh"], vec!["q4", "s4"],
+            vec!["fp8", "e8m0"], vec!["bf16"]] {
+            let expected = components.iter().enumerate().map(|(i, _)|
+                (std::ptr::without_provenance::<c_void>(100 * (rank + 1) + i), 1 << 20))
+                .collect::<Vec<Range>>();
+            // Reverse insertion cannot change read order, unlike HashMap iteration.
+            let resident = components.iter().zip(&expected).rev().map(|(component, &range)|
+                (crate::families::glm5::native_dense::key("q_a", component), range)).collect::<HashMap<_, _>>();
+            let actual = native_projection_ranges("q_a", |key| resident.get(key).copied());
+            assert_eq!(actual, expected);
+            assert_eq!(crate::shared::l2_prefetch::prefix(&actual, 1 << 19),
+                [(expected[0].0, 1 << 19)]);
+            assert!(native_projection_ranges("kv_a", |key| resident.get(key).copied()).is_empty());
+        }
+    }
+}
+
+#[test]
+fn k6_prefetch_enumerates_both_transform_vectors_and_payload() {
+    let buffer = |id| CuteafdDeviceBuffer { ptr: std::ptr::without_provenance_mut::<c_void>(id),
+        bytes: 1 << 20, device_id: 0, flags: 0 };
+    let ranges = trellis_ranges(buffer(2), buffer(1), buffer(3));
+    assert_eq!(ranges, [1, 2, 3].map(|id| (buffer(id).ptr.cast_const(), buffer(id).bytes)));
+    assert_eq!(crate::shared::l2_prefetch::prefix(&ranges, 3 << 20), ranges);
+}

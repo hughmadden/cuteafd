@@ -744,10 +744,14 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
+        use cuteafd_loader::families::glm5::DensePrograms;
+        let dense_programs = if native { DensePrograms::Exlr8 } else { DensePrograms::Fp8 };
+        // Preserve EXLR8's eager split stages on one GPU. Their ABI still
+        // comes from this checkpoint, never from unrelated K6 exports.
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name)
-                || (native && (name.starts_with("exlr8_")
-                    || name.starts_with("exlr8_dense_") || name.starts_with("glm_stage_") || name.starts_with("glm2_stage_"))))?;
+                || (native && (cuteafd_core::coordinator_programs::program_namespace(name) == Some("exlr8")
+                    || dense_programs.stage(name, true))))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
@@ -859,9 +863,7 @@ impl Opened {
         let native_dense_charge = if let Some(core) = &core { core.bytes(self.cfg.hidden)? }
             else { native_dense_charge };
         let code_set = core.as_ref().map(|core| core.program_set(&manifest, devices.len() == 2))
-            .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(
-                if native { &["glm", "glm2", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage"] }
-                else { &["glm", "glm2"] }, programs.names()));
+            .unwrap_or_else(|| dense_programs.program_set(&manifest, true));
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
                 if core.is_some() { "glm-k6" } else { "glm" }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
@@ -894,7 +896,7 @@ impl Opened {
         let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
             args.prefill_rows as u64, 1, exchange_f32));
         let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
-            spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), skip_routed_experts: args.skip_routed_experts,
+            spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), native_head: core.as_ref().is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,
             max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),

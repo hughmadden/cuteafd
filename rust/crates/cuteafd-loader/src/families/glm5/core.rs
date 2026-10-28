@@ -146,7 +146,8 @@ pub struct CoreRankLayout {
     pub stages: Option<[CoreStageLayout; 2]>,
     pub decode: Option<ProjectionScratchLayout>,
     pub prefill: Option<ProjectionScratchLayout>,
-    pub target_heads: Vec<ProjectionScratchLayout>,
+    /// Decode and prefill target launches are serialized on the rank-0 stream.
+    pub target_head: Option<ProjectionScratchLayout>,
     pub draft_head: Option<ProjectionScratchLayout>,
     pub retained_rows: usize,
     pub receive_suffix: usize,
@@ -158,7 +159,7 @@ impl CoreRankLayout {
             bytes = bytes.checked_add(n).context("GLM K6 allocation total overflow")?;
             Ok(())
         };
-        for layout in self.decode.iter().chain(&self.prefill).chain(&self.target_heads).chain(&self.draft_head) {
+        for layout in self.decode.iter().chain(&self.prefill).chain(&self.target_head).chain(&self.draft_head) {
             add(layout.bytes()?)?;
         }
         if let Some(stages) = &self.stages { for stage in stages { add(stage.bytes()?)?; } }
@@ -235,8 +236,7 @@ impl CoreCharges {
                 Some([CoreStageLayout::new(cfg, 64, ranks, owners.is_some())?,
                     CoreStageLayout::new(cfg, unit, ranks, owners.is_some())?])
             };
-            let target_heads = if rank == 0 { [64, unit.min(64)].into_iter()
-                .map(head_scratch).filter_map(Result::transpose).collect::<Result<Vec<_>>>()? } else { Vec::new() };
+            let target_head = if rank == 0 { head_scratch(64)? } else { None };
             let draft_head = if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None };
             layouts.push(CoreRankLayout {
                 decode: scratch(&body, 64)?, prefill: scratch(&body, unit)?, stages,
@@ -244,7 +244,7 @@ impl CoreCharges {
                 receive_suffix: if ranks == 2 && split { 4usize.checked_mul(slots)
                     .and_then(|n| n.checked_mul(unit.max(64))).and_then(|n| n.checked_mul(cfg.hidden))
                     .and_then(|n| n.checked_mul(4)).context("GLM K6 receive suffix overflow")? } else { 0 },
-                body, target_heads, draft_head,
+                body, target_head, draft_head,
             });
         }
         let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
@@ -254,11 +254,10 @@ impl CoreCharges {
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> {
         self.ranks.iter().map(|rank| rank.bytes(hidden)).collect()
     }
-    /// Ordinary GLM programs include the BF16 stages. Add only the neutral
+    /// Native GLM explicitly selects its BF16 stages. Add only the neutral
     /// policies actually selected by the checkpoint, not every Kimi export.
     pub fn program_set(&self, manifest: &serde_json::Value, split: bool) -> crate::placement::ProgramSet {
-        let mut set = crate::placement::ProgramSet::from_manifest(manifest,
-            if split { &["glm", "glm2"] } else { &["glm"] });
+        let mut set = super::DensePrograms::Trellis.program_set(manifest, split);
         set.names.extend(self.programs.iter().cloned());
         set.names.sort(); set.names.dedup();
         set
@@ -399,8 +398,8 @@ mod tests {
                         let suffix = if ranks == 2 { 4 * slots * unit.max(64) * cfg.hidden * 4 } else { 0 };
                         assert_eq!(layout.receive_suffix, suffix);
                         expected += suffix;
-                        assert_eq!(layout.target_heads.len(), if rank == 0 { 2 } else { 0 });
-                        for head in &layout.target_heads { assert_eq!(head.rows, 64); expected += head.bytes()?; }
+                        assert_eq!(layout.target_head.is_some(), rank == 0);
+                        if let Some(head) = &layout.target_head { assert_eq!(head.rows, 64); expected += head.bytes()?; }
                         assert_eq!(layout.draft_head.as_ref().map(|h| h.rows), if rank == 0 { draft } else { None });
                         expected += layout.draft_head.as_ref().map(|h| h.bytes()).transpose()?.unwrap_or(0);
                         assert_eq!(bytes[rank], expected as u64);
@@ -472,7 +471,7 @@ mod tests {
                 assert_eq!(c.stages.is_some(), body);
                 assert_eq!(c.retained_rows > 0, body);
                 assert_eq!(c.receive_suffix > 0, body);
-                assert_eq!(!c.target_heads.is_empty(), rank == 0 && matches!(which, "head" | "partial"));
+                assert_eq!(c.target_head.is_some(), rank == 0 && matches!(which, "head" | "partial"));
                 if which == "none" { assert_eq!(c.bytes(cfg.hidden)?, 0); }
             }
         }

@@ -64,10 +64,61 @@ pub(crate) fn fp8_operand_names(name: &str) -> (&'static str, &'static str, &'st
     }
 }
 
+/// Native replacements occupy their original projection's place in the read
+/// order, before the prefetch budget is applied (never an unordered tail).
+fn decode_ranges(range: impl Fn(&str) -> Option<crate::shared::l2_prefetch::Range>,
+    projection: impl Fn(&str) -> Vec<crate::shared::l2_prefetch::Range>)
+    -> Vec<crate::shared::l2_prefetch::Range> {
+    let mut out = Vec::new();
+    let order: &[(&str, &[&str])] = &[
+        ("input_norm", &[]), ("w_qkv_a", &["q_a", "kv_a"]), ("q_a_norm", &[]), ("kv_a_norm", &[]),
+        ("w_q_b", &["q_b"]), ("w_iq", &["index_q"]), ("w_ik", &["index_k", "index_w"]),
+        ("k_norm_w", &[]), ("k_norm_b", &[]), ("w_uk", &[]), ("w_uv", &[]), ("w_o", &["o"]),
+        ("post_norm", &[]), ("gate", &[]), ("gate.bias", &[]), ("w_gate_up", &["gate", "up"]),
+        ("w_down", &["down"]),
+    ];
+    for &(name, projections) in order {
+        let native = projections.iter().flat_map(|name| projection(name)).collect::<Vec<_>>();
+        if native.is_empty() {
+            out.extend(crate::shared::l2_prefetch::operands(&[name], &range));
+        } else { out.extend(native); }
+    }
+    out
+}
+
+pub(super) fn head_read_order(rank: usize, norm: crate::shared::l2_prefetch::Range,
+    head: impl FnOnce() -> Vec<crate::shared::l2_prefetch::Range>) -> Vec<crate::shared::l2_prefetch::Range> {
+    if rank == 0 { std::iter::once(norm).chain(head()).collect() } else { Vec::new() }
+}
+
+fn trellis_ranges(payload: CuteafdDeviceBuffer, suh: CuteafdDeviceBuffer, svh: CuteafdDeviceBuffer)
+    -> Vec<crate::shared::l2_prefetch::Range> {
+    [suh, payload, svh].map(|b| (b.ptr.cast_const(), b.bytes)).to_vec()
+}
+
+fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::shared::l2_prefetch::Range>)
+    -> Vec<crate::shared::l2_prefetch::Range> {
+    // Input transform, payload, output transform; scaled native formats keep
+    // their payload/scale order. Only this rank's resident components enter.
+    ["suh", "trellis", "svh", "q4", "s4", "fp8", "e8m0", "scale", "bf16", "fp32"]
+        .into_iter().filter_map(|component| range(&super::native_dense::key(name, component))).collect()
+}
+
 impl GlmLayer<'_> {
     /// The device range of `operand`, when the layer has it.
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
+    }
+
+    pub fn decode_read_order(&self) -> Vec<crate::shared::l2_prefetch::Range> {
+        decode_ranges(|name| self.range(name).or_else(|| self.native.get(name)
+            .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))), |name| {
+            if let Some(w) = self.core.get(name) {
+                return trellis_ranges(w.payload.buffer, w.suh.buffer, w.svh.buffer);
+            }
+            native_projection_ranges(name, |key| self.native.get(key)
+                .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)))
+        })
     }
 
     pub fn ptr(&self, operand: &str) -> Result<*mut c_void> {
@@ -120,12 +171,13 @@ impl<'a> GlmHead<'a> {
             Self::K6(head) => head.payload.buffer.bytes + head.suh.buffer.bytes + head.svh.buffer.bytes }
     }
 
-    /// The device range the L2 prefetch reads after the last layer.
-    pub fn range(&self) -> crate::shared::l2_prefetch::Range {
+    /// All resident head components, in read order; rank 1 never calls this.
+    pub fn ranges(&self) -> Vec<crate::shared::l2_prefetch::Range> {
         match self {
-            Self::Bf16(head) => (head.buffer.ptr.cast_const(), head.buffer.bytes),
-            Self::RowFp8(owner) => (owner.head.payload().ptr.cast_const(), owner.head.payload().bytes),
-            Self::K6(head) => (head.payload.buffer.ptr.cast_const(), head.payload.buffer.bytes),
+            Self::Bf16(head) => vec![(head.buffer.ptr.cast_const(), head.buffer.bytes)],
+            Self::RowFp8(owner) => [owner.head.payload(), owner.head.scales()]
+                .map(|b| (b.ptr.cast_const(), b.bytes)).to_vec(),
+            Self::K6(head) => trellis_ranges(head.payload.buffer, head.suh.buffer, head.svh.buffer),
         }
     }
 

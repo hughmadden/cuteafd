@@ -183,7 +183,9 @@ def requirements(repo, matrix, scope):
             tag = 'dsv4p' if any(s.startswith('dsv4p:') for s in experts) else 'dsv4f'
             programs = {tag, tag + '2'} if dual else {tag}
         elif family == 'glm5':
-            programs = {'glm', 'glm2', 'dense_trellis_k6', 'glm_stage', 'glm2_stage'}
+            programs = {'glm', 'dense_trellis_k6', 'glm_stage'}
+            if dual:
+                programs |= {'glm2', 'glm2_stage'}
         elif family == 'glm5_flash':
             programs = {'glmf', 'glmf2'} if dual else {'glmf'}
         elif family == 'mimo_v2':

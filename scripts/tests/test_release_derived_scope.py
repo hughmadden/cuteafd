@@ -138,7 +138,8 @@ def test_glm_inventory_requires_full_static_namespaces(fixture_repo, tmp_path, d
     data['entries'][0]['set']['RTX_GPUS'] = '2' if dual else '1'
     write_json(matrix, data)
     wanted = SCOPE.requirements(repo, matrix, 'glm-fp8')
-    assert wanted[0]['programs'] == GLM_PROGRAMS
+    required = GLM_PROGRAMS if dual else [p for p in GLM_PROGRAMS if p not in ('glm2', 'glm2_stage')]
+    assert wanted[0]['programs'] == required
     root = fake_inventory(tmp_path / 'images') / 'coordinator'
     manifest = root / 'share/PROGRAMS.json'
     data = json.loads(manifest.read_text())
@@ -148,6 +149,9 @@ def test_glm_inventory_requires_full_static_namespaces(fixture_repo, tmp_path, d
     SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
     data['programs'] = [p for p in data['programs'] if p['family'] != missing]
     write_json(manifest, data)
+    if missing not in required:
+        SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
+        return
     with pytest.raises(ValueError, match=f'missing program families.*{missing}'):
         SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
 
@@ -410,4 +414,6 @@ def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
     derived, _ = SCOPE.derive(tmp_path, matrix, 'glm', {})
     assert derived[P + 'KIMIK3_AOT'] == 'OFF'
     assert derived[P + 'GLM_AOT'] == 'ON'
-    assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == GLM_PROGRAMS
+    assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == [
+        p for p in GLM_PROGRAMS if p not in ('glm2', 'glm2_stage')
+    ]
