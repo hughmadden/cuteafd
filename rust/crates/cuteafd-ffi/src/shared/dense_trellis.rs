@@ -187,6 +187,42 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
     Ok(())
 }
 
+/// Validate the same native ABI for offline admission without loading CUDA.
+/// The runtime additionally verifies the compiled library's table at load.
+pub fn validate_package_geometry(manifest: &serde_json::Value, input: usize, output: usize,
+    side: usize, codebook: &str, rows: usize, output_dtype: TrellisDType) -> Result<[String; 3]> {
+    let policy = DenseTrellisPolicy::from_geometry_metadata(&manifest["families"]["dense_trellis_k6"],
+        input, output, side, codebook)?;
+    policy.validate_rows(rows)?;
+    let names = [policy.native_input, policy.native, policy.output_program];
+    let entries = manifest["programs"].as_array().ok_or(DenseTrellisError::Invalid("program inventory"))?;
+    let specs = names.iter().map(|name| -> Result<ProgramSpec> {
+        let mut matches = entries.iter().filter(|p| p["name"].as_str() == Some(name));
+        let entry = matches.next().ok_or(DenseTrellisError::Invalid("missing native program"))?;
+        if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate native program")); }
+        let pointers = entry["pointers"].as_array().ok_or(DenseTrellisError::Invalid("program pointers"))?
+            .iter().map(|p| p["name"].as_str().map(str::to_owned)
+                .ok_or(DenseTrellisError::Invalid("program pointer name"))).collect::<Result<Vec<_>>>()?;
+        let scalar_kinds = entry["scalars"].as_array().ok_or(DenseTrellisError::Invalid("program scalars"))?
+            .iter().map(|s| match s["type"].as_str() {
+                Some("int32") => Ok(b'i'), Some("int64") => Ok(b'l'), Some("float32") => Ok(b'f'),
+                _ => Err(DenseTrellisError::Invalid("program scalar type")),
+            }).collect::<Result<Vec<_>>>()?;
+        let scratch = entry["scratch_bytes_at_capacity"].as_object()
+            .ok_or(DenseTrellisError::Invalid("program scratch"))?.iter().map(|(name, n)|
+                n.as_u64().map(|n| (name.clone(), n)).ok_or(DenseTrellisError::Invalid("program scratch extent")))
+            .collect::<Result<_>>()?;
+        let capacity_rows = entry["capacity_rows"].as_u64().and_then(|n| u32::try_from(n).ok())
+            .ok_or(DenseTrellisError::Invalid("program capacity"))?;
+        Ok(ProgramSpec { name: name.clone(), pointers, scalar_kinds, scratch, capacity_rows,
+            geometry: entry["geometry"].clone() })
+    }).collect::<Result<Vec<_>>>()?;
+    let geometry = DenseTrellisGeometry { input, output, bits: 6, side, rows,
+        input_dtype: TrellisDType::Bf16, output_dtype };
+    validate_manifest([&specs[0], &specs[1], &specs[2]], geometry, codebook, geometry.workspace()?)?;
+    Ok(names)
+}
+
 fn matching_rotated_dtype(input: &serde_json::Value, core: &serde_json::Value) -> bool {
     let input_dtype = input.get("output_dtype").map_or(Some("f16"), serde_json::Value::as_str);
     let core_dtype = core.get("input_dtype").map_or(Some("f16"), serde_json::Value::as_str);

@@ -393,6 +393,7 @@ pub(crate) struct GlmEngine<'a> {
     /// (EXLR8 checkpoint dense operands); empty on the official path.
     pub(crate) native_dense: Vec<Option<native_dense::NativePrograms<'a>>>,
     core_programs: Vec<Option<super::core_runtime::CorePrograms<'a>>>,
+    core_admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>,
     pub(crate) exlr8_prefill_activations: super::Exlr8PrefillActivations,
     pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
@@ -545,7 +546,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
@@ -557,14 +558,28 @@ impl<'a> GlmEngine<'a> {
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_core_head: None, embedding, prefill_w8a8: true })
     }
 
-    pub(crate) fn bind_core(&mut self) -> Result<()> {
-        ensure!(self.core_programs.is_empty(), "GLM K6 programs already bound");
+    pub(crate) fn bind_core(&mut self, admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>) -> Result<()> {
+        ensure!(self.core_programs.is_empty() && self.core_admission.is_none(), "GLM K6 programs already bound");
+        ensure!(admission.as_ref().is_none_or(|a| a.ranks.len() == self.ranks()), "GLM K6 admitted rank count");
         for rank in 0..self.ranks() {
             let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
+            let admitted = admission.as_ref().map(|a| &a.ranks[rank]);
+            if let Some(admitted) = admitted {
+                let span = cuteafd_loader::placement::families::glm5::prefill_span(
+                    self.prefill_rows as u64, self.prefill_lanes as u64) as usize;
+                ensure!(admitted.retained_rows == if admitted.body.is_empty() { 0 } else { DECODE_ROWS + span },
+                    "GLM K6 retained row reserve differs from admission");
+            }
             let programs = self.on(rank, || super::core_runtime::CorePrograms::new(self.programs, &self.cfg,
-                layers, self.prefill_rows.max(DECODE_ROWS), self.ranks()))?;
+                layers, self.prefill_rows, self.ranks(), admitted))?;
+            if let (Some(admitted), Some(exchange)) = (admitted, &self.exchange) {
+                let prefix = self.prefill_rows.max(DECODE_ROWS) * self.cfg.hidden * self.tp2_exchange.element_bytes();
+                ensure!(exchange.slot_bytes().checked_sub(prefix).and_then(|n| n.checked_mul(4 * self.prefill_lanes))
+                    == Some(admitted.receive_suffix), "GLM K6 peer suffix differs from admission");
+            }
             self.core_programs.push(programs);
         }
+        self.core_admission = admission;
         Ok(())
     }
 
@@ -573,7 +588,9 @@ impl<'a> GlmEngine<'a> {
             let rows = drafter.max_batch_sequences().checked_mul(drafter.cfg.block)
                 .context("GLM K6 drafter head row extent overflow")?;
             self.draft_core_head = Some(super::core_runtime::CoreHead::new(self.programs, weights, rows,
-                crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream)?);
+                crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
+                self.core_admission.as_ref().and_then(|a| a.ranks[0].draft_head.as_ref())
+                    .context("GLM K6 drafter head has no admitted scratch")?)?);
         }
         Ok(())
     }
@@ -851,11 +868,13 @@ impl<'a> GlmEngine<'a> {
             head_workspace,
             core_head: if let (true, super::weights::GlmHead::K6(weights)) = (lead, &self.weights.head) {
                 Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, t.min(DECODE_ROWS),
-                    crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream)?))
+                    crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
+                    self.core_admission.as_ref().and_then(|a| a.ranks[0].target_heads.get(usize::from(!decode)))
+                        .context("GLM K6 target head has no admitted scratch")?)?))
             } else { None },
             core: self.core_programs.get(rank).and_then(Option::as_ref).map(|programs|
                 programs.allocate(crate::shared::memory::device::Device { library: self.library,
-                    id: self.exchange_device(rank)? }, t).map(Rc::new)).transpose()?,
+                    id: self.exchange_device(rank)? }, t, decode).map(Rc::new)).transpose()?,
         })
     }
 
@@ -2853,7 +2872,7 @@ mod long_graph_tests {
 
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
-        if self.tp2.is_some() || self.layer_execution.is_some()
+        if self.tp2.is_some() || self.layer_execution.is_some() || self.core_admission.is_some()
             || (!self.native_experts.is_empty() && self.peer.is_some()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }

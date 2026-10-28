@@ -3,7 +3,7 @@
 use super::GlmDsaConfig;
 use crate::{formats::trellis_core::{CoreContract, read_projections}, plan::Checkpoint};
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScratchLayout};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
 pub fn split(cfg: &GlmDsaConfig, stem: &str) -> Option<CoreSplit> {
@@ -136,27 +136,144 @@ impl CoreInventory {
         Ok(())
     }
 
-    /// Reusable per-lane projection scratch. The head uses at most 64 rows;
-    /// all transforms retain the complete stored N, including padded kv_a.
-    pub fn projection_scratch(&self, ranks: usize, rows: usize, owned_attention: bool)
-        -> Result<Option<ProjectionScratchLayout>> {
-        let mut combined: Option<ProjectionScratchLayout> = None;
-        for projection in self.projections.values() {
-            let world = if projection.split == CoreSplit::Whole
-                || owned_attention && projection.stem.contains(".self_attn.") { 1 } else { ranks };
-            projection.resident_bytes(world)?;
-            let mut n = projection.stored_outputs;
-            let mut k = projection.shape[1];
-            if projection.split == CoreSplit::Output { n /= world; }
-            if projection.split == CoreSplit::Input { k /= world; }
-            let mut layout = ProjectionScratchLayout::new(k, n,
-                if projection.stem == "lm_head" { rows.min(64) } else { rows })?;
-            layout.rows = rows;
-            if let Some(combined) = &mut combined { combined.merge(&layout)?; }
-            else { combined = Some(layout); }
+}
+
+/// Native storage beside the existing GLM workspaces. Head scratch is never
+/// merged into the serialized body arena: target and drafter retain owners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreRankLayout {
+    pub body: Vec<crate::formats::trellis_core::CoreWeightLayout>,
+    pub stages: Option<[CoreStageLayout; 2]>,
+    pub decode: Option<ProjectionScratchLayout>,
+    pub prefill: Option<ProjectionScratchLayout>,
+    pub target_heads: Vec<ProjectionScratchLayout>,
+    pub draft_head: Option<ProjectionScratchLayout>,
+    pub retained_rows: usize,
+    pub receive_suffix: usize,
+}
+impl CoreRankLayout {
+    pub fn bytes(&self, hidden: usize) -> Result<u64> {
+        let mut bytes = self.receive_suffix;
+        let mut add = |n: usize| -> Result<()> {
+            bytes = bytes.checked_add(n).context("GLM K6 allocation total overflow")?;
+            Ok(())
+        };
+        for layout in self.decode.iter().chain(&self.prefill).chain(&self.target_heads).chain(&self.draft_head) {
+            add(layout.bytes()?)?;
         }
-        Ok(combined)
+        if let Some(stages) = &self.stages { for stage in stages { add(stage.bytes()?)?; } }
+        add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(3 * 4))
+            .context("GLM K6 retained plane extent overflow")?)?;
+        Ok(bytes as u64)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreCharges { pub ranks: Vec<CoreRankLayout>, pub programs: Vec<String> }
+impl CoreCharges {
+    pub fn from_package(cfg: &GlmDsaConfig, core: &CoreInventory, layers: usize,
+        ranks: usize, owners: Option<&[u8]>, unit: usize, slots: usize,
+        draft_rows: Option<usize>, manifest: &serde_json::Value) -> Result<Self> {
+        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+        ensure!(layers > 0 && layers <= cfg.layers && matches!(ranks, 1 | 2)
+            && (1..=4096).contains(&unit) && (1..=4).contains(&slots)
+            && owners.is_none_or(|o| ranks == 2 && o.len() == layers), "GLM K6 admission geometry");
+        let span = usize::try_from(crate::placement::families::glm5::prefill_span(unit as u64, slots as u64))?;
+        let mut bodies = vec![Vec::new(); ranks];
+        for layer in 0..layers {
+            for (rank, weights) in core.layer_weights(cfg, layer, ranks, owners.map(|o| o[layer]))?.into_iter().enumerate() {
+                bodies[rank].extend(weights.into_values());
+            }
+        }
+        let head = core.get_weight("lm_head").map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
+        let mut programs = std::collections::BTreeSet::new();
+        let mut geometries = std::collections::BTreeSet::new();
+        for weight in bodies.iter().flatten().chain(head.iter()) {
+            let side = if weight.side == TrellisSide::Input { 2 } else { 1 };
+            if geometries.insert((weight.shape, side, weight.codebook.marker())) {
+                for name in policy_programs(weight, manifest)? { programs.insert(name); }
+            }
+        }
+        if bodies.iter().any(|body| !body.is_empty()) {
+            let entries = manifest["programs"].as_array().context("GLM K6 stage program inventory")?;
+            for prefix in if owners.is_some() { vec!["glm", "glm2"] }
+                else if ranks == 2 { vec!["glm2"] } else { vec!["glm"] } {
+                for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                    let name = format!("{prefix}_stage_swiglu_i{inter}");
+                    // Whole-attention stages still use the split FFN namespace.
+                    if prefix == "glm" && ranks == 2 { continue; }
+                    ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "GLM K6 requires {name}");
+                }
+                let context = prefix == "glm2" && owners.is_none()
+                    && crate::placement::families::glm5::context_programs(
+                        entries.iter().filter_map(|p| p["name"].as_str()),
+                        |name| entries.iter().any(|p| p["name"] == name).then_some(0)).is_some();
+                for cap in ["m64", "m4096"] {
+                    for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16"].into_iter()
+                        .chain(context.then_some("absorb_bf16_context"))
+                        .chain(context.then_some("query_rope_context")) {
+                        let name = format!("{prefix}_stage_{stage}_{cap}");
+                        ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "GLM K6 requires {name}");
+                    }
+                }
+            }
+        }
+        let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input);
+        let scratch = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
+            let mut result: Option<ProjectionScratchLayout> = None;
+            for weight in body {
+                let layout = ProjectionScratchLayout::new(weight.shape[1], weight.shape[0], rows)?;
+                if let Some(result) = &mut result { result.merge(&layout)?; } else { result = Some(layout); }
+            }
+            Ok(result)
+        };
+        let head_scratch = |rows| head.as_ref().map(|head|
+            ProjectionScratchLayout::new(head.shape[1], head.shape[0], rows)).transpose();
+        let mut layouts = Vec::new();
+        for (rank, body) in bodies.into_iter().enumerate() {
+            let stages = if body.is_empty() { None } else {
+                Some([CoreStageLayout::new(cfg, 64, ranks, owners.is_some())?,
+                    CoreStageLayout::new(cfg, unit, ranks, owners.is_some())?])
+            };
+            let target_heads = if rank == 0 { [64, unit.min(64)].into_iter()
+                .map(head_scratch).filter_map(Result::transpose).collect::<Result<Vec<_>>>()? } else { Vec::new() };
+            let draft_head = if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None };
+            layouts.push(CoreRankLayout {
+                decode: scratch(&body, 64)?, prefill: scratch(&body, unit)?, stages,
+                retained_rows: if body.is_empty() { 0 } else { 64usize.checked_add(span).context("GLM K6 row span")? },
+                receive_suffix: if ranks == 2 && split { 4usize.checked_mul(slots)
+                    .and_then(|n| n.checked_mul(unit.max(64))).and_then(|n| n.checked_mul(cfg.hidden))
+                    .and_then(|n| n.checked_mul(4)).context("GLM K6 receive suffix overflow")? } else { 0 },
+                body, target_heads, draft_head,
+            });
+        }
+        let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
+        result.bytes(cfg.hidden)?;
+        Ok(result)
+    }
+    pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> {
+        self.ranks.iter().map(|rank| rank.bytes(hidden)).collect()
+    }
+    /// Ordinary GLM programs include the BF16 stages. Add only the neutral
+    /// policies actually selected by the checkpoint, not every Kimi export.
+    pub fn program_set(&self, manifest: &serde_json::Value, split: bool) -> crate::placement::ProgramSet {
+        let mut set = crate::placement::ProgramSet::from_manifest(manifest,
+            if split { &["glm", "glm2"] } else { &["glm"] });
+        set.names.extend(self.programs.iter().cloned());
+        set.names.sort(); set.names.dedup();
+        set
+    }
+}
+
+fn policy_programs(weight: &crate::formats::trellis_core::CoreWeightLayout,
+    manifest: &serde_json::Value) -> Result<[String; 3]> {
+    use cuteafd_ffi::dense_trellis::{validate_package_geometry, TrellisDType};
+    let book = match weight.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+        crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };
+    let side = if weight.side == crate::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 };
+    validate_package_geometry(manifest, weight.shape[1], weight.shape[0], side, book, 4096,
+        if weight.stem == "lm_head" { TrellisDType::F32 } else { TrellisDType::Bf16 })
+        .with_context(|| format!("{}: GLM native K6 package", weight.stem))
 }
 
 #[cfg(test)]
@@ -194,6 +311,197 @@ mod tests {
             missing_shards:Vec::new(),shard_bytes:0}
     }
 
+    fn package(cfg: &GlmDsaConfig, core: &CoreInventory) -> Result<serde_json::Value> {
+        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+        use serde_json::json;
+        let mut weights = Vec::new();
+        for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+            for layer in 0..cfg.layers { weights.extend(core.layer_weights(cfg, layer, ranks, owner)?.into_iter()
+                .flat_map(BTreeMap::into_values)); }
+        } }
+        if let Some(head) = core.get_weight("lm_head") {
+            weights.push(CoreWeightLayout::new(head, TrellisSide::Output, 0, 1)?);
+        }
+        let mut policies = BTreeMap::new();
+        let mut programs = BTreeMap::new();
+        for w in weights {
+            let [n, k] = w.shape;
+            let side = if w.side == TrellisSide::Input { 2 } else { 1 };
+            let book = w.codebook.marker();
+            let shape = format!("k{k}_n{n}_s{side}_{book}");
+            let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
+            policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
+                "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
+                "output_program":routes[2]}));
+            let output = if w.stem == "lm_head" { "f32" } else { "bf16" };
+            let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
+                json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
+                    "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
+                    "splits":k.div_ceil(1024),"ctas_per_sm":4}),
+                json!({"features":n,"output_dtype":output,"max_rows":4096})];
+            let pointers = [vec!["input", "suh", "rotated", "input_block_scales"],
+                vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
+                vec!["input", "svh", "output"]];
+            for i in 0..3 {
+                let name = format!("dense_trellis_k6_{}", routes[i]);
+                programs.insert(name.clone(), json!({"name":name,"capacity_rows":4096,"geometry":geometries[i],
+                    "pointers":pointers[i].iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
+                    "scalars":vec![json!({"type":"int32"}); if i == 1 { 3 } else { 2 }],
+                    "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
+            }
+        }
+        for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
+            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                let name = format!("{prefix}_stage_swiglu_i{inter}");
+                programs.insert(name.clone(), json!({"name":name}));
+            }
+            for cap in ["m64", "m4096"] { for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16",
+                "absorb_bf16_context", "query_rope_context"] {
+                let name = format!("{prefix}_stage_{stage}_{cap}");
+                programs.insert(name.clone(), json!({"name":name}));
+            } }
+        }
+        Ok(json!({"families":{"dense_trellis_k6":{"abi_version":1,
+            "row_policies":policies.into_values().collect::<Vec<_>>()}},"programs":programs.into_values().collect::<Vec<_>>()}))
+    }
+
+    #[test]
+    fn native_admission_separates_body_heads_row_reserve_and_peer_suffix() -> Result<()> {
+        let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        cfg.vocab_size = 256;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint(&cfg))?;
+        let manifest = package(&cfg, &core)?;
+        for ranks in [1, 2] { for owners in if ranks == 1 { vec![None] } else { vec![None, Some([0, 1])] } {
+            for (unit, slots) in [(64, 1), (2048, 2), (2752, 3), (4096, 4)] {
+                for draft in [None, Some(128)] {
+                    let charge = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, owners.as_ref().map(|o| o.as_slice()),
+                        unit, slots, draft, &manifest)?;
+                    let bytes = charge.bytes(cfg.hidden)?;
+                    for (rank, layout) in charge.ranks.iter().enumerate() {
+                        let mut expected = 0;
+                        for (actual, rows) in [layout.decode.as_ref().unwrap(), layout.prefill.as_ref().unwrap()]
+                            .into_iter().zip([64, unit]) {
+                            let mut scratch: Option<ProjectionScratchLayout> = None;
+                            for weight in &layout.body {
+                                let next = ProjectionScratchLayout::new(weight.shape[1], weight.shape[0], rows)?;
+                                if let Some(scratch) = &mut scratch { scratch.merge(&next)?; } else { scratch = Some(next); }
+                            }
+                            assert_eq!(Some(actual), scratch.as_ref());
+                            expected += actual.storage()?.owners.values().sum::<usize>();
+                        }
+                        assert!(layout.decode.as_ref().unwrap().extents["accumulator"] <= 64 * 16384 * 4);
+                        for (stage, rows) in layout.stages.as_ref().unwrap().iter().zip([64, unit]) {
+                            assert_eq!(stage, &CoreStageLayout::new(&cfg, rows, ranks, owners.is_some())?);
+                            expected += stage.extents.values().sum::<usize>();
+                        }
+                        assert_eq!(layout.retained_rows, 64 + crate::placement::families::glm5::prefill_span(unit as u64, slots as u64) as usize);
+                        expected += layout.retained_rows * cfg.hidden * 3 * 4;
+                        let suffix = if ranks == 2 { 4 * slots * unit.max(64) * cfg.hidden * 4 } else { 0 };
+                        assert_eq!(layout.receive_suffix, suffix);
+                        expected += suffix;
+                        assert_eq!(layout.target_heads.len(), if rank == 0 { 2 } else { 0 });
+                        for head in &layout.target_heads { assert_eq!(head.rows, 64); expected += head.bytes()?; }
+                        assert_eq!(layout.draft_head.as_ref().map(|h| h.rows), if rank == 0 { draft } else { None });
+                        expected += layout.draft_head.as_ref().map(|h| h.bytes()).transpose()?.unwrap_or(0);
+                        assert_eq!(bytes[rank], expected as u64);
+                    }
+                    let set = charge.program_set(&manifest, ranks == 2);
+                    assert!(charge.programs.iter().all(|name| set.names.contains(name)));
+                }
+            }
+        } }
+        Ok(())
+    }
+
+    #[test]
+    fn native_admission_rejects_missing_or_corrupt_executable_inventory() -> Result<()> {
+        let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        cfg.vocab_size = 256;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint(&cfg))?;
+        let manifest = package(&cfg, &core)?;
+        let admit = |m: &serde_json::Value| CoreCharges::from_package(&cfg, &core, cfg.layers, 2, None, 2752, 3, Some(128), m);
+        admit(&manifest)?;
+        for corruption in ["policy", "duplicate-policy", "program", "duplicate-program", "capacity", "geometry", "dtype", "scratch", "pointer", "scalar", "stage"] {
+            let mut m = manifest.clone();
+            match corruption {
+                "policy" => { m["families"]["dense_trellis_k6"]["row_policies"].as_array_mut().unwrap().clear(); }
+                "duplicate-policy" => { let p = m["families"]["dense_trellis_k6"]["row_policies"][0].clone();
+                    m["families"]["dense_trellis_k6"]["row_policies"].as_array_mut().unwrap().push(p); }
+                "stage" => m["programs"].as_array_mut().unwrap().retain(|p| p["name"] != "glm2_stage_swiglu_i1024"),
+                _ => {
+                    let entries = m["programs"].as_array_mut().unwrap();
+                    let index = entries.iter().position(|p| p["geometry"]["sharded_side"] == 2).unwrap();
+                    match corruption {
+                        "program" => { entries.remove(index); }
+                        "duplicate-program" => { let p = entries[index].clone(); entries.push(p); }
+                        "capacity" => entries[index]["capacity_rows"] = serde_json::json!(64),
+                        "geometry" => entries[index]["geometry"]["bits"] = serde_json::json!(4),
+                        "dtype" => entries[index]["geometry"]["input_dtype"] = serde_json::json!("bf16"),
+                        "scratch" => entries[index]["scratch_bytes_at_capacity"]["partial"] = serde_json::json!(8),
+                        "pointer" => entries[index]["pointers"][0]["name"] = serde_json::json!("wrong"),
+                        "scalar" => entries[index]["scalars"][0]["type"] = serde_json::json!("int64"),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(admit(&m).is_err(), "accepted {corruption}");
+        }
+        for (ranks, unit, slots, draft) in [(0, 64, 1, None), (3, 64, 1, None), (2, 0, 1, None),
+            (2, 4097, 1, None), (2, 64, 0, None), (2, 64, 5, None), (2, 64, 1, Some(4097))] {
+            assert!(CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None, unit, slots, draft, &manifest).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_admission_tracks_head_only_body_only_and_partial_layer_loads() -> Result<()> {
+        let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        cfg.vocab_size = 256;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint(&cfg))?;
+        let manifest = package(&cfg, &core)?;
+        for which in ["head", "body", "none", "partial"] {
+            let mut selected = core.clone();
+            selected.projections.retain(|stem, _| match which { "head" => stem == "lm_head", "body" => stem != "lm_head",
+                "none" => false, _ => true });
+            let layers = if which == "partial" { 1 } else { cfg.layers };
+            let c = CoreCharges::from_package(&cfg, &selected, layers, 2, Some(&[0, 1][..layers]), 2048, 2, Some(128), &manifest)?;
+            for (rank, c) in c.ranks.iter().enumerate() {
+                let body = which == "body" || which == "partial";
+                assert_eq!(c.decode.is_some(), body);
+                assert_eq!(c.prefill.is_some(), body);
+                assert_eq!(c.stages.is_some(), body);
+                assert_eq!(c.retained_rows > 0, body);
+                assert_eq!(c.receive_suffix > 0, body);
+                assert_eq!(!c.target_heads.is_empty(), rank == 0 && matches!(which, "head" | "partial"));
+                if which == "none" { assert_eq!(c.bytes(cfg.hidden)?, 0); }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_operand_admission_preserves_logical_crop_and_keep_list() -> Result<()> {
+        use crate::plan::{family::Family, FamilyModel, format::{Encoding, QuantOperand}, spec::{Component, TensorRole}};
+        let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        cfg.vocab_size = 256;
+        let checkpoint = checkpoint(&cfg);
+        let model = crate::plan::families::glm::GLM5.open(&checkpoint)?;
+        let operand = |logical| QuantOperand { encoding: Encoding::Exl3 { bits: 6 }, container: "I16".into(), logical,
+            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![] };
+        for (name, shape) in expected(&cfg) {
+            let stem = name.strip_suffix(".weight").unwrap();
+            let role = crate::plan::families::glm::GLM5.classify(model.spec(), &name).unwrap();
+            let mut op = operand(if stem.ends_with("kv_a_proj_with_mqa") { vec![640, cfg.hidden] } else { shape.clone() });
+            model.accepts(&role, stem, &mut op).map_err(anyhow::Error::msg)?;
+            assert_eq!(op.logical, shape);
+        }
+        for stem in ["model.layers.0.self_attn.kv_b_proj", "model.layers.0.self_attn.indexer.wq_b", "model.layers.0.mlp.gate"] {
+            assert!(model.accepts(&TensorRole::new(Component::Attention), stem, &mut operand(vec![128, 6144])).is_err());
+        }
+        assert!(model.accepts(&TensorRole::new(Component::Speculator), "model.layers.2.self_attn.q_a_proj", &mut operand(vec![2048, 6144])).is_err());
+        Ok(())
+    }
+
     #[test]
     fn core_inventory_charges_native_payload_vectors_and_full_padded_crop() -> Result<()> {
         let mut cfg=GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
@@ -209,10 +517,6 @@ mod tests {
             assert_eq!(p.resident_bytes(2)?,split/2+replicated);
             assert_eq!(p.resident_bytes(1)?,p.source_bytes-4);
         }
-        let scratch=core.projection_scratch(2,4096,false)?.unwrap();
-        assert!(scratch.extents["rotated"]>=4096*cfg.hidden*2);
-        assert!(scratch.extents["accumulator"]>=4096*8192*4);
-        assert!(scratch.bytes()?>0);
         let resident = |ranks, owners: Option<&[u8]>| -> Result<u64> {
             Ok(crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners)?
                 .iter().flatten().filter(|(_, format, _)| format == "exl3-k6")

@@ -10,26 +10,43 @@ use std::{collections::BTreeMap, ffi::c_void};
 /// scratch is serialized; the caller retains split output cores in row slots.
 pub(crate) struct CorePrograms<'a> {
     projections: BTreeMap<(usize, usize, usize, &'static str), Projection<'a>>,
-    layout: ProjectionLayout,
-    stages: cuteafd_loader::families::glm5::core::CoreStageLayout,
+    layouts: [ProjectionLayout; 2],
+    stages: [cuteafd_loader::families::glm5::core::CoreStageLayout; 2],
     pub add: F32Add<'a>,
     pub copy: V41PeerCopy<'a>,
 }
 impl<'a> CorePrograms<'a> {
     pub(crate) fn new(programs: &'a Programs<'a>, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig,
-        layers: &[super::weights::GlmLayer<'_>], rows: usize, ranks: usize) -> Result<Option<Self>> {
+        layers: &[super::weights::GlmLayer<'_>], unit: usize, ranks: usize,
+        admitted: Option<&cuteafd_loader::families::glm5::core::CoreRankLayout>) -> Result<Option<Self>> {
+        let rows = unit.max(super::engine::DECODE_ROWS);
         let mut projections = BTreeMap::new();
-        let mut layout: Option<ProjectionLayout> = None;
+        let mut layouts: [Option<ProjectionLayout>; 2] = [None, None];
         for weights in layers.iter().flat_map(|layer| layer.core.values()) {
             let key = projection_key(weights);
             if projections.contains_key(&key) { continue; }
             let projection = Projection::load_geometry(programs, key.0, key.1, key.2, key.3,
                 rows, TrellisDType::Bf16)?;
-            let required = ProjectionLayout::new(&projection.program, rows)?;
-            if let Some(layout) = &mut layout { layout.merge(&required)?; } else { layout = Some(required); }
+            ProjectionLayout::new(&projection.program, rows)?;
+            for (layout, rows) in layouts.iter_mut().zip([super::engine::DECODE_ROWS, unit]) {
+                let required = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(key.0, key.1, rows)?;
+                let required = ProjectionLayout { rows, extents: required.extents };
+                if let Some(layout) = layout { layout.merge(&required)?; } else { *layout = Some(required); }
+            }
             projections.insert(key, projection);
         }
-        let Some(layout) = layout else { return Ok(None); };
+        if projections.is_empty() {
+            ensure!(admitted.is_none_or(|a| a.body.is_empty()), "GLM K6 admitted body has no loaded owners");
+            return Ok(None);
+        }
+        let admitted = admitted.context("GLM K6 body has no admitted native layout")?;
+        let layouts = [layouts[0].take().context("GLM K6 decode layout")?,
+            layouts[1].take().context("GLM K6 prefill layout")?];
+        for (actual, expected) in layouts.iter().zip([admitted.decode.as_ref(), admitted.prefill.as_ref()]) {
+            let expected = expected.context("GLM K6 admitted projection layout")?;
+            ensure!(actual.rows == expected.rows && actual.extents == expected.extents,
+                "GLM K6 loaded body scratch differs from admission");
+        }
         // Neutral projection and GLM stage namespaces are distinct; both must
         // resolve on this rank before an unmatched peer wait or graph capture.
         programs.load_matching(|name| name.starts_with("glm_stage_") || name.starts_with("glm2_stage_"))?;
@@ -38,28 +55,22 @@ impl<'a> CorePrograms<'a> {
             let prefix = if ranks == 2 { "glm2" } else { "glm" };
             programs.program(&format!("{prefix}_stage_swiglu_i{inter}"), &["gate", "up", "hidden"])?;
         }
-        Ok(Some(Self { projections, layout,
-            stages: cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, rows, ranks, owned)?,
+        let stages = [cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, super::engine::DECODE_ROWS, ranks, owned)?,
+            cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, unit, ranks, owned)?];
+        ensure!(admitted.stages.as_ref() == Some(&stages), "GLM K6 loaded BF16 stages differ from admission");
+        Ok(Some(Self { projections, layouts, stages,
             add: programs.library().f32_add()?, copy: programs.library().v41_peer_copy()? }))
     }
     pub(crate) fn projection(&self, weights: &CoreWeights<'_>) -> Result<&Projection<'a>> {
         self.projections.get(&projection_key(weights)).context("GLM K6 geometry not bound before capture")
     }
-    pub(crate) fn allocate(&self, device: Device<'a>, rows: usize) -> Result<CoreScratch<'a>> {
-        ensure!(rows <= self.layout.rows && rows > 0, "GLM K6 scratch row capacity");
-        // Decode and prefill own different arenas, sized from the same policies.
-        let mut layout: Option<ProjectionLayout> = None;
-        for projection in self.projections.values() {
-            let policy = projection.program.policy();
-            let required = ProjectionLayout { rows, extents:
-                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(policy.input, policy.output, rows)?.extents };
-            if let Some(layout) = &mut layout { layout.merge(&required)?; } else { layout = Some(required); }
-        }
-        let projection = layout.context("GLM K6 projection arena")?.allocate(device)?;
-        let stages = self.stages.extents.iter().map(|(&name, &bytes)| {
-            ensure!(bytes % self.layout.rows == 0, "GLM K6 stage row extent");
-            Ok((name, Allocation::new(device, bytes / self.layout.rows * rows)?))
-        }).collect::<Result<_>>()?;
+    pub(crate) fn allocate(&self, device: Device<'a>, rows: usize, decode: bool) -> Result<CoreScratch<'a>> {
+        let index = usize::from(!decode);
+        let layout = &self.layouts[index];
+        ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
+        let projection = layout.allocate(device)?;
+        let stages = self.stages[index].extents.iter().map(|(&name, &bytes)|
+            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<_>>()?;
         Ok(CoreScratch { projection, stages })
     }
 }
@@ -85,12 +96,16 @@ pub(crate) struct CoreHead<'a> {
 }
 impl<'a> CoreHead<'a> {
     pub(crate) fn new(programs: &'a Programs<'a>, weights: &CoreWeights<'a>, rows: usize,
-        device: Device<'a>, stream: *mut c_void) -> Result<Self> {
+        device: Device<'a>, stream: *mut c_void,
+        admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {
         ensure!(weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Output,
             "GLM K6 head must be whole on rank 0");
         let projection = device.run(|| Projection::load_geometry(programs, weights.shape[1], weights.shape[0],
             1, book(weights), rows, TrellisDType::F32))?;
-        let scratch = ProjectionLayout::new(&projection.program, rows)?.allocate(device)?;
+        let layout = ProjectionLayout::new(&projection.program, rows)?;
+        ensure!(admitted.rows == layout.rows && admitted.extents == layout.extents,
+            "GLM K6 head scratch differs from admission");
+        let scratch = layout.allocate(device)?;
         Ok(Self { projection, scratch, device, stream, rows })
     }
 

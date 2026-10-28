@@ -822,12 +822,6 @@ impl Opened {
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
-        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*",
-                &cuteafd_loader::placement::ProgramSet::from_names(
-                    if native { &["glm", "glm2", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage"] } else { &["glm", "glm2"] },
-                    programs.names())))
-            .collect::<Result<Vec<_>>>()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
@@ -850,6 +844,27 @@ impl Opened {
         let prefill_lanes = usize::from(args.prefill_waves);
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
             "layer-owned prefill lacks capacity for {prefill_lanes} waves");
+        let core = checkpoint.as_ref().map(|checkpoint| -> Result<_> {
+            let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&self.cfg, checkpoint)?;
+            if core.projections.is_empty() { return Ok(None); }
+            let draft_rows = args.draft.as_deref().map(|snapshot| -> Result<_> {
+                let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+                let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
+                args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")
+            }).transpose()?;
+            Ok(Some(cuteafd_loader::families::glm5::core::CoreCharges::from_package(&self.cfg,
+                &core, layers, devices.len(), owners.as_deref(), args.prefill_rows, prefill_lanes,
+                draft_rows, &manifest)?))
+        }).transpose()?.flatten();
+        let native_dense_charge = if let Some(core) = &core { core.bytes(self.cfg.hidden)? }
+            else { native_dense_charge };
+        let code_set = core.as_ref().map(|core| core.program_set(&manifest, devices.len() == 2))
+            .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(
+                if native { &["glm", "glm2", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage"] }
+                else { &["glm", "glm2"] }, programs.names()));
+        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
+            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
+                if core.is_some() { "glm-k6" } else { "glm" }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
@@ -1109,7 +1124,7 @@ impl Opened {
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
-        engine.bind_core()?;
+        engine.bind_core(core)?;
         if native {
             // Bind each GPU before capture; all prefill scratch is lane-local.
             for rank in 0..engine.ranks() {
