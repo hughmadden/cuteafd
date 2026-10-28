@@ -335,10 +335,12 @@ impl<'library> DsparkWeights<'library> {
             DsparkAttentionWave::device_bytes_with_width(library, members, width)?.checked_mul(3).context("draft attention overflow")?,
             members as usize * 4, DsparkTerminal::device_bytes_with_width(members as usize, width)?]
             .into_iter().try_fold(0usize, |n, b| n.checked_add(b).context("draft chain overflow"))?;
-        let head_scratch = if crate::families::deepseek_v41::v41_tensors::fp8_head()
-            != crate::families::deepseek_v41::v41_tensors::Fp8Head::Off {
-            library.fp8_w8a16_workspace(members as usize * width, 5120, 129280)?.max(256)
-        } else { 0 };
+        let head_scratch = match crate::families::deepseek_v41::v41_tensors::fp8_head() {
+            crate::families::deepseek_v41::v41_tensors::Fp8Head::Off => 0,
+            crate::families::deepseek_v41::v41_tensors::Fp8Head::Packed =>
+                library.packed_head_workspace(members as usize * width, 5120, 129280)?.max(256),
+            _ => library.fp8_w8a16_workspace(members as usize * width, 5120, 129280)?.max(256),
+        };
         let mut runtime = chain.checked_add(head_scratch).and_then(|n| n.checked_mul(lanes as usize)).context("draft lanes overflow")?
             .checked_add(DsparkMainContext::device_bytes(library, context_capacity)?).context("draft main overflow")?;
         if lanes > 1 { runtime = runtime.checked_add(DsparkMainContext::device_bytes(library, 80)?).context("draft second main overflow")?; }

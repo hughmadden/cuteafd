@@ -99,7 +99,7 @@ impl<'a> TargetHeadWeights<'a> {
             head,
             capacity,
             graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
-            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.fp8(), capacity,
+            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.copy(), capacity,
                 crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
             ready: None,
             origin: None,
@@ -140,8 +140,8 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     /// Captured head graphs by row count (index rows - 1), kept while serving:
     /// verification widths vary round to round.
     graphs: crate::shared::decode_graph::RowGraphs<'a>,
-    /// Scratch of the FP8 head copy when the target head projects through it.
-    fp8_scratch: Option<DeviceAllocation<'a>>,
+    /// Scratch of the head copy (E4M3 or exact 12-bit) when the target head projects through it.
+    fp8_scratch: Option<crate::families::deepseek_v41::v41_tensors::HeadScratch<'a>>,
     ready: Option<usize>,
     origin: Option<QueryBinding>,
     selected: Vec<usize>,
@@ -199,7 +199,7 @@ impl TargetHeadWave<'_, '_> {
                 self.stream.raw,
             )?;
             crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, &self.projection,
-                self.head.weight(), self.head.fp8().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
+                self.head.weight(), self.head.copy().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
                 self.stream.raw)?;
             Ok(())
         }

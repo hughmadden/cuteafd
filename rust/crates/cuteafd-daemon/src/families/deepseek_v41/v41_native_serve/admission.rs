@@ -203,12 +203,11 @@ pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib
     use cuteafd_ffi::memory_ledger::{snapshot, Space};
     let manifest = families::deepseek_v41::owners::native_manifest(native_lib, "V41_FP8_AOT.json")?;
     let programs = families::deepseek_v41::owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
-    let fp8_head = crate::families::deepseek_v41::v41_tensors::fp8_head()
-        == crate::families::deepseek_v41::v41_tensors::Fp8Head::All;
+    let head_mode = crate::families::deepseek_v41::v41_tensors::fp8_head();
     let window_batch = gpus.len() == 1 && super::BackboneExecution::window_batch_enabled();
     let ranks = gpus.len();
-    let lanes = programs.decode_lanes(u64::from(decode_rows), ranks, fp8_head, window_batch)?;
-    let prefill = programs.prefill_slots(reserve, u64::from(unit), ranks, slots, fp8_head, window_batch)?;
+    let lanes = programs.decode_lanes(u64::from(decode_rows), ranks, head_mode, window_batch)?;
+    let prefill = programs.prefill_slots(reserve, u64::from(unit), ranks, slots, head_mode, window_batch)?;
     let ledger = snapshot();
     for (rank, &gpu) in gpus.iter().enumerate() {
         let owners = ledger.by_owner(Space::Device, gpu);
@@ -291,8 +290,7 @@ pub(super) fn admit_startup(
     let passes = shape.waves;
     let mut target = programs.target(u64::from(super::DECODE_LANE_ROWS), shape.reserve_rows() as u64,
         u64::from(capacity), 1, passes,
-        crate::families::deepseek_v41::v41_tensors::fp8_head()
-            == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
+        crate::families::deepseek_v41::v41_tensors::fp8_head(),
         BackboneExecution::window_batch_enabled())?;
     validate_engram_rows(&target, shape.reserve_rows(), super::DECODE_LANE_ROWS as usize)?;
     // Test builds retain the materialized query reference buffer; production
@@ -388,7 +386,8 @@ mod startup_tests {
         for k in 2..=4u64 {
             let unit = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(k);
             let reserve = (k * unit) as usize;
-            let target = programs.target(80, reserve as u64, unit, 1, k as usize, false, true)?;
+            let target = programs.target(80, reserve as u64, unit, 1, k as usize,
+                super::families::deepseek_v41::resident::Fp8Head::Off, true)?;
             super::validate_engram_rows(&target, reserve, 80)?;
             assert!(super::validate_engram_rows(&target, reserve - 64, 80).is_err(), "reserve mismatch");
             let missing: Vec<_> = target.iter().filter(|d| d.group != "lane 1 engram rows").cloned().collect();
@@ -914,7 +913,7 @@ mod admission_tests {
                 let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
-                let target = programs.target(80, 512, 256, ranks, 2, true, ranks == 1)?;
+                let target = programs.target(80, 512, 256, ranks, 2, resident::Fp8Head::All, ranks == 1)?;
                 // The startup validators accept the planner's own target list.
                 if ranks == 1 { validate_engram_rows(&target, 512, 80)?; }
                 let fixed = owners::TargetOwners::new(weights, target, ranks,
@@ -1297,7 +1296,7 @@ mod plan_runtime_breakdown {
         let manifest = super::families::deepseek_v41::owners::native_manifest(&path, "V41_FP8_AOT.json")?;
         let programs = super::families::deepseek_v41::owners::NativePrograms::new(&manifest, 188)?;
         let rows = 80u32;
-        let plan = programs.decode_lanes(rows as u64, 1, false, true)?;
+        let plan = programs.decode_lanes(rows as u64, 1, super::families::deepseek_v41::resident::Fp8Head::Off, true)?;
         for d in plan.iter().filter(|d| d.group.starts_with("lane 0 ")) { eprintln!("PLAN {} {}", d.group, d.bytes); }
         let r = rows as usize;
         let lane: usize = v41_backbone_lane::BackboneLane::workspace_bytes(&lib, rows)?.into_iter().sum();
