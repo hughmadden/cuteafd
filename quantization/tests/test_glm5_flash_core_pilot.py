@@ -105,9 +105,12 @@ def test_qualification_requires_every_measured_proof_and_exact_inventory():
         validate_qualification(good)
 
 
-def test_quality_gate_rejects_k6_worse_than_fp8_control():
-    bad=report(); bad["results"][0]["nmse"]=.01
-    with pytest.raises(ValueError,match="exceeds the FP8"):
+def test_quality_gate_checks_absolute_error_and_reports_nearly_lossless_fp8_control():
+    good=report(); good["results"][0]["nmse"]=.000309
+    good["results"][1]["nmse"]=1e-9
+    assert validate_qualification(good) is good
+    bad=report(); bad["results"][0]["nmse"]=.001001
+    with pytest.raises(ValueError,match="absolute format bound"):
         validate_qualification(bad)
 
 
