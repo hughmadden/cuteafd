@@ -1259,12 +1259,22 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             }
             return Ok(report);
         }
-        // The largest page-multiple reserve that fits, by bisection (fit is
-        // monotone in the reserve). The adaptive executor admits four slots
-        // cut from it: depth k runs roundup64(reserve / k) rows, the widest
-        // unit (depth 2) is half the reserve, and the planner charges the
-        // largest split (8192 charges 8256).
+        // TJ's reserve rule (#762): the largest page-multiple reserve (at
+        // most the standard 8192) that keeps the RTX expert layers the
+        // reference 2 x 2048 shape onboards, and fits; fit and layers are
+        // monotone in the reserve, so a bisection finds it. The adaptive
+        // executor admits four slots cut from it: depth k runs
+        // roundup64(reserve / k) rows, the widest unit (depth 2) is half the
+        // reserve, and the planner charges the largest split (8192 charges 8256).
         use crate::serving_capacity::prefill_waves::{unit_rows_in, MAX_WAVES, RESERVE_ROWS, ROW_PAGE};
+        let reference = {
+            let mut pinned = candidate.clone();
+            let layout = pinned.layout.as_mut().unwrap();
+            layout.prefill_rows = 2048;
+            layout.prefill_waves = 2;
+            input.plan(&pinned)?
+        };
+        let keep = reference.executable().then_some(reference.onboard_layers).flatten();
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
                 candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
@@ -1273,32 +1283,39 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
         };
+        let admits = |report: &PlanReport| report.executable()
+            && keep.is_none_or(|layers| report.onboard_layers.is_some_and(|onboard| onboard >= layers));
         // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`)
         // at every depth it may run.
         let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
             .filter(|&reserve| unit_rows_in(MAX_WAVES, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
             .collect();
         let waves = report.prefill_waves.unwrap_or(2);
-        let full = at(RESERVE_ROWS)?;
-        if full.executable() { return Ok(full); }
-        let smallest = at(*candidates.last().unwrap())?;
-        if !smallest.executable() {
-            let mut refused = full;
-            refused.hints.push(Hint {
-                what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
-                    candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
-                how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
-            });
-            return Ok(refused);
-        }
-        // candidates[lo] fits, candidates[hi] does not (descending order).
-        let (mut lo, mut hi, mut best) = (candidates.len() - 1, 0, smallest);
-        while lo - hi > 1 {
-            let mid = (lo + hi) / 2;
-            let report = at(candidates[mid])?;
-            if report.executable() { lo = mid; best = report; } else { hi = mid; }
-        }
-        Ok(best)
+        // The largest candidate (descending) whose report passes `ok`, by
+        // bisection (monotone in the reserve); None when the smallest fails.
+        let mut largest = |ok: &dyn Fn(&PlanReport) -> bool| -> Result<Option<PlanReport>, PlanError> {
+            let full = at(RESERVE_ROWS)?;
+            if ok(&full) { return Ok(Some(full)); }
+            let smallest = at(*candidates.last().unwrap())?;
+            if !ok(&smallest) { return Ok(None); }
+            let (mut lo, mut hi, mut best) = (candidates.len() - 1, 0, smallest);
+            while lo - hi > 1 {
+                let mid = (lo + hi) / 2;
+                let report = at(candidates[mid])?;
+                if ok(&report) { lo = mid; best = report; } else { hi = mid; }
+            }
+            Ok(Some(best))
+        };
+        if let Some(best) = largest(&admits)? { return Ok(best); }
+        // No reserve keeps the reference layers: the largest that fits.
+        if let Some(best) = largest(&|report: &PlanReport| report.executable())? { return Ok(best); }
+        let mut refused = at(RESERVE_ROWS)?;
+        refused.hints.push(Hint {
+            what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
+                candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
+            how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
+        });
+        Ok(refused)
     };
     let mut requested = candidate(count)?;
     if count > available {

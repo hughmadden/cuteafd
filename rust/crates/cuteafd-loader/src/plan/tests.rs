@@ -3579,6 +3579,33 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
 }
 
 #[test]
+fn v41_reserve_keeps_the_reference_2x2048_onboarded_layers() {
+    // TJ's reserve rule (#762): the largest reserve that onboards at least
+    // the layers 2 x 2048 does; one 64-row step larger loses a layer or no
+    // longer fits (unless 8192 already keeps them).
+    let dir = strict_v41_snapshot(false);
+    for gib in [32u64, 64, 96] {
+        let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![gib << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0),
+            context_tokens: 1 << 20, prefill_rows: 0, ..Default::default() };
+        let reference = plan_spark_count(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            prefill_rows: 2048, prefill_waves: 2, ..layout.clone() }), ..sparks(4) }, 6, Some(4)).unwrap();
+        let chosen = plan_spark_count(dir.path(), &PlanOptions { layout: Some(layout.clone()), ..sparks(4) }, 6, Some(4)).unwrap();
+        if !reference.executable() { continue; }
+        assert!(chosen.executable(), "{gib} GiB: {}", render(&chosen));
+        let reserve = chosen.prefill_reserve_rows.unwrap();
+        assert!(chosen.onboard_layers >= reference.onboard_layers,
+            "{gib} GiB reserve {reserve}: {:?} layers < reference {:?}", chosen.onboard_layers, reference.onboard_layers);
+        if reserve < 8192 {
+            let larger = plan_spark_count(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+                prefill_reserve_rows: Some(reserve + 64), ..layout.clone() }), ..sparks(4) }, 6, Some(4)).unwrap();
+            assert!(!larger.executable() || larger.onboard_layers < reference.onboard_layers,
+                "{gib} GiB: reserve {} also keeps the layers", reserve + 64);
+        }
+    }
+}
+
+#[test]
 fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);
