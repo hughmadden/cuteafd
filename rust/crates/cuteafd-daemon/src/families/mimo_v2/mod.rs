@@ -1403,7 +1403,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     if let Some(dir) = &args.save_logits {
-        ensure!(!dir.try_exists()? && dir.parent().is_some_and(std::path::Path::is_dir),
+        let parent = dir.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        ensure!(!dir.try_exists()? && parent.is_dir(),
             "--save-logits needs an existing parent and a new output directory");
     }
     args.engine.validate_draft_replay(args.draft_replay.is_some())?;
@@ -1582,7 +1584,9 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         println!("decode steps of {}: warm median {:.3} ms, first {:.3} ms", args.step_rows, 1e3 * warm[warm.len() / 2],
             1e3 * step_times[0]);
     }
-    let reference = read_golden_logits(&args.golden, args.save_logits.is_some())?;
+    let reference = if !prefill_logits.is_empty() || !decode_logits.is_empty() || logits.is_some() {
+        read_golden_logits(&args.golden, args.save_logits.is_some())?
+    } else { None };
     if let Some(golden) = &reference {
         ensure!(tokens.len().checked_mul(cfg.vocab_size) == Some(golden.len())
             && golden.iter().all(|v| v.is_finite()), "MiMo golden logits shape/finite mismatch");
