@@ -478,13 +478,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
                     for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
-                    super::score(lib, runtime, requests, &mut *prefill_slots, lease,
+                    super::score(lib, runtime, requests, (&mut *first, &mut *first_transport), &mut *prefill_slots, lease,
                         &prompt, from, super::PrefillShape::from_args(args), &job, draft.as_deref_mut(),
                         &mut || prefixes.prefill_hold())?;
                 }
                 for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
                 let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
-                else { prefill(lib, runtime, requests, &mut *prefill_slots, lease, &prompt,
+                else { prefill(lib, runtime, requests, &mut *prefill_slots, Some((&mut *first, &mut *first_transport)), lease, &prompt,
                     super::PrefillShape::from_args(args), &job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
                 requests.record_state(lease, &job.probe, "prompt")?;
                 if crate::shared::probe::wants_first(&job.probe) {

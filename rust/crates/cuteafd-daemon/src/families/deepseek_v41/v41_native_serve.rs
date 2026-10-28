@@ -691,6 +691,9 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     runtime: &tokio::runtime::Runtime,
     requests: &mut Requests<'a>,
     prefill_slots: &mut prefill_target::PrefillSlots<'a, P>,
+    // A decode lane for a cold-replay probe's decode-shaped steps: only a
+    // decode lane's transport reaches a Spark decode execution.
+    mut decode_lane: Option<(&mut P, &mut P::Transport)>,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
     tokens: &[u32],
     shape: PrefillShape,
@@ -715,7 +718,9 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
                     draft: draft.as_deref_mut(), hold, times: &mut times };
                 scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
             } else if cold_step.decode {
-                let (pass, transport) = prefill_slots.slot0();
+                let (pass, transport) = decode_lane.as_mut()
+                    .context("V4.1 cold replay decode steps need a decode lane")?;
+                let (pass, transport) = (&mut **pass, &mut **transport);
                 let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
                     image_mask: None, kind: ExpertV2SourceKind::Decode }])?;
                 let result = (|| -> Result<RetainedScores> {
@@ -832,7 +837,7 @@ pub(crate) fn calibrate_prefill_depth<'w, 'a: 'w, P: scheduler::layout::ServingT
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let ran = (|| -> Result<()> {
             for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
-            prefill::<P, P::Chain>(lib, runtime, requests, prefill_slots, lease, tokens, shape, &job, None,
+            prefill::<P, P::Chain>(lib, runtime, requests, prefill_slots, None, lease, tokens, shape, &job, None,
                 &mut || Ok(())).map(|_| ())
         })();
         requests.release(lease)?;
@@ -930,10 +935,14 @@ impl ScoringPlan {
 /// Teacher-forced scoring: prefill the prefix, then record rows from the
 /// explicitly selected decode-shaped verification or legacy prefill-shaped
 /// continuation. The first row comes from prefix prefill in either path.
+/// Decode-shaped steps (Decode/MtpVerify rows) run on `decode_lane`, whose
+/// transport is a Spark decode execution; prefill-shaped steps stay on prefill
+/// slot 0, whose link the Spark admits only for prefill rows.
 /// Returns [`ScoringDone`] when done.
 #[allow(clippy::too_many_arguments)]
 fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
-    requests: &mut Requests<'a>, prefill_slots: &mut prefill_target::PrefillSlots<'a, P>,
+    requests: &mut Requests<'a>, decode_lane: (&mut P, &mut P::Transport),
+    prefill_slots: &mut prefill_target::PrefillSlots<'a, P>,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
     tokens: &[u32], from: usize, shape: PrefillShape, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
@@ -942,9 +951,14 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let from = from.clamp(1, tokens.len() - 1);
-    let first = prefill(lib, runtime, requests, prefill_slots, lease, &tokens[..from],
+    let (decode_pass, decode_transport) = decode_lane;
+    let first = prefill(lib, runtime, requests, prefill_slots, Some((&mut *decode_pass, &mut *decode_transport)), lease, &tokens[..from],
         shape, job, draft.as_deref_mut(), hold)?;
-    let (pass, transport) = prefill_slots.slot0();
+    let (slot_pass, slot_transport) = prefill_slots.slot0();
+    let (pass, transport) = match plan.path {
+        crate::shared::probe::ScorePath::Decode => (decode_pass, decode_transport),
+        crate::shared::probe::ScorePath::Prefill => (slot_pass, slot_transport),
+    };
     probe.row(from, &first.logits()?);
     for step in plan.steps(from, tokens.len()) {
         ensure!(!job.events.is_closed(), "client disconnected");
@@ -987,6 +1001,42 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
     Err(ScoringDone.into())
+}
+
+#[cfg(test)]
+mod spark_lane_tests {
+    use super::*;
+
+    /// The Spark admits the two decode lanes' endpoints as decode executions
+    /// and the prefill link (endpoint 2) only for prefill rows, at every k.
+    /// So decode-shaped rows (Decode/MtpVerify: scoring verify steps, cold
+    /// replay decode steps) must run on a decode lane, never on prefill slot 0
+    /// (its transport is the prefill link): cards30 min failed on exactly that.
+    #[test]
+    fn decode_shaped_rows_never_ride_the_prefill_link() {
+        use cuteafd_transport::{worker_selection::{execution_owner, ExecutionOwner}, ExpertV2SourceKind::*};
+        for (slots, unit) in [(2u64, 4096u64), (3, 2752), (4, 2048)] {
+            let executions = cuteafd_loader::plan::spark_executions::admit_family("deepseek_v41",
+                &cuteafd_core::EXL3_CAPACITIES, None, unit, slots).unwrap();
+            for lane in 0..2 {
+                for (kind, rows) in [(Decode, 1), (MtpVerify, 8)] {
+                    assert_eq!(execution_owner(&executions, kind, lane, rows).unwrap(), ExecutionOwner::Decode(lane as usize));
+                }
+            }
+            for kind in [Decode, MtpVerify] {
+                assert!(execution_owner(&executions, kind, 2, 8).is_err(), "k={slots}: decode rows on the prefill link");
+            }
+            assert_eq!(execution_owner(&executions, Prefill, 2, unit as u32).unwrap(), ExecutionOwner::Prefill);
+        }
+        // Every decode-shaped call site takes its pass from a decode lane.
+        let source = include_str!("v41_native_serve.rs");
+        let body = |name: &str| { let start = source.find(name).unwrap(); &source[start..start + source[start..].find("\n}\n").unwrap()] };
+        let cold = body("fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(");
+        let decode_step = &cold[cold.find("} else if cold_step.decode {").unwrap()..cold.find("} else {\n                if index + 1").unwrap()];
+        assert!(decode_step.contains("decode_lane") && !decode_step.contains("slot0()"), "cold replay decode step must use a decode lane");
+        let score = body("fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(");
+        assert!(score.contains("ScorePath::Decode => (decode_pass, decode_transport)"), "decode-path scoring must use the decode lane");
+    }
 }
 
 #[cfg(test)]
