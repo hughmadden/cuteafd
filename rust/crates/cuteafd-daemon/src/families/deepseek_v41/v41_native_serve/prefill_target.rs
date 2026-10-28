@@ -87,6 +87,18 @@ pub(crate) struct V41PrefillTimes {
     us_per_row: [Option<f64>; 5],
 }
 
+/// One stream call's units: the shared cut for page-aligned unit widths;
+/// test geometries below a page (2-RTX fixture: 3 and 16 rows) keep plain
+/// `chunk_rows` units, as `V41PrefillTimes::encoder_unit` streams them.
+fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    if chunk_rows % 64 != 0 {
+        ensure!(rows > 0 && chunk_rows > 0, "empty prefill stream units");
+        return Ok((0..rows).step_by(chunk_rows).map(|first| first..rows.min(first + chunk_rows)).collect());
+    }
+    crate::shared::prefill_pipeline::prefill_units(rows, chunk_rows, waves,
+        cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize)
+}
+
 impl V41PrefillTimes {
     fn encoder_unit(&self, tokens: usize, chunk_rows: usize, waves: usize, next: usize,
         replay_end: usize, streamed: bool, budget: ChunkBudget) -> V41Unit {
@@ -99,8 +111,7 @@ impl V41PrefillTimes {
         let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
         if whole && waves > 1 && chunk_rows % 64 == 0 {
             // The shared cut: full units of the configured (captured) width and one tail.
-            if let Ok(units) = crate::shared::prefill_pipeline::prefill_units(tokens - next, chunk_rows, waves,
-                cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize) {
+            if let Ok(units) = stream_units(tokens - next, chunk_rows, waves) {
                 return V41Unit::Stream(units.into_iter().map(|unit| next + unit.start..next + unit.end).collect());
             }
         }
@@ -272,8 +283,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     result = (|| -> Result<()> {
                         ensure!(waves <= self.prefill.slots.len(), "{waves} prefill waves exceed the {} slots",
                             self.prefill.slots.len());
-                        let unit_rows = crate::shared::prefill_pipeline::prefill_units(rows, self.chunk_rows, waves,
-                            cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize)?;
+                        let unit_rows = stream_units(rows, self.chunk_rows, waves)?;
                         let chunks: Vec<_> = unit_rows.iter().map(|range| &self.tokens[at + range.start..at + range.end]).collect();
                         // The next call's first units at this call's unit width.
                         let width = unit_rows.first().map_or(1, |range| range.len());
