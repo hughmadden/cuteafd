@@ -5892,3 +5892,239 @@ Independent focused validation passed 64 CPU cases and 24 RTX CUDA cases,
 covering FP16/BF16/FP32 inputs, bias and batches 1/33. The production native
 loader already supported this geometry. Recovery of the completed producer
 uses its recorded commit; a new producer pin requires fresh admission evidence.
+
+## GLM 5.3 BF16 to EXL3 K4 / Core K6 (Oliver, 2026-10-24)
+
+User brief: `~/glm53-k4-core-k6-quant.md`. Work is isolated in
+`~/Developer/cuteafd-glm53-core-k6` on `quant/glm53-k4-core-k6`, based on
+`2000d0826298dcdae14a8d1631300b8489d17651`. Push only the task branch;
+the orchestrator reviews and merges. Step 1 is the bounded format pilot and
+recipe report; stop for TJ's recipe decision before the full quantization.
+Publication also has the explicit confirmation point stated in the brief.
+Only Oliver's RTX is used for quantization and correctness, with no serving
+performance measurements. Raptor qualification and engine work are separate.
+
+Source: `zai-org/GLM-5.3-BF16` at
+`9d2398f478cab2de883137db3a36ad2c96205e24`. All 282 headers match the exact
+59,585-tensor inventory (1,506,659,919,872 payload bytes). The proposed recipe
+in `quantization/glm5/core_k6/recipe.py` selects 547 target core matrices at
+K6, eight MTP core matrices at K4 and 58,368 routed expert matrices at K4.
+All selected formats use standard MCG, seed 787 and sigma 0.025. Retain the
+662 other tensors byte-for-byte, including the F32 router correction biases.
+Expected output: 236,354 tensors, 385,362,552,236 payload bytes (358.90 GiB).
+Non-expert payload is 16.01 GiB; the head-split weight estimate is 10.00 GiB
+on rank 0 and 7.34 GiB on rank 1, with MTP eh_proj replicated and excluding
+runtime overhead. The native 576-output kv_a uses standard stored width 640.
+
+`quantization/glm5/prepare_corpus.py` reuses the Kimi panel attestation and
+flat-token format, with native GLM thinking/max-effort rendering. Same pinned
+panel revision as Kimi; 1,426 calibration prompts yield 1,097,737 GLM tokens.
+Native and Tokenicer boundary probes match exactly. Heldout has 88 prompts,
+68,286 tokens and maximum length 1,049, so it cannot qualify long-context
+sparse-token selection. Only calibration prompt cal-1304 exceeds 2,048
+tokens (2,205); the pilot includes it as a native replay correctness witness.
+
+The bounded pilot uses fixed BF16 source predecessors for fair format
+comparison, 35,229 calibration tokens and 4,691 heldout tokens on layers 1
+and 6. It compares serialized MCG K6/K5/K4, block-128 FP8 RTN and BF16,
+using heldout activation-weighted NMSE and scale-inclusive TP2 storage.
+Candidate weights never affect this reference replay. The head comparison
+is deferred because its true normalized input requires all 78 source layers.
+Capture includes exact shared DSA top-k state in each rolling frontier;
+candidate/Hessian receipts and immutable input/code hashes permit explicit
+recovery. The run reuses Kimi's bounded container, hardware admission,
+container guard and detached supervisor, with a one-hour limit and 50 GiB
+container memory cap. Logs/receipts/results live under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/pilot-v1/`;
+research/header evidence under `~/.cache/cuteafd/builds/glm53-core-k6/research/`.
+
+The approved production ordering is one interleaved causal pass: finish each
+core stage and K4 experts, replay the finished block, then calibrate the next.
+Dense core uses natural observations only; newly quantized cold experts need
+the explicit GLM recovery recipe, not Kimi's router-rank window. MTP requires
+a qualified shifted embedding/target-state input contract, not ordinary
+layer-78 replay. Wait for Oliver's local BF16 copy before full production.
+
+Engine gaps are report-only in this task. Existing GLM native trellis support
+is K4-only and EXLR8-record based; K6 standard-HF discovery, BF16 kv_b/indexer,
+head/shared-FFN execution, padded output handling, DFlash2 head borrowing and
+MTP need scheduling before claiming this checkpoint is served by cuteafd.
+
+Step 1 completed on 2026-10-24: [results and engine audit](https://github.com/tpurtell/cuteafd/issues/713),
+[draft implementation](https://github.com/tpurtell/cuteafd/pull/711), reviewed recipe
+`~/glm53-core-quant.md`. All 110 measurements are durable: K6 selected-core
+heldout projection NMSE is 5.18–66.89 times lower than the block-128 FP8 RTN
+control on the same BF16 weights. This does not compare full-model quality
+against the vendor checkpoint. K5 dense-FFN NMSE is about 3.7 times K6 for
+only 81 MiB saved across the three dense layers; recommend the original K6
+scope. Head K6/K8 and independent long-context quality remain unmeasured.
+
+All native/staged boundaries through layers 0–6, including cal-1304, were
+byte-exact. The capture attempt completed both splits, then stopped on the
+reused E4M3 pilot helper's unsupported optional codebook keyword against the
+pinned MCG codec. Scoring-only recovery uses that codec's standard MCG default,
+requires identical inputs/dependencies and unchanged capture AST, verifies
+all Hessian receipts, and retains the original immutable capture plan. Final
+63 CPU checks pass; successful attempt `1792844246867467726` exits zero.
+Results are under `pilot-v2-score/`, capture evidence under `pilot-v1/`.
+Peak CUDA allocations were 22.02 GiB for native capture and 11.52 GiB for
+scoring, host RSS 3.71 GiB. Both containers are stopped, GPU ownership is
+released, and all rolling activation frontiers are retired. Oliver's complete
+sealed BF16 source replica is now ready. Full production awaits the explicit
+recipe decision required by the brief; the source checkpoint and final K4/K6
+payload together fit the root disk with room for bounded rolling state.
+
+TJ approved the reviewed recipe with "Go" on 2026-10-24. Full production
+started at 22:06 Taipei, attempt `1792850759329904317`, under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/production/`; output is
+`~/.cache/huggingface/cuteafd-exports/GLM-5.3-EXL3-K4-Core-K6/`.
+Use `quantization/glm5/core_k6/launch.py` with source/tokens/root/export;
+explicit recovery adds `--resume`. Publication is a later explicit
+`--publish-only` invocation after the brief's confirmation point. The GPU
+job does not upload automatically. It holds the bounded local gpu1 queue
+admission, uses the architecture-matched container with a 60 GiB memory cap,
+and releases its container before exit. Monitor every 30 minutes after
+stable startup. Full calibration is 1,097,737 rows; MTP uses the 1,096,311
+valid within-prompt shifted pairs.
+
+Fork main and the matching pin/tree lock are pushed at
+`a196a448fb3f76774c31e02b42523997f05385e3`. New core/MTP helpers passed
+50 focused CPU tests, ten K4/K6 CUDA cases and six source-native MTP CUDA
+cases. Coordinator/export/publication/compatibility gates pass 115 CPU cases.
+The real-weight smoke quantized all core matrices in target layers 0–3,
+all 256 experts of layer 3 and MTP EH/KV (798 projections), using unchanged
+cal-1304. Native/staged target boundaries and DSA state were byte-exact at
+2,205 tokens; real MTP and shared-head norm were byte-exact at 2,204 valid
+pairs. Peak GPU allocation was 27.06 GiB. Its final log call duplicated a
+memory keyword after the successful numerical report; the logging fix and
+independent completed-proof audit retain that report's original identity,
+verify all four shard checksums and 798 calibrated evidence records, and
+exit successfully without repeating numerical work. Evidence and audit
+markers remain in `~/.cache/cuteafd/builds/glm53-core-k6/`.
+
+Do not change the producer, fork pin or prepared data during the run: the
+production plan binds numerical code and packages. Documentation, status
+and a future publication-only compatibility fix are separate from that
+numerical identity. CPU-only publication requires the matching durable
+completion marker, exact 80-shard inventory and remote checksum audit.
+
+Recovery on 2026-10-26: the old WSL filesystem failed and its production
+quantization was lost. The rebuilt host is named `maxq`; persistent `/home`
+and Docker's `/srv` now use the native NVMe filesystem rather than the small
+WSL root volume. A 256 MiB write/fsync/read checksum check passed. Rebuilt
+the task worktree's corrupt Git index after verifying its working files;
+the original index is retained in the readiness cache. Git object checks
+pass, and every tracked GPTQModel file matches the existing pinned commit.
+Recovered only the three attested tokenized panel splits from the read-only
+old filesystem: their manifest SHA-256 is unchanged
+(`672455f149d27ff640441e2409d1dc9b1341067bd58f0fdd7136ee503f10add8`).
+New production starts from layer zero, with the same numerical producer.
+
+Restored `cuteafd-coordinator-dev:tc-aa74e55ca2130070` from Raptor using
+compressed Docker save/load; all 86 layers and the toolchain label match,
+as does image ID `fc14e74c6890556cd7d2770d8afe50230a5cdac9342024428bb98cb03060b51c`.
+The preflight accepts only the authorized `oliver`/`maxq` host names and
+requires the complete BF16 source on the current host, never merely on the
+old host name or archive. Explicit `--qualification-only` admits a fresh
+GPU proof without requiring its future report; normal production continues
+to require the completed proof and audit. Launcher/corpus/producer/export
+CPU checks pass 89 cases. Fresh CUDA proof and full local-source integrity
+are required before restarting. This agent session predates the host's FUSE
+mount, so host-side admission runs through a fresh local SSH session that
+sees the mounted source; containers also see the host mount normally.
+
+TJ explicitly requested taking the GPU reservation before the source copy
+finishes, then starting automatically once the original is fully local.
+The local fair-queue `gpu1` lease is held across readiness, qualification and
+production. The launcher supports `--foreground --use-held-lock`: it checks
+the enclosing lease and actual flock, keeps durable attempt records, avoids
+requeueing behind itself and replaces itself with the existing container
+teardown guard. It cannot detach or publish while using that reservation.
+The guard now handles SIGHUP as well as TERM/INT, so SSH hangup cleanup
+precedes reservation release. The expanded CPU gate passes 94 cases.
+
+The source is fully local on MaxQ. `nest fsck --deep` reported corrupt blob
+names, but independently hashing flagged shard 92 matches its published HF
+LFS SHA-256 exactly: Sparknest's global deduplicated blob IDs differ from
+the HF content SHA-256 names. No destructive fsck resolution was applied.
+Readiness therefore verifies all 282 weights and six source/config/tokenizer
+assets directly against the pinned Hugging Face revision's published hashes;
+the two-thread streaming audit and evidence live in the readiness cache.
+Non-login SSH admission also resolves WSL's `/usr/lib/wsl/lib/nvidia-smi`
+when it is absent from PATH. The final CPU gate passes 96 cases, including
+both normal Linux and minimal-PATH WSL admission.
+
+The fresh full run started 2026-10-26 19:53 Taipei, attempt
+`1793015633854537011`, at the same production/export paths above. All 282
+weight shards and six configuration/tokenizer assets (1,403.22 GiB) passed
+direct comparison with the pinned HF revision's published SHA-256/Git-blob
+hashes in a 614-second two-thread streaming audit. Fresh CUDA qualification
+passes 16 cases. The real-weight proof finishes normally with 798 calibrated
+projections, byte-exact native/staged target boundaries at 2,205 tokens and
+byte-exact MTP/shared-head norm at 2,204 valid pairs; peak CUDA allocation is
+27.06 GiB. The separate completed-proof audit also passes. The same reserved
+local GPU lease spans qualification and the foreground production supervisor;
+its container guard runs before the lease releases. The immutable numerical
+producer, source revision, token manifest and fork pin are unchanged. Resume
+an interrupted reserved run explicitly with `--resume --foreground
+--use-held-lock` under a newly acquired enclosing lease; ordinary detached
+recovery without a reservation still uses `--resume`. Publication remains
+separate and requires TJ's confirmation once the completed artifact is ready.
+
+The monitoring server restarted on 2026-10-28 04:40 Taipei. The foreground
+SSH reservation's hangup guard stopped its container cleanly; all 66 completed
+layers and 48,846 projections survived. Resumed at layer 66 (zero-based) as
+detached attempt `1793133687423980344`, using the normal launcher `--resume`
+path and its own fair-queued gpu1 lease. The supervisor owns a separate session,
+independent of the monitoring connection; the actual GPU flock is verified
+held. Only the uncommitted current capture phase is repeated. For production
+that must survive monitoring-session loss, prefer the normal detached launcher
+once advance reservation/preparation has finished; foreground reservation mode
+deliberately tears down on its enclosing session's hangup. The numerical plan,
+producer, source, tokens and fork pin are unchanged.
+
+Quantization completed successfully on 2026-10-28 11:34 Taipei; the detached
+attempt exits zero. Final independent checks pass: 80 shards, 236,354 tensors,
+385,362,552,236 payload bytes (358.896844 GiB), 547 K6 matrices and 58,376 K4
+matrices, all 58,923 error records finite with valid Hessian-LDLQ metrics.
+The 662 retained native tensors have per-shard byte-preservation audits.
+Peak production CUDA allocation is 20.71 GiB and host RSS 15.79 GiB. All
+production frontiers, input stages and packed recovery candidates are retired;
+the GPU container is gone and the actual hardware flock is free. The local
+model card includes per-part source and quantized payload sizes. Source/fork
+and numerical producer identities are unchanged. Completed artifact and
+model card remain at the export path above. Publication is not started:
+the brief explicitly requires TJ's confirmation before upload. Full-model
+quality, long-context behavior and serving qualification remain separate work.
+
+TJ approved publication with "Yep publish it" on 2026-10-28. The completed
+export already organizes all 58,923 diagnostic records into 80 subdirectories
+(at most 776 files each), below the Hub's folder-entry ceiling. Every exported
+record independently matches its original numerical evidence byte-for-byte.
+Publication uses the existing CPU-only publisher and exact completed producer;
+no numerical or weight changes are needed.
+
+The Hub accepted all 80 weight shards but rejected further per-tensor
+diagnostics at its observed 20,000-file repository cap. Publication now bundles
+the complete diagnostics into 80 per-layer/head JSONL files plus a SHA-256/count
+index; the 58,923 individual source records remain local and are excluded from
+upload/cache manifests. Every bundle matches the exact concatenated original
+record bytes. Bundle creation is inode-preserving on retry and frozen after a
+publication marker; incomplete/unsafe inputs fail before Hub writes. Publisher
+checks pass 30 CPU cases. Only our partial remote diagnostic subtree is replaced;
+the already uploaded weight shards are retained. Numerical identity is unchanged.
+
+Published on 2026-10-28 at 14:22 Taipei:
+https://huggingface.co/wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6
+revision `5a4e83a09a11f3145332ed632d28a9894ea88225`, CPU-only attempt
+`1793168087222174043`, exit zero. All 172 remote objects pass checksum/size
+verification, including 80 weight shards and 80 diagnostic JSONL bundles with
+all 58,923 records. Anonymous revision access and an anonymous weight-file HEAD
+match the published SHA, length and commit. The explicit local HF snapshot is
+offline-resolvable and all 172 files hardlink the export on the same filesystem;
+no second weight copy was made. The publication-complete marker records the
+manifest digest and revision. Final CPU checks pass 101 cases; CUDA/native
+qualification remains the 16 CUDA cases and 798-projection real-weight proof.
+GPU ownership is released and production rolling tensors remain retired.
+Full-model quality/long-context/serving qualification is the separately scheduled
+next step; this branch is pushed for orchestrator review, not merged.

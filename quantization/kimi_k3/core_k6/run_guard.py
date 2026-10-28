@@ -18,6 +18,7 @@ def main():
             process.send_signal(signum)
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
+    signal.signal(signal.SIGHUP, forward)
     try:
         result = process.wait()
     finally:
