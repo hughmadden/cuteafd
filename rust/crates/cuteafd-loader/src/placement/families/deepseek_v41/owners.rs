@@ -77,16 +77,13 @@ pub fn transports_bytes(rows: u64, ranks: usize, slots: usize, reserve: u64) -> 
     Ok(lanes + outputs + reserve * ranks as u64 * 5120 * 2)
 }
 
-/// Full vocabulary packing peak above the pre-weight sample. The first lane's
-/// backbone/cache/index/embedding/Engram owners already exist; heads, taps,
-/// transports, the second lane, draft, vision and marks do not.
+/// Full vocabulary packing peak above the pre-weight sample: the resident
+/// weights (but the head being packed) and the packing staging. Every lane
+/// and slot owner, transport, draft, vision and mark allocates after it.
 pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64) -> Result<Demand> {
     ensure!(weights.iter().chain(target).all(|d| d.gpu == 0),
         "vocabulary startup phase requires the single-RTX owners");
-    let retained = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm"));
-    let lane = target.iter().filter(|d| d.group.starts_with("lane 0 ")
-        && !matches!(d.group.as_str(), "lane 0 target head" | "lane 0 target taps"));
-    let bytes = retained.chain(lane).try_fold(packing, |sum, d|
+    let bytes = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm")).try_fold(packing, |sum, d|
         sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
     Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
 }
@@ -437,15 +434,16 @@ mod tests {
     }
 
     #[test]
-    fn vocabulary_phase_charges_only_the_first_lanes_live_owners() -> Result<()> {
+    fn vocabulary_phase_charges_only_the_resident_weights_before_any_lane() -> Result<()> {
         let demand = |group: &str, bytes| Demand::new(0, Category::Workspace, group, bytes, Basis::Formula);
         let weights = vec![demand("attention", 100), demand("engram-projections", 20),
             demand("embedding", 50), demand("lm_head", 300), demand("norm", 10)];
         let target = vec![demand("lane 0 backbone", 40), demand("lane 0 engram", 30),
             demand("lane 0 window batch table", 5), demand("lane 0 target head", 60),
             demand("lane 0 target taps", 70), demand("lane 1 backbone", 80)];
+        // Lanes and slots allocate after the head is packed.
         let phase = vocabulary_load_phase(&weights, &target, 400)?;
-        assert_eq!(phase.bytes, 400 + 100 + 20 + 50 + 40 + 30 + 5);
+        assert_eq!(phase.bytes, 400 + 100 + 20 + 50);
         assert_eq!(phase.category, Category::Staging);
         assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
         assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
@@ -465,7 +463,7 @@ mod tests {
         let demand = |gpu, group: &str, bytes| Demand::new(gpu, Category::Workspace,
             group, bytes, Basis::Formula);
         // A synthetic allocation trace, independent of the composition helper:
-        // weights=170, first lane=75, head/taps=130, second lane=80.
+        // weights=170 (then the head packs), lanes and slots after it.
         let weights = vec![demand(0, "attention", 100), demand(0, "engram-projections", 20),
             demand(0, "embedding", 50), demand(0, "lm_head", 682_598_400), demand(0, "norm", 10)];
         let target = vec![demand(0, "lane 0 backbone", 40), demand(0, "lane 0 engram", 30),
@@ -473,7 +471,7 @@ mod tests {
             demand(0, "lane 0 target taps", 70), demand(0, "lane 1 backbone", 80)];
         let vocabulary = vocabulary_load_phase(&weights, &target,
             Fp8Head::All.load_bytes(1_323_827_200))?;
-        assert_eq!(vocabulary.bytes, 2_006_425_845);
+        assert_eq!(vocabulary.bytes, 2_006_425_845 - 40 - 30 - 5);
         let draft = DraftInventory { resident: 600, loading_experts: [500, 0],
             staging: [200, 0], loader_peak: [600, 0], marks: 50,
             runtime: vec![demand(0, "draft runtime", 70)], ..Default::default() };

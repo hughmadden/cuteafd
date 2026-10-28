@@ -236,7 +236,7 @@ pub(super) fn admit_startup(
         crate::families::deepseek_v41::v41_tensors::fp8_head()
             == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
         BackboneExecution::window_batch_enabled())?;
-    validate_engram_rows(&target, cuteafd_loader::EngramStagingShape::new(capacity as usize, passes)?)?;
+    validate_engram_rows(&target, shape.reserve_rows(), super::DECODE_LANE_ROWS as usize)?;
     // Test builds retain the materialized query reference buffer; production
     // intentionally has no such owner.
     #[cfg(test)]
@@ -291,15 +291,22 @@ pub(super) fn admit_startup(
     Ok(())
 }
 
-/// Each prefill unit's upload planes are a formula owner, separate from its
-/// gates. The private-lane base and shared reserve assembly both allocate
-/// exactly k * unit_rows rows; sharing must never turn this into unit scratch.
-fn validate_engram_rows(target: &[Demand], shape: cuteafd_loader::EngramStagingShape) -> Result<()> {
+/// The Engram upload planes are formula owners, separate from the gates:
+/// the prefill slots' one shared row plane over the `reserve` rows (each
+/// in-flight unit's rows a window of it, never unit scratch) and each decode
+/// lane's private planes at `decode_rows`, all on the gate GPU (GPU0).
+fn validate_engram_rows(target: &[Demand], reserve: usize, decode_rows: usize) -> Result<()> {
     use cuteafd_core::memory_layout::Basis;
+    let row_bytes = cuteafd_loader::ENGRAM_DEVICE_ROW_BYTES as u64;
     let rows = target.iter().filter(|d| d.group.ends_with(" engram rows")).collect::<Vec<_>>();
-    ensure!(rows.len() == shape.units() && rows.iter().all(|d| d.gpu == 0 && d.basis == Basis::Formula)
-        && rows.iter().map(|d| d.bytes).sum::<u64>() == shape.device_bytes() as u64,
-        "V4.1 Engram upload admission differs from required unit row planes");
+    let slots = rows.iter().filter(|d| d.group == "prefill slots engram rows").collect::<Vec<_>>();
+    let lanes = rows.iter().filter(|d| d.group.starts_with("lane ")).collect::<Vec<_>>();
+    ensure!(rows.iter().all(|d| d.gpu == 0 && d.basis == Basis::Formula)
+        && rows.len() == 3 && slots.len() == 1 && lanes.len() == 2
+        && slots[0].bytes == reserve as u64 * row_bytes
+        && lanes.iter().all(|d| d.bytes == decode_rows as u64 * row_bytes),
+        "V4.1 Engram upload admission differs from the reserve row plane and the decode lanes' rows: {:?}",
+        rows.iter().map(|d| (d.group.as_str(), d.gpu, d.bytes)).collect::<Vec<_>>());
     Ok(())
 }
 
@@ -310,23 +317,28 @@ fn local_vision_owner(enabled: bool, remote: bool) -> bool {
 
 #[cfg(test)]
 mod startup_tests {
+    /// The planner's own target list (decode lanes + prefill slot set) passes
+    /// the Engram check at every admitted depth, and the check still refuses a
+    /// missing, mis-sized or misplaced owner.
     #[test]
-    fn engram_row_admission_requires_every_unit_and_formula_basis() -> anyhow::Result<()> {
-        use cuteafd_core::memory_layout::{Basis, Category};
-        use cuteafd_loader::{EngramStagingShape, ENGRAM_DEVICE_ROW_BYTES};
-        use cuteafd_loader::placement::Demand;
-        for k in 2..=4 {
-            let rows = 8192usize.div_ceil(k).div_ceil(64) * 64;
-            let shape = EngramStagingShape::new(rows, k)?;
-            let target = (0..k).map(|slot| Demand::new(0, Category::Staging,
-                format!("lane {slot} engram rows"), (rows * ENGRAM_DEVICE_ROW_BYTES) as u64,
-                Basis::Formula)).collect::<Vec<_>>();
-            super::validate_engram_rows(&target, shape)?;
-            assert!(super::validate_engram_rows(&target[..k - 1], shape).is_err());
-            let mut wrong = target.clone(); wrong[0].bytes -= 1;
-            assert!(super::validate_engram_rows(&wrong, shape).is_err());
-            let mut wrong = target.clone(); wrong[0].gpu = 1;
-            assert!(super::validate_engram_rows(&wrong, shape).is_err());
+    fn engram_row_admission_matches_the_slot_set_and_decode_lanes() -> anyhow::Result<()> {
+        use cuteafd_loader::serving_capacity::wave_control::reserve_rows;
+        let dir = tempfile::tempdir()?;
+        let manifest = cuteafd_loader::plan::testing::write_v41_workspaces(dir.path());
+        let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+        let programs = super::families::deepseek_v41::owners::NativePrograms::new(&fp8, 188)?;
+        for k in 2..=4u64 {
+            let unit = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(k);
+            let reserve = reserve_rows(4, 4096) as usize;
+            let target = programs.target(80, reserve as u64, unit, 1, 4, false, true)?;
+            super::validate_engram_rows(&target, reserve, 80)?;
+            assert!(super::validate_engram_rows(&target, reserve - 64, 80).is_err(), "reserve mismatch");
+            let missing: Vec<_> = target.iter().filter(|d| d.group != "lane 1 engram rows").cloned().collect();
+            assert!(super::validate_engram_rows(&missing, reserve, 80).is_err(), "missing decode lane");
+            let mut moved = target.clone();
+            moved.iter_mut().find(|d| d.group == "prefill slots engram rows").unwrap().gpu = 1;
+            assert!(super::validate_engram_rows(&moved, reserve, 80).is_err(), "off the gate GPU");
         }
         Ok(())
     }
@@ -845,8 +857,10 @@ mod admission_tests {
                 let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
-                let fixed = owners::TargetOwners::new(weights,
-                    programs.target(80, 512, 256, ranks, 2, true, ranks == 1)?, ranks,
+                let target = programs.target(80, 512, 256, ranks, 2, true, ranks == 1)?;
+                // The startup validators accept the planner's own target list.
+                if ranks == 1 { validate_engram_rows(&target, 512, 80)?; }
+                let fixed = owners::TargetOwners::new(weights, target, ranks,
                     2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
                     &catalog, &manifest, 256, ranks, 188, 2, 512, 80)?;
