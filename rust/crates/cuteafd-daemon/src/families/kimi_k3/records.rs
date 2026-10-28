@@ -11,8 +11,9 @@
 //!   shard (`Job::TrellisTiles`). Each K6 codebook marker is read and checked
 //!   while planning, before any record exists.
 use super::*;
+use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
-use cuteafd_loader::plan::Checkpoint;
+use cuteafd_loader::{plan::Checkpoint, formats::exl3_storage::exl3_module};
 
 /// One coordinator GPU's records target.
 pub(crate) struct KimiRecords<'l, 'a> {

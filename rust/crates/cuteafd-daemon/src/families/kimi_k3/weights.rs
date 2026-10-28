@@ -9,7 +9,8 @@ use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, 
     w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::{collections::BTreeMap, os::unix::fs::FileExt};
 use cuteafd_loader::families::kimi_k3::core::CoreInventory;
-use cuteafd_loader::formats::{dense_trellis::{LoadedDenseTrellis, TrellisSide}, exl3_storage::exl3_module};
+use cuteafd_loader::formats::dense_trellis::{LoadedDenseTrellis, TrellisSide};
+use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 
 /// One canonical front end per routed ordinal, independent of attention placement.
 pub(crate) use cuteafd_loader::families::kimi_k3::weight_layout::routed_owner;
@@ -743,88 +744,6 @@ mod tests {
         }).is_err());
         Ok(())
     }
-}
-
-/// Inert until explicit K6 admission: native bytes remain compressed on device.
-/// The caller selects ownership from the shared layer placement before packing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CoreWeightLayout {
-    pub stem: String, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
-    pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize,
-    pub codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook,
-}
-impl CoreWeightLayout {
-    fn from_shared(layout: cuteafd_loader::families::kimi_k3::weight_layout::CoreWeightLayout) -> Self {
-        Self { stem: layout.stem, side: layout.side, rank: layout.rank, ranks: layout.ranks,
-            shape: layout.shape, bytes: layout.bytes, codebook: layout.codebook }
-    }
-    pub(crate) fn new(projection: &cuteafd_loader::families::kimi_k3::core::CoreProjection,
-        side: TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
-        Ok(Self::from_shared(cuteafd_loader::families::kimi_k3::weight_layout::CoreWeightLayout::new(
-            projection, side, rank, ranks)?))
-    }
-    fn check(&self, loaded: &LoadedDenseTrellis) -> Result<()> {
-        let shard = &loaded.shard;
-        ensure!(loaded.codebook == self.codebook && shard.side == self.side && shard.shape == self.shape
-            && shard.payload.len() == extent(&[self.shape[0], self.shape[1], 6])? / 8
-            && shard.suh.len() == self.shape[1] * 2 && shard.svh.len() == self.shape[0] * 2,
-            "Kimi K6 packed shard differs from admitted operands");
-        Ok(())
-    }
-
-    fn read(&self, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<LoadedDenseTrellis> {
-        let mut tensors = BTreeMap::new();
-        for suffix in ["trellis", "suh", "svh", self.codebook.marker()] {
-            let tensor = read(&format!("{}.{}", self.stem, suffix))?;
-            tensors.insert(suffix, tensor);
-        }
-        let metadata = tensors.iter().map(|(&suffix, tensor)| (suffix, cuteafd_loader::SafetensorsTensorMetadata {
-            name: tensor.info.name.clone(), dtype: tensor.info.dtype.clone(), shape: tensor.info.shape.clone(),
-            byte_offset: tensor.info.byte_offset, byte_length: tensor.info.byte_length,
-        })).collect::<BTreeMap<_, _>>();
-        let suffixes = tensors.keys().copied().collect::<Vec<_>>();
-        let module = exl3_module(&self.stem, &suffixes, |suffix| metadata.get(suffix))?;
-        let loaded = self.pack(&module, |name| {
-            let suffix = name.strip_prefix(&format!("{}.", self.stem)).context("Kimi K6 source stem")?;
-            tensors.remove(suffix).context("Kimi K6 source member already consumed")
-        })?;
-        self.check(&loaded)?;
-        Ok(loaded)
-    }
-
-    pub(crate) fn demand(&self, device: u8) -> Demand {
-        Demand::new(device,Category::Weights,format!("Kimi K6 {}",self.stem),self.bytes as u64,Basis::Exact)
-    }
-    pub(crate) fn pack(&self,module:&cuteafd_loader::formats::exl3_storage::Exl3Module,
-        read:impl FnMut(&str)->Result<LoadedTensor>) -> Result<cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis> {
-        let loaded=cuteafd_loader::formats::dense_trellis::load_native_shard(&self.stem,module,self.side,self.rank,self.ranks,read)?;
-        ensure!(loaded.codebook==self.codebook && loaded.shard.shape==self.shape
-            && loaded.shard.payload.len()+loaded.shard.suh.len()+loaded.shard.svh.len()==self.bytes,
-            "Kimi K6 packed shard differs from admitted geometry/bytes");
-        self.check(&loaded)?;
-        Ok(loaded)
-    }
-    pub(crate) fn upload<'a>(&self,device:Device<'a>,loaded:cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis)
-        -> Result<CoreWeights<'a>> {
-        self.check(&loaded)?;
-        let shard=loaded.shard;
-        ensure!(loaded.codebook==self.codebook && shard.side==self.side && shard.shape==self.shape
-            && shard.payload.len()+shard.suh.len()+shard.svh.len()==self.bytes,
-            "Kimi K6 upload differs from admitted shard");
-        let upload=|bytes:&[u8]|->Result<Allocation<'a>> {
-            let _scope=cuteafd_ffi::memory_ledger::scope("weights/Kimi K6 core");
-            let owner=Allocation::new(device,bytes.len())?;
-            device.run(||device.library.copy_h2d(owner.buffer,bytes))?;
-            Ok(owner)
-        };
-        Ok(CoreWeights{payload:upload(&shard.payload)?,suh:upload(&shard.suh)?,svh:upload(&shard.svh)?,
-            shape:self.shape,side:self.side,codebook:self.codebook})
-    }
-}
-pub(crate) struct CoreWeights<'a> {
-    pub payload:Allocation<'a>, pub suh:Allocation<'a>, pub svh:Allocation<'a>,
-    pub shape:[usize;2], pub side:cuteafd_loader::formats::dense_trellis::TrellisSide,
-    pub codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook,
 }
 
 #[cfg(test)]

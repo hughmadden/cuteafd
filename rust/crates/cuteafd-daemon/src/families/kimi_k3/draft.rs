@@ -55,7 +55,7 @@ pub(crate) struct NativeDraft<'a> {
     window_bytes: usize,
     /// A K6 target head (no BF16 operand to borrow): the target rank's K6
     /// programs and this drafter's own head scratch, used only on the bridge stream.
-    k6_head: Option<(Rc<super::device::NativePrograms<'a>>, super::core_runtime::ProjectionScratch<'a>)>,
+    k6_head: Option<(Rc<super::device::NativePrograms<'a>>, crate::shared::dense_trellis::ProjectionScratch<'a>)>,
     cache_format: cuteafd_core::MlaCacheFormat,
     marks: usize,
 }
@@ -106,7 +106,7 @@ impl<'a> NativeDraft<'a> {
             let rows = self.owners.draft.max_batch_sequences() * cfg.block;
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
-                super::core_runtime::ProjectionLayout::new(&projection.program, rows)?
+                crate::shared::dense_trellis::ProjectionLayout::new(&projection.program, rows)?
                     .allocate(self.target_streams[1].device)?
             };
             self.k6_head = Some((head_programs, scratch));

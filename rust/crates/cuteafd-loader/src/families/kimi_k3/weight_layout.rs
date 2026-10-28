@@ -1,4 +1,5 @@
 //! Packed device weight extents shared by checkpoint admission and runtime owners.
+use crate::formats::trellis_core::CoreWeightLayout;
 use super::{config::{KimiAttention, KimiK3Config}, core::CoreInventory, kda};
 use crate::{placement::{Demand, LayerMode}, formats::dense_trellis::TrellisSide};
 use anyhow::{ensure, Context, Result};
@@ -230,31 +231,6 @@ impl LayerLayout {
             .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))
     }
 
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreWeightLayout {
-    pub stem: String, pub side: TrellisSide, pub rank: usize, pub ranks: usize,
-    pub shape: [usize;2], pub bytes: usize,
-    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
-}
-impl CoreWeightLayout {
-    pub fn new(projection: &crate::families::kimi_k3::core::CoreProjection,
-        side: crate::formats::dense_trellis::TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
-        ensure!(matches!(ranks,1|2) && rank<ranks,"Kimi core native rank geometry");
-        let [_,k]=projection.shape;
-        let n=projection.stored_outputs;
-        ensure!(match side {
-            crate::formats::dense_trellis::TrellisSide::Output=>n%ranks==0,
-            crate::formats::dense_trellis::TrellisSide::Input=>k%ranks==0,
-        },"Kimi core dimension does not divide ranks");
-        let (n,k)=match side {
-            crate::formats::dense_trellis::TrellisSide::Output=>(n/ranks,k),
-            crate::formats::dense_trellis::TrellisSide::Input=>(n,k/ranks),
-        };
-        ensure!(projection.bits==6 && n>0 && k>0 && n%128==0 && k%128==0,"Kimi K6 local H128 geometry");
-        let bytes=extent(&[n,k,6])?/8+extent(&[n+k,2])?;
-        Ok(Self{stem:projection.stem.clone(),side,rank,ranks,shape:[n,k],bytes,codebook:projection.codebook})
-    }
 }
 fn extent(dimensions: &[usize]) -> Result<usize> {
     ensure!(dimensions.iter().all(|n| *n > 0), "Kimi weight extent is empty");

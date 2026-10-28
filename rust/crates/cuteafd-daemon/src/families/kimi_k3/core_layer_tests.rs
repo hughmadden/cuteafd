@@ -1,6 +1,6 @@
 //! Real-size core-layer gate; routed experts are deliberately outside this fixture.
-use super::{core_native_tests::{bf16, errors}, core_runtime::{Projected,Projection,ProjectionLayout,ProjectionScratch},
-    weights::{CoreWeightLayout,CoreWeights}};
+use super::{core_native_tests::{bf16, errors}, core_runtime::Projected};
+use crate::shared::dense_trellis::{Projection, ProjectionLayout, ProjectionScratch, CoreWeightLayout, CoreWeights};
 use crate::shared::memory::device::{Allocation,Device,Stream};
 use anyhow::{ensure,Context,Result};
 use cuteafd_core::{DType,TensorInfo,TensorRole};

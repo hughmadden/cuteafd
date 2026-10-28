@@ -192,7 +192,7 @@ impl<'a> NativePrograms<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaneLayout {
     base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout,
-    core: Option<super::core_runtime::ProjectionLayout>,
+    core: Option<crate::shared::dense_trellis::ProjectionLayout>,
 }
 
 impl std::ops::Deref for LaneLayout {
@@ -260,7 +260,7 @@ pub(crate) struct Lane<'a> {
     layout: LaneLayout,
     window: Option<std::ops::Range<usize>>,
     metadata_bank: usize,
-    core: Option<super::core_runtime::ProjectionScratch<'a>>,
+    core: Option<crate::shared::dense_trellis::ProjectionScratch<'a>>,
 }
 
 impl Drop for Lane<'_> {

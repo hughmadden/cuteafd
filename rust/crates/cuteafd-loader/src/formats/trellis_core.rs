@@ -53,6 +53,37 @@ impl CoreProjection {
     }
 }
 
+/// Exact compressed payload and H128 vector ownership after TP placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreWeightLayout {
+    pub stem: String, pub side: crate::formats::dense_trellis::TrellisSide, pub rank: usize, pub ranks: usize,
+    pub shape: [usize;2], pub bytes: usize,
+    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
+}
+impl CoreWeightLayout {
+    pub fn new(projection: &CoreProjection,
+        side: crate::formats::dense_trellis::TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks,1|2) && rank<ranks,"dense trellis native rank geometry");
+        let [_,k]=projection.shape;
+        let n=projection.stored_outputs;
+        ensure!(match side {
+            crate::formats::dense_trellis::TrellisSide::Output=>n%ranks==0,
+            crate::formats::dense_trellis::TrellisSide::Input=>k%ranks==0,
+        },"dense trellis dimension does not divide ranks");
+        let (n,k)=match side {
+            crate::formats::dense_trellis::TrellisSide::Output=>(n/ranks,k),
+            crate::formats::dense_trellis::TrellisSide::Input=>(n,k/ranks),
+        };
+        ensure!(projection.bits==6 && n>0 && k>0 && n%128==0 && k%128==0,"dense trellis K6 local H128 geometry");
+        let payload=n.checked_mul(k).and_then(|v|v.checked_mul(6))
+            .context("dense trellis payload extent overflow")?/8;
+        let vectors=n.checked_add(k).and_then(|v|v.checked_mul(2))
+            .context("dense trellis vector extent overflow")?;
+        let bytes=payload.checked_add(vectors).context("dense trellis resident extent overflow")?;
+        Ok(Self{stem:projection.stem.clone(),side,rank,ranks,shape:[n,k],bytes,codebook:projection.codebook})
+    }
+}
+
 /// Physical owners and bounded route-exclusive views for serialized projections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionStorageLayout {
@@ -180,4 +211,77 @@ pub fn read_projections(
         projections.insert(stem, projection);
     }
     Ok(projections)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook};
+
+    fn projection(n: usize, k: usize, split: CoreSplit) -> CoreProjection {
+        CoreProjection { stem: "model.projection".into(), bits: 6, codebook: Exl3Codebook::Mcg,
+            shape: [n, k], stored_outputs: n, split, source_bytes: 0 }
+    }
+
+    #[test]
+    fn native_weight_layout_matches_exact_whole_and_split_residency() -> Result<()> {
+        for (n, k) in [(16384, 2048), (6144, 16384), (12288, 6144), (2048, 6144), (154880, 6144)] {
+            for (split, side) in [(CoreSplit::Output, TrellisSide::Output), (CoreSplit::Input, TrellisSide::Input)] {
+                let p = projection(n, k, split);
+                for ranks in [1, 2] {
+                    for rank in 0..ranks {
+                        let layout = CoreWeightLayout::new(&p, side, rank, ranks)?;
+                        assert_eq!(layout.bytes as u64, p.resident_bytes(ranks)?);
+                        assert_eq!(layout.shape, match side {
+                            TrellisSide::Output => [n / ranks, k], TrellisSide::Input => [n, k / ranks],
+                        });
+                        assert_eq!(layout.codebook, Exl3Codebook::Mcg);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn padded_kv_a_layout_keeps_full_transform_extent() -> Result<()> {
+        let mut p = projection(576, 6144, CoreSplit::Whole);
+        p.stored_outputs = 640;
+        let layout = CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1)?;
+        assert_eq!(layout.shape, [640, 6144]);
+        assert_eq!(layout.bytes as u64, p.resident_bytes(1)?);
+        assert_eq!(layout.bytes, 640 * 6144 * 6 / 8 + (640 + 6144) * 2);
+        Ok(())
+    }
+
+    #[test]
+    fn native_weight_layout_rejects_invalid_and_overflowing_geometry() {
+        let p = projection(640, 6144, CoreSplit::Whole);
+        for (rank, ranks) in [(0, 0), (0, 3), (2, 2)] {
+            assert!(CoreWeightLayout::new(&p, TrellisSide::Output, rank, ranks).is_err());
+        }
+        assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 2).is_err());
+        let mut p = projection(128, 128, CoreSplit::Whole);
+        p.bits = 4;
+        assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1).is_err());
+        p.bits = 6;
+        p.stored_outputs = usize::MAX & !127;
+        assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1).unwrap_err().to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn serialized_projection_scratch_preserves_bounded_partial_and_route_owner() -> Result<()> {
+        let mut layout = ProjectionScratchLayout::new(6144, 640, 4096)?;
+        layout.merge(&ProjectionScratchLayout::new(2048, 16384, 4096)?)?;
+        assert_eq!(layout.extents["rotated"], 4096 * 6144 * 2);
+        assert_eq!(layout.extents["partial"], 129 * 2 * 16384 * 4);
+        assert_eq!(layout.extents["accumulator"], 4096 * 16384 * 4);
+        let storage = layout.storage()?;
+        assert!(!storage.owners.contains_key("partial"));
+        assert_eq!(storage.route_offsets["partial"], 0);
+        assert_eq!(storage.owners["route arena"], layout.extents["partial"]);
+        assert_eq!(layout.bytes()?, layout.extents.values().sum::<usize>());
+        assert!(layout.merge(&ProjectionScratchLayout::new(6144, 640, 64)?).is_err());
+        Ok(())
+    }
 }
