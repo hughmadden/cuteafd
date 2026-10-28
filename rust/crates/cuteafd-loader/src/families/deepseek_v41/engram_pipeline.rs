@@ -1,7 +1,7 @@
 //! Request-owned early engram I/O and accepted-prefix history transactions.
 use crate::{
-    EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherer, EngramPrefetcher, EngramTable,
-    EngramTokenMap, OfficialV41Catalog, PrefetchTicket,
+    EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherer, EngramTable,
+    EngramTokenMap, OfficialV41Catalog,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramBatch, EngramHistory, ENGRAM_LAYERS};
@@ -24,16 +24,26 @@ pub struct EngramWave {
     gatherer: Arc<EngramGatherer>,
     tables: [Arc<EngramTable>; 2],
     batches: Vec<Arc<EngramBatch>>,
-    prefetch: Vec<PrefetchTicket>,
     layers: [LayerIo; 2],
     finished: bool,
     waiting: [Option<std::time::Instant>; 2],
     decode: bool,
 }
 impl EngramWave {
-    pub fn set_decode(&mut self, decode: bool) { self.decode = decode; }
+    pub fn copy_capacity_stalled(&self, layer: usize) -> Result<bool> {
+        Ok(matches!(self.layers.get(layer), Some(LayerIo::AwaitingAdmission))
+            && self.gatherer.copy_capacity_stalled()?)
+    }
     pub fn batches(&self) -> &[Arc<EngramBatch>] {
         &self.batches
+    }
+    pub fn retain_copy(&self, lease: EngramGatherLease) { self.gatherer.retain_copy(lease); }
+    pub fn reclaim_copies(&self) -> Result<()> { self.gatherer.reclaim_copies() }
+    /// Admit layer 14 only after the layer-1 result has been delivered. Call
+    /// after the caller refilled the next burst of layer-1 work.
+    pub fn start_later(&mut self) -> Result<()> {
+        ensure!(matches!(self.layers[0], LayerIo::Consumed), "layer 1 gather has not been delivered");
+        self.admit(1)
     }
     /// Await admission and I/O using only wave-owned state. The caller must
     /// revalidate request generations through `EngramPipeline::poll` afterwards.
@@ -46,7 +56,10 @@ impl EngramWave {
         result
     }
     async fn wait_layer(&mut self, layer: usize) -> Result<()> {
+        ensure!(layer == 0 || matches!(self.layers[0], LayerIo::Consumed),
+            "layer 14 gather cannot precede layer 1 delivery");
         if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
+            self.gatherer.reclaim_copies()?;
             let ticket = self.gatherer.submit(Arc::clone(&self.tables[layer]),
                 &self.batches, layer).await?;
             self.layers[layer] = LayerIo::Queued(ticket);
@@ -65,6 +78,8 @@ impl EngramWave {
         Ok(())
     }
     fn admit(&mut self, layer: usize) -> Result<()> {
+        ensure!(layer == 0 || matches!(self.layers[0], LayerIo::Consumed),
+            "layer 14 gather cannot precede layer 1 delivery");
         if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
             if let Some(ticket) = self.gatherer.try_submit(Arc::clone(&self.tables[layer]),
                 &self.batches, layer)? {
@@ -76,7 +91,6 @@ impl EngramWave {
     /// Cancel early I/O without committing any token history.
     pub fn cancel(&mut self) {
         self.finished = true;
-        self.prefetch.clear();
         self.layers = [LayerIo::Consumed, LayerIo::Consumed];
     }
     /// Preflight history publication before an enclosing device-cache commit.
@@ -115,26 +129,23 @@ pub struct EngramPipeline {
     identity: Arc<()>,
     tables: [Arc<EngramTable>; 2],
     token_map: EngramTokenMap,
-    prefetch: EngramPrefetcher,
     gatherer: Arc<EngramGatherer>,
+    decode_gatherer: Arc<EngramGatherer>,
     capacity: usize,
     placement: crate::formats::mapped_preload::MappedPlacement,
+    shape: crate::EngramStagingShape,
 }
 impl EngramPipeline {
     /// # Safety
     /// Official checkpoint files must stay immutable while any mapping/job is alive.
     pub unsafe fn new(
+        library: &cuteafd_ffi::NativeLibrary,
         catalog: &OfficialV41Catalog,
         token_map: EngramTokenMap,
-        capacity: usize,
-        gather_slots: usize,
-        staging_budget: usize,
+        shape: crate::EngramStagingShape,
         scale_preload_cap: u64,
     ) -> Result<Self> {
-        ensure!(
-            capacity > 0 && capacity <= 4096,
-            "invalid engram pipeline capacity"
-        );
+        let capacity = shape.rows();
         // SAFETY: forwarded from this constructor's immutable checkpoint contract.
         let mut tables = unsafe { [catalog.map_engram(ENGRAM_LAYERS[0] as usize)?,
             catalog.map_engram(ENGRAM_LAYERS[1] as usize)?] };
@@ -161,13 +172,17 @@ impl EngramPipeline {
             identity: Arc::new(()),
             tables,
             token_map,
-            prefetch: EngramPrefetcher::new(32, capacity * 24, capacity * 48)?,
-            gatherer: Arc::new(EngramGatherer::new(gather_slots, capacity, staging_budget)?),
+            gatherer: Arc::new(EngramGatherer::new_pinned(library, shape)?),
+            decode_gatherer: Arc::new(EngramGatherer::new_decode(library, shape)?),
             capacity,
-            placement,
+            placement, shape,
         })
     }
     pub fn placement(&self) -> &crate::formats::mapped_preload::MappedPlacement { &self.placement }
+    pub fn shape(&self) -> crate::EngramStagingShape { self.shape }
+    pub fn reclaim_copies(&self) -> Result<()> {
+        self.gatherer.reclaim_copies()?; self.decode_gatherer.reclaim_copies()
+    }
     pub fn new_history(&self) -> Result<EngramHistory> {
         Ok(EngramHistory::new(self.token_map.pad_id())?)
     }
@@ -185,6 +200,13 @@ impl EngramPipeline {
     /// Call as soon as decode, prefill or verification token IDs and image spans are known.
     /// Prepare all hashes before starting I/O, preserving committed request histories.
     pub fn prepare(&self, requests: &[EngramRequestTokens<'_>]) -> Result<EngramWave> {
+        self.prepare_on(requests, false)
+    }
+    pub fn prepare_decode(&self, requests: &[EngramRequestTokens<'_>]) -> Result<EngramWave> {
+        self.prepare_on(requests, true)
+    }
+    fn prepare_on(&self, requests: &[EngramRequestTokens<'_>], decode: bool) -> Result<EngramWave> {
+        self.reclaim_copies()?;
         ensure!(
             !requests.is_empty() && requests.len() <= 16,
             "engram wave requires 1..16 requests"
@@ -198,7 +220,7 @@ impl EngramPipeline {
                 .context("engram wave row overflow")
         })?;
         ensure!(
-            total <= self.capacity,
+            total <= if decode { self.shape.decode_rows() } else { self.capacity },
             "engram wave exceeds pipeline capacity"
         );
         // Reject repeated histories before any work is admitted; one request owns
@@ -227,26 +249,17 @@ impl EngramPipeline {
             .collect();
         let mut wave = EngramWave {
             pipeline: Arc::clone(&self.identity),
-            gatherer: Arc::clone(&self.gatherer),
+            gatherer: Arc::clone(if decode { &self.decode_gatherer } else { &self.gatherer }),
             tables: self.tables.clone(),
             batches: batches?,
-            prefetch: Vec::with_capacity(32),
             layers: [LayerIo::AwaitingAdmission, LayerIo::AwaitingAdmission],
             finished: false,
             waiting: [None; 2],
-            decode: false,
+            decode,
         };
-        for layer in 0..2 {
-            for batch in &wave.batches {
-                if let Some(ticket) =
-                    self.prefetch
-                        .try_submit_batch(Arc::clone(&self.tables[layer]), batch, layer)?
-                {
-                    wave.prefetch.push(ticket);
-                }
-            }
-            wave.admit(layer)?;
-        }
+        // Actual k-ahead L1 gathers replace advisory reads. Issuing both
+        // table layers here duplicates I/O and steals the tight L1 deadline.
+        wave.admit(0)?;
         Ok(wave)
     }
     /// Retry bounded admission and poll without waiting for mapped pages.
@@ -279,6 +292,7 @@ impl EngramWave {
             for (history, batch) in histories.iter().zip(&wave.batches) {
                 history.validate_commit(batch, 0)?;
             }
+            wave.gatherer.reclaim_copies()?;
             wave.admit(layer)?;
             let result = match &mut wave.layers[layer] {
                 LayerIo::AwaitingAdmission => {
@@ -373,7 +387,7 @@ mod wait_tests {
     }
     fn wave_fixture(table: Arc<EngramTable>, gatherer: Arc<EngramGatherer>, batch: Arc<EngramBatch>) -> EngramWave {
         EngramWave { pipeline: Arc::new(()), gatherer, tables: [table.clone(), table],
-            batches: vec![batch], prefetch: Vec::new(),
+            batches: vec![batch],
             layers: [LayerIo::AwaitingAdmission, LayerIo::Consumed], finished: false,
             waiting: [None; 2], decode: false }
     }

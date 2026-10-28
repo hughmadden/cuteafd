@@ -508,6 +508,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         if !stage.is_encoder() {
             self.resources.taps.begin(guard.batch.cache()?)?;
         }
+        self.resources.upload.reset()?;
         self.resources.execution.restart_for(stage);
         if stage == CacheStage::Replay {
             let encoder = encoder.context("missing retained encoder suffix")?;
@@ -534,20 +535,31 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 let prepare_timing = Instant::now();
                 self.resources.lane.advance()?;
                 let advance_us = prepare_timing.elapsed().as_micros() as u64;
+                if (2..14).contains(&layer) && !self.resources.upload.staged(1)
+                    && self.resources.upload.can_enqueue(1)? {
+                    if let cuteafd_loader::EngramGatherPoll::Ready(lease) = requests.with_requests(|r| r.poll_engram_layer(guard.batch, 1))? {
+                        self.resources.upload.enqueue_lease(lease, guard.batch.engram_wave()?)?;
+                    }
+                }
                 if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
-                    guard.batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    if !self.resources.upload.staged(gate) {
+                        guard.batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    self.resources.upload.wait_enqueue(gate, self.resources.engram_timeout).await?;
+                    }
                     // Revalidate only after waking; no request-bank borrow spans
                     // admission or mapped I/O. Keep each route's upload/gate order.
                     if requests.cooperative_completion() || crate::shared::memory::chain::active() {
-                        let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
-                        match gathered {
-                            cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
-                                unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
+                        if !self.resources.upload.staged(gate) {
+                            match requests.with_requests(|r| r.poll_engram_gather(guard.batch, &self.resources.lane))? {
+                                cuteafd_loader::EngramGatherPoll::Ready(lease) => self.resources.upload.enqueue_lease(lease, guard.batch.engram_wave()?)?,
+                                cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
+                                cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                             }
-                            cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
-                            cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                         }
+                        let rows = self.resources.upload.consume(gate)?;
+                        unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
+                        self.resources.upload.release_scratch()?;
+                        if gate == 0 { guard.batch.start_later_engram()?; }
                     } else {
                         crate::shared::memory::chain::settle(self.resources.upload.library())?;
                         ensure!(unsafe { requests.with_requests(|requests| requests.poll_engram(

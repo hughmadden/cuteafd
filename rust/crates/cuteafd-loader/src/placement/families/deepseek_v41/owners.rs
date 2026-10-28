@@ -225,9 +225,12 @@ impl<'a> NativePrograms<'a> {
                 add(&mut out, "index", index_query + selection + follower);
                 if rank == 0 {
                     add(&mut out, "embedding", rows * (4 + 40960 + 16 + 10240 + 4));
-                    add(&mut out, "engram", rows * (24 * (256 + 8 + 512) + 1)
-                        + 2 * (rows * (40960 * 2 + 51200 + 24 * 512 + 1)
-                            + self.scratch(rows, 6144, 25600)? + 4));
+                    // Each live unit owns one upload region, reused by L1/L14.
+                    // Keep it distinct from gate scratch so admission can assert
+                    // k * unit_rows exactly, without charging the upload twice.
+                    add(&mut out, "engram rows", rows * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
+                    add(&mut out, "engram gates", 2 * (rows * (40960 * 2 + 51200 + 24 * 512 + 1)
+                        + self.scratch(rows, 6144, 25600)? + 4));
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
                 let head_rows = cuteafd_core::V41_VERIFY_ROWS as u64;

@@ -172,6 +172,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         );
         ensure!((self.keep_running)(), "client disconnected");
         (self.before_unit)()?;
+        slot.pass.resources.upload.reset()?;
         slot.started = Instant::now();
         let chunk = self.chunks[unit.index];
         slot.batch = Some(
@@ -185,9 +186,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                 }])?,
         );
         // Start the next unit's Engram I/O now (#815): see the 2-RTX hook.
-        if let Some(next) = self.chunks.get(unit.index + 1) {
-            self.requests.borrow_mut().prefetch_encoder(self.lease, next)?;
-        }
+        self.requests.borrow_mut().prefetch_encoder(self.lease, &self.chunks[unit.index + 1..])?;
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
             let positions = batch.cache()?.positions();
@@ -430,11 +429,25 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.resources.lane.advance()?;
         // The cooperative forms join the unit's chain (its previous layer's
         // mHC output is not complete on the host).
+        if (2..14).contains(&layer) && !self.resources.upload.staged(1)
+                    && self.resources.upload.can_enqueue(1)? {
+            if let cuteafd_loader::EngramGatherPoll::Ready(lease) = requests.borrow().poll_engram_layer(batch, 1)? {
+                self.resources.upload.enqueue_lease(lease, batch.engram_wave()?)?;
+            }
+        }
         if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
-            batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
-            let rows = requests.borrow().poll_engram_rows(batch, &mut self.resources.upload, &self.resources.lane)?
-                .context("engram gather wait returned pending")?;
+            let rows = if self.resources.upload.staged(gate) {
+                self.resources.upload.consume(gate)?
+            } else {
+                batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    self.resources.upload.wait_enqueue(gate, self.resources.engram_timeout).await?;
+                requests.borrow().poll_engram_rows(batch, &mut self.resources.upload, &self.resources.lane)?
+                    .context("engram gather wait returned pending")?
+            };
+            // SAFETY: gate reads this unit's immutable window until release.
             unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
+            self.resources.upload.release_scratch()?;
+            if gate == 0 { batch.start_later_engram()?; }
         }
         unsafe { self.resources.lane.begin_prepared_cooperative().await?; }
         Ok(())
@@ -452,6 +465,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        requests.prefetch_encoder(lease, chunks)?;
         let waves = slots.len();
         ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         let mut units = encoder_units(chunks)?;

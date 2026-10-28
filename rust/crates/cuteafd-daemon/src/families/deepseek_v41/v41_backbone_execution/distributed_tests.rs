@@ -179,7 +179,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
         &std::path::Path::new(&model).join("tokenizer.json"),
     )?;
     let pipeline =
-        unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, 80, 2, 8 * 1024 * 1024, 0)? };
+        unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, map, cuteafd_loader::EngramStagingShape::new(80, 2)?, 0)? };
     let mut requests = Requests::new(
         &lib,
         pipeline,

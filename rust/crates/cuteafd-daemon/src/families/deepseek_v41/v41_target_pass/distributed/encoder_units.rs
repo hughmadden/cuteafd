@@ -21,17 +21,25 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let device = self.resources.lanes[gpu].device;
         if layer != 0 {
             unsafe { self.advance(layer).await?; }
+            if (2..14).contains(&layer) && !self.resources.engram.staged(1)
+                    && self.resources.engram.can_enqueue(1)? {
+                if let cuteafd_loader::EngramGatherPoll::Ready(lease) = requests.borrow().poll_engram_layer(batch, 1)? {
+                    self.resources.engram.enqueue_lease(lease, batch.engram_wave()?)?;
+                }
+            }
             if [1, 14].contains(&layer) {
                 let gate = usize::from(layer == 14);
-                batch.wait_engram_gather(gate, self.resources.timeout).await?;
-                let gathered = requests.with_requests(|r| r.poll_engram_gather(batch, &self.resources.lanes[gpu]))?;
-                match gathered {
-                    cuteafd_loader::EngramGatherPoll::Ready(lease) => unsafe {
-                        self.resources.engram.apply(&mut self.resources.lanes[gpu], &lease.view()?).await?;
-                    },
-                    cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("distributed Engram gather cancelled"),
-                    cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
+                if !self.resources.engram.staged(gate) {
+                    batch.wait_engram_gather(gate, self.resources.timeout).await?;
+                    self.resources.engram.wait_enqueue(gate, self.resources.timeout).await?;
+                    let gathered = requests.with_requests(|r| r.poll_engram_gather(batch, &self.resources.lanes[gpu]))?;
+                    match gathered {
+                        cuteafd_loader::EngramGatherPoll::Ready(lease) => self.resources.engram.enqueue_lease(lease, batch.engram_wave()?)?,
+                        _ => anyhow::bail!("Engram gather wait returned no rows"),
+                    }
                 }
+                unsafe { self.resources.engram.apply_staged(&mut self.resources.lanes[gpu], gate).await?; }
+                if gate == 0 { batch.start_later_engram()?; }
             }
             device.future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() }).await?;
         }
@@ -133,6 +141,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         (self.before_unit)()?;
         let slot = &mut self.slots[unit.slot];
         ensure!(slot.batch.is_none() && slot.prepared.is_none(), "encoder unit slot occupied");
+        slot.pass.resources.engram.reset_uploads()?;
         slot.started = Instant::now();
         let chunk = self.chunks[unit.index];
         let batch = self.requests.borrow_mut().reserve_encoder(&[RequestTokens { lease: self.lease, tokens: chunk,
@@ -140,9 +149,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         // Start the next unit's Engram I/O now (#815, prof13: it otherwise
         // starts at that unit's reservation, one local layer before layer 1
         // needs it, which left GPU0 idle ~14 ms per Engram layer).
-        if let Some(next) = self.chunks.get(unit.index + 1) {
-            self.requests.borrow_mut().prefetch_encoder(self.lease, next)?;
-        }
+        self.requests.borrow_mut().prefetch_encoder(self.lease, &self.chunks[unit.index + 1..])?;
         let batch = slot.batch.insert(batch);
         slot.pass.state.begin()?;
         // SAFETY: the unit exclusively owns its batch and the pass's input storage.
@@ -309,6 +316,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         prefill: &mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>, requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]],
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        requests.prefetch_encoder(lease, chunks)?;
         let waves = slots.len();
         ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         ensure!(slots.iter().all(|(pass, _)| pass.state == State::Idle), "distributed encoder lane still in use");

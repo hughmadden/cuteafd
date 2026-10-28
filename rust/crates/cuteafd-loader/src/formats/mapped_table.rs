@@ -1472,6 +1472,7 @@ impl<S: Send + 'static, J> GatherLease<S, J> {
     pub fn slot(&self) -> Option<&S> {
         self.slot.as_ref()
     }
+    pub fn slot_mut(&mut self) -> Option<&mut S> { self.slot.as_mut() }
     pub fn job(&self) -> &J {
         &self.job
     }
@@ -1733,6 +1734,13 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(MappedTableError::Stopped("gather staging pool poisoned")),
         };
         self.submit_slot(slot, job, timed).map(Some)
+    }
+
+    /// Snapshot admission capacity without reserving a slot. CUDA-backed
+    /// consumers use this to distinguish event stalls from worker-only waits.
+    pub fn capacity_available(&self) -> Result<bool> {
+        self.slots.free.lock().map(|free| !free.is_empty())
+            .map_err(|_| MappedTableError::Stopped("gather staging pool poisoned"))
     }
 
     /// Wait until a released lease makes admission possible. This is a
