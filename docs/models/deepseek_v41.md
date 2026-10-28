@@ -47,6 +47,7 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   packing. `off` keeps BF16; `draft` retains both formats. Earlier release
   notes incorrectly described BF16 as the default. The matched two-RTX
   v0/RC1 ABAB recheck did not reproduce the historical C1 regression.
+  Opt-in `packed`, unqualified until measured, keeps only an exact 12-bit copy of the BF16 head: target logits read it exactly, dSpark its coarse plane.
 - Optional vision tower (MoonViT-style) when the checkpoint carries
   `vision_config`.
 
