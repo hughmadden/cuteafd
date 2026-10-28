@@ -6068,3 +6068,18 @@ record bytes. Bundle creation is inode-preserving on retry and frozen after a
 publication marker; incomplete/unsafe inputs fail before Hub writes. Publisher
 checks pass 30 CPU cases. Only our partial remote diagnostic subtree is replaced;
 the already uploaded weight shards are retained. Numerical identity is unchanged.
+
+Published on 2026-10-28 at 14:22 Taipei:
+https://huggingface.co/wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6
+revision `5a4e83a09a11f3145332ed632d28a9894ea88225`, CPU-only attempt
+`1793168087222174043`, exit zero. All 172 remote objects pass checksum/size
+verification, including 80 weight shards and 80 diagnostic JSONL bundles with
+all 58,923 records. Anonymous revision access and an anonymous weight-file HEAD
+match the published SHA, length and commit. The explicit local HF snapshot is
+offline-resolvable and all 172 files hardlink the export on the same filesystem;
+no second weight copy was made. The publication-complete marker records the
+manifest digest and revision. Final CPU checks pass 101 cases; CUDA/native
+qualification remains the 16 CUDA cases and 798-projection real-weight proof.
+GPU ownership is released and production rolling tensors remain retired.
+Full-model quality/long-context/serving qualification is the separately scheduled
+next step; this branch is pushed for orchestrator review, not merged.
