@@ -1,0 +1,2397 @@
+{
+  "source": {
+    "commit": "72c49116ff3ed318ab5481841b5044aba06f8f1a",
+    "coordinator_seal": "9df1b0aa7d28367927b6025d0ae0a9e7f087232fb5ad4620bf68baf413aea42c",
+    "description": "Unmodified GLM stage entries from the sealed SM120 WIP export that exposed the split-SwiGLU validator dispatch failure."
+  },
+  "programs": [
+    {
+      "name": "glm_stage_rank_pack_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "rank_pack",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "rank_pack",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "qkv",
+          "dtype": "bfloat16",
+          "shape": "[rows,2624]",
+          "role": "in"
+        },
+        {
+          "name": "q_norm",
+          "dtype": "bfloat16",
+          "shape": "[2048]",
+          "role": "in"
+        },
+        {
+          "name": "kv_norm",
+          "dtype": "bfloat16",
+          "shape": "[512]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "q_resid",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,41984]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_rank_pack_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmRankNormPackKV_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "0910843cbe84ddb3db248082a75888c08af67ac5274c2286295407a4262e18c6"
+    },
+    {
+      "name": "glm_stage_query_rope_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "query_rope",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "query_rope",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "q",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,576]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_query_rope_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmQueryRope_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "949859ef57bdf0a22085bf0e51ba61763f72f89a851015810f6c67b17776306e"
+    },
+    {
+      "name": "glm_stage_index_post_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "index_post",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "index_post",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "iq",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,128]",
+          "role": "in"
+        },
+        {
+          "name": "kw",
+          "dtype": "bfloat16",
+          "shape": "[rows,160]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "k_weight",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "k_bias",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,32,128]",
+          "role": "out"
+        },
+        {
+          "name": "head_weights",
+          "dtype": "float32",
+          "shape": "[rows,32]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,8448]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_index_post_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmIndexPost_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "b14e5af8173c95d151c0d1a5c474d2fc79e5239e10dc58052cf9389c18a5dfbd"
+    },
+    {
+      "name": "glm_stage_absorb_bf16_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[64,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_absorb_bf16_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "a0e932eb3512875bdbdef958604adab59192060267799b584d0ccaa95eec4c58"
+    },
+    {
+      "name": "glm_stage_absorb_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "fp8_only": "decode"
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "decode",
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[64,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[64,512,3]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_absorb_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f1d2d930d441f899d9b025033bc5d8d928228c0e44196644ae6e2d563101f2fe"
+    },
+    {
+      "name": "glm_stage_values_bf16_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[64,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_values_bf16_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "065bada5936e98fa34aee17b1613042f0f8fa0b251334b67fccfb777a9a1fdb8"
+    },
+    {
+      "name": "glm_stage_values_m64",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 64,
+        "fp8_only": "decode"
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 64,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "decode",
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[64,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[64,256,8]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm_stage_values_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "6a5d9163735e7904b8298d96bf775ae8ec7977b3457fbbbc2737202ecb939bca"
+    },
+    {
+      "name": "glm_stage_rank_pack_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "rank_pack",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "rank_pack",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "qkv",
+          "dtype": "bfloat16",
+          "shape": "[rows,2624]",
+          "role": "in"
+        },
+        {
+          "name": "q_norm",
+          "dtype": "bfloat16",
+          "shape": "[2048]",
+          "role": "in"
+        },
+        {
+          "name": "kv_norm",
+          "dtype": "bfloat16",
+          "shape": "[512]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "q_resid",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,41984]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_rank_pack_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmRankNormPackKV_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "3967315d50040e64f08ad7082b5db2ffa337693ab02c43fa60dca6224c8e0c7d"
+    },
+    {
+      "name": "glm_stage_query_rope_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "query_rope",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "query_rope",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "q",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,576]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_query_rope_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmQueryRope_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "83b41d9cf38bac5e0e46c8f7b698ac11d8e94514b3b74f1f7c3082b94359e35e"
+    },
+    {
+      "name": "glm_stage_index_post_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "index_post",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "index_post",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "iq",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,128]",
+          "role": "in"
+        },
+        {
+          "name": "kw",
+          "dtype": "bfloat16",
+          "shape": "[rows,160]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "k_weight",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "k_bias",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,32,128]",
+          "role": "out"
+        },
+        {
+          "name": "head_weights",
+          "dtype": "float32",
+          "shape": "[rows,32]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,8448]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_index_post_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmIndexPost_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f49e14184675b32e0d2ea6e896a02cf61950b3c9d6e733930618e5019a041e4e"
+    },
+    {
+      "name": "glm_stage_absorb_bf16_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[64,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_absorb_bf16_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "8fc18d3642b08b4c38e4c429b42834bc5d99f894f3f6207b540679ed11cdd1fe"
+    },
+    {
+      "name": "glm_stage_absorb_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "fp8_only": "prefill"
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "prefill",
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[64,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[64,512,3]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_absorb_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "3157743aff0c7fa0589c54096e50ed6a6305a990327ed4eb5a4e6731f8643b0b"
+    },
+    {
+      "name": "glm_stage_values_bf16_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[64,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_values_bf16_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "edc9a8de0b176e77d6262e6f993e15c3f71f7b96fd404a157b3fe08aeed0fa03"
+    },
+    {
+      "name": "glm_stage_values_m4096",
+      "family": "glm_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 4096,
+        "fp8_only": "prefill"
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 4096,
+        "heads": 64,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "prefill",
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[64,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[64,256,8]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_values_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "404b051bdd9f16b6a3da73158e511e68a20d4f1c8e2b844effb23294a32df6a8"
+    },
+    {
+      "name": "glm_stage_swiglu_i2048",
+      "family": "glm_stage",
+      "op": "swiglu_split",
+      "params": {
+        "inter": 2048
+      },
+      "geometry": {
+        "inter": 2048
+      },
+      "pointers": [
+        {
+          "name": "gate",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "up",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "hidden",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_swiglu_i2048__mlir_ciface_cutlass___call___b12xintegrationcuteafdnative_dense_SwiGLUSplit_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "253a71ac1f28a949cc1d79aa69620fe41639e913a17755fef6d0c850958b657b"
+    },
+    {
+      "name": "glm_stage_swiglu_i12288",
+      "family": "glm_stage",
+      "op": "swiglu_split",
+      "params": {
+        "inter": 12288
+      },
+      "geometry": {
+        "inter": 12288
+      },
+      "pointers": [
+        {
+          "name": "gate",
+          "dtype": "bfloat16",
+          "shape": "[rows,12288]",
+          "role": "in"
+        },
+        {
+          "name": "up",
+          "dtype": "bfloat16",
+          "shape": "[rows,12288]",
+          "role": "in"
+        },
+        {
+          "name": "hidden",
+          "dtype": "bfloat16",
+          "shape": "[rows,12288]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm_stage_swiglu_i12288__mlir_ciface_cutlass___call___b12xintegrationcuteafdnative_dense_SwiGLUSplit_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "eaab9c891433ad0be8705e0d4323f092df4a9d711a176c952b9ce61df86a1c34"
+    },
+    {
+      "name": "glm2_stage_rank_pack_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "rank_pack",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "rank_pack",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "qkv",
+          "dtype": "bfloat16",
+          "shape": "[rows,2624]",
+          "role": "in"
+        },
+        {
+          "name": "q_norm",
+          "dtype": "bfloat16",
+          "shape": "[2048]",
+          "role": "in"
+        },
+        {
+          "name": "kv_norm",
+          "dtype": "bfloat16",
+          "shape": "[512]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "q_resid",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,41984]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_rank_pack_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmRankNormPackKV_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "cfa474965818d597fffdbf5a5d5041e66d8d6222908bd175a57a28622d5d4567"
+    },
+    {
+      "name": "glm2_stage_query_rope_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "query_rope",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "query_rope",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "q",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_query_rope_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmQueryRope_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "b2fed0e0478e718cf7757eb19db7317b98e18ab0899a62b5225a6c0abdcbc5aa"
+    },
+    {
+      "name": "glm2_stage_index_post_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "index_post",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "index_post",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "iq",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,128]",
+          "role": "in"
+        },
+        {
+          "name": "kw",
+          "dtype": "bfloat16",
+          "shape": "[rows,160]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "k_weight",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "k_bias",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,32,128]",
+          "role": "out"
+        },
+        {
+          "name": "head_weights",
+          "dtype": "float32",
+          "shape": "[rows,32]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,8448]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_index_post_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmIndexPost_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "7fefbdcfefc98fd73726d874f4d6570d4841020f7a090d1f336d6348334df28b"
+    },
+    {
+      "name": "glm2_stage_absorb_bf16_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_bf16_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "237e2d1028cc8e94cfd35a76e989957980fcbc1642bcb006e237f0c701d879ae"
+    },
+    {
+      "name": "glm2_stage_absorb_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "fp8_only": "decode"
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "decode",
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[32,512,3]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "e74349126437c8f8ff07701bcea9d515aa077b7447b7b0b38c911aee974bc76d"
+    },
+    {
+      "name": "glm2_stage_values_bf16_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 64,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[32,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_values_bf16_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "34b124b75cb58e8f80c13fecc8ba562746923a6444a93b25781fcd454406a056"
+    },
+    {
+      "name": "glm2_stage_values_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 64,
+        "fp8_only": "decode"
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "decode",
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[32,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[32,256,8]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_values_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "8726045a3c5ae4f0b65bed9b00a0c803e682694cb7acd74c66760d9b5c905ce9"
+    },
+    {
+      "name": "glm2_stage_query_rope_context_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "query_rope",
+        "max_rows": 64,
+        "query_row": 36864
+      },
+      "geometry": {
+        "stage": "query_rope",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "q",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576] (rows 36864 apart)",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_query_rope_context_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmQueryRope_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f6294452b50bb9333968769ce428eb99bc4b27931e35e6490fbba6f971c70711"
+    },
+    {
+      "name": "glm2_stage_absorb_context_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "query_row": 36864,
+        "fp8_only": "decode"
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "decode",
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[32,512,3]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576] (rows 36864 apart)",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_context_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "1479f8eb346c3dc109a8af0d39e460319c9f90f3aa338d3540a57dd9f22fbdaa"
+    },
+    {
+      "name": "glm2_stage_absorb_bf16_context_m64",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "query_row": 36864,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 64,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576] (rows 36864 apart)",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_bf16_context_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f418efd6cd8fab97fe66263e349e213385c53f93fe8e08ab0f27efd71ef3dcff"
+    },
+    {
+      "name": "glm2_stage_rank_pack_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "rank_pack",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "rank_pack",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "qkv",
+          "dtype": "bfloat16",
+          "shape": "[rows,2624]",
+          "role": "in"
+        },
+        {
+          "name": "q_norm",
+          "dtype": "bfloat16",
+          "shape": "[2048]",
+          "role": "in"
+        },
+        {
+          "name": "kv_norm",
+          "dtype": "bfloat16",
+          "shape": "[512]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "q_resid",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,41984]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_rank_pack_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmRankNormPackKV_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "9fa4cf6d60620cc2a82926f7a22a63a0925f3eb19c6533f9264ea4cd82958159"
+    },
+    {
+      "name": "glm2_stage_query_rope_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "query_rope",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "query_rope",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "q",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_query_rope_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmQueryRope_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f6d43a5a725a244bbed65cf3383de3eb17ab35792bedb64c25a88838ba9faf87"
+    },
+    {
+      "name": "glm2_stage_index_post_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "index_post",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "index_post",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "iq",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,128]",
+          "role": "in"
+        },
+        {
+          "name": "kw",
+          "dtype": "bfloat16",
+          "shape": "[rows,160]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "k_weight",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "k_bias",
+          "dtype": "bfloat16",
+          "shape": "[128]",
+          "role": "in"
+        },
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,32,128]",
+          "role": "out"
+        },
+        {
+          "name": "head_weights",
+          "dtype": "float32",
+          "shape": "[rows,32]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pages,8448]",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_index_post_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmIndexPost_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "70bcca5ee77008277e9cb2dd51c6a8590917188846bfd19a7f6b1d9a65376680"
+    },
+    {
+      "name": "glm2_stage_absorb_bf16_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_bf16_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "ae71423915e8db390fe432d14bd4f4f9befdf4a922a59be58abee6feada6486e"
+    },
+    {
+      "name": "glm2_stage_absorb_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "fp8_only": "prefill"
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "prefill",
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[32,512,3]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "1b186c1de410e8414b24de3a93bc4db5e89ee01a8f64109b8d494b82d2ad6e1d"
+    },
+    {
+      "name": "glm2_stage_values_bf16_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 4096,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[32,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_values_bf16_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f31769915d75cbe091966aa339d1c67d1247bbb30d3941f529582db32094cc4e"
+    },
+    {
+      "name": "glm2_stage_values_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "values",
+        "max_rows": 4096,
+        "fp8_only": "prefill"
+      },
+      "geometry": {
+        "stage": "values",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "prefill",
+        "query_row": 18432
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,512]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[32,256,512]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[32,256,8]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_values_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "1cffec2d0e924a1deabef8fff57df4979a8b8c9082611eef26538a6a973f18ef"
+    },
+    {
+      "name": "glm2_stage_query_rope_context_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "query_rope",
+        "max_rows": 4096,
+        "query_row": 36864
+      },
+      "geometry": {
+        "stage": "query_rope",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "q",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[P,64]",
+          "role": "in"
+        },
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576] (rows 36864 apart)",
+          "role": "inout"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_query_rope_context_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsGlmQueryRope_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "a80dd1a2f26bc15ebb5445482f04e4ec9f7767755a1d6fa75296bf07cc6426b2"
+    },
+    {
+      "name": "glm2_stage_absorb_context_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "query_row": 36864,
+        "fp8_only": "prefill"
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": true,
+        "mode": "prefill",
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "float8_e4m3fn",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "scale",
+          "dtype": "float32",
+          "shape": "[32,512,3]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576] (rows 36864 apart)",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_context_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedFp8Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "c16368da37c7dbc0e6be6c177159360d854d634a1101794e92b8f596b8759738"
+    },
+    {
+      "name": "glm2_stage_absorb_bf16_context_m4096",
+      "family": "glm2_stage",
+      "op": "attention_stage",
+      "params": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "query_row": 36864,
+        "fp8_only": null
+      },
+      "geometry": {
+        "stage": "absorb",
+        "max_rows": 4096,
+        "heads": 32,
+        "index_heads": 32,
+        "q_lora_rank": 2048,
+        "record_bytes": 656,
+        "page_rows": 64,
+        "norm_eps": 1e-05,
+        "index_norm_eps": 1e-06,
+        "fp8_weights": false,
+        "mode": null,
+        "query_row": 36864
+      },
+      "pointers": [
+        {
+          "name": "a",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,256]",
+          "role": "in"
+        },
+        {
+          "name": "w",
+          "dtype": "bfloat16",
+          "shape": "[32,512,192]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,32,576] (rows 36864 apart)",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_absorb_bf16_context_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafd_glm_kernelsBatchedBf16Gemm_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "61780d6e0bf4a052f4b78838e436039d88b7e6e3eddebaf0274b5c27a4af69ae"
+    },
+    {
+      "name": "glm2_stage_swiglu_i1024",
+      "family": "glm2_stage",
+      "op": "swiglu_split",
+      "params": {
+        "inter": 1024
+      },
+      "geometry": {
+        "inter": 1024
+      },
+      "pointers": [
+        {
+          "name": "gate",
+          "dtype": "bfloat16",
+          "shape": "[rows,1024]",
+          "role": "in"
+        },
+        {
+          "name": "up",
+          "dtype": "bfloat16",
+          "shape": "[rows,1024]",
+          "role": "in"
+        },
+        {
+          "name": "hidden",
+          "dtype": "bfloat16",
+          "shape": "[rows,1024]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_swiglu_i1024__mlir_ciface_cutlass___call___b12xintegrationcuteafdnative_dense_SwiGLUSplit_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "f171c3240a17e081a55f892c20ec6f13a6bd6711893ed7268e0fd93088cab56a"
+    },
+    {
+      "name": "glm2_stage_swiglu_i6144",
+      "family": "glm2_stage",
+      "op": "swiglu_split",
+      "params": {
+        "inter": 6144
+      },
+      "geometry": {
+        "inter": 6144
+      },
+      "pointers": [
+        {
+          "name": "gate",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "in"
+        },
+        {
+          "name": "up",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "in"
+        },
+        {
+          "name": "hidden",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_glm2_stage_swiglu_i6144__mlir_ciface_cutlass___call___b12xintegrationcuteafdnative_dense_SwiGLUSplit_object_at__Ptrgmem_Ptrgmem_Ptrgmem__CUstream0x0",
+      "object_sha256": "260d45edb496513ace426bc1f5ecd6e8cb83a25ddf8c29596e603af6693732bb"
+    }
+  ]
+}

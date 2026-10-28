@@ -3,8 +3,10 @@
 functions are stubs that return their call."""
 from __future__ import annotations
 
+import ast
 import dataclasses
 import importlib.util
+import json
 import re
 import sys
 import types
@@ -574,6 +576,61 @@ def test_glm_dormant_stage_catalog(exporter, heads, count):
         if heads == 32:
             expected |= {f"{stage}_context_m{rows}" for stage in ("query_rope", "absorb", "absorb_bf16")}
         assert names == expected
+
+
+def test_real_glm_stage_runtime_fixture_matches_pinned_manifest_builders(exporter, monkeypatch):
+    fork = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+
+    def definitions(filename, names, namespace):
+        tree = ast.parse((fork / filename).read_text())
+        nodes = [node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+        assert {node.name for node in nodes} == names
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(fork / filename), "exec"), namespace)
+
+    # Execute the real descriptor builders; only CUDA primitive compilation is
+    # replaced. Operand/Scalar and ABI serialization remain the fork's code.
+    namespace = dict(dataclass=dataclasses.dataclass, torch=types.SimpleNamespace(
+        dtype=str, bfloat16="torch.bfloat16", int64="torch.int64", float32="torch.float32",
+        uint8="torch.uint8", float8_e4m3fn="torch.float8_e4m3fn"))
+    definitions("_common.py", {"GLMGeometry", "Operand", "Scalar"}, namespace)
+    aot = ast.parse((fork / "_common.py").read_text())
+    cls = next(node for node in aot.body if isinstance(node, ast.ClassDef) and node.name == "AotProgram")
+    abi = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "abi")
+    exec(compile(ast.Module(body=[abi], type_ignores=[]), str(fork / "_common.py"), "exec"), namespace)
+
+    def compile_program(launch, **kwargs):
+        program = types.SimpleNamespace(**kwargs)
+        return dict(geometry=program.geometry, **namespace["abi"].fget(program))
+
+    namespace.update(GLM53=namespace["GLMGeometry"](), compile_program=compile_program)
+    for name in ("GlmRankNormPackKV", "GlmQueryRope", "GlmIndexPost", "BatchedBf16Gemm", "BatchedFp8Gemm"):
+        namespace[name] = lambda **kwargs: None
+    namespace["_SwiGLUSplit"] = lambda inter: None
+    definitions("glm_attention.py", {"_check_rows", "_rank_pack", "_query_rope", "_index_post",
+        "_kv_projection", "kv_b_fp8_operands", "_w8_batched_warps", "compile_glm_attention_stage_aot"}, namespace)
+    definitions("native_dense.py", {"_positive", "compile_swiglu_split_aot"}, namespace)
+    monkeypatch.setattr(sys.modules["b12x.integration.cuteafd.glm_attention"],
+                        "compile_glm_attention_stage_aot", namespace["compile_glm_attention_stage_aot"])
+    monkeypatch.setattr(sys.modules["b12x.integration.cuteafd.native_dense"],
+                        "compile_swiglu_split_aot", namespace["compile_swiglu_split_aot"])
+    fixture = json.loads((ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/glm_stage_programs_sm120.json").read_text())
+    actual = {entry["name"]: entry for entry in fixture["programs"]}
+    expected = {}
+    for split in (False, True):
+        family = "glm2_stage" if split else "glm_stage"
+        geometry = exporter.glm_stage_geometry(namespace["GLM53"], split)
+        for suffix, op, params, thunk in exporter.glm_stage_programs(geometry, 64, 4096):
+            program = thunk()
+            name = f"{family}_{suffix}"
+            expected[name] = dict(name=name, family=family, op=op, params=params,
+                geometry=program["geometry"],
+                pointers=[dict(zip(("name", "dtype", "shape", "role"), p)) for p in program["pointers"]],
+                scalars=[dict(zip(("name", "type"), s)) for s in program["scalars"]],
+                capacity_rows=params.get("max_rows", 4096), scratch_bytes_at_capacity={})
+    assert actual.keys() == expected.keys() and len(expected) == 38
+    for name, entry in expected.items():
+        assert {key: actual[name][key] for key in entry} == entry, name
 
 
 def test_glm_official_catalog_stays_fused(exporter):
