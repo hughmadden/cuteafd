@@ -149,7 +149,7 @@ __global__ void __launch_bounds__(kScanThreads) scan_kernel(uint32_t* __restrict
 // One warp per (16-row tile, 128-wide K block): its four 16 x 32 tiles of both planes.
 __global__ void planes_kernel(const uint16_t* __restrict__ w, const uint8_t* __restrict__ base,
                               uint4* __restrict__ coarse, uint2* __restrict__ fine, int k) {
-  const int kb = blockIdx.x, rt = blockIdx.y, lane = threadIdx.x;
+  const int rt = blockIdx.x, kb = blockIdx.y, lane = threadIdx.x;
   const int g = lane / 4, c = (lane % 4) * 2;
   const uint16_t* rows[2] = {w + size_t(rt * 16 + g) * k, w + size_t(rt * 16 + g + 8) * k};
   const uint32_t bases[2] = {base[rt * 16 + g], base[rt * 16 + g + 8]};
@@ -488,9 +488,10 @@ void launch_gemv(int groups, dim3 grid, cudaStream_t s, const Head& head, const 
 
 // Verifies a packed head against its BF16 source `w` [n, k] (see the file
 // comment): status words 1 (failing rows) and 2 (the first, all ones if none)
-// are reset and written; word 0 must hold the pack's exception count. `planes`
-// are coarse, fine, base, row_ptr, columns, values; `capacity` the table's
-// entries. Asynchronous on `stream`; read the status after it drains.
+// are reset and written, the others left as the pack wrote them; the table's
+// size is row_ptr[n]. `planes` are coarse, fine, base, row_ptr, columns,
+// values; `capacity` the table's entries. Asynchronous on `stream`; read the
+// status after it drains.
 extern "C" int32_t cuteafd_packed_head_verify(const void* w, const void* const* planes, int64_t capacity, int32_t n,
                                               int32_t k, void* status, void* stream) {
   if (!w || !planes || !status || !valid_shape(n, k) || capacity < 0 || capacity > INT64_C(0xffffffff)) {
@@ -536,7 +537,7 @@ extern "C" int32_t cuteafd_packed_head_pack(const void* w, void* const* planes, 
   if (error != cudaSuccess) return error;
   base_kernel<<<n, kBaseThreads, 0, s>>>(source, base, row_ptr, words, k);
   scan_kernel<<<1, kScanThreads, 0, s>>>(row_ptr, words, n);
-  planes_kernel<<<dim3(k / 128, n / 16), 32, 0, s>>>(source, base, static_cast<uint4*>(planes[kCoarse]),
+  planes_kernel<<<dim3(n / 16, k / 128), 32, 0, s>>>(source, base, static_cast<uint4*>(planes[kCoarse]),
                                                        static_cast<uint2*>(planes[kFine]), k);
   table_kernel<<<(n + kRowWarps - 1) / kRowWarps, kRowWarps * 32, 0, s>>>(
       source, base, row_ptr, static_cast<uint32_t*>(planes[kColumns]), static_cast<uint16_t*>(planes[kValues]),
