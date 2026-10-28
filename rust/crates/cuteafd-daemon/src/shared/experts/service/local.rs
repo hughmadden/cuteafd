@@ -67,6 +67,27 @@ mod selection_tests {
     }
 
     #[test]
+    fn full_response_ring_stops_staged_intake_before_any_send_wait() -> Result<()> {
+        assert!(intake_has_capacity(0, false, || panic!("ordinary decode must not preflight"))?);
+        for (sweep, staged) in [(0, true), (1, false), (1, true)] {
+            let mut checked = 0;
+            let mut launched = 0;
+            let mut send_waits = 0;
+            if intake_has_capacity(sweep, staged, || { checked += 1; Ok(false) })? {
+                send_waits += 1; // Negative control: begin_deferred on a full ring waits.
+            } else {
+                launched += usize::from(staged);
+            }
+            assert_eq!((checked, send_waits, launched), (1, 0, usize::from(staged)));
+        }
+        let source = include_str!("local.rs").rsplit_once("pub(super) fn run(").unwrap().1;
+        assert!(source.find("try_deferred_capacity").unwrap() < source.find(".begin_deferred(").unwrap());
+        let stop = source.find("if intake_blocked { break; }").unwrap();
+        assert!(source[stop..].contains("for execution in &mut executions {\n            if let Err(error) = execution.flush_staged()"));
+        Ok(())
+    }
+
+    #[test]
     fn staged_cancellation_neither_publishes_nor_strands_other_credits() -> Result<()> {
         let owners = cuteafd_core::SparkExecutions::admit(&[64], 4096, 2752, 3, &cuteafd_core::EXL3_CAPACITIES)?;
         let mut queues = OwnerQueues::new(&owners);
@@ -615,6 +636,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         while index < connections.len() {
             let mut execution_failed = false;
             let mut executed = false;
+            let mut intake_blocked = false;
             let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)
                 && wait_index == Some(index)).then_some(idle_wait);
             let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
@@ -637,6 +659,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     _ => Ok(false),
                 };
                 finished.and_then(|finished| {
+                    if !intake_has_capacity(intake, executions.iter().any(Execution::has_staged),
+                        || connections[index].try_deferred_capacity(deferred_limit))? {
+                        intake_blocked = true;
+                        return Ok(finished);
+                    }
                     let mut launch_failed = false;
                     let mut input_address = 0;
                     let launched = connections[index].begin_deferred(wait, deferred_limit, |view, mapped| {
@@ -717,6 +744,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         );
                         pending_steady_log = false;
                     }
+                    // A full reply ring cannot delay the staged wave behind a
+                    // SEND wait. Launch it now, then resume the ordinary sweep.
+                    if intake_blocked { break; }
                     received_this_sweep |= processed;
                     index += 1;
                     // Finish the original connection sweep before any extra
@@ -783,6 +813,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark owner teardown");
     }
     result
+}
+
+fn intake_has_capacity(sweep: usize, staged: bool, check: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    if sweep == 0 && !staged { return Ok(true); }
+    check()
 }
 
 /// Extra intake follows a full ordinary sweep and never waits for an arrival.
