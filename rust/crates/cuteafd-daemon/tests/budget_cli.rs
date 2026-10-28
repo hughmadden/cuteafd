@@ -109,15 +109,24 @@ fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
         &testing::mimo_pro_tensors(), Some(8));
     let manifest = snapshot.path().join("PROGRAMS.json");
     std::fs::write(&manifest, br#"{"capacities":{"prefill_rows":4096}}"#).unwrap();
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../examples/configs/mimo-v26-pro-mxfp4-max.config");
-    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
-        .arg("plan").arg(snapshot.path()).arg("--config").arg(example)
-        .args(["--deployment", "--rtx", "2", "--prefill-rows", "2752",
-            "--vision", "off", "--audio", "off", "--speculator", "off",
-            "--workspace-manifest"]).arg(manifest).output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let deployment = release_accepts_prefill(&output.stdout);
+    use cuteafd_loader::plan::{deployment::{DeploymentOptions, DeploymentSpec},
+        layout::LayoutOptions, MediaMode, PlanInput, PlanOptions};
+    let example = include_str!("../../../../examples/configs/mimo-v26-pro-mxfp4-max.config");
+    let config = example.lines().filter_map(|line| line.split_once('=')).collect::<std::collections::BTreeMap<_, _>>();
+    let gpus = config["RTX_GPUS"].parse::<usize>().unwrap();
+    let ranks = config["SPARK_COUNT"].parse::<usize>().unwrap();
+    let options = PlanOptions {
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus],
+            prefill_rows: 2752, workspace_manifest: Some(manifest), ..Default::default()
+        }), ..Default::default()
+    };
+    let report = PlanInput::open(snapshot.path()).unwrap().plan_spark_count(&options, ranks, Some(ranks)).unwrap();
+    let launch = DeploymentOptions { rtx_gpus: gpus, speculator: "off".into(), ..Default::default() };
+    let deployment = release_accepts_prefill(&serde_json::to_vec(
+        &DeploymentSpec::from_report(&report, &launch).unwrap()).unwrap());
     assert_eq!(deployment["family"], "mimo_v2");
     assert_eq!(deployment["rtx_gpus"], 2);
     assert_eq!(deployment["spark_ranks"], 6);
@@ -134,16 +143,46 @@ fn glm53_max_deployment_runs_three_2752_row_units() {
         &testing::glm5_tensors(|name, n, k| testing::fp8(name, n, k, None)), None);
     let manifest = snapshot.path().join("PROGRAMS.json");
     std::fs::write(&manifest, testing::glm5_native_programs().to_string()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
-        .arg("plan").arg(snapshot.path()).args(["--deployment", "--rtx", "2",
-            "--spark-ranks", "6", "--vision", "off", "--audio", "off",
-            "--speculator", "off", "--workspace-manifest"]).arg(manifest).output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let deployment = release_accepts_prefill(&output.stdout);
+    use cuteafd_loader::plan::{deployment::{DeploymentOptions, DeploymentSpec},
+        layout::LayoutOptions, MediaMode, PlanInput, PlanOptions};
+    let input = PlanInput::open(snapshot.path()).unwrap();
+    let mut options = PlanOptions {
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(LayoutOptions {
+            // Shape contracts must not depend on the test runner's live cgroup.
+            host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2],
+            head_split: true, workspace_manifest: Some(manifest), ..Default::default()
+        }), ..Default::default()
+    };
+    let launch = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
+    let report = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
+    let deployment = release_accepts_prefill(&serde_json::to_vec(
+        &DeploymentSpec::from_report(&report, &launch).unwrap()).unwrap());
     // The fixed depth: three units of the 8192-row reserve.
     assert_eq!(deployment["prefill_unit_rows"], 2752);
     assert_eq!(deployment["prefill_waves"], 3);
     assert_eq!(deployment["prefill_span_rows"], 8256);
+
+    options.layout.as_mut().unwrap().host_memory = Some((20 << 30, 15 << 30));
+    let capped = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert!(capped.executable(), "{}", cuteafd_loader::plan::render(&capped));
+    assert_eq!(capped.prefill_waves, Some(3));
+    assert!(capped.prefill_unit_rows.is_some_and(|rows| rows > 0 && rows < 2752));
+    assert!(capped.prefill_reserve_rows.is_some_and(|rows| rows > 0 && rows < 8192));
+    let host = capped.host_ledger.as_ref().unwrap();
+    assert_eq!((host.total_bytes, host.available_bytes), (20 << 30, 15 << 30));
+    assert_eq!(host.shortfall_bytes, 0);
+    release_accepts_prefill(&serde_json::to_vec(
+        &DeploymentSpec::from_report(&capped, &launch).unwrap()).unwrap());
+
+    options.layout.as_mut().unwrap().prefill_rows = 2752;
+    let refused = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert_eq!(refused.prefill_unit_rows, Some(2752));
+    assert!(!refused.executable());
+    assert!(refused.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("coordinator host memory shortfall")));
 }
 
 fn installed_example_snapshot(model_id: &str, revision: Option<&str>, hf_home: &std::path::Path)
