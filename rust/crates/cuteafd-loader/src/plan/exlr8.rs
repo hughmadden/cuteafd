@@ -10,6 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::read_json;
+use super::spec::Family;
 use super::format::{
     BlockScale, Encoding, RowTiling, ScaleDirection, ScaleEncoding, TrellisCodebook,
 };
@@ -141,7 +142,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(checkpoint, options)?;
     super::layout::resolve_prefill(&mut report, &mut resolved_layout, world,
-        crate::serving_capacity::prefill_waves::PrefillLimits::default())?;
+        super::families::glm::GLM5.prefill_limits())?;
     let layout = &resolved_layout;
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
@@ -1097,6 +1098,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn native_prefill_uses_the_serving_family_limits() {
+        let source = include_str!("exlr8.rs");
+        let body = source.split("pub(super) fn native_plan_of(").nth(1).unwrap()
+            .split("let layout = &resolved_layout;").next().unwrap();
+        assert!(body.contains("super::families::glm::GLM5.prefill_limits()"));
+        assert!(!body.contains("PrefillLimits::default()"));
+    }
 
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {
         let mut header = serde_json::Map::new();
