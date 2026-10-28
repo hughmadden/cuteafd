@@ -1495,6 +1495,10 @@ pub(crate) struct SparkLink<'a> {
     transport: Option<SparkExperts>,
     /// Widest wave staging each slot needs (bytes), sized at bootstrap.
     staging_bytes: usize,
+    /// The bootstrap request without its (all-zero) hidden payload, and that
+    /// payload's length: a reset re-opens the sessions with it before the
+    /// exchange restarts, as bootstrap does.
+    bootstrap: Option<(cuteafd_transport::ExpertProtocolV2Request, usize)>,
     timing: bool,
     world: cuteafd_transport::expert::SparkWorld,
     world_size: usize,
@@ -1570,7 +1574,7 @@ impl<'a> SparkLink<'a> {
         let world = transport.world();
         Ok(Self { intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
-            staging_bytes: 0, timing, world, world_size: ranks, capacity })
+            staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
     }
 
     /// The transport while no exchange runs (setup and teardown only).
@@ -1607,6 +1611,8 @@ impl<'a> SparkLink<'a> {
         transport.bootstrap(request)?;
         self.egress_bytes = registered;
         self.staging_bytes = staging;
+        let shape = cuteafd_transport::ExpertProtocolV2Request { hidden_payload: bytes::Bytes::new(), ..request.clone() };
+        self.bootstrap = Some((shape, request.hidden_payload.len()));
         self.start()
     }
 
@@ -1683,6 +1689,13 @@ impl<'a> SparkLink<'a> {
         let intake = std::rc::Rc::clone(&self.intake);
         let transport = self.transport.as_mut().context("Spark link has no transport")?;
         intake.reset(transport)?;
+        // Re-open every rank's session as bootstrap did: the exchange reads
+        // which ranks land in device memory from the live sessions.
+        if let Some((shape, payload)) = &self.bootstrap {
+            let request = cuteafd_transport::ExpertProtocolV2Request {
+                hidden_payload: bytes::Bytes::from(vec![0; *payload]), ..shape.clone() };
+            transport.bootstrap(&request)?;
+        }
         self.start()
     }
 
