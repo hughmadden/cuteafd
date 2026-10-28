@@ -90,6 +90,31 @@ def _write_diagnostic_metadata(path, data, *, frozen):
     fsync_directory(path.parent)
 
 
+def _source_license_metadata(export, *, frozen=False):
+    """Match the model-card tag to the untouched source MIT license.
+
+    This is publication metadata only. The sealed numerical producer and
+    its tensor receipts are unchanged, including on an in-flight run.
+    """
+    license_path = export / "LICENSE"
+    if license_path.is_symlink():
+        raise ValueError("refuse symlink license asset")
+    lines = license_path.read_text().splitlines()
+    if not lines or lines[0].strip() != "MIT License":
+        return
+    card = export / "README.md"
+    if card.is_symlink():
+        raise ValueError("refuse symlink model card")
+    text = card.read_text()
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        raise ValueError("MIT source requires model-card YAML metadata")
+    end = text.index("\n---\n", 4)
+    metadata = [line for line in text[4:end].splitlines()
+                if not line.startswith(("license:", "license_name:", "license_link:"))]
+    corrected = "---\nlicense: mit\n" + "\n".join(metadata) + text[end:]
+    _write_diagnostic_metadata(card, corrected.encode(), frozen=frozen)
+
+
 def _bundle_diagnostics(export, *, frozen=False):
     """Publish complete per-layer JSONL evidence, retaining raw records locally."""
     errors=export/"quantization-errors"
@@ -241,6 +266,7 @@ def publish(export, root, repo_id):
         raise ValueError("publication roots must be regular directories")
     export, root = export.resolve(), root.resolve()
     identity = _complete_plan(export, root, repo_id)
+    _source_license_metadata(export, frozen=(root/"publication-complete.json").exists())
     _bundle_diagnostics(export,frozen=(root/"publication-complete.json").exists())
     files = _collect_local(export, identity)
     LOCAL_HUB_CACHE.mkdir(parents=True, exist_ok=True)

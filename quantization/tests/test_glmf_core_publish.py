@@ -22,6 +22,27 @@ def git_blob(data):
     return hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
 
 
+def test_mit_source_license_sets_correct_public_tag_without_changing_license(tmp_path):
+    license_bytes = b"MIT License\n\nCopyright (c) 2026 Z.AI Co., Ltd\n"
+    (tmp_path/"LICENSE").write_bytes(license_bytes)
+    card = tmp_path/"README.md"
+    card.write_text("---\nlicense: other\nlicense_name: glm-5.3\nlicense_link: https://source/LICENSE\nbase_model: source/model\n---\n# Quant\n")
+    publication._source_license_metadata(tmp_path)
+    assert card.read_text() == "---\nlicense: mit\nbase_model: source/model\n---\n# Quant\n"
+    assert (tmp_path/"LICENSE").read_bytes() == license_bytes
+    publication._source_license_metadata(tmp_path, frozen=True)
+
+
+def test_completed_publication_license_metadata_cannot_change(tmp_path):
+    (tmp_path/"LICENSE").write_text("MIT License\n")
+    card = tmp_path/"README.md"
+    original = "---\nlicense: other\n---\n# Quant\n"
+    card.write_text(original)
+    with pytest.raises(ValueError, match="completed diagnostic bundle differs"):
+        publication._source_license_metadata(tmp_path, frozen=True)
+    assert card.read_text() == original
+
+
 @pytest.fixture
 def finished(tmp_path, monkeypatch):
     root, export, cache = tmp_path/"run", tmp_path/"export", tmp_path/"local-hub"
