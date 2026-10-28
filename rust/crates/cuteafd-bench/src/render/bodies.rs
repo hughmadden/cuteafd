@@ -78,6 +78,10 @@ pub fn decode_scaling(doc: &mut Doc, theme: &Theme, report: &Report, x: f64, y: 
     let top = y + 36.0 * scale;
     let bottom = y + 106.0 * scale;
     doc.text(x, y, Font::new(15.0 * scale, theme.muted).spacing(3.0 * scale).weight(600), "DECODE SCALING");
+    // Waves of one repeated prompt share experts and drafts; say which kind this is.
+    if let Some(point) = points.iter().find(|point| point.width > 1) {
+        doc.text(x + width, y, Font::new(12.0 * scale, theme.muted).anchor(Anchor::End), point.prompt_label());
+    }
     doc.line(x, bottom, x + width, bottom, theme.line2, 1.0);
     let max = points.iter().map(|point| point.aggregate_tok_s).fold(1.0f64, f64::max) * 1.08;
     let px = |level: usize| {

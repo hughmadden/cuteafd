@@ -68,7 +68,9 @@ pub fn report(failed: bool) -> Report {
                 .into_iter().map(|(width, aggregate_tok_s, per_stream_median_tok_s)| ConcurrentRate {
                     width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,
                     runs: (0..width).map(|_| ConcurrentTiming { sent_s: 0.0,
-                        timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0 }).collect(),
+                        timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0,
+                    prompts: Some(if width == 1 { "code" } else { crate::panels::speed::DISTINCT_PROMPTS }.into()) })
+                .collect(),
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
             warmup_s: Some(14.2), prompt_token_ratio: None,
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
@@ -161,6 +163,7 @@ mod tests {
                 // Median is 118, deliberately not the aggregate / width (120).
                 assert!(card.contains(&format!("aggregate tps · {}/stream at C8",
                     render::rate(third.per_stream_median_tok_s))));
+                assert!(card.contains(">distinct prompts</text>"), "{case}: prompt set label");
                 assert!(!card.contains("120/stream"));
             } else {
                 assert!(card.contains("C8 not measured"));
