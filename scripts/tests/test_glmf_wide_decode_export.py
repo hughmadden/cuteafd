@@ -3,6 +3,7 @@
 functions are stubs that return their call."""
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import re
 import sys
@@ -531,8 +532,17 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
 
 @pytest.mark.parametrize("heads,count", [(64, 16), (32, 22)])
 def test_glm_dormant_stage_catalog(exporter, heads, count):
+    @dataclasses.dataclass(frozen=True)
+    class Geometry:
+        name: str = "glm53"
+        heads: int = 64
+        latent_dim: int = 576
+        dense_inter: int = 12288
+        moe_inter: int = 2048
+
     dense, shared = ((12288, 2048) if heads == 64 else (6144, 1024))
-    geometry = types.SimpleNamespace(heads=heads, latent_dim=576, dense_inter=dense, moe_inter=shared)
+    geometry = exporter.glm_stage_geometry(Geometry(), heads == 32)
+    assert (geometry.heads, geometry.dense_inter, geometry.moe_inter) == (heads, dense, shared)
     entries = exporter.glm_stage_programs(geometry, 64, 4096)
     assert len(entries) == count
     assert len({name for name, _, _, _ in entries}) == count

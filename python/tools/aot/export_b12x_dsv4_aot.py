@@ -149,6 +149,11 @@ def head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int
     return [item for item in programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
+def glm_stage_geometry(g, split: bool):
+    return dataclasses.replace(g, name="glm53_tp2", heads=g.heads // 2,
+                               dense_inter=g.dense_inter // 2, moe_inter=g.moe_inter // 2) if split else g
+
+
 def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
     """Dormant primitive boundaries; the official fused GLM table stays unchanged."""
     from functools import partial
@@ -898,7 +903,7 @@ def main() -> None:
     work = []
     for name in geometries:
         if name in ("glm_stage", "glm2_stage"):
-            g = GLM53 if name == "glm_stage" else dataclasses.replace(GLM53, name="glm53_tp2", heads=32)
+            g = glm_stage_geometry(GLM53, name == "glm2_stage")
             manifest["families"][name] = dataclasses.asdict(g)
             work += [(name, *item) for item in glm_stage_programs(g, args.decode_rows, args.prefill_rows)]
             continue
