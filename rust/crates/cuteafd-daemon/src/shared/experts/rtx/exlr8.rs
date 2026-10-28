@@ -11,6 +11,28 @@ use std::{ffi::c_void, rc::Rc};
 const DECODE_ROWS: usize = 64;
 const TP2_UNITS: usize = 8;
 
+#[cfg(test)]
+mod copy_tests {
+    #[test]
+    fn all_decode_operands_use_the_shared_sm_copy_route() {
+        use crate::shared::memory::device::sm_peer_copy_for;
+        for rows in [1, 16, DECODE_ROWS] {
+            for bytes in [rows * 6144 * 33 / 32, rows * 8 * 4, rows * 6144 * 2] {
+                assert!(sm_peer_copy_for(true, bytes, DECODE_ROWS * 6144 * 2));
+            }
+        }
+        assert!(!sm_peer_copy_for(true, DECODE_ROWS * 6144 * 2 + 1, DECODE_ROWS * 6144 * 2));
+        assert!(!sm_peer_copy_for(true, 4096 * 6144 * 2, DECODE_ROWS * 6144 * 2));
+        let source = include_str!("exlr8.rs");
+        let enqueue = source.split("unsafe fn enqueue(").nth(1).unwrap();
+        assert_eq!(enqueue.matches("copy_d2d_async(").count(), 1);
+        assert!(enqueue.contains("sm_peer_copy_for(true, input.bytes, DECODE_ROWS * 6144 * 2)"));
+        assert!(enqueue.contains("self.sm_copy.launch_rows("), "same-device SM copies require the local-capable entry point");
+        assert!(enqueue.contains("copy(view(self.output.buffer, 0, bytes)?,"));
+    }
+    use super::DECODE_ROWS;
+}
+
 pub(crate) struct Exlr8Tp2Weights<'a> {
     device: Device<'a>,
     rank: u8,
@@ -29,6 +51,7 @@ pub(crate) struct Exlr8Tp2<'a> {
     owner: Exlr8Tp2Weights<'a>,
     executions: DeviceOwner<'a, Vec<Exlr8Execution<'a>>>,
     output: Allocation<'a>,
+    sm_copy: cuteafd_ffi::V41PeerCopy<'a>,
 }
 
 impl<'a> Exlr8Tp2Weights<'a> {
@@ -90,7 +113,8 @@ impl<'a> Exlr8Tp2Weights<'a> {
         })?;
         let completion = RankCompletion::new(Event::new(device)?);
         let output = Allocation::new(device, self.max_rows * 6144 * 2)?;
-        Ok(Exlr8Tp2 { completion, owner: self, executions, output })
+        let sm_copy = device.run(|| device.library.v41_peer_copy())?;
+        Ok(Exlr8Tp2 { completion, owner: self, executions, output, sm_copy })
     }
 }
 
@@ -125,20 +149,29 @@ impl RtxExpertLayer for Exlr8Tp2<'_> {
             let device = self.owner.device;
             let source = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: device.id, flags: 0 };
             device.run(|| {
+                let copy = |target, input: CuteafdDeviceBuffer| -> Result<()> {
+                    // SAFETY: rank-local operands outlive this stream's completion;
+                    // decode copies execute on SMs, never behind a parked copy engine.
+                    unsafe {
+                        if crate::shared::memory::device::sm_peer_copy_for(true, input.bytes, DECODE_ROWS * 6144 * 2) {
+                            self.sm_copy.launch_rows(target, input, input.bytes, 1, input.bytes, input.bytes, stream)
+                        } else {
+                            device.library.copy_d2d_async(target, input, input.bytes, stream)
+                        }
+                    }
+                };
                 for (target, input) in [
                     (execution.input()?, source(wire, rows * 6144 * 33 / 32)),
                     (execution.ids()?, source(routes.ids, rows * 8 * 4)),
                     (execution.route_weights()?, source(routes.weights, rows * 8 * 4)),
                 ] {
-                    // SAFETY: caller retains rank-local input/routes and this owner through stream drainage.
-                    unsafe { device.library.copy_d2d_async(view(target, 0, input.bytes)?, input, input.bytes, stream)?; }
+                    copy(view(target, 0, input.bytes)?, input)?;
                 }
                 // SAFETY: immutable weights and sealed arena remain owned until the completion event drains.
                 unsafe {
                     execution.run(&self.owner.weights[index], rows, stream)?;
                     let bytes = rows * 6144 * 2;
-                    device.library.copy_d2d_async(view(self.output.buffer, 0, bytes)?,
-                        view(execution.output()?, 0, bytes)?, bytes, stream)?;
+                    copy(view(self.output.buffer, 0, bytes)?, view(execution.output()?, 0, bytes)?)?;
                 }
                 Ok(())
             })

@@ -106,6 +106,16 @@ impl<'a> GlmContextSplit<'a> {
                 let (candidates, own, peer, topk_scratch, partial_scratch, gather) =
                     (next()?, next()?, next()?, next()?, next()?, next()?);
                 let commit = (0..lanes).map(|_| next()).collect::<Result<Vec<_>>>()?;
+                let half = staging_pages.div_ceil(2);
+                for owner in 0..2 {
+                    // SAFETY: each full owner region and stream live with this split.
+                    unsafe { engine.library.reserve_h2d_ordered(
+                        view(&gather, owner * half * 4, half * 4)?, engine.stream_of(rank))?; }
+                }
+                for table in &commit {
+                    // SAFETY: each lane's whole commit destination lives with this split.
+                    unsafe { engine.library.reserve_h2d_ordered(table.buffer, engine.stream_of(rank))?; }
+                }
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let view = staging_pages * (RECORD_PAGE_BYTES + INDEX_PAGE_BYTES);
@@ -373,6 +383,21 @@ fn commit_blocks(rank: usize, start: usize, rows: usize, pages: &[u32], limit: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_tables_reserve_every_upload_destination_at_construction() {
+        fn reserved(source: &str) -> bool {
+            let new = source.split("pub fn new(engine:").nth(1).unwrap().split("let [mut first,").next().unwrap();
+            new.contains("for owner in 0..2 {") && new.contains("view(&gather, owner * half * 4, half * 4)?")
+                && new.contains("for table in &commit {")
+                && new.contains("reserve_h2d_ordered(table.buffer, engine.stream_of(rank))?")
+                && new.matches("reserve_h2d_ordered(").count() == 2
+        }
+        let source = include_str!("context.rs");
+        assert!(reserved(source));
+        assert!(!reserved(&source.replacen("for owner in 0..2 {", "for owner in 0..1 {", 1)));
+        assert!(!reserved(&source.replacen("for table in &commit {", "for table in commit.iter().take(1) {", 1)));
+    }
 
     /// A parity pool's ids for logical pages `0..n` (page `j` of parity `j % 2`).
     fn ids(n: usize, base: u32) -> Vec<u32> {

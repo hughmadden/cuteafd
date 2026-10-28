@@ -192,18 +192,47 @@ fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
     let executions = cuteafd_loader::plan::spark_executions::admit_family("glm5", &backend.exports(), None,
         u64::from(unit_rows), waves as u64)?;
-    let endpoints = 1 + usize::from(waves > 1);
     let rings = crate::shared::placement::spark_rings(if native {
         cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
     } else { 64 << 20 })?;
-    cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }; endpoints], rings, executions)
+    let model = cuteafd_transport::worker_selection::ModelAdmission::new(
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress },
+            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)?;
+    validate_spark_endpoint_count(model.endpoints.len(), waves)?;
+    Ok(model)
+}
+
+fn validate_spark_endpoint_count(endpoints: usize, waves: usize) -> Result<()> {
+    ensure!(endpoints == cuteafd_loader::plan::layout::spark_endpoints("glm5", waves as u64),
+        "GLM Spark endpoint count differs from the planner");
+    Ok(())
 }
 
 #[cfg(test)]
 mod draft_cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn width_diagnostics_fail_closed_and_detect_live_route_changes() {
+        let tap = || engine::WidthTap { layer: 3, x: vec![0; 4], routes: vec![0; 16], delta: vec![0; 4] };
+        assert!(validate_width_taps(&[], &[3], 2, 1, 1).is_err());
+        assert!(validate_width_taps(&[tap()], &[4], 2, 1, 1).is_err());
+        assert!(validate_width_taps(&[tap()], &[3], 1, 1, 1).is_err());
+        assert!(validate_width_taps(&[tap()], &[3], 2, 1, 1).is_ok());
+        let base = engine::WidthTap { layer: 3, x: vec![0; 2], routes: vec![0; 8], delta: vec![0; 2] };
+        assert!(tap_split(&[tap()], std::slice::from_ref(&base), 1, 1, 1).is_empty());
+        for (offset, label) in [(4, "ids differ"), (12, "weights differ")] {
+            let mut changed = tap();
+            changed.routes[offset] = 1;
+            assert!(tap_split(&[changed], std::slice::from_ref(&base), 1, 1, 1).contains(label));
+        }
+        let source = include_str!("engine.rs");
+        let tap = source.split("fn tap_width(").nth(1).unwrap().split("fn finish_width_tap(").next().unwrap();
+        assert!(tap.find("if self.width_taps.borrow().is_none()").unwrap() < tap.find("self.download(").unwrap());
+        assert!(tap.contains("self.download(&w.route_ids,") && tap.contains("self.download(&w.route_weights,"));
+        assert!(!tap.contains("router_host"));
+    }
 
     #[derive(Parser)]
     struct Parse {
@@ -238,9 +267,10 @@ mod draft_cli_tests {
                 let model = spark_model(SparkBackend::Fp8, waves, unit, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
                 // The decode link and one prefill link carrying every wave in flight.
-                assert_eq!(model.endpoints.len(), if waves == 1 { 1 } else { 2 });
-                assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == unit
-                    && endpoint.ingress == if bf16 { cuteafd_core::SparkIngress::Bf16 }
+                assert_eq!(model.endpoints.len(), 2);
+                assert_eq!(model.endpoints[0].capacity, engine::DECODE_ROWS as u32);
+                assert_eq!(model.endpoints[1].capacity, unit);
+                assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == if bf16 { cuteafd_core::SparkIngress::Bf16 }
                         else { cuteafd_core::SparkIngress::Fp8K32 }));
                 // One prefill owner at the selected unit's covering export; k only buffers units.
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit,
@@ -252,7 +282,9 @@ mod draft_cli_tests {
         for waves in 1..=4 {
             let native = spark_model(SparkBackend::Exlr8, waves, 4096, false)?;
             native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
-            assert_eq!(native.endpoints.len(), if waves == 1 { 1 } else { 2 });
+            assert_eq!(native.endpoints.len(), 2);
+            assert_eq!(native.endpoints[0].capacity, engine::DECODE_ROWS as u32);
+            assert_eq!(native.endpoints[1].capacity, 4096);
             assert!(native.endpoints.iter().all(|endpoint|
                 endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
             assert_eq!(native.executions.decode[0].compiled_capacity,
@@ -261,6 +293,19 @@ mod draft_cli_tests {
                 cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity())?);
         }
         assert!(spark_model(SparkBackend::Fp8, 0, 4096, false).is_err());
+        assert!(validate_spark_endpoint_count(1, 1).is_err());
+        assert!(validate_spark_endpoint_count(3, 3).is_err());
+        assert!(validate_spark_endpoint_count(2, 1).is_ok());
+        let source = include_str!("mod.rs");
+        let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
+            .split("let runtime = tokio::runtime::Builder").next().unwrap();
+        let check = |body: &str| body.contains("engine::DECODE_ROWS as u32, config.clone(), row_bytes")
+            && body.contains("warm(engine::DECODE_ROWS, true)")
+            && body.contains("warm(args.prefill_rows, false)")
+            && !body.contains("selected_peers.filter(");
+        assert!(check(links));
+        assert!(!check(&links.replace("engine::DECODE_ROWS as u32", "4096")));
+        assert!(!check(&links.replace("match selected_peers {", "match selected_peers.filter(|_| prefill_lanes > 1) {")));
         Ok(())
     }
 
@@ -1095,15 +1140,15 @@ impl Opened {
             Ok((peers, world))
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
-            timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 } };
+            timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 } };
         let row_bytes = self.cfg.hidden * 2;
         crate::shared::memory_report::release_load_staging(&self.library);
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
-        let (rows, h, topk, experts, layer) =
-            (args.prefill_rows, self.cfg.hidden, self.cfg.topk, self.cfg.experts,
+        let (h, topk, experts, layer) =
+            (self.cfg.hidden, self.cfg.topk, self.cfg.experts,
                 working.spark.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
-        let warm = move || -> Result<cuteafd_transport::ExpertProtocolV2Request> {
+        let warm = move |rows: usize, decode: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
                 row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
             }).collect();
@@ -1111,7 +1156,8 @@ impl Opened {
                 h as u32, if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
                     else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
                 (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                    row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
+                    row_id: u64::from(row), source_kind: if decode { cuteafd_transport::ExpertV2SourceKind::Decode }
+                        else { cuteafd_transport::ExpertV2SourceKind::Prefill },
                     source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
                     route_count: topk as u32,
                 }).collect(),
@@ -1121,32 +1167,34 @@ impl Opened {
         };
         let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
             let (peers, world) = ranks(peers)?;
-            let mut link = SparkLink::new(&self.library, world, &peers, 4096, config.clone(), row_bytes)?;
+            let mut link = SparkLink::new(&self.library, world, &peers, engine::DECODE_ROWS as u32, config.clone(), row_bytes)?;
             // The bootstrap opens every rank before any wave does, so the
             // installed grouping is readable from here on. The warm-up below
             // then reuses these sessions.
-            link.bootstrap(&warm()?)?;
+            link.bootstrap(&warm(engine::DECODE_ROWS, true)?)?;
             Ok(link)
         }).transpose()?;
         // One prefill transport with `prefill_lanes` waves in flight (PLAN
         // "Prefill contract"): each in-flight unit lands in its own return slot.
-        let mut prefill_link = match selected_peers.filter(|_| prefill_lanes > 1) {
+        let mut prefill_link = match selected_peers {
             Some(peers) => {
                 let (peers, world) = ranks(peers)?;
-                let mut link = SparkLink::new_waves(&self.library, world, &peers, 4096, config.clone(), row_bytes,
+                let mut link = SparkLink::new_waves(&self.library, world, &peers, u32::try_from(args.prefill_rows)?, config.clone(), row_bytes,
                     prefill_lanes, u32::try_from(args.prefill_rows)?)?;
-                link.bootstrap(&warm()?)?;
+                link.bootstrap(&warm(args.prefill_rows, false)?)?;
                 Some(link)
             }
             None => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let started = Instant::now();
-        for link in transport.iter_mut().chain(prefill_link.iter_mut()) {
+        for (link, decode) in transport.iter_mut().map(|link| (link, true))
+            .chain(prefill_link.iter_mut().map(|link| (link, false))) {
             // A full-width wave through each link's exchange (rings and the
             // Sparks' first-use costs), landed and drained on the stream.
+            let rows = link.capacity() as usize;
             let exchange = link.exchange()?;
-            let ticket = exchange.send_request(warm()?)?;
+            let ticket = exchange.send_request(warm(rows, decode)?)?;
             exchange.land_drained(ticket, stream)?;
         }
         if transport.is_some() {
@@ -1370,9 +1418,21 @@ fn hooked_verify(engine: &engine::GlmEngine<'_>, placement: &mut engine::GlmPlac
     let logits = engine.verify(&mut [(placement, rows)], tokens, transport.as_deref_mut().map(|t| (t, runtime)),
         Some(&mut hook));
     let taps = engine.width_taps.borrow_mut().take().unwrap_or_default();
-    let logits = logits?.context("width invariance needs every layer")?;
     placement.len = start;
+    let logits = logits?.context("width invariance needs every layer")?;
+    let expected = engine.weights.layers.iter().enumerate().filter_map(|(i, layer)| (!layer.dense).then_some(i))
+        .collect::<Vec<_>>();
+    validate_width_taps(&taps, &expected, rows, engine.cfg.hidden, engine.cfg.topk)?;
     Ok((layers, logits, taps))
+}
+
+fn validate_width_taps(taps: &[engine::WidthTap], expected: &[usize], rows: usize, hidden: usize, topk: usize) -> Result<()> {
+    ensure!(taps.len() == expected.len() && !expected.is_empty(), "width diagnostics missed MoE layer taps");
+    for (tap, &layer) in taps.iter().zip(expected) {
+        ensure!(tap.layer == layer && tap.x.len() == rows * hidden * 2 && tap.delta.len() == tap.x.len()
+            && tap.routes.len() == rows * topk * 8, "incomplete width diagnostic tap for MoE layer {layer}");
+    }
+    Ok(())
 }
 
 /// Where a differing row first departs inside its first differing MoE layer:
@@ -1405,7 +1465,10 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     let max_rows = *args.width_invariance.iter().max().unwrap();
     ensure!(args.width_invariance.iter().all(|&w| (1..=engine::DECODE_ROWS).contains(&w)),
         "--width-invariance takes widths 1..={}", engine::DECODE_ROWS);
-    ensure!(transport.is_some() || engine.skip_routed(), "--width-invariance needs Spark peers or --skip-routed-experts");
+    ensure!(transport.is_some() || engine.skip_routed()
+        || engine.weights.layers.iter().enumerate().all(|(i, layer)| layer.dense
+            || engine.tp2_layers().is_some_and(|layers| layers.contains(&i))),
+        "--width-invariance needs Spark peers, local experts, or --skip-routed-experts");
     let prefill = args.prefill.unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
     let mut placement = engine::PageAllocator::new(engine).admit(prefill + max_rows)?;
@@ -1446,12 +1509,13 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
                 != ref_layers[i][..row_bytes]);
             let logits_differ = logits[r * vocab..(r + 1) * vocab].iter().map(|v| v.to_bits())
                 .ne(ref_logits[..vocab].iter().map(|v| v.to_bits()));
-            if layer.is_some() || logits_differ {
+            let split = tap_split(&taps, ref_taps, r, engine.cfg.hidden, engine.cfg.topk);
+            if layer.is_some() || logits_differ || !split.is_empty() {
                 let max = logits[r * vocab..(r + 1) * vocab].iter().zip(&ref_logits[..vocab])
                     .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                 differing.push(format!("row {r}: layer {} (max |dlogit| {max:.3e}){}",
                     layer.map_or("L".to_string(), |i| i.to_string()),
-                    tap_split(&taps, ref_taps, r, engine.cfg.hidden, engine.cfg.topk)));
+                    split));
             }
         }
         clean &= differing.is_empty();
@@ -1459,6 +1523,7 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             if differing.is_empty() { "bitwise identical".to_string() } else { differing.join("; ") });
     }
     println!("width invariance: {}", if clean { "PASS" } else { "FAIL" });
+    ensure!(clean, "width invariance failed");
     Ok(())
 }
 
@@ -1945,7 +2010,7 @@ fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_
     let mut placement = allocator.admit(tokens.len() + steps + 1)?;
     let mut last = None;
     for chunk in tokens.chunks(engine.prefill_capacity()) {
-        last = engine.prefill_device(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)))?;
+        last = engine.prefill_device(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), 1)?;
     }
     let last = last.context("--token-check needs every layer")?.row_host(&opened.library, 0)?;
     let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;

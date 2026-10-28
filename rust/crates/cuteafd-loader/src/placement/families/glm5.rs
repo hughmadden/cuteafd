@@ -380,16 +380,13 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                     Basis::Formula)));
             }
             if inputs.spark_ranks > 0 {
-                // The decode link's 4096-row planes, plus the prefill link's one
-                // reserve range per rank every admitted depth's return slots
-                // are cut from (#762).
-                let prefill = if inputs.prefill_lanes > 1 {
-                    crate::serving_capacity::prefill_return_bytes(1,
-                        prefill_span(inputs.prefill_rows, inputs.prefill_lanes),
-                        inputs.spark_ranks as u64, cfg.hidden as u64)
-                } else { 0 };
+                // Decode owns only decode-width planes; every Spark layout
+                // has separate prefill return slots, including pinned one-wave.
+                let prefill = crate::serving_capacity::prefill_return_bytes(1,
+                    prefill_span(inputs.prefill_rows, inputs.prefill_lanes),
+                    inputs.spark_ranks as u64, cfg.hidden as u64);
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2 + prefill, Basis::Formula)));
+                    inputs.spark_ranks as u64 * DECODE_ROWS * cfg.hidden as u64 * 2 + prefill, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -1103,7 +1100,7 @@ mod tests {
         let h = cfg.hidden as u64;
         assert_eq!(term(&split, "steps") - term(&ordinary, "steps"),
             2 * 123456);
-        assert_eq!(term(&split, "Spark intake planes"), 4 * 4096 * h * 2);
+        assert_eq!(term(&split, "Spark intake planes"), 4 * (DECODE_ROWS + base.prefill_rows) * h * 2);
         for lanes in 1..=4 {
             let mut parallel = native.clone(); parallel.prefill_lanes = lanes;
             let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
@@ -1111,9 +1108,9 @@ mod tests {
             assert_eq!(term(&request(&parallel).unwrap(), "steps")
                 - term(&request(&ordinary).unwrap(), "steps"), 2 * 123456);
             // One reserve range per rank every admitted depth is cut from.
-            let prefill = if lanes > 1 { prefill_span(parallel.prefill_rows, lanes) * 4 * h * 2 } else { 0 };
+            let prefill = prefill_span(parallel.prefill_rows, lanes) * 4 * h * 2;
             assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
-                4 * 4096 * h * 2 + prefill);
+                4 * DECODE_ROWS * h * 2 + prefill);
         }
         for gpus in 1..=2 {
             let mut drafting = native.clone();
@@ -1349,9 +1346,9 @@ mod tests {
             assert!(working.spark.includes(WorkingSetComponent::SparkExperts));
             assert_eq!(working.tp2_workspace, if n == 0 { [0; 2] } else { input.tp2_workspace });
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
-            // Decode's 4096-row planes plus one reserve range per rank that three
+            // Decode-width planes plus one reserve range per rank that three
             // admitted 4096-row slots are cut from (#762).
-            assert_eq!(intake.bytes, 4 * 4096 * 6144 * 2 + 4 * prefill_span(input.prefill_rows, 3) * 6144 * 2);
+            assert_eq!(intake.bytes, 4 * DECODE_ROWS * 6144 * 2 + 4 * prefill_span(input.prefill_rows, 3) * 6144 * 2);
         }
     }
 
@@ -2131,8 +2128,8 @@ mod tests {
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
         for (requested_pool, expected_pool, expected_context) in [
-            // Two prefill slots share one step's scratch, head and logits (#762).
-            (Some(32768), 32768, 32512), (None, 117248, 116992),
+            // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
+            (Some(32768), 32768, 32512), (None, 124288, 124032),
         ] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;

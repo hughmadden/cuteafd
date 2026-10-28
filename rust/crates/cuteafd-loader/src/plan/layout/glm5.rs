@@ -494,7 +494,8 @@ mod tests {
                 let moe = spec.moe.as_ref().unwrap();
                 let expert = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
                     topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-                let endpoints = native.prefill_transports.unwrap();
+                // The prefill transport count excludes the separate decode endpoint.
+                let endpoints = 2;
                 let endpoint = SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Fp8K32 };
                 let (request, response) = endpoint.wire_bytes(expert).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
@@ -503,7 +504,7 @@ mod tests {
                 let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
                 assert_eq!(bytes("spark-intake"), shape.span_rows * expert.hidden as u64 * 4 * endpoints * sparks as u64);
                 assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(expert, rings).unwrap() as u64 * endpoints * sparks as u64);
-                assert_eq!(bytes("workspace/router"), (shape.unit_rows + 64) * (expert.hidden as u64 * 2 + expert.topk as u64 * 8));
+                assert!(!host.items.iter().any(|item| item.group == "workspace/router"));
                 assert_eq!(host.shortfall_bytes, 0);
             }
         }
