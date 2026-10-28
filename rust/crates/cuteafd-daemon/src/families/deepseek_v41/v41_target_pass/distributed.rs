@@ -1249,7 +1249,9 @@ mod tests {
         // the Sparks, two prefill units) before any link. Endpoints admit the
         // decode owners' verify width (64 rows); the fixture's 16-row links fit.
         crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(std::path::Path::new(&snapshot),
-            &catalog, 20, peers.len(), cuteafd_core::V41_VERIFY_ROWS as u32, 2, None)?.start(&peers)?.wait()?;
+            &catalog, 20, peers.len(), cuteafd_core::V41_VERIFY_ROWS as u32, 2,
+            // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
+            Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                 timeout: Duration::from_secs(120),
                 max_frame_bytes: 2 << 20,
