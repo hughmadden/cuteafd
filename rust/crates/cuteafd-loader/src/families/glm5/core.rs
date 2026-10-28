@@ -43,6 +43,31 @@ pub fn expected(cfg: &GlmDsaConfig) -> BTreeMap<String, Vec<usize>> {
     shapes
 }
 
+/// Serialized BF16 stage operands beside the shared projection arena. F32
+/// partials live in each row slot, not here: they outlive the producer hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreStageLayout { pub extents: BTreeMap<&'static str, usize> }
+impl CoreStageLayout {
+    pub fn new(cfg: &GlmDsaConfig, rows: usize, ranks: usize, owned_attention: bool) -> Result<Self> {
+        ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2), "GLM K6 stage geometry");
+        let heads = cfg.heads / if owned_attention { 1 } else { ranks };
+        let intermediate = cfg.dense_intermediate.max(cfg.moe_intermediate * cfg.shared_experts) / ranks;
+        let bf16 = |width: usize| rows.checked_mul(width).and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| anyhow::anyhow!("GLM K6 stage extent overflow"));
+        Ok(Self { extents: BTreeMap::from([
+            ("qkv", bf16(cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim)?),
+            ("q", bf16((heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim))
+                .max(cfg.q_lora_rank).max((cfg.kv_lora_rank + cfg.qk_rope_head_dim).next_multiple_of(128)))?),
+            ("gate", bf16(intermediate)?), ("up", bf16(intermediate)?),
+            ("hidden", bf16(intermediate)?), ("values", bf16(heads * cfg.v_head_dim)?),
+        ]) })
+    }
+    pub fn bytes(&self) -> Result<usize> {
+        self.extents.values().try_fold(0usize, |total, &n| total.checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("GLM K6 stage total overflow")))
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory { pub projections: BTreeMap<String, CoreProjection> }
 
@@ -239,6 +264,31 @@ mod tests {
         }
         let ordinary = CoreInventory::default().layer_weights(&cfg, 0, 2, None)?;
         assert!(ordinary.iter().all(BTreeMap::is_empty));
+        Ok(())
+    }
+
+    #[test]
+    fn stage_layout_tracks_whole_attention_but_keeps_ffns_split() -> Result<()> {
+        let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        for rows in [1, 8, 64, 4096] {
+            for ranks in [1, 2] {
+                let split = CoreStageLayout::new(&cfg, rows, ranks, false)?;
+                let owned = CoreStageLayout::new(&cfg, rows, ranks, true)?;
+                let h = cfg.heads / ranks;
+                assert_eq!(split.extents["values"], rows * h * cfg.v_head_dim * 2);
+                assert_eq!(owned.extents["values"], rows * cfg.heads * cfg.v_head_dim * 2);
+                for name in ["gate", "up", "hidden"] {
+                    assert_eq!(split.extents[name], rows * cfg.dense_intermediate / ranks * 2);
+                    assert_eq!(owned.extents[name], split.extents[name]);
+                }
+                assert_eq!(split.extents["qkv"], rows * 2624 * 2);
+                assert!(split.extents["q"] >= rows * 640 * 2);
+                assert_eq!(split.bytes()?, split.extents.values().sum::<usize>());
+            }
+        }
+        for (rows, ranks) in [(0, 1), (4097, 1), (64, 0), (64, 3)] {
+            assert!(CoreStageLayout::new(&cfg, rows, ranks, false).is_err());
+        }
         Ok(())
     }
 

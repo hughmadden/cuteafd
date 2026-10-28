@@ -174,6 +174,13 @@ def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
                     suffix = "_bf16" if stage == "absorb" and weights is None else ""
                     out.append((f"{stage}{suffix}_context_m{rows}", "attention_stage", params,
                                 partial(compile_glm_attention_stage_aot, g, **params)))
+    # The calibrated K6 gate/up projections stay separate through their BF16
+    # egress. Reuse the existing format-neutral GLM SwiGLU boundary.
+    from b12x.integration.cuteafd.native_dense import compile_swiglu_split_aot
+    for inter in sorted({g.dense_inter, g.moe_inter}):
+        params = dict(inter=inter)
+        out.append((f"swiglu_i{inter}", "swiglu_split", params,
+                    partial(compile_swiglu_split_aot, **params)))
     return out
 
 

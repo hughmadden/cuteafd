@@ -1109,6 +1109,7 @@ impl Opened {
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
+        engine.bind_core()?;
         if native {
             // Bind each GPU before capture; all prefill scratch is lane-local.
             for rank in 0..engine.ranks() {

@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -529,13 +529,19 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
-@pytest.mark.parametrize("heads,count", [(64, 14), (32, 20)])
+@pytest.mark.parametrize("heads,count", [(64, 16), (32, 22)])
 def test_glm_dormant_stage_catalog(exporter, heads, count):
-    geometry = types.SimpleNamespace(heads=heads, latent_dim=576)
+    dense, shared = ((12288, 2048) if heads == 64 else (6144, 1024))
+    geometry = types.SimpleNamespace(heads=heads, latent_dim=576, dense_inter=dense, moe_inter=shared)
     entries = exporter.glm_stage_programs(geometry, 64, 4096)
     assert len(entries) == count
     assert len({name for name, _, _, _ in entries}) == count
     for name, op, params, thunk in entries:
+        if op == "swiglu_split":
+            assert params in ({"inter": dense}, {"inter": shared})
+            assert name == f"swiglu_i{params['inter']}"
+            assert thunk() == ("native_dense", "compile_swiglu_split_aot", (), params)
+            continue
         assert op == "attention_stage"
         rows = params["max_rows"]
         assert rows in (64, 4096) and name.endswith(f"_m{rows}")
