@@ -122,7 +122,7 @@ if tool == "docker":
         family = os.environ.get("CAPTURE_FAMILY", "deepseek_v41")
         default_rows = 4096 if family == "qwen4" else 2048
         response = {"spark_ranks": int(ranks), "prefill_unit_rows": int(rows) or default_rows,
-                    "prefill_waves": 1, "prefill_slots": 1, "prefill_span_rows": int(rows) or default_rows,
+                    "prefill_waves": 1, "prefill_span_rows": int(rows) or default_rows, "prefill_reserve_rows": 8192,
                     "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
                     "encoder_plan_hash": "ab" * 32, "placement_supported": True, "fits": True}
         if "--deployment" in args:
@@ -144,7 +144,7 @@ if tool == "docker":
                     waves = min(waves, 2)
                 unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]
                 span = int(value("--prefill-span-rows", "0")) or unit * waves
-                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_slots=waves, prefill_span_rows=span)
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             report = dict(response)
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))

@@ -1,15 +1,74 @@
-//! Two local-head waves for one lane; no state is shared with another lane.
+//! Per-slot head-half waves on shared, guarded unit-cap attention storage.
 use super::*;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache,CacheAttention,peer_inputs::PeerAttentionInputs};
 
-pub(crate) struct DualAttentionWave<'a> {
-    halves: [DeviceOwner<'a, CompactSparseAttentionWave<'a>>; 2],
+/// Query/output, gather output, mirrored proposal/selection inputs and the
+/// copied sink half are guarded unit scratch, consumed within one attention
+/// hook. The half workspaces/descriptors are plain scratch on shared streams.
+/// Host metadata, cold state and graph banks remain per slot. Mirrored source
+/// bindings live on the shared PeerAttentionInputs, beside the shared arena:
+/// A -> B -> A changes that one key on each slot switch and recopies A. The
+/// guard orders the writes after all earlier readers, even with both slots in
+/// flight. A repeated binding can reuse bytes only while that same arena still
+/// carries it; no per-slot cache key survives another slot's overwrite.
+#[cfg(test)]
+thread_local! { static SKIP_DUAL_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+unsafe fn acquire_dual(guard: &crate::shared::memory::row_window::ScratchGuard<'_>, stream: *mut c_void) -> Result<()> {
+    #[cfg(test)]
+    if SKIP_DUAL_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+    // SAFETY: caller supplies a live writer stream on the current device.
+    unsafe { guard.acquire(stream) }
+}
+pub(crate) struct DualAttentionStorage<'a> {
+    halves: [std::rc::Rc<SparseAttentionStorage<'a, 32>>; 2],
     copies: [V41PeerCopy<'a>; 2],
     peer_done: Event<'a>,
     output: Allocation<'a>,
     inputs: PeerAttentionInputs<'a>,
     peer_sink: Allocation<'a>,
+    guard: crate::shared::memory::row_window::ScratchGuard<'a>,
+    capacity: usize,
+}
+impl<'a> DualAttentionStorage<'a> {
+    pub(crate) fn storage_bytes(unit: usize) -> Result<[usize; 2]> {
+        let half = SparseAttentionStorage::<'_, 32>::storage_bytes(unit)?;
+        Ok([half + unit*64*1024, half + PeerAttentionInputs::device_bytes(unit)? + 128])
+    }
+    pub(crate) fn new(devices: [Device<'a>; 2], unit: usize) -> Result<std::rc::Rc<Self>> {
+        ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
+            "dual attention devices differ");
+        Self::storage_bytes(unit)?;
+        for i in 0..2 { devices[i].run(|| devices[i].library.cuda_enable_peer(devices[1-i].id))?; }
+        let readers = [devices[0].id, devices[1].id];
+        let inputs = PeerAttentionInputs::new(devices[0], devices[1], unit, PeerAttentionInputs::device_bytes(unit)?)?;
+        Ok(std::rc::Rc::new(Self {
+            halves: [devices[0].run(|| SparseAttentionStorage::new(devices[0].library, unit, &readers))?,
+                devices[1].run(|| SparseAttentionStorage::new(devices[1].library, unit, &readers))?],
+            copies: [devices[0].run(|| devices[0].library.v41_peer_copy())?,
+                devices[1].run(|| devices[1].library.v41_peer_copy())?],
+            peer_done: Event::new(devices[1])?,
+            output: Allocation::new(devices[0], unit*64*1024)?, inputs,
+            peer_sink: Allocation::new(devices[1], 128)?,
+            guard: crate::shared::memory::row_window::ScratchGuard::new(devices[0].library, &readers)?,
+            capacity: unit,
+        }))
+    }
+}
+impl Drop for DualAttentionStorage<'_> {
+    fn drop(&mut self) {
+        for half in &self.halves {
+            crate::shared::decode_graph::fatal_drain(unsafe {
+                half.stream.library.cuda_set_device(half.query.buffer.device_id).and_then(|_|
+                    half.stream.library.cuda_stream_synchronize(half.stream.raw))
+            }, "dual attention storage");
+        }
+    }
+}
+pub(crate) struct DualAttentionWave<'a> {
+    halves: [DeviceOwner<'a, CompactSparseAttentionWave<'a>>; 2],
+    storage: std::rc::Rc<DualAttentionStorage<'a>>,
+    window: crate::shared::memory::row_window::RowWindow,
     capacity: usize,
     pending: Option<OwnedSubmission>,
     tails: GraphBank<(usize, Vec<usize>), GraphOwner<'a, ()>>,
@@ -19,29 +78,33 @@ impl<'a> DualAttentionWave<'a> {
     /// Budgets are in head-half order: the first device owns the gathered output.
     /// Includes private proposals, selection and sink storage on the peer.
     /// Committed cache replicas remain budgeted by the backbone bank.
+    pub(crate) fn source_device(&self) -> Device<'a> { self.halves[0].device }
+    pub(crate) fn capacity(&self) -> usize { self.capacity }
     pub fn device_bytes(capacity: usize) -> Result<[usize; 2]> {
-        let half = CompactSparseAttentionWave::device_bytes(capacity)?;
-        Ok([half + capacity*64*1024, half+PeerAttentionInputs::device_bytes(capacity)?+128])
+        DualAttentionStorage::storage_bytes(capacity)
     }
     pub fn new(devices: [Device<'a>; 2], capacity: usize, budgets: [usize; 2]) -> Result<Self> {
-        ensure!(devices[0].id != devices[1].id
-            && std::ptr::eq(devices[0].library, devices[1].library), "dual attention devices differ");
-        let needed = Self::device_bytes(capacity)?;
-        ensure!(needed.iter().zip(budgets).all(|(n,b)| *n<=b), "dual attention exceeds budget");
-        for i in 0..2 { devices[i].run(|| devices[i].library.cuda_enable_peer(devices[1-i].id))?; }
-        let half = CompactSparseAttentionWave::device_bytes(capacity)?;
+        ensure!(Self::device_bytes(capacity)?.iter().zip(budgets).all(|(n,b)| *n<=b), "dual attention exceeds budget");
+        Self::on_storage(DualAttentionStorage::new(devices, capacity)?)
+    }
+    pub(crate) fn on_storage(storage: std::rc::Rc<DualAttentionStorage<'a>>) -> Result<Self> {
+        let devices = std::array::from_fn::<_, 2, _>(|i| Device {
+            library: storage.halves[i].stream.library, id: storage.halves[i].query.buffer.device_id });
         Ok(Self {
-            halves: [devices[0].own(|| CompactSparseAttentionWave::new(devices[0].library,capacity,half))?,
-                devices[1].own(|| CompactSparseAttentionWave::new(devices[1].library,capacity,half))?],
-            copies: [devices[0].run(|| devices[0].library.v41_peer_copy())?,
-                devices[1].run(|| devices[1].library.v41_peer_copy())?],
-            peer_done: Event::new(devices[1])?,
-            output: Allocation::new(devices[0],capacity*64*1024)?, capacity,
-            inputs: PeerAttentionInputs::new(devices[0],devices[1],capacity,PeerAttentionInputs::device_bytes(capacity)?)?,
-            peer_sink: Allocation::new(devices[1],128)?,
-            pending: None,
-            tails: GraphBank::new(None),
+            halves: [devices[0].own(|| CompactSparseAttentionWave::on_storage(storage.halves[0].clone()))?,
+                devices[1].own(|| CompactSparseAttentionWave::on_storage(storage.halves[1].clone()))?],
+            capacity: storage.capacity, storage, window: crate::shared::memory::row_window::RowWindow::NONE,
+            pending: None, tails: GraphBank::new(None),
         })
+    }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        crate::shared::memory::row_window::require_rest(self.pending.is_some(), "dual attention", "work is pending")?;
+        for half in &mut self.halves { half.select_window(window.clone())?; }
+        self.window = window; Ok(())
+    }
+    pub(crate) fn release_scratch(&self) -> Result<()> {
+        for half in &self.halves { half.release_scratch()?; }
+        self.storage.guard.release()
     }
     pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
         for half in &mut self.halves {
@@ -102,8 +165,8 @@ impl<'a> DualAttentionWave<'a> {
         let plan=self.pending.as_ref().context("dual attention submission absent")?;
         let (layer,rows)=(plan.layer,plan.rows);
         let mut key=tail.identity();
-        key.extend([rows,self.output.buffer.ptr as usize]);
-        let graph=self.tails.launch(&(layer,key.clone())).map(|graph|graph.raw);
+        key.extend([rows,self.storage.output.buffer.ptr as usize]);
+        let graph=if self.window.is_windowed() { None } else { self.tails.launch(&(layer,key.clone())).map(|graph|graph.raw) };
         let library=self.halves[0].device.library;
         let (attention,stream)=unsafe { self.complete_owned_then(|attention,stream| {
             tail.prepare(stream)?;
@@ -113,7 +176,7 @@ impl<'a> DualAttentionWave<'a> {
                 graph, || tail.enqueue(&attention,stream))?;
             Ok((attention,stream))
         }).await? };
-        if graph.is_some() { return Ok(()); }
+        if graph.is_some() || self.window.is_windowed() { return Ok(()); }
         // The warmup is complete. Re-establish host-side block state, capture
         // the same operations and replay them before publishing FFN output.
         let mut guard=PendingDualAttention { wave:Some(self),cold:[false;2],rows,layer };
@@ -166,18 +229,19 @@ impl<'a> DualAttentionWave<'a> {
         let wave=pending.wave.as_deref_mut().unwrap();
         let stream=wave.halves[1].chain_stream();
         let peer=wave.halves[1].device;
-        let mirrored=unsafe { wave.inputs.enqueue(bank,cache,stream)? };
-        let selected=selection.map(|s|unsafe { wave.inputs.selection(s,stream) }).transpose()?;
-        peer.run(||unsafe { wave.copies[1].launch(wave.peer_sink.buffer,slice(sink,128,128),128,stream) })?;
+        peer.run(|| unsafe { wave.storage.guard.acquire(stream) })?;
+        let mirrored=unsafe { wave.storage.inputs.enqueue(bank,cache,stream)? };
+        let selected=selection.map(|s|unsafe { wave.storage.inputs.selection(s,stream) }).transpose()?;
+        peer.run(||unsafe { wave.storage.copies[1].launch(wave.storage.peer_sink.buffer,slice(sink,128,128),128,stream) })?;
         let (original,original_count)=cache.attention_requests_fixed()?;
         let (requests,count)=mirrored.attention_requests();
         let request_slices=[&original[..original_count],&requests[..count]];
         let selections=[selection,selected.as_ref()];
-        let sinks=[slice(sink,0,128),wave.peer_sink.buffer];
+        let sinks=[slice(sink,0,128),wave.storage.peer_sink.buffer];
         for i in 0..2 {
             let device=wave.halves[i].device;
             pending.cold[i]=device.run(||unsafe {
-                wave.halves[i].enqueue_split_query_prepared(query,i*32,&wave.copies[i],
+                wave.halves[i].enqueue_split_query_prepared(query,i*32,&wave.storage.copies[i],
                     sinks[i],request_slices[i],selections[i],true,None)
             })?.is_none();
         }
@@ -204,7 +268,7 @@ impl<'a> DualAttentionWave<'a> {
         for i in 0..2 {
             let device = wave.halves[i].device;
             pending.cold[i] = device.run(|| unsafe {
-                wave.halves[i].enqueue_split_query_prepared(query,i*32,&wave.copies[i],
+                wave.halves[i].enqueue_split_query_prepared(query,i*32,&wave.storage.copies[i],
                     sinks[i],requests[i],selections[i],true,None)
             })?.is_none();
         }
@@ -244,16 +308,17 @@ impl PendingDualAttention<'_,'_> {
         let stream = wave.halves[0].chain_stream();
         let library = owner.library;
         owner.run(|| unsafe {
-            wave.copies[0].launch_rows(wave.output.buffer,wave.halves[0].output.buffer,
+            acquire_dual(&wave.storage.guard,stream)?;
+            wave.storage.copies[0].launch_rows(wave.storage.output.buffer,wave.halves[0].storage.output.buffer,
                 32*1024,self.rows,64*1024,32*1024,stream)
         })?;
-        peer.run(|| unsafe { library.cuda_event_record(wave.peer_done.raw,wave.halves[1].chain_stream()) })?;
+        peer.run(|| unsafe { library.cuda_event_record(wave.storage.peer_done.raw,wave.halves[1].chain_stream()) })?;
         owner.run(|| unsafe {
-            library.cuda_stream_wait_event(stream,wave.peer_done.raw)?;
-            wave.copies[0].launch_rows(slice(wave.output.buffer,32*1024,wave.output.buffer.bytes-32*1024),
-                wave.halves[1].output.buffer,32*1024,self.rows,64*1024,32*1024,stream)
+            library.cuda_stream_wait_event(stream,wave.storage.peer_done.raw)?;
+            wave.storage.copies[0].launch_rows(slice(wave.storage.output.buffer,32*1024,wave.storage.output.buffer.bytes-32*1024),
+                wave.halves[1].storage.output.buffer,32*1024,self.rows,64*1024,32*1024,stream)
         })?;
-        let values = slice(wave.output.buffer,0,self.rows*64*1024);
+        let values = slice(wave.storage.output.buffer,0,self.rows*64*1024);
         let result=owner.run(||consume(QueuedSparseAttention { values,rows:self.rows,layer:self.layer },stream))?;
         owner.future(wave.halves[0].wait_chain()).await?;
         self.wave = None;
@@ -301,11 +366,11 @@ mod tests {
                     library.copy_h2d(end.buffer,&[0;8])?;
                     let s=if i==0 { 0f32 } else { 3f32.ln() };
                     library.copy_h2d(sink.buffer,&s.to_ne_bytes().repeat(32))?;
-                    library.copy_h2d(wave.halves[i].query.buffer,&vec![0;4*32*1024])?;
-                    library.copy_h2d(wave.halves[i].replay_begins.buffer,&[0;32])?;
+                    library.copy_h2d(wave.halves[i].storage.query.buffer,&vec![0;4*32*1024])?;
+                    library.copy_h2d(wave.halves[i].storage.replay_begins.buffer,&[0;32])?;
                     let metadata:Vec<u8>=(0..4).flat_map(|pos|
                         [0u64,0,4,pos,0,0,0,0,0,0].into_iter().flat_map(u64::to_ne_bytes)).collect();
-                    library.copy_h2d(wave.halves[i].metadata.buffer,&metadata)
+                    library.copy_h2d(wave.halves[i].storage.metadata.buffer,&metadata)
                 })?;
                 buffers.push((values,scales,end,sink));
             }
@@ -317,9 +382,9 @@ mod tests {
                         let half=&wave.halves[i];
                         let window=V41SparseWindow { values:values.buffer,scales:scales.buffer,
                             proposals:values.buffer,proposal_scales:scales.buffer,end:end.buffer,
-                            proposal_capacity:128,replay_begins:Some(half.replay_begins.buffer) };
-                        unsafe { half.kernel.launch(half.query.buffer,sink.buffer,half.metadata.buffer,None,
-                            &window,None,half.output.buffer,4,0,None,half.chain_stream()) }
+                            proposal_capacity:128,replay_begins:Some(half.storage.replay_begins.buffer) };
+                        unsafe { half.storage.kernel.launch(half.storage.query.buffer,sink.buffer,half.storage.metadata.buffer,None,
+                            &window,None,half.storage.output.buffer,4,0,None,half.chain_stream()) }
                     })?;
                 }
                 let pending=PendingDualAttention { wave:Some(&mut wave),cold:[false;2],rows:4,layer:0 };
@@ -338,5 +403,115 @@ mod tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    use crate::shared::memory::{chain::StageChain, device::Stream};
+    fn run(guarded: bool) -> Result<()> {
+        let lib=unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let devices=[Device { library:&lib,id:0 },Device { library:&lib,id:1 }];
+        let storage=DualAttentionStorage::new(devices,4)?;
+        let mut slots=[DualAttentionWave::on_storage(storage.clone())?,DualAttentionWave::on_storage(storage.clone())?];
+        for (i,slot) in slots.iter_mut().enumerate() {
+            slot.select_window(crate::shared::memory::row_window::RowWindow::within(i*4..i*4+4,8)?)?;
+        }
+        let mut data=Vec::new();
+        for device in devices {
+            let values=[Allocation::new(device,128*512)?,Allocation::new(device,128*512)?];
+            let scales=Allocation::new(device,128*16)?;let end=Allocation::new(device,8)?;
+            let sink=Allocation::new(device,128)?;
+            device.run(|| {
+                lib.copy_h2d(values[0].buffer,&vec![0x38;128*512])?;
+                lib.copy_h2d(values[1].buffer,&vec![0x40;128*512])?;
+                lib.copy_h2d(scales.buffer,&vec![127;128*16])?;
+                lib.copy_h2d(end.buffer,&[0;8])?;lib.copy_h2d(sink.buffer,&[0;128])
+            })?;data.push((values,scales,end,sink));
+        }
+        let metadata:Vec<u8>=(0..4).flat_map(|pos|
+            [0u64,0,4,pos,0,0,0,0,0,0].into_iter().flat_map(u64::to_ne_bytes)).collect();
+        let runtime=tokio::runtime::Builder::new_current_thread().build()?;
+        let enqueue=|wave:&mut DualAttentionWave<'_>,seed:usize|->Result<()> {
+            for i in 0..2 {
+                let half=&wave.halves[i];let stream=half.chain_stream();
+                let (values,scales,end,sink)=&data[i];
+                devices[i].run(||unsafe {
+                    acquire_dual(&wave.storage.guard,stream)?;
+                    half.acquire_scratch()?;
+                    crate::shared::memory::chain::join(&lib,stream)?;
+                    let window=V41SparseWindow {values:values[seed].buffer,scales:scales.buffer,
+                        proposals:values[seed].buffer,proposal_scales:scales.buffer,end:end.buffer,
+                        proposal_capacity:128,replay_begins:Some(half.storage.replay_begins.buffer)};
+                    half.storage.kernel.launch(half.storage.query.buffer,sink.buffer,half.storage.metadata.buffer,None,
+                        &window,None,half.storage.output.buffer,4,0,None,stream)
+                })?;
+            }
+            Ok(())
+        };
+        let initialize=|wave:&DualAttentionWave<'_>|->Result<()> {
+            for i in 0..2 {devices[i].run(|| {
+                lib.copy_h2d(wave.halves[i].storage.query.buffer,&vec![0;4*32*1024])?;
+                lib.copy_h2d(wave.halves[i].storage.metadata.buffer,&metadata)?;
+                lib.copy_h2d(wave.halves[i].storage.replay_begins.buffer,&[0;32])
+            })?;} Ok(())
+        };
+        let mut private=DualAttentionWave::new(devices,4,DualAttentionWave::device_bytes(4)?)?;
+        initialize(&private)?;enqueue(&mut private,0)?;
+        let output=runtime.block_on(PendingDualAttention {wave:Some(&mut private),cold:[false;2],rows:4,layer:0}.complete())?;
+        let mut want=vec![0;4*64*1024];lib.copy_d2h(&mut want,output.values)?;
+        initialize(&slots[0])?;
+        for seed in 0..2 {
+            enqueue(&mut slots[seed],seed)?;
+            runtime.block_on(PendingDualAttention {wave:Some(&mut slots[seed]),cold:[false;2],rows:4,layer:0}.complete())?;
+        }
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,storage.output.buffer,want.len(),reader.raw)})?;reader.drain()?;
+        let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
+        let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;
+        runtime.block_on(chains[0].handle().scope(async {
+            enqueue(&mut slots[0],0)?;
+            let output=PendingDualAttention {wave:Some(&mut slots[0]),cold:[false;2],rows:4,layer:0}.complete().await?;
+            devices[1].run(||unsafe {
+                crate::shared::memory::chain::join(&lib,reader.raw)?;
+                lib.copy_peer_async(saved.buffer,output.values,want.len(),reader.raw)?;
+                crate::shared::memory::chain::finish(&lib,reader.raw)
+            })?;slots[0].release_scratch()
+        }))?;
+        SKIP_DUAL_ACQUIRE.with(|s|s.set(!guarded));
+        super::super::SKIP_STORAGE_ACQUIRE.with(|s|s.set(!guarded));
+        let queued=runtime.block_on(chains[1].handle().scope(async {
+            enqueue(&mut slots[1],1)?;
+            PendingDualAttention {wave:Some(&mut slots[1]),cold:[false;2],rows:4,layer:0}.complete().await?;
+            anyhow::Ok(())
+        }));
+        SKIP_DUAL_ACQUIRE.with(|s|s.set(false));super::super::SKIP_STORAGE_ACQUIRE.with(|s|s.set(false));queued?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(if guarded {2} else {10});let mut done=false;
+        while std::time::Instant::now()<deadline {
+            if devices[0].run(||unsafe {lib.cuda_stream_query(storage.halves[0].stream.raw)})? {done=true;break;}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        devices[1].run(|| {drop(gate);Ok(())})?;
+        for chain in &chains {chain.drain()?;}reader.drain()?;
+        assert_eq!(done,!guarded,"dual B completion before A reader release");
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        if guarded {assert_eq!(got,want);}else {assert_ne!(got,want,"unguarded dual gather did not clobber");}
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires compact sparse attention and two GPUs"]
+    fn dual_shared_arena_preserves_gated_peer_reader()->Result<()> {for _ in 0..3 {run(true)?;} Ok(())}
+    #[test]
+    #[ignore = "requires compact sparse attention and two GPUs"]
+    fn dual_without_guards_clobbers_gated_peer_reader()->Result<()> {for _ in 0..3 {run(false)?;} Ok(())}
+    #[test]
+    fn dual_storage_bytes_equal_planned_allocations()->Result<()> {
+        for unit in [4096,2752,2048] {
+            let half=SparseAttentionStorage::<'_,32>::allocation_sizes(unit)?.into_iter().sum::<usize>();
+            assert_eq!(DualAttentionStorage::storage_bytes(unit)?,
+                [half+unit*65536,half+unit*(528+4*288+2048)+128]);
+        } Ok(())
     }
 }

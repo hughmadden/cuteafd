@@ -4,7 +4,7 @@ use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 mod distributed;
 pub(crate) use distributed::{DistributedExecution, PendingDistributedProduction};
-pub(crate) use placement::PlacedProducerWaves;
+pub(crate) use placement::{PlacedProducerStorage, PlacedProducerWaves};
 use crate::families::deepseek_v41::v41_backbone_lane::{BackboneLane, LaneFfn, PendingLaneFfn};
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_compressor::{CompressorWave, CompressorWeights};
@@ -33,6 +33,24 @@ pub(crate) struct PreparedLayer<'l, 'w, 'a> {
     produced_us: u64,
     indexed_us: u64,
     attended_us: u64,
+}
+/// Completed attention with no borrowed lane storage. Re-entry validates the
+/// original query binding before exposing any slot-owned FFN input.
+pub(crate) struct UnitPreparedLayer {
+    binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
+    cooperative: bool,
+    rows: Vec<ExpertRow>,
+    batch: u64,
+    layer: usize,
+    started: std::time::Instant,
+    produced_us: u64,
+    indexed_us: u64,
+    attended_us: u64,
+}
+pub(crate) struct UnitPendingLayer {
+    prepared: UnitPreparedLayer,
+    pending: crate::families::deepseek_v41::v41_backbone_lane::LaneUnitFfn,
+    shared_tp: usize,
 }
 pub(crate) struct CompletedLayer<'t> {
     result: NativeFfnOutput<'t>,
@@ -73,7 +91,65 @@ impl CompletedLayer<'_> {
             finish_us=total_us-self.experts_us, total_us, "verification layer cost");
     }
 }
+impl UnitPendingLayer {
+    /// # Safety
+    /// Preserve the original unit's buffers until this FIFO ticket completes.
+    pub async unsafe fn land<'t, 'l>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'l>, link: &'t mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>) -> Result<CompletedLayer<'t>> {
+        let result = unsafe { lane.land_unit(transport, link, self.pending).await? };
+        let prepared = self.prepared;
+        Ok(CompletedLayer { result, batch: prepared.batch, layer: prepared.layer,
+            rows: prepared.rows.len(), routed_backend: "spark_tp4", shared_tp: self.shared_tp,
+            started: prepared.started, produced_us: prepared.produced_us,
+            indexed_us: prepared.indexed_us, attended_us: prepared.attended_us,
+            experts_us: prepared.started.elapsed().as_micros() as u64 })
+    }
+}
+impl UnitPreparedLayer {
+    /// # Safety
+    /// The original lane's input and shared result remain in this unit's slot
+    /// until `UnitPendingLayer::land` finishes or the pass is discarded.
+    pub async unsafe fn send<'a>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &mut NativeTp4Wave<'a>, link: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, placement: u64, image_mask: &[u8])
+        -> Result<UnitPendingLayer> {
+        let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
+        let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
+        let pending = unsafe { ffn.send_unit(transport, link, placement, image_mask, &self.rows).await? };
+        Ok(UnitPendingLayer { prepared: self, pending, shared_tp })
+    }
+    /// # Safety
+    /// The original lane retains this unit's storage unchanged between hooks.
+    pub async unsafe fn execute<'t>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'_>, placement: u64, image_mask: &[u8])
+        -> Result<CompletedLayer<'t>> {
+        let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
+        let routed_backend = if transport.has_tp2_layer(self.layer) { "rtx_tp2" }
+            else if transport.has_local_layer(self.layer) { "rtx_local" } else { "spark_tp4" };
+        let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
+        let result = unsafe { ffn.execute_tp4(transport, placement, image_mask, &self.rows).await? };
+        Ok(CompletedLayer { result, batch: self.batch, layer: self.layer, rows: self.rows.len(),
+            routed_backend, shared_tp, started: self.started, produced_us: self.produced_us,
+            indexed_us: self.indexed_us, attended_us: self.attended_us,
+            experts_us: self.started.elapsed().as_micros() as u64 })
+    }
+}
 impl PreparedLayer<'_, '_, '_> {
+    /// Finish the attention chain before releasing its borrow to the executor.
+    pub async fn into_unit(self) -> Result<UnitPreparedLayer> {
+        let (binding, attended_us) = match self.ffn {
+            PreparedFfn::Ready(ffn) => (ffn.input.binding(), self.attended_us),
+            PreparedFfn::Pending(pending) => {
+                let ffn = pending.complete().await?;
+                (ffn.input.binding(), self.started.elapsed().as_micros() as u64)
+            }
+        };
+        // A unit's router and shared-expert waits yield to the executor (the
+        // same kernels; only the wait differs): another unit issues meanwhile
+        // instead of the engine thread blocking on this unit's stream (#815).
+        Ok(UnitPreparedLayer { binding, cooperative: true, rows: self.rows, batch: self.batch,
+            layer: self.layer, started: self.started, produced_us: self.produced_us,
+            indexed_us: self.indexed_us, attended_us })
+    }
     #[cfg(test)]
     pub async unsafe fn trace_ffn_input(mut self, library: &cuteafd_ffi::NativeLibrary,
         destination: cuteafd_ffi::CuteafdDeviceBuffer, stream: *mut std::ffi::c_void)
@@ -242,6 +318,38 @@ struct Produced {
     producer_us: u64,
     indexed: bool,
 }
+/// One RTX's cache-producer storage shared by every prefill slot
+/// (`shared::memory::row_window`): the window storage (one shared stream,
+/// each layer's proposal plane at the reserve) and one compressor storage per
+/// source layer's wave (one storage holding all four source layers' planes at
+/// the reserve, carry and plain scratch at the unit, one stream). A private
+/// pass builds its own with rows == unit (one compressor storage per layer).
+pub(crate) struct ProducerStorage<'a> {
+    windows: std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowStorage<'a>>,
+    sources: Vec<std::rc::Rc<crate::families::deepseek_v41::v41_compressor::CompressorStorage<'a>>>,
+    /// Rows of each slot's window batch table (full-phase commits only).
+    batch_rows: usize,
+}
+impl<'a> ProducerStorage<'a> {
+    /// Planes over `rows` reserve rows, scratch for units of up to `unit` rows,
+    /// every wave on the storage's shared stream.
+    pub(crate) fn new(library: &'a NativeLibrary, rows: usize, unit: usize) -> Result<Self> {
+        Ok(Self {
+            windows: crate::families::deepseek_v41::v41_window::WindowStorage::new(library, rows, unit,
+                &(0..40).collect::<Vec<_>>(), true)?,
+            // One compressor storage for the four source layers: one stream
+            // orders every slot's productions, scratch is shared (WP2 contract).
+            sources: vec![crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+                library, rows, unit, &SOURCES)?; SOURCES.len()],
+            batch_rows: unit,
+        })
+    }
+}
+impl Clone for ProducerStorage<'_> {
+    fn clone(&self) -> Self {
+        Self { windows: self.windows.clone(), sources: self.sources.clone(), batch_rows: self.batch_rows }
+    }
+}
 pub(crate) struct BackboneExecution<'w, 'a> {
     weights: &'w CacheProducerWeights<'a>,
     windows: Vec<WindowWave<'w, 'a>>,
@@ -396,9 +504,9 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
         std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
     }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        let mut total = WindowWave::device_bytes(library, capacity)?
-            .checked_mul(40)
-            .context("window workspace budget overflow")?;
+        // One window storage: shared producer scratch, each layer's proposal plane.
+        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+            library, capacity as usize, capacity, 40)?;
         for layer in SOURCES {
             total = total
                 .checked_add(CompressorWave::device_bytes(layer, capacity as usize)?)
@@ -420,33 +528,45 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             Self::workspace_bytes(weights.library, capacity)? <= budget,
             "cache producer workspace exceeds budget"
         );
+        // A private pass: its layers share scratch, each wave keeps its own stream.
+        let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
+            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>(), false)?;
+        let sources = SOURCES.iter().map(|&layer| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+            weights.library, capacity as usize, capacity as usize, &[layer])).collect::<Result<Vec<_>>>()?;
+        Self::on_storage(weights, ProducerStorage { windows, sources, batch_rows: capacity as usize })
+    }
+    /// Bytes of one prefill slot set's producer storage on one RTX
+    /// ([`ProducerStorage::new`]): window planes and compressed-source planes
+    /// at the `rows` reserve, scratch at the `unit` cap, and the window batch
+    /// table at the unit (only full-phase commits use it).
+    pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<usize> {
+        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+            library, rows as usize, unit, 40)?
+            + crate::families::deepseek_v41::v41_compressor::CompressorStorage::device_bytes(&SOURCES, rows as usize, unit as usize)?;
+        if Self::window_batch_enabled() { total += WindowBatch::bytes(unit as usize); }
+        Ok(total)
+    }
+    /// Every prefill slot's producers on one shared storage set
+    /// ([`ProducerStorage`]); `select_window` places each slot's unit.
+    pub fn on_storage(weights: &'w CacheProducerWeights<'a>, storage: ProducerStorage<'a>) -> Result<Self> {
+        ensure!(weights.placement.is_none(), "distributed producer weights require placed execution workspaces");
         ensure!(
-            weights.windows.len() == 40 && weights.sources.len() == 4,
+            weights.windows.len() == 40 && weights.sources.len() == SOURCES.len() && storage.sources.len() == SOURCES.len(),
             "cache producer weight owners incomplete"
         );
         let windows = weights
             .windows
             .iter()
-            .map(|w| {
-                w.wave(
-                    capacity,
-                    WindowWave::device_bytes(weights.library, capacity)?,
-                )
-            })
+            .map(|w| w.on_storage(storage.windows.clone()))
             .collect::<Result<Vec<_>>>()?;
         let sources = weights
             .sources
             .iter()
-            .zip(SOURCES)
-            .map(|(w, layer)| {
-                w.wave(
-                    capacity as usize,
-                    CompressorWave::device_bytes(layer, capacity as usize)?,
-                )
-            })
+            .zip(&storage.sources)
+            .map(|(w, storage)| w.on_storage(storage.clone()))
             .collect::<Result<Vec<_>>>()?;
         let window_batch = Self::window_batch_enabled()
-            .then(|| WindowBatch::new(weights.library, capacity as usize)).transpose()?;
+            .then(|| WindowBatch::new(weights.library, storage.batch_rows)).transpose()?;
         Ok(Self {
             weights,
             windows,
@@ -491,10 +611,27 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
         self.queued_production = None;
         self.progress = PassProgress::default();
     }
+    /// A failed or cancelled unit's producers back at rest: every pending
+    /// query and unconsumed proposal dropped (after its stream drains), so the
+    /// slot's next unit or non-unit work can select a window.
+    pub fn abort_queries(&mut self) -> Result<()> {
+        self.queued_production = None;
+        let mut result = Ok(());
+        for wave in &mut self.windows { if let Err(error) = wave.abort_query() { result = Err(error); } }
+        for wave in &mut self.sources { if let Err(error) = wave.abort_query() { result = Err(error); } }
+        result
+    }
 
     pub fn restart_for(&mut self, stage: CacheStage) {
         self.queued_production = None;
         self.progress = PassProgress::for_stage(stage);
+    }
+    /// Selects this slot's unit rows in every producer's shared planes, at
+    /// rest (`shared::memory::row_window`).
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        for wave in &mut self.windows { wave.select_window(window.clone())?; }
+        for wave in &mut self.sources { wave.select_window(window.clone())?; }
+        Ok(())
     }
     /// Publish source 20 after a complete reserved encoder chunk.
     /// # Safety

@@ -172,7 +172,6 @@
     "COORDINATOR_GPU_BUDGET_GIB": "31.8",
     "SPARK_INTAKE": "pinned",
     "MAX_CONTEXT_TOKENS": "1048576",
-    "PREFILL_BATCH_TOKENS": "1024",
     "SPECULATOR": "dspark",
     "SPARK_COUNT": "4",
     "SPARK_TP": "4",

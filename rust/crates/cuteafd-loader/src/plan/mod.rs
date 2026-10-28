@@ -247,10 +247,6 @@ pub struct PlanReport {
     /// Family-resolved units in flight on each transport.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_waves: Option<u64>,
-    /// Admitted prefill slots (#762): the deepest depth an adaptive executor
-    /// may run; equal to the waves when static or pinned.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_slots: Option<u64>,
     /// The admitted pool's RTX expert layers and the pool the same solve
     /// admits with none onboarded (bench cards read both beside the pool).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,8 +258,10 @@ pub struct PlanReport {
     /// Solver-selected transport count, independent of units in flight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_transports: Option<u64>,
+    /// The shared prefill reserve the units split (8192, or the largest
+    /// standard reserve that fits the card); `None` when pinned explicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_selection: Option<String>,
+    pub prefill_reserve_rows: Option<u64>,
     /// The package and layouts that serve this checkpoint's routed experts.
     pub experts: Option<ExpertContract>,
     /// Whether this build has a layout for the requested placement.
@@ -681,12 +679,11 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         prefill_span_rows: None,
         prefill_unit_rows: None,
         prefill_waves: None,
-        prefill_slots: None,
         onboard_layers: None,
         max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
         prefill_transports: None,
-        prefill_selection: None,
+        prefill_reserve_rows: None,
         experts: None,
         placement_supported: true,
         min_spark_ranks: None,
@@ -967,7 +964,6 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
-        report.prefill_slots = Some(layout_options.prefill_slots.max(layout_options.prefill_waves));
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
             report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
@@ -1020,7 +1016,6 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
-        report.prefill_slots = Some(inventory.prefill_slots.max(inventory.prefill_waves));
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -1237,36 +1232,71 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         if report.family.as_deref() != Some("deepseek_v41") || candidate.layout.is_none() {
             return Ok(report);
         }
-        let rows = candidate.layout.as_ref().unwrap().prefill_rows;
-        report.prefill_span_rows = Some(if rows == 0 { 2048 } else { rows });
-        if rows != 0 {
+        // The prefill reserve is sized first (TJ 2026-10-27): the largest
+        // standard reserve that fits the card, split into k units; the KV
+        // pool takes what remains and never shrinks the reserve. Explicit
+        // PREFILL_ROWS / PREFILL_WAVES pin the shape.
+        let layout = candidate.layout.as_ref().unwrap();
+        // An explicit reserve (a resolved deployment's, or a pin) plans at it.
+        if let Some(reserve) = layout.prefill_reserve_rows {
+            report.prefill_reserve_rows = Some(reserve);
+            return Ok(report);
+        }
+        // An explicit shape (PREFILL_ROWS, or a depth: PREFILL_WAVES pins even
+        // without rows) plans exactly as given, ahead of every automatic rule.
+        if layout.prefill_rows != 0 || layout.prefill_unit_rows.is_some()
+            || layout.prefill_waves > 1 || layout.prefill_lanes > 0 {
             if !report.executable() {
+                let (rows, waves) = (report.prefill_unit_rows.unwrap_or(0), report.prefill_waves.unwrap_or(0));
                 report.hints.push(Hint {
-                    what: format!("explicit V4.1 prefill capacity {rows} refused by checkpoint or memory admission"),
-                    how: "Keep the requested shape with more memory, or omit prefill rows for automatic admission.".into(),
+                    what: format!("explicit V4.1 prefill shape {waves} x {rows} rows refused by checkpoint or memory admission"),
+                    how: "Keep the requested shape with more memory, or omit PREFILL_ROWS for the automatic reserve.".into(),
                 });
             }
             return Ok(report);
         }
-        // Count candidates each solve their largest executable default shape.
-        let reason = report.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
-        if !report.executable() {
-            for rows in [1024, 256] {
-                let layout = candidate.layout.as_mut().unwrap();
-                layout.prefill_rows = rows;
-                layout.spark_capacity_rows = rows;
-                let mut smaller = input.plan(&candidate)?;
-                smaller.prefill_span_rows = Some(rows);
-                if smaller.executable() {
-                    smaller.prefill_selection = Some(format!(
-                        "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));
-                    return Ok(smaller);
-                }
+        // The reserve rule: the standard 8192 rows, capped only when the card
+        // cannot fit it beside its fixed owners (the largest page-multiple
+        // reserve that fits; fit is monotone in the reserve, so a bisection
+        // finds it). It is never shrunk to buy onboarded layers or KV (TJ
+        // 2026-10-28). The fixed depth cuts it: 3 x roundup64(reserve / 3).
+        use crate::serving_capacity::prefill_waves::{unit_rows_in, RESERVE_ROWS, ROW_PAGE};
+        let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
+            let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
+                candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
+                input.plan(&candidate)?
+            };
+            report.prefill_reserve_rows = Some(reserve);
+            Ok(report)
+        };
+        // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`).
+        let waves = report.prefill_waves.unwrap_or(crate::serving_capacity::prefill_waves::DEPTH);
+        let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
+            .filter(|&reserve| unit_rows_in(waves, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
+            .collect();
+        // The largest candidate (descending) that fits, by bisection; None
+        // when the smallest does not.
+        let mut largest = || -> Result<Option<PlanReport>, PlanError> {
+            let full = at(RESERVE_ROWS)?;
+            if full.executable() { return Ok(Some(full)); }
+            let smallest = at(*candidates.last().unwrap())?;
+            if !smallest.executable() { return Ok(None); }
+            let (mut lo, mut hi, mut best) = (candidates.len() - 1, 0, smallest);
+            while lo - hi > 1 {
+                let mid = (lo + hi) / 2;
+                let report = at(candidates[mid])?;
+                if report.executable() { lo = mid; best = report; } else { hi = mid; }
             }
-        } else {
-            report.prefill_selection = Some("V4.1 automatic prefill selected 2048 rows".into());
-        }
-        Ok(report)
+            Ok(Some(best))
+        };
+        if let Some(best) = largest()? { return Ok(best); }
+        let mut refused = at(RESERVE_ROWS)?;
+        refused.hints.push(Hint {
+            what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
+                candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
+            how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
+        });
+        Ok(refused)
     };
     let mut requested = candidate(count)?;
     if count > available {
@@ -1315,15 +1345,17 @@ pub fn render(report: &PlanReport) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
     match report.family.as_deref() {
-        Some("deepseek_v41") => {
-            let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #744)");
-        }
+        Some("deepseek_v41") => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
+            let reserve = report.prefill_reserve_rows.map_or("pinned".into(), |rows| format!("{rows}-row"));
+            let _ = writeln!(out, "prefill shape: {reserve} reserve, {waves} waves x {unit} unit rows; {} Spark transport(s)",
+                report.prefill_transports.unwrap_or(0));
+        },
         Some("mimo_v2") => {
-            let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #671 / #709)");
+            let _ = writeln!(out, "prefill shape: family executor (shared units pending #671 / #709)");
         }
         _ => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
-            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows ({} admitted slots); intake {} rows; {} Spark transport(s)",
-                report.prefill_slots.unwrap_or(waves), report.prefill_span_rows.unwrap_or(unit * waves),
+            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows; intake {} rows; {} Spark transport(s)",
+                report.prefill_span_rows.unwrap_or(unit * waves),
                 report.prefill_transports.unwrap_or(0));
         },
     }
@@ -1344,7 +1376,6 @@ pub fn render(report: &PlanReport) -> String {
         let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
     }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
-    if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(cap) = report.max_image_tokens {
         let _ = writeln!(out, "image cap  {cap} merged tokens per image (detail=low 256); BF16 residual");

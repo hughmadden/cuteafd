@@ -4,7 +4,7 @@ use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
 mod admission;
-mod layout;
+pub(crate) mod layout;
 use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
@@ -200,7 +200,8 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         let logits = cuteafd_core::memory_layout::host_logits_bytes(
             u64::from(rows), u64::from(rows),
             super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
-        crate::shared::prefix::budget::admit(config.bytes, logits, 8 << 30)?;
+        crate::shared::memory::budget::admit_host_memory_with_resident_formulas(config.bytes, &requests.engram_host_workspace(),
+            &requests.engram_host_formulas(), logits, 8 << 30)?;
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");
@@ -250,7 +251,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     runtime: &tokio::runtime::Runtime, receive: &mut mpsc::Receiver<NativeRequest>,
     first: &mut P, second: &mut P,
     requests: &mut Requests<'a>, first_transport: &mut P::Transport,
-    second_transport: &mut P::Transport, mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
+    second_transport: &mut P::Transport, prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>,
+    mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
     vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
@@ -475,16 +477,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
                 ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
-                    P::begin_request(first_transport)?; P::begin_request(second_transport)?;
-                    super::score(lib, runtime, first, second, requests, first_transport, second_transport, lease,
-                        &prompt, from, args.prefill_batch_tokens as usize, &job, draft.as_deref_mut(),
+                    for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
+                    super::score(lib, runtime, requests, (&mut *first, &mut *first_transport), &mut *prefill_slots, lease,
+                        &prompt, from, super::PrefillShape::from_args(args), &job, draft.as_deref_mut(),
                         &mut || prefixes.prefill_hold())?;
                 }
-                P::begin_request(first_transport)?; P::begin_request(second_transport)?;
+                for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
                 let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
-                else { prefill(lib, runtime, first, second, requests, first_transport,
-                    second_transport, lease, &prompt, args.prefill_batch_tokens as usize, &job,
-                    draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
+                else { prefill(lib, runtime, requests, &mut *prefill_slots, Some((&mut *first, &mut *first_transport)), lease, &prompt,
+                    super::PrefillShape::from_args(args), &job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
                 requests.record_state(lease, &job.probe, "prompt")?;
                 if crate::shared::probe::wants_first(&job.probe) {
                     crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
@@ -532,6 +533,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     requests.release_if_present(lease)?;
                     if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
                     P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
+                    for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
                 }
             }
         }
@@ -585,6 +587,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if let Err(error) = result {
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
+                    for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
             for request in active.iter_mut().flatten() {
                 let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;

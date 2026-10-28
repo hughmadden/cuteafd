@@ -31,6 +31,18 @@ impl<'a> EncoderSuffix<'a> {
         let library = self.residual.library;
         self.capture_with(output, |dst, src, bytes| library.copy_d2d(dst, src, bytes))
     }
+    /// Device-ordered prefill units (#815 option (i)): the copies join the
+    /// stage chain on `stream` and record its head, without a host wait. The
+    /// unit's commit drains the chain before the suffix is read.
+    /// # Safety
+    /// `stream` is a live stream on this suffix's GPU, inside a chain scope;
+    /// the output's producer stays live until the chain drains.
+    pub unsafe fn capture_chained(&mut self, output: &BlockOutput<'_>, stream: *mut std::ffi::c_void) -> Result<()> {
+        let library = self.residual.library;
+        unsafe { crate::shared::memory::chain::join(library, stream)?; }
+        self.capture_with(output, |dst, src, bytes| unsafe { library.copy_d2d_async(dst, src, bytes, stream) })?;
+        unsafe { crate::shared::memory::chain::finish(library, stream) }
+    }
     /// # Safety
     /// The completed output and stream are on this suffix's GPU. Retain the
     /// producer through completion; cancellation drains queued copies and leaves

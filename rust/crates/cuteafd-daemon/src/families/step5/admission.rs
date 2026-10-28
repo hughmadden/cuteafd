@@ -220,8 +220,7 @@ mod tests {
                 &cuteafd_loader::plan::families::step5::STEP5);
             let daemon = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(
                 sparks, descriptor, Default::default())?;
-            // Admitted slots of the admitted unit (#762).
-            let (waves, rows, unit) = (daemon.slots as usize, daemon.span_rows as usize, daemon.unit_rows as usize);
+            let (waves, rows, unit) = (daemon.waves as usize, daemon.span_rows as usize, daemon.unit_rows as usize);
             assert_eq!(report.prefill_unit_rows, Some(daemon.unit_rows));
             assert_eq!(report.prefill_waves, Some(daemon.waves));
             assert_eq!(report.prefill_span_rows, Some(daemon.span_rows));

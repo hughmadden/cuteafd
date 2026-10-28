@@ -69,6 +69,7 @@ pub(crate) struct StageChain<'a> {
     device: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
+    pub fn library(&self) -> &'a NativeLibrary { self.library }
     /// Whether the next scoped pass runs device-ordered; default on.
     pub fn set_device_order(&self, on: bool) {
         self.device.set(on);
@@ -401,6 +402,79 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
     }
 }
 
+/// The device whose event is the chain head (None outside a scope or before
+/// any stage finished).
+pub(crate) fn head_device() -> Option<i32> {
+    let current = current()?;
+    current.head.get().map(|head| current.events[head].0)
+}
+
+/// Records the current chain head into `event` (no host wait): another
+/// chain's stages ordered after it with [`depend`] follow everything chained
+/// here so far. No-op outside a scope or before any stage finished.
+/// # Safety
+/// `event` is a live event on the chain's head device.
+pub(crate) unsafe fn record_into(library: &NativeLibrary, event: *mut c_void) -> Result<bool> {
+    let Some(current) = current() else { return Ok(false) };
+    let Some(head) = current.head.get() else { return Ok(false) };
+    let device = current.events[head].0;
+    let fence = current.fences.iter().find(|f| f.device == device).copied()
+        .ok_or_else(|| anyhow::anyhow!("chain has no fence stream on device {device}"))?;
+    let previous = library.cuda_get_device()?;
+    library.cuda_set_device(device)?;
+    // SAFETY: the fence stream and head event belong to this chain's device;
+    // `event` lives on the same device (caller contract).
+    let recorded = unsafe { library.cuda_stream_wait_event(fence.stream, current.events[head].1)
+        .and_then(|()| library.cuda_event_record(event, fence.stream)) };
+    library.cuda_set_device(previous)?;
+    recorded.map(|()| true)
+}
+
+/// Orders the current chain after `event` (recorded by another chain with
+/// [`record_into`]): every later stage of this scope joins a head that
+/// includes it. No host wait.
+/// # Safety
+/// `event` is a live event recorded on the chain's current device.
+#[cfg(test)]
+thread_local! {
+    /// Test-only negative control: `depend` leaves an open fork untouched (the
+    /// pre-fix behaviour, hunt C #1).
+    static SKIP_FORK_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) unsafe fn depend(library: &NativeLibrary, event: *mut c_void) -> Result<()> {
+    let Some(current) = current() else { return Ok(()) };
+    let device = library.cuda_get_device()?;
+    let index = current.events.iter().position(|&(d, _)| d == device)
+        .ok_or_else(|| anyhow::anyhow!("chain has no event on device {device}"))?;
+    let fence = current.fences.iter().find(|f| f.device == device).copied()
+        .ok_or_else(|| anyhow::anyhow!("chain has no fence stream on device {device}"))?;
+    // SAFETY: the fence stream and events belong to this chain's device.
+    unsafe {
+        if let Some(head) = current.head.get() {
+            library.cuda_stream_wait_event(fence.stream, current.events[head].1)?;
+        }
+        library.cuda_stream_wait_event(fence.stream, event)?;
+        library.cuda_event_record(current.events[index].1, fence.stream)?;
+        // An open fork window must include the dependency too: fork joiners
+        // (`join_fork`) wait on the fork event, not the head, so without this
+        // they would overtake `event` (hunt C #1). The fork event becomes
+        // "old fork point + event", recorded on this device's fork slot.
+        #[cfg(test)]
+        let skip = SKIP_FORK_FOLD.with(|skip| skip.get());
+        #[cfg(not(test))]
+        let skip = false;
+        if let Some(fork) = current.fork.get().filter(|_| !skip) {
+            let slot = current.forks.iter().position(|&(d, _)| d == device)
+                .ok_or_else(|| anyhow::anyhow!("chain has no fork event on device {device}"))?;
+            library.cuda_stream_wait_event(fence.stream, current.forks[fork].1)?;
+            library.cuda_event_record(current.forks[slot].1, fence.stream)?;
+            current.fork.set(Some(slot));
+        }
+    }
+    current.head.set(Some(index));
+    Ok(())
+}
+
 /// Host wait for all chained work before a host-synchronous operation (legacy
 /// stream copies do not order with the non-blocking stage streams).
 pub(crate) fn settle(library: &NativeLibrary) -> Result<()> {
@@ -653,4 +727,69 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Hunt C #1: two slots' chains, unit B's chain depends on unit A's
+    /// recorded publication while B's fork window is open. A `join_fork`
+    /// stage of B must wait for A (gated here). The negative control skips the
+    /// fold, and that stage then completes while A is still held.
+    fn fork_join_follows_a_cross_slot_dependency(fold: bool) -> Result<()> {
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let device = Device { library: &library, id: 0 };
+        let [a, b_main, b_fork] = [Stream::new(device)?, Stream::new(device)?, Stream::new(device)?];
+        let published = library.cuda_event_create_ordering()?;
+        // Recorded right after the fork joiner's wait: the stage's own
+        // ordering, before its `finish` merges the head (which includes A).
+        let joined = library.cuda_event_create_ordering()?;
+        let chains = [StageChain::new(&library)?, StageChain::new(&library)?];
+        for chain in &chains { chain.set_device_order(true); }
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        // Warm every call ungated (lazy module loading) before gating A.
+        runtime.block_on(chains[0].handle().scope(async { unsafe {
+            super::finish(&library, a.raw)?; super::record_into(&library, published).map(|_| ())
+        } }))?;
+        unsafe { library.cuda_stream_synchronize(a.raw)?; }
+        library.cuda_device_synchronize()?;
+        let gate = unsafe { CudaStreamGate::new(&library, a.raw)? };
+        // Unit A (slot 0): a stage held by the gate, then its publication.
+        runtime.block_on(chains[0].handle().scope(async { unsafe {
+            super::join(&library, a.raw)?;
+            super::finish(&library, a.raw)?;
+            super::record_into(&library, published).map(|_| ())
+        } }))?;
+        // Unit B (slot 1): marks a fork, depends on A's publication, then a
+        // fork joiner stage.
+        SKIP_FORK_FOLD.with(|skip| skip.set(!fold));
+        let queued = runtime.block_on(chains[1].handle().scope(async { unsafe {
+            super::join(&library, b_main.raw)?;
+            super::mark_fork(&library, b_main.raw)?;
+            super::finish(&library, b_main.raw)?;
+            super::depend(&library, published)?;
+            super::join_fork(&library, b_fork.raw)?;
+            library.cuda_event_record(joined, b_fork.raw)?;
+            super::finish(&library, b_fork.raw)
+        } }));
+        SKIP_FORK_FOLD.with(|skip| skip.set(false));
+        queued?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(if fold { 2 } else { 10 });
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { library.cuda_event_query(joined)? } { done = true; break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(gate);
+        for chain in &chains { chain.drain()?; }
+        unsafe { library.cuda_event_destroy(published)?; library.cuda_event_destroy(joined)?; }
+        assert_eq!(done, !fold, "the fork joiner {} while unit A's publication was held",
+            if done { "completed" } else { "stayed pending" });
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and a GPU"]
+    fn fork_joiners_wait_for_a_cross_slot_dependency() -> Result<()> { fork_join_follows_a_cross_slot_dependency(true) }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and a GPU"]
+    fn unfolded_fork_joiners_overtake_a_cross_slot_dependency() -> Result<()> { fork_join_follows_a_cross_slot_dependency(false) }
 }

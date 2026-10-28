@@ -18,8 +18,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
         max_waves: if spark_ranks == 0 { 1 }
             else if layers { crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
-        // Owned attention runs one unit per slot at a fixed depth.
-        adaptive: !layers && crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).adaptive,
         ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
     };
     let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
@@ -67,8 +65,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
     }
-    // Admitted slots (#762): every per-slot owner covers the deepest depth.
-    let lanes = prefill.slots;
+    let lanes = prefill.waves;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
@@ -287,7 +284,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let lanes = options.prefill_slots.max(options.prefill_waves);
+    let lanes = options.prefill_waves;
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
@@ -375,7 +372,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             gpu_count, rank, cfg.layers, cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim,
             cfg.kv_lora_rank).map_err(anyhow::Error::from)).collect::<anyhow::Result<Vec<_>>>()?
     } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
-    let lanes = options.prefill_slots.max(options.prefill_waves);
+    let lanes = options.prefill_waves;
     let dense_scratch = if native {
         let a8 = options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8;
         let bytes = crate::plan::exlr8::dense::lane_charge_bytes(&cfg, gpu_count, glm::DECODE_ROWS as usize,
@@ -484,17 +481,13 @@ mod tests {
                 charge_host(&mut native, &options, input.checkpoint(), true).unwrap();
                 let geometry = |r: &PlanReport| (r.prefill_unit_rows, r.prefill_waves,
                     r.prefill_span_rows, r.prefill_transports);
-                // Unpinned, the topology picks the waves (#762): 3 x 2752 at six
-                // Sparks, 2 x 4096 below; an explicit PREFILL_WAVES pins k.
-                let planned = crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(sparks);
+                // Unpinned, the fixed depth (3 x 2752 with Sparks, one unit
+                // without); an explicit PREFILL_WAVES pins k.
+                let planned = crate::serving_capacity::prefill_waves::depth(sparks, Default::default());
                 let waves = if requested == 0 { planned } else { requested };
-                // An unpinned shape admits four slots of the widest unit (4096)
-                // inside one reserve and starts at the estimate (#762).
-                let adaptive = requested == 0 && span.is_none();
-                let rows = if unit != 0 { unit } else if adaptive || waves <= 1 { 4096 } else {
+                let rows = if unit != 0 { unit } else if waves <= 1 { 4096 } else {
                     crate::serving_capacity::prefill_waves::unit_rows(waves) };
-                let admitted = if adaptive {
-                    crate::serving_capacity::wave_control::reserve_rows(4, rows) } else { rows * waves };
+                let admitted = rows * waves;
                 assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(admitted)), Some(1)));
                 assert_eq!(geometry(&native), geometry(&exl3), "{gpus} RTX/{sparks} Sparks");
                 let spec = native.spec.as_ref().unwrap();

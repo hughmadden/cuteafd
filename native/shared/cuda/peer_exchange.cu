@@ -316,6 +316,17 @@ unsigned default_blocks(uint64_t units, uint32_t blocks) {
   return unsigned(std::max<uint64_t>(1, std::min<uint64_t>(wanted, 32)));
 }
 
+// Staging copies are bandwidth-bound and overlap compute: at most an eighth of
+// this device's SMs (at least 8), queried at runtime so the RTX PRO 6000, the
+// 5090 and GB10 each size their own grid.
+unsigned staging_blocks(uint64_t units) {
+  int device = 0, sms = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) sms = 64;
+  const uint64_t cap = std::max<uint64_t>(8, uint64_t(sms) / 8);
+  return unsigned(std::max<uint64_t>(1, std::min<uint64_t>((units + 1023) / 1024, cap)));
+}
+
 #define CHECK(call) do { const cudaError_t status_ = (call); if (status_ != cudaSuccess) return status_; } while (0)
 
 // Device-side resources of one probe call; freed on every return path.
@@ -785,6 +796,6 @@ extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void
     const uint64_t units = regions.vector[r] ? bytes[r] / 16 : bytes[r];
     if (units > largest) largest = units;
   }
-  copy_regions<<<default_blocks(largest, 0), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
+  copy_regions<<<staging_blocks(largest), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
   return cudaGetLastError();
 }

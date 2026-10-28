@@ -16,31 +16,12 @@ pub struct PrefillUnits {
 }
 
 impl PrefillUnits {
-    /// The family's prefill owner at the resolved unit and wave count.
-    pub fn for_family(family: &dyn crate::plan::Family, unit_rows: u64, waves: u64) -> Self {
-        let waves = match family.spark_prefill() {
-            SparkPrefill::Ladder => waves,
-            SparkPrefill::Streams(streams) => u64::from(streams),
-        };
-        Self::ladder(unit_rows, waves)
-    }
-
     /// A resolved shape on the shared ladder. The static executor cannot
     /// repartition into a larger unit after startup, so no larger owner is needed.
     pub fn ladder(unit_rows: u64, waves: u64) -> Self {
         Self { unit_rows: u32::try_from(unit_rows).unwrap_or(u32::MAX),
             waves: u8::try_from(waves.max(1)).unwrap_or(u8::MAX) }
     }
-}
-
-/// How a family's executor feeds the prefill owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SparkPrefill {
-    /// The shared ladder: scratch at the admitted unit's export, k units in flight.
-    Ladder,
-    /// A legacy executor with fixed parallel streams of its own live chunk
-    /// (V4.1 CED): scratch at that chunk, `streams` units in flight.
-    Streams(u8),
 }
 
 /// Rows each of the family's decode compute owners admits (one owner per
@@ -107,13 +88,12 @@ pub fn descriptor(family: &str) -> anyhow::Result<&'static dyn crate::plan::Fami
         .ok_or_else(|| anyhow::anyhow!("Spark execution admission requires a family descriptor for {family}"))
 }
 
-/// Admit `family` at its resolved prefill unit and wave count; the descriptor
-/// decides the prefill owner's shape ([`PrefillUnits::for_family`]). Plan,
-/// serve and golden all call this.
+/// Admit `family` at its resolved prefill unit and wave count on the shared
+/// ladder. Plan, serve and golden all call this.
 pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
     unit_rows: u64, waves: u64) -> anyhow::Result<SparkExecutions> {
     let descriptor = descriptor(family)?;
-    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::for_family(descriptor, unit_rows, waves))?)
+    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::ladder(unit_rows, waves))?)
 }
 
 #[cfg(test)]
@@ -170,7 +150,7 @@ mod tests {
             let plan = admit(glm, &backend.exports(), Some(rows), PrefillUnits::ladder(2752, 3)).unwrap();
             assert_eq!(plan.decode, [DecodeExecution { capacity: rows, compiled_capacity: compiled }], "{backend:?}");
         }
-        // A legacy executor's own maximum unit selects its covering native main.
+        // V4.1's unit selects its covering native main.
         let v41 = admit(&crate::plan::families::deepseek::DEEPSEEK_V41, &SparkBackend::Native.exports(), None,
             PrefillUnits { unit_rows: 256, waves: 2 }).unwrap();
         assert_eq!(v41.decode, [DecodeExecution { capacity: 64, compiled_capacity: 80 }; 2]);

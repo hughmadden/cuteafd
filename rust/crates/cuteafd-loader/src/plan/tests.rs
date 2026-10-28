@@ -229,9 +229,8 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let (unit, waves) = (expected.unit_rows, expected.waves);
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
-            // An adaptive family admits its slots inside one reserve (#762).
-            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows, report.prefill_slots),
-                (Some(unit), Some(waves), Some(expected.span_rows), Some(expected.slots)),
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(unit), Some(waves), Some(expected.span_rows)),
                 "{family} ranks={ranks}: {}", render(&report));
             for (unit, waves) in [(1024, 1), (2048, 2), (2752, 3), (2048, 4)] {
                 let layout = options.layout.as_mut().unwrap();
@@ -328,7 +327,8 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
             options.prefill_rows = unit;
             options.prefill_lanes = waves;
             let daemon = prefill_shape(6, limits, PrefillOverrides {
-                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None, slots: None,
+                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+                reserve_rows: None,
             }).unwrap();
             let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
             assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());
@@ -366,7 +366,12 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
     let v41 = tempfile::tempdir().unwrap();
     write_v41_snapshot(v41.path());
     let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
-    for (dir, marker) in [(v41, "#744"), (mimo, "#671 / #709")] {
+    for ranks in 0..=8 {
+        let options = wave_plan_options(v41.path(), ranks);
+        let rendered = render(&plan(v41.path(), &options).unwrap());
+        assert!(rendered.contains("prefill shape: ") && !rendered.contains("family executor"), "{rendered}");
+    }
+    for (dir, marker) in [(mimo, "#671 / #709")] {
         for ranks in 0..=8 {
             let options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
@@ -939,10 +944,12 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
                         let ingress = if nvfp4 { cuteafd_core::SparkIngress::Bf16 }
                             else { cuteafd_core::SparkIngress::Fp8K32 };
+                        // Rings at the resolved unit, one link per target pass (two decode
+                        // lanes plus each further prefill slot), as serve opens them.
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
-                            capacity: options.layout.as_ref().unwrap().spark_capacity_rows as u32,
+                            capacity: report.prefill_unit_rows.unwrap() as u32,
                             ingress
-                        }; 2];
+                        }; report.prefill_waves.unwrap().max(2) as usize];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
                                 max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
@@ -954,7 +961,9 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             || item.group.starts_with("TP2 expert layer halves")).unwrap();
                         let (costs, workspace) = crate::placement::families::deepseek_v41::expert_inventory(
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
-                            options.layout.as_ref().unwrap().prefill_rows.max(2048), gpus, 188).unwrap();
+                            report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap() as usize,
+                            report.prefill_waves.unwrap() * report.prefill_unit_rows.unwrap(),
+                            crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
@@ -2635,9 +2644,10 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     assert!(!refused(&broad, wide_build) && !refused(&broad, one_gpu));
     for (report, rows) in [(&narrow, 64u64), (&broad, 128)] {
         // What the engine allocates from the same arithmetic and manifest.
-        let engine = glmf_step_workspaces(&cfg, 2, 4096, rows, &shape,
+        // The fixed depth: three 2752-row lanes with Sparks.
+        let engine = glmf_step_workspaces(&cfg, 3, 2752, rows, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, true).unwrap(),
-            glmf_step_scratch(&lookup, &cfg, Default::default(), 4096, false).unwrap()).device_bytes();
+            glmf_step_scratch(&lookup, &cfg, Default::default(), 2752, false).unwrap()).device_bytes();
         assert_eq!(item(report, "steps"), Some((Category::Workspace, engine, Basis::Formula)), "{rows} rows");
         // The engine's caches: 2 layers (one KDA, one MLA) of records and commit tables of `rows` rows.
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
@@ -2689,9 +2699,9 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let scratch_options = crate::serving_capacity::GlmfScratchOptions {
             index_compact: true, ..Default::default()
         };
-        let engine = glmf_step_workspaces(&cfg, 2, 4096, rows, &shape,
+        let engine = glmf_step_workspaces(&cfg, 3, 2752, rows, &shape,
             glmf_step_scratch(&lookup, &cfg, scratch_options, rows, true).unwrap(),
-            glmf_step_scratch(&lookup, &cfg, scratch_options, 4096, false).unwrap()).device_bytes();
+            glmf_step_scratch(&lookup, &cfg, scratch_options, 2752, false).unwrap()).device_bytes();
         assert_eq!(item(&report, "steps"), Some((Category::Workspace, engine, Basis::Formula)));
     }
     // A prefill lane narrower than a verify step (`--prefill-rows 64 --decode-rows 128`): every lane's
@@ -2702,12 +2712,13 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         options.layout.as_mut().unwrap().prefill_rows = prefill_rows;
         plan(dir.path(), &options).unwrap()
     };
-    for (rows, decode_rows, intake_rows) in [(64u64, 64u64, 64u64), (64, 128, 128), (4096, 128, 4096)] {
-        let engine = glmf_step_workspaces(&cfg, 2, rows, decode_rows, &shape,
+    // Explicit rows pin the unit; the depth stays the fixed three lanes.
+    for (rows, decode_rows, intake_rows) in [(64u64, 64u64, 64u64), (64, 128, 128), (2752, 128, 2752)] {
+        let engine = glmf_step_workspaces(&cfg, 3, rows, decode_rows, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
-        let intake = crate::serving_capacity::spark_intake_bytes(2, 4, intake_rows, 4096);
-        assert_eq!(intake, 2 * 4 * intake_rows * 4096 * 2);
+        let intake = crate::serving_capacity::spark_intake_bytes(3, 4, intake_rows, 4096);
+        assert_eq!(intake, 3 * 4 * intake_rows * 4096 * 2);
         assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine, Basis::Formula)),
             "{rows} prefill rows, {decode_rows} decode rows");
     }
@@ -3516,11 +3527,14 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     let default_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         prefill_rows: 0, ..options.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
+    // The default is the fixed depth: three units of 2752 rows; the same
+    // admission as passing that unit explicitly.
     let explicit_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        prefill_rows: 2048, ..default_prefill.layout.as_ref().unwrap().clone()
+        prefill_unit_rows: Some(2752), ..default_prefill.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
-    assert_eq!(plan(dir.path(), &default_prefill).unwrap().memory_layout,
-        plan(dir.path(), &explicit_prefill).unwrap().memory_layout);
+    let default_report = plan(dir.path(), &default_prefill).unwrap();
+    assert_eq!((default_report.prefill_unit_rows, default_report.prefill_waves), (Some(2752), Some(3)));
+    assert_eq!(default_report.memory_layout, plan(dir.path(), &explicit_prefill).unwrap().memory_layout);
     let unavailable = plan_spark_count(dir.path(), &options, 4, Some(6)).unwrap();
     assert!(!unavailable.executable());
     assert_eq!(unavailable.spark_ranks, 6);
@@ -3528,29 +3542,63 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
 }
 
 #[test]
-fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
+fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
+    // TJ 2026-10-27: the reserve is sized first, the largest that fits the
+    // card (8192, else a multiple of 64 rows), split into roundup64(R / k)
+    // units; the pool takes what remains. Only an explicit pin changes it.
+    use crate::serving_capacity::prefill_waves::{unit_rows_in, ROW_PAGE as RESERVE_STEP_ROWS};
     let dir = strict_v41_snapshot(false);
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
-        // Full official fixed owners plus an independent external draft budget
-        // leave room for the 1024-row lane, but not the 2048-row lane.
-        drafter_bytes: 4 << 30, prefill_rows: 0,
-        ..Default::default()
-    }), ..sparks(4) };
-    let automatic = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
-    assert!(automatic.executable(), "{}", render(&automatic));
-    assert_eq!(automatic.prefill_span_rows, Some(1024));
-    assert!(automatic.prefill_selection.as_ref().unwrap().contains("selected 1024"));
-    assert!(automatic.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
-    let explicit = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        prefill_rows: 2048, ..options.layout.unwrap()
-    }), ..sparks(4) };
-    let refused = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
-    assert!(!refused.executable());
-    assert_eq!(refused.prefill_span_rows, Some(2048));
-    assert!(refused.prefill_selection.is_none());
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")));
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));
+        drafter_bytes: 4 << 30, prefill_rows: 0, ..Default::default() };
+    let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], ..layout.clone() }), ..sparks(4) };
+    let roomy = plan_spark_count(dir.path(), &roomy, 6, Some(4)).unwrap();
+    assert!(roomy.executable(), "{}", render(&roomy));
+    // Three units of roundup64(reserve / 3).
+    assert_eq!((roomy.prefill_reserve_rows, roomy.prefill_unit_rows, roomy.prefill_waves),
+        (Some(8192), Some(2752), Some(3)));
+    let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
+    let capped = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(capped.executable(), "{}", render(&capped));
+    let reserve = capped.prefill_reserve_rows.unwrap();
+    assert_eq!(capped.prefill_waves, Some(3));
+    assert_eq!(capped.prefill_unit_rows, Some(unit_rows_in(3, reserve)), "{}", render(&capped));
+    if reserve < 8192 {
+        assert_eq!(reserve % RESERVE_STEP_ROWS, 0);
+        // The next larger reserve does not fit: the cap is the largest.
+        let larger = PlanOptions { layout: Some(layout::LayoutOptions {
+            prefill_reserve_rows: Some(reserve + RESERVE_STEP_ROWS), ..layout.clone() }), ..sparks(4) };
+        assert!(!plan_spark_count(dir.path(), &larger, 6, Some(4)).unwrap().executable());
+    }
+    // An explicit pin keeps its shape whether or not it fits.
+    let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
+    let pinned = plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap();
+    assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_reserve_rows), (Some(1024), Some(2), None));
+    assert!(pinned.executable(), "{}", render(&pinned));
+}
+
+#[test]
+fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
+    // TJ 2026-10-28: fixed 3 everywhere. A 2-RTX deployment with every
+    // encoder layer onboarded (no Spark traffic in prefill) runs three units
+    // like every other (cards47: k3 beat one 4096-row unit by 9-13%); an
+    // explicit depth still pins (measurement arms).
+    let dir = strict_v41_snapshot(false);
+    let two = |gib: u64, waves: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![gib << 30, gib << 30],
+        workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
+        prefill_rows: rows, prefill_waves: waves, ..Default::default() }), ..sparks(4) };
+    let auto = plan_spark_count(dir.path(), &two(96, 0, 0), 6, Some(4)).unwrap();
+    assert!(auto.executable(), "{}", render(&auto));
+    assert_eq!((auto.prefill_unit_rows, auto.prefill_waves, auto.prefill_span_rows, auto.prefill_reserve_rows),
+        (Some(2752), Some(3), Some(8256), Some(8192)), "{}", render(&auto));
+    for (waves, rows) in [(2, 4096), (4, 2048)] {
+        let pinned = plan_spark_count(dir.path(), &two(96, waves, 0), 6, Some(4)).unwrap();
+        assert!(pinned.executable(), "{}", render(&pinned));
+        assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves), (Some(rows), Some(waves)), "{}", render(&pinned));
+        crate::EngramStagingShape::new(rows as usize, waves as usize).unwrap();
+    }
+    crate::EngramStagingShape::new(2752, 3).unwrap();
 }
 
 #[test]

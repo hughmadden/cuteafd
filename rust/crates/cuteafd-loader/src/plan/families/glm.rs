@@ -18,7 +18,6 @@ pub struct Glm {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
-    prefill: crate::serving_capacity::prefill_waves::PrefillEstimate,
     /// Rows of one decode step's Spark request (the engine's decode programs).
     decode_rows: u32,
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
@@ -27,19 +26,13 @@ pub struct Glm {
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
     Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving,
-        prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::Timing {
-            spark_ms: 13.0, turnaround_ms: 19.5, reference_ranks: 6, reference_unit_rows: 2752,
-            source: "https://github.com/tpurtell/cuteafd/issues/762; GLM K4 max W3 observed2752-row units, approximate S/T",
-        }, decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
+        decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own graph set, about 3 GiB per GPU today (213 shapes), more than one onboarded layer (2.26 GiB per GPU), and the big dense core leaves little round trip to hide (predicted loss, #705, #744)" } };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM5_FLASH: Glm =
     Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving,
-        prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::MeasuredWaves {
-            waves: 2, reference_ranks: 4, larger_topology_waves: 3,
-            source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; four-Spark EXL3/FP8 qualified k2; larger counts unmeasured, borrow GLM5 k3; no independent S/T",
-        }, decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
+        decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "the second lane is not wired yet: only the Spark-bound min card (1 RTX + 2 Sparks) can hide a round trip, and it is the OneOrTwo candidate awaiting its A/B; the 0-Spark layout has no exchange to hide (#744)" } };
 
@@ -59,12 +52,6 @@ impl Family for Glm {
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
-    }
-    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        // GLM 5 re-cuts its depth per call inside four admitted slots (#762);
-        // GLM Flash keeps its static depth.
-        crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill,
-            adaptive: self.id == "glm5", ..Default::default() }
     }
     fn id(&self) -> &'static str {
         self.id

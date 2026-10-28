@@ -204,10 +204,9 @@ pub fn step_bytes(cfg: &GlmDsaConfig, rows: u64, lead: bool, split: bool,
         .ok_or(PlacementError::Overflow("GLM step buffers"))
 }
 
-/// A GLM prefill's admitted shape on one GPU (#762): `slots` units of at most
-/// `unit_rows` in flight, every depth's slots views into per-field arenas of
-/// [`reserve_rows`](crate::serving_capacity::wave_control::reserve_rows) rows,
-/// and the hook-local storage (program/top-k scratch, head) shared once; its
+/// A GLM prefill's shape on one GPU: `slots` units of `unit_rows` in flight,
+/// slot views into per-field arenas of [`prefill_span`] rows, and the
+/// hook-local storage (program/top-k scratch, head) shared once; its
 /// logits rows serve one unit at a time (`launch_head` per unit). Its bytes:
 /// one step workspace's rows at the reserve.
 pub fn prefill_bytes(cfg: &GlmDsaConfig, unit_rows: u64, slots: u64, lead: bool, split: bool, router: bool,
@@ -217,20 +216,13 @@ pub fn prefill_bytes(cfg: &GlmDsaConfig, unit_rows: u64, slots: u64, lead: bool,
         .checked_add(step_shared(lead, scratch)).ok_or(PlacementError::Overflow("GLM prefill buffers"))
 }
 
-/// Rows of every per-slot prefill arena: `slots` units of at most `unit_rows`
-/// at every admitted depth (one unit when serial).
-pub fn prefill_span(unit_rows: u64, slots: u64) -> u64 {
-    if slots <= 1 { unit_rows } else { crate::serving_capacity::wave_control::reserve_rows(slots, unit_rows) }
-}
+/// Rows of every per-slot prefill arena: `slots` units of `unit_rows`.
+pub fn prefill_span(unit_rows: u64, slots: u64) -> u64 { slots.max(1) * unit_rows }
 
-/// The engine's prefill slot views (#762): for each admitted depth `k` in
-/// `1..=slots` (index `k - 1`), its `k` slots' row ranges inside the arenas
-/// of [`prefill_span`] rows, slot `s` at `s * unit_for(k)`.
-pub fn slot_views(unit_rows: u64, slots: u64) -> Vec<Vec<std::ops::Range<u64>>> {
-    (1..=slots).map(|k| {
-        let rows = crate::serving_capacity::wave_control::unit_for(k, unit_rows);
-        (0..k).map(|slot| slot * rows..(slot + 1) * rows).collect()
-    }).collect()
+/// The engine's prefill slot views: slot `s` at rows `s * unit_rows` inside
+/// the arenas of [`prefill_span`] rows.
+pub fn slot_views(unit_rows: u64, slots: u64) -> Vec<std::ops::Range<u64>> {
+    (0..slots.max(1)).map(|slot| slot * unit_rows..(slot + 1) * unit_rows).collect()
 }
 
 /// All non-baseline storage is future storage on both sides. Coordinator
@@ -1192,31 +1184,23 @@ mod tests {
         assert_eq!(working.spark.prefill_lanes, 1);
     }
 
-    /// #762, GLM K4 max (two GPUs, six Sparks, 4 x 2752 admitted): the
-    /// runtime's prefill storage is one arena per `step_row_widths` field at
-    /// the reserve plus the shared step storage, and every depth k=1..4 is
-    /// views inside it: slot 0 at offset 0, slots contiguous and disjoint,
-    /// each at most the admitted unit. The planner charges exactly that, the
-    /// shared storage once rather than per slot.
+    /// GLM K4 max (two GPUs, six Sparks, 3 x 2752): the runtime's prefill
+    /// storage is one arena per `step_row_widths` field at the span plus the
+    /// shared step storage, and each slot is a view inside it: slot 0 at
+    /// offset 0, slots contiguous and disjoint. The planner charges exactly
+    /// that, the shared storage once rather than per slot.
     #[test]
-    fn adaptive_prefill_slots_are_views_and_the_planner_charges_one_reserve() {
+    fn prefill_slots_are_views_and_the_planner_charges_one_span() {
         let cfg = config();
-        let (unit, slots) = (2752u64, 4u64);
+        let (unit, slots) = (2752u64, 3u64);
         let span = prefill_span(unit, slots);
         assert_eq!(span, 8256);
         let views = slot_views(unit, slots);
-        assert_eq!(views.len(), 4);
-        for (index, depth) in views.iter().enumerate() {
-            let k = index as u64 + 1;
-            assert_eq!(depth.len() as u64, k);
-            assert_eq!(depth[0].start, 0, "lane 0 stays at offset 0 at depth {k}");
-            for pair in depth.windows(2) { assert_eq!(pair[0].end, pair[1].start, "contiguous at depth {k}"); }
-            let rows = crate::serving_capacity::wave_control::unit_for(k, unit);
-            assert!(depth.iter().all(|r| r.end - r.start == rows && rows <= unit && rows % 64 == 0));
-            assert!(depth.last().unwrap().end <= span, "depth {k} past the reserve");
-        }
-        assert_eq!(views[2].last().unwrap().end, 8256);
-        assert_eq!(views[3].last().unwrap().end, 8192);
+        assert_eq!(views.len(), 3);
+        assert_eq!(views[0].start, 0);
+        for pair in views.windows(2) { assert_eq!(pair[0].end, pair[1].start); }
+        assert!(views.iter().all(|r| r.end - r.start == unit));
+        assert_eq!(views.last().unwrap().end, span);
         let scratch = GlmScratch { programs: 380 << 20, topk: 742 << 20 };
         for (lead, router) in [(true, false), (false, false), (false, true)] {
             // The runtime's allocation list: each arena floored at 256 bytes.
@@ -1225,15 +1209,10 @@ mod tests {
             let logits = if lead { DECODE_ROWS * cfg.vocab_size as u64 * 4 } else { FLOOR };
             let runtime = arenas + logits + span * 8 + step_shared(lead, scratch);
             assert_eq!(prefill_bytes(&cfg, unit, slots, lead, true, router, false, scratch).unwrap(), runtime);
-            // The former per-slot workspaces charged the shared storage every slot.
-            let per_slot = slots * step_bytes(&cfg, unit, lead, true, false, false, scratch).unwrap();
-            assert!(runtime + (slots - 1) * (scratch.programs + scratch.topk) <= per_slot, "lead {lead}");
         }
-        // A pinned or serial shape keeps its one span of units.
         assert_eq!(prefill_span(4096, 2), 8192);
-        assert_eq!(prefill_span(2752, 3), 8256);
         assert_eq!(prefill_span(4096, 1), 4096);
-        assert_eq!(slot_views(4096, 1), vec![vec![0..4096]]);
+        assert_eq!(slot_views(4096, 1), vec![0..4096]);
     }
 
     /// The engine builds its prefill arenas from the planner's field list and

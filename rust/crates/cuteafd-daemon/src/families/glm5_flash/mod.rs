@@ -39,7 +39,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(args.prefill_waves as u64),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
-        slots: (args.prefill_slots > 0).then_some(args.prefill_slots as u64),
+        reserve_rows: None,
     })?;
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = usize::try_from(shape.waves)?;
@@ -134,11 +134,6 @@ pub(crate) struct EngineArgs {
     #[arg(long = "prefill-waves", default_value_t = 0,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=engine::MAX_PREFILL_WAVES as u64))]
     pub prefill_waves: usize,
-    /// Admitted prefill slots of a resolved deployment (#762); 0/unset resolves
-    /// them. Equal to the waves on a static family.
-    #[arg(long, default_value_t = 0,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=engine::MAX_PREFILL_WAVES as u64))]
-    pub prefill_slots: usize,
     /// Shared prefill span; 0 resolves to waves times per-unit rows.
     #[arg(long, default_value_t = 0)]
     pub prefill_span_rows: usize,
@@ -798,8 +793,8 @@ mod draft_cli_tests {
             let rows = experts.unwrap();
             assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
         }
-        // One transport, with two independent return slots per Spark (4 ranks).
-        assert_eq!(wide_intake_bytes(&args, 4, 4096), 2 * 4 * 64 * 4096 * 2);
+        // One transport, with three independent return slots per Spark (4 ranks).
+        assert_eq!(wide_intake_bytes(&args, 4, 4096), 3 * 4 * 64 * 4096 * 2);
         assert_eq!(wide_intake_bytes(&parse(&["--peers", "127.0.0.1:19441", "--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
             4, 4096), 4 * 4 * 64 * 4096 * 2);
         for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
@@ -886,7 +881,7 @@ mod draft_cli_tests {
         for ranks in [0, 1, 2, 4, 5, 6, 8] {
             let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19441 + rank)).collect::<Vec<_>>().join(",");
             let args = if ranks == 0 { parse(&[]) } else { parse(&["--peers", &peers]) };
-            let waves = cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::glm::GLM5_FLASH).estimate.waves(ranks);
+            let waves = cuteafd_loader::serving_capacity::prefill_waves::depth(ranks, Default::default());
             assert_eq!((args.prefill_waves as u64, args.prefill_rows as u64),
                 (waves, cuteafd_loader::serving_capacity::prefill_waves::unit_rows(waves)));
         }
@@ -917,7 +912,7 @@ mod draft_cli_tests {
                     if ranks > 0 { argv.extend(["--peers", peers.as_str()]); }
                     if let Some(value) = &wave_flag { argv.extend(["--prefill-waves", value.as_str()]); }
                     let mut args = Parse::try_parse_from(argv).unwrap().engine;
-                    let waves = requested.unwrap_or_else(|| cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::glm::GLM5_FLASH).estimate.waves(if complete { ranks } else { 0 }));
+                    let waves = requested.unwrap_or_else(|| cuteafd_loader::serving_capacity::prefill_waves::depth(if complete { ranks } else { 0 }, Default::default()));
                     let result = resolve_prefill(&mut args, complete);
                     if (!complete || ranks == 0) && waves > 1 {
                         assert!(matches!(result.unwrap_err().downcast_ref::<PrefillError>(),
@@ -1046,7 +1041,7 @@ mod draft_cli_tests {
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--local-experts", "--peers", "127.0.0.1:19441"]).is_ok());
         let spark = parse(&SPARKS);
-        assert_eq!((spark.peers.as_deref(), spark.local_experts, spark.prefill_rows), (Some(SPARKS[1]), false, 4096));
+        assert_eq!((spark.peers.as_deref(), spark.local_experts, spark.prefill_rows), (Some(SPARKS[1]), false, 2752));
     }
 }
 

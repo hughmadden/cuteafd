@@ -127,7 +127,6 @@ pub trait Family: Sync {
     /// `None` for families without Spark experts.
     fn spark_decode(&self) -> Option<super::spark_executions::SparkDecode> { None }
     /// How the executor feeds the single Spark prefill owner.
-    fn spark_prefill(&self) -> super::spark_executions::SparkPrefill { super::spark_executions::SparkPrefill::Ladder }
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
     /// Parses the checkpoint's configuration into the family's canonical model

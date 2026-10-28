@@ -9,6 +9,15 @@ impl Requests<'_> {
         unsafe { pending.poll_encoder(&mut self.cache, batch.cache()?) }
     }
 
+    /// Device-ordered prefill units: publish `layer`'s window as a chained
+    /// direct commit (see `DistributedExecution::publish_unit_window`).
+    pub fn publish_distributed_unit_window(&mut self, batch: &RequestBatch,
+        execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>,
+        layer: usize) -> Result<()> {
+        self.validate(batch)?;
+        execution.publish_unit_window(&mut self.cache, batch.cache()?, layer)
+    }
+
     pub fn finish_distributed_encoder_publication(&mut self, batch: &RequestBatch,
         execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>) -> Result<()> {
         self.validate(batch)?;
@@ -32,6 +41,28 @@ impl Requests<'_> {
         -> Result<crate::families::deepseek_v41::v41_backbone_execution::PreparedLayer<'l, 'lw, 'la>> {
         self.validate(batch)?;
         unsafe { execution.prepare_encoder_layer(&mut self.cache, batch.cache()?, lane, index) }
+    }
+
+    /// Start the entire mandatory burst before the executor can begin it.
+    /// A private cursor hashes later known chunks without publishing history.
+    /// Image requests intentionally prepare at reservation instead.
+    pub fn prefetch_encoder(&mut self, lease: CacheLease, chunks: &[&[u32]]) -> Result<()> {
+        self.pipeline.reclaim_copies()?;
+        if chunks.is_empty() || self.image_requests > 0 { return Ok(()); }
+        let live = self.request(lease)?;
+        let mut cursor = live.prefill.as_ref().map_or(&live.history, |p| p.history()).prefill_cursor();
+        for tokens in chunks.iter().take(self.pipeline.shape().prefetch_units()) {
+            let key = prefetch::PrefetchKey { lease, position: cursor.history().position(), tokens: tokens.to_vec() };
+            if let Some(wave) = self.prefetched.matching(&key) {
+                cursor.advance_full(&wave.batches()[0])?;
+            } else {
+                let wave = self.pipeline.prepare(&[EngramRequestTokens {
+                    history: cursor.history(), token_ids: tokens, image_mask: None }])?;
+                cursor.advance_full(&wave.batches()[0])?;
+                self.prefetched.hold(key, wave);
+            }
+        }
+        Ok(())
     }
 
     pub fn reserve_encoder(&mut self, requests: &[RequestTokens<'_>]) -> Result<RequestBatch> {
@@ -62,7 +93,18 @@ impl Requests<'_> {
             history: p.history(), token_ids: r.tokens,
             image_mask: masks.as_ref().map_or(r.image_mask, |m| m[i].as_deref()),
         }).collect::<Vec<_>>();
-        let mut engram = self.pipeline.prepare(&inputs)?;
+        // Adopt this reservation's exact wave, or cancel only its participants'
+        // stale lookahead; unrelated requests retain their mandatory burst.
+        let key = (requests.len() == 1 && masks.is_none()).then(|| prefetch::PrefetchKey {
+            lease: requests[0].lease, position: prepared[0].history().position(), tokens: requests[0].tokens.to_vec() });
+        let adopted = match &key {
+            Some(key) => self.prefetched.take_matching(key),
+            None => {
+                for request in requests { self.prefetched.cancel_owner(&request.lease); }
+                None
+            }
+        };
+        let mut engram = match adopted { Some(wave) => wave, None => self.pipeline.prepare(&inputs)? };
         let advanced = prepared.iter().zip(engram.batches()).map(|(p, b)| {
             let mut next = p.history().prefill_cursor();
             next.advance_full(b)?;
@@ -83,54 +125,3 @@ impl Requests<'_> {
     }
 }
 
-struct PairGuard<'r, 'a> {
-    requests: &'r mut Requests<'a>,
-    batches: [&'r mut RequestBatch; 2],
-    complete: bool,
-}
-impl Drop for PairGuard<'_, '_> {
-    fn drop(&mut self) {
-        if !self.complete {
-            for batch in &mut self.batches { self.requests.revoke_batch(batch); }
-        }
-    }
-}
-impl Requests<'_> {
-    /// Run one layer of two ordered encoder chunks. The second attention is
-    /// prepared while the first remote FFN is pending; both lanes retain their
-    /// own query/index/residual storage. Cancellation revokes both admissions.
-    /// # Safety
-    /// Both prepared queries are on the owning CUDA thread/device; chunks are
-    /// ordered, and the two lanes, executions and transports are independent.
-    pub async unsafe fn execute_encoder_pair_layer(&mut self,
-        batches: [&mut RequestBatch; 2],
-        executions: [&mut BackboneExecution<'_, '_>; 2],
-        lanes: [&mut BackboneLane<'_, '_>; 2],
-        indices: [&mut crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>; 2],
-        transports: [&mut crate::families::deepseek_v41::v41_experts::coordinator::NativeTp4Wave<'_>; 2],
-    ) -> Result<()> {
-        let mut guard = PairGuard { requests: self, batches, complete: false };
-        let [first, second] = &mut guard.batches;
-        let [exec0, exec1] = executions;
-        let [lane0, lane1] = lanes;
-        let [index0, index1] = indices;
-        let [transport0, transport1] = transports;
-        guard.requests.validate(first)?;
-        guard.requests.validate(second)?;
-        let prepared = unsafe { guard.requests.prepare_encoder_layer(first, exec0, lane0, index0)? };
-        let (done0, done1) = tokio::try_join!(
-            biased;
-            unsafe { prepared.execute(transport0, 0, first.image_mask()) },
-            async {
-                let prepared = unsafe { guard.requests.prepare_encoder_layer(second, exec1, lane1, index1)? };
-                unsafe { prepared.execute(transport1, 0, second.image_mask()).await }
-            },
-        )?;
-        unsafe {
-            exec0.complete_layer(first.cache()?, lane0, done0)?;
-            exec1.complete_layer(second.cache()?, lane1, done1)?;
-        }
-        guard.complete = true;
-        Ok(())
-    }
-}

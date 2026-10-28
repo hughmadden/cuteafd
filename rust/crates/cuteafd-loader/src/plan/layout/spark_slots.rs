@@ -348,9 +348,9 @@ mod tests {
             let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
             Ok((find("execution owners"), find("execution staging")))
         };
-        // V4.1's CED executor: two streams of its live chunk on one owner.
+        // V4.1 on the shared ladder: two units of its live rows in flight.
         for live in [256, 1024, 4096] {
-            let (owners, staging) = charge(&mut device, "deepseek_v41", live, 1)?;
+            let (owners, staging) = charge(&mut device, "deepseek_v41", live, 2)?;
             let prefill = if live <= 80 { 51 * (1 << 20) } else { 810 * (1 << 20) - 4096 * (5120 + 5120 / 32 + 6 * 8) };
             assert_eq!(owners, prefill + live * (5120 + 5120 / 32 + 6 * 8) + decode);
             assert_eq!(staging, 2 * 64 * 6 * 8 + 2 * live * 6 * 8);

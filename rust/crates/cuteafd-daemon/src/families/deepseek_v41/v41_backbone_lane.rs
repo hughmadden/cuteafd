@@ -136,6 +136,8 @@ enum Phase {
     Prepared,
     Query,
     Ffn,
+    /// A prefill unit's wave is out; its shared values sit in the unit's slot.
+    UnitPending,
     SharedReady,
     Complete,
     Invalid,
@@ -245,7 +247,8 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let producer=lane.sparse.as_ref().map(|s|s.chain_stream());
             let weights=&lane.weights.layers[lane.layer].hc;
             let graphs=lane.tp2_ffn_graphs.as_mut().context("TP2 FFN graph owner absent")?;
-            let cached=graphs.bank.get_shape(lane.layer,weights,rows as u32);
+            let windowed=lane.window.is_windowed();
+            let cached=if windowed { None } else { graphs.bank.get_shape(lane.layer,weights,rows as u32) };
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {
@@ -256,7 +259,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
                         cached.map(|(raw,_)|raw), || lane.block.enqueue_ffn(binding,rows,projected,stream).map(|_| ()))?;
                     Ok((lane.block.graph_normalized_storage(rows),stream,projected))
                 }).await? };
-            if cached.is_none() && !crate::shared::decode_graph::census::eager("layer_row") {
+            if cached.is_none() && !windowed && !crate::shared::decode_graph::census::eager("layer_row") {
                 // Warm output is complete. Recording the next invocation restores
                 // host phase without executing the FFN prefix a second time.
                 unsafe {graphs.capture_ready(&mut lane.block,weights,binding,rows,projected,stream)?;}
@@ -302,6 +305,22 @@ pub(crate) struct LaneFfn<'s, 'w, 'a> {
     ffn_split: Option<&'s mut FfnSplit>,
     /// This pass prefetches the next layer during Spark exchanges (`--l2-prefetch`).
     l2: Option<&'s LaneL2<'a>>,
+}
+
+/// A prefill unit's remote FFN between its send and land hooks (shared
+/// executor): every field is owned, so no lane borrow survives the hook. The
+/// shared contribution stays in this lane's shared workspace, which only this
+/// unit's slot uses until it lands.
+pub(crate) struct LaneUnitFfn {
+    ticket: crate::families::deepseek_v41::v41_experts::coordinator::NativeUnitFfn,
+    binding: QueryBinding,
+    shared: CuteafdDeviceBuffer,
+    /// The lane's GPU, which the reduced result returns to.
+    destination: i32,
+    started: std::time::Instant,
+    routed_us: u64,
+    dispatched_us: u64,
+    shared_us: u64,
 }
 
 /// Host-clock split of a captured pass's FFN stages, summed over its layers.
@@ -524,6 +543,47 @@ impl LaneFfn<'_, '_, '_> {
         .await;
         output
     }
+    /// A prefill unit's remote layer (shared executor): router, the wave's
+    /// send and the shared expert, all queued; no host wait. Land it with
+    /// [`BackboneLane::land_unit`] after the executor's FIFO turn.
+    /// # Safety
+    /// The unit's slot keeps this lane's FFN input and shared workspace
+    /// unchanged until the returned owner lands or the pass is discarded.
+    pub(crate) async unsafe fn send_unit<'l>(&mut self, transport: &mut NativeTp4Wave<'l>,
+        link: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>, placement: u64, image_mask: &[u8], rows: &[ExpertRow]) -> Result<LaneUnitFfn> {
+        let prior = std::mem::replace(self.phase, Phase::Invalid);
+        ensure!(prior == Phase::Ffn && !transport.has_local_layer(self.input.layer),
+            "prefill unit remote FFN phase or route differs");
+        let started = std::time::Instant::now();
+        self.router.set_local_mode(false)?;
+        let ring = self.router.ring_capture();
+        let routed = unsafe { if self.cooperative { self.router.execute_ffn_cooperative(&self.input, image_mask).await? }
+            else { self.router.execute_ffn(&self.input, image_mask)? } };
+        if let Some(capture) = self.route_capture.as_deref_mut().filter(|_| !ring) {
+            unsafe { routed.capture_route_ids(self.library, &mut capture[self.input.layer])?; }
+        }
+        let routed_us = started.elapsed().as_micros() as u64;
+        // SAFETY: as `execute_tp4`'s dispatch: the router outputs stay unchanged
+        // until the wave's staging copies, which its stream orders.
+        let ticket = unsafe { transport.dispatch_unit(link, &routed, routed.stream, placement, rows)? };
+        let dispatched_us = started.elapsed().as_micros() as u64;
+        // Two RTX: the shared expert runs TP2 into this slot's transport-owned
+        // workspace; one RTX: in this lane's shared workspace.
+        let shared_values = if transport.has_tp2_shared_layer(self.input.layer) {
+            unsafe { transport.unit_shared(&self.input).await? }
+        } else {
+            let shared = self.shared.as_mut().context("prefill unit shared workspace absent")?;
+            let contribution = unsafe { if self.cooperative { shared.execute_ffn_cooperative(&self.input).await? }
+                else { shared.execute_ffn(&self.input)? } };
+            ensure!(contribution.binding()? == self.input.binding(), "prefill unit shared contribution differs");
+            contribution.values
+        };
+        let shared_us = started.elapsed().as_micros() as u64;
+        if let Some(l2) = self.l2 { l2.issue(self.input.layer)?; }
+        *self.phase = Phase::UnitPending;
+        Ok(LaneUnitFfn { ticket, binding: self.input.binding(), shared: shared_values,
+            destination: self.input.values.device_id, started, routed_us, dispatched_us, shared_us })
+    }
     /// # Safety
     /// No external writes race the preserved FFN input or shared workspace.
     pub unsafe fn execute_shared(&mut self) -> Result<SharedOutput<'_>> {
@@ -557,8 +617,69 @@ pub(crate) struct Capture {
     pub timing: bool,
 }
 
+/// One per-GPU prefill reserve, shared by host slots. HC, projection and router
+/// data are cross-hook reserve planes. Query and sparse-attention data are
+/// guarded unit scratch; shared FFN intermediates are plain unit scratch. Host
+/// phase, weights, pinned staging and graphs stay in BackboneLane. A hook must
+/// call release_scratch only after its last fork reader has joined the chain.
+pub(crate) struct LaneStorage<'a> {
+    hc: [std::rc::Rc<crate::families::deepseek_v41::v41_hc::HcStorage<'a>>; 2],
+    query: std::rc::Rc<crate::families::deepseek_v41::v41_attention_query::AttentionQueryStorage<'a>>,
+    projection: std::rc::Rc<crate::families::deepseek_v41::v41_attention_output::AttentionOutputStorage<'a>>,
+    shared: Option<std::rc::Rc<crate::families::deepseek_v41::v41_backbone_shared::BackboneSharedStorage<'a>>>,
+    router: std::rc::Rc<crate::families::deepseek_v41::v41_backbone_router::BackboneRouterStorage<'a>>,
+    sparse: std::rc::Rc<crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionStorage<'a, 64>>,
+    device: Device<'a>,
+    unit: u32,
+    first_layer: usize,
+}
+impl<'a> LaneStorage<'a> {
+    fn allocation_groups(rows: u32, query: usize, output: usize, shared: usize,
+        sparse: usize, router: usize, placed: bool) -> [usize; 6] {
+        [2 * rows as usize * crate::families::deepseek_v41::v41_hc::HcStorage::ROW_BYTES,
+            query, output, if placed { 0 } else { shared }, sparse, router]
+    }
+
+    pub(crate) fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32,
+        split_query: bool, split_output: bool, placed: bool) -> Result<[usize; 6]> {
+        use crate::families::deepseek_v41::{v41_attention_output::AttentionOutputStorage, v41_backbone_shared::BackboneSharedStorage,
+            v41_backbone_router::BackboneRouterStorage, v41_sparse_attention::SparseAttentionStorage};
+        ensure!(unit > 0 && unit <= 4096 && unit <= rows
+            && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS, "invalid lane storage geometry");
+        Ok(Self::allocation_groups(rows,
+            AttentionQueryWave::device_bytes_with_split(library, unit, split_query)?,
+            AttentionOutputStorage::storage_bytes(library, rows, unit, split_output)?,
+            if placed { 0 } else { BackboneSharedStorage::storage_bytes(library, rows, unit)? },
+            SparseAttentionStorage::<'_, 64>::storage_bytes(unit as usize)?,
+            BackboneRouterStorage::storage_bytes(rows, unit)?, placed))
+    }
+    /// The current CUDA device selects the placed GPU; unplaced weights use
+    /// their first layer. Readers includes every device the hook can join on.
+    pub(crate) fn new(weights: &BackboneLaneWeights<'a>, rows: u32, unit: u32, readers: &[i32]) -> Result<std::rc::Rc<Self>> {
+        Self::storage_bytes(weights.library, rows, unit, weights.split_query_b, weights.split_output_b, weights.placement.is_some())?;
+        let current = weights.library.cuda_get_device()?;
+        let first_layer = if weights.placement.is_some() {
+            weights.layers.iter().position(|l| l.device.id == current).context("device owns no backbone layers")?
+        } else { 0 };
+        let first = weights.layers.get(first_layer).context("lane weights are empty")?;
+        ensure!(first.device.id == current, "lane storage allocated on wrong device");
+        Ok(std::rc::Rc::new(Self {
+            hc: [crate::families::deepseek_v41::v41_hc::HcStorage::new(weights.library, rows as usize)?,
+                crate::families::deepseek_v41::v41_hc::HcStorage::new(weights.library, rows as usize)?],
+            query: first.query.storage(unit, readers)?, projection: first.projection.storage(rows, unit)?,
+            shared: first.shared.as_ref().map(|_| crate::families::deepseek_v41::v41_backbone_shared::BackboneSharedStorage::new(weights.library, rows, unit)).transpose()?,
+            router: crate::families::deepseek_v41::v41_backbone_router::BackboneRouterStorage::new(weights.library, rows, unit)?,
+            sparse: crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionStorage::new(weights.library, unit as usize, readers)?,
+            device: first.device, unit, first_layer,
+        }))
+    }
+}
+
 pub(crate) struct BackboneLane<'w, 'a> {
     tp2_ffn_graphs: Option<Tp2FfnGraphs<'w,'a>>,
+    /// The selected row window: windowed (shared-storage) units never replay
+    /// or capture the TP2 FFN graphs (row_window: capture uses rows from 0).
+    window: crate::shared::memory::row_window::RowWindow,
     // Destroy containing graphs before their captured consumer allocations.
     sparse: Option<SparseAttentionWave<'a>>,
     dual_sparse: Option<crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave<'a>>,
@@ -624,9 +745,10 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             weights.layers.len() == 40,
             "backbone lane requires all 40 layers"
         );
-        let first = &weights.layers[first_layer];
+        let first = weights.layers.get(first_layer).context("lane weights are empty")?;
         Ok(Self {
             tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),
+            window: crate::shared::memory::row_window::RowWindow::NONE,
             weights,
             block: first.hc.block(capacity as usize, sizes[0])?,
             query: first.query.wave(capacity, sizes[1])?,
@@ -648,6 +770,59 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             layer_clock: LayerClock::new(weights.library, 40)?,
             l2: None,
         })
+    }
+    pub(crate) fn on_storage(weights: &'w BackboneLaneWeights<'a>, storage: std::rc::Rc<LaneStorage<'a>>) -> Result<Self> {
+        let first = weights.layers.get(storage.first_layer).context("lane storage layer is absent")?;
+        ensure!(weights.layers.len() == 40 && first.device.id == storage.device.id
+            && std::ptr::eq(weights.library, storage.device.library), "lane weights/storage differ");
+        Ok(Self {
+            // Each slot owns its TP2 FFN graph owner (host-only), as the private lane does.
+            tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),
+            window: crate::shared::memory::row_window::RowWindow::NONE,
+            weights,
+            block: first.hc.block_on_storage(storage.hc[0].clone(), storage.hc[1].clone(), storage.unit as usize)?,
+            query: first.query.on_storage(storage.query.clone())?, tp2_query: None, tp2_output: None,
+            projection: first.projection.on_storage(storage.projection.clone())?,
+            shared: first.shared.as_ref().zip(storage.shared.as_ref()).map(|(w,s)| w.on_storage(s.clone())).transpose()?,
+            sparse: Some(SparseAttentionWave::on_storage(storage.sparse.clone())?), dual_sparse: None,
+            capacity: storage.unit as usize, router: first.router.on_storage(storage.router.clone())?,
+            layer: storage.first_layer, phase: Phase::Idle, capture_routes: false, capture_timing: false,
+            retain_small_shapes: false, route_capture: Vec::new(), ffn_split: FfnSplit::default(),
+            layer_clock: LayerClock::new(weights.library, 40)?, l2: None,
+        })
+    }
+    pub(crate) fn on_storage_on_device(weights: &'w BackboneLaneWeights<'a>, storage: std::rc::Rc<LaneStorage<'a>>) -> Result<DeviceOwner<'a, Self>> {
+        ensure!(weights.placement.is_some(), "GPU-owned shared lane requires placed weights");
+        storage.device.own(|| Self::on_storage(weights, storage.clone()))
+    }
+    /// Selects a prefill slot's rows, at rest: the previous unit committed
+    /// and its chain drained, so its finished outputs (the block's last
+    /// layer, the query/output readiness) are dropped as `invalidate` does;
+    /// the next use restarts the lane. Pending work still refuses.
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        self.invalidate();
+        self.query.discard_ready();
+        self.projection.discard_ready();
+        self.block.select_window(window.clone())?;
+        self.query.select_window(window.clone())?; self.projection.select_window(window.clone())?;
+        self.router.select_window(window.clone())?;
+        if let Some(shared) = &mut self.shared { shared.select_window(window.clone())?; }
+        if let Some(sparse) = &mut self.sparse { sparse.select_window(window.clone())?; }
+        if let Some(sparse) = &mut self.dual_sparse { sparse.select_window(window.clone())?; }
+        if let Some(projection) = &mut self.tp2_query { projection.select_window(window.clone())?; }
+        if let Some(projection) = &mut self.tp2_output { projection.select_window(window.clone())?; }
+        self.window = window;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn window(&self) -> &crate::shared::memory::row_window::RowWindow { &self.window }
+    pub(crate) fn release_scratch(&self) -> Result<()> {
+        self.query.release_scratch()?;
+        if let Some(sparse) = &self.sparse { sparse.release_scratch()?; }
+        if let Some(sparse) = &self.dual_sparse { sparse.release_scratch()?; }
+        if let Some(projection) = &self.tp2_query { projection.release_scratch()?; }
+        if let Some(projection) = &self.tp2_output { projection.release_scratch()?; }
+        Ok(())
     }
     /// `--l2-prefetch`: in this lane's decode and verify steps, while a layer's
     /// routed experts are on the Sparks, load the first `budget` bytes of the
@@ -710,6 +885,20 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.router.rebind(&decoder.router)?;
         self.block.initialize_decoder(&decoder.hc, encoder)?;
         self.layer = 20;
+        self.phase = Phase::Prepared;
+        Ok(())
+    }
+    /// The layer-0 block's input planes (residual, pre) in this lane's window.
+    pub(crate) fn input_planes(&self) -> [CuteafdDeviceBuffer; 2] { self.block.inputs() }
+    /// A prefill unit's layer 0, prepared from its embedding without the query
+    /// (`BackboneBlockWave::prepare_embedding`): the attention hook begins it
+    /// with [`Self::begin_prepared_cooperative`].
+    pub fn prepare_embedded(&mut self, embedding: &TargetEmbedding<'_>) -> Result<()> {
+        self.enter(Phase::Idle)?;
+        ensure!(self.layer == 0, "embedding requires layer zero");
+        // The embedding has no producing layer: the binding names layer -1's
+        // place (no tap or Engram reads it at layer 0).
+        self.block.prepare_embedding(embedding, QueryBinding::new(0)?)?;
         self.phase = Phase::Prepared;
         Ok(())
     }
@@ -825,6 +1014,46 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.enter(Phase::Prepared)?;
         let result = unsafe { self.block.begin_prepared_attention(&mut self.query)? };
         self.phase = Phase::Query;
+        Ok(result)
+    }
+    /// Reborrow the prepared FFN views of a unit whose attention completed in
+    /// an earlier hook; nothing borrowed survives the hook.
+    pub(crate) fn prepared_ffn(&mut self, binding: QueryBinding, cooperative: bool)
+        -> Result<LaneFfn<'_, 'w, 'a>> {
+        ensure!(self.phase == Phase::Ffn, "backbone lane FFN unavailable");
+        let input = self.block.ffn_input(binding)?;
+        Ok(LaneFfn {
+            input, cooperative, shared: &mut self.shared, router: &mut self.router,
+            library: self.weights.library, phase: &mut self.phase,
+            route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
+            ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
+            l2: self.l2.as_ref().filter(|l2| l2.decode && l2.solo),
+        })
+    }
+    /// Lands a prefill unit's wave and reduces it with the shared values the
+    /// unit's send queued (FIFO turn from the shared executor).
+    /// # Safety
+    /// This unit's shared and output storage have not been reused since its send.
+    pub(crate) async unsafe fn land_unit<'t, 'l>(&mut self, transport: &'t mut NativeTp4Wave<'l>,
+        link: &'t mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>, pending: LaneUnitFfn)
+        -> Result<crate::families::deepseek_v41::v41_experts::coordinator::NativeFfnOutput<'t>> {
+        self.enter(Phase::UnitPending)?;
+        self.block.ffn_input(pending.binding)?;
+        let result = unsafe { transport.collect_unit(link, pending.ticket, pending.shared, pending.destination).await? };
+        ensure!(result.binding() == pending.binding, "prefill unit FFN result binding differs");
+        let collect_us = (pending.started.elapsed().as_micros() as u64).saturating_sub(pending.shared_us);
+        if self.capture_timing {
+            let split = &mut self.ffn_split;
+            split.remote_layers += 1;
+            split.remote_routed_us += pending.routed_us;
+            split.remote_dispatch_us += pending.dispatched_us - pending.routed_us;
+            split.remote_shared_us += pending.shared_us - pending.dispatched_us;
+            split.remote_collect_us += collect_us;
+        }
+        tracing::debug!(target: "cuteafd::timing", layer=self.layer, routed_us=pending.routed_us,
+            dispatch_us=pending.dispatched_us-pending.routed_us, shared_us=pending.shared_us-pending.dispatched_us,
+            collect_us, "target unit experts");
+        self.phase = Phase::SharedReady;
         Ok(result)
     }
     pub fn query_output(&self) -> Result<AttentionQueryOutput<'_>> {
@@ -1005,6 +1234,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(self.phase == Phase::SharedReady, "test FFN phase differs");
         unsafe { self.block.check_queued_finish(binding, result).await }
     }
+    /// The stream carrying this lane's mHC FFN finish (the block's output).
+    pub(crate) fn finish_stream(&self) -> *mut std::ffi::c_void { self.block.finish_stream() }
     pub fn output(&self) -> Result<BlockOutput<'_>> {
         ensure!(
             self.phase == Phase::Complete,
@@ -1055,6 +1286,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
     /// After a device-ordered pass drained: the ring-captured local layers'
     /// routes into the capture; returns those layers.
+    pub fn captures_routes(&self) -> bool { self.capture_routes }
     pub fn drain_route_ring(&mut self) -> Result<Vec<usize>> {
         if !self.capture_routes { return Ok(Vec::new()); }
         self.router.drain_ring(&mut self.route_capture)
@@ -1107,6 +1339,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if self.retain_small_shapes { dual.enable_small_graph_shapes(); }
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
+    }
+    pub(crate) fn enable_dual_attention_on_storage(&mut self,
+        storage: std::rc::Rc<crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionStorage<'a>>) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && self.dual_sparse.is_none(), "dual attention requires an unused lane");
+        let dual = crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::on_storage(storage)?;
+        ensure!(dual.source_device().id == self.query.input().device_id && dual.capacity() == self.capacity,
+            "dual attention storage geometry differs");
+        self.sparse = None; self.dual_sparse = Some(dual); Ok(())
     }
     pub fn dual_attention_bytes(&self)->Result<[usize;2]> {
         crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::device_bytes(self.capacity)
@@ -1293,5 +1533,79 @@ impl BackboneLaneWeights<'_> {
             if let Some(shared) = &w.shared { shared.visit(&p("shared"), f); }
             w.router.visit(&p("router"), f);
         }
+    }
+}
+
+#[cfg(test)]
+mod split_output_tests {
+    /// Every lane constructor that can later take an output split (private
+    /// `new_inner` and shared-storage `on_storage`) owns its TP2 FFN graph
+    /// owner when the weights split output_b; `complete` refuses without it
+    /// (Astra review of 15b4ad52a: on_storage set None, so any
+    /// --tp2-output-projection serve failed on its first prefill unit).
+    #[test]
+    fn every_lane_constructor_owns_the_tp2_ffn_graph_owner_for_split_output() {
+        let source = include_str!("v41_backbone_lane.rs");
+        let owner = "tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),";
+        for constructor in ["fn new_inner(", "pub(crate) fn on_storage("] {
+            let start = source.find(constructor).unwrap();
+            let body = &source[start..start + source[start..].find("\n    }\n").unwrap()];
+            assert!(body.contains(owner), "{constructor} lacks the TP2 FFN graph owner");
+        }
+        let dropped = ["tp2_ffn_graphs", ": None"].concat();
+        assert_eq!(source.matches(dropped.as_str()).count(), 0, "a lane constructor drops the graph owner");
+    }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn lane_storage_bytes_equal_composed_allocation_groups() {
+        for placed in [false, true] {
+            let groups=LaneStorage::allocation_groups(8192,123,456,789,111,222,placed);
+            assert_eq!(groups,[8192*225504,123,456,if placed {0}else {789},111,222]);
+        }
+    }
+    #[test]
+    #[ignore = "requires the installed native kernel manifests"]
+    fn wp7_storage_bytes_table() -> Result<()> {
+        use crate::families::deepseek_v41::{
+            v41_backbone_router::BackboneRouterStorage,
+            v41_backbone_shared::{BackboneSharedStorage,tp2::Storage as SharedTp2},
+            v41_shared_ffn::SharedFfnStorage,
+            v41_sparse_attention::{SparseAttentionStorage,dual::DualAttentionStorage},
+            v41_projection_tp2::{Storage as Projection,Kind},
+            v41_experts::tp2_ffn::Storage as Ffn,
+            v41_attention_output::AttentionOutputStorage};
+        use crate::shared::experts::rtx::pair::{OwnerPair,OwnerPolicy};
+        // SAFETY: the canonical runner supplies the sealed native library.
+        let lib=unsafe {NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};
+        let geometry=cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+        for (k,u) in [(2,4096),(3,2752),(4,2048)] {
+            let r=8192;
+            let mut emit=|name:&str,new:usize,old:usize|eprintln!("WP7_BYTES k={k} unit={u} {name} new={new} old={}",old*k);
+            emit("router",BackboneRouterStorage::storage_bytes(r,u)?,BackboneRouterStorage::storage_bytes(u,u)?);
+            emit("shared_ffn",SharedFfnStorage::storage_bytes(&lib,u)?,SharedFfnStorage::storage_bytes(&lib,u)?);
+            emit("backbone_shared",BackboneSharedStorage::storage_bytes(&lib,r,u)?,BackboneSharedStorage::storage_bytes(&lib,u,u)?);
+            emit("sparse64",SparseAttentionStorage::<'_,64>::storage_bytes(u as usize)?,SparseAttentionStorage::<'_,64>::storage_bytes(u as usize)?);
+            for (gpu,(new,old)) in DualAttentionStorage::storage_bytes(u as usize)?.into_iter().zip(DualAttentionStorage::storage_bytes(u as usize)?).enumerate() {
+                emit(&format!("dual_gpu{gpu}"),new,old);
+            }
+            for kind in [Kind::QueryB,Kind::OutputB] {
+                for (gpu,bytes) in Projection::storage_bytes(&lib,kind,u,0)?.into_iter().enumerate() {
+                    emit(&format!("projection_{kind:?}_gpu{gpu}"),bytes,bytes);
+                }
+            }
+            emit("shared_tp2",SharedTp2::storage_bytes(&lib,r,u)?,SharedTp2::storage_bytes(&lib,u,u)?);
+            emit("tp2_ffn_mxfp4",Ffn::storage_bytes(&lib,r,u,false)?,Ffn::storage_bytes(&lib,u,u,false)?);
+            emit("output",AttentionOutputStorage::storage_bytes(&lib,r,u,false)?,AttentionOutputStorage::storage_bytes(&lib,u,u,false)?);
+            let exact=OwnerPair::device_bytes_for(&lib,u,geometry,OwnerPolicy::native(&lib,false)?)?;
+            eprintln!("WP7_OWNER k={k} unit={u} exact={exact}");
+            let new=LaneStorage::storage_bytes(&lib,r,u,false,false,false)?.into_iter().sum::<usize>();
+            let old=LaneStorage::storage_bytes(&lib,u,u,false,false,false)?.into_iter().sum::<usize>();
+            emit("lane_unplaced",new,old);
+        }
+        Ok(())
     }
 }

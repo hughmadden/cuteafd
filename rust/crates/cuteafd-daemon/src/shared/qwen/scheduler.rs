@@ -148,40 +148,8 @@ pub(crate) trait Backend<'a> {
     fn probe_begin(&self, rows: usize);
     fn probe_end(&self);
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T>;
-    /// The runtime prefill depth controller and its deployment identity,
-    /// when the family's prefill depth adapts (#762): the scheduler
-    /// calibrates it before readiness.
-    fn prefill_depth(&self) -> Option<(&crate::shared::prefill_depth::PrefillDepth,
-        crate::shared::prefill_depth::DeploymentIdentity)> { None }
 }
 
-/// Startup calibration of the runtime prefill depth (#762), before
-/// readiness: cold full-call prefills of fresh sequences at row 0, each
-/// admitted cold, cancelled and released (nothing is retained or cached).
-fn calibrate_prefill_depth<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Path, family: &B::Prefix,
-    cache: &mut PrefixCache<CudaCopyEngine<'a>, B::Meta>, tokenizer: &cuteafd_loader::LoadedTokenizer) -> Result<()> {
-    let Some((depth, identity)) = engine.prefill_depth() else { return Ok(()) };
-    let geometry = engine.geometry();
-    let key = crate::shared::prefill_depth::CalibrationKey::new(geometry.family, snapshot, depth, identity);
-    crate::shared::prefill_depth::calibrate(depth, key, tokenizer, |_, tokens| {
-        let extent = (tokens.len() + geometry.decode_rows).min(geometry.max_context);
-        let mut placement = cache.admit_cold(family, tokens.len(), extent, |units| engine.placement(units, 0))?.placement;
-        let request = || NativeRequest { prompt: String::new(), literal_spans: Vec::new(), constraint: None,
-            images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 1, sampling: Default::default(),
-            stop_token_ids: Vec::new(), events: tokio::sync::mpsc::unbounded_channel().0, probe: None, usage: None,
-            prefix_cache_source: Default::default() };
-        let ran = (|| -> Result<()> {
-            let (Prompt { tokens, .. }, media, _) = engine.prepare(request(), tokens.to_vec())?;
-            let coordinates = engine.coordinates(&tokens, &request(), &media)?;
-            engine.bind_request(&mut placement, coordinates, media, &tokens, 0)?;
-            engine.prefill_device(&mut placement, &tokens, 1, cache.pool())?.context("calibration prefill logits")?;
-            Ok(())
-        })();
-        engine.cancel(&placement)?;
-        cache.release(family, placement.units())?;
-        ran
-    })
-}
 
 use cuteafd_engine::media::{MediaAdmission, MediaPoll, MediaReady, MediaWaiter};
 use crate::shared::probe;
@@ -573,16 +541,6 @@ mod readiness_tests {
     }
 
     #[test]
-    fn prefill_depth_calibration_precedes_readiness_in_both_schedulers() {
-        let source = include_str!("scheduler.rs");
-        let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
-        let calibrate = schedule.find("calibrate_prefill_depth(engine,").unwrap();
-        assert!(schedule.find("engine.prefix_cache(").unwrap() < calibrate && calibrate < schedule.find("}, initialized)?").unwrap());
-        let glm = include_str!("../../families/glm5/serve.rs").split_once("\nfn schedule(").unwrap().1;
-        assert!(glm.find("prefill_depth::calibrate(depth,").unwrap() < glm.find("\n    ready();").unwrap());
-    }
-
-    #[test]
     fn scheduler_prefix_cache_is_initialized_before_readiness() {
         let source = include_str!("scheduler.rs");
         let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
@@ -675,9 +633,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
-        let mut cache = cache;
+        let cache = cache;
         let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-        calibrate_prefill_depth(engine, snapshot, &family, &mut cache, &tokenizer)?;
         let selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
         let shared = if width > 0 {
             let geometry = engine.draft_geometry(snapshot, width)?;

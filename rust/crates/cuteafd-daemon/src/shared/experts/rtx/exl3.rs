@@ -67,6 +67,13 @@ impl<'a> Exl3Tp2Weights<'a> {
     pub(crate) fn execution(&self) -> Result<Exl3Tp2<'a>> {
         self.execution_with_modules(None)
     }
+    /// The same resident weights admitted at another row capacity: lanes built
+    /// from it select packages, workspace and output at `max_rows`.
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        let workspace_bytes = Exl3Tp2::workspace_bytes_for_selection(&self.package, self.geometry.hidden as usize,
+            max_rows, self.row_policy, self.selection)?;
+        Ok(Self { max_rows, workspace_bytes, ..self.clone() })
+    }
     pub(crate) fn execution_with_modules(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<Exl3Tp2<'a>> {
         let reduction_plan = match self.selection {
             RtxSelectionPolicy::FirstCapacity => None,
@@ -217,6 +224,12 @@ impl<'a> Exl3Tp2<'a> {
         row_policy: Exl3RowPolicy,
         selection: RtxSelectionPolicy,
     ) -> Result<usize> {
+        let sizes = Self::allocation_sizes_for_selection(package, hidden, max_rows, row_policy, selection)?;
+        sizes[0].checked_add(sizes[1]).context("EXL3 TP2 workspace overflow")
+    }
+
+    pub(crate) fn allocation_sizes_for_selection(package: &Path, hidden: usize, max_rows: usize,
+        row_policy: Exl3RowPolicy, selection: RtxSelectionPolicy) -> Result<[usize; 2]> {
         let paths = selected_directories(package, max_rows, row_policy, selection)?;
         for path in &paths {
             let metadata = path.join("v41_exl3.json");
@@ -237,14 +250,9 @@ impl<'a> Exl3Tp2<'a> {
         if selection == RtxSelectionPolicy::CanonicalDecode {
             Exl3ReductionPlan::new(&paths)?;
         }
-        Exl3Workspace::plan(&paths, Self::INPUT_FORMAT)?
-            .checked_add(
-                max_rows
-                    .checked_mul(hidden)
-                    .and_then(|n| n.checked_mul(4))
-                    .context("EXL3 TP2 output overflow")?,
-            )
-            .context("EXL3 TP2 workspace overflow")
+        Ok([Exl3Workspace::plan(&paths, Self::INPUT_FORMAT)?,
+            max_rows.checked_mul(hidden).and_then(|n| n.checked_mul(4))
+                .context("EXL3 TP2 output overflow")?])
     }
 
     /// Loads each layer's two slices concurrently before advancing to the next

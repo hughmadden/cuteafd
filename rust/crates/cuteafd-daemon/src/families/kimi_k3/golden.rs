@@ -418,7 +418,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
     let prefill = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
         unit_rows: args.prefill_rows.map(|rows| rows as u64),
-        waves: Some(u64::from(args.prefill_waves)), span_rows: None, slots: None,
+        waves: Some(u64::from(args.prefill_waves)), span_rows: None, reserve_rows: None,
     })?;
     let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);
@@ -430,7 +430,6 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
             rows, waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
-            prefill_slots: usize::try_from(prefill.slots)?,
             slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,
             draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
             verify_rows: verify.unwrap_or(0),
@@ -805,7 +804,7 @@ mod tests {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
-            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None, slots: 2,
+            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
             startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),

@@ -90,7 +90,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         &std::path::Path::new(&model).join("tokenizer.json"),
     )?;
     let pipeline =
-        unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, 80, 4, 8 * 1024 * 1024, 0)? };
+        unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, map, cuteafd_loader::EngramStagingShape::new(80, 2)?, 0)? };
     let mut requests = Requests::new(
         &lib,
         pipeline,
@@ -135,10 +135,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         )?,
         Duration::from_secs(120),
     )?;
-    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-            timeout: Duration::from_secs(120),
-            max_frame_bytes: 2 * 1024 * 1024,
-        }, 0)?;
+    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, crate::families::deepseek_v41::v41_native_serve::transport_config(false), 0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
     if std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some()
         || std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
@@ -155,9 +152,12 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             Duration::from_secs(120),
         )?;
         let mut second_transport = NativeTp4Wave::new(&lib,
-            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-                timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
-            }, 0)?, NativeTp4Wave::device_bytes(80)?)?;
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, crate::families::deepseek_v41::v41_native_serve::transport_config(false), 0)?, NativeTp4Wave::device_bytes(80)?)?;
+        // The one prefill link (execution lane 2): two return slots of 80 rows.
+        let mut prefill_link = crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80,
+                crate::families::deepseek_v41::v41_native_serve::transport_config(false), 2)?,
+            2, 80)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         if std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
             let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(
@@ -175,56 +175,34 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             let tokens: Vec<u32> = (0..130).map(|i| ((i * 7919 + 17) % 129280) as u32).collect();
             let lease = requests.admit(0, 6999)?;
             requests.begin_encoder(lease, 130)?;
-            let mut first = requests.reserve_encoder(&[RequestTokens { lease, tokens: &tokens[..65],
-                image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-            let mut second = requests.reserve_encoder(&[RequestTokens { lease, tokens: &tokens[65..],
-                image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
+            let chunks = [&tokens[..65], &tokens[65..]];
             let mut suffix = EncoderSuffix::new(&lib, 130, EncoderSuffix::device_bytes(130)?)?;
             {
-                let mut pending = Box::pin(unsafe { pass.execute_encoder_pair(&mut other, &mut requests,
-                    [&mut first, &mut second], [&mut transport, &mut second_transport], &mut suffix) });
+                let mut pending = Box::pin(unsafe { TargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)], &mut prefill_link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(())) });
                 runtime.block_on(std::future::poll_fn(|cx| {
                     assert!(pending.as_mut().poll(cx).is_pending(), "expected a live encoder suspension");
                     std::task::Poll::Ready(())
                 }));
             }
-            assert!(requests.validate(&first).is_err());
-            assert!(requests.validate(&second).is_err());
             assert!(requests.cache().request_id(lease).is_err());
-            pass.discard(&mut first)?; other.discard(&mut second)?;
-            transport.reset_connections(); second_transport.reset_connections();
-            eprintln!("PASS cancelled independent encoder: both batches revoked before owner reuse");
+            assert_eq!(pass.state, State::Idle);
+            assert_eq!(other.state, State::Idle);
+            transport.reset_connections()?; second_transport.reset_connections()?;
+            eprintln!("PASS cancelled encoder units: admission revoked before owner reuse");
         }
         for (left, right, tail) in [(65usize, 65usize, 0usize), (79, 1, 0), (65, 65, 1), (64, 64, 27)] {
             let tokens: Vec<u32> = (0..left + right + tail).map(|i| ((i * 7919 + 17) % 129280) as u32).collect();
             let mut expected = None;
             for mode in 0..3 {
-                let paired = mode == 1;
-                let lease = requests.admit(0, 7000 + mode as u64)?;
+                                let lease = requests.admit(0, 7000 + mode as u64)?;
                 let end = tokens.len() as u64;
                 requests.begin_encoder(lease, end)?;
                 let mut suffix = EncoderSuffix::new(&lib, end, EncoderSuffix::device_bytes(end)?)?;
-                if mode == 2 {
+                if mode != 0 {
+                    // One wave (units in sequence) and two waves (one layer apart).
                     let chunks: Vec<_> = [&tokens[..left], &tokens[left..left + right], &tokens[left + right..]]
                         .into_iter().filter(|c| !c.is_empty()).collect();
-                    runtime.block_on(unsafe { pass.execute_encoder_stream(&mut other, &mut requests,
-                        lease, &chunks, [&mut transport, &mut second_transport], &mut suffix, &|| true) })?;
-                } else if paired {
-                    let mut first = requests.reserve_encoder(&[RequestTokens { lease,
-                        tokens: &tokens[..left], image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-                    let mut second = requests.reserve_encoder(&[RequestTokens { lease,
-                        tokens: &tokens[left..left + right], image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-                    runtime.block_on(unsafe { pass.execute_encoder_pair(&mut other, &mut requests,
-                        [&mut first, &mut second], [&mut transport, &mut second_transport], &mut suffix) })?;
-                    pass.commit(&mut requests, &mut first, &[left as u32])?;
-                    other.commit(&mut requests, &mut second, &[right as u32])?;
-                    if tail != 0 {
-                        let mut batch = requests.reserve_encoder(&[RequestTokens { lease,
-                            tokens: &tokens[left + right..], image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-                        runtime.block_on(unsafe { pass.execute_reserved_encoder(&mut requests,
-                            &mut batch, &mut transport, &mut suffix) })?;
-                        pass.commit(&mut requests, &mut batch, &[tail as u32])?;
-                    }
+                    runtime.block_on(unsafe { TargetPass::execute_encoder_units({ let mut slots = vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)]; slots.truncate(mode); slots }, &mut prefill_link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(())) })?;
                 } else {
                     for chunk in [&tokens[..left], &tokens[left..left + right], &tokens[left + right..]] {
                         if chunk.is_empty() { continue; }
@@ -247,7 +225,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                 assert_eq!(requests.begin_decoder_replay(lease)?, end.saturating_sub(128));
                 requests.release(lease)?;
             }
-            eprintln!("PASS independent encoder chunks {left}+{right}+{tail}: suffix residual/pre byte-identical to serial, ordered commits and decoder replay ready");
+            eprintln!("PASS encoder units {left}+{right}+{tail}: suffix residual/pre at 1 and 2 waves byte-identical to serial, ordered commits and decoder replay ready");
         }
         // Five chunks reuse both lanes, crossing more than one former pair boundary.
         // Drop a live stream first, then reuse the same owners for exact comparisons.
@@ -259,9 +237,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.begin_encoder(lease, 175)?;
             let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
             {
-                let mut pending = Box::pin(unsafe { pass.execute_encoder_stream(&mut other,
-                    &mut requests, lease, &chunks, [&mut transport, &mut second_transport],
-                    &mut suffix, &|| true) });
+                let mut pending = Box::pin(unsafe { TargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)], &mut prefill_link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(())) });
                 runtime.block_on(std::future::poll_fn(|cx| {
                     assert!(pending.as_mut().poll(cx).is_pending());
                     std::task::Poll::Ready(())
@@ -270,8 +246,8 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             assert!(requests.cache().request_id(lease).is_err());
             assert_eq!(pass.state, State::Idle);
             assert_eq!(other.state, State::Idle);
-            transport.reset_connections(); second_transport.reset_connections();
-            eprintln!("PASS cancelled encoder stream revoked admission and reset both owners");
+            transport.reset_connections()?; second_transport.reset_connections()?;
+            eprintln!("PASS cancelled encoder units revoked admission and reset both owners");
         }
         let mut expected = None;
         for streaming in [false, true] {
@@ -279,8 +255,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.begin_encoder(lease, 175)?;
             let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
             if streaming {
-                runtime.block_on(unsafe { pass.execute_encoder_stream(&mut other, &mut requests,
-                    lease, &chunks, [&mut transport, &mut second_transport], &mut suffix, &|| true) })?;
+                runtime.block_on(unsafe { TargetPass::execute_encoder_units(vec![(&mut pass, &mut transport), (&mut other, &mut second_transport)], &mut prefill_link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(())) })?;
             } else {
                 for chunk in chunks {
                     let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,

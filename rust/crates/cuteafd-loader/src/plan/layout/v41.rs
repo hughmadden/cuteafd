@@ -18,16 +18,20 @@ const SPARK: SparkCharges = SparkCharges {
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> Result<MemoryLayout> {
     let checkpoint = input.checkpoint();
-    let explicit_unit = options.prefill_unit_rows.is_some();
-    let shape = Shape::resolve(report, model, options, ShapePolicy {
-        context: ContextPolicy::Checkpoint, prefill_rows: Some(2048), all_native_stages: false,
+    // Units, waves and span come from the shared prefill policy and the
+    // descriptor (two units in flight, one target pass per slot).
+    let limits = crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41);
+    let prefill = super::resolve_prefill(report, options, report.placement.spark_ranks(), limits)?;
+    let mut shape = Shape::resolve(report, model, options, ShapePolicy {
+        context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
     });
+    shape.prefill_rows = prefill.unit_rows;
+    report.prefill_span_rows = Some(prefill.span_rows);
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
     ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    if options.prefill_waves == 1 && !explicit_unit { options.prefill_unit_rows = Some(rows); }
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
     ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
         "V4.1 prefix slots must be zero or 2 * retained turns + 2 (at most 258)");
@@ -46,7 +50,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mode = Fp8Head::configured();
     let fp8_head = mode.target();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
-    let target = programs.target(rows, ranks, fp8_head, window_batch)?;
+    // The prefill slots, one storage set over their units; two decode lanes
+    // at decode width.
+    let slots = usize::try_from(prefill.waves)?;
+    let span = slots as u64 * rows;
+    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, fp8_head, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
@@ -73,7 +81,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
     }
     let spark_ranks = report.placement.spark_ranks();
-    let transport = if spark_ranks > 0 { 2 * v41::owners::transport_bytes(rows, spark_ranks)? } else { 0 };
+    // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots)? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",
@@ -82,7 +91,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut owners = v41::owners::TargetOwners::new(fixed, target, ranks, transport, marks)?;
     let mut fixed = owners.fixed.clone();
     let catalog = input.expert_catalog()?;
-    let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms)?;
+    let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
+        v41::owners::DECODE_LANE_ROWS)?;
     let draft = if dspark {
         ensure!(catalog.native_dspark_experts(), "V4.1 compressed dSpark owner manifest is not supported by this adapter");
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
@@ -131,7 +141,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     v41::cache_demands(&mut request, &checkpoint.config, shape.concurrency, turns, false)?;
     let mut placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
     let mut working = SparkWorkingSet { rtx_layers: (0..placement.onboard_layers).collect(),
-        spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: 1 };
+        spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: slots as u64 };
     let mut sparks = spark_devices(report, model, input, options, SPARK, &working, 2, &mut waste, &mut notes);
     update_sparks(catalog, &working, &mut sparks)?;
     // A mandatory encoder displaces an optional expert prefix, not the pool.

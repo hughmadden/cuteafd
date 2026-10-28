@@ -111,12 +111,16 @@ pub fn spin_window<E>(mut ready: impl FnMut() -> Result<bool, E>) -> Result<bool
 
 /// A bounded backoff for one host wait on the critical path: under
 /// [`HostWait::Spin`] it always spins; under [`HostWait::Block`] it spins for
-/// [`BLOCK_SPIN`], then sleeps [`BLOCK_SLEEP`] per pass. Start one per wait.
-pub struct Backoff { block: bool, started: Option<Instant> }
+/// [`BLOCK_SPIN`], then sleeps [`BLOCK_SLEEP`] per pass. The spin restarts on
+/// progress: [`Self::reset`], or engine activity ([`note_active`], every Spark
+/// wave) since the stretch began, so a backoff spanning many per-layer waits
+/// (`serve::lanes::paced` around a whole decode loop) spins through each of
+/// them instead of sleeping past every completion once its first 10 ms passed.
+pub struct Backoff { block: bool, started: Option<Instant>, active: u64 }
 
 impl Backoff {
     pub fn new() -> Self {
-        Self { block: wait_policy().wait == HostWait::Block, started: None }
+        Self { block: wait_policy().wait == HostWait::Block, started: None, active: 0 }
     }
     /// One pass of the wait: spin, or sleep once the spin budget is spent.
     pub fn pause(&mut self) {
@@ -125,6 +129,8 @@ impl Backoff {
     /// Whether this pass sleeps (block mode, past [`BLOCK_SPIN`] since the
     /// first pause after the last progress).
     fn sleeps(&mut self) -> bool {
+        let active = LAST_ACTIVE.load(Ordering::Relaxed);
+        if active != self.active { self.active = active; self.started = None; }
         self.block && !block_spins(self.started.get_or_insert_with(Instant::now).elapsed())
     }
     /// The wait made progress: the next pause spins again.
@@ -198,7 +204,7 @@ mod tests {
 
     #[test]
     fn backoff_spins_through_the_window_then_sleeps_under_block() {
-        let mut backoff = Backoff { block: true, started: None };
+        let mut backoff = Backoff { block: true, started: None, active: LAST_ACTIVE.load(Ordering::Relaxed) };
         assert!(!backoff.sleeps(), "the first pause spins");
         // A Kimi K3 per-layer round (0.6-0.7 ms) in: still spinning.
         backoff.started = Instant::now().checked_sub(Duration::from_micros(700));
@@ -210,8 +216,49 @@ mod tests {
         assert!(late.elapsed() >= BLOCK_SLEEP, "a sleeping pause sleeps");
         backoff.reset();
         assert!(!backoff.sleeps(), "progress restarts the spin");
-        let mut spin = Backoff { block: false, started: Instant::now().checked_sub(Duration::from_secs(1)) };
+        let mut spin = Backoff { block: false, started: Instant::now().checked_sub(Duration::from_secs(1)), active: 0 };
         assert!(!spin.sleeps(), "spin mode never sleeps");
+    }
+
+    /// A backoff spanning a whole decode loop (`serve::lanes::paced`): engine
+    /// activity (every Spark wave notes it) restarts the spin, so each
+    /// per-layer wait spins instead of sleeping past its completion once the
+    /// loop's first 10 ms passed (V4.1 2-RTX max C1: +26 us per eager layer).
+    #[test]
+    fn engine_activity_restarts_the_spin() {
+        // A stretch past its budget, begun before the latest recorded activity
+        // (`active` holds an older reading than LAST_ACTIVE, which never equals
+        // u64::MAX): the activity restarts the spin. The global is only read.
+        let mut backoff = Backoff { block: true, started: Instant::now().checked_sub(BLOCK_SPIN), active: u64::MAX };
+        assert!(!backoff.sleeps(), "activity since the stretch began restarts the spin");
+        assert!(!backoff.sleeps(), "and the restarted stretch spins within its window");
+        // With no new activity the same stretch sleeps once past its budget.
+        backoff.started = Instant::now().checked_sub(BLOCK_SPIN);
+        assert!(backoff.sleeps(), "no activity: past the budget it sleeps");
+    }
+
+    /// Bounded spin (AGENTS.md: no idle CPU burn): with no engine activity a
+    /// stretch still reaches the sleep stage after BLOCK_SPIN and stays there;
+    /// the waiting loop's own pauses never record activity, so an idle lane
+    /// cannot keep itself spinning. Idle parking reads the same clock.
+    #[test]
+    fn an_idle_wait_still_sleeps_and_pausing_never_records_activity() {
+        let before = LAST_ACTIVE.load(Ordering::Relaxed);
+        let mut backoff = Backoff { block: true, started: None, active: before };
+        assert!(!backoff.sleeps(), "the first pause spins");
+        backoff.started = Instant::now().checked_sub(BLOCK_SPIN);
+        // Another test may record activity concurrently; only assert the
+        // sleep stage when the clock did not move under us.
+        let moved = || LAST_ACTIVE.load(Ordering::Relaxed) != before;
+        for _ in 0..3 {
+            let slept = Instant::now();
+            backoff.pause();
+            if !moved() { assert!(slept.elapsed() >= BLOCK_SLEEP, "past the budget an idle wait sleeps"); }
+        }
+        if !moved() {
+            assert_eq!(LAST_ACTIVE.load(Ordering::Relaxed), before, "pausing never records activity");
+            assert!(backoff.sleeps(), "an idle stretch keeps sleeping");
+        }
     }
 
     #[test]

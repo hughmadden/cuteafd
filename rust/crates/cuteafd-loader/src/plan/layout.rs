@@ -60,9 +60,9 @@ pub struct LayoutOptions {
     pub prefill_span_rows: Option<u64>,
     /// Continuous row-unit waves on one transport.
     pub prefill_waves: u64,
-    /// Admitted in-flight slots (#762): the deepest depth an adaptive executor
-    /// may run inside the same reserve; equals `prefill_waves` when static.
-    pub prefill_slots: u64,
+    /// The reserve the depth cuts (TJ's reserve rule: the planner's fit cap
+    /// below the standard one); None is the standard.
+    pub prefill_reserve_rows: Option<u64>,
     /// Family-resolved decode views; unrelated to prefill wave depth.
     pub decode_lanes: u8,
     /// Native EXLR8 trellis prefill activations: A8 also charges every prefill lane's MX8 records.
@@ -203,7 +203,7 @@ impl Default for LayoutOptions {
             prefill_unit_rows: None,
             prefill_span_rows: None,
             prefill_waves: 1,
-            prefill_slots: 1,
+            prefill_reserve_rows: None,
             decode_lanes: 1,
             exlr8_prefill_activations: Default::default(),
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
@@ -334,7 +334,10 @@ mod scoring_workspace_tests {
 /// Qwen: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
-        "deepseek_v41" | "deepseek_v4" => 2,
+        // The two decode lanes' links and one prefill link (its waves share
+        // that endpoint's rings).
+        "deepseek_v41" => 3,
+        "deepseek_v4" => 2,
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
@@ -418,9 +421,7 @@ pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: 
 pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
     decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
-    // Spark owners buffer every admitted slot (#762).
-    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit,
-        options.prefill_slots.max(options.prefill_waves))
+    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit, options.prefill_waves)
 }
 
 #[cfg(test)]
@@ -558,8 +559,8 @@ mod selected_spark_io_tests {
             charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
             assert!(device.items.is_empty());
         }
-        assert_eq!(spark_endpoints("glm5", crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(4)), 2);
-        assert_eq!(spark_endpoints("glm5", crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(0)), 1);
+        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::depth(4, Default::default())), 2);
+        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::depth(0, Default::default())), 1);
     }
 }
 
@@ -696,17 +697,15 @@ pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     let unit_rows = (options.prefill_rows > 0).then_some(options.prefill_rows)
         .or(options.prefill_unit_rows);
     let shape = prefill_shape(spark_ranks, limits, PrefillOverrides {
-        unit_rows, waves, span_rows: options.prefill_span_rows, slots: None,
+        unit_rows, waves, span_rows: options.prefill_span_rows, reserve_rows: options.prefill_reserve_rows,
     })?;
     options.prefill_rows = shape.unit_rows;
     options.prefill_unit_rows = Some(shape.unit_rows);
     options.prefill_lanes = shape.waves;
     options.prefill_waves = shape.waves;
-    options.prefill_slots = shape.slots;
     options.spark_capacity_rows = shape.unit_rows;
     report.prefill_unit_rows = Some(shape.unit_rows);
     report.prefill_waves = Some(shape.waves);
-    report.prefill_slots = Some(shape.slots);
     report.prefill_span_rows = Some(shape.span_rows);
     report.prefill_transports = Some(u64::from(spark_ranks > 0));
     Ok(shape)
@@ -1386,9 +1385,6 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         ensure!(ranks == 0 || (1..=4096).contains(&unit_rows),
             "{family} Spark host admission needs prefill_unit_rows in 1..=4096, got {unit_rows}");
         unit_rows
-    } else if options.prefill_slots > options.prefill_waves {
-        // Adaptive depth (#762): every admitted depth is cut from one reserve.
-        crate::serving_capacity::wave_control::reserve_rows(options.prefill_slots, unit_rows)
     } else {
         crate::serving_capacity::PrefillShape { unit_rows, waves: options.prefill_waves }.validate()?.slot_rows()
     };
@@ -1398,8 +1394,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             "glm5" | "glm5_flash" => u64::from(ranks > 0),
             "mimo_v2" => {
                 let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
-                let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-                    else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
+                let configured = (options.prefill_lanes > 0).then(|| options.prefill_lanes.to_string());
                 crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
                     cfg.program_family()?, configured.as_deref())? as u64
             }
@@ -1433,7 +1428,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
         let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
             !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
-        let egress = (egress_request as u64).checked_mul(options.prefill_slots.max(options.prefill_waves))
+        let egress = (egress_request as u64).checked_mul(options.prefill_waves)
             .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?;
         push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.

@@ -11,6 +11,8 @@ use cuteafd_ffi::{
 use cuteafd_loader::OfficialV41Catalog;
 use std::marker::PhantomData;
 const ROW_BYTES: [usize; 5] = [65536, 16384, 10240, 8, 256];
+#[cfg(test)]
+thread_local! { static IGNORE_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub(crate) struct AttentionOutputWeights<'a> {
     library: &'a NativeLibrary,
     layer: usize,
@@ -103,44 +105,62 @@ impl<'a> AttentionOutputWeights<'a> {
             AttentionOutputWave::device_bytes_with_split(self.library, capacity,self.scales.is_none())? <= budget,
             "attention output wave exceeds budget"
         );
+        self.on_storage(self.storage(capacity, capacity)?)
+    }
+    /// Shared storage: row planes over `rows` reserve rows, GEMM plans and
+    /// scratch for units of up to `unit` rows.
+    pub fn storage(&self, rows: u32, unit: u32) -> Result<std::rc::Rc<AttentionOutputStorage<'a>>> {
+        ensure!(unit >= 1 && unit <= rows, "attention output unit {unit} outside {rows} rows");
         let stream = LoadStream {
             library: self.library,
             raw: self.library.cuda_stream_create()?,
         };
-        let kernel=self.scales.as_ref().map(|_|self.library.v41_fp8_matrix_plan(capacity,8192,5120)).transpose()?;
-        let grouped = self.library.v41_fp8_matrix_plan(capacity, 32768, 8192)?;
-        let grouped_scratch = DeviceAllocation::new(self.library, grouped.info().scratch_bytes as usize)?;
-        let value = AttentionOutputWave {
+        let kernel=self.scales.as_ref().map(|_|self.library.v41_fp8_matrix_plan(unit,8192,5120)).transpose()?;
+        let grouped = self.library.v41_fp8_matrix_plan(unit, 32768, 8192)?;
+        let (grouped_bytes, down_bytes, alpha_bytes, planes) = AttentionOutputStorage::allocation_sizes(
+            grouped.info().scratch_bytes as usize, kernel.as_ref().map(|k|k.info().scratch_bytes as usize).unwrap_or(0), rows);
+        let storage = AttentionOutputStorage {
             stream,
             grouped,
-            grouped_scratch,
-            scratch: kernel.as_ref().map(|k|DeviceAllocation::new(self.library,k.info().scratch_bytes as usize)).transpose()?,
+            grouped_scratch: DeviceAllocation::new(self.library, grouped_bytes)?,
+            scratch: kernel.as_ref().map(|_|DeviceAllocation::new(self.library, down_bytes)).transpose()?,
             kernel,
-            alpha: DeviceAllocation::new(self.library, 4)?,
-            norm: self.library.v41_attention_ops()?,
-            buffers: ROW_BYTES
+            alpha: DeviceAllocation::new(self.library, alpha_bytes)?,
+            buffers: planes
                 .into_iter()
-                .map(|n| DeviceAllocation::new(self.library, n * capacity as usize))
+                .map(|n| DeviceAllocation::new(self.library, n))
                 .collect::<Result<Vec<_>>>()?,
-            position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
+            rows,
+            unit,
+        };
+        let launched = (|| unsafe {
+            storage.grouped.initialize_scratch(storage.grouped_scratch.buffer, storage.alpha.buffer, storage.stream.raw)?;
+            if let (Some(kernel),Some(scratch))=(&storage.kernel,&storage.scratch) {
+                kernel.initialize_scratch(scratch.buffer,storage.alpha.buffer,storage.stream.raw)?;
+            }
+            Ok(())
+        })();
+        launched.and(unsafe { self.library.cuda_stream_synchronize(storage.stream.raw) })?;
+        Ok(std::rc::Rc::new(storage))
+    }
+    /// A slot's projection over shared `storage` (one per GPU for prefill slots).
+    pub fn on_storage(&self, storage: std::rc::Rc<AttentionOutputStorage<'a>>) -> Result<AttentionOutputWave<'_, 'a>> {
+        ensure!(storage.kernel.is_some() == self.scales.is_some(), "attention output storage plans differ from the weights");
+        let value = AttentionOutputWave {
+            norm: self.library.v41_attention_ops()?,
+            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
             weights: self,
-            capacity,
+            capacity: storage.unit,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             ready: None,
             origin: None,
+            window: crate::shared::memory::row_window::RowWindow::NONE,
+            storage,
         };
         ensure!(
             value.b(0).device_id == self.grouped_scales.buffer.device_id,
             "output weight device differs"
         );
-        let launched = (|| unsafe {
-            value.grouped.initialize_scratch(value.grouped_scratch.buffer, value.alpha.buffer, value.stream.raw)?;
-            if let (Some(kernel),Some(scratch))=(&value.kernel,&value.scratch) {
-                kernel.initialize_scratch(scratch.buffer,value.alpha.buffer,value.stream.raw)?;
-            }
-            Ok(())
-        })();
-        launched.and(value.synchronize())?;
         Ok(value)
     }
 }
@@ -167,15 +187,49 @@ impl AttentionOutput<'_> {
         Ok(b)
     }
 }
-pub(crate) struct AttentionOutputWave<'w, 'a> {
+/// The attention output projection's stream, GEMM plans/scratch and row
+/// planes (`shared::memory::row_window`). Every row buffer is a plane: sparse
+/// attention writes the input, positions and frequencies on its stream, the
+/// mHC post reads the projection on its own, and the grouped intermediate
+/// (16 KB/row) is kept with them. Prefill slots share one per GPU.
+pub(crate) struct AttentionOutputStorage<'a> {
     stream: LoadStream<'a>,
     grouped: V41Fp8Plan<'a>,
     grouped_scratch: DeviceAllocation<'a>,
     kernel: Option<V41Fp8Plan<'a>>,
     scratch: Option<DeviceAllocation<'a>>,
     alpha: DeviceAllocation<'a>,
-    norm: V41AttentionOps<'a>,
     buffers: Vec<DeviceAllocation<'a>>,
+    rows: u32,
+    unit: u32,
+}
+impl AttentionOutputStorage<'_> {
+    fn allocation_sizes(grouped: usize, down: usize, rows: u32) -> (usize, usize, usize, [usize; 5]) {
+        (grouped, down, 4, ROW_BYTES.map(|n|n * rows as usize))
+    }
+
+    pub(crate) fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32, split: bool) -> Result<usize> {
+        ensure!(unit > 0 && unit <= 4096 && unit <= rows
+            && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS, "invalid output storage geometry");
+        let (grouped, down, alpha, planes) = Self::allocation_sizes(
+            library.v41_fp8_matrix_plan_info(unit, 32768, 8192)?.scratch_bytes as usize,
+            if split { 0 } else { library.v41_fp8_matrix_plan_info(unit, 8192, 5120)?.scratch_bytes as usize }, rows);
+        Ok(grouped + down + alpha + planes.into_iter().sum::<usize>())
+    }
+}
+impl Drop for AttentionOutputStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the stream is owned here; queued work reads only this storage.
+        if let Err(error) = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } {
+            tracing::error!(%error, "draining attention output storage");
+        }
+    }
+}
+pub(crate) struct AttentionOutputWave<'w, 'a> {
+    storage: std::rc::Rc<AttentionOutputStorage<'a>>,
+    window: crate::shared::memory::row_window::RowWindow,
+    norm: V41AttentionOps<'a>,
+    /// Per slot: rewritten on the host for each unit (pinned staging rule).
     position_staging: HostAllocation<'a>,
     weights: &'w AttentionOutputWeights<'a>,
     capacity: u32,
@@ -190,12 +244,12 @@ impl<'w, 'a> AttentionOutputWave<'w, 'a> {
         self.ready = None;
         self.origin = None;
         ensure!(
-            std::ptr::eq(self.stream.library, weights.library)
-                && self.kernel.is_some()==weights.scales.is_some()
+            std::ptr::eq(self.storage.stream.library, weights.library)
+                && self.storage.kernel.is_some()==weights.scales.is_some()
                 && weights.grouped_scales.buffer.device_id == self.b(0).device_id,
             "attention rebound weight library or device differs"
         );
-        self.stream.require_complete()?;
+        if !crate::shared::memory::chain::active() { self.storage.stream.require_complete()?; }
         self.weights = weights;
         Ok(())
     }
@@ -205,13 +259,48 @@ impl AttentionOutputWave<'_, '_> {
         Self::device_bytes_with_split(library,capacity,false)
     }
     pub fn device_bytes_with_split(library:&NativeLibrary,capacity:u32,split_output_b:bool)->Result<usize> {
-        Ok(library.v41_fp8_matrix_plan_info(capacity, 32768, 8192)?.scratch_bytes as usize
-            + 4
-            + capacity as usize * ROW_BYTES.iter().sum::<usize>()
-            + if split_output_b {0} else {library.v41_fp8_matrix_plan_info(capacity,8192,5120)?.scratch_bytes as usize})
+        AttentionOutputStorage::storage_bytes(library, capacity, capacity, split_output_b)
+    }
+    /// Graphs bake in row-plane addresses (row_window: capture uses rows from
+    /// 0), so a selected prefill window always executes eagerly.
+    fn graphed(&self, rows: u32) -> bool {
+        #[cfg(test)]
+        if IGNORE_WINDOW.with(|ignore| ignore.get()) { return super::graph_policy::captures_shape(rows); }
+        !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+    }
+    /// `execute_attention`'s graph decision over inputs already in `input()`
+    /// and `positions()` (the window test drives exactly that branch).
+    #[cfg(test)]
+    unsafe fn run_unit(&mut self, rows: u32) -> Result<AttentionOutput<'_>> {
+        if self.graphed(rows) {
+            if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
+                unsafe { self.capture_ready_on(rows, self.storage.stream.raw)?; }
+            }
+            let (graph, _) = self.graphs.get_shape(self.weights.layer, self.weights, rows).context("graph missing")?;
+            unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw)?; }
+            self.synchronize()?;
+            self.ready = Some(rows);
+            self.output()
+        } else {
+            unsafe { self.execute(rows) }
+        }
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
-        self.buffers[i].buffer
+        self.window.apply(self.storage.buffers[i].buffer, ROW_BYTES[i])
+    }
+    /// Selects this slot's unit rows in the shared planes, at rest
+    /// (`shared::memory::row_window`).
+    /// Drops a finished output (the slot is at rest: its readers drained).
+    pub(crate) fn discard_ready(&mut self) { self.ready = None; }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        crate::shared::memory::row_window::require_rest(self.ready.is_some(), "attention output", "an output is unconsumed")?;
+        if let Some(range) = window.range() {
+            ensure!(range.end <= self.storage.rows as usize && range.len() <= self.capacity as usize,
+                "attention output window {range:?} outside {} rows or wider than the {}-row unit",
+                self.storage.rows, self.capacity);
+        }
+        self.window = window;
+        Ok(())
     }
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.b(0)
@@ -220,19 +309,19 @@ impl AttentionOutputWave<'_, '_> {
         self.b(3)
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
     }
     fn validate(&mut self, rows: u32) -> Result<()> {
         self.ready = None;
         self.origin = None;
         ensure!(
-            rows > 0 && rows <= self.capacity,
-            "attention output rows exceed capacity"
+            rows > 0 && rows <= self.capacity && self.window.admits(rows as usize),
+            "attention output rows exceed capacity or the unit's window"
         );
         Ok(())
     }
     unsafe fn enqueue(&mut self, rows: u32) -> Result<()> {
-        unsafe { self.enqueue_on(rows, self.stream.raw) }
+        unsafe { self.enqueue_on(rows, self.storage.stream.raw) }
     }
     unsafe fn enqueue_grouped_on(&mut self, rows: u32, stream: *mut std::ffi::c_void) -> Result<()> {
         unsafe {
@@ -243,13 +332,13 @@ impl AttentionOutputWave<'_, '_> {
                 self.weights.layer as u32,
                 stream,
             )?;
-            self.grouped.launch_rope(
+            self.storage.grouped.launch_rope(
                 self.b(0),
                 self.b(4),
                 self.weights.tensors.get(&self.weights.names[0])?,
                 self.weights.grouped_scales.buffer,
-                self.grouped_scratch.buffer,
-                self.alpha.buffer,
+                self.storage.grouped_scratch.buffer,
+                self.storage.alpha.buffer,
                 self.b(1),
                 rows,
                 stream,
@@ -258,15 +347,15 @@ impl AttentionOutputWave<'_, '_> {
         Ok(())
     }
     unsafe fn enqueue_on(&mut self,rows:u32,stream:*mut std::ffi::c_void)->Result<()> {
-        ensure!(self.kernel.is_some(),"split output-B requires TP2 execution");
+        ensure!(self.storage.kernel.is_some(),"split output-B requires TP2 execution");
         unsafe {
             self.enqueue_grouped_on(rows,stream)?;
-            self.kernel.as_ref().context("full output-B kernel absent")?.launch(
+            self.storage.kernel.as_ref().context("full output-B kernel absent")?.launch(
                 self.b(1),
                 self.weights.tensors.get(&self.weights.names[2])?,
                 self.weights.scales.as_ref().context("full output-B scales absent")?.buffer,
-                self.scratch.as_ref().context("full output-B scratch absent")?.buffer,
-                self.alpha.buffer,
+                self.storage.scratch.as_ref().context("full output-B scratch absent")?.buffer,
+                self.storage.alpha.buffer,
                 self.b(2),
                 rows,
                 stream,
@@ -288,6 +377,7 @@ impl AttentionOutputWave<'_, '_> {
     /// # Safety
     /// Same inputs as execute. Warmup is drained but not published after capture.
     pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
+        ensure!(!self.window.is_windowed(), "attention output graphs never capture a row window");
         self.ready = None;
         self.origin = None;
         ensure!(
@@ -297,18 +387,18 @@ impl AttentionOutputWave<'_, '_> {
         unsafe {
             self.execute(rows)?;
         }
-        unsafe { self.capture_ready_on(rows, self.stream.raw) }
+        unsafe { self.capture_ready_on(rows, self.storage.stream.raw) }
     }
     unsafe fn capture_ready_on(&mut self, rows: u32, stream: *mut std::ffi::c_void) -> Result<()> {
         self.ready = None;
         self.origin = None;
         unsafe {
-            self.stream
+            self.storage.stream
                 .library
                 .cuda_graph_begin_capture(stream)?;
         }
         let launched = unsafe { self.enqueue_on(rows, stream) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(stream) };
+        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(stream) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 if let Err(error) = unsafe {
@@ -316,7 +406,7 @@ impl AttentionOutputWave<'_, '_> {
                         .insert(self.weights.layer, self.weights, rows, graph)
                 } {
                     unsafe {
-                        self.stream.library.cuda_graph_exec_destroy(graph)?;
+                        self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
                     }
                     return Err(error);
                 }
@@ -324,7 +414,7 @@ impl AttentionOutputWave<'_, '_> {
             }
             (Err(e), Ok(graph)) => {
                 unsafe {
-                    self.stream.library.cuda_graph_exec_destroy(graph)?;
+                    self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(e)
             }
@@ -334,6 +424,7 @@ impl AttentionOutputWave<'_, '_> {
     /// # Safety
     /// Same matching initialized inputs as execute. Captured live row count is fixed.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<AttentionOutput<'_>> {
+        ensure!(!self.window.is_windowed(), "attention output graphs never replay into a row window");
         self.validate(rows)?;
         let (graph, count) = self
             .graphs
@@ -341,9 +432,9 @@ impl AttentionOutputWave<'_, '_> {
             .context("attention output graph missing")?;
         ensure!(count == rows, "attention output capture row count differs");
         let launched = unsafe {
-            self.stream
+            self.storage.stream
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.storage.stream.raw)
         };
         launched.and(self.synchronize())?;
         self.ready = Some(rows);
@@ -370,15 +461,15 @@ impl AttentionOutputWave<'_, '_> {
         }
         let executed = (|| -> Result<()> {
             unsafe {
-                self.stream.library.copy_d2d_async(
-                    self.b(0), attention.values, attention.values.bytes, self.stream.raw,
+                self.storage.stream.library.copy_d2d_async(
+                    self.b(0), attention.values, attention.values.bytes, self.storage.stream.raw,
                 )?;
-                self.stream.library.copy_host_buffer_h2d_async(
-                    self.positions(), self.position_staging.buffer, tokens.len() * 8, self.stream.raw,
+                self.storage.stream.library.copy_host_buffer_h2d_async(
+                    self.positions(), self.position_staging.buffer, tokens.len() * 8, self.storage.stream.raw,
                 )?;
             }
             let rows = attention.rows as u32;
-            if super::graph_policy::captures_shape(rows) {
+            if self.graphed(rows) {
                 if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
                     unsafe { self.capture(rows)?; }
                 }
@@ -417,13 +508,13 @@ impl AttentionOutputWave<'_, '_> {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
         unsafe {
-            self.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
-            self.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
+            self.storage.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
+            self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
-        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row") {
-            let library = self.stream.library;
+        if !self.graphed(rows) || crate::shared::decode_graph::census::eager("layer_row") {
+            let library = self.storage.stream.library;
             unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 None, || self.enqueue_on(rows, stream))?; }
             let mut output = self.b(2);
@@ -433,12 +524,12 @@ impl AttentionOutputWave<'_, '_> {
         if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
             // Cold setup uses the existing drained capture path; its input copies
             // must complete before capture's private-stream warmup can read them.
-            unsafe { self.stream.library.cuda_stream_synchronize(stream)?; self.capture(rows)?; }
+            unsafe { self.storage.stream.library.cuda_stream_synchronize(stream)?; self.capture(rows)?; }
         }
         let (graph, count) = self.graphs.get_shape(self.weights.layer, self.weights, rows)
             .context("queued output graph missing")?;
         ensure!(count == rows, "queued output graph shape differs");
-        let library = self.stream.library;
+        let library = self.storage.stream.library;
         unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
             Some(graph), || self.enqueue_on(rows, stream))?; }
         let mut output = self.b(2);
@@ -461,14 +552,20 @@ impl AttentionOutputWave<'_, '_> {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
         unsafe {
-            self.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
-            self.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
+            self.storage.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
+            self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
+        if self.window.is_windowed() {
+            // A windowed (shared-storage) unit: no captured addresses, eager.
+            unsafe { self.enqueue_on(rows, stream)?; }
+            let mut output = self.b(2); output.bytes = attention.rows * ROW_BYTES[2];
+            return Ok(Some(output));
+        }
         if crate::shared::decode_graph::census::enabled() && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_some() {
             let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows).map(|(raw, _)| raw);
-            let library = self.stream.library;
+            let library = self.storage.stream.library;
             unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 graph, || self.enqueue_on(rows, stream))?; }
             let mut output = self.b(2); output.bytes = attention.rows * ROW_BYTES[2];
@@ -492,10 +589,11 @@ impl AttentionOutputWave<'_, '_> {
         unsafe { self.capture_ready_on(rows, stream)?; self.replay_prepared(rows, stream) }
     }
     unsafe fn replay_prepared(&self, rows: u32, stream: *mut std::ffi::c_void) -> Result<CuteafdDeviceBuffer> {
+        ensure!(!self.window.is_windowed(), "attention output graphs never replay into a row window");
         let (graph, count) = self.graphs.get_shape(self.weights.layer, self.weights, rows)
             .context("prepared output graph missing")?;
         ensure!(count == rows, "prepared output graph shape differs");
-        unsafe { self.stream.library.cuda_graph_launch(graph, stream)?; }
+        unsafe { self.storage.stream.library.cuda_graph_launch(graph, stream)?; }
         let mut output = self.b(2); output.bytes = rows as usize * ROW_BYTES[2];
         Ok(output)
     }
@@ -507,7 +605,7 @@ impl AttentionOutputWave<'_, '_> {
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
-        unsafe { self.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
+        unsafe { self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
             tokens.len() * 8, stream) }
     }
     /// # Safety
@@ -519,7 +617,7 @@ impl AttentionOutputWave<'_, '_> {
             && attention.rows <= self.capacity as usize
             && attention.values.device_id == self.b(0).device_id, "projection graph origin differs");
         unsafe {
-            self.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
+            self.storage.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
             self.enqueue_on(attention.rows as u32, stream)?;
         }
         let mut value = self.b(2); value.bytes = attention.rows * 10240; Ok(value)
@@ -530,11 +628,11 @@ impl AttentionOutputWave<'_, '_> {
     pub unsafe fn enqueue_grouped_chain_graph(&mut self,
         attention:&crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
         stream:*mut std::ffi::c_void)->Result<CuteafdDeviceBuffer> {
-        ensure!(self.kernel.is_none() && attention.layer==self.weights.layer && attention.rows>0
+        ensure!(self.storage.kernel.is_none() && attention.layer==self.weights.layer && attention.rows>0
             && attention.rows<=self.capacity as usize && attention.values.device_id==self.b(0).device_id,
             "split output prefix differs");
         unsafe {
-            self.stream.library.copy_d2d_async(self.b(0),attention.values,attention.values.bytes,stream)?;
+            self.storage.stream.library.copy_d2d_async(self.b(0),attention.values,attention.values.bytes,stream)?;
             self.enqueue_grouped_on(attention.rows as u32,stream)?;
         }
         Ok(CuteafdDeviceBuffer {bytes:attention.rows*ROW_BYTES[1],..self.b(1)})
@@ -547,12 +645,12 @@ impl AttentionOutputWave<'_, '_> {
         projection:&mut crate::families::deepseek_v41::v41_projection_tp2::Wave<'_, '_>,producer:Option<*mut std::ffi::c_void>,
         consume:impl FnOnce(CuteafdDeviceBuffer,*mut std::ffi::c_void)->Result<T>)->Result<T> {
         self.validate(rows)?;
-        ensure!(self.kernel.is_none() && projection.kind()==crate::families::deepseek_v41::v41_projection_tp2::Kind::OutputB
+        ensure!(self.storage.kernel.is_none() && projection.kind()==crate::families::deepseek_v41::v41_projection_tp2::Kind::OutputB
             && projection.output_device().id==self.b(0).device_id
-            && std::ptr::eq(projection.output_device().library,self.stream.library),"output projection owner differs");
+            && std::ptr::eq(projection.output_device().library,self.storage.stream.library),"output projection owner differs");
         unsafe { projection.execute_after(self.weights.layer,rows,
             CuteafdDeviceBuffer {bytes:rows as usize*ROW_BYTES[1],..self.b(1)},producer,|output,stream| {
-                self.stream.library.copy_d2d_async(self.b(2),output,output.bytes,stream)?;
+                self.storage.stream.library.copy_d2d_async(self.b(2),output,output.bytes,stream)?;
                 consume(CuteafdDeviceBuffer {bytes:output.bytes,..self.b(2)},stream)
             }).await }
     }
@@ -602,6 +700,69 @@ impl Drop for AttentionOutputWave<'_, '_> {
 }
 
 #[cfg(test)]
+mod window_graph_tests {
+    use super::*;
+    /// Two equal-row units at two window offsets on one shared-storage slot
+    /// each equal a private eager run of the same input. With the window gate
+    /// removed (negative control) the second unit replays the first unit's
+    /// captured graph, which reads and writes the first window's rows.
+    fn run(gated: bool) -> Result<()> {
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let layer = 2;
+        let weights = AttentionOutputWeights::load(&library, &catalog, layer,
+            AttentionOutputWeights::device_bytes(&library, &catalog, layer)?, 1 << 20)?;
+        let rows = 16u32;
+        let input = |seed: u8| -> Vec<u8> { (0..rows as usize * 32768).flat_map(|i| {
+            let v = ((i * 37 + seed as usize * 101) % 61) as u16; (0x3c00u16 ^ (v << 3)).to_ne_bytes() }).collect() };
+        let positions: Vec<u8> = (0..rows as u64).flat_map(|p| (p * 3 + 100).to_ne_bytes()).collect();
+        let mut private = weights.wave(rows, usize::MAX)?;
+        let mut expect = Vec::new();
+        for seed in [1u8, 2] {
+            library.copy_h2d(private.input(), &input(seed))?;
+            library.copy_h2d(private.positions(), &positions)?;
+            let out = unsafe { private.execute(rows)? };
+            let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h(&mut bytes, out.projected)?;
+            expect.push(bytes);
+        }
+        assert_ne!(expect[0], expect[1], "distinct inputs must project differently");
+        let storage = weights.storage(4 * rows, rows)?;
+        let mut slot = weights.on_storage(storage)?;
+        IGNORE_WINDOW.with(|ignore| ignore.set(!gated));
+        let result = (|| -> Result<Vec<Vec<u8>>> {
+            let mut got = Vec::new();
+            for (seed, offset) in [(1u8, 2 * rows as usize), (2, rows as usize)] {
+                // As the lane does before a window change: the previous output is consumed.
+                slot.discard_ready();
+                slot.select_window(crate::shared::memory::row_window::RowWindow::within(offset..offset + rows as usize,
+                    4 * rows as usize)?)?;
+                library.copy_h2d(slot.input(), &input(seed))?;
+                library.copy_h2d(slot.positions(), &positions)?;
+                let out = unsafe { slot.run_unit(rows)? };
+                let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h(&mut bytes, out.projected)?;
+                got.push(bytes);
+            }
+            Ok(got)
+        })();
+        IGNORE_WINDOW.with(|ignore| ignore.set(false));
+        let got = result?;
+        eprintln!("attention output window graphs gated={gated}: unit A exact={} unit B exact={}",
+            got[0] == expect[0], got[1] == expect[1]);
+        assert_eq!(got[0], expect[0], "first windowed unit differs from its private run");
+        if gated { assert_eq!(got[1], expect[1], "second windowed unit differs from its private run"); }
+        else { assert_ne!(got[1], expect[1], "ungated replay at a moved window did not go stale"); }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a CUDA GPU"]
+    fn windowed_units_never_replay_a_graph_captured_at_another_offset() -> Result<()> { for _ in 0..3 { run(true)?; } Ok(()) }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and a CUDA GPU"]
+    fn without_the_window_gate_a_moved_window_replays_stale_rows() -> Result<()> { for _ in 0..3 { run(false)?; } Ok(()) }
+}
+
+#[cfg(test)]
 mod tp2_tests {
     use super::*;
     use crate::shared::memory::device::{Allocation,Device};
@@ -622,7 +783,7 @@ mod tp2_tests {
             assert!(split.scales.is_none() && split.tensors.get(&split.names[2]).is_err());
             let mut reference=device.own(||weights.wave(capacity,usize::MAX))?;
             let mut output=device.own(||split.wave(capacity,usize::MAX))?;
-            assert!(output.scratch.is_none() && output.rebind(&weights).is_err());
+            assert!(output.storage.scratch.is_none() && output.rebind(&weights).is_err());
             let halves=[vec![Weights::load(devices[0],&catalog,layer,Kind::OutputB,0,
                 Weights::load_peak_device_bytes(Kind::OutputB))?],
                 vec![Weights::load(devices[1],&catalog,layer,Kind::OutputB,1,
@@ -642,13 +803,13 @@ mod tp2_tests {
                 let tokens:Vec<u64>=(0..rows).map(|i|(cycle*8192+i) as u64).collect();
                 let attention=crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention {
                     values:CuteafdDeviceBuffer {bytes:rows*ROW_BYTES[0],..input.buffer},rows,layer};
-                let stream=reference.stream.raw;
+                let stream=reference.storage.stream.raw;
                 let expected=device.run(||unsafe {
                     reference.prepare_chain_graph(&tokens,stream)?;
                     let result=reference.enqueue_chain_graph(&attention,stream)?;
                     library.cuda_stream_synchronize(stream)?;read(result)
                 })?;
-                let stream=output.stream.raw;
+                let stream=output.storage.stream.raw;
                 device.run(||unsafe {
                     output.prepare_chain_graph(&tokens,stream)?;
                     output.enqueue_grouped_chain_graph(&attention,stream)?;Ok(())
@@ -697,5 +858,21 @@ impl AttentionOutputWeights<'_> {
         self.tensors.visit(prefix, f);
         f(format!("{prefix}grouped_scale"), self.grouped_scales.buffer);
         if let Some(s) = &self.scales { f(format!("{prefix}packed_scale"), s.buffer); }
+    }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn output_storage_bytes_equal_allocation_requests() {
+        for rows in [2048, 2752, 4096, 8192] {
+            for down in [0, 456] {
+                let (grouped, down, alpha, planes) = AttentionOutputStorage::allocation_sizes(123, down, rows);
+                assert_eq!(planes, [65536, 16384, 10240, 8, 256].map(|n|n * rows as usize));
+                assert_eq!(grouped + down + alpha + planes.into_iter().sum::<usize>(),
+                    123 + down + 4 + rows as usize * 92424);
+            }
+        }
     }
 }

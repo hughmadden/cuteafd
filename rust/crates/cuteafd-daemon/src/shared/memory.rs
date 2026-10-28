@@ -19,6 +19,8 @@ pub(crate) mod peer_publication;
 pub(crate) mod proposal_replica;
 #[path = "memory/chain.rs"]
 pub(crate) mod chain;
+#[path = "memory/row_window.rs"]
+pub(crate) mod row_window;
 
 #[path = "memory/budget.rs"]
 pub(crate) mod budget;
@@ -283,6 +285,9 @@ impl LoadStream<'_> {
         while !unsafe { self.library.cuda_stream_query(self.raw)? } {
             tokio::task::yield_now().await;
         }
+        // A completed wait is progress: the host-wait pacing around the
+        // caller's loop restarts its spin (`wait_policy::Backoff`).
+        cuteafd_transport::wait_policy::note_active();
         guard.complete = true;
         Ok(())
     }

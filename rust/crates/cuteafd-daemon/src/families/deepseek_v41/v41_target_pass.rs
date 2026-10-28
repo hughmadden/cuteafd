@@ -33,9 +33,8 @@ mod distributed;
 pub(crate) use distributed::DistributedTargetPass;
 mod verification;
 pub(crate) use verification::VerificationTarget;
-mod encoder_pair;
-mod encoder_stream;
-pub(crate) use taps::{TargetTapWave, TargetTaps};
+mod encoder_units;
+pub(crate) use taps::{TargetTapStorage, TargetTapWave, TargetTaps};
 
 /// Target cache publication used by the independent scheduler's queued dSpark
 /// transaction. Static dispatch keeps ordinary serving on its existing path.
@@ -172,7 +171,20 @@ impl<'a, R> Pass<'a, R> {
         Ok(Some(chain.handle()))
     }
 
-    fn drain_chain(&self) -> Result<()> {
+    /// A prefill unit's device-ordered chain (shared executor): every hook of
+    /// the unit polls in this scope, so its stages order on the device and no
+    /// hook waits on the host for its own GPU or Spark work (#815). Drained
+    /// with [`Self::drain_chain`] at the unit's end.
+    pub(super) fn unit_chain(&self) -> Result<crate::shared::memory::chain::ChainHandle<'a>> {
+        let chain = self.chain.as_ref().context("prefill units need the stage chain (CUTEAFD_STAGE_CHAIN)")?;
+        chain.set_device_order(true);
+        Ok(chain.handle())
+    }
+    /// The pass's native library (its stage chain's).
+    pub(super) fn library(&self) -> Result<&'a cuteafd_ffi::NativeLibrary> {
+        Ok(self.chain.as_ref().context("prefill units need the stage chain (CUTEAFD_STAGE_CHAIN)")?.library())
+    }
+    pub(super) fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
         chain.drain_bounded(Duration::from_secs(60))
     }
@@ -263,6 +275,25 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// `--l2-prefetch` with `budget` bytes per layer (see [`BackboneLane::enable_l2_prefetch`]).
     pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
         self.resources.lane.enable_l2_prefetch(budget)
+    }
+    /// Selects this prefill slot's rows in every component's shared row planes
+    /// (`shared::memory::row_window`), at rest: before a unit begins (its
+    /// window) and before non-unit prefill work (`RowWindow::NONE`). The slot's
+    /// previous work has drained ([`Pass::drain_chain`]).
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        crate::shared::memory::row_window::require_rest(self.state != State::Idle, "prefill slot", "a pass is running or uncommitted")?;
+        let resources = &mut self.resources;
+        // At rest the previous unit's finished outputs are dropped (the next
+        // use restarts every owner); pending work still refuses.
+        resources.index.restart()?;
+        resources.execution.restart();
+        resources.lane.select_window(window.clone())?;
+        resources.index.select_window(window.clone())?;
+        resources.execution.select_window(window.clone())?;
+        resources.embedding.select_window(window.clone())?;
+        resources.upload.select_window(window.clone())?;
+        for gate in &mut resources.gates { gate.select_window(window.clone())?; }
+        resources.taps.select_window(window)
     }
     /// # Safety
     /// All components belong to the same device, capacity and official model.
@@ -496,6 +527,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         if !stage.is_encoder() {
             self.resources.taps.begin(guard.batch.cache()?)?;
         }
+        self.resources.upload.reset()?;
         self.resources.execution.restart_for(stage);
         if stage == CacheStage::Replay {
             let encoder = encoder.context("missing retained encoder suffix")?;
@@ -522,20 +554,30 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 let prepare_timing = Instant::now();
                 self.resources.lane.advance()?;
                 let advance_us = prepare_timing.elapsed().as_micros() as u64;
+                if (2..14).contains(&layer) && !self.resources.upload.staged(1)
+                    && self.resources.upload.can_enqueue(1)? {
+                    if let cuteafd_loader::EngramGatherPoll::Ready(lease) = requests.with_requests(|r| r.poll_engram_layer(guard.batch, 1))? {
+                        self.resources.upload.enqueue_lease(lease, guard.batch.engram_wave()?)?;
+                    }
+                }
                 if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
-                    guard.batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    if !self.resources.upload.staged(gate) {
+                        guard.batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    self.resources.upload.wait_enqueue(gate, self.resources.engram_timeout).await?;
+                    }
                     // Revalidate only after waking; no request-bank borrow spans
                     // admission or mapped I/O. Keep each route's upload/gate order.
                     if requests.cooperative_completion() || crate::shared::memory::chain::active() {
-                        let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
-                        match gathered {
-                            cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
-                                unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
+                        if !self.resources.upload.staged(gate) {
+                            match requests.with_requests(|r| r.poll_engram_gather(guard.batch, &self.resources.lane))? {
+                                cuteafd_loader::EngramGatherPoll::Ready(lease) => self.resources.upload.enqueue_lease(lease, guard.batch.engram_wave()?)?,
+                                cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
+                                cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                             }
-                            cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
-                            cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                         }
+                        let rows = self.resources.upload.consume(gate)?;
+                        unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
+                        self.resources.upload.release_scratch()?;
                     } else {
                         crate::shared::memory::chain::settle(self.resources.upload.library())?;
                         ensure!(unsafe { requests.with_requests(|requests| requests.poll_engram(

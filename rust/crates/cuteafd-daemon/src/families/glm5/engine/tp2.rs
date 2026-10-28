@@ -162,13 +162,13 @@ impl<'a> GlmEngine<'a> {
         self.ensure_prefill_slots()?;
         drop(self.peer_workspaces(true, 1)?);
         for rank in 0..2 {
-            // Depth 1's slot: one unit's rows, the widest a backend sees.
+            // Slot 0: one unit's rows, the widest a backend sees.
             let owned = if rank == 0 {
                 self.prefill_slots.borrow()
             } else {
                 self.peer()?.prefill_slots.borrow()
             };
-            let owned = &owned[0];
+            let owned = &owned[..];
             let decode = if rank == 0 {
                 self.decode_workspace.borrow()
             } else {

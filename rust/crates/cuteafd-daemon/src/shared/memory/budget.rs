@@ -126,16 +126,33 @@ impl FromStr for LocalLayers {
 /// reservations: they can each fit while their combined working set does not.
 pub(crate) fn admit_host_memory(cache: u64, tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
     -> Result<cuteafd_core::memory_layout::HostLayout> {
-    use cuteafd_core::memory_layout::{Basis, Category, Item};
+    admit_host_memory_with_resident_formulas(cache, tables, &[], deferred_logits, headroom)
+}
+
+/// Already allocated native payload and pageable workspace have one formula
+/// owner. Replace their pinned attribution, rather than charging them twice.
+pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&str, u64)],
+    formulas: &[(&str, u64)], deferred_logits: u64, headroom: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
     let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let snapshot = cuteafd_ffi::memory_ledger::snapshot();
-    let resident = snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1).into_iter()
-        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
-        .collect();
+    let resident = host_resident_items(snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
     let ledger = host_admission(memory, resident, cache, tables, deferred_logits, headroom)?;
     tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
         "coordinator host memory admitted");
     Ok(ledger)
+}
+
+fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, usize>, formulas: &[(&str, u64)])
+    -> Vec<cuteafd_core::memory_layout::Item> {
+    use cuteafd_core::memory_layout::{Basis, Category, Item};
+    let mut items: Vec<_> = pinned.into_iter()
+        .filter(|(scope, _)| !formulas.iter().any(|&(name, _)| name == *scope))
+        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+        .collect();
+    items.extend(formulas.iter().map(|&(name, bytes)| Item::new(Category::Staging, name,
+        "pinned payload + pageable sort tuples", bytes, Basis::Formula)));
+    items
 }
 
 fn host_admission((total, available): (u64, u64),
@@ -162,6 +179,38 @@ mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
 
+    #[test]
+    fn engram_host_formula_replaces_payload_attribution_without_double_charge() -> Result<()> {
+        for k in 1..=4 {
+            let rows = 8192usize.div_ceil(k.max(2)).div_ceil(64) * 64;
+            let shape = cuteafd_loader::EngramStagingShape::new(rows, k)?;
+            let formulas = [("v41/engram-prefill", shape.host_resident_bytes() as u64),
+                ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)];
+            let pinned = std::collections::BTreeMap::from([
+                ("v41/engram-prefill", shape.host_slots() * rows * 6337),
+                ("v41/engram-decode", shape.decode_slots() * shape.decode_rows() * 6337),
+                ("unrelated/pinned", 7)]);
+            let items = host_resident_items(pinned, &formulas);
+            assert_eq!(items.len(), 3);
+            for &(name, bytes) in &formulas {
+                let entry = items.iter().find(|item| item.group == name).unwrap();
+                assert_eq!((entry.bytes, entry.basis, entry.lifetime),
+                    (bytes, Basis::Formula, ItemLifetime::ReadyResident));
+            }
+            let workspace = [("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64),
+                ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64)];
+            let workspace_bytes = workspace.iter().map(|f| f.1).sum::<u64>();
+            let ledger = host_admission((2 << 30, 1 << 30), items.clone(), 0, &workspace, 0, 0)?;
+            assert_eq!(ledger.resident_bytes, formulas.iter().map(|f| f.1).sum::<u64>() + 7);
+            assert_eq!(ledger.deferred_bytes, workspace_bytes);
+            assert_eq!(ledger.resident_bytes + ledger.deferred_bytes,
+                (shape.host_bytes() + shape.decode_host_bytes()) as u64 + 7);
+            // Worker vectors/rings do not exist at readiness: they must consume
+            // future availability, not be mislabeled already-resident bytes.
+            assert!(host_admission((2 << 30, workspace_bytes - 1), items, 0, &workspace, 0, 0).is_err());
+        }
+        Ok(())
+    }
     #[test]
     fn named_pinned_tables_are_admitted_without_a_prefix_cache() -> Result<()> {
         let memory = (1000, 800);

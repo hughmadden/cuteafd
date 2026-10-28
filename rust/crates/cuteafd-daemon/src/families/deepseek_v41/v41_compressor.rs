@@ -1,5 +1,6 @@
 //! CSA2 source weights, immutable proposal execution and accepted-prefix state.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::row_window::RowWindow;
 use crate::shared::decode_graph::{GraphBank, GraphOwner};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -329,65 +330,167 @@ impl<'a> CompressorWeights<'a> {
             names,
         })
     }
+    /// A wave with its own single-layer storage: rows, unit and capacity are
+    /// equal (decode lanes, references, tests).
     pub fn wave(&self, rows: usize, budget: usize) -> Result<CompressorWave<'_, 'a>> {
         ensure!(
             CompressorWave::device_bytes(self.layer, rows)? <= budget,
             "compressor wave exceeds budget"
         );
-        let workspace = DeviceAllocation::new(self.library, V41Compressor::WORKSPACE_BYTES)?;
-        ensure!(
-            workspace.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
-            "compressor weights device differs"
-        );
-        let kernel = unsafe { self.library.v41_compressor(workspace.buffer)? };
+        self.on_storage(CompressorStorage::new(self.library, rows, rows, &[self.layer])?)
+    }
+    /// This layer's wave on `storage` (same device).
+    pub fn on_storage(&self, storage: std::rc::Rc<CompressorStorage<'a>>) -> Result<CompressorWave<'_, 'a>> {
+        let plane = storage.planes.iter().position(|p| p.layer == self.layer)
+            .context("compressor storage has no plane for this layer")?;
+        ensure!(storage.input.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
+            "compressor weights device differs");
+        let unit = storage.unit;
         Ok(CompressorWave {
-            stream: LoadStream {
-                library: self.library,
-                raw: self.library.cuda_stream_create()?,
-            },
-            kernel,
+            own_stream: private_stream_for_test().then(|| -> Result<_> { Ok(LoadStream {
+                library: self.library, raw: self.library.cuda_stream_create()? }) }).transpose()?,
+            storage,
+            plane,
+            window: RowWindow::NONE,
+            produced: 0,
             kv: self.library.v41_compressed_kv()?,
-            _workspace: workspace,
             norm: self.library.v41_attention_ops()?,
             weights: self,
-            input: DeviceAllocation::new(self.library, rows * 10240)?,
-            projected: DeviceAllocation::new(
-                self.library,
-                rows * 512 * if self.ratio == 2 { 4 } else { 2 },
-            )?,
-            scores: if self.ratio == 2 {
-                Some(DeviceAllocation::new(self.library, rows * 2048)?)
-            } else {
-                None
-            },
-            descriptors: if self.ratio == 2 {
-                Some(DeviceAllocation::new(self.library, rows * 8)?)
-            } else {
-                None
-            },
-            staging: HostAllocation::new(
-                self.library,
-                rows * if self.ratio == 2 { 16 } else { 8 },
-            )?,
-            positions: DeviceAllocation::new(self.library, rows * 8)?,
-            frequencies: DeviceAllocation::new(self.library, rows * 256)?,
-            index_projected: DeviceAllocation::new(self.library, rows * 256)?,
-            index_key: DeviceAllocation::new(self.library, rows * 256)?,
-            index_packed: DeviceAllocation::new(self.library, rows * 64)?,
-            index_scales: DeviceAllocation::new(self.library, rows * 4)?,
-            kv_values: DeviceAllocation::attention_plane(self.library, rows, V41Kv::COMPRESSED_VALUE_BYTES, "compressed proposal values")?,
-            kv_scales: DeviceAllocation::attention_plane(self.library, rows, V41Kv::COMPRESSED_SCALE_BYTES, "compressed proposal scales")?,
-            cache_destinations: DeviceAllocation::new(self.library, rows * 8)?,
-            output: DeviceAllocation::new(self.library, rows * 1024)?,
-            capacity: rows,
+            staging: HostAllocation::new(self.library, unit * if self.ratio == 2 { 16 } else { 8 })?,
+            capacity: unit,
             graph: None,
             retained_graphs: GraphBank::new(None),
             ready: None,
             pending_query: None,
             pending_commit: None,
+            unsettled: Vec::new(),
             replica: None,
-            commit_staging: HostAllocation::new(self.library, rows*4+256)?,
+            commit_staging: HostAllocation::new(self.library, unit * 4 + 256)?,
+            commit_destinations: HostAllocation::new(self.library, unit * 8)?,
         })
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// Test-only negative control: waves built while set issue on their own
+    /// stream instead of their storage's shared one.
+    pub(crate) static PRIVATE_STREAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only negative control: skip the commit's carry epoch check.
+    pub(crate) static SKIP_CARRY_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn private_stream_for_test() -> bool {
+    #[cfg(test)]
+    { PRIVATE_STREAM.with(|private| private.get()) }
+    #[cfg(not(test))]
+    { false }
+}
+/// One source layer's buffers in a [`CompressorStorage`].
+pub(crate) struct CompressorPlanes<'a> {
+    layer: usize,
+    ratio: usize,
+    /// Row planes at the reserve.
+    kv_values: DeviceAllocation<'a>,
+    kv_scales: DeviceAllocation<'a>,
+    index_packed: DeviceAllocation<'a>,
+    index_scales: DeviceAllocation<'a>,
+    cache_destinations: DeviceAllocation<'a>,
+    /// Carry scratch at the unit cap (see [`CompressorStorage`]).
+    projected: DeviceAllocation<'a>,
+    scores: Option<DeviceAllocation<'a>>,
+    /// Productions of this layer on the storage; a ratio-two commit reads the
+    /// carry only while no later production of the layer overwrote it.
+    epoch: std::cell::Cell<u64>,
+}
+/// The compressed-source producers' storage on one GPU
+/// (`shared::memory::row_window` contract). One stream orders every wave on
+/// it: prefill slots, and the source layers of a lane.
+///
+/// | Buffer | Class | Why |
+/// |---|---|---|
+/// | `kv_values`/`kv_scales`, `index_packed`/`index_scales` (per layer) | row plane | sparse attention and index selection read them on their streams; the commit stores them, in a later hook for decode/verify |
+/// | `cache_destinations` (per layer) | row plane | the commit's H2D lands there and its stores read them (a later hook for decode/verify) |
+/// | `projected`, `scores` (per layer) | carry scratch at the unit cap | consumed by production on this stream; the ratio-two commit then reads one carry row per request (row `accepted - 1`, known only at commit) on this same stream. Stream order protects it until the layer's next production; the commit refuses (epoch check) when another production of the layer came first |
+/// | `input`, `positions`, `frequencies`, `descriptors`, `output`, `index_projected`, `index_key`, compressor workspace | plain scratch at the unit cap, shared by every layer | written and consumed by this stream inside one production; nothing else reads them (`CompressorOutput` exposes them to tests only) |
+/// | position/descriptor `staging`, `commit_staging`, `commit_destinations` | per slot (on the wave) | pinned and rewritten on the host for each unit (#815) |
+pub(crate) struct CompressorStorage<'a> {
+    stream: LoadStream<'a>,
+    kernel: V41Compressor<'a>,
+    _workspace: DeviceAllocation<'a>,
+    input: DeviceAllocation<'a>,
+    descriptors: Option<DeviceAllocation<'a>>,
+    positions: DeviceAllocation<'a>,
+    frequencies: DeviceAllocation<'a>,
+    index_projected: DeviceAllocation<'a>,
+    index_key: DeviceAllocation<'a>,
+    output: DeviceAllocation<'a>,
+    planes: Vec<CompressorPlanes<'a>>,
+    /// Rows the planes span (the reserve); scratch runs up to `unit`.
+    rows: usize,
+    unit: usize,
+}
+impl<'a> CompressorStorage<'a> {
+    /// Shared plain scratch for units of up to `unit` rows over `layers`.
+    pub fn scratch_bytes(layers: &[usize], unit: usize) -> Result<usize> {
+        let paired = layers.iter().map(|&l| ratio(l)).collect::<Result<Vec<_>>>()?.contains(&2);
+        Ok(V41Compressor::WORKSPACE_BYTES + unit * (10240 + 8 + 256 + 256 + 256 + 1024 + if paired { 8 } else { 0 }))
+    }
+    /// One layer's planes over `rows` rows and carry scratch over `unit`.
+    pub fn plane_bytes(layer: usize, rows: usize, unit: usize) -> Result<usize> {
+        Ok(rows * (V41Kv::COMPRESSED_ROW_BYTES + 64 + 4 + 8)
+            + unit * if ratio(layer)? == 2 { 2048 + 2048 } else { 1024 })
+    }
+    pub fn device_bytes(layers: &[usize], rows: usize, unit: usize) -> Result<usize> {
+        ensure!((1..=4096).contains(&unit) && unit <= rows, "invalid compressor unit {unit} of {rows} rows");
+        layers.iter().try_fold(Self::scratch_bytes(layers, unit)?, |total, &layer|
+            Ok(total + Self::plane_bytes(layer, rows, unit)?))
+    }
+    /// Planes for source `layers` over `rows` reserve rows; scratch for units
+    /// of up to `unit` rows. Every wave on it issues on its one stream.
+    pub fn new(library: &'a NativeLibrary, rows: usize, unit: usize, layers: &[usize]) -> Result<std::rc::Rc<Self>> {
+        Self::device_bytes(layers, rows, unit)?;
+        ensure!(rows <= crate::shared::memory::row_window::MAX_RESERVE_ROWS.max(4096),
+            "compressor storage of {rows} rows exceeds the reserve");
+        let paired = layers.iter().any(|&l| ratio(l).is_ok_and(|r| r == 2));
+        let workspace = DeviceAllocation::new(library, V41Compressor::WORKSPACE_BYTES)?;
+        let kernel = unsafe { library.v41_compressor(workspace.buffer)? };
+        Ok(std::rc::Rc::new(Self {
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            kernel,
+            _workspace: workspace,
+            input: DeviceAllocation::new(library, unit * 10240)?,
+            descriptors: paired.then(|| DeviceAllocation::new(library, unit * 8)).transpose()?,
+            positions: DeviceAllocation::new(library, unit * 8)?,
+            frequencies: DeviceAllocation::new(library, unit * 256)?,
+            index_projected: DeviceAllocation::new(library, unit * 256)?,
+            index_key: DeviceAllocation::new(library, unit * 256)?,
+            output: DeviceAllocation::new(library, unit * 1024)?,
+            planes: layers.iter().map(|&layer| {
+                let ratio = ratio(layer)?;
+                Ok(CompressorPlanes {
+                    layer,
+                    ratio,
+                    kv_values: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_VALUE_BYTES, "compressed proposal values")?,
+                    kv_scales: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_SCALE_BYTES, "compressed proposal scales")?,
+                    index_packed: DeviceAllocation::new(library, rows * 64)?,
+                    index_scales: DeviceAllocation::new(library, rows * 4)?,
+                    cache_destinations: DeviceAllocation::new(library, rows * 8)?,
+                    projected: DeviceAllocation::new(library, unit * 512 * if ratio == 2 { 4 } else { 2 })?,
+                    scores: (ratio == 2).then(|| DeviceAllocation::new(library, unit * 2048)).transpose()?,
+                    epoch: std::cell::Cell::new(0),
+                })
+            }).collect::<Result<Vec<_>>>()?,
+            rows,
+            unit,
+        }))
+    }
+    pub fn rows(&self) -> usize { self.rows }
+    pub fn unit(&self) -> usize { self.unit }
+}
+impl Drop for CompressorStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: owned stream; its queued work reads only this storage.
+        crate::shared::decode_graph::fatal_drain(
+            unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }, "compressor storage");
     }
 }
 struct Prepared {
@@ -526,27 +629,20 @@ impl IndexProposal<'_> {
     }
 }
 pub(crate) struct CompressorWave<'w, 'a> {
-    stream: LoadStream<'a>,
-    kernel: V41Compressor<'a>,
+    /// Test-only negative control: a stream of its own.
+    own_stream: Option<LoadStream<'a>>,
+    storage: std::rc::Rc<CompressorStorage<'a>>,
+    /// This layer's planes in `storage`.
+    plane: usize,
+    /// This unit's rows in the planes (`RowWindow::NONE`: from row 0).
+    window: RowWindow,
+    /// The layer epoch of this wave's last production (carry check).
+    produced: u64,
     kv: V41Kv<'a>,
-    _workspace: DeviceAllocation<'a>,
     norm: V41AttentionOps<'a>,
     weights: &'w CompressorWeights<'a>,
-    input: DeviceAllocation<'a>,
-    projected: DeviceAllocation<'a>,
-    scores: Option<DeviceAllocation<'a>>,
-    descriptors: Option<DeviceAllocation<'a>>,
+    /// Per slot: descriptors and positions rewritten on the host per unit.
     staging: HostAllocation<'a>,
-    positions: DeviceAllocation<'a>,
-    frequencies: DeviceAllocation<'a>,
-    index_projected: DeviceAllocation<'a>,
-    index_key: DeviceAllocation<'a>,
-    index_packed: DeviceAllocation<'a>,
-    index_scales: DeviceAllocation<'a>,
-    kv_values: DeviceAllocation<'a>,
-    kv_scales: DeviceAllocation<'a>,
-    cache_destinations: DeviceAllocation<'a>,
-    output: DeviceAllocation<'a>,
     capacity: usize,
     graph: Option<(*mut c_void, usize, u64)>,
     // Lane-local decode shapes; large prefill retains only the current graph.
@@ -554,9 +650,54 @@ pub(crate) struct CompressorWave<'w, 'a> {
     ready: Option<Prepared>,
     pending_query: Option<(Prepared, bool)>,
     pending_commit: Option<PendingCommit>,
+    /// Slots a device-ordered direct commit advanced before its queued write
+    /// completed (see `WindowWave::unsettled`, hunt C #2).
+    unsettled: Vec<usize>,
     replica: Option<(std::rc::Rc<SourceReplica<'a>>,
         crate::shared::memory::peer_publication::PeerPublication<'a>)>,
     commit_staging: HostAllocation<'a>,
+    /// Commit destinations: their own pinned buffer. An async H2D reads pinned
+    /// staging when it executes, so no two queued uses share one (the producer's
+    /// descriptors/positions copy may not have run when a device-ordered commit
+    /// is staged, #815).
+    commit_destinations: HostAllocation<'a>,
+}
+impl<'a> CompressorWave<'_, 'a> {
+    fn stream(&self) -> &LoadStream<'a> { self.own_stream.as_ref().unwrap_or(&self.storage.stream) }
+    fn kernel(&self) -> &V41Compressor<'a> { &self.storage.kernel }
+    fn planes(&self) -> &CompressorPlanes<'a> { &self.storage.planes[self.plane] }
+    fn kv_values(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_values.buffer, V41Kv::COMPRESSED_VALUE_BYTES) }
+    fn kv_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_scales.buffer, V41Kv::COMPRESSED_SCALE_BYTES) }
+    fn index_packed(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_packed.buffer, 64) }
+    fn index_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_scales.buffer, 4) }
+    fn cache_destinations(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().cache_destinations.buffer, 8) }
+    fn projected(&self) -> CuteafdDeviceBuffer { self.planes().projected.buffer }
+    fn scores(&self) -> Option<CuteafdDeviceBuffer> { self.planes().scores.as_ref().map(|s| s.buffer) }
+    /// Records this wave's production of the layer (host order = stream order).
+    fn mark_produced(&mut self) {
+        let epoch = self.planes().epoch.get() + 1;
+        self.planes().epoch.set(epoch);
+        self.produced = epoch;
+    }
+    /// The carry scratch still holds this wave's production.
+    fn carry_intact(&self) -> bool {
+        #[cfg(test)]
+        if SKIP_CARRY_CHECK.with(|skip| skip.get()) { return true; }
+        self.planes().epoch.get() == self.produced
+    }
+    /// Selects this slot's unit rows in the storage's planes, at rest
+    /// (`shared::memory::row_window`). Windowed production runs eagerly.
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        crate::shared::memory::row_window::require_rest(self.ready.is_some() || self.pending_query.is_some() || self.pending_commit.is_some(),
+            "compressor", "a proposal or commit is pending")?;
+        if let Some(range) = window.range() {
+            ensure!(range.end <= self.storage.rows && range.len() <= self.capacity,
+                "compressor window {range:?} outside {} rows or wider than the {}-row unit",
+                self.storage.rows, self.capacity);
+        }
+        self.window = window;
+        Ok(())
+    }
 }
 impl<'w, 'a> CompressorWave<'w, 'a> {
     pub fn device_bytes(layer: usize, rows: usize) -> Result<usize> {
@@ -564,21 +705,15 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             (1..=4096).contains(&rows),
             "invalid compressor row capacity"
         );
-        Ok(V41Compressor::WORKSPACE_BYTES
-            + rows
-                * if ratio(layer)? == 2 {
-                    10240 + 2048 + 2048 + 8 + 1024 + 264 + 512 + 68 + 8 + V41Kv::COMPRESSED_ROW_BYTES
-                } else {
-                    10240 + 1024 + 1024 + 264 + 512 + 68 + 8 + V41Kv::COMPRESSED_ROW_BYTES
-                })
+        CompressorStorage::device_bytes(&[layer], rows, rows)
     }
     /// Packed BF16 [sum(chunk.tokens),5120], in chunk order. Finish all producer
     /// writes before execution, and keep this borrowed storage live until drop.
     pub fn input(&self) -> CuteafdDeviceBuffer {
-        self.input.buffer
+        self.storage.input.buffer
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        unsafe { self.stream().library.cuda_stream_synchronize(self.stream().raw) }
     }
     fn prepare(
         &mut self,
@@ -597,12 +732,12 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             "invalid compressor batch count"
         );
         ensure!(
-            state.index.packed.buffer.device_id == self.input.buffer.device_id,
+            state.index.packed.buffer.device_id == self.storage.input.buffer.device_id,
             "compressor index cache device differs"
         );
         if let Some(pending) = &state.pending {
             ensure!(
-                pending[0].buffer.device_id == self.input.buffer.device_id,
+                pending[0].buffer.device_id == self.storage.input.buffer.device_id,
                 "compressor state device differs"
             );
         }
@@ -667,25 +802,29 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             }
             result.rows = end;
         }
+        ensure!(self.window.admits(result.rows), "compressor rows differ from the unit's window");
+        // Host prepare order is this stream's production order: a later
+        // production of the layer overwrites the carry scratch.
+        self.mark_produced();
         Ok(result)
     }
+    /// Host-synchronous upload (legacy-stream copies). Those do not order
+    /// with the non-blocking producer stream, which other slots may share, so
+    /// it drains first: no queued production still reads the shared
+    /// positions/descriptors scratch or this slot's staging.
     fn upload(&mut self, prepared: &Prepared) -> Result<()> {
-        let offset = if self.descriptors.is_some() {
-            prepared.rows * 8
-        } else {
-            0
-        };
+        let library = self.stream().library;
+        self.synchronize()?;
+        let offset = if self.weights.ratio == 2 { prepared.rows * 8 } else { 0 };
         let bytes = self.staging.bytes_mut();
-        if let Some(device) = &self.descriptors {
+        if let Some(device) = self.storage.descriptors.as_ref().filter(|_| self.weights.ratio == 2) {
             for (chunk, value) in bytes[..offset]
                 .chunks_exact_mut(8)
                 .zip(&prepared.descriptors)
             {
                 chunk.copy_from_slice(&value.to_ne_bytes());
             }
-            self.stream
-                .library
-                .copy_h2d(device.buffer, &bytes[..offset])?;
+            library.copy_h2d(device.buffer, &bytes[..offset])?;
         }
         let positions = &mut bytes[offset..offset + prepared.rows * 8];
         positions.fill(0);
@@ -693,14 +832,12 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             positions[row.source_row as usize * 8..row.source_row as usize * 8 + 8]
                 .copy_from_slice(&row.position.to_ne_bytes());
         }
-        self.stream
-            .library
-            .copy_h2d(self.positions.buffer, positions)?;
+        library.copy_h2d(self.storage.positions.buffer, positions)?;
         Ok(())
     }
     fn upload_queued(&mut self, prepared: &Prepared) -> Result<()> {
         let host = self.staging.buffer;
-        let offset = if self.descriptors.is_some() { prepared.rows * 8 } else { 0 };
+        let offset = if self.weights.ratio == 2 { prepared.rows * 8 } else { 0 };
         let bytes = self.staging.bytes_mut();
         for (dst, value) in bytes[..offset].chunks_exact_mut(8).zip(&prepared.descriptors) {
             dst.copy_from_slice(&value.to_ne_bytes());
@@ -712,99 +849,99 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 .copy_from_slice(&row.position.to_ne_bytes());
         }
         unsafe {
-            if let Some(device) = &self.descriptors {
-                self.stream.library.copy_host_buffer_h2d_async(device.buffer, host, offset, self.stream.raw)?;
+            if let Some(device) = self.storage.descriptors.as_ref().filter(|_| self.weights.ratio == 2) {
+                self.stream().library.copy_host_buffer_h2d_async(device.buffer, host, offset, self.stream().raw)?;
             }
             let mut positions = host;
             positions.ptr = host.ptr.cast::<u8>().add(offset).cast();
             positions.bytes = prepared.rows * 8;
-            self.stream.library.copy_host_buffer_h2d_async(self.positions.buffer, positions,
-                prepared.rows * 8, self.stream.raw)
+            self.stream().library.copy_host_buffer_h2d_async(self.storage.positions.buffer, positions,
+                prepared.rows * 8, self.stream().raw)
         }
     }
     unsafe fn enqueue(&self, state: &CompressorState<'_>, rows: usize) -> Result<()> {
         unsafe {
             self.norm.backbone_frequencies(
-                self.positions.buffer,
-                self.frequencies.buffer,
+                self.storage.positions.buffer,
+                self.storage.frequencies.buffer,
                 rows as u32,
                 self.weights.layer as u32,
-                self.stream.raw,
+                self.stream().raw,
             )?;
-            self.kernel.project(
-                self.input.buffer,
+            self.kernel().project(
+                self.storage.input.buffer,
                 self.weights.tensors.get(&self.weights.names[0])?,
-                self.projected.buffer,
+                self.projected(),
                 rows,
                 self.weights.ratio,
-                self.stream.raw,
+                self.stream().raw,
             )?;
             if let Some(pending) = &state.pending {
-                self.kernel.project(
-                    self.input.buffer,
+                self.kernel().project(
+                    self.storage.input.buffer,
                     self.weights.tensors.get(&self.weights.names[2])?,
-                    self.scores.as_ref().unwrap().buffer,
+                    self.scores().unwrap(),
                     rows,
                     2,
-                    self.stream.raw,
+                    self.stream().raw,
                 )?;
-                self.kernel.pool(
-                    self.projected.buffer,
-                    self.scores.as_ref().unwrap().buffer,
+                self.kernel().pool(
+                    self.projected(),
+                    self.scores().unwrap(),
                     pending[0].buffer,
                     pending[1].buffer,
-                    self.descriptors.as_ref().unwrap().buffer,
+                    self.storage.descriptors.as_ref().unwrap().buffer,
                     self.weights.tensors.get(&self.weights.names[1])?,
-                    self.output.buffer,
+                    self.storage.output.buffer,
                     rows,
                     state.slot_count,
-                    self.stream.raw,
+                    self.stream().raw,
                 )?;
             } else {
                 self.norm.norm(
-                    self.projected.buffer,
+                    self.projected(),
                     self.weights.tensors.get(&self.weights.names[1])?,
                     None,
-                    self.output.buffer,
+                    self.storage.output.buffer,
                     rows as u32,
                     512,
-                    self.stream.raw,
+                    self.stream().raw,
                 )?;
             }
-            self.kernel.index_project(
-                self.output.buffer,
+            self.kernel().index_project(
+                self.storage.output.buffer,
                 self.weights
                     .tensors
                     .get(&self.weights.names[self.weights.names.len() - 2])?,
-                self.index_projected.buffer,
+                self.storage.index_projected.buffer,
                 rows,
-                self.stream.raw,
+                self.stream().raw,
             )?;
             self.norm.norm(
-                self.index_projected.buffer,
+                self.storage.index_projected.buffer,
                 self.weights
                     .tensors
                     .get(&self.weights.names[self.weights.names.len() - 1])?,
-                Some(self.frequencies.buffer),
-                self.index_key.buffer,
+                Some(self.storage.frequencies.buffer),
+                self.storage.index_key.buffer,
                 rows as u32,
                 128,
-                self.stream.raw,
+                self.stream().raw,
             )?;
-            self.kernel.index_pack(
-                self.index_key.buffer,
-                self.index_packed.buffer,
-                self.index_scales.buffer,
+            self.kernel().index_pack(
+                self.storage.index_key.buffer,
+                self.index_packed(),
+                self.index_scales(),
                 rows,
-                self.stream.raw,
+                self.stream().raw,
             )?;
             self.kv.pack(
-                self.output.buffer,
-                Some(self.frequencies.buffer),
-                self.kv_values.buffer,
-                self.kv_scales.buffer,
+                self.storage.output.buffer,
+                Some(self.storage.frequencies.buffer),
+                self.kv_values(),
+                self.kv_scales(),
                 rows,
-                self.stream.raw,
+                self.stream().raw,
             )?;
         }
         Ok(())
@@ -817,21 +954,21 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(query.binding()?.layer() == self.weights.layer && query.layer == self.weights.layer
             && query.rows == prepared.rows && query.hidden.bytes == prepared.rows * 10240
-            && query.hidden.device_id == self.input.buffer.device_id
+            && query.hidden.device_id == self.storage.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
         let forced_eager = crate::shared::decode_graph::census::eager("layer_row")
-            || !super::graph_policy::captures_shape(prepared.rows as u32);
+            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
-            unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
-            unsafe { self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
-                query.hidden.bytes, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::join_fork(self.stream().library, self.stream().raw)?; }
+            unsafe { self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,
+                query.hidden.bytes, self.stream().raw)?; }
             self.upload_queued(&prepared)?;
             unsafe {
-                crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
                     prepared.rows, if capture || forced_eager { None } else { self.graph.map(|(raw,_,_)|raw) },
                     || self.enqueue(state, prepared.rows))
             }
@@ -847,15 +984,15 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             let (prepared, capture) = self.pending_query.as_ref().context("no queued cache query")?;
             ensure!(prepared.owner == state.owner, "queued cache owner differs");
             let chained = crate::shared::memory::chain::active();
-            if !chained && !unsafe { self.stream.library.cuda_stream_query(self.stream.raw)? } { return Ok(false); }
+            if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
             if *capture {
-                unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
+                unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
                 let queued = unsafe { self.enqueue(state, prepared.rows) };
-                let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+                let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
                 let graph = match (queued, captured) {
                     (Ok(()), Ok(graph)) => graph,
                     (Err(error), Ok(graph)) => {
-                        unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
+                        unsafe { self.stream().library.cuda_graph_exec_destroy(graph)?; }
                         return Err(error);
                     }
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
@@ -864,7 +1001,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
-            if chained { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; } }
+            if chained { unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw)?; } }
             self.ready = Some(self.pending_query.take().unwrap().0);
             self.output(state)?;
             Ok(true)
@@ -894,32 +1031,35 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             && query.layer == self.weights.layer
             && query.rows == prepared.rows
             && query.hidden.bytes == prepared.rows * 10240
-            && query.hidden.device_id == self.input.buffer.device_id
+            && query.hidden.device_id == self.storage.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))),
             "compressor query layer, rows or positions differ");
+        // Windowed units run eagerly: graphs bake row-0 plane pointers.
+        let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
-            && self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner) {
-            // Captured shape: order the producer on the chain (forked from the
-            // query's normalized input) instead of draining it on the host.
-            let graph = self.graph.unwrap().0;
+            && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
+            // Order the producer on the chain (forked from the query's
+            // normalized input) instead of draining it on the host: a captured
+            // shape replays, an uncaptured prefill width launches eagerly.
+            let graph = if uncaptured { None } else { Some(self.graph.unwrap().0) };
             let queued = (|| -> Result<()> { unsafe {
-                crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?;
-                self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
-                    query.hidden.bytes, self.stream.raw)?;
+                crate::shared::memory::chain::join_fork(self.stream().library, self.stream().raw)?;
+                self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,
+                    query.hidden.bytes, self.stream().raw)?;
                 self.upload_queued(&prepared)?;
-                crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
-                    prepared.rows, Some(graph), || self.enqueue(state, prepared.rows))?;
-                crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)
+                crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
+                    prepared.rows, graph, || self.enqueue(state, prepared.rows))?;
+                crate::shared::memory::chain::finish(self.stream().library, self.stream().raw)
             } })();
             if let Err(error) = queued { self.synchronize()?; return Err(error); }
             self.ready = Some(prepared);
             return self.output(state);
         }
-        crate::shared::memory::chain::settle(self.stream.library)?;
+        crate::shared::memory::chain::settle(self.stream().library)?;
         self.synchronize()?;
-        self.stream.library.copy_d2d(self.input.buffer, query.hidden, query.hidden.bytes)?;
-        if !super::graph_policy::captures_shape(prepared.rows as u32) {
+        self.stream().library.copy_d2d(self.storage.input.buffer, query.hidden, query.hidden.bytes)?;
+        if uncaptured {
             // An uncached prefill tail: run it once eagerly, never capture it.
             return unsafe { self.execute(state, chunks) };
         }
@@ -953,18 +1093,18 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         chunks: &[CompressorChunk],
     ) -> Result<()> {
         self.ready = None;
-        ensure!(self.graph.is_none(), "compressor graph already captured");
+        ensure!(self.graph.is_none() && !self.window.is_windowed(), "compressor graph already captured or windowed");
         unsafe {
             self.execute(state, chunks)?;
         }
         let prepared = self.prepare(state, chunks)?;
         unsafe {
-            self.stream
+            self.stream()
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.stream().raw)?;
         }
         let launched = unsafe { self.enqueue(state, prepared.rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 self.insert_graph(graph, prepared.rows, state.owner)?;
@@ -972,7 +1112,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             }
             (Err(error), Ok(graph)) => {
                 unsafe {
-                    self.stream.library.cuda_graph_exec_destroy(graph)?;
+                    self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(error)
             }
@@ -987,6 +1127,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         chunks: &[CompressorChunk],
     ) -> Result<CompressorOutput<'s>> {
         let prepared = self.prepare(state, chunks)?;
+        ensure!(!self.window.is_windowed(), "windowed compressor production is eager");
         let (graph, rows, owner) = self.graph.context("compressor graph is not captured")?;
         ensure!(
             rows == prepared.rows && owner == state.owner,
@@ -994,7 +1135,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         );
         self.upload(&prepared)?;
         let launched = unsafe {
-            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+            crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
                 rows, Some(graph), || self.enqueue(state, rows))
         };
         let drained = self.synchronize();
@@ -1019,19 +1160,21 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 "stale compressor output"
             );
         }
-        let mut buffer = self.output.buffer;
+        let mut buffer = self.storage.output.buffer;
         buffer.bytes = prepared.rows * 1024;
-        let mut frequencies = self.frequencies.buffer;
+        // The scratch (output, frequencies, index key) is only current until
+        // the storage's next production; the planes are this unit's rows.
+        let mut frequencies = self.storage.frequencies.buffer;
         frequencies.bytes = prepared.rows * 256;
-        let mut index_key = self.index_key.buffer;
+        let mut index_key = self.storage.index_key.buffer;
         index_key.bytes = prepared.rows * 256;
-        let mut index_packed = self.index_packed.buffer;
+        let mut index_packed = self.index_packed();
         index_packed.bytes = prepared.rows * 64;
-        let mut index_scales = self.index_scales.buffer;
+        let mut index_scales = self.index_scales();
         index_scales.bytes = prepared.rows * 4;
-        let mut kv_values = self.kv_values.buffer;
+        let mut kv_values = self.kv_values();
         kv_values.bytes = prepared.rows * V41Kv::COMPRESSED_VALUE_BYTES;
-        let mut kv_scales = self.kv_scales.buffer;
+        let mut kv_scales = self.kv_scales();
         kv_scales.bytes = prepared.rows * V41Kv::COMPRESSED_SCALE_BYTES;
         Ok(CompressorOutput {
             kv_values,
@@ -1122,7 +1265,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             return self.clear_graph_inner(drain);
         }
         self.ready = None;
-        if drain { self.synchronize()?; } else { self.stream.require_complete()?; }
+        if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
         self.graph = None;
         if rows > 64 && self.retained_graphs.count(|&(r, _)| r > 64 && r != rows)
             >= crate::shared::decode_graph::LARGE_SHAPES {
@@ -1134,7 +1277,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         Ok(())
     }
     fn insert_graph(&mut self, graph: *mut c_void, rows: usize, owner: u64) -> Result<()> {
-        let library = self.stream.library;
+        let library = self.stream().library;
         let device = library.cuda_get_device()?;
         // SAFETY: weights are borrowed and the containing wave retains workspace
         // and buffers; the cache owner is unchanged until a drained bank clear.
@@ -1153,7 +1296,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         ensure!(self.pending_query.is_none(), "cannot clear pending cache query");
         ensure!(self.pending_commit.is_none(), "cannot reset a pending source commit");
         self.ready = None;
-        if drain { self.synchronize()?; } else { self.stream.require_complete()?; }
+        if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
         self.graph = None;
         self.retained_graphs.retire_all();
         drop(self.retained_graphs.drain_retired(|| Ok(()))?);

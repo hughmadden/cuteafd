@@ -72,10 +72,6 @@ pub(crate) struct EngineArgs {
     /// Units in flight; 0 selects the shared policy within executor capability.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_waves: u8,
-    /// Admitted prefill slots of a resolved deployment (#762); 0/unset resolves
-    /// them. Equal to the waves on a static family.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
-    pub prefill_slots: u8,
     /// Explicit per-unit rows for diagnostic cuts, including N=1.
     #[arg(long)]
     pub prefill_units: Option<usize>,
@@ -247,7 +243,7 @@ impl EngineArgs {
                 unit_rows: self.prefill_units.or((self.prefill_rows > 0).then_some(self.prefill_rows)).map(|r| r as u64),
                 waves: (self.prefill_waves > 0).then_some(u64::from(self.prefill_waves)),
                 span_rows: self.prefill_units.and_then(|_| (self.prefill_rows > 0).then_some(self.prefill_rows as u64)),
-                slots: (self.prefill_slots > 0).then_some(u64::from(self.prefill_slots)),
+                reserve_rows: None,
             })?;
         ensure!(shape.waves == 1 || self.peers.is_some() || self.shared_only,
             "Qwen prefill units need Spark experts or shared-only diagnostics");

@@ -5450,26 +5450,32 @@ Ideas TJ wants kept for later; not v2 work.
 
 Every family that sends experts to Sparks prefills the same way.
 
-- **Units:** the prompt runs as a continuous stream of row units: a
-  planner-admitted maximum of k units in flight inside one 8192-row reserve
-  (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
-  capacity (k = 2/3/4 → 4096/2752/2048). Each family descriptor supplies a
-  base estimate: Spark compute S_ref at a reference unit and N_ref Sparks,
-  plus raptor turnaround T. Shared code scales S = S_ref × N_ref / N and
-  admits k = ⌈T/S⌉ + 1, at most 4 and bounded by the hard executor/arena
-  capacities; zero Sparks use one wave. Families without independent S/T use
-  their measured best k, explicitly sourced in the descriptor. Unmeasured
-  families keep a conservative estimate; hard constraints (Qwen's two-slot
-  mapped-PLE ring) are separate. Planner, serve and golden consume the same
-  descriptor; there are no shared family-name constants, per-family automatic
-  row caps or Spark-count thresholds. Supported explicit pins override the
-  estimate, never hard capacities. Runtime S/T refinement (#762 stages 2–4)
-  follows separately. A short prompt that cannot half-fill units uses fewer
-  waves without reallocating or recapturing.
-  `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
-  5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
-  (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
-  fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.
+- **Units (fixed 3, TJ 2026-10-28):** the prompt runs as a continuous
+  stream of row units, three in flight, cut from one reserve: units of
+  roundup64(reserve / 3) rows (3 × 2752 in the standard 8192-row reserve,
+  span 8256). Zero Sparks use one unit; a family whose executor holds fewer
+  units (Qwen 4's two-slot mapped-PLE ring, #717) is capped by that hard
+  capacity, not by a preference. The reserve is sized before KV and never
+  shrunk for KV or onboarded layers (TJ, 2026-10-27/28): 8192 rows, or on a
+  card where that doesn't fit the largest multiple of 64 rows that does, and
+  the depth cuts whatever reserve fits (a reserve too small for three
+  ≥256-row units is reported unfit, never special-cased). Planner, serve and
+  golden consume the same shape. `PREFILL_WAVES`/`PREFILL_ROWS` remain plain
+  config for measurement arms. A short prompt that cannot half-fill units
+  uses fewer waves without reallocating or recapturing.
+  - **Why fixed, not adaptive (#762 removed).** Every measured layout ran
+    best at three: 1 RTX + 4 Sparks (calibration ratios k2 1.24 / k3 1.00 /
+    k4 1.02), sim-5090 (1.15 / 1.00 / 1.02), and 2 RTX with every encoder
+    layer onboarded (ref-tp4 and max, cards47: k3 beat one 4096-row unit by
+    9–13% and k2 lost on max). The adaptive controller lost 5–7% to its own
+    serving re-tests, which locked whole prompts at k2/k4 under the
+    no-wider-mid-prompt rule, and its startup calibration was warm-up
+    biased (k4 measured last) and cost 4–7 s of readiness. The controller,
+    calibration and evidence store, per-call pace reporting, the per-call
+    link re-cut, the fourth admitted slot and the Spark-free one-window rule
+    were all deleted. MiMo still runs its own transport lanes (a lane is a
+    full 4096-row workspace and link, not a cut of the reserve) until #671
+    moves it onto the shared executor.
 - **One transport, N waves:** each unit's expert wave goes out on one
   transport that admits N outstanding waves, each with its own return slot.
   The Spark side already pipelines (rings 8 deep, in order); only the
@@ -5486,8 +5492,8 @@ Every family that sends experts to Sparks prefills the same way.
   chunk boundaries, so the Sparks don't drain between units.
 - **Head:** logits only for the rows serving needs. Prefix snapshots happen at
   the unit boundary that carries the prompt or turn end.
-- **Admission:** k × unit rows × row-owned bytes, plus one unit of scratch,
-  plus k return slots, charged before allocation.
+- **Admission:** 3 × unit rows × row-owned bytes, plus one unit of
+  scratch, plus 3 return slots, charged before allocation.
 - **Why units and not windows inside a chunk:** per-row workspace dominates
   (V4.1 max: 8.0 / 5.8 GiB for 2 × 2048 rows, ~2 MiB/row). Lanes and windows
   cost the same memory for the same rows in flight. Units keep full-size

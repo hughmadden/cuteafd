@@ -659,6 +659,14 @@ impl<'a> OwnerWeights<'a> {
             Self::Exl3(w) => w.max_rows(),
         }
     }
+    /// The same resident weights admitted at `max_rows` (one load serves the
+    /// prefill arena at the unit cap and the decode lanes at their width).
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        Ok(match self {
+            Self::Native(w) => Self::Native(w.with_max_rows(max_rows)?),
+            Self::Exl3(w) => Self::Exl3(w.with_max_rows(max_rows)?),
+        })
+    }
     fn execution(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<OwnerExecution<'a>> {
         Ok(match self {
             Self::Native(w) => {
@@ -716,6 +724,37 @@ struct OwnerRank<'a> {
     execution: OwnerExecution<'a>,
 }
 
+/// The loader and admission share the same arithmetic/output selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerPolicy<'p> {
+    Native {
+        selection: super::RtxSelectionPolicy,
+        output: super::native::NativeOutputPolicy,
+        nvfp4: bool,
+    },
+    Exl3 {
+        package: &'p std::path::Path,
+        selection: super::RtxSelectionPolicy,
+    },
+}
+impl<'p> OwnerPolicy<'p> {
+    pub(crate) fn native(library: &NativeLibrary, nvfp4: bool) -> Result<Self> {
+        Ok(Self::native_for(nvfp4, library.v41_tp2_expert_reducer()?.supports_route_sums()))
+    }
+    fn native_for(nvfp4: bool, route_sums: bool) -> Self {
+        Self::Native {
+            selection: if nvfp4 { super::RtxSelectionPolicy::FirstCapacity }
+                else { super::RtxSelectionPolicy::CanonicalDecode },
+            output: if nvfp4 || !route_sums { super::native::NativeOutputPolicy::KernelPlanes }
+                else { super::native::NativeOutputPolicy::TokenSums },
+            nvfp4,
+        }
+    }
+    pub(crate) fn exl3(package: &'p std::path::Path) -> Self {
+        Self::Exl3 { package, selection: super::RtxSelectionPolicy::CanonicalDecode }
+    }
+}
+
 pub(crate) struct OwnerPair<'a> {
     reductions: [super::combine::OwnerReduce<'a>; 2],
     ranks: [OwnerRank<'a>; 2],
@@ -724,47 +763,25 @@ pub(crate) struct OwnerPair<'a> {
     geometry: cuteafd_core::ExpertGeometry,
 }
 impl<'a> OwnerPair<'a> {
-    pub(crate) fn device_bytes(
-        library: &NativeLibrary,
-        capacity: u32,
-        nvfp4: bool,
-        geometry: cuteafd_core::ExpertGeometry,
-    ) -> Result<usize> {
-        cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
-        super::native::NativeTp2::workspace_bytes_for_format(
-            library,
-            capacity as usize,
-            if nvfp4 {
-                super::RtxSelectionPolicy::FirstCapacity
-            } else {
-                super::RtxSelectionPolicy::CanonicalDecode
-            },
-            super::native::NativeOutputPolicy::KernelPlanes,
-            nvfp4,
-        )?
-        .checked_add(super::combine::OwnerReduce::workspace_bytes(
-            capacity, geometry,
-        )?)
-        .context("owner expert workspace overflow")
+    /// Exact per-GPU arena requests for the policy used to load the weights.
+    pub(crate) fn device_bytes_for(library: &NativeLibrary, capacity: u32,
+        geometry: cuteafd_core::ExpertGeometry, policy: OwnerPolicy<'_>) -> Result<usize> {
+        let backend = match policy {
+            OwnerPolicy::Native { selection, output, nvfp4 } =>
+                super::native::NativeTp2::allocation_sizes_for_format(library,
+                    capacity as usize, selection, output, nvfp4)?,
+            OwnerPolicy::Exl3 { package, selection } =>
+                super::exl3::Exl3Tp2::allocation_sizes_for_selection(package,
+                    geometry.hidden as usize, capacity as usize,
+                    cuteafd_core::Exl3RowPolicy::for_geometry(geometry), selection)?,
+        };
+        Self::allocation_sizes(backend, capacity, geometry)?.into_iter()
+            .try_fold(0usize, |sum, n| sum.checked_add(n).context("owner arena overflow"))
     }
-
-    pub(crate) fn exl3_device_bytes(
-        package: &std::path::Path,
-        capacity: u32,
-        geometry: cuteafd_core::ExpertGeometry,
-    ) -> Result<usize> {
-        cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
-        super::exl3::Exl3Tp2::workspace_bytes_for_selection(
-            package,
-            geometry.hidden as usize,
-            capacity as usize,
-            cuteafd_core::Exl3RowPolicy::for_geometry(geometry),
-            super::RtxSelectionPolicy::FirstCapacity,
-        )?
-        .checked_add(super::combine::OwnerReduce::workspace_bytes(
-            capacity, geometry,
-        )?)
-        .context("owner EXL3 workspace overflow")
+    fn allocation_sizes(backend: [usize; 2], capacity: u32,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<[usize; 4]> {
+        let reduce = super::combine::OwnerReduce::allocation_sizes(capacity, geometry)?;
+        Ok([backend[0], backend[1], reduce[0], reduce[1]])
     }
 
     pub(crate) fn new(
@@ -849,6 +866,10 @@ impl<'a> OwnerPair<'a> {
     #[cfg(test)]
     pub(crate) fn rank_output(&self, rank: usize) -> CuteafdDeviceBuffer {
         self.ranks[rank].execution.allocation().buffer
+    }
+    #[cfg(test)]
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        &self.ranks[rank].stream
     }
 
     /// # Safety
@@ -1067,6 +1088,32 @@ impl SubmissionOwners for TestSubmission<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_policy_bytes_equal_native_and_reducer_allocation_requests() -> anyhow::Result<()> {
+        use super::{OwnerPair, OwnerPolicy};
+        use crate::shared::experts::rtx::{native::{NativeTp2, NativeOutputPolicy}, RtxSelectionPolicy};
+        let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+        for unit in [4096, 2752, 2048] {
+            for (nvfp4, sums) in [(false, false), (false, true), (true, false), (true, true)] {
+                let OwnerPolicy::Native { selection, output, .. } = OwnerPolicy::native_for(nvfp4, sums)
+                    else { unreachable!() };
+                assert_eq!(selection, if nvfp4 { RtxSelectionPolicy::FirstCapacity }
+                    else { RtxSelectionPolicy::CanonicalDecode });
+                assert_eq!(output, if nvfp4 || !sums { NativeOutputPolicy::KernelPlanes }
+                    else { NativeOutputPolicy::TokenSums });
+                let partial = unit as usize * 5120 * if nvfp4 { 12 } else if sums { 4 } else { 24 };
+                let native = NativeTp2::allocation_sizes(12345, geometry, unit as usize, output, nvfp4)?;
+                let requests = OwnerPair::allocation_sizes(native, unit, geometry)?;
+                assert_eq!(requests, [12345, partial, unit as usize * 5120 * 6 * 4, unit as usize * 5120 * 2]);
+                assert_eq!(requests.into_iter().sum::<usize>(), 12345 + partial + unit as usize * 133120);
+            }
+            let exl3 = OwnerPolicy::exl3(std::path::Path::new("fixture"));
+            assert!(matches!(exl3, OwnerPolicy::Exl3 { selection: RtxSelectionPolicy::CanonicalDecode, .. }));
+            let requests = OwnerPair::allocation_sizes([67890, unit as usize * 5120 * 4], unit, geometry)?;
+            assert_eq!(requests.into_iter().sum::<usize>(), 67890 + unit as usize * 153600);
+        }
+        Ok(())
+    }
     use super::*;
     #[test]
     fn failed_lane_quiescence_retains_endpoint_mr_and_intake_before_copies() {

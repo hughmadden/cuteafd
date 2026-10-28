@@ -8,6 +8,7 @@ use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramHistory, EngramPrefillCursor};
 mod reservation;
+mod prefetch;
 mod images;
 pub(crate) use images::RequestImages;
 use cuteafd_ffi::NativeLibrary;
@@ -61,8 +62,22 @@ impl RequestBatch {
     pub async fn wait_engram_gather(&mut self, layer: usize, timeout: std::time::Duration) -> Result<()> {
         ensure!(!self.finished, "request batch finished");
         let wave = self.engram.as_mut().context("decoder replay has no engram work")?;
-        tokio::time::timeout(timeout, wave.wait_gather(layer)).await
-            .context("target engram gather timed out")?
+        tokio::time::timeout(timeout, async {
+            // Worker-only waits are notified. A full pool containing any queued
+            // copy also needs CUDA-thread event queries, including after cancel.
+            wave.reclaim_copies()?;
+            let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
+            while wave.copy_capacity_stalled(layer)? {
+                tracing::debug!(layer, "Engram admission stalled with copy fences pending");
+                tokio::task::yield_now().await;
+                backoff.pause();
+                wave.reclaim_copies()?;
+            }
+            wave.wait_gather(layer).await
+        }).await.context("target engram gather timed out")?
+    }
+    pub(crate) fn engram_wave(&self) -> Result<&EngramWave> {
+        self.engram.as_ref().context("decoder replay has no engram work")
     }
     pub fn cancel(&mut self) {
         self.finished = true;
@@ -85,10 +100,22 @@ pub(crate) struct Requests<'a> {
     /// Units of released slots, for the prefix engine to unreference once their consumers drained.
     released_units: Vec<Vec<u32>>,
     image_requests: usize,
+    /// The next encoder unit's Engram I/O, started ahead of its reservation (#815).
+    prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
 }
 impl<'a> Requests<'a> {
+    pub fn engram_host_formulas(&self) -> [(&'static str, u64); 2] {
+        let shape = self.pipeline.shape();
+        [("v41/engram-prefill", shape.host_resident_bytes() as u64),
+         ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)]
+    }
+    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 2] {
+        let shape = self.pipeline.shape();
+        [("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64),
+         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64)]
+    }
     pub fn new(
         library: &'a NativeLibrary,
         pipeline: EngramPipeline,
@@ -104,6 +131,7 @@ impl<'a> Requests<'a> {
             units: vec![Vec::new(); slots],
             released_units: Vec::new(),
             image_requests: 0,
+            prefetched: Default::default(),
             releases: 0,
         })
     }
@@ -123,6 +151,7 @@ impl<'a> Requests<'a> {
             units: vec![Vec::new(); slots],
             released_units: Vec::new(),
             image_requests: 0,
+            prefetched: Default::default(),
             releases: 0,
         })
     }
@@ -133,7 +162,7 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0,releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
@@ -181,6 +210,7 @@ impl<'a> Requests<'a> {
         }).collect::<Result<Vec<_>>>().map(Some)
     }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
+        self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }
         let slot = self
             .slots
@@ -394,6 +424,7 @@ impl<'a> Requests<'a> {
         ensure!(self.request(lease)?.history.position() == self.cache.committed_end(lease)?,
             "encoder history differs before replay");
         let start = self.cache.begin_decoder_replay(lease)?;
+        self.prefetched.cancel_owner(&lease);
         self.slots.iter_mut().flatten().find(|r| r.lease == lease)
             .expect("validated request").prefill = None;
         Ok(start)
@@ -454,8 +485,8 @@ impl<'a> Requests<'a> {
             tokens.extend_from_slice(r.tokens);
             mask.extend((0..r.tokens.len()).map(|i| u8::from(image_mask.is_some_and(|m| m[i]))));
         }
-        let mut engram = self.pipeline.prepare(&inputs)?;
-        engram.set_decode(requests.iter().any(|r| r.kind != ExpertV2SourceKind::Prefill));
+        let decode = requests.iter().any(|r| r.kind != ExpertV2SourceKind::Prefill);
+        let engram = if decode { self.pipeline.prepare_decode(&inputs)? } else { self.pipeline.prepare(&inputs)? };
         Ok(RequestBatch {
             cache,
             prepared: Vec::new(),
@@ -510,6 +541,29 @@ impl<'a> Requests<'a> {
         }
         Ok(())
     }
+    /// A prefill unit's input hook: the embedding (text or image rows) written
+    /// straight into the lane's layer-0 block planes, the lane prepared at
+    /// layer 0 without its query (`BackboneLane::prepare_embedded`); the
+    /// embedding's guarded scratch is released once the block's copy joined.
+    /// # Safety
+    /// As [`Self::begin_input`]; inside the unit's chain scope.
+    pub unsafe fn prepare_unit_input(
+        &self,
+        batch: &RequestBatch,
+        embedding: &mut TargetEmbeddingWave<'_, '_>,
+        lane: &mut BackboneLane<'_, '_>,
+    ) -> Result<()> {
+        self.validate(batch)?;
+        let positions = batch.cache.positions();
+        let features = if batch.image_mask.iter().all(|&b| b == 0) { Vec::new() }
+            else { self.embedding_features(batch)? };
+        // SAFETY: the block planes are this unit's window, retained through
+        // the unit's chain drain.
+        let embedded = unsafe { embedding.execute_with_images_into(&batch.tokens, &positions, &features,
+            lane.input_planes())? };
+        lane.prepare_embedded(&embedded)?;
+        embedding.release_scratch()
+    }
     /// # Safety
     /// This lane was initialized/advanced for batch and all device producers have
     /// completed. Poll on the CUDA-owning thread. False means I/O is still pending.
@@ -542,8 +596,29 @@ impl<'a> Requests<'a> {
                 unsafe {
                     lane.apply_engram(gate, &rows)?;
                 }
+                upload.release_scratch()?;
                 Ok(true)
             }
+        }
+    }
+    /// [`Self::poll_engram`] without applying: the gathered rows for the
+    /// caller's cooperative (chain-ordered) gate.
+    pub fn poll_engram_rows(&self, batch: &mut RequestBatch, upload: &mut EngramDeviceRows<'_>,
+        lane: &BackboneLane<'_, '_>) -> Result<Option<crate::families::deepseek_v41::v41_engram::EngramDeviceView>> {
+        self.validate(batch)?;
+        let (pending_layer, positions) = lane.pending_engram()?;
+        let layer = cuteafd_core::ENGRAM_LAYERS.iter().position(|&l| l as usize == pending_layer)
+            .context("prepared layer has no engram")?;
+        ensure!(positions == batch.cache.positions(), "engram lane positions differ");
+        let histories = if batch.prepared.is_empty() {
+            batch.leases.iter().map(|&l| Ok(&self.request(l)?.history)).collect::<Result<Vec<_>>>()?
+        } else {
+            batch.prepared.iter().map(|cursor| cursor.history()).collect()
+        };
+        match upload.poll_wave(&self.pipeline, batch.engram.as_mut().context("decoder replay has no engram work")?, &histories, layer)? {
+            EngramUploadPoll::Pending => Ok(None),
+            EngramUploadPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
+            EngramUploadPoll::Ready(rows) => Ok(Some(rows)),
         }
     }
     /// Poll only the I/O gather under the shared request borrow. The returned
@@ -565,6 +640,15 @@ impl<'a> Requests<'a> {
         } else {
             batch.prepared.iter().map(|cursor| cursor.history()).collect()
         };
+        self.pipeline.poll(batch.engram.as_mut().context("decoder replay has no engram work")?, &histories, layer)
+    }
+    /// Poll a future Engram layer before the lane reaches it. Generation and
+    /// private preparation-frontier validation are identical to the gate poll.
+    pub fn poll_engram_layer(&self, batch: &mut RequestBatch, layer: usize) -> Result<cuteafd_loader::EngramGatherPoll> {
+        self.validate(batch)?;
+        let histories = if batch.prepared.is_empty() {
+            batch.leases.iter().map(|&l| Ok(&self.request(l)?.history)).collect::<Result<Vec<_>>>()?
+        } else { batch.prepared.iter().map(|cursor| cursor.history()).collect() };
         self.pipeline.poll(batch.engram.as_mut().context("decoder replay has no engram work")?, &histories, layer)
     }
     pub fn validate_acceptance(&self, batch: &RequestBatch, accepted: &[u32]) -> Result<()> {
@@ -688,7 +772,7 @@ mod tests {
         let catalog =
             cuteafd_loader::read_official_v41_catalog(&model)?;
         let map = cuteafd_loader::EngramTokenMap::from_file(&model.join("tokenizer.json"))?;
-        let pipeline = unsafe { EngramPipeline::new(&catalog, map, 80, 2, 8 * 1024 * 1024, 0)? };
+        let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map, cuteafd_loader::EngramStagingShape::new(80, 2)?, 0)? };
         let mut requests = Requests::new(
             &lib,
             pipeline,

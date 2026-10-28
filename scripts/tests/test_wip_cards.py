@@ -1299,10 +1299,12 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     expected = {
         'RTX_GPUS': '1', 'COORDINATOR_GPU': '0',
         'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
-        'MAX_CONTEXT_TOKENS': '1048576', 'PREFILL_BATCH_TOKENS': '1024',
+        'MAX_CONTEXT_TOKENS': '1048576',
         'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
     }
     assert {key: values[key] for key in expected} == expected
+    # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
+    assert 'PREFILL_BATCH_TOKENS' not in values and 'PREFILL_ROWS' not in values
     assert [values[f'SPARK_{rank}_HOST'] for rank in range(4)] == card['sparks']
     entries = json.loads((kit / 'matrix-gate.json').read_text())['entries']
     for key in ('ADDR', 'EXPERT_PORT'):

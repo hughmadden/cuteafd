@@ -85,6 +85,14 @@ impl PlacedPreparedLayer<'_, '_, '_> {
             .await
     }
 }
+impl PlacedPreparedLayer<'_, '_, '_> {
+    /// Finish the attention on its GPU and release the lane borrow (a prefill
+    /// unit's FFN runs in a later executor hook).
+    pub async fn into_unit(mut self) -> Result<super::UnitPreparedLayer> {
+        let prepared = self.prepared.take().context("prepared layer absent")?;
+        self.device.future(prepared.into_unit()).await
+    }
+}
 impl Drop for PlacedPreparedLayer<'_, '_, '_> {
     fn drop(&mut self) {
         if let Some(prepared) = self.prepared.take() {
@@ -98,6 +106,20 @@ impl Drop for PlacedPreparedLayer<'_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedExecution<'w, 'a> {
+    /// As [`super::BackboneExecution::abort_queries`], on each producer's GPU.
+    pub(crate) fn abort_queries(&mut self) -> Result<()> {
+        self.produced = None;
+        let mut result = Ok(());
+        for wave in &mut self.producers.windows {
+            let device = wave.device;
+            if let Err(error) = device.run(|| wave.get_mut().abort_query()) { result = Err(error); }
+        }
+        for wave in &mut self.producers.sources {
+            let device = wave.device;
+            if let Err(error) = device.run(|| wave.get_mut().abort_query()) { result = Err(error); }
+        }
+        result
+    }
     pub fn new(
         weights: &'w CacheProducerWeights<'a>,
         capacity: u32,
@@ -110,6 +132,19 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
             produced: None,
             publication: None,
         })
+    }
+    /// Every prefill slot's producers on one placed storage set per GPU.
+    pub fn on_storage(weights: &'w CacheProducerWeights<'a>, storage: &super::PlacedProducerStorage<'a>) -> Result<Self> {
+        Ok(Self {
+            weights,
+            producers: PlacedProducerWaves::on_storage(weights, storage)?,
+            progress: PassProgress::default(),
+            produced: None,
+            publication: None,
+        })
+    }
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        self.producers.select_window(window)
     }
     /// All external readers/writers have completed or drained before restarting.
     pub fn restart_for(&mut self, stage: CacheStage) {
@@ -300,6 +335,32 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
             }
         }
         Ok(())
+    }
+    /// A prefill unit publishes layer `layer`'s window KV right after its
+    /// attention was queued (as one RTX does), before its FFN: the next unit
+    /// attends `layer` before this one lands it (shared executor order).
+    /// # Safety
+    /// As [`Self::enqueue_encoder_publication`]; the layer's production completed.
+    pub unsafe fn enqueue_unit_window_publication(&mut self, bank: &BackboneCache<'_>,
+        batch: &CacheBatch, layer: usize) -> Result<()> {
+        ensure!(batch.is_reserved() && batch.stage() == CacheStage::Encoder && self.publication.is_none()
+            && self.progress.invalid && self.progress.batch == Some(batch.identity())
+            && layer < 20 && self.progress.next == layer,
+            "unit window publication requires this layer's queued attention");
+        self.publication = Some((batch.identity(), layer));
+        unsafe { bank.enqueue_encoder_window(batch, layer, &mut self.producers.windows[layer]) }
+    }
+    /// Device-ordered prefill units (#815 option (i)): publish layer `layer`'s
+    /// window as a chained direct commit right after its queued attention, no
+    /// host wait; the next unit's attention orders after it by the unit's
+    /// publication event.
+    pub fn publish_unit_window(&mut self, bank: &mut BackboneCache<'_>, batch: &CacheBatch, layer: usize) -> Result<()> {
+        ensure!(crate::shared::memory::chain::deferred(), "chained window publication needs a device-ordered scope");
+        ensure!(batch.is_reserved() && batch.stage() == CacheStage::Encoder && self.publication.is_none()
+            && self.progress.invalid && self.progress.batch == Some(batch.identity())
+            && layer < 20 && self.progress.next == layer,
+            "unit window publication requires this layer's queued attention");
+        bank.publish_encoder_window(batch, layer, &mut self.producers.windows[layer])
     }
     pub fn poll_encoder_publication(&self) -> Result<bool> {
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;
@@ -510,10 +571,7 @@ mod tests {
             )?]),
         ];
         let peers = [1u16, 2, 3, 4].map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)));
-        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                timeout: std::time::Duration::from_secs(1),
-                max_frame_bytes: 2 * 1024 * 1024,
-            }, 0)?;
+        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?)?;
         transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 1, 16, [None, None])?)?;
         let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);

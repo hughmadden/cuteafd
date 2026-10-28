@@ -13,15 +13,34 @@ use std::time::Duration;
 
 #[cfg(test)]
 pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
-    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, pass: &mut P, other: &mut P,
-    requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], lease: CacheLease,
-    tokens: &[u32], chunk_rows: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
+    prefill: &mut PrefillSlots<'a, P>, lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize,
+    draft: Option<&mut DraftRuntime<'_, 'a, C>>,
 ) -> Result<u32> {
     let (events, _receive) = mpsc::unbounded_channel();
     let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
-    let [first_transport, second_transport] = transports;
-    super::prefill(lib, runtime, pass, other, requests, first_transport, second_transport,
-        lease, tokens, chunk_rows, &job, draft, &mut || Ok(()))?.select(None)
+    super::prefill(lib, runtime, requests, prefill, None, lease, tokens,
+        super::PrefillShape { rows: chunk_rows, waves }, &job, draft, &mut || Ok(()))?.select(None)
+}
+
+/// [`exercise_prefill`] whose client disconnects at the first unit's begin
+/// (its prefill hold drops the receiver): the units call fails mid-unit with
+/// chained work queued. Returns that error; the slots must come back at rest,
+/// windows at rows from 0 and slot 0 holding its link (C4, D1).
+#[cfg(test)]
+pub(crate) fn exercise_cancelled_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
+    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
+    prefill: &mut PrefillSlots<'a, P>, lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize,
+) -> anyhow::Error {
+    let (events, receive) = mpsc::unbounded_channel();
+    let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
+    let mut receive = Some(receive);
+    match super::prefill::<P, C>(lib, runtime, requests, prefill, None, lease, tokens,
+        super::PrefillShape { rows: chunk_rows, waves }, &job, None,
+        &mut || { receive.take(); Ok(()) }) {
+        Ok(_) => anyhow::anyhow!("cancelled prefill unexpectedly finished"),
+        Err(error) => error,
+    }
 }
 
 /// Only request-owned state survives a unit; both execution lanes are drained.
@@ -68,8 +87,20 @@ pub(crate) struct V41PrefillTimes {
     us_per_row: [Option<f64>; 5],
 }
 
+/// One stream call's units: the shared cut for page-aligned unit widths;
+/// test geometries below a page (2-RTX fixture: 3 and 16 rows) keep plain
+/// `chunk_rows` units, as `V41PrefillTimes::encoder_unit` streams them.
+fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    if chunk_rows % 64 != 0 {
+        ensure!(rows > 0 && chunk_rows > 0, "empty prefill stream units");
+        return Ok((0..rows).step_by(chunk_rows).map(|first| first..rows.min(first + chunk_rows)).collect());
+    }
+    crate::shared::prefill_pipeline::prefill_units(rows, chunk_rows, waves,
+        cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize)
+}
+
 impl V41PrefillTimes {
-    fn encoder_unit(&self, tokens: usize, chunk_rows: usize, next: usize,
+    fn encoder_unit(&self, tokens: usize, chunk_rows: usize, waves: usize, next: usize,
         replay_end: usize, streamed: bool, budget: ChunkBudget) -> V41Unit {
         if next < replay_end {
             return V41Unit::ReplayChunk(next..(next + chunk_rows).min(replay_end));
@@ -77,8 +108,14 @@ impl V41PrefillTimes {
         if next == tokens { return V41Unit::DecoderReplay; }
         let end = (next + chunk_rows).min(tokens);
         if !streamed { return V41Unit::Single(next..end); }
-        let mut chunks = vec![next..end];
         let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
+        if whole && waves > 1 && chunk_rows % 64 == 0 {
+            // The shared cut: full units of the configured (captured) width and one tail.
+            if let Ok(units) = stream_units(tokens - next, chunk_rows, waves) {
+                return V41Unit::Stream(units.into_iter().map(|unit| next + unit.start..next + unit.end).collect());
+            }
+        }
+        let mut chunks = vec![next..end];
         let mut next = end;
         while next < tokens && (whole || chunks.len() < 2) {
             let end = (next + chunk_rows).min(tokens);
@@ -108,14 +145,14 @@ impl V41PrefillTimes {
 pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain<'a>> {
     pub(crate) lib: &'a NativeLibrary,
     pub(crate) runtime: &'s tokio::runtime::Runtime,
-    pub(crate) pass: &'s mut P,
-    pub(crate) other: &'s mut P,
     pub(crate) requests: &'s mut Requests<'a>,
-    pub(crate) transport: &'s mut P::Transport,
-    pub(crate) other_transport: &'s mut P::Transport,
     pub(crate) lease: CacheLease,
     pub(crate) tokens: &'s [u32],
     pub(crate) chunk_rows: usize,
+    /// Units in flight on the shared executor.
+    pub(crate) waves: usize,
+    /// The prefill slots: slot 0 (with the prefill link) runs non-unit work.
+    pub(crate) prefill: &'s mut PrefillSlots<'a, P>,
     pub(crate) job: &'s NativeRequest,
     pub(crate) draft: Option<&'s mut DraftRuntime<'w, 'a, C>>,
     pub(crate) hold: &'s mut dyn FnMut() -> Result<()>,
@@ -123,9 +160,12 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
 }
 
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
+    /// Whether `rows` uncached prompt rows run as units on the shared
+    /// executor: more than one unit.
+    fn streams(&self, rows: usize) -> bool { rows.div_ceil(self.chunk_rows.max(1)) > 1 }
     fn encoder_unit(&self, next: usize, replay_end: usize, streamed: bool,
         budget: ChunkBudget) -> V41Unit {
-        self.times.encoder_unit(self.tokens.len(), self.chunk_rows, next, replay_end, streamed, budget)
+        self.times.encoder_unit(self.tokens.len(), self.chunk_rows, self.waves, next, replay_end, streamed, budget)
     }
 
     fn initialize(&mut self, cursor: &mut V41Prefill<P::Suffix>) -> Result<()> {
@@ -137,7 +177,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
             cursor.state = PrefillState::Continuation { next: cached };
             return Ok(());
         }
-        let suffix = self.pass.new_suffix(self.lib, end)?;
+        let suffix = self.prefill.slot0().0.new_suffix(self.lib, end)?;
         let next = if stage == CacheStage::EncoderReplay {
             let start = self.requests.cache().history_end(self.lease)? as usize;
             ensure!(cached - start <= 128, "encoder prefix replay exceeds one window");
@@ -147,7 +187,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
             cached
         };
         cursor.state = PrefillState::Encoder { suffix, next, replay_end: cached,
-            streamed: self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1 };
+            streamed: self.streams(self.tokens.len().saturating_sub(cached)) };
         Ok(())
     }
 }
@@ -173,8 +213,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     let next = if stage == CacheStage::EncoderReplay {
                         self.requests.cache().history_end(self.lease)? as usize
                     } else { cached };
-                    self.encoder_unit(next, cached,
-                        self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1, budget)
+                    self.encoder_unit(next, cached, self.streams(self.tokens.len().saturating_sub(cached)), budget)
                 }
             }
             PrefillState::Encoder { next, replay_end, streamed, .. } =>
@@ -208,13 +247,14 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let mut batch = self.requests.prepare(&[RequestTokens { lease: self.lease, tokens: chunk,
                     image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
                 let started = Instant::now();
+                let (pass, transport) = self.prefill.slot0();
                 let result = (|| -> Result<()> {
                     // SAFETY: the live request owns the batch/suffix until execution and commit drain.
-                    self.runtime.block_on(unsafe { self.pass.encoder_part(self.requests, &mut batch, self.transport, suffix) })?;
+                    self.runtime.block_on(unsafe { pass.encoder_part(self.requests, &mut batch, transport, suffix) })?;
                     ensure!(!self.job.events.is_closed(), "client disconnected");
-                    self.runtime.block_on(self.pass.commit_prefill::<C>(self.requests, &mut batch, None, chunk.len() as u32))
+                    self.runtime.block_on(pass.commit_prefill::<C>(self.requests, &mut batch, None, chunk.len() as u32))
                 })();
-                if result.is_err() { self.pass.discard(&mut batch)?; }
+                if result.is_err() { pass.discard(&mut batch)?; }
                 result?;
                 if matches!(unit.work, V41Unit::Single(_)) {
                     console::totals::prefill(chunk.len());
@@ -223,26 +263,48 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 }
                 *next = range.end;
             }
-            (V41Unit::Stream(ranges), PrefillState::Encoder { suffix, next, replay_end, .. }) => {
-                let chunks: Vec<_> = ranges.iter().map(|range| &self.tokens[range.clone()]).collect();
+            (V41Unit::Stream(ranges), PrefillState::Encoder { suffix, next, .. }) => {
+                let span = ranges.first().context("empty encoder units")?.start..ranges.last().context("empty encoder units")?.end;
                 let started = Instant::now();
-                // Both lanes call this synchronous hook without nesting.
                 let hold = RefCell::new(&mut *self.hold);
-                let before_chunk = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
-                // Preserve alternating lane ownership after a bounded singleton stream.
-                let odd = (*next - *replay_end) / self.chunk_rows % 2 != 0;
-                let (first, second, a, b) = if odd {
-                    (&mut *self.other, &mut *self.pass, &mut *self.other_transport, &mut *self.transport)
-                } else {
-                    (&mut *self.pass, &mut *self.other, &mut *self.transport, &mut *self.other_transport)
-                };
-                // SAFETY: independent lanes retain the same request/suffix through drained completion.
-                self.runtime.block_on(unsafe { first.execute_encoder_stream_held(second, self.requests,
-                    self.lease, &chunks, [a, b], suffix,
-                    &|| !self.job.events.is_closed(), &before_chunk) })?;
-                tracing::debug!(target: "cuteafd::timing", rows=self.tokens.len(),
-                    total_us=started.elapsed().as_micros() as u64, "target encoder stream");
-                *next = ranges.last().context("empty encoder stream")?.end;
+                let before_unit = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
+                let keep_running = || !self.job.events.is_closed();
+                // Slot 0 lends the prefill link to the span's calls; every
+                // slot's waves go out on it. Nothing fallible runs between the
+                // take and the loop, and every error inside the loop lands in
+                // `result`, so the link returns on every exit (D1).
+                let mut link = P::take_link(&mut self.prefill.slots[0].1)?;
+                let mut result = Ok(());
+                let mut at = span.start;
+                let (waves, call_rows) = (self.waves, self.waves * self.chunk_rows);
+                // One call per window cycle: `waves` units of `chunk_rows` rows.
+                while at < span.end && result.is_ok() {
+                    let rows = (span.end - at).min(call_rows);
+                    result = (|| -> Result<()> {
+                        ensure!(waves <= self.prefill.slots.len(), "{waves} prefill waves exceed the {} slots",
+                            self.prefill.slots.len());
+                        let unit_rows = stream_units(rows, self.chunk_rows, waves)?;
+                        let chunks: Vec<_> = unit_rows.iter().map(|range| &self.tokens[at + range.start..at + range.end]).collect();
+                        // The next call's first units at this call's unit width.
+                        let width = unit_rows.first().map_or(1, |range| range.len());
+                        let ahead: Vec<&[u32]> = lookahead(at + rows..span.end, width, waves)
+                            .map(|range| &self.tokens[range]).collect();
+                        let mut slots: Vec<(&mut P, &mut P::Transport)> = self.prefill.slots.iter_mut()
+                            .map(|(pass, transport)| (pass, transport)).collect();
+                        slots.truncate(waves);
+                        // SAFETY: every slot's pass and the link retain the request
+                        // and suffix through drained completion or cancellation.
+                        self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
+                            self.lease, &chunks, suffix, &ahead, &keep_running, &before_unit) })?;
+                        tracing::debug!(target: "cuteafd::timing", rows, units=chunks.len(), waves,
+                            total_us=started.elapsed().as_micros() as u64, "target encoder units");
+                        Ok(())
+                    })();
+                    at += rows;
+                }
+                P::restore_link(&mut self.prefill.slots[0].1, link)?;
+                result?;
+                *next = span.end;
             }
             (V41Unit::DecoderReplay, PrefillState::Replay { suffix } | PrefillState::Encoder { suffix, .. }) => {
                 ensure!(!self.job.events.is_closed(), "client disconnected");
@@ -250,16 +312,17 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let rows = (self.tokens.len() as u64 - start) as u32;
                 let mut batch = self.requests.prepare_replay(&[CacheWork { lease: self.lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
                 let started = Instant::now();
+                let (pass, transport) = self.prefill.slot0();
                 let result = (|| -> Result<RetainedScores> {
                     // SAFETY: all encoder rows committed and the retained suffix matches this replay.
-                    let bytes = self.runtime.block_on(unsafe { self.pass.prefill_logits(self.lib, self.requests,
-                        &mut batch, self.transport, &[rows as usize - 1], Some(suffix)) })?;
+                    let bytes = self.runtime.block_on(unsafe { pass.prefill_logits(self.lib, self.requests,
+                        &mut batch, transport, &[rows as usize - 1], Some(suffix)) })?;
                     let scores = RetainedScores::new(scores::VOCAB, bytes)?;
                     ensure!(!self.job.events.is_closed(), "client disconnected");
-                    self.runtime.block_on(self.pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
+                    self.runtime.block_on(pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
                     Ok(scores)
                 })();
-                if result.is_err() { self.pass.discard(&mut batch)?; }
+                if result.is_err() { pass.discard(&mut batch)?; }
                 console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
                 tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
                 let scores = result?;
@@ -267,8 +330,9 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 return Ok(Some(scores));
             }
             (V41Unit::Continuation(range), PrefillState::Continuation { next }) => {
-                let scores = super::prefill_continuation(self.lib, self.runtime, self.pass, self.requests,
-                    self.transport, self.lease, &self.tokens[range.clone()], self.chunk_rows, self.job,
+                let (pass, transport) = self.prefill.slot0();
+                let scores = super::prefill_continuation(self.lib, self.runtime, pass, self.requests,
+                    transport, self.lease, &self.tokens[range.clone()], self.chunk_rows, self.job,
                     self.draft.as_deref_mut(), self.hold)?;
                 *next = range.end;
                 if range.end == self.tokens.len() {
@@ -296,36 +360,46 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 }
 
+/// The prefill slots (PLAN "Prefill contract"), apart from the decode lanes:
+/// `slots` passes on one shared storage set per GPU (row planes at the
+/// reserve, scratch at the unit cap), each slot's FFN owner beside it. Slot
+/// 0's FFN owner holds the one prefill link, whose return slots hold the
+/// in-flight units' waves; slot 0 also runs every non-unit prefill step
+/// (replay, continuation, scoring, cold steps) at rows from 0.
+pub(crate) struct PrefillSlots<'a, P: PrefillTarget<'a>> {
+    pub slots: Vec<(P, P::Transport)>,
+}
+impl<'a, P: PrefillTarget<'a>> PrefillSlots<'a, P> {
+    pub(crate) fn slot0(&mut self) -> (&mut P, &mut P::Transport) {
+        let (pass, transport) = &mut self.slots[0];
+        (pass, transport)
+    }
+}
+
 pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type Suffix;
+    /// The one prefill transport (PLAN "Prefill contract"): its return slots
+    /// hold the in-flight units' waves. Slot 0's FFN owner holds it.
+    type PrefillLink;
+    fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink>;
+    fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
     /// live through completion/cancellation, with no conflicting access.
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()>;
+    /// Encoder units of one prompt on the shared executor, one unit per slot
+    /// in flight: slot k is `slots[k]`, a target pass with its reduce/FFN
+    /// owner; every unit's wave goes out on the one `prefill` link.
     /// # Safety
-    /// The passes have independent workspaces and the same layout/model. Input
-    /// chunks and suffix follow the encoder stream's request/cache contract.
-    async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
-        chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool) -> Result<()>;
-    /// # Safety
-    /// Same contract as `encoder_stream`, plus: `before_chunk` runs synchronously
-    /// before each dispatched chunk (host-cache store pacing, packet HC-9).
-    async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
-        suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
-        before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
-        // Default for passes without a held dispatch (dual-RTX lane): the hold is
-        // load-bearing on the single-GPU 5090 path only; log once so degradation
-        // is observable rather than silent (rc2 lesson).
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::warn!("held encoder stream unavailable on this pass; HC-9 per-chunk hold inactive");
-        }
-        self.encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await
-    }
+    /// The passes have independent workspaces and the same layout/model; the
+    /// chunks and suffix follow the encoder's request/cache contract.
+    /// `before_unit` runs synchronously before each unit (host-cache store
+    /// pacing, packet HC-9).
+    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
+        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()>;
     /// # Safety
     /// Batch inputs and optional completed encoder suffix match this target.
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
@@ -336,6 +410,11 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
 }
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     type Suffix = EncoderSuffix<'a>;
+    type PrefillLink = crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>;
+    fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink> { transport.take_link() }
+    fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
+        transport.restore_link(link)
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -346,21 +425,10 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
             unsafe { self.execute_encoder_replay(requests, batch, transport, 0, suffix).await }
         } else { unsafe { self.execute_encoder(requests, batch, transport, 0, suffix).await } }
     }
-    async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
-        chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool) -> Result<()> {
-        self.set_attention_decode(false);
-        other.set_attention_decode(false);
-        unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
-    }
-    async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
-        suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
-        before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
-        self.set_attention_decode(false);
-        other.set_attention_decode(false);
-        unsafe { self.execute_encoder_stream_held(other, requests, lease, chunks, transports, suffix,
-            keep_running, before_chunk).await }
+    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
+        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, keep_running, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -382,6 +450,16 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
 }
 impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     type Suffix = DeviceOwner<'a, EncoderSuffix<'a>>;
+    type PrefillLink = DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>;
+    fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink> {
+        let device = transport.device;
+        device.own(|| transport.get_mut().take_link())
+    }
+    fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
+        let device = transport.device;
+        ensure!(link.device.id == device.id, "prefill link device differs from slot 0's");
+        device.run(|| transport.get_mut().restore_link(link.into_inner()))
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
     }
@@ -390,12 +468,10 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         self.set_attention_decode(false);
         unsafe { self.execute(&RefCell::new(requests), batch, transport, 0, &[], Some(suffix), None, false).await }
     }
-    async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
-        chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool) -> Result<()> {
-        self.set_attention_decode(false);
-        other.set_attention_decode(false);
-        unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
+    async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
+        requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
+        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, keep_running, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -451,11 +527,11 @@ mod prefill_tests {
     #[test]
     fn whole_preserves_all_chunk_boundaries_in_one_stream() {
         let times = V41PrefillTimes::default();
-        assert_eq!(stream(times.encoder_unit(1050, 256, 0, 0, true, ChunkBudget::WHOLE)),
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true, ChunkBudget::WHOLE)),
             [0..256, 256..512, 512..768, 768..1024, 1024..1050]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 300, 300, true, ChunkBudget::WHOLE)),
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 300, 300, true, ChunkBudget::WHOLE)),
             [300..556, 556..812, 812..1050]);
-        assert!(matches!(times.encoder_unit(1050, 256, 950, 950, false, ChunkBudget::WHOLE), V41Unit::Single(range) if range == (950..1050)));
+        assert!(matches!(times.encoder_unit(1050, 256, 1, 950, 950, false, ChunkBudget::WHOLE), V41Unit::Single(range) if range == (950..1050)));
     }
 
     #[test]
@@ -466,7 +542,7 @@ mod prefill_tests {
                 for remaining in [0, 1, chunk_rows - 1, chunk_rows, chunk_rows + 1, 2 * chunk_rows + 17] {
                     let tokens = cached + remaining;
                     let streamed = remaining.div_ceil(chunk_rows) > 1;
-                    let unit = times.encoder_unit(tokens, chunk_rows, cached, cached, streamed, ChunkBudget::WHOLE);
+                    let unit = times.encoder_unit(tokens, chunk_rows, 1, cached, cached, streamed, ChunkBudget::WHOLE);
                     let expected: Vec<_> = (cached..tokens).step_by(chunk_rows)
                         .map(|start| start..(start + chunk_rows).min(tokens)).collect();
                     match unit {
@@ -485,25 +561,41 @@ mod prefill_tests {
         let mut times = V41PrefillTimes::default();
         times.observe(2, 256, Duration::from_micros(256));
         let budget = ChunkBudget { target: Some(Duration::from_micros(511)), row_cap: usize::MAX };
-        assert_eq!(stream(times.encoder_unit(1050, 256, 0, 0, true, budget)), [0..256]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 0, 0, true,
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true, budget)), [0..256]);
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
             ChunkBudget { target: Some(Duration::from_micros(512)), ..budget })), [0..256, 256..512]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 0, 0, true,
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
             ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 })), [0..256]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 0, 0, true,
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
             ChunkBudget { target: Some(Duration::from_secs(1)), row_cap: 511 })), [0..256]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 0, 0, true,
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
             ChunkBudget { target: Some(Duration::from_secs(1)), row_cap: 512 })), [0..256, 256..512]);
         // A streamed prompt's final singleton must not switch to encoder_part.
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1024, 0, true, budget)), [1024..1050]);
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 1024, 0, true, budget)), [1024..1050]);
+    }
+
+    #[test]
+    fn whole_streams_cut_fixed_captured_units_and_one_tail() {
+        let times = V41PrefillTimes::default();
+        // Every unit but the tail is exactly the registered (captured) width.
+        assert_eq!(stream(times.encoder_unit(8192, 2752, 3, 0, 0, true, ChunkBudget::WHOLE)),
+            [0..2752, 2752..5504, 5504..8192]);
+        assert_eq!(stream(times.encoder_unit(8192, 1024, 3, 0, 0, true, ChunkBudget::WHOLE)).len(), 8);
+        let units = stream(times.encoder_unit(65536, 2752, 3, 0, 0, true, ChunkBudget::WHOLE));
+        assert!(units[..units.len() - 1].iter().all(|unit| unit.len() == 2752));
+        assert_eq!((units[0].start, units.last().unwrap().end), (0, 65536));
+        assert_eq!(stream(times.encoder_unit(8492, 2752, 3, 300, 300, true, ChunkBudget::WHOLE)),
+            [300..3052, 3052..5804, 5804..8492]);
+        let budget = ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 };
+        assert_eq!(stream(times.encoder_unit(8192, 2752, 3, 0, 0, true, budget)), [0..2752]);
     }
 
     #[test]
     fn history_replay_stops_at_cached_frontier_before_the_encoder_stream() {
         let times = V41PrefillTimes::default();
-        assert!(matches!(times.encoder_unit(1024, 80, 128, 256, true, ChunkBudget::WHOLE), V41Unit::ReplayChunk(range) if range == (128..208)));
-        assert!(matches!(times.encoder_unit(1024, 80, 208, 256, true, ChunkBudget::WHOLE), V41Unit::ReplayChunk(range) if range == (208..256)));
-        assert!(matches!(times.encoder_unit(1024, 80, 1024, 256, true, ChunkBudget::WHOLE), V41Unit::DecoderReplay));
+        assert!(matches!(times.encoder_unit(1024, 80, 1, 128, 256, true, ChunkBudget::WHOLE), V41Unit::ReplayChunk(range) if range == (128..208)));
+        assert!(matches!(times.encoder_unit(1024, 80, 1, 208, 256, true, ChunkBudget::WHOLE), V41Unit::ReplayChunk(range) if range == (208..256)));
+        assert!(matches!(times.encoder_unit(1024, 80, 1, 1024, 256, true, ChunkBudget::WHOLE), V41Unit::DecoderReplay));
     }
 
     #[test]
@@ -521,3 +613,59 @@ mod prefill_tests {
 
 #[cfg(test)]
 pub(crate) use super::scheduler::exercise_distributed_decode;
+
+/// The next call's first `units` row ranges of `span` at `width` rows: the
+/// rows whose Engram gathers the current call's last units prefetch.
+fn lookahead(span: Range<usize>, width: usize, units: usize) -> impl Iterator<Item = Range<usize>> {
+    let width = width.max(1);
+    (span.start..span.end).step_by(width).take(units).map(move |start| start..(start + width).min(span.end))
+}
+
+#[cfg(test)]
+mod stream_tests {
+    /// A call's last units prefetch the next call's first units (#762 window
+    /// cycles; prof39: each cycle's first Engram layer-1 gathers waited
+    /// 40-150 ms cold, ~2.3 s of a 64K prefill on max).
+    #[test]
+    fn calls_look_ahead_at_the_next_calls_first_units() {
+        assert_eq!(super::lookahead(8256..20000, 2752, 3).collect::<Vec<_>>(), [8256..11008, 11008..13760, 13760..16512]);
+        assert_eq!(super::lookahead(8256..9000, 2752, 3).collect::<Vec<_>>(), [8256..9000]);
+        assert_eq!(super::lookahead(9000..9000, 2752, 3).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod unit_exit_tests {
+    /// Final-review regressions, at the source of each exit path:
+    /// D1 the lent prefill link returns on every exit (nothing fallible
+    /// between its take and the loop whose errors land in `result`);
+    /// C4 every units call resets its slots' windows in `Drop`;
+    /// C2 the layer-20 boundary releases the lane's guarded scratch.
+    #[test]
+    fn units_exits_return_the_link_reset_windows_and_release_boundary_scratch() {
+        let step = include_str!("prefill_target.rs");
+        let take = step.find("let mut link = P::take_link(").unwrap();
+        let take = take + step[take..].find(";\n").unwrap() + 1;
+        let restore = step[take..].find("P::restore_link(&mut self.prefill.slots[0].1, link)").unwrap() + take;
+        let between = &step[take..restore];
+        let loop_start = between.find("while at < span.end && result.is_ok() {").unwrap();
+        assert!(!between[..loop_start].contains('?'), "a fallible step between taking and lending the link (D1)");
+        for (name, source) in [("1 RTX", include_str!("../v41_target_pass/encoder_units.rs")),
+            ("2 RTX", include_str!("../v41_target_pass/distributed/encoder_units.rs"))] {
+            let drop_impl = &source[source.find("impl Drop for UnitHooks").unwrap()..];
+            let drop_body = &drop_impl[..drop_impl.find("\n}\n").unwrap()];
+            assert!(drop_body.contains("select_window(") && drop_body.contains("RowWindow::NONE"),
+                "{name}: UnitHooks::drop must reset every slot's window (C4)");
+        }
+        let one = include_str!("../v41_target_pass/encoder_units.rs");
+        let end = &one[one.find("async fn end_unit_inner").unwrap()..];
+        let end = &end[..end.find("\n    }\n").unwrap()];
+        assert!(end.find("publish_encoder_boundary").unwrap() < end.find("lane.release_scratch()").unwrap(),
+            "1 RTX: the boundary must release the lane's scratch after its publication (C2)");
+        let two = include_str!("../v41_target_pass/distributed.rs");
+        let finish = &two[two.find("async unsafe fn finish_encoder_stage").unwrap()..];
+        let finish = &finish[..finish.find("\n    }\n").unwrap()];
+        assert!(finish.find("finish_decoder_source").unwrap() < finish.find("lane.release_scratch()").unwrap(),
+            "2 RTX: the boundary must release the lane's scratch after its production (C2)");
+    }
+}

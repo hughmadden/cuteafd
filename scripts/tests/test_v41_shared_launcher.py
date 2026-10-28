@@ -108,11 +108,17 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         if role == "coordinator":
             assert link and link.startswith('echo "http://') and "$(cat ~/.cache/cuteafd/console/secret)" in link, where
         assert added == INTENDED[role], where
-        assert {key: after["env"][key] for key in before["env"]} == before["env"], where
+        # The fingerprint now also covers the shared executor's prefill waves.
+        fingerprinted = {key: value for key, value in before["env"].items() if key != "CUTEAFD_RELEASE_CONFIG_SHA256"}
+        assert {key: after["env"][key] for key in fingerprinted} == fingerprinted, where
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        expected_command = before["command"] + (["--mapped-scale-preload-gib", "0"] if role == "coordinator" else [])
+        # The planner's prefill waves and reserve reach the shared executor.
+        value = lambda flag: after["command"][after["command"].index(flag) + 1]
+        expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
+            "--prefill-waves", value("--prefill-waves"),
+            "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
         assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above
@@ -188,11 +194,13 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
     assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
     command = dict(flag_values(coordinator["command"]))
     for flag, value in {"--rtx-gpus": "1", "--spark-tp": "4", "--spark-ep": "1",
-                        "--prefill-batch-tokens": "1024", "--max-context-tokens": "1048576"}.items():
+                        "--max-context-tokens": "1048576"}.items():
         assert command[flag] == value
     assert len(containers) == 5
     for plan in result["plans"]:
         assert plan[plan.index("--coordinator-gpu-budget-gib") + 1] == "31.8"
+        # The planner sizes the reserve: the card pins no prefill rows (0 = automatic).
+        assert plan[plan.index("--prefill-rows") + 1] == "0"
 
 
 def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> None:

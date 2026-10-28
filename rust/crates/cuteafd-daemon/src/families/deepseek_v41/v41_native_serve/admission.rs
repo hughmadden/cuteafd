@@ -3,17 +3,21 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, bf16: bool)
+fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, waves: u8, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    let decode = super::DECODE_LANE_ROWS;
     use cuteafd_core::{SparkEndpoint, SparkIngress};
     use cuteafd_loader::plan::spark_executions::{admit_family, SparkBackend};
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    // The descriptor's legacy stream shape queues the live chunk on one owner.
+    // The shared ladder: the unit's covering export, `waves` units buffered.
     let executions = admit_family("deepseek_v41", &SparkBackend::for_catalog(catalog)?.exports(), None,
-        u64::from(capacity), 1)?;
-    // One endpoint per link: the decode transport and the prefill transport.
+        u64::from(capacity), u64::from(waves))?;
+    // The two decode lanes' links at the decode width and the one prefill
+    // link at the unit (its `waves` units are the prefill owner's buffered units).
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2],
+        vec![SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress },
+             SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress },
+             SparkEndpoint { ring_depth: None, capacity, ingress }],
         crate::shared::placement::spark_rings(64 << 20)?, executions)?;
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)
@@ -40,11 +44,22 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         ensure!(local_layers == geometry.layers as usize, "V4.1 remote layers require Spark peers");
         return Ok(None);
     }
+    let slots = super::AdmittedPrefill::resolve(args)?.waves;
+    spark_admission(&args.snapshot, catalog, local_layers, args.peers.len(), capacity, slots, topology).map(Some)
+}
+
+/// The Spark admission for `ranks` workers serving layers `local_layers..`,
+/// the decode lanes' and prefill link's endpoints at `capacity` (the unit),
+/// `slots` prefill units buffered: what serve (and the GPU fixtures) start
+/// before any transport connects.
+pub(crate) fn spark_admission(snapshot: &std::path::Path, catalog: &cuteafd_loader::OfficialV41Catalog,
+    local_layers: usize, ranks: usize, capacity: u32, slots: usize,
+    topology: Option<cuteafd_transport::expert::SparkTopology>) -> Result<crate::shared::placement::SparkAdmission> {
+    let geometry = catalog.routed_experts().geometry()?;
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
-        rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
-    Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
-        &working, args.peers.len(), topology,
-        spark_model(catalog, capacity, catalog.nvfp4().is_some())?)?))
+        rtx_layers: (0..local_layers).collect(), spark_ranks: ranks, prefill_lanes: slots as u64 };
+    crate::shared::placement::SparkAdmission::plan(snapshot, geometry, Some(catalog), &working, ranks, topology,
+        spark_model(catalog, capacity, u8::try_from(slots)?, catalog.nvfp4().is_some())?)
 }
 
 #[cfg(test)]
@@ -72,12 +87,28 @@ mod spark_tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let backend = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
         for live in [256u32, 2048, 4096] {
-            // V4.1's layout pins its unit to the live chunk at one wave.
-            let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
-                prefill_waves: 1, ..Default::default() };
-            assert_eq!(spark_model(&catalog, live, false)?.executions,
-                cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
+            for waves in [1u8, 2] {
+                // The planner's resolved unit and waves, as serve admits them.
+                let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
+                    prefill_waves: u64::from(waves), ..Default::default() };
+                assert_eq!(spark_model(&catalog, live, waves, false)?.executions,
+                    cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
+            }
         }
+        Ok(())
+    }
+
+    /// The GPU fixture's admission (endpoints at the 64-row verify width, two
+    /// 64-row prefill units) passes the same validation the workers run.
+    #[test]
+    fn the_fixture_admission_shape_validates() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let model = spark_model(&catalog, cuteafd_core::V41_VERIFY_ROWS as u32, 2, false)?;
+        model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
+        assert!(spark_model(&catalog, 16, 2, false).is_err(),
+            "16-row endpoints cannot admit the 64-row decode owners");
         Ok(())
     }
 
@@ -88,16 +119,17 @@ mod spark_tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
             for bf16 in [false, true] {
-                let model = spark_model(&catalog, live, bf16)?;
+                let model = spark_model(&catalog, live, 2, bf16)?;
                 assert_eq!((model.capacity(), model.compiled_capacity()), (live, compiled));
-                // Two decode lanes, one prefill owner; two streams queue on it.
+                // Two decode lanes, one prefill owner holding the two units in flight.
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
                     capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
                     compiled_capacity: compiled, unit_rows: live, buffered_units: 2 });
-                assert_eq!(model.endpoints.len(), 2);
-                assert!(model.endpoints.iter().all(|e| e.capacity == live && e.ingress == if bf16 {
-                    cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 }));
+                // The decode lanes' links at the decode width (P3), the prefill link at the unit.
+                let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
+                assert_eq!(model.endpoints.iter().map(|e| (e.capacity, e.ingress)).collect::<Vec<_>>(),
+                    [(80.min(live), ingress), (80.min(live), ingress), (live, ingress)]);
             }
         }
         Ok(())
@@ -151,6 +183,84 @@ pub(super) fn startup_phase(
     Ok(())
 }
 
+/// Runs `build` with its device allocations owned by `"{scope}/{component}"`
+/// (ledger owner tag and default category). Category scopes nested inside
+/// (`sampler`, `workspace/fp8-linear`) keep the owner, so the plan == runtime
+/// check sums every byte the component allocates and reports each component.
+pub(super) fn scoped<T>(scope: &str, component: &str, build: impl FnOnce() -> Result<T>) -> Result<T> {
+    let label = format!("{scope}/{component}");
+    let _owner = cuteafd_ffi::memory_ledger::owner(&label);
+    let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+    build()
+}
+
+/// Plan == runtime (WP6): the decode lanes' and prefill slots' device
+/// allocations on each of `gpus` (their ledger owners) are exactly what the
+/// planner charges (`NativePrograms::target`). A retained temporary or an
+/// unmodelled owner fails startup instead of silently shrinking the pool.
+pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib: &std::path::Path, gpus: &[i32],
+    decode_rows: u32, reserve: u64, unit: u32, slots: usize) -> Result<()> {
+    use cuteafd_ffi::memory_ledger::{snapshot, Space};
+    let manifest = families::deepseek_v41::owners::native_manifest(native_lib, "V41_FP8_AOT.json")?;
+    let programs = families::deepseek_v41::owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
+    let fp8_head = crate::families::deepseek_v41::v41_tensors::fp8_head()
+        == crate::families::deepseek_v41::v41_tensors::Fp8Head::All;
+    let window_batch = gpus.len() == 1 && super::BackboneExecution::window_batch_enabled();
+    let ranks = gpus.len();
+    let lanes = programs.decode_lanes(u64::from(decode_rows), ranks, fp8_head, window_batch)?;
+    let prefill = programs.prefill_slots(reserve, u64::from(unit), ranks, slots, fp8_head, window_batch)?;
+    let ledger = snapshot();
+    for (rank, &gpu) in gpus.iter().enumerate() {
+        let owners = ledger.by_owner(Space::Device, gpu);
+        for (scope, demands, prefix) in [(super::DECODE_LANES_SCOPE, &lanes, "lane "), (super::PREFILL_SLOTS_SCOPE, &prefill, "prefill slots ")] {
+            // Live bytes per component (`scoped`), and the plan's per group
+            // (decode lanes' groups summed over both lanes).
+            let mut live = std::collections::BTreeMap::<String, u64>::new();
+            // Engram rows and gates are charged apart but one owner allocates both on two RTX.
+            let component = |name: &str| if name.starts_with("engram") { "engram".to_string() } else { name.to_string() };
+            for (label, &bytes) in owners.iter().filter(|(label, _)| label.starts_with(scope)) {
+                let name = label.strip_prefix(scope).unwrap_or(label).trim_start_matches('/');
+                *live.entry(if name.is_empty() { "(unscoped)".into() } else { component(name) }).or_default() += bytes as u64;
+            }
+            let mut plan = std::collections::BTreeMap::<String, u64>::new();
+            for demand in demands.iter().filter(|d| usize::from(d.gpu) == rank) {
+                let group = demand.group.strip_prefix(prefix).unwrap_or(&demand.group);
+                let group = if prefix == "lane " { group.split_once(' ').map_or(group, |(_, g)| g) } else { group };
+                // The decode lanes' window batch table belongs to their producers.
+                let group = if group == "window batch table" { "cache producers" } else { group };
+                *plan.entry(component(group)).or_default() += demand.bytes;
+            }
+            let (live_total, plan_total) = (live.values().sum::<u64>(), plan.values().sum::<u64>());
+            let differing: Vec<_> = live.keys().chain(plan.keys()).collect::<std::collections::BTreeSet<_>>().into_iter()
+                .filter_map(|group| { let (l, p) = (live.get(group).copied().unwrap_or(0), plan.get(group).copied().unwrap_or(0));
+                    (l != p).then(|| format!("{group}: live {l} plan {p} ({:+})", l as i64 - p as i64)) }).collect();
+            tracing::info!(gpu, scope, live = live_total, plan = plan_total, ?differing, "V4.1 target owners: plan == runtime");
+            ensure!(live_total == plan_total && differing.is_empty(),
+                "V4.1 {scope} on GPU {gpu}: allocated {live_total} B, planned {plan_total} B ({:+} B); {}",
+                live_total as i64 - plan_total as i64, differing.join("; "));
+        }
+    }
+    Ok(())
+}
+
+/// Plan == runtime for the coordinator expert workspaces (WP6): the planner's
+/// charge (`expert_inventory`: slot arenas at the unit, decode lanes at their
+/// width) equals what serve admits and allocates (`exact`, from the native
+/// library's own plans and the TP2 owner policy).
+pub(super) fn verify_expert_charges(catalog: &cuteafd_loader::OfficialV41Catalog, native_lib: &std::path::Path,
+    sms: u32, ranks: usize, unit: u32, slots: usize, reserve: u64, exact: u64) -> Result<()> {
+    let directory = native_lib.parent().context("native library has no directory")?;
+    let programs = [directory.join("PROGRAMS.json"), directory.join("../share/PROGRAMS.json"),
+        directory.join("../../share/PROGRAMS.json")].into_iter().find(|path| path.is_file())
+        .context("missing PROGRAMS.json beside the native library or in its share directory")?;
+    let (_, planned) = families::deepseek_v41::expert_inventory(catalog, &programs, u64::from(unit), ranks, sms,
+        slots, reserve, u64::from(super::DECODE_LANE_ROWS))?;
+    tracing::info!(planned, exact, ranks, unit, slots, reserve, "V4.1 expert workspaces: plan == runtime");
+    ensure!(planned == exact, "V4.1 expert workspaces: planned {planned} B per GPU, serve admits {exact} B ({:+} B)",
+        exact as i64 - planned as i64);
+    Ok(())
+}
+
 /// Startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
 pub(super) fn admit_startup(
@@ -176,10 +286,15 @@ pub(super) fn admit_startup(
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
-    let mut target = programs.target(u64::from(capacity), 1,
+    // Every owner serve allocates: two decode lanes, the prefill slots' storage.
+    let shape = super::AdmittedPrefill::resolve(args)?;
+    let passes = shape.waves;
+    let mut target = programs.target(u64::from(super::DECODE_LANE_ROWS), shape.reserve_rows() as u64,
+        u64::from(capacity), 1, passes,
         crate::families::deepseek_v41::v41_tensors::fp8_head()
             == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
         BackboneExecution::window_batch_enabled())?;
+    validate_engram_rows(&target, shape.reserve_rows(), super::DECODE_LANE_ROWS as usize)?;
     // Test builds retain the materialized query reference buffer; production
     // intentionally has no such owner.
     #[cfg(test)]
@@ -192,7 +307,7 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
+        owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes)?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
@@ -234,6 +349,25 @@ pub(super) fn admit_startup(
     Ok(())
 }
 
+/// The Engram upload planes are formula owners, separate from the gates:
+/// the prefill slots' one shared row plane over the `reserve` rows (each
+/// in-flight unit's rows a window of it, never unit scratch) and each decode
+/// lane's private planes at `decode_rows`, all on the gate GPU (GPU0).
+fn validate_engram_rows(target: &[Demand], reserve: usize, decode_rows: usize) -> Result<()> {
+    use cuteafd_core::memory_layout::Basis;
+    let row_bytes = cuteafd_loader::ENGRAM_DEVICE_ROW_BYTES as u64;
+    let rows = target.iter().filter(|d| d.group.ends_with(" engram rows")).collect::<Vec<_>>();
+    let slots = rows.iter().filter(|d| d.group == "prefill slots engram rows").collect::<Vec<_>>();
+    let lanes = rows.iter().filter(|d| d.group.starts_with("lane ")).collect::<Vec<_>>();
+    ensure!(rows.iter().all(|d| d.gpu == 0 && d.basis == Basis::Formula)
+        && rows.len() == 3 && slots.len() == 1 && lanes.len() == 2
+        && slots[0].bytes == reserve as u64 * row_bytes
+        && lanes.iter().all(|d| d.bytes == decode_rows as u64 * row_bytes),
+        "V4.1 Engram upload admission differs from the reserve row plane and the decode lanes' rows: {:?}",
+        rows.iter().map(|d| (d.group.as_str(), d.gpu, d.bytes)).collect::<Vec<_>>());
+    Ok(())
+}
+
 // Remote vision reserves its tower on the Spark, never in the RTX startup bound.
 fn local_vision_owner(enabled: bool, remote: bool) -> bool {
     enabled && !remote
@@ -241,6 +375,31 @@ fn local_vision_owner(enabled: bool, remote: bool) -> bool {
 
 #[cfg(test)]
 mod startup_tests {
+    /// The planner's own target list (decode lanes + prefill slot set) passes
+    /// the Engram check at every pinned depth, and the check still refuses a
+    /// missing, mis-sized or misplaced owner.
+    #[test]
+    fn engram_row_admission_matches_the_slot_set_and_decode_lanes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let manifest = cuteafd_loader::plan::testing::write_v41_workspaces(dir.path());
+        let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+        let programs = super::families::deepseek_v41::owners::NativePrograms::new(&fp8, 188)?;
+        for k in 2..=4u64 {
+            let unit = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(k);
+            let reserve = (k * unit) as usize;
+            let target = programs.target(80, reserve as u64, unit, 1, k as usize, false, true)?;
+            super::validate_engram_rows(&target, reserve, 80)?;
+            assert!(super::validate_engram_rows(&target, reserve - 64, 80).is_err(), "reserve mismatch");
+            let missing: Vec<_> = target.iter().filter(|d| d.group != "lane 1 engram rows").cloned().collect();
+            assert!(super::validate_engram_rows(&missing, reserve, 80).is_err(), "missing decode lane");
+            let mut moved = target.clone();
+            moved.iter_mut().find(|d| d.group == "prefill slots engram rows").unwrap().gpu = 1;
+            assert!(super::validate_engram_rows(&moved, reserve, 80).is_err(), "off the gate GPU");
+        }
+        Ok(())
+    }
+
     #[test]
     fn verifier_extent_matches_heads_sparse_admission_and_planner() -> anyhow::Result<()> {
         use crate::families::deepseek_v41::graph_policy;
@@ -316,19 +475,21 @@ pub(super) fn local_workspace(
         return Ok(0);
     }
     use crate::families::deepseek_v41::v41_experts::local::LocalExpertWave;
-    let lane = if let Some(exl3) = catalog.exl3() {
+    let lane = |rows: u32| -> Result<usize> { if let Some(exl3) = catalog.exl3() {
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
             &args.native_lib,
             exl3.decoder_tiers(),
             "rtx-tp1",
         );
-        LocalExpertWave::exl3_device_bytes(&directory, rows)?
+        LocalExpertWave::exl3_device_bytes(&directory, rows)
     } else {
-        LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some())?
-    };
-    Ok(lane
-        .checked_mul(2)
-        .context("local serving lanes overflow")? as u64)
+        LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some())
+    } };
+    // One local expert wave per prefill slot at the unit, one per decode lane
+    // at decode width.
+    let slots = super::AdmittedPrefill::resolve(args)?.waves;
+    Ok((lane(rows)?.checked_mul(slots).context("local serving lanes overflow")?
+        + 2 * lane(super::DECODE_LANE_ROWS)?) as u64)
 }
 
 /// With `draft`, the sample must precede all draft weights, runtime buffers and
@@ -604,13 +765,13 @@ pub(super) fn admission_memory(
 /// Weight and scratch allocations happen only after the resulting admission.
 pub(super) fn preload_exl3<'a>(
     lib: &'a cuteafd_ffi::NativeLibrary, directory: &std::path::Path,
-    capacity: u32, ranks: usize,
-) -> Result<[Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>; 2]> {
+    capacity: u32, ranks: usize, lanes: usize,
+) -> Result<Vec<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>> {
     use crate::shared::experts::exl3::execution::{Exl3InputFormat, Exl3Modules, Exl3ReductionPlan};
     let capacities = families::deepseek_v41::exl3_capacities(capacity as u64, ranks == 1)?;
     let directories: Vec<_> = capacities.iter().map(|capacity| directory.join(format!("m{capacity}"))).collect();
     Exl3ReductionPlan::new(&directories)?;
-    let mut lanes = [Vec::new(), Vec::new()];
+    let mut lanes = (0..lanes).map(|_| Vec::new()).collect::<Vec<_>>();
     for lane in &mut lanes {
         for directory in &directories {
             // SAFETY: operator-selected pinned native exports, owned on the current device.
@@ -689,6 +850,25 @@ pub(super) fn preload(
 
 #[cfg(test)]
 mod admission_tests {
+
+    /// The planner's transport charge is exactly what serve allocates: two
+    /// decode lanes' linked waves, every prefill slot's reduce output (slot 0
+    /// holds the link) and the one prefill link's intake over its slots.
+    #[test]
+    fn transport_charge_equals_serve_allocation() -> anyhow::Result<()> {
+        use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, V41Link};
+        for (rows, ranks) in [(1024u32, 3usize), (1408, 3), (2752, 4), (2752, 6), (4096, 4)] {
+            for slots in 2..=4usize {
+                let reserve = slots as u64 * u64::from(rows);
+                let runtime = 2 * NativeTp4Wave::device_bytes_for(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS, ranks)?
+                    + slots * rows as usize * 5120 * 2
+                    + V41Link::prefill_device_bytes(reserve as usize, ranks)?;
+                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS), u64::from(rows), ranks, slots)?, runtime as u64,
+                    "{slots} x {rows} rows on {ranks} ranks");
+            }
+        }
+        Ok(())
+    }
     use super::*;
     use clap::Parser;
 
@@ -734,11 +914,13 @@ mod admission_tests {
                 let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
-                let fixed = owners::TargetOwners::new(weights,
-                    programs.target(256, ranks, true, ranks == 1)?, ranks,
+                let target = programs.target(80, 512, 256, ranks, 2, true, ranks == 1)?;
+                // The startup validators accept the planner's own target list.
+                if ranks == 1 { validate_engram_rows(&target, 512, 80)?; }
+                let fixed = owners::TargetOwners::new(weights, target, ranks,
                     2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
-                    &catalog, &manifest, 256, ranks, 188)?;
+                    &catalog, &manifest, 256, ranks, 188, 2, 512, 80)?;
                 // Deliberately synthetic pre-weight inventory, independent of
                 // planner output. This is not a CUDA sample or ready-parity gate.
                 let memory = vec![(80usize << 30, 96usize << 30); ranks];
@@ -1096,6 +1278,39 @@ mod admission_tests {
             1_000_000,
         ));
         assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0, None).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plan_runtime_breakdown {
+    /// Prints the decode lane's planner groups beside the runtime owners'
+    /// own byte functions at decode width (CUTEAFD_NATIVE_LIB: a WIP or image
+    /// library; no device work).
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB"]
+    fn decode_lane_groups_against_runtime_byte_functions() -> anyhow::Result<()> {
+        use crate::families::deepseek_v41::*;
+        let path = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIB")?);
+        // SAFETY: trusted native library; only plan metadata is read.
+        let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&path)? };
+        let manifest = super::families::deepseek_v41::owners::native_manifest(&path, "V41_FP8_AOT.json")?;
+        let programs = super::families::deepseek_v41::owners::NativePrograms::new(&manifest, 188)?;
+        let rows = 80u32;
+        let plan = programs.decode_lanes(rows as u64, 1, false, true)?;
+        for d in plan.iter().filter(|d| d.group.starts_with("lane 0 ")) { eprintln!("PLAN {} {}", d.group, d.bytes); }
+        let r = rows as usize;
+        let lane: usize = v41_backbone_lane::BackboneLane::workspace_bytes(&lib, rows)?.into_iter().sum();
+        let index: usize = v41_index_lane::IndexLane::workspace_bytes(&lib, rows)?.into_iter().sum();
+        let producers = v41_backbone_execution::BackboneExecution::workspace_bytes(&lib, rows)?;
+        let gates = 2 * v41_engram::layer::EngramGate::device_bytes(&lib, r)?;
+        let head = v41_target_head::TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?;
+        for (name, bytes) in [("backbone", lane), ("index", index), ("cache producers+batch", producers),
+            ("embedding", v41_target_embedding::TargetEmbeddingWave::device_bytes(r)?),
+            ("engram rows", v41_engram::EngramDeviceRows::device_bytes(r)?), ("engram gates", gates),
+            ("target head", head), ("target taps", v41_target_pass::TargetTapWave::device_bytes(r)?)] {
+            eprintln!("RUNTIME {name} {bytes}");
+        }
         Ok(())
     }
 }

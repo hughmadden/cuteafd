@@ -209,8 +209,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     }).collect();
     let fp8_output = output_formats.values().any(|&r| r == R::Fp8);
     let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
-        if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-        else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
+        (options.prefill_lanes > 0).then(|| options.prefill_lanes.to_string()).as_deref())?;
     let rings = options.mimo_rings.max(concurrency);
     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     let dir = checkpoint.snapshot.join("dflash");
@@ -371,8 +370,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let ranks = devices.len();
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
-        if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-        else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
+        (options.prefill_lanes > 0).then(|| options.prefill_lanes.to_string()).as_deref())?;
     let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
         cfg: &cfg, profile: &profiles.steady, layers: cfg.layers,
         kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,

@@ -672,8 +672,7 @@ pub(super) fn transport_lanes(spark: bool, cfg: &MimoV2Config) -> Result<usize> 
     if !spark {
         return Ok(1);
     }
-    let configured = std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok();
-    resolve_transport_lanes(spark, cfg.program_family()?, configured.as_deref())
+    resolve_transport_lanes(spark, cfg.program_family()?, None)
 }
 
 

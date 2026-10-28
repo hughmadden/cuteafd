@@ -1811,12 +1811,120 @@ native_symbols! {
 }
 
 pub struct NativeLibrary {
-    lib: ManuallyDrop<Library>,
+    lib: ManuallyDrop<Arc<Library>>,
     symbols: NativeSymbols,
     quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     ordered_h2d_staging: Mutex<std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
+}
+
+/// Thread-movable, exclusive pinned bytes. A recorded H2D fence keeps the
+/// allocation alive through cancellation; its module outlives every function pointer.
+pub struct PinnedBytes {
+    module: Arc<Library>,
+    buffer: CuteafdHostBuffer,
+    free: FreeHostBufferFn,
+    event: *mut c_void,
+    create: CudaEventCreateFn,
+    get_device: unsafe extern "C" fn(*mut i32) -> CuteafdStatus,
+    device: i32,
+    record: CudaEventRecordFn,
+    query: CudaEventQueryFn,
+    synchronize: CudaEventSynchronizeFn,
+    destroy: CudaEventDestroyFn,
+    pending: bool,
+}
+// SAFETY: ownership is exclusive; worker fills bytes before handing them to the
+// CUDA thread. Once recorded, no writer accesses the bytes until the fence completes.
+unsafe impl Send for PinnedBytes {}
+impl PinnedBytes {
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: this owner retains a nonempty allocation for the slice lifetime.
+        unsafe { std::slice::from_raw_parts(self.buffer.ptr.cast(), self.buffer.bytes) }
+    }
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        assert!(!self.pending, "pinned copy source is still in flight");
+        // SAFETY: exclusive ownership and no pending asynchronous reader.
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.ptr.cast(), self.buffer.bytes) }
+    }
+    pub fn buffer(&self) -> CuteafdHostBuffer { self.buffer }
+    /// # Safety
+    /// All reads from these bytes were queued on `stream`; it is live on the
+    /// allocation event's device. Do not mutate the bytes until `copy_ready`.
+    pub unsafe fn copied_on(&mut self, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(!self.pending, "pinned source already has a queued reader");
+        // Mark pending before any fallible fence operation: failure quarantines
+        // the source rather than recycling bytes whose reads are unproved.
+        self.pending = true;
+        let mut device = -1;
+        // SAFETY: valid local output; the DSO is retained by this owner.
+        let status = unsafe { (self.get_device)(&mut device) };
+        if status != 0 { self.event = std::ptr::null_mut(); }
+        anyhow::ensure!(status == 0, "querying copy fence device: {status}");
+        if !self.event.is_null() && self.device != device {
+            // SAFETY: this old event was queried complete before slot reuse.
+            unsafe { let _ = (self.destroy)(self.event); }
+            self.event = std::ptr::null_mut();
+        }
+        if self.event.is_null() {
+            // SAFETY: create on the copy stream's device, not host allocator's.
+            let status = unsafe { (self.create)(&mut self.event) };
+            if status != 0 { self.event = std::ptr::null_mut(); }
+            anyhow::ensure!(status == 0, "creating pinned source copy fence: {status}");
+            self.device = device;
+        }
+        // SAFETY: caller retains this source and stream until the event's completion.
+        let status = unsafe { (self.record)(self.event, stream) };
+        if status != 0 {
+            // A failed record cannot establish a reclamation fence. Never free it.
+            self.event = std::ptr::null_mut();
+        }
+        anyhow::ensure!(status == 0, "recording pinned source copy fence: {status}");
+        Ok(())
+    }
+    pub fn copy_ready(&mut self) -> Result<bool> {
+        if !self.pending { return Ok(true); }
+        anyhow::ensure!(!self.event.is_null(), "pinned source has an unproved copy fence");
+        let mut ready = 0;
+        // SAFETY: this owner retains its event and module, even after cancellation.
+        let status = unsafe { (self.query)(self.event, &mut ready) };
+        anyhow::ensure!(status == 0, "querying pinned source copy fence: {status}");
+        if ready != 0 { self.pending = false; }
+        Ok(!self.pending)
+    }
+}
+impl Drop for PinnedBytes {
+    fn drop(&mut self) {
+        // SAFETY: a pending copy must drain before its source/event are released.
+        if self.pending && (self.event.is_null() || unsafe { (self.synchronize)(self.event) } != 0) {
+            tracing::error!("retaining pinned source and module after failed copy drain");
+            std::mem::forget(self.module.clone());
+            return;
+        }
+        // SAFETY: the source has no readers and this owner retains the module.
+        unsafe { if !self.event.is_null() { let _ = (self.destroy)(self.event); } }
+        memory_ledger::record_free(self.buffer.ptr as usize);
+        // SAFETY: exclusive allocation, with all queued readers completed above.
+        unsafe { let _ = (self.free)(&mut self.buffer); }
+    }
+}
+impl NativeLibrary {
+    pub fn pinned_bytes(&self, bytes: usize) -> Result<PinnedBytes> {
+        let free = self.cuteafd_free_host_buffer()?;
+        let record = self.cuteafd_cuda_event_record()?;
+        let query = self.cuteafd_cuda_event_query()?;
+        let synchronize = self.cuteafd_cuda_event_synchronize()?;
+        let destroy = self.cuteafd_cuda_event_destroy()?;
+        let create = self.cuteafd_cuda_event_create_ordering()?;
+        let get_device = self.cuteafd_cuda_get_device()?;
+        let buffer = self.alloc_host_buffer(bytes)?;
+        // SAFETY: newly allocated, exclusive storage must be initialized before
+        // safe byte slices expose it (including unused capacity padding).
+        unsafe { std::ptr::write_bytes(buffer.ptr.cast::<u8>(), 0, bytes); }
+        Ok(PinnedBytes { module: Arc::clone(&self.lib), buffer, free, event: std::ptr::null_mut(),
+            create, get_device, device: -1, record, query, synchronize, destroy, pending: false })
+    }
 }
 
 pub const CUTEAFD_XGRAMMAR_JSON_OBJECT: c_int = 1;
@@ -2224,7 +2332,7 @@ impl NativeLibrary {
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
         Ok(Self {
-            lib: ManuallyDrop::new(lib),
+            lib: ManuallyDrop::new(Arc::new(lib)),
             symbols: NativeSymbols::default(),
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),

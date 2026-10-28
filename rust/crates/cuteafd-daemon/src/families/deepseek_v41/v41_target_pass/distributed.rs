@@ -1,13 +1,12 @@
 //! Full target-pass sequencing with GPU-local lanes and short request borrows.
 use super::*;
 use crate::families::deepseek_v41::v41_target_head::distributed_target::{DistributedTargetHead, DistributedTargetLogits};
-mod encoder_stream;
+mod encoder_units;
 use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
 use crate::shared::peer_split::hop::DirectInputHop;
 use crate::families::deepseek_v41::v41_engram::placement::PlacedEngram;
 use crate::shared::memory::device::DeviceOwner;
-use encoder_stream::EncoderFlow;
 
 #[cfg(test)]
 fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>)
@@ -209,6 +208,51 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             sampled: None,
         })
     }
+    /// Selects this prefill slot's rows in every component's shared row planes
+    /// on both GPUs (`shared::memory::row_window`), at rest.
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        crate::shared::memory::row_window::require_rest(self.state != State::Idle, "prefill slot", "a pass is running or uncommitted")?;
+        let resources = &mut self.resources;
+        // At rest the previous unit's finished outputs are dropped (the next
+        // use restarts every owner); pending work still refuses.
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.restart())?;
+        }
+        resources.execution.restart_for(CacheStage::Encoder);
+        for lane in &mut resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().select_window(window.clone()))?;
+        }
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.get_mut().select_window(window.clone()))?;
+        }
+        resources.execution.select_window(window.clone())?;
+        let device = resources.embedding.device;
+        device.run(|| resources.embedding.get_mut().select_window(window.clone()))?;
+        resources.engram.select_window(window.clone())?;
+        let device = resources.taps.device;
+        device.run(|| resources.taps.get_mut().select_window(window))
+    }
+    /// A prefill unit's input (`Requests::prepare_unit_input`) on layer 0's GPU.
+    /// # Safety
+    /// As `begin_stage`: the unit owns its batch and its rows.
+    pub(super) fn prepare_unit_input(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch) -> Result<()> {
+        self.resources.execution.restart_for(CacheStage::Encoder);
+        for index in self.resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.restart())?;
+        }
+        let gpu = self.resources.map.attention(0)?;
+        let device = self.resources.lanes[gpu].device;
+        ensure!(self.resources.embedding.device.id == device.id, "embedding and layer 0 differ in GPU");
+        device.run(|| self.resources.lanes[gpu].restart())?;
+        let (embedding, lane) = (self.resources.embedding.get_mut(), self.resources.lanes[gpu].get_mut());
+        // SAFETY: the unit owns its rows of the block planes (caller contract).
+        device.run(|| unsafe { requests.borrow().prepare_unit_input(batch, embedding, lane) })
+    }
     /// `--l2-prefetch` on both GPUs' lanes, each for the layers it holds.
     pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
         for lane in &mut self.resources.lanes {
@@ -368,7 +412,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let result = unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
             // A failed Spark wire released its waits over garbage planes.
-            return result.and_then(|()| crate::shared::spark_waves::healthy());
+            let result = result.and_then(|()| crate::shared::spark_waves::healthy());
+            // Remote layers left their captured routes in the routers' rings.
+            if result.is_ok() { self.drain_route_rings()?; }
+            return result;
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
@@ -383,21 +430,25 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");
         }
         let ring_timed = timed.map(|_| Instant::now());
-        if result.is_ok() && self.resources.capture_routes {
-            // Device-ordered local layers left their routes in the routers' rings.
-            for gpu in 0..self.resources.lanes.len() {
-                let device = self.resources.lanes[gpu].device;
-                let lane = &mut self.resources.lanes[gpu];
-                for layer in device.run(|| lane.get_mut().drain_route_ring())? {
-                    self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
-                }
-            }
-        }
+        // Remote and device-ordered local layers left their routes in the routers' rings.
+        if result.is_ok() { self.drain_route_rings()?; }
         if let Some(t) = ring_timed {
             tracing::debug!(target: "cuteafd::timing", route_ring_us=t.elapsed().as_micros() as u64,
                 "distributed route ring drain");
         }
         result
+    }
+    /// After a drained pass: every ring-captured layer's routes into the capture.
+    fn drain_route_rings(&mut self) -> Result<()> {
+        if !self.resources.capture_routes { return Ok(()); }
+        for gpu in 0..self.resources.lanes.len() {
+            let device = self.resources.lanes[gpu].device;
+            let lane = &mut self.resources.lanes[gpu];
+            for layer in device.run(|| lane.get_mut().drain_route_ring())? {
+                self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
+            }
+        }
+        Ok(())
     }
     async unsafe fn execute_unchained(
         &mut self,
@@ -431,7 +482,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         suffix,
                         encoder,
                         greedy,
-                        None,
                     )
                     .await?;
             }
@@ -440,7 +490,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         } else {
             unsafe {
                 self.execute_inner(
-                    requests, batch, transport, placement, selected, suffix, encoder, greedy, None,
+                    requests, batch, transport, placement, selected, suffix, encoder, greedy,
                 )
                 .await
             }
@@ -456,7 +506,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         mut suffix: Option<&mut DeviceOwner<'a, EncoderSuffix<'a>>>,
         encoder: Option<&BlockOutput<'_>>,
         greedy: bool,
-        flow: Option<EncoderFlow<'_, '_, 'a>>,
     ) -> Result<()> {
         let begin_timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         requests.with_requests(|r| r.validate(batch))?;
@@ -483,83 +532,18 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             "invalid distributed head selection"
         );
         self.state.begin()?;
+        self.resources.engram.reset_uploads()?;
         let guard = BatchGuard {
             batch,
             completed: false,
         };
         let mut guard = guard;
-        self.resources.execution.restart_for(stage);
-        for index in self.resources.indices.iter_mut().flatten() {
-            let device = index.device;
-            device.run(|| {
-                if stage == CacheStage::Replay {
-                    index.restart_decoder()
-                } else {
-                    index.restart()
-                }
-            })?;
-        }
-        if !stage.is_encoder() {
-            self.resources.taps.begin(guard.batch.cache()?)?;
-        }
-        let first = stage.windows().start;
-        let gpu = self.resources.map.attention(first)?;
-        let device = self.resources.lanes[gpu].device;
-        if stage == CacheStage::Replay {
-            let encoder = encoder.context("distributed replay requires retained encoder suffix")?;
-            ensure!(
-                encoder.tokens == guard.batch.cache()?.positions(),
-                "distributed replay suffix rows differ"
-            );
-            if encoder.residual.device_id == device.id {
-                device.run(|| self.resources.lanes[gpu].restart_decoder(encoder))?;
-            } else {
-                unsafe {
-                    self.resources.lanes[gpu]
-                        .get_mut()
-                        .import_previous_cooperative(encoder, &mut self.resources.transfers[gpu])
-                        .await?;
-                }
-            }
-            device
-                .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
-                .await?;
-        } else {
-            device.run(|| self.resources.lanes[gpu].restart())?;
-            let text = requests.with_requests(|r| r.text_embedding_input(guard.batch))?;
-            if let Some((tokens, positions)) = text {
-                device
-                    .future(unsafe {
-                        self.resources.lanes[gpu].get_mut().begin_tokens_cooperative(
-                            self.resources.embedding.get_mut(),
-                            tokens,
-                            &positions,
-                        )
-                    })
-                    .await?;
-            } else {
-                unsafe {
-                    requests.with_requests(|r| {
-                        device.run(|| {
-                            r.begin_input(
-                                guard.batch,
-                                self.resources.embedding.get_mut(),
-                                self.resources.lanes[gpu].get_mut(),
-                            )
-                        })
-                    })?;
-                }
-            }
-        }
+        unsafe { self.begin_stage(requests, guard.batch, stage, encoder).await?; }
         if let Some(t) = begin_timed {
             tracing::debug!(target: "cuteafd::timing", rows, begin_us=t.elapsed().as_micros() as u64,
                 "distributed pass begin");
         }
         layer_schedule!(stage; layer, first; {
-            if let Some(flow) = &flow {
-                flow.permit.wait_predecessor(layer).await;
-                ensure!((flow.keep_running)(), "client disconnected");
-            }
             let gpu = self.resources.map.attention(layer)?;
             let device = self.resources.lanes[gpu].device;
         }; device.library; {
@@ -567,25 +551,24 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 unsafe {
                     self.advance(layer).await?;
                 }
+                if (2..14).contains(&layer) && !self.resources.engram.staged(1)
+                    && self.resources.engram.can_enqueue(1)? {
+                    if let cuteafd_loader::EngramGatherPoll::Ready(lease) = requests.with_requests(|r| r.poll_engram_layer(guard.batch, 1))? {
+                        self.resources.engram.enqueue_lease(lease, guard.batch.engram_wave()?)?;
+                    }
+                }
                 if [1, 14].contains(&layer) {
                     let gate = usize::from(layer == 14);
-                    guard.batch.wait_engram_gather(gate, self.resources.timeout).await?;
-                    let gathered = requests.with_requests(|r| {
-                        r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
-                    })?;
-                    match gathered {
-                        cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                            unsafe {
-                                self.resources.engram
-                                    .apply(&mut self.resources.lanes[gpu], &lease.view()?)
-                                    .await?;
-                            }
+                    if !self.resources.engram.staged(gate) {
+                        guard.batch.wait_engram_gather(gate, self.resources.timeout).await?;
+                    self.resources.engram.wait_enqueue(gate, self.resources.timeout).await?;
+                        match requests.with_requests(|r| r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu]))? {
+                            cuteafd_loader::EngramGatherPoll::Ready(lease) => self.resources.engram.enqueue_lease(lease, guard.batch.engram_wave()?)?,
+                            cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("distributed Engram gather cancelled"),
+                            cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                         }
-                        cuteafd_loader::EngramGatherPoll::Cancelled => {
-                            anyhow::bail!("distributed Engram gather cancelled")
-                        }
-                        cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                     }
+                    unsafe { self.resources.engram.apply_staged(&mut self.resources.lanes[gpu], gate).await?; }
                 }
                 if layer >= 37 {
                     let input = self.resources.lanes[gpu].prepared_input()?;
@@ -774,75 +757,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     self.publish_encoder_layer(requests, guard.batch, layer)
                         .await?;
                 }
-                if let Some(flow) = &flow {
-                    flow.permit.publish(layer);
-                }
             }
         });
         if stage.is_encoder() {
-            let gpu = self.resources.map.attention(19)?;
-            let device = self.resources.lanes[gpu].device;
-            if let Some(flow) = &flow {
-                flow.permit.wait_commit_turn().await;
-                ensure!((flow.keep_running)(), "client disconnected");
-                let mut suffix = flow.suffix.borrow_mut();
-                ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
-                let output = self.resources.lanes[gpu].output()?;
-                device
-                    .future(unsafe {
-                        suffix
-                            .get_mut()
-                            .capture_cooperative(&output, &self.resources.suffix_stream)
-                    })
-                    .await?;
-            } else {
-                let suffix = suffix
-                    .as_mut()
-                    .context("distributed encoder suffix owner missing")?;
-                ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
-                let output = self.resources.lanes[gpu].output()?;
-                device
-                    .future(unsafe {
-                        suffix
-                            .get_mut()
-                            .capture_cooperative(&output, &self.resources.suffix_stream)
-                    })
-                    .await?;
-            }
-            if stage == CacheStage::Encoder {
-                unsafe {
-                    self.advance(20).await?;
-                }
-                let gpu = self.resources.map.attention(20)?;
-                let device = self.resources.lanes[gpu].device;
-                device
-                    .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
-                    .await?;
-                let mut production = unsafe {
-                    requests.with_requests(|r| {
-                        self.resources.execution.enqueue_production(
-                            r.cache(),
-                            guard.batch.cache()?,
-                            &self.resources.lanes[gpu],
-                            None,
-                        )
-                    })?
-                };
-                while !unsafe {
-                    if reserved {
-                        requests
-                            .borrow_mut()
-                            .poll_distributed_encoder_production(guard.batch, &mut production)?
-                    } else {
-                        requests
-                            .with_requests(|r| production.poll(r.cache(), guard.batch.cache()?))?
-                    }
-                } {
-                    tokio::task::yield_now().await;
-                }
-                drop(production);
-                self.resources.execution.finish_decoder_source(guard.batch.cache()?)?;
-            }
+            let suffix = suffix.as_mut().context("distributed encoder suffix owner missing")?;
+            unsafe { self.finish_encoder_stage(requests, guard.batch, stage, suffix).await?; }
             self.state = State::Encoded(id);
         } else {
             self.resources.taps.output(guard.batch.cache()?)?;
@@ -857,6 +776,129 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             self.state = State::Ready(id);
         }
         guard.completed = true;
+        Ok(())
+    }
+    /// Restart the pass's owners for `batch` at `stage` and embed its rows (or
+    /// import the retained encoder suffix for the decoder replay).
+    /// # Safety
+    /// The pass exclusively owns its lanes; `encoder` is this batch's retained suffix.
+    async unsafe fn begin_stage(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch, stage: CacheStage, encoder: Option<&BlockOutput<'_>>) -> Result<()> {
+        self.resources.execution.restart_for(stage);
+        for index in self.resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| {
+                if stage == CacheStage::Replay {
+                    index.restart_decoder()
+                } else {
+                    index.restart()
+                }
+            })?;
+        }
+        if !stage.is_encoder() {
+            self.resources.taps.begin(batch.cache()?)?;
+        }
+        let first = stage.windows().start;
+        let gpu = self.resources.map.attention(first)?;
+        let device = self.resources.lanes[gpu].device;
+        if stage == CacheStage::Replay {
+            let encoder = encoder.context("distributed replay requires retained encoder suffix")?;
+            ensure!(
+                encoder.tokens == batch.cache()?.positions(),
+                "distributed replay suffix rows differ"
+            );
+            if encoder.residual.device_id == device.id {
+                device.run(|| self.resources.lanes[gpu].restart_decoder(encoder))?;
+            } else {
+                unsafe {
+                    self.resources.lanes[gpu]
+                        .get_mut()
+                        .import_previous_cooperative(encoder, &mut self.resources.transfers[gpu])
+                        .await?;
+                }
+            }
+            device
+                .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
+                .await?;
+        } else {
+            device.run(|| self.resources.lanes[gpu].restart())?;
+            let text = requests.with_requests(|r| r.text_embedding_input(batch))?;
+            if let Some((tokens, positions)) = text {
+                device
+                    .future(unsafe {
+                        self.resources.lanes[gpu].get_mut().begin_tokens_cooperative(
+                            self.resources.embedding.get_mut(),
+                            tokens,
+                            &positions,
+                        )
+                    })
+                    .await?;
+            } else {
+                unsafe {
+                    requests.with_requests(|r| {
+                        device.run(|| {
+                            r.begin_input(
+                                batch,
+                                self.resources.embedding.get_mut(),
+                                self.resources.lanes[gpu].get_mut(),
+                            )
+                        })
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// The encoder tail: capture the suffix rows, then (full encoder) advance
+    /// to layer 20 and produce the decoder source.
+    /// # Safety
+    /// The pass's encoder output for `batch` is complete; `suffix` is this prompt's.
+    async unsafe fn finish_encoder_stage(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch, stage: CacheStage, suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>) -> Result<()> {
+        let reserved = batch.cache()?.is_reserved();
+        let gpu = self.resources.map.attention(19)?;
+        let device = self.resources.lanes[gpu].device;
+        ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
+        let output = self.resources.lanes[gpu].output()?;
+        if crate::shared::memory::chain::deferred() {
+            // Device-ordered prefill units (#815 option (i)): no host wait;
+            // the unit's commit drains the chain before the suffix is read.
+            let stream = self.resources.suffix_stream.raw;
+            device.run(|| unsafe { suffix.get_mut().capture_chained(&output, stream) })?;
+        } else {
+            device.future(unsafe { suffix.get_mut().capture_cooperative(&output, &self.resources.suffix_stream) }).await?;
+        }
+        if stage == CacheStage::Encoder {
+            unsafe { self.advance(20).await?; }
+            let gpu = self.resources.map.attention(20)?;
+            let device = self.resources.lanes[gpu].device;
+            device.future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() }).await?;
+            let mut production = unsafe { requests.with_requests(|r| self.resources.execution.enqueue_production(
+                r.cache(), batch.cache()?, &self.resources.lanes[gpu], None))? };
+            while !unsafe {
+                if reserved { requests.borrow_mut().poll_distributed_encoder_production(batch, &mut production)? }
+                else { requests.with_requests(|r| production.poll(r.cache(), batch.cache()?))? }
+            } {
+                tokio::task::yield_now().await;
+            }
+            drop(production);
+            self.resources.execution.finish_decoder_source(batch.cache()?)?;
+            // The boundary's query projection and its source-20 reader are done
+            // (the production completed): free the lane's guarded scratch as
+            // attention does after its join, so a later unit's acquire orders
+            // after this boundary (C2).
+            let lane = &self.resources.lanes[gpu];
+            lane.device.run(|| lane.release_scratch())?;
+        }
+        Ok(())
+    }
+    /// A unit's encoder tail on the shared executor (units end in order).
+    /// # Safety
+    /// As [`Self::finish_encoder_stage`].
+    pub(super) async unsafe fn finish_encoder_unit(&mut self, requests: &std::cell::RefCell<&mut Requests<'a>>,
+        batch: &RequestBatch, suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>) -> Result<()> {
+        unsafe { self.finish_encoder_stage(requests, batch, CacheStage::Encoder, suffix).await?; }
+        self.state = State::Encoded(batch.cache()?.identity());
         Ok(())
     }
     async unsafe fn publish_encoder_layer(
@@ -974,6 +1016,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
     use cuteafd_ffi::NativeLibrary;
     use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::SparkExperts};
+    use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
     use std::rc::Rc;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
@@ -1146,12 +1189,53 @@ mod tests {
             }
             Ok(pass)
         };
+        // Two prefill slots on one storage set per GPU (reserve 32, unit 16),
+        // as serve assembles them (`shared::memory::row_window`).
+        let slot_storage = || -> Result<_> {
+            let both = [0, 1];
+            Ok((
+                [devices[0].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, 32, 16, &both))?,
+                 devices[1].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, 32, 16, &both))?],
+                [IndexLane::storage_on_device(&iw, 32, 16, 0, &both)?, IndexLane::storage_on_device(&iw, 32, 16, 1, &both)?],
+                crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(&lib, map, 32, 16)?,
+                devices[0].own(|| TargetEmbeddingWave::storage(&lib, 32, 16))?,
+                PlacedEngram::storage(&ew, 32, 16)?,
+                devices[1].own(|| TargetTapWave::storage(&lib, 32, 16))?,
+            ))
+        };
+        let (lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage) = slot_storage()?;
+        let make_slot = || -> Result<DistributedTargetPass<'_, '_>> {
+            let mut pass = DistributedTargetPass::new(
+                map,
+                devices[0].own(|| TargetEmbeddingWave::on_storage(&lib, &table, embedding_storage.get().clone()))?,
+                [BackboneLane::on_storage_on_device(&weights, lane_storage[0].get().clone())?,
+                 BackboneLane::on_storage_on_device(&weights, lane_storage[1].get().clone())?],
+                [Some(IndexLane::on_storage_on_device(&iw, index_storage[0].get().clone())?),
+                 Some(IndexLane::on_storage_on_device(&iw, index_storage[1].get().clone())?)],
+                DistributedExecution::on_storage(&producers, &producer_storage)?,
+                PlacedEngram::on_storage(&ew, &engram_storage)?,
+                DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], 16,
+                    DistributedTargetHead::device_bytes(16, 64640)?)?,
+                devices[1].own(|| TargetTapWave::on_storage(tap_storage.get().clone()))?,
+                Duration::from_secs(120),
+            )?;
+            let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+            let modes = (0..40).map(|layer| Ok(cuteafd_loader::placement::LayerMode::Whole {
+                gpu: map.attention(layer)? as u8, ffn: cuteafd_loader::placement::FfnMode::Owner,
+            })).collect::<Result<Vec<_>>>()?;
+            let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
+            for (gpu, transfer) in pass.resources.transfers.iter_mut().enumerate() {
+                let incoming: Vec<_> = hops.iter().filter(|hop| usize::from(hop.to) == gpu).copied().collect();
+                transfer.bind(&incoming, spec)?;
+            }
+            Ok(pass)
+        };
         let mut pass = make_pass()?;
         let token_map = cuteafd_loader::EngramTokenMap::from_file(
             &std::path::Path::new(&snapshot).join("tokenizer.json"),
         )?;
         let pipeline =
-            unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, 16, 2, 8 << 20, 0)? };
+            unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, cuteafd_loader::EngramStagingShape::new(16, 2)?, 0)? };
         let pages = [4, 4, 4, 8];
         let mut requests = Requests::new_distributed(
             &lib,
@@ -1168,13 +1252,20 @@ mod tests {
             .try_into()
             .ok()
             .context("four Spark endpoints required")?;
-        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                timeout: Duration::from_secs(120),
-                max_frame_bytes: 2 << 20,
-            }, 0)?;
+        // As serve: the workers' selection/admission handshake (layers 20.. on
+        // the Sparks, two prefill units) before any link. Endpoints admit the
+        // decode owners' verify width (64 rows); the fixture's 16-row links fit.
+        crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(std::path::Path::new(&snapshot),
+            &catalog, 20, peers.len(), cuteafd_core::V41_VERIFY_ROWS as u32, 2,
+            // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
+            Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;
+        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
+        // As serve: each link's exchange starts at the first remote layer.
+        let nvfp4 = catalog.nvfp4().is_some();
+        devices[1].run(|| transport.get_mut().bootstrap(20, nvfp4))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -1222,8 +1313,11 @@ mod tests {
                 }
             })?;
             ensure!(pass.captured_routes().len() == 40, "distributed route history has missing layers");
+            let counts: Vec<usize> = pass.captured_routes().iter().map(Vec::len).collect();
             for (layer, routes) in pass.captured_routes().iter().enumerate() {
-                ensure!(routes.len() == tokens.len(), "distributed route row count differs at layer {layer}");
+                ensure!(routes.len() == tokens.len(),
+                    "distributed route row count differs at layer {layer}: {} rows, expected {} (step {step}, per layer {counts:?})",
+                    routes.len(), tokens.len());
                 ensure!(routes == &pass.resources.lanes[pass.resources.map.attention(layer)?].captured_routes()[layer],
                     "distributed route history differs from its GPU owner");
                 ensure!(routes.iter().all(|row| row.iter().enumerate().all(|(i, id)|
@@ -1357,14 +1451,28 @@ mod tests {
         let mut other_transport = devices[1].own(|| {
             NativeTp4Wave::new(
                 &lib,
-                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
-                        timeout: Duration::from_secs(120),
-                        max_frame_bytes: 2 << 20,
-                    }, 0)?,
+                // As serve: the second decode lane's own endpoint (lane 1).
+                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 1)?,
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;
-        other_transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 20, 16, [None, None])?)?;
+        other_transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
+        devices[1].run(|| other_transport.get_mut().bootstrap(20, nvfp4))?;
+        // The prefill slots: two passes on shared storage; slot 0's FFN owner
+        // holds the one prefill link (execution lane 2), two return slots of
+        // 16 rows; one TP2 FFN arena for both (reserve 32, unit 16).
+        let ffn_storage = tp2_ffn::Storage::new(routed, shared, 20, 32, 16, [None, None])?;
+        let link = devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16,
+                crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 2)?, 2, 16))?;
+        let mut slot_transports = [devices[1].own(|| NativeTp4Wave::with_link(&lib, link.into_inner()))?,
+            devices[1].own(|| NativeTp4Wave::unlinked(&lib, 16))?];
+        for transport in &mut slot_transports { transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?; }
+        devices[1].run(|| slot_transports[0].get_mut().bootstrap(20, nvfp4))?;
+        let [slot0_transport, slot1_transport] = slot_transports;
+        let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
+            slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
+        };
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;
             requests.begin_encoder(reference_lease, prompt.len() as u64)?;
@@ -1396,8 +1504,7 @@ mod tests {
                 devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
             draft.admit(id)?;
             let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
-                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
-                &prompt, chunk_rows, Some(draft.get_mut()))?;
+                &mut requests, &mut prefill_slots, lease, &prompt, chunk_rows, 2, Some(draft.get_mut()))?;
             assert_eq!(anchor, reference_anchor, "serving prefill anchor differs from matching sequential chunks");
             draft.validate_position(id, 7)?;
             let proposed = loop {
@@ -1408,8 +1515,7 @@ mod tests {
                 "serving prefill to draft handoff differs");
             let continued: Vec<_> = prompt.into_iter().chain([800, 900]).collect();
             let next = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
-                &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
-                &continued, chunk_rows, Some(draft.get_mut()))?;
+                &mut requests, &mut prefill_slots, lease, &continued, chunk_rows, 2, Some(draft.get_mut()))?;
             ensure!(next < 129280, "invalid continuation anchor");
             assert_eq!(requests.cache().committed_end(lease)?, 9);
             draft.validate_position(id, 9)?;
@@ -1419,6 +1525,52 @@ mod tests {
             assert_eq!(lib.cuda_get_device()?, 0);
             eprintln!("PASS serving distributed decode: streamed finish, target/draft retirement, transport reset");
             eprintln!("PASS serving distributed prefill chunk_rows={chunk_rows}: encoder/replay, draft handoff, cached continuation, target/draft commits");
+        }
+        {
+            // C1/C4/D1: a client disconnect mid-unit (queued chained work, the
+            // link lent out, windows selected on passes and their TP2 FFN).
+            use crate::shared::memory::row_window::RowWindow;
+
+            let lease = requests.admit(0, 93500)?;
+            let error = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_cancelled_prefill::<_, DsparkChain<'_, '_>>(
+                &lib, &runtime, &mut requests, &mut prefill_slots, lease, &prompt, 3, 2);
+            ensure!(format!("{error:#}").contains("client disconnected"), "cancel path failed otherwise: {error:#}");
+            if requests.cache().request_id(lease).is_ok() { requests.release(lease)?; }
+            let windows: Vec<_> = prefill_slots.slots.iter().map(|(pass, transport)| (
+                pass.resources.lanes.iter().map(|lane| lane.window().clone()).collect::<Vec<_>>(),
+                transport.tp2_window().cloned())).collect();
+            for (lanes, tp2) in windows {
+                ensure!(lanes.iter().all(|window| *window == RowWindow::NONE), "a cancelled unit left a lane windowed");
+                ensure!(tp2.is_none_or(|window| window == RowWindow::NONE), "a cancelled unit left its TP2 FFN windowed");
+            }
+            ensure!(prefill_slots.slots[0].1.get_mut().take_link().map(|link| prefill_slots.slots[0].1.get_mut().restore_link(link)).is_ok(),
+                "a cancelled units call left slot 0 without its link");
+            // Slot 0 serves the next prompt (units, replay) after the cancel.
+            let lease = requests.admit(0, 93501)?;
+            let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill::<_, DsparkChain<'_, '_>>(
+                &lib, &runtime, &mut requests, &mut prefill_slots, lease, &prompt, 3, 2, None)?;
+            ensure!(anchor < 129280, "post-cancel prefill anchor invalid");
+            requests.release(lease)?;
+            eprintln!("PASS cancelled units: windows (passes + TP2 FFN) at rows from 0, link restored, slot 0 serves again");
+            // C1: every unit's TP2 FFN works in its slot's window, as its pass
+            // does (negative control: unwindowed TP2 sees rows from 0).
+            use self::encoder_units::{SKIP_TP2_WINDOW, UNIT_WINDOWS};
+            for skip in [false, true] {
+                SKIP_TP2_WINDOW.with(|flag| flag.set(skip));
+                UNIT_WINDOWS.with(|seen| seen.borrow_mut().clear());
+                let lease = requests.admit(0, 93510 + u64::from(skip))?;
+                let ran = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill::<_, DsparkChain<'_, '_>>(
+                    &lib, &runtime, &mut requests, &mut prefill_slots, lease, &prompt, 3, 2, None);
+                SKIP_TP2_WINDOW.with(|flag| flag.set(false));
+                ran?;
+                requests.release(lease)?;
+                let seen = UNIT_WINDOWS.with(|seen| std::mem::take(&mut *seen.borrow_mut()));
+                ensure!(seen.len() >= 2 && seen.iter().any(|(pass, _)| pass.start() > 0), "units did not run in two windows");
+                let matched = seen.iter().all(|(pass, tp2)| tp2.as_ref() == Some(pass));
+                eprintln!("TP2 FFN unit windows skip={skip}: {} units, matched={matched}", seen.len());
+                ensure!(matched != skip, "TP2 FFN window {} its pass's (skip={skip})", if matched { "matches" } else { "differs from" });
+            }
+            eprintln!("PASS TP2 FFN units windowed with their passes; the unwindowed control differs");
         }
         drop(draft_weights);
         if std::env::var_os("CUTEAFD_INDEPENDENT_ENCODER_CHECK").is_some() {
@@ -1500,17 +1652,13 @@ mod tests {
                 let mut suffix = devices[map.attention(19)?]
                     .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
                 if interleaved {
-                    runtime.block_on(unsafe {
-                        pass.execute_encoder_stream(
-                            &mut other,
-                            &mut requests,
-                            lease,
-                            &chunks,
-                            [&mut transport, &mut other_transport],
-                            &mut suffix,
-                            &|| true,
-                        )
-                    })?;
+                    let mut link = DistributedTargetPass::take_link(&mut prefill_slots.slots[0].1)?;
+                    let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
+                    let result = runtime.block_on(unsafe {
+                        DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(()))
+                    });
+                    DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
+                    result?;
                 } else {
                     for chunk in &chunks {
                         let mut batch =
@@ -1674,24 +1822,20 @@ mod tests {
         let mut cancelled_suffix = devices[map.attention(19)?]
             .own(|| EncoderSuffix::new(&lib, 7, EncoderSuffix::device_bytes(7)?))?;
         let calls = std::cell::Cell::new(0);
-        let result = runtime.block_on(unsafe {
-            pass.execute_encoder_stream(
-                &mut other,
-                &mut requests,
-                lease,
-                &[&prompt[..3], &prompt[3..]],
-                [&mut transport, &mut other_transport],
-                &mut cancelled_suffix,
-                &|| {
-                    calls.set(calls.get() + 1);
-                    calls.get() < 12
-                },
-            )
-        });
-        assert!(result.is_err(), "disconnected encoder stream succeeded");
+        let mut link = DistributedTargetPass::take_link(&mut prefill_slots.slots[0].1)?;
+        let result = {
+            let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
+            runtime.block_on(unsafe {
+                DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &[], &|| {
+                        calls.set(calls.get() + 1);
+                        calls.get() < 12
+                    }, &|| Ok(()))
+            })
+        };
+        DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
+        assert!(result.is_err(), "disconnected encoder units succeeded");
         assert!(requests.cache().request_id(lease).is_err());
-        assert_eq!(pass.state, State::Idle);
-        assert_eq!(other.state, State::Idle);
+        assert!(prefill_slots.slots.iter().all(|(slot, _)| slot.state == State::Idle));
         assert_eq!(lib.cuda_get_device()?, 0);
         eprintln!("PASS disconnected distributed encoder stream revoked both active chunks");
         // Cancel a reserved pass at a cooperative suspension. The guard revokes
