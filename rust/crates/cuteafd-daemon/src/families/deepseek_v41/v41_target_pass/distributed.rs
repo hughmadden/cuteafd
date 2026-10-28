@@ -877,6 +877,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             }
             drop(production);
             self.resources.execution.finish_decoder_source(batch.cache()?)?;
+            // The boundary's query projection and its source-20 reader are done
+            // (the production completed): free the lane's guarded scratch as
+            // attention does after its join, so a later unit's acquire orders
+            // after this boundary (C2).
+            let lane = &self.resources.lanes[gpu];
+            lane.device.run(|| lane.release_scratch())?;
         }
         Ok(())
     }
@@ -1505,6 +1511,52 @@ mod tests {
             assert_eq!(lib.cuda_get_device()?, 0);
             eprintln!("PASS serving distributed decode: streamed finish, target/draft retirement, transport reset");
             eprintln!("PASS serving distributed prefill chunk_rows={chunk_rows}: encoder/replay, draft handoff, cached continuation, target/draft commits");
+        }
+        {
+            // C1/C4/D1: a client disconnect mid-unit (queued chained work, the
+            // link lent out, windows selected on passes and their TP2 FFN).
+            use crate::shared::memory::row_window::RowWindow;
+
+            let lease = requests.admit(0, 93500)?;
+            let error = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_cancelled_prefill::<_, DsparkChain<'_, '_>>(
+                &lib, &runtime, &mut requests, &mut prefill_slots, lease, &prompt, 3, 2);
+            ensure!(format!("{error:#}").contains("client disconnected"), "cancel path failed otherwise: {error:#}");
+            if requests.cache().request_id(lease).is_ok() { requests.release(lease)?; }
+            let windows: Vec<_> = prefill_slots.slots.iter().map(|(pass, transport)| (
+                pass.resources.lanes.iter().map(|lane| lane.window().clone()).collect::<Vec<_>>(),
+                transport.tp2_window().cloned())).collect();
+            for (lanes, tp2) in windows {
+                ensure!(lanes.iter().all(|window| *window == RowWindow::NONE), "a cancelled unit left a lane windowed");
+                ensure!(tp2.is_none_or(|window| window == RowWindow::NONE), "a cancelled unit left its TP2 FFN windowed");
+            }
+            ensure!(prefill_slots.slots[0].1.get_mut().take_link().map(|link| prefill_slots.slots[0].1.get_mut().restore_link(link)).is_ok(),
+                "a cancelled units call left slot 0 without its link");
+            // Slot 0 serves the next prompt (units, replay) after the cancel.
+            let lease = requests.admit(0, 93501)?;
+            let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill::<_, DsparkChain<'_, '_>>(
+                &lib, &runtime, &mut requests, &mut prefill_slots, lease, &prompt, 3, 2, None)?;
+            ensure!(anchor < 129280, "post-cancel prefill anchor invalid");
+            requests.release(lease)?;
+            eprintln!("PASS cancelled units: windows (passes + TP2 FFN) at rows from 0, link restored, slot 0 serves again");
+            // C1: every unit's TP2 FFN works in its slot's window, as its pass
+            // does (negative control: unwindowed TP2 sees rows from 0).
+            use self::encoder_units::{SKIP_TP2_WINDOW, UNIT_WINDOWS};
+            for skip in [false, true] {
+                SKIP_TP2_WINDOW.with(|flag| flag.set(skip));
+                UNIT_WINDOWS.with(|seen| seen.borrow_mut().clear());
+                let lease = requests.admit(0, 93510 + u64::from(skip))?;
+                let ran = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill::<_, DsparkChain<'_, '_>>(
+                    &lib, &runtime, &mut requests, &mut prefill_slots, lease, &prompt, 3, 2, None);
+                SKIP_TP2_WINDOW.with(|flag| flag.set(false));
+                ran?;
+                requests.release(lease)?;
+                let seen = UNIT_WINDOWS.with(|seen| std::mem::take(&mut *seen.borrow_mut()));
+                ensure!(seen.len() >= 2 && seen.iter().any(|(pass, _)| pass.start() > 0), "units did not run in two windows");
+                let matched = seen.iter().all(|(pass, tp2)| tp2.as_ref() == Some(pass));
+                eprintln!("TP2 FFN unit windows skip={skip}: {} units, matched={matched}", seen.len());
+                ensure!(matched != skip, "TP2 FFN window {} its pass's (skip={skip})", if matched { "matches" } else { "differs from" });
+            }
+            eprintln!("PASS TP2 FFN units windowed with their passes; the unwindowed control differs");
         }
         drop(draft_weights);
         if std::env::var_os("CUTEAFD_INDEPENDENT_ENCODER_CHECK").is_some() {

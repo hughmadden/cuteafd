@@ -384,10 +384,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
     let spark_ranks = args.peers.len();
-    let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
+    // Decode lanes' links at their own width (P3); the prefill link at the unit.
+    let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(capacity), spark_ranks, slots, prefill_shape.reserve as u64)?)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, prefill_shape.reserve as u64)?)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -491,7 +492,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // Decode lanes own a link each at decode width; prefill slot 0 holds the
     // one prefill link (endpoint after the lanes'), every slot's units send on it.
     let mut decode_transport = |lane: usize| -> Result<_> {
-        let mut transport = devices[1].own(|| NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, capacity,
+        let mut transport = devices[1].own(|| NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, decode_rows,
             timing, spark_world, u32::try_from(lane)?)?, wave_bytes))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows,
             lane_modules.next().context("missing admitted TP2 decode lane")?)?)?;

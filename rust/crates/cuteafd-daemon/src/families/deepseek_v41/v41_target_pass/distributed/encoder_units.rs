@@ -101,6 +101,25 @@ struct UnitSlot<'s, 'w, 'a> {
     /// As on one RTX: this slot's per-layer publication events.
     published: super::super::encoder_units::PublishedLayers<'a>,
 }
+#[cfg(test)]
+thread_local! {
+    /// Negative control: leave the transport's TP2 FFN unwindowed (pre-C1).
+    pub(crate) static SKIP_TP2_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each unit's (pass lane window, TP2 FFN window) as its rows are selected.
+    pub(crate) static UNIT_WINDOWS: std::cell::RefCell<Vec<(crate::shared::memory::row_window::RowWindow,
+        Option<crate::shared::memory::row_window::RowWindow>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+impl UnitSlot<'_, '_, '_> {
+    /// The slot's rows in every shared plane: the pass's components and its
+    /// borrowed transport's TP2 FFN (peer inputs, shared and final outputs).
+    fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        self.pass.select_window(window.clone())?;
+        #[cfg(test)]
+        if SKIP_TP2_WINDOW.with(|skip| skip.get()) { return Ok(()); }
+        let device = self.transport.device;
+        device.run(|| self.transport.get_mut().select_window(window))
+    }
+}
 struct UnitHooks<'s, 'r, 'w, 'a> {
     slots: Vec<UnitSlot<'s, 'w, 'a>>,
     /// The call's unit: slot `k`'s window is rows `k * unit_rows` onward.
@@ -145,6 +164,14 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
                 tracing::error!(%error, "revoking cancelled distributed encoder units");
             }
         }
+        drop(requests);
+        // Every exit (completion, error, cancel) leaves each drained slot at
+        // rows from 0, so later non-unit work on slot 0 finds no stale window.
+        for slot in &mut self.slots {
+            if let Err(error) = slot.select_window(crate::shared::memory::row_window::RowWindow::NONE) {
+                tracing::error!(%error, "resetting a prefill slot's window");
+            }
+        }
     }
 }
 impl<'a> UnitHooks<'_, '_, '_, 'a> {
@@ -166,11 +193,16 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         // starts at that unit's reservation, one local layer before layer 1
         // needs it, which left GPU0 idle ~14 ms per Engram layer).
         self.requests.borrow_mut().prefetch_encoder(self.lease, &self.chunks[unit.index + 1..])?;
-        let batch = slot.batch.insert(batch);
         // The slot is at rest (drained in `begin_unit`): select this unit's
-        // rows in every shared plane, then prepare layer 0's input. Its query
-        // runs in its attention hook (the query outputs are shared scratch).
-        slot.pass.select_window(super::super::encoder_units::unit_window(unit, self.unit_rows)?)?;
+        // rows in every shared plane (its transport's TP2 FFN included, C1),
+        // then prepare layer 0's input. Its query runs in its attention hook
+        // (the query outputs are shared scratch).
+        slot.batch = Some(batch);
+        slot.select_window(super::super::encoder_units::unit_window(unit, self.unit_rows)?)?;
+        #[cfg(test)]
+        UNIT_WINDOWS.with(|seen| seen.borrow_mut().push((slot.pass.resources.lanes[0].window().clone(),
+            slot.transport.tp2_window().cloned())));
+        let batch = slot.batch.as_mut().context("encoder unit batch")?;
         slot.pass.state.begin()?;
         slot.pass.prepare_unit_input(&self.requests, batch)
     }
@@ -369,9 +401,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         crate::shared::spark_waves::healthy()?;
         hooks.complete = true;
         // Non-unit work (replay, continuation, scoring) runs at rows from 0.
-        for slot in &mut hooks.slots {
-            slot.pass.select_window(crate::shared::memory::row_window::RowWindow::NONE)?;
-        }
+        // Here a refusal is loud; error and cancel exits reset in `Drop`.
+        for slot in &mut hooks.slots { slot.select_window(crate::shared::memory::row_window::RowWindow::NONE)?; }
         Ok(())
     }
 }

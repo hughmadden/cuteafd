@@ -23,6 +23,26 @@ pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
         super::PrefillShape { rows: chunk_rows, waves, adaptive_calls: false }, &job, draft, &mut || Ok(()))?.select(None)
 }
 
+/// [`exercise_prefill`] whose client disconnects at the first unit's begin
+/// (its prefill hold drops the receiver): the units call fails mid-unit with
+/// chained work queued. Returns that error; the slots must come back at rest,
+/// windows at rows from 0 and slot 0 holding its link (C4, D1).
+#[cfg(test)]
+pub(crate) fn exercise_cancelled_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
+    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
+    prefill: &mut PrefillSlots<'a, P>, lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize,
+) -> anyhow::Error {
+    let (events, receive) = mpsc::unbounded_channel();
+    let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
+    let mut receive = Some(receive);
+    match super::prefill::<P, C>(lib, runtime, requests, prefill, None, lease, tokens,
+        super::PrefillShape { rows: chunk_rows, waves, adaptive_calls: false }, &job, None,
+        &mut || { receive.take(); Ok(()) }) {
+        Ok(_) => anyhow::anyhow!("cancelled prefill unexpectedly finished"),
+        Err(error) => error,
+    }
+}
+
 /// Only request-owned state survives a unit; both execution lanes are drained.
 pub(crate) struct V41Prefill<S> {
     state: PrefillState<S>,
@@ -132,6 +152,12 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
 }
 
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
+    /// Whether `rows` uncached prompt rows run as units on the shared
+    /// executor: more than one unit. Adaptive calls compare with the
+    /// controller's current unit (it re-cuts each call), not the unit cap (P2).
+    fn streams(&self, rows: usize) -> bool {
+        streams(rows, self.adaptive_calls.then(|| self.prefill.depth.current().1), self.chunk_rows)
+    }
     fn encoder_unit(&self, next: usize, replay_end: usize, streamed: bool,
         budget: ChunkBudget) -> V41Unit {
         self.times.encoder_unit(self.tokens.len(), self.chunk_rows, self.waves, next, replay_end, streamed, budget)
@@ -156,7 +182,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
             cached
         };
         cursor.state = PrefillState::Encoder { suffix, next, replay_end: cached,
-            streamed: self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1 };
+            streamed: self.streams(self.tokens.len().saturating_sub(cached)) };
         Ok(())
     }
 }
@@ -182,8 +208,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     let next = if stage == CacheStage::EncoderReplay {
                         self.requests.cache().history_end(self.lease)? as usize
                     } else { cached };
-                    self.encoder_unit(next, cached,
-                        self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1, budget)
+                    self.encoder_unit(next, cached, self.streams(self.tokens.len().saturating_sub(cached)), budget)
                 }
             }
             PrefillState::Encoder { next, replay_end, streamed, .. } =>
@@ -240,18 +265,22 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let before_unit = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
                 let keep_running = || !self.job.events.is_closed();
                 // Slot 0 lends the prefill link to the span's calls; every
-                // slot's waves go out on it. It returns even when a call fails.
-                let mut link = P::take_link(&mut self.prefill.slots[0].1)?;
+                // slot's waves go out on it. Nothing fallible runs between the
+                // take and the loop, and every error inside the loop lands in
+                // `result`, so the link returns on every exit (D1).
                 let key = self.requests.cache().request_id(self.lease)?;
+                let mut link = P::take_link(&mut self.prefill.slots[0].1)?;
                 let mut result = Ok(());
                 let mut at = span.start;
                 // One call per window cycle (#762): each call's depth from the
                 // controller, its units cut at that depth, the link re-cut.
                 while at < span.end && result.is_ok() {
                     let rows = (span.end - at).min(if self.adaptive_calls { self.prefill.depth.call_rows() } else { span.end - at });
+                    let mut started_call = false;
                     result = (|| -> Result<()> {
                         let (waves, unit_rows) = if self.adaptive_calls {
-                            let depth = P::start_prefill(&mut link, &self.prefill.depth, key, at - span.start, rows)?;
+                            let depth = P::start_prefill(&mut link, &self.prefill.depth, key, at, rows)?;
+                            started_call = true;
                             let units = crate::shared::prefill_pipeline::prefill_units(rows, depth.unit_rows, depth.waves,
                                 cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS as usize)?;
                             self.prefill.depth.ran(depth, units.len(), rows);
@@ -267,12 +296,17 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                         // and suffix through drained completion or cancellation.
                         let ran = self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
                             self.lease, &chunks, suffix, &keep_running, &before_unit) });
-                        if self.adaptive_calls { P::stop_prefill(&mut link)?; }
-                        ran?;
+                        started_call = false;
+                        let stopped = if self.adaptive_calls { P::stop_prefill(&mut link) } else { Ok(()) };
+                        ran.and(stopped)?;
                         tracing::debug!(target: "cuteafd::timing", rows, units=chunks.len(), waves,
                             total_us=started.elapsed().as_micros() as u64, "target encoder units");
                         Ok(())
                     })();
+                    // A call that started but failed before its units ran still stops.
+                    if started_call { if let Err(error) = P::stop_prefill(&mut link) {
+                        tracing::error!(%error, "stopping a failed prefill call");
+                    } }
                     at += rows;
                 }
                 P::restore_link(&mut self.prefill.slots[0].1, link)?;
@@ -606,3 +640,64 @@ mod prefill_tests {
 
 #[cfg(test)]
 pub(crate) use super::scheduler::exercise_distributed_decode;
+
+/// More than one unit of `rows`: the controller's current unit for adaptive
+/// calls (`adaptive`), else the configured chunk.
+fn streams(rows: usize, adaptive: Option<usize>, chunk_rows: usize) -> bool {
+    rows.div_ceil(adaptive.unwrap_or(chunk_rows).max(1)) > 1
+}
+
+#[cfg(test)]
+mod stream_tests {
+    /// P2: an adaptive call at a 2048-row unit streams a 3000-row prompt even
+    /// though the unit cap (4096) would fit it in one Single; fixed calls keep
+    /// their configured chunk.
+    #[test]
+    fn adaptive_calls_stream_past_the_controllers_unit_not_the_cap() {
+        assert!(super::streams(3000, Some(2048), 4096));
+        assert!(!super::streams(3000, None, 4096));
+        assert!(!super::streams(2048, Some(2048), 4096));
+        assert!(super::streams(2049, Some(2048), 4096));
+        // The prefill call boundary takes the absolute prompt row (as GLM
+        // does), so a span after a cached prefix is not an opening at row 0.
+        let step = include_str!("prefill_target.rs");
+        assert!(step.contains("P::start_prefill(&mut link, &self.prefill.depth, key, at, rows)"));
+    }
+}
+
+#[cfg(test)]
+mod unit_exit_tests {
+    /// Final-review regressions, at the source of each exit path:
+    /// D1 the lent prefill link returns on every exit (nothing fallible
+    /// between its take and the loop whose errors land in `result`);
+    /// C4 every units call resets its slots' windows in `Drop`;
+    /// C2 the layer-20 boundary releases the lane's guarded scratch.
+    #[test]
+    fn units_exits_return_the_link_reset_windows_and_release_boundary_scratch() {
+        let step = include_str!("prefill_target.rs");
+        let take = step.find("let mut link = P::take_link(").unwrap();
+        let take = take + step[take..].find(";\n").unwrap() + 1;
+        let restore = step[take..].find("P::restore_link(&mut self.prefill.slots[0].1, link)").unwrap() + take;
+        let between = &step[take..restore];
+        let loop_start = between.find("while at < span.end && result.is_ok() {").unwrap();
+        assert!(!between[..loop_start].contains('?'), "a fallible step between taking and lending the link (D1)");
+        assert!(between.contains("if started_call { if let Err(error) = P::stop_prefill("), "a started call must stop (D1)");
+        for (name, source) in [("1 RTX", include_str!("../v41_target_pass/encoder_units.rs")),
+            ("2 RTX", include_str!("../v41_target_pass/distributed/encoder_units.rs"))] {
+            let drop_impl = &source[source.find("impl Drop for UnitHooks").unwrap()..];
+            let drop_body = &drop_impl[..drop_impl.find("\n}\n").unwrap()];
+            assert!(drop_body.contains("select_window(") && drop_body.contains("RowWindow::NONE"),
+                "{name}: UnitHooks::drop must reset every slot's window (C4)");
+        }
+        let one = include_str!("../v41_target_pass/encoder_units.rs");
+        let end = &one[one.find("async fn end_unit_inner").unwrap()..];
+        let end = &end[..end.find("\n    }\n").unwrap()];
+        assert!(end.find("publish_encoder_boundary").unwrap() < end.find("lane.release_scratch()").unwrap(),
+            "1 RTX: the boundary must release the lane's scratch after its publication (C2)");
+        let two = include_str!("../v41_target_pass/distributed.rs");
+        let finish = &two[two.find("async unsafe fn finish_encoder_stage").unwrap()..];
+        let finish = &finish[..finish.find("\n    }\n").unwrap()];
+        assert!(finish.find("finish_decoder_source").unwrap() < finish.find("lane.release_scratch()").unwrap(),
+            "2 RTX: the boundary must release the lane's scratch after its production (C2)");
+    }
+}

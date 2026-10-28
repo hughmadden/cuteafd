@@ -814,6 +814,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.window = window;
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn window(&self) -> &crate::shared::memory::row_window::RowWindow { &self.window }
     pub(crate) fn release_scratch(&self) -> Result<()> {
         self.query.release_scratch()?;
         if let Some(sparse) = &self.sparse { sparse.release_scratch()?; }

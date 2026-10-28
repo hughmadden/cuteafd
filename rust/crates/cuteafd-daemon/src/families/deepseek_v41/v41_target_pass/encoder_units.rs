@@ -162,6 +162,13 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
                 }
             }
         }
+        // Every exit (completion, error, cancel) leaves each drained slot at
+        // rows from 0, so later non-unit work on slot 0 finds no stale window.
+        for slot in &mut self.slots {
+            if let Err(error) = slot.pass.select_window(RowWindow::NONE) {
+                tracing::error!(%error, "resetting a prefill slot's window");
+            }
+        }
     }
 }
 impl<'a> UnitHooks<'_, '_, '_, 'a> {
@@ -339,6 +346,10 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                 &slot.pass.resources.lane,
             )?;
         }
+        // The boundary's query projection and its source-20 reader (queued on
+        // the chain head by the compressor's join) are the last readers of the
+        // lane's guarded scratch: release as attention does (C2).
+        slot.pass.resources.lane.release_scratch()?;
         slot.pass.state = State::Encoded(batch.cache()?.identity());
         Ok(())
     }

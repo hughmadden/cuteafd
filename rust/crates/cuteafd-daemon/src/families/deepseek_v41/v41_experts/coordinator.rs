@@ -288,6 +288,10 @@ impl<'a> NativeTp4Wave<'a> {
         if let Some(tp2) = self.tp2.as_mut() { tp2.select_window(window)?; }
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn tp2_window(&self) -> Option<&crate::shared::memory::row_window::RowWindow> {
+        self.tp2.as_ref().map(|tp2| tp2.window())
+    }
     pub fn has_tp2_layer(&self, layer: usize) -> bool {
         self.tp2.as_ref().is_some_and(|wave| wave.contains(layer))
     }

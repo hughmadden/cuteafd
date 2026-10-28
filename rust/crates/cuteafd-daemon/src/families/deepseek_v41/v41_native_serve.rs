@@ -479,9 +479,10 @@ fn worker(
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
-    let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
+    // Decode lanes' links at their own width (P3); the prefill link below at the unit.
+    let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, args.peers.len())?;
     let lanes = crate::shared::serve::lanes::LaneSet::default();
-    let [roce, second_roce] = lanes.try_map(|lane| spark_transport(&args.peers, capacity,
+    let [roce, second_roce] = lanes.try_map(|lane| spark_transport(&args.peers, decode_rows,
         protocol_v2_timing, spark_world, u32::try_from(lane.index())?))?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     let mut second_transport = NativeTp4Wave::new(&lib, second_roce, wave_bytes)?;

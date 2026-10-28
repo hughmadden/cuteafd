@@ -83,7 +83,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let spark_ranks = report.placement.spark_ranks();
     // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
-    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(rows, spark_ranks, slots, reserve)? } else { 0 };
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots, reserve)? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",

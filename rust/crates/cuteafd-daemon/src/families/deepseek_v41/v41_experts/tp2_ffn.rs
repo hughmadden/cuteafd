@@ -211,6 +211,8 @@ impl<'a> Wave<'a> {
         self.window = window; Ok(())
     }
     pub(crate) fn contains(&self, layer: usize) -> bool { layer < self.storage.layers }
+    #[cfg(test)]
+    pub(crate) fn window(&self) -> &crate::shared::memory::row_window::RowWindow { &self.window }
     pub(crate) fn contains_shared(&self, layer: usize) -> bool { layer < self.storage.shared_layers }
     pub(crate) fn stream(&self, device: usize) -> &Stream<'a> { &self.storage.streams[device] }
     pub(crate) fn release_scratch(&self) -> Result<()> {

@@ -133,8 +133,8 @@ impl<'a> BackboneRouterWeights<'a> {
             input_quantizer: self.library.v41_expert_input_quantizer()?,
             // Decode/verification benefits from batching small DMA transfers.
             // Large prefill retains direct downloads to avoid another host copy.
-            request_staging: HostAllocation::new(self.library,
-                capacity as usize * (request_hidden_format(self.nvfp4).1 + 48))?,
+            // Route ids (24 B per row); also the non-deferred mask staging.
+            request_staging: HostAllocation::new(self.library, capacity as usize * 24)?,
             mask_staging: HostAllocation::new(self.library, capacity as usize)?,
             route_ring: Some(HostAllocation::new(self.library, 40 * capacity as usize * 24)?),
             ring_capture: false,
@@ -181,12 +181,9 @@ impl RouterOutput<'_> {
         // Arrays have contiguous u32 layout; every bit pattern is valid. The
         // vector is exclusively borrowed and fully initialized before copying.
         let bytes = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), self.ids.bytes) };
-        let offset = if self.full_request {
-            self.rows as usize * request_hidden_format(self.request_nvfp4).1
-        } else { 0 };
-        ensure!(offset + bytes.len() <= self.request_staging.bytes, "route capture staging extent differs");
+        ensure!(bytes.len() <= self.request_staging.bytes, "route capture staging extent differs");
         // This execution already drained the graph's route-ID download.
-        unsafe { std::ptr::copy_nonoverlapping(self.request_staging.ptr.cast::<u8>().add(offset), bytes.as_mut_ptr(), bytes.len()); }
+        unsafe { std::ptr::copy_nonoverlapping(self.request_staging.ptr.cast::<u8>(), bytes.as_mut_ptr(), bytes.len()); }
         let _ = library;
         Ok(())
     }
@@ -553,25 +550,13 @@ impl<'a> BackboneRouterWave<'_, 'a> {
                 self.input_quantizer
                     .launch(self.b(0), self.b(5), rows, self.stream().raw)?;
             }
-            let hidden_row_bytes = request_hidden_format(self.weights.nvfp4).1;
-            let bytes = rows as usize * if self.full_request { hidden_row_bytes + 48 } else { 24 };
-            if !self.full_request {
-                ensure!(bytes <= self.request_staging.buffer.bytes, "local route staging too small");
-                let ids = std::slice::from_raw_parts_mut(self.request_staging.buffer.ptr.cast::<u8>(), bytes);
-                self.stream().library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
-            } else if bytes <= self.request_staging.buffer.bytes {
-                let staging = std::slice::from_raw_parts_mut(
-                    self.request_staging.buffer.ptr.cast::<u8>(),
-                    bytes,
-                );
-                let (hidden, routes) = staging.split_at_mut(rows as usize * hidden_row_bytes);
-                let (ids, weights) = routes.split_at_mut(rows as usize * 24);
-                let library = self.stream().library;
-                library.copy_d2h_async(hidden,
-                    self.b(if self.weights.nvfp4 { 0 } else { 5 }), self.stream().raw)?;
-                library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
-                library.copy_d2h_async(weights, self.b(4), self.stream().raw)?;
-            }
+            // Route ids only (route capture, route-policy tracing). A remote
+            // layer's wave stages its hidden rows, ids and weights from the
+            // device buffers (`wave_sources`), so nothing else comes down (P4).
+            let bytes = rows as usize * 24;
+            ensure!(bytes <= self.request_staging.buffer.bytes, "route staging too small");
+            let ids = std::slice::from_raw_parts_mut(self.request_staging.buffer.ptr.cast::<u8>(), bytes);
+            self.stream().library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
             Ok(())
         }
     }
@@ -901,32 +886,6 @@ pub(crate) struct ExpertRow {
     pub position: u64,
     pub kind: cuteafd_transport::ExpertV2SourceKind,
 }
-/// An immutable host request owns its format-selected input and router result after D2H.
-/// The private binding survives asynchronous transport and router-wave reuse.
-pub(crate) struct BoundExpertRequest {
-    request: cuteafd_transport::ExpertProtocolV2Request,
-    binding: QueryBinding,
-}
-impl BoundExpertRequest {
-    /// Encode this lane's replicated-group ownership after proving the request
-    /// still describes the same layer as its block binding. The request stays
-    /// private to this owner; only the ownership encoder can rewrite route words.
-    pub(crate) fn assign_native(&mut self,
-        planner: &mut crate::families::deepseek_v41::v41_experts::coordinator::ReplicatedGroupPlanner) -> Result<()> {
-        ensure!(
-            self.binding.layer() == self.request.header.layer_id as usize,
-            "bound native expert request layer differs from its block binding"
-        );
-        planner.encode(&mut self.request)
-    }
-
-    pub fn request(&self) -> &cuteafd_transport::ExpertProtocolV2Request {
-        &self.request
-    }
-    pub fn binding(&self) -> QueryBinding {
-        self.binding
-    }
-}
 impl RouterOutput<'_> {
     /// Whether the Spark request carries BF16 rows (NVFP4 experts) instead of FP8 wire rows.
     pub fn request_nvfp4(&self) -> bool {
@@ -943,33 +902,25 @@ impl RouterOutput<'_> {
         );
         Ok(binding)
     }
+    /// The remote request rows from the device buffers (tests; serving sends
+    /// them from the device via `wave_sources`).
     /// # Safety
     /// The completed output and its owning stream remain exclusively borrowed
     /// until all transfers drain, including after a partial enqueue failure.
+    #[cfg(test)]
     unsafe fn download_request(
         &self,
         library: &NativeLibrary,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         ensure!(self.full_request, "local router output has no remote request payload");
         let hidden_row_bytes = request_hidden_format(self.request_nvfp4).1;
-        let bytes = self.rows as usize * (hidden_row_bytes + 48);
-        if bytes > self.request_staging.bytes {
-            let mut hidden = vec![0; self.rows as usize * hidden_row_bytes];
-            let mut ids = vec![0; self.rows as usize * 24];
-            let mut weights = vec![0; self.rows as usize * 24];
-            library.copy_d2h(&mut hidden,
-                if self.request_nvfp4 { self.input } else { self.expert_input })?;
-            library.copy_d2h(&mut ids, self.ids)?;
-            library.copy_d2h(&mut weights, self.routing)?;
-            return Ok((hidden, ids, weights));
-        }
-        // Successful execution already drained the graph's D2H copies. This
-        // borrow prevents another execution from reusing the pinned arena.
-        let staging =
-            unsafe { std::slice::from_raw_parts(self.request_staging.ptr.cast::<u8>(), bytes) };
-        let (hidden, routes) = staging.split_at(self.rows as usize * hidden_row_bytes);
-        let (ids, weights) = routes.split_at(self.rows as usize * 24);
-        Ok((hidden.to_vec(), ids.to_vec(), weights.to_vec()))
+        let mut hidden = vec![0; self.rows as usize * hidden_row_bytes];
+        let mut ids = vec![0; self.rows as usize * 24];
+        let mut weights = vec![0; self.rows as usize * 24];
+        library.copy_d2h(&mut hidden, if self.request_nvfp4 { self.input } else { self.expert_input })?;
+        library.copy_d2h(&mut ids, self.ids)?;
+        library.copy_d2h(&mut weights, self.routing)?;
+        Ok((hidden, ids, weights))
     }
 
     /// The shared exchange's staging of this remote layer's wave: `rows x 6`
@@ -985,7 +936,7 @@ impl RouterOutput<'_> {
     }
 
     /// The worker-side builder of this layer's Spark request: the same request
-    /// bytes [`Self::expert_request`] builds on the host (one request id per
+    /// request bytes (one request id per
     /// call, taken now, in issue order), from the staged routes and wire rows.
     /// `encode` (replicated TP x EP lanes) rewrites the route words on the
     /// worker, in the same order requests are issued.
@@ -1015,60 +966,6 @@ impl RouterOutput<'_> {
         })))
     }
 
-    /// # Safety
-    /// Device views still hold this completed router execution with no external
-    /// writes. Metadata identifies the actual requests represented by the block.
-    /// Calls sharing this wave's pinned staging must not overlap.
-    pub unsafe fn expert_request(
-        &self,
-        library: &NativeLibrary,
-        placement: u64,
-        rows: &[ExpertRow],
-    ) -> Result<BoundExpertRequest> {
-        use cuteafd_transport::{
-            ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
-        };
-        let binding = self.validate_request_rows(rows)?;
-        let request_id = next_request_id()?;
-        let (hidden, ids, weights) = unsafe { self.download_request(library)? };
-        let descriptors = rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| ExpertProtocolV2RowDescriptor {
-                row_id: i as u64,
-                source_kind: r.kind,
-                source_request_id: r.request_id,
-                token_position: r.position,
-                route_offset: i as u32 * 6,
-                route_count: 6,
-            })
-            .collect();
-        let routes = ids
-            .chunks_exact(4)
-            .zip(weights.chunks_exact(4))
-            .enumerate()
-            .map(|(i, (id, w))| ExpertProtocolV2RouteEntry {
-                row_index: (i / 6) as u32,
-                expert_id: u32::from_ne_bytes(id.try_into().unwrap()),
-                gate_weight: f32::from_ne_bytes(w.try_into().unwrap()),
-            })
-            .collect();
-        let mut request = ExpertProtocolV2Request::new(
-            request_id,
-            placement,
-            self.layer as u32,
-            5120,
-            request_hidden_format(self.request_nvfp4).0,
-            descriptors,
-            routes,
-            hidden,
-        )?;
-        request.header.flags |=
-            cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        // Prove the same complete-batch contract used by every Spark receiver.
-        cuteafd_transport::expert::BackboneRequest::validate_owned(&request, self.rows)?;
-        Ok(BoundExpertRequest { request, binding })
-    }
 }
 
 #[cfg(test)]
