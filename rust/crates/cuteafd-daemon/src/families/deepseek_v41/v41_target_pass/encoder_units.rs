@@ -495,7 +495,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             // SAFETY: gate reads this unit's immutable window until release.
             unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
             self.resources.upload.release_scratch()?;
-            if gate == 0 { batch.start_later_engram()?; }
         }
         unsafe { self.resources.lane.begin_prepared_cooperative().await?; }
         Ok(())

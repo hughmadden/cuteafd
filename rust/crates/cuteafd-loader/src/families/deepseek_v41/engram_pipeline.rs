@@ -39,12 +39,6 @@ impl EngramWave {
     }
     pub fn retain_copy(&self, lease: EngramGatherLease) { self.gatherer.retain_copy(lease); }
     pub fn reclaim_copies(&self) -> Result<()> { self.gatherer.reclaim_copies() }
-    /// Admit layer 14 only after the layer-1 result has been delivered. Call
-    /// after the caller refilled the next burst of layer-1 work.
-    pub fn start_later(&mut self) -> Result<()> {
-        ensure!(matches!(self.layers[0], LayerIo::Consumed), "layer 1 gather has not been delivered");
-        self.admit(1)
-    }
     /// Await admission and I/O using only wave-owned state. The caller must
     /// revalidate request generations through `EngramPipeline::poll` afterwards.
     pub async fn wait_gather(&mut self, layer: usize) -> Result<()> {
@@ -56,8 +50,6 @@ impl EngramWave {
         result
     }
     async fn wait_layer(&mut self, layer: usize) -> Result<()> {
-        ensure!(layer == 0 || matches!(self.layers[0], LayerIo::Consumed),
-            "layer 14 gather cannot precede layer 1 delivery");
         if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
             self.gatherer.reclaim_copies()?;
             let ticket = self.gatherer.submit(Arc::clone(&self.tables[layer]),
@@ -78,8 +70,6 @@ impl EngramWave {
         Ok(())
     }
     fn admit(&mut self, layer: usize) -> Result<()> {
-        ensure!(layer == 0 || matches!(self.layers[0], LayerIo::Consumed),
-            "layer 14 gather cannot precede layer 1 delivery");
         if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
             if let Some(ticket) = self.gatherer.try_submit(Arc::clone(&self.tables[layer]),
                 &self.batches, layer)? {
@@ -257,9 +247,12 @@ impl EngramPipeline {
             waiting: [None; 2],
             decode,
         };
-        // Actual k-ahead L1 gathers replace advisory reads. Issuing both
-        // table layers here duplicates I/O and steals the tight L1 deadline.
+        // Both layers' host gathers start now (L14 right after L1, for prefill
+        // and decode alike); the gather worker runs every queued L1 before any
+        // L14, so an early L14 never delays a unit's L1 deadline. Each layer's
+        // upload stays host-issued after its gate (never parked on a copy engine).
         wave.admit(0)?;
+        wave.admit(1)?;
         Ok(wave)
     }
     /// Retry bounded admission and poll without waiting for mapped pages.

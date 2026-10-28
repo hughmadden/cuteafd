@@ -42,7 +42,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     }
                 }
                 unsafe { self.resources.engram.apply_staged(&mut self.resources.lanes[gpu], gate).await?; }
-                if gate == 0 { batch.start_later_engram()?; }
             }
             device.future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() }).await?;
         }

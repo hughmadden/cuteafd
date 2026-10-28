@@ -562,7 +562,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         }
                     }
                     unsafe { self.resources.engram.apply_staged(&mut self.resources.lanes[gpu], gate).await?; }
-                    if gate == 0 { guard.batch.start_later_engram()?; }
                 }
                 if layer >= 37 {
                     let input = self.resources.lanes[gpu].prepared_input()?;

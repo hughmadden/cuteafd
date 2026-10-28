@@ -79,9 +79,6 @@ impl RequestBatch {
     pub(crate) fn engram_wave(&self) -> Result<&EngramWave> {
         self.engram.as_ref().context("decoder replay has no engram work")
     }
-    pub(crate) fn start_later_engram(&mut self) -> Result<()> {
-        self.engram.as_mut().context("decoder replay has no engram work")?.start_later()
-    }
     pub fn cancel(&mut self) {
         self.finished = true;
         if let Some(engram) = &mut self.engram { engram.cancel(); }
@@ -600,7 +597,6 @@ impl<'a> Requests<'a> {
                     lane.apply_engram(gate, &rows)?;
                 }
                 upload.release_scratch()?;
-                if layer == 0 { batch.start_later_engram()?; }
                 Ok(true)
             }
         }

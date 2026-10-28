@@ -578,7 +578,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                         let rows = self.resources.upload.consume(gate)?;
                         unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
                         self.resources.upload.release_scratch()?;
-                        if gate == 0 { guard.batch.start_later_engram()?; }
                     } else {
                         crate::shared::memory::chain::settle(self.resources.upload.library())?;
                         ensure!(unsafe { requests.with_requests(|requests| requests.poll_engram(
