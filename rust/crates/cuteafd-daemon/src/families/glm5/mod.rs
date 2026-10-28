@@ -285,6 +285,16 @@ mod draft_cli_tests {
                 cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity())?);
         }
         assert!(spark_model(SparkBackend::Fp8, 0, 4096, false).is_err());
+        let source = include_str!("mod.rs");
+        let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
+            .split("let runtime = tokio::runtime::Builder").next().unwrap();
+        let check = |body: &str| body.contains("engine::DECODE_ROWS as u32, config.clone(), row_bytes")
+            && body.contains("warm(engine::DECODE_ROWS, true)")
+            && body.contains("warm(args.prefill_rows, false)")
+            && !body.contains("selected_peers.filter(");
+        assert!(check(links));
+        assert!(!check(&links.replace("engine::DECODE_ROWS as u32", "4096")));
+        assert!(!check(&links.replace("match selected_peers {", "match selected_peers.filter(|_| prefill_lanes > 1) {")));
         Ok(())
     }
 

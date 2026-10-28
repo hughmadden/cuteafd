@@ -777,7 +777,6 @@ impl<'a> GlmEngine<'a> {
         let h = self.cfg.hidden;
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
-        let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         let scratch = self.step_scratch(decode)?;
         let head_workspace = Buf::owned(self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?);
         let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
@@ -2759,6 +2758,23 @@ impl Drop for GlmEngine<'_> {
 
 #[cfg(test)]
 mod prefill_unit_tests {
+    #[test]
+    fn serial_prefill_never_uses_decode_transport_or_eager_host_staging() {
+        let source = include_str!("engine.rs");
+        let fallback = source.split("fn prefill_step(").nth(1).unwrap()
+            .split("fn step(").next().unwrap();
+        let check = |body: &str| body.contains("self.prefill_link.borrow_mut()")
+            && body.contains("self.step(&tables, tokens, logit_rows, Some((link, runtime)), on_layer)?")
+            && !body.contains("self.step(&tables, tokens, logit_rows, experts, on_layer)?");
+        assert!(check(fallback));
+        assert!(!check(&fallback.replace("Some((link, runtime))", "experts")));
+        let shared = source.split("fn shared_here(").nth(1).unwrap()
+            .split("fn ").next().unwrap();
+        assert!(shared.contains("router_host: Rc::new(RefCell::new(None))"));
+        let stage = source.split("fn moe_stage(").nth(1).unwrap().split("fn moe_wave(").next().unwrap();
+        assert!(stage.contains("HostAllocation::new(self.library, layout.bytes)?"));
+    }
+
     #[test]
     fn prefill_reuses_tables_after_device_ordered_peer_readers_without_a_host_drain() {
         let source = include_str!("engine.rs");
