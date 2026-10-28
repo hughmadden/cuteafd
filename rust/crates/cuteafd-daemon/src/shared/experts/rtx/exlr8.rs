@@ -18,14 +18,15 @@ mod copy_tests {
         use crate::shared::memory::device::sm_peer_copy_for;
         for rows in [1, 16, DECODE_ROWS] {
             for bytes in [rows * 6144 * 33 / 32, rows * 8 * 4, rows * 6144 * 2] {
-                assert!(sm_peer_copy_for(true, bytes));
+                assert!(sm_peer_copy_for(true, bytes, DECODE_ROWS * 6144 * 2));
             }
         }
-        assert!(!sm_peer_copy_for(true, 4096 * 6144 * 2));
+        assert!(!sm_peer_copy_for(true, DECODE_ROWS * 6144 * 2 + 1, DECODE_ROWS * 6144 * 2));
+        assert!(!sm_peer_copy_for(true, 4096 * 6144 * 2, DECODE_ROWS * 6144 * 2));
         let source = include_str!("exlr8.rs");
         let enqueue = source.split("unsafe fn enqueue(").nth(1).unwrap();
         assert_eq!(enqueue.matches("copy_d2d_async(").count(), 1);
-        assert!(enqueue.contains("sm_peer_copy_for(true, input.bytes)"));
+        assert!(enqueue.contains("sm_peer_copy_for(true, input.bytes, DECODE_ROWS * 6144 * 2)"));
         assert!(enqueue.contains("self.sm_copy.launch_rows("), "same-device SM copies require the local-capable entry point");
         assert!(enqueue.contains("copy(view(self.output.buffer, 0, bytes)?,"));
     }
@@ -152,7 +153,7 @@ impl RtxExpertLayer for Exlr8Tp2<'_> {
                     // SAFETY: rank-local operands outlive this stream's completion;
                     // decode copies execute on SMs, never behind a parked copy engine.
                     unsafe {
-                        if crate::shared::memory::device::sm_peer_copy_for(true, input.bytes) {
+                        if crate::shared::memory::device::sm_peer_copy_for(true, input.bytes, DECODE_ROWS * 6144 * 2) {
                             self.sm_copy.launch_rows(target, input, input.bytes, 1, input.bytes, input.bytes, stream)
                         } else {
                             device.library.copy_d2d_async(target, input, input.bytes, stream)
