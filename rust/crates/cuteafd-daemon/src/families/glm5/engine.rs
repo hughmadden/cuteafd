@@ -188,8 +188,8 @@ impl PageAllocator {
 }
 
 /// One MoE layer of a tapped verify step (real rows only): the norm output the
-/// router and shared expert read, the staged int32 ids then FP32 gate weights
-/// (`rows * topk` each), and the reduced routed + shared delta.
+/// router and shared expert read, the live int32 ids then FP32 gate weights
+/// (`rows * topk` each), and the post-FFN residual (including both TP2 halves).
 pub(crate) struct WidthTap {
     pub layer: usize,
     pub x: Vec<u8>,
@@ -1819,7 +1819,7 @@ impl<'a> GlmEngine<'a> {
         routes.extend(self.download(&w.route_weights, route_bytes)?);
         let bytes = rows * self.cfg.hidden * 2;
         let tap = WidthTap { layer, x: self.download(&w.x, bytes)?, routes,
-            delta: if self.tp2_layer(layer) { Vec::new() } else { self.download(&w.delta, bytes)? } };
+            delta: Vec::new() };
         self.width_taps.borrow_mut().as_mut().unwrap().push(tap);
         Ok(())
     }
