@@ -133,6 +133,21 @@ def test_glm_stage_cross_sm_groups(geometry):
     assert job == (name, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
 
 
+def test_kimik3_package_and_route_registry_are_both_sm_gated(monkeypatch):
+    jobs = compare_sm.jobs("all")
+    for name, exporter, extra in [
+        ("exl3-kimik3", "package_exl3_aot.py", []),
+        ("exl3-kimik3-k23", "package_exl3_aot.py", ["--bits", "2,3"]),
+        ("exl3-routes-kimik3", "export_b12x_exl3_routes_aot.py", []),
+    ]:
+        assert [job for job in jobs if job[0] == name] == [
+            (name, exporter, ["--geometry", "kimik3", "--capacities", compare_sm.EXL3_CAPACITIES, *extra])]
+    # Negative control: the old list silently omitted the route registry.
+    monkeypatch.setattr(compare_sm, "EXL3_GEOMETRIES",
+                        tuple(g for g in compare_sm.EXL3_GEOMETRIES if g != "kimik3"))
+    assert not any(job[0] == "exl3-routes-kimik3" for job in compare_sm.jobs("all"))
+
+
 def test_mimop_k32_tp6_uses_production_exact_slice_export():
     job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
     assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",

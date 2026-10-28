@@ -31,7 +31,7 @@ EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
-EXL3_GEOMETRIES = ("v41", "dsv4f", "dsv4p", "glm", "glmf", "qwen4")
+EXL3_GEOMETRIES = ("v41", "dsv4f", "dsv4p", "glm", "glmf", "qwen4", "kimik3")
 
 
 def load_file(name, path):
@@ -157,8 +157,6 @@ def jobs(scope):
     result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
-    result.append(("exl3-kimik3-k23", "package_exl3_aot.py",
-                   ["--geometry", "kimik3", "--capacities", EXL3_CAPACITIES, "--bits", "2,3"]))
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
                            ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
