@@ -642,6 +642,8 @@ impl<'w> NativePendingFfn<'w, '_> {
                 backoff.pause();
                 tokio::task::yield_now().await;
             }
+            // The reply landed: progress for the pacing around the lane loop.
+            cuteafd_transport::wait_policy::note_active();
         }
         // SAFETY: the reduce stream joins the chain (the shared contribution's
         // producers), then waits on the device for this wave's planes; the

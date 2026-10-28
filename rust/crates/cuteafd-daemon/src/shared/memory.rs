@@ -285,6 +285,9 @@ impl LoadStream<'_> {
         while !unsafe { self.library.cuda_stream_query(self.raw)? } {
             tokio::task::yield_now().await;
         }
+        // A completed wait is progress: the host-wait pacing around the
+        // caller's loop restarts its spin (`wait_policy::Backoff`).
+        cuteafd_transport::wait_policy::note_active();
         guard.complete = true;
         Ok(())
     }

@@ -314,6 +314,8 @@ impl<'a> Stream<'a> {
     pub(crate) async fn wait(&self) -> Result<()> {
         let mut guard = self.cancellation_guard("interrupted device stream");
         while !self.ready()? { tokio::task::yield_now().await; }
+        // A completed wait is progress (`wait_policy::Backoff` restarts its spin).
+        cuteafd_transport::wait_policy::note_active();
         guard.complete = true;
         Ok(())
     }
