@@ -186,8 +186,9 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 assert_eq!(bytes("transport/egress"), request as u64 * waves * endpoints);
                 assert_eq!(bytes("spark-intake"), unit * waves * geometry.hidden as u64
                     * if native { 4 } else { 2 } * endpoints * 4);
-                assert_eq!(bytes("workspace/router"), (unit + 64)
-                    * (geometry.hidden as u64 * 2 + geometry.topk as u64 * 8));
+                if family == "glm5" {
+                    assert!(!host.items.iter().any(|item| item.group == "workspace/router"));
+                }
                 assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
                 assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
             }

@@ -2128,8 +2128,8 @@ mod tests {
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
         for (requested_pool, expected_pool, expected_context) in [
-            // Two prefill slots share one step's scratch, head and logits (#762).
-            (Some(32768), 32768, 32512), (None, 117248, 116992),
+            // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
+            (Some(32768), 32768, 32512), (None, 124288, 124032),
         ] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;
