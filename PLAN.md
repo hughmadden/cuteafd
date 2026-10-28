@@ -6058,3 +6058,13 @@ export already organizes all 58,923 diagnostic records into 80 subdirectories
 record independently matches its original numerical evidence byte-for-byte.
 Publication uses the existing CPU-only publisher and exact completed producer;
 no numerical or weight changes are needed.
+
+The Hub accepted all 80 weight shards but rejected further per-tensor
+diagnostics at its observed 20,000-file repository cap. Publication now bundles
+the complete diagnostics into 80 per-layer/head JSONL files plus a SHA-256/count
+index; the 58,923 individual source records remain local and are excluded from
+upload/cache manifests. Every bundle matches the exact concatenated original
+record bytes. Bundle creation is inode-preserving on retry and frozen after a
+publication marker; incomplete/unsafe inputs fail before Hub writes. Publisher
+checks pass 30 CPU cases. Only our partial remote diagnostic subtree is replaced;
+the already uploaded weight shards are retained. Numerical identity is unchanged.

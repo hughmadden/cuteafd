@@ -1,5 +1,6 @@
 """Completed-run Hub publication checks with fake APIs and tiny local shards."""
 import hashlib
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -71,6 +72,7 @@ def fake_hub(monkeypatch):
             relative=path.relative_to(export).as_posix()
             if (not path.is_file() or path.name.endswith("-receipt.json")
                     or ".cache" in path.relative_to(export).parts):continue
+            if any(fnmatch.fnmatchcase(relative,pattern) for pattern in state["uploads"][-1]["ignore_patterns"]):continue
             data=path.read_bytes()
             is_lfs=path.suffix==".safetensors" or (state["metadata_lfs"] and relative=="quantize_config.json")
             remote.append(SimpleNamespace(rfilename=relative,size=len(data),
@@ -134,6 +136,44 @@ def test_publish_audits_hardlinks_offline_cache_and_idempotent_completion(finish
     assert fake_hub["instances"][-1].kwargs == dict(token=False)
     assert publication.publish(finished.export,finished.root,publication.TARGET_REPO)==REVISION
     assert len(fake_hub["uploads"])==1
+
+
+def test_complete_diagnostics_are_bundled_and_raw_records_stay_local(finished,fake_hub):
+    source=finished.export/"quantization-errors/layer-078/mtp.json"
+    original=source.read_bytes()
+    publication.publish(finished.export,finished.root,publication.TARGET_REPO)
+    errors=finished.export/"quantization-errors";bundle=errors/"layer-078.jsonl"
+    assert [json.loads(line) for line in bundle.read_text().splitlines()]==[json.loads(original)]
+    assert source.read_bytes()==original
+    index=json.loads((errors/"index.json").read_text())
+    assert index["records"]==1 and index["bundles"][bundle.name]["records"]==1
+    assert index["bundles"][bundle.name]["sha256"]==hashlib.sha256(bundle.read_bytes()).hexdigest()
+    marker=json.loads((finished.root/"publication-complete.json").read_text());snapshot=Path(marker["local_snapshot"])
+    assert os.path.samefile(snapshot/"quantization-errors/layer-078.jsonl",bundle)
+    assert not (snapshot/"quantization-errors/layer-078/mtp.json").exists()
+    inode=bundle.stat().st_ino
+    assert publication.publish(finished.export,finished.root,publication.TARGET_REPO)==REVISION
+    assert bundle.stat().st_ino==inode and len(fake_hub["uploads"])==1
+
+
+def test_changed_diagnostics_cannot_rewrite_an_already_published_bundle(finished,fake_hub):
+    publication.publish(finished.export,finished.root,publication.TARGET_REPO)
+    bundle=finished.export/"quantization-errors/layer-078.jsonl";before=bundle.read_bytes()
+    (finished.export/"quantization-errors/layer-078/mtp.json").write_text('{"finite":false}')
+    with pytest.raises(ValueError,match="completed diagnostic bundle differs"):
+        publication.publish(finished.export,finished.root,publication.TARGET_REPO)
+    assert bundle.read_bytes()==before and len(fake_hub["uploads"])==1
+
+
+@pytest.mark.parametrize("damage",["missing","symlink","invalid-json"])
+def test_unsafe_or_incomplete_diagnostic_sources_fail_before_hub(finished,fake_hub,damage,tmp_path):
+    path=finished.export/"quantization-errors/layer-078/mtp.json"
+    if damage=="missing":path.unlink()
+    elif damage=="symlink":
+        outside=tmp_path/"outside.json";outside.write_text('{}');path.unlink();path.symlink_to(outside)
+    else:path.write_text('invalid JSON')
+    with pytest.raises(ValueError):publication.publish(finished.export,finished.root,publication.TARGET_REPO)
+    assert not fake_hub["instances"]
 
 
 @pytest.mark.parametrize("damage",["identity","summary","paths","target","index","provenance","receipt","missing","checksum"])

@@ -14,7 +14,8 @@ from .export import SHARD_COUNT
 from .recipe import MODULE_COUNT, TARGET_PAYLOAD_BYTES, TARGET_REPO, TARGET_TENSOR_COUNT
 
 LOCAL_HUB_CACHE = Path.home() / ".cache/huggingface/cuteafd-local-hub"
-IGNORE_PATTERNS = ["*-receipt.json", ".cache/**", "**/.cache/**", "*.partial", ".json-*"]
+IGNORE_PATTERNS = ["*-receipt.json", ".cache/**", "**/.cache/**", "*.partial", ".json-*",
+    "quantization-errors/*/*.json"]
 REQUIRED_ASSETS = {"config.json", "quantize_config.json", "model.safetensors.index.json",
     "quantization-provenance.json", "README.md", "LICENSE", "tokenizer.json",
     "tokenizer_config.json", "chat_template.jinja", "generation_config.json"}
@@ -74,6 +75,59 @@ def _metadata_digests(path):
     return sha256.hexdigest(), blob.hexdigest()
 
 
+def _write_diagnostic_metadata(path, data, *, frozen):
+    if path.is_symlink():
+        raise ValueError("refuse symlink diagnostic bundle")
+    if path.exists() and path.read_bytes()==data:
+        return
+    if frozen:
+        raise ValueError("completed diagnostic bundle differs")
+    temporary=path.with_suffix(path.suffix+".partial")
+    with temporary.open("wb") as file:
+        file.write(data);file.flush();os.fsync(file.fileno())
+    os.replace(temporary,path)
+    fsync_directory(path.parent)
+
+
+def _bundle_diagnostics(export, *, frozen=False):
+    """Publish complete per-layer JSONL evidence, retaining raw records locally."""
+    errors=export/"quantization-errors"
+    if errors.is_symlink() or not errors.is_dir():
+        raise ValueError("diagnostic source directory is missing or unsafe")
+    groups={}
+    for directory in errors.iterdir():
+        if directory.is_symlink():
+            raise ValueError("refuse symlink diagnostic source")
+        if not directory.is_dir():
+            continue
+        if directory.name!="head" and not re.fullmatch(r"layer-(?:0[0-6][0-9]|07[0-8])",directory.name):
+            raise ValueError("unreviewed diagnostic group")
+        paths=sorted(directory.iterdir())
+        if any(p.is_symlink() or not p.is_file() or p.suffix!=".json" for p in paths):
+            raise ValueError("diagnostic records must be regular JSON files")
+        groups[directory.name]=paths
+    if sum(map(len,groups.values()))!=MODULE_COUNT:
+        raise ValueError("diagnostic record count differs from the completed recipe")
+    bundles={}
+    for name,paths in sorted(groups.items()):
+        lines=[]
+        for path in paths:
+            record=json.loads(path.read_text())
+            if not isinstance(record,dict):
+                raise ValueError("diagnostic record must be a JSON object")
+            lines.append(canonical(record).encode()+b"\n")
+        data=b"".join(lines);filename=name+".jsonl"
+        _write_diagnostic_metadata(errors/filename,data,frozen=frozen)
+        bundles[filename]=dict(records=len(paths),sha256=hashlib.sha256(data).hexdigest())
+    index=dict(schema="glm-exl3-diagnostics-jsonl-v1",records=MODULE_COUNT,bundles=bundles)
+    _write_diagnostic_metadata(errors/"index.json",(canonical(index)+"\n").encode(),frozen=frozen)
+
+
+def _original_diagnostic(relative):
+    prefix="quantization-errors/"
+    return relative.startswith(prefix) and "/" in relative[len(prefix):] and relative.endswith(".json")
+
+
 def _collect_local(export, identity):
     files = {}
     # Prune upload caches before walking, and never follow a symlink into
@@ -87,9 +141,11 @@ def _collect_local(export, identity):
             if name.endswith(("-receipt.json", ".partial")) or name.startswith(".json-"):
                 continue
             path = Path(directory) / name
+            relative = path.relative_to(export).as_posix()
+            if _original_diagnostic(relative):
+                continue
             if path.is_symlink() or not path.is_file():
                 raise ValueError("publication payload must contain only regular files")
-            relative = path.relative_to(export).as_posix()
             if path.suffix == ".safetensors":
                 if relative not in _expected_shards():
                     raise ValueError(f"unexpected publication tensor file: {relative}")
@@ -184,6 +240,7 @@ def publish(export, root, repo_id):
         raise ValueError("publication roots must be regular directories")
     export, root = export.resolve(), root.resolve()
     identity = _complete_plan(export, root, repo_id)
+    _bundle_diagnostics(export,frozen=(root/"publication-complete.json").exists())
     files = _collect_local(export, identity)
     LOCAL_HUB_CACHE.mkdir(parents=True, exist_ok=True)
     if LOCAL_HUB_CACHE.is_symlink() or export.stat().st_dev != LOCAL_HUB_CACHE.stat().st_dev:
