@@ -6037,3 +6037,17 @@ that must survive monitoring-session loss, prefer the normal detached launcher
 once advance reservation/preparation has finished; foreground reservation mode
 deliberately tears down on its enclosing session's hangup. The numerical plan,
 producer, source, tokens and fork pin are unchanged.
+
+Quantization completed successfully on 2026-10-28 11:34 Taipei; the detached
+attempt exits zero. Final independent checks pass: 80 shards, 236,354 tensors,
+385,362,552,236 payload bytes (358.896844 GiB), 547 K6 matrices and 58,376 K4
+matrices, all 58,923 error records finite with valid Hessian-LDLQ metrics.
+The 662 retained native tensors have per-shard byte-preservation audits.
+Peak production CUDA allocation is 20.71 GiB and host RSS 15.79 GiB. All
+production frontiers, input stages and packed recovery candidates are retired;
+the GPU container is gone and the actual hardware flock is free. The local
+model card includes per-part source and quantized payload sizes. Source/fork
+and numerical producer identities are unchanged. Completed artifact and
+model card remain at the export path above. Publication is not started:
+the brief explicitly requires TJ's confirmation before upload. Full-model
+quality, long-context behavior and serving qualification remain separate work.
