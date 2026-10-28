@@ -98,6 +98,20 @@ mod spark_tests {
         Ok(())
     }
 
+    /// The GPU fixture's admission (endpoints at the 64-row verify width, two
+    /// 64-row prefill units) passes the same validation the workers run.
+    #[test]
+    fn the_fixture_admission_shape_validates() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let model = spark_model(&catalog, cuteafd_core::V41_VERIFY_ROWS as u32, 2, false)?;
+        model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
+        assert!(spark_model(&catalog, 16, 2, false).is_err(),
+            "16-row endpoints cannot admit the 64-row decode owners");
+        Ok(())
+    }
+
     #[test]
     fn endpoint_contract_covers_the_decode_and_prefill_links() -> Result<()> {
         let root = tempfile::tempdir()?;
