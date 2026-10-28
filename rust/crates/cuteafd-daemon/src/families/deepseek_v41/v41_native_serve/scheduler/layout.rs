@@ -1,4 +1,6 @@
 //! Layout selection stays outside lane execution and uses static dispatch.
+// A dropped transport result (a failed reset or re-bootstrap) is a bug here.
+#![deny(unused_must_use)]
 use super::*;
 use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DistributedDsparkChain};
 use crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass;
@@ -22,7 +24,7 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for TargetPass<'_, 'a> {
         transport.begin_request(); Ok(())
     }
     fn reset_connections(transport: &mut Self::Transport) -> Result<()> {
-        transport.reset_connections(); Ok(())
+        transport.reset_connections()
     }
     fn decode_round(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,
@@ -51,7 +53,7 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for DistributedTargetPass<'_, 'a> {
     }
     fn reset_connections(transport: &mut Self::Transport) -> Result<()> {
         let device = transport.device;
-        device.run(|| { transport.reset_connections(); Ok(()) })
+        device.run(|| transport.reset_connections())
     }
     fn decode_round(_lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,
@@ -63,5 +65,24 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for DistributedTargetPass<'_, 'a> {
         // The empty peer returns immediately without joining per-token work.
         independent::run(runtime, first, second, requests, first_transport,
             second_transport, active, draft, prefixes, receive, wake)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A reset that cannot restart its Spark exchange (a failed re-bootstrap)
+    /// fails the call: serve then fails the request instead of sending the
+    /// next wave into a stopped exchange. Both layouts forward the transport's
+    /// result, and the module denies dropped results.
+    #[test]
+    fn serving_resets_forward_the_transports_result() {
+        let source = include_str!("layout.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("#![deny(unused_must_use)]"));
+        let bodies: Vec<_> = source.split("fn reset_connections(transport: &mut Self::Transport) -> Result<()> {")
+            .skip(1).map(|rest| rest.split("\n    }").next().unwrap()).collect();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].trim() == "transport.reset_connections()", "{}", bodies[0]);
+        assert!(bodies[1].contains("device.run(|| transport.reset_connections())"), "{}", bodies[1]);
+        assert!(bodies.iter().all(|body| !body.contains("Ok(())")), "{bodies:?}");
     }
 }
