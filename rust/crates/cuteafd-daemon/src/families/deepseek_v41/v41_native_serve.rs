@@ -9,7 +9,7 @@ mod coordinator_push;
 pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
-mod admission;
+pub(crate) mod admission;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
