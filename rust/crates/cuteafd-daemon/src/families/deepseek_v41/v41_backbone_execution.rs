@@ -611,6 +611,16 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
         self.queued_production = None;
         self.progress = PassProgress::default();
     }
+    /// A failed or cancelled unit's producers back at rest: every pending
+    /// query and unconsumed proposal dropped (after its stream drains), so the
+    /// slot's next unit or non-unit work can select a window.
+    pub fn abort_queries(&mut self) -> Result<()> {
+        self.queued_production = None;
+        let mut result = Ok(());
+        for wave in &mut self.windows { if let Err(error) = wave.abort_query() { result = Err(error); } }
+        for wave in &mut self.sources { if let Err(error) = wave.abort_query() { result = Err(error); } }
+        result
+    }
 
     pub fn restart_for(&mut self, stage: CacheStage) {
         self.queued_production = None;

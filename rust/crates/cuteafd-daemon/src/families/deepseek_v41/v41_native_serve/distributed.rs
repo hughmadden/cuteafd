@@ -555,10 +555,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     // The prefill depth controller (#762): evidence or calibration before readiness.
-    super::calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefill_slots,
+    super::calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefixes, &mut prefill_slots,
         format!("2rtx-tp{}x{}", spark_world.topology().tp(), spark_world.topology().ep()))?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;

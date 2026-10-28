@@ -106,6 +106,20 @@ impl Drop for PlacedPreparedLayer<'_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedExecution<'w, 'a> {
+    /// As [`super::BackboneExecution::abort_queries`], on each producer's GPU.
+    pub(crate) fn abort_queries(&mut self) -> Result<()> {
+        self.produced = None;
+        let mut result = Ok(());
+        for wave in &mut self.producers.windows {
+            let device = wave.device;
+            if let Err(error) = device.run(|| wave.get_mut().abort_query()) { result = Err(error); }
+        }
+        for wave in &mut self.producers.sources {
+            let device = wave.device;
+            if let Err(error) = device.run(|| wave.get_mut().abort_query()) { result = Err(error); }
+        }
+        result
+    }
     pub fn new(
         weights: &'w CacheProducerWeights<'a>,
         capacity: u32,

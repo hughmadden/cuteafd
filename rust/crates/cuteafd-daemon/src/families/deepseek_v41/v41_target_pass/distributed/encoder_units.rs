@@ -153,6 +153,9 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
                 if let Err(error) = slot.pass.abort_cache_commit(&mut requests) {
                     tracing::error!(%error, "draining cancelled distributed encoder unit");
                 }
+                if let Err(error) = slot.pass.resources.execution.abort_queries() {
+                    tracing::error!(%error, "aborting cancelled distributed encoder unit's producers");
+                }
                 requests.revoke_batch(&mut batch);
                 if let Err(error) = slot.pass.discard(&mut batch) {
                     tracing::error!(%error, "discarding cancelled distributed encoder unit");

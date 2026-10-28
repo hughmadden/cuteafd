@@ -156,6 +156,14 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         }
         for slot in &mut self.slots {
             if let Some(mut batch) = slot.batch.take() {
+                // Pending commits and producer proposals of the failed unit
+                // are dropped, so the slot comes back at rest (as on 2 RTX).
+                if let Err(error) = slot.pass.abort_cache_commit(&mut self.requests.borrow_mut()) {
+                    tracing::error!(%error, "draining cancelled encoder unit");
+                }
+                if let Err(error) = slot.pass.resources.execution.abort_queries() {
+                    tracing::error!(%error, "aborting cancelled encoder unit's producers");
+                }
                 self.requests.borrow_mut().revoke_batch(&mut batch);
                 if let Err(error) = slot.pass.discard(&mut batch) {
                     tracing::error!(%error, "discarding cancelled encoder unit");

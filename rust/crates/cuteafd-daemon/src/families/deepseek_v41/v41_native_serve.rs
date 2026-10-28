@@ -663,10 +663,10 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let mut prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     // The prefill depth controller (#762): evidence or calibration before readiness.
-    calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefill_slots,
+    calibrate_prefill_depth(&lib, &runtime, &args, &mut requests, &mut prefixes, &mut prefill_slots,
         format!("1rtx-tp{}x{}", spark_world.topology().tp(), spark_world.topology().ep()))?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
@@ -822,7 +822,7 @@ impl AdmittedPrefill {
 /// drafter, no prefix snapshot).
 pub(crate) fn calibrate_prefill_depth<'w, 'a: 'w, P: scheduler::layout::ServingTarget<'w, 'a>>(lib: &'a NativeLibrary,
     runtime: &tokio::runtime::Runtime, args: &crate::cli::NativeServeArgs, requests: &mut Requests<'a>,
-    prefill_slots: &mut prefill_target::PrefillSlots<'a, P>, topology: String) -> Result<()> {
+    prefixes: &mut prefix::V41Cache<'a>, prefill_slots: &mut prefill_target::PrefillSlots<'a, P>, topology: String) -> Result<()> {
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&args.snapshot)?;
     let identity = crate::shared::prefill_depth::DeploymentIdentity::new(lib, &args.peers, topology);
     let depth = prefill_slots.depth.clone();
@@ -832,6 +832,13 @@ pub(crate) fn calibrate_prefill_depth<'w, 'a: 'w, P: scheduler::layout::ServingT
     crate::shared::prefill_depth::calibrate(&depth, key, &tokenizer, |_, tokens| {
         id += 1;
         let lease = requests.admit(0, id)?;
+        // As a cold serving request: KV units for the call's lifetime bound
+        // before its prefill (unit paging), released with the request.
+        if let Err(error) = prefixes.admit(requests, None::<&mut DraftRuntime<'_, 'a, P::Chain>>, lease, None,
+            tokens, tokens, &[], tokens.len() + 1, true) {
+            requests.release(lease)?;
+            return Err(error);
+        }
         let (events, _receive) = mpsc::unbounded_channel();
         let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
             prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
