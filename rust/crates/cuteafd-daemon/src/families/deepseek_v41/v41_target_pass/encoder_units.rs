@@ -145,6 +145,9 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
     suffix: &'s mut EncoderSuffix<'a>,
     keep_running: &'s dyn Fn() -> bool,
     before_unit: &'s dyn Fn() -> Result<()>,
+    /// The next call's leading chunks (#762 window cycles): the last units of
+    /// this call prefetch their Engram rows, so the next call's units start warm.
+    ahead: &'s [&'s [u32]],
 }
 impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
@@ -213,7 +216,8 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
                 }])?,
         );
         // Start the next unit's Engram I/O now (#815): see the 2-RTX hook.
-        self.requests.borrow_mut().prefetch_encoder(self.lease, &self.chunks[unit.index + 1..])?;
+        let next: Vec<&[u32]> = self.chunks[unit.index + 1..].iter().chain(self.ahead).copied().collect();
+        self.requests.borrow_mut().prefetch_encoder(self.lease, &next)?;
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
             let positions = batch.cache()?.positions();
@@ -506,10 +510,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// completion or drained cancellation. Decode is idle during this span.
     pub(crate) async unsafe fn execute_encoder_units(
         slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, prefill: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
+        lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        requests.prefetch_encoder(lease, chunks)?;
+        requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?;
         let waves = slots.len();
         ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         let mut units = encoder_units(chunks)?;
@@ -527,7 +531,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 Ok(UnitSlot { published: PublishedLayers::new(pass.library()?)?, pass, transport,
                     batch: None, prepared: None, started: Instant::now() })
             }).collect::<Result<Vec<_>>>()?,
-            requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
+            requests: RefCell::new(requests), lease, chunks, suffix, ahead, keep_running, before_unit,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
         // Every unit's chained work completes before the decoder replay (or a

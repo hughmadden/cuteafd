@@ -133,6 +133,9 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
     suffix: &'s mut DeviceOwner<'a, EncoderSuffix<'a>>,
     keep_running: &'s dyn Fn() -> bool,
     before_unit: &'s dyn Fn() -> Result<()>,
+    /// The next call's leading chunks (#762 window cycles): the last units of
+    /// this call prefetch their Engram rows, so the next call's units start warm.
+    ahead: &'s [&'s [u32]],
     /// Every unit committed: the request stays admitted.
     complete: bool,
 }
@@ -195,7 +198,8 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         // Start the next unit's Engram I/O now (#815, prof13: it otherwise
         // starts at that unit's reservation, one local layer before layer 1
         // needs it, which left GPU0 idle ~14 ms per Engram layer).
-        self.requests.borrow_mut().prefetch_encoder(self.lease, &self.chunks[unit.index + 1..])?;
+        let next: Vec<&[u32]> = self.chunks[unit.index + 1..].iter().chain(self.ahead).copied().collect();
+        self.requests.borrow_mut().prefetch_encoder(self.lease, &next)?;
         // The slot is at rest (drained in `begin_unit`): select this unit's
         // rows in every shared plane (its transport's TP2 FFN included, C1),
         // then prepare layer 0's input. Its query runs in its attention hook
@@ -370,9 +374,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     /// placement and capacity. Poll on one CUDA-owning executor thread.
     pub(crate) async unsafe fn execute_encoder_units(slots: Vec<(&mut Self, &mut DeviceOwner<'a, NativeTp4Wave<'a>>)>,
         prefill: &mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>, requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]],
-        suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, keep_running: &dyn Fn() -> bool,
+        suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        requests.prefetch_encoder(lease, chunks)?;
+        requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?;
         let waves = slots.len();
         ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         ensure!(slots.iter().all(|(pass, _)| pass.state == State::Idle), "distributed encoder lane still in use");
@@ -396,7 +400,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     |layer| Ok(pass.resources.lanes[map.attention(layer)?].device.id))?;
                 Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published })
             }).collect::<Result<Vec<_>>>()?,
-            requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit, complete: false,
+            requests: RefCell::new(requests), lease, chunks, suffix, ahead, keep_running, before_unit, complete: false,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
         // Every unit's chained work completes before the decoder replay reads it.

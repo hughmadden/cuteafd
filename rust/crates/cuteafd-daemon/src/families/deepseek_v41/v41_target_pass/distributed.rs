@@ -1650,7 +1650,7 @@ mod tests {
                     let mut link = DistributedTargetPass::take_link(&mut prefill_slots.slots[0].1)?;
                     let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
                     let result = runtime.block_on(unsafe {
-                        DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &chunks, &mut suffix, &|| true, &|| Ok(()))
+                        DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(()))
                     });
                     DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
                     result?;
@@ -1821,7 +1821,7 @@ mod tests {
         let result = {
             let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
             runtime.block_on(unsafe {
-                DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &|| {
+                DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &[], &|| {
                         calls.set(calls.get() + 1);
                         calls.get() < 12
                     }, &|| Ok(()))

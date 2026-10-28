@@ -289,13 +289,18 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                             (self.waves, ranges.iter().map(|range| range.start - at..range.end - at).collect())
                         };
                         let chunks: Vec<_> = unit_rows.iter().map(|range| &self.tokens[at + range.start..at + range.end]).collect();
+                        // The next call's first units at this call's unit width
+                        // (a depth change only turns the prefetch into a miss).
+                        let width = unit_rows.first().map_or(1, |range| range.len());
+                        let ahead: Vec<&[u32]> = lookahead(at + rows..span.end, width, waves)
+                            .map(|range| &self.tokens[range]).collect();
                         let mut slots: Vec<(&mut P, &mut P::Transport)> = self.prefill.slots.iter_mut()
                             .map(|(pass, transport)| (pass, transport)).collect();
                         slots.truncate(waves);
                         // SAFETY: every slot's pass and the link retain the request
                         // and suffix through drained completion or cancellation.
                         let ran = self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
-                            self.lease, &chunks, suffix, &keep_running, &before_unit) });
+                            self.lease, &chunks, suffix, &ahead, &keep_running, &before_unit) });
                         started_call = false;
                         let stopped = if self.adaptive_calls { P::stop_prefill(&mut link) } else { Ok(()) };
                         ran.and(stopped)?;
@@ -412,7 +417,7 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     /// pacing, packet HC-9).
     async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
         requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()>;
+        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()>;
     /// # Safety
     /// Batch inputs and optional completed encoder suffix match this target.
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
@@ -445,8 +450,8 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     }
     async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
         requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, keep_running, before_unit).await }
+        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, keep_running, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -497,8 +502,8 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     }
     async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
         requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
-        keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, keep_running, before_unit).await }
+        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, keep_running, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -641,6 +646,13 @@ mod prefill_tests {
 #[cfg(test)]
 pub(crate) use super::scheduler::exercise_distributed_decode;
 
+/// The next call's first `units` row ranges of `span` at `width` rows: the
+/// rows whose Engram gathers the current call's last units prefetch.
+fn lookahead(span: Range<usize>, width: usize, units: usize) -> impl Iterator<Item = Range<usize>> {
+    let width = width.max(1);
+    (span.start..span.end).step_by(width).take(units).map(move |start| start..(start + width).min(span.end))
+}
+
 /// More than one unit of `rows`: the controller's current unit for adaptive
 /// calls (`adaptive`), else the configured chunk.
 fn streams(rows: usize, adaptive: Option<usize>, chunk_rows: usize) -> bool {
@@ -662,6 +674,16 @@ mod stream_tests {
         // does), so a span after a cached prefix is not an opening at row 0.
         let step = include_str!("prefill_target.rs");
         assert!(step.contains("P::start_prefill(&mut link, &self.prefill.depth, key, at, rows)"));
+    }
+
+    /// A call's last units prefetch the next call's first units (#762 window
+    /// cycles; prof39: each cycle's first Engram layer-1 gathers waited
+    /// 40-150 ms cold, ~2.3 s of a 64K prefill on max).
+    #[test]
+    fn calls_look_ahead_at_the_next_calls_first_units() {
+        assert_eq!(super::lookahead(8256..20000, 2752, 3).collect::<Vec<_>>(), [8256..11008, 11008..13760, 13760..16512]);
+        assert_eq!(super::lookahead(8256..9000, 2752, 3).collect::<Vec<_>>(), [8256..9000]);
+        assert_eq!(super::lookahead(9000..9000, 2752, 3).count(), 0);
     }
 }
 
