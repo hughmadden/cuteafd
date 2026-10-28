@@ -1546,7 +1546,8 @@ impl<'a> GlmEngine<'a> {
     ///
     /// Under a head split each segment exchanges with rank 1's segment of the
     /// same layer (captured on rank 1's stream); rank 1's next segment is
-    /// queued before the host waits in this layer's Spark exchange.
+    /// queued before the host waits in this layer's Spark exchange, except when
+    /// its current shared-core meet still needs rank 0's publication.
     #[allow(clippy::too_many_arguments)]
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, ranked: &[StepTables; 2], t: usize,
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
@@ -1647,24 +1648,29 @@ impl<'a> GlmEngine<'a> {
                 // The segment just queued reduced the previous layer's planes.
                 transport.exchange()?.consumed(0, self.stream)?;
             }
+            let defer_peer = layer.is_some_and(|layer| !layer.dense && !self.tp2_layer(index)
+                && Self::core_split(layer, "down"));
+            let peer_next = || -> Result<()> {
+                if let (Some(w1), Some(layer)) = (w1, layer.filter(|_| index + 1 < layers.len())) {
+                    let kind = if layer.dense || self.tp2_layer(index) { Previous::Delta }
+                        else { Previous::Planes(0) };
+                    if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
+                        self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
+                    }
+                    self.peer_segment(index + 1, kind, w1, t, ranked, bytes)?;
+                }
+                Ok(())
+            };
             if let Some(w1) = w1 {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before
-                // this layer's exchange.
+                // this layer's exchange unless a native shared-core meet is still pending.
                 if index == 0 {
                     self.peer_segment(0, Previous::First, w1, t, ranked, bytes)?;
                 }
                 if let Some(_layer) = layer.filter(|_| self.tp2_layer(index)) {
                     self.tp2_pair(index, 0, w, w1, t, "m64")?;
                 }
-                if let Some(layer) = layer.filter(|_| index + 1 < layers.len()) {
-                    let kind = if layer.dense || self.tp2_layer(index) { Previous::Delta }
-                        else { Previous::Planes(0) };
-                    // Rank 1's next weights into L2 while rank 0 waits in this layer's exchange.
-                    if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
-                        self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
-                    }
-                    self.peer_segment(index + 1, kind, w1, t, ranked, bytes)?;
-                }
+                if !defer_peer { peer_next()?; }
             }
             previous = match layer {
                 None => break,
@@ -1681,6 +1687,9 @@ impl<'a> GlmEngine<'a> {
                     Previous::Planes(waves.ranks())
                 }
             };
+            // Instantiating the next peer graph can wait for that device to drain.
+            // Queue rank 0's current shared meet first so rank 1 can reach its end.
+            if defer_peer { peer_next()?; }
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
                 // SAFETY: the engine stream owns this round and its layer events.
                 unsafe { probe.mark(index, self.stream)? };
@@ -2882,6 +2891,96 @@ impl Drop for GlmEngine<'_> {
                 self.library.cuda_stream_synchronize(self.stream)
             }, "GLM EXLR8 engine retirement");
         }
+    }
+}
+
+#[cfg(test)]
+mod native_decode_order_tests {
+    use super::slot;
+    use crate::shared::peer_split::{DIRECT, order::{self, host::{check_host, HostSchedule}}};
+
+    // The ordinary head/context decode's main exchange, including the seven
+    // onboard layers from the failing native warm-up. Capture can synchronize
+    // the already-queued peer stream before it launches the new segment.
+    fn schedule(native: bool, local_end: usize, old_order: bool, sync_at: Option<usize>) -> HostSchedule {
+        let mut s = HostSchedule::default();
+        let meet = |s: &mut HostSchedule, rank, layer| {
+            s.push(rank, "main", slot(layer, true, 0), format!("rank{rank} shared push L{layer}"));
+            s.wait(rank, "main", slot(layer, true, 0), format!("rank{rank} shared wait L{layer}"));
+        };
+        let peer = |s: &mut HostSchedule, layer| {
+            if sync_at.is_none() || sync_at == Some(layer) {
+                s.sync(1, format!("instantiate peer L{layer}"));
+            }
+            s.wait(1, "main", if layer == 0 { DIRECT } else { slot(layer - 1, true, 0) },
+                format!("rank1 previous wait L{layer}"));
+            s.push(1, "main", slot(layer, false, 0), format!("rank1 attention push L{layer}"));
+            s.wait(1, "main", slot(layer, false, 0), format!("rank1 attention wait L{layer}"));
+            if native && layer >= 3 { meet(s, 1, layer); }
+            if layer < 3 || layer >= local_end {
+                s.push(1, "main", slot(layer, true, 0), format!("rank1 output push L{layer}"));
+            }
+            if native && layer == 77 && layer >= local_end {
+                s.wait(1, "main", slot(layer, true, 0), "rank1 terminal wait");
+            }
+        };
+        for layer in 0..=78 {
+            s.sync(0, format!("instantiate rank0 L{layer}"));
+            if layer == 0 { s.push(0, "main", DIRECT, "embedding"); }
+            else {
+                if layer > local_end && (native || layer < 78) {
+                    s.push(0, "main", slot(layer - 1, true, 0), format!("rank0 routed push L{}", layer - 1));
+                }
+                s.wait(0, "main", slot(layer - 1, true, 0), format!("rank0 previous wait L{layer}"));
+            }
+            if layer == 78 { break; }
+            s.push(0, "main", slot(layer, false, 0), format!("rank0 attention push L{layer}"));
+            s.wait(0, "main", slot(layer, false, 0), format!("rank0 attention wait L{layer}"));
+            if layer < 3 { s.push(0, "main", slot(layer, true, 0), format!("rank0 dense push L{layer}")); }
+            if layer == 0 { peer(&mut s, 0); }
+            if (3..local_end).contains(&layer) {
+                if native { meet(&mut s, 0, layer); }
+                for rank in 0..2 { s.push(rank, "main", slot(layer, true, 0), format!("rank{rank} local push L{layer}")); }
+                if layer == 77 { s.wait(1, "main", slot(layer, true, 0), "rank1 local terminal wait"); }
+            }
+            let remote = layer >= local_end;
+            let deferred = native && remote && !old_order;
+            if !deferred && layer < 77 { peer(&mut s, layer + 1); }
+            if native && remote { meet(&mut s, 0, layer); }
+            if deferred && layer < 77 { peer(&mut s, layer + 1); }
+        }
+        s
+    }
+
+    #[test]
+    fn native_shared_meet_precedes_next_peer_instantiation() {
+        // The real watchdog was rank1 L51's meet while instantiating peer L52.
+        let old = schedule(true, 10, true, Some(52));
+        order::check(&old.streams()).unwrap();
+        let failure = check_host(&old).unwrap_err();
+        assert_eq!(failure.sync, "instantiate peer L52");
+        assert_eq!(failure.blocked[1].as_deref(), Some("rank1 shared wait L51"));
+        let fixed = schedule(true, 10, false, Some(52));
+        assert_eq!(old.streams().streams, fixed.streams().streams, "only host issue order changes");
+        check_host(&fixed).unwrap();
+        for local_end in [3, 4, 10, 77, 78] {
+            for native in [false, true] {
+                let one = schedule(native, local_end, false, None);
+                check_host(&one).unwrap();
+                let mut repeated = one.clone();
+                repeated.ops.extend(one.ops);
+                check_host(&repeated).unwrap();
+            }
+        }
+        // Bind the modeled seam to decode_layers, not just a balanced toy schedule.
+        let source = include_str!("engine.rs");
+        let decode = source.split("fn decode_layers(").nth(1).unwrap().split("fn peer_segment(").next().unwrap();
+        assert!(decode.contains("!layer.dense && !self.tp2_layer(index)\n                && Self::core_split(layer, \"down\")"));
+        let before = decode.find("if !defer_peer { peer_next()?; }").unwrap();
+        let exchange = decode.find("self.moe_exchange(").unwrap();
+        let skip = decode.find("self.moe_skip(").unwrap();
+        let after = decode.find("if defer_peer { peer_next()?; }").unwrap();
+        assert!(before < exchange && exchange < after && before < skip && skip < after);
     }
 }
 
