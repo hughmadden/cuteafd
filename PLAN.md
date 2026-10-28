@@ -6128,3 +6128,44 @@ qualification remains the 16 CUDA cases and 798-projection real-weight proof.
 GPU ownership is released and production rolling tensors remain retired.
 Full-model quality/long-context/serving qualification is the separately scheduled
 next step; this branch is pushed for orchestrator review, not merged.
+
+
+## GLM 5.3 Flash BF16 to EXL3 K4 / Core K6 (MaxQ, 2026-10-28)
+
+TJ authorized the full job, a shortened pilot, autonomous recipe decisions
+and publication without another approval stop. This supersedes the Flash
+brief's Step 1 and upload confirmation points. Public target:
+`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6`. Integration stays on the
+`quant/glm53-flash-k4-core-k6` task branch; the implementation checkout is
+`~/Developer/cute-worktrees/flash-quant-integration`. No engine, serving,
+performance or shared infrastructure changes are part of this job.
+
+Pinned source `zai-org/GLM-5.3-Flash-BF16` revision
+`f9fed3bbc82291073373d67452e9f25317ef7577` is managed locally by Sparknest.
+Its 120 weight headers contain 38,770 tensors and 642,646,653,816 payload
+bytes. The fail-closed Flash recipe selects 316 target core/head matrices
+at K6, eight MTP core matrices at K4 and 37,152 routed expert matrices at
+K4. Retain 1,294 native tensors, including all 347 vision tensors, recurrent
+gates/convolutions, DSA indexer, kv_b, mHC, routers, norms and embeddings.
+Output: 151,198 tensors, 165,621,841,672 payload bytes (154.247 GiB) in 47
+shards. Flash kv_a has 512 outputs and no RoPE output padding.
+
+`quantization/glm5_flash/prepare_corpus.py` attests the same pinned public
+panel and native thinking/max-effort rendering: 1,426 calibration prompts,
+1,097,737 tokens. The shorter pilot compares serialized K6, block-128 FP8
+and BF16 on representative layers 1/4/7, with a small calibration/heldout
+subset and the original 2,205-token sparse-indexer witness. Native/staged
+KDA, mHC, MLA/indexer, serialized projection and independently aligned MTP
+checks precede production. The source checksum pass compares every source
+file to its actual Hub LFS/Git hash rather than Sparknest's internal IDs.
+
+`quantization/glm5_flash/core_k6/launch.py` runs the existing fair queue
+helper unchanged on raptor under `maxq.lock`; all GPU work stays on MaxQ.
+A durable systemd user supervisor holds the lease through container
+teardown, releases it, then runs authorized CPU-only publication. Every
+wait/run is bounded. Production retains only rolling front-edge recovery,
+with explicit identity/receipt checks and an 86 GiB GPU allocation ceiling.
+Run/token/pilot state: `~/.cache/cuteafd/quantization/glm53-flash-k4-core-k6/`.
+Output: `~/.cache/huggingface/cuteafd-exports/GLM-5.3-Flash-EXL3-K4-Core-K6/`.
+Report layer progress and ETA every 30 minutes once the full run is stable.
+Raptor quality/serving qualification and engine K6 shape support are separate.
