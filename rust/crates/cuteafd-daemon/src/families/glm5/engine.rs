@@ -64,10 +64,7 @@ const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 const SKIP_RANKS: usize = cuteafd_loader::placement::families::glm5::SKIP_RANKS;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
-/// Most lanes a long Spark prefill chunk splits into (serve `--prefill-waves`,
-/// default 2; 1 is the serial path), and the fewest rows per
-/// lane worth another exchange per layer.
-pub(crate) const PREFILL_LANES: usize = 4;
+/// Fewest rows per lane worth another exchange per layer.
 const MIN_LANE_ROWS: usize = 256;
 
 /// What precedes a decode segment's residual norm.
@@ -255,7 +252,7 @@ struct Workspace<'a> {
     /// Native dense scratch (EXLR8 checkpoint dense operands), when the layers run natively.
     native_dense: Option<Rc<native_dense::NativeScratch<'a>>>,
     payload: Option<Buf<'a>>,
-    router_host: Rc<RefCell<HostAllocation<'a>>>,
+    router_host: Rc<RefCell<Option<HostAllocation<'a>>>>,
     /// The step's token ids (U32, gathered from the device embedding table).
     ids: Buf<'a>,
     /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
@@ -274,7 +271,7 @@ struct SharedStep<'a> {
     topk_scratch: Buf<'a>,
     native_shared: Option<Rc<crate::shared::experts::exlr8::Exlr8Execution<'a>>>,
     native_dense: Option<Rc<native_dense::NativeScratch<'a>>>,
-    router_host: Rc<RefCell<HostAllocation<'a>>>,
+    router_host: Rc<RefCell<Option<HostAllocation<'a>>>>,
     head: Option<Rc<VocabularyHead<'a>>>,
     head_workspace: Buf<'a>,
 }
@@ -796,8 +793,7 @@ impl<'a> GlmEngine<'a> {
                 Some(Rc::new(native_dense::NativeScratch::new(self, self.cfg.heads / if attention_split { 2 } else { 1 },
                     self.cfg.dense_intermediate / if split { 2 } else { 1 }, t)?))
             } else { None },
-            router_host: Rc::new(RefCell::new(HostAllocation::new(self.library,
-                lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 })))?)),
+            router_host: Rc::new(RefCell::new(None)),
             // SAFETY: the head workspace lives in every workspace holding the head, which drops first.
             head: if lead {
                 Some(Rc::new(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
@@ -970,7 +966,7 @@ impl<'a> GlmEngine<'a> {
 
     /// [`Self::prefill`] returning the logits of the chunk's last `logit_rows` rows.
     /// Without `on_layer`, a Spark chunk of at least 2 x 256 rows runs as
-    /// [`PREFILL_LANES`] lanes (see [`Self::step_lanes`]).
+    /// the admitted waves (see [`Self::step_lanes`]).
     pub fn prefill_rows_logits(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize) -> Result<Option<Vec<f32>>> {
@@ -1005,7 +1001,16 @@ impl<'a> GlmEngine<'a> {
         }
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let tables = self.prefill_tables(placement, start, t)?;
-        let logits = self.step(&tables, tokens, logit_rows, experts, on_layer)?;
+        // Short chunks, callbacks and partial-layer goldens use the same
+        // prefill owner as units; the decode link admits decode rows only.
+        let logits = if experts.is_some() {
+            let mut link = self.prefill_link.borrow_mut();
+            let link = link.as_mut().context("GLM Spark prefill needs the prefill link")?;
+            let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
+            self.step(&tables, tokens, logit_rows, Some((link, runtime)), on_layer)?
+        } else {
+            self.step(&tables, tokens, logit_rows, None, on_layer)?
+        };
         placement.len += t;
         Ok(logits.map(StepLogits::Device))
     }
@@ -1843,7 +1848,11 @@ impl<'a> GlmEngine<'a> {
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
             if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
         let route_bytes = layout.route_bytes;
-        let staging = w.router_host.borrow_mut();
+        let mut staging = w.router_host.borrow_mut();
+        if staging.as_ref().is_none_or(|pinned| pinned.buffer.bytes < layout.bytes) {
+            *staging = Some(HostAllocation::new(self.library, layout.bytes)?);
+        }
+        let staging = staging.as_ref().context("GLM diagnostic route staging")?;
         let timer = std::time::Instant::now();
         // SAFETY: the pinned regions are large enough; the sync completes them
         // (and this workspace's previous plane uploads, freeing its staging).
