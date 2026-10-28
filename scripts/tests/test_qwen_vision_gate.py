@@ -245,6 +245,8 @@ def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
     assert "self.mtp_prefill_workspace.borrow().is_none()" in future
     assert "self.mtp_prefill_rows()" in future
     assert "ple.mapped()" in future
+    assert '"staging/mapped-table-worker"' in future
+    assert "ple.mapped().host_workspace_bytes()" in future
     assert "HostAllocation::new" not in future
 
     serve = (root / "serve.rs").read_text()
@@ -332,6 +334,29 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert 'get QWEN_STARTUP_GRAPHS' in launcher
     assert 'on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1)' in launcher
     assert 'off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0)' in launcher
+
+
+def test_qwen_startup_shapes_drain_without_serving_warmup_reachability():
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
+
+    def check(source):
+        start = source.index("    pub fn warm_decode_graphs(")
+        end = source.index("    /// Compare real logits", start)
+        warm = source[start:end]
+        loop = warm[warm.index("            for &(rows, spec, geometry) in &shapes {"):]
+        loop = loop[:loop.index("\n            }")]
+        assert loop.index("self.step(") < loop.index("self.drain_state()?;")
+        # No engine execution helper may enter startup warm-up, even indirectly.
+        assert "warm_decode_graphs(" not in source[:start] + source[end:]
+
+    check(engine)
+    drain = "                self.drain_state()?;\n"
+    warm_start = engine.index("    pub fn warm_decode_graphs(")
+    drain_at = engine.index(drain, warm_start)
+    with pytest.raises((AssertionError, ValueError)):
+        check(engine[:drain_at] + engine[drain_at + len(drain):])
+    with pytest.raises(AssertionError):
+        check(engine + "\nfn serving_step() { self.warm_decode_graphs(1, false); }\n")
 
 
 @pytest.mark.parametrize("family", ["qwen4", "mimo_v2", "glm5_flash", "glm5"])

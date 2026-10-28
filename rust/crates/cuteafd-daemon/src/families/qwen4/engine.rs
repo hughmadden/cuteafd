@@ -1439,6 +1439,8 @@ impl<'a> Qwen4Engine<'a> {
                 let mut tokens = Vec::new();
                 pad_decode_tables(&mut tables, &mut tokens, rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
                 self.step(&Arc::new(tables), &tokens, rows, None, None, &Default::default(), true)?;
+                // Startup shapes reuse an arena admitted for one serving step.
+                self.drain_state()?;
             }
             // SAFETY: queued captures/replays drain before reporting memory or publishing readiness.
             self.drain_state()
