@@ -1225,6 +1225,12 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
 
 /// Count candidates differ only in placement, so every one shares the
 /// checkpoint and catalog `input` already read.
+/// The unit a Spark-free prefill path runs at (one unit in flight).
+pub const SPARK_FREE_UNIT_ROWS: u64 = 4096;
+/// V4.1's prefill path: the encoder layers (the decoder replay is at most
+/// 128 rows); every one onboarded leaves no Spark traffic in prefill.
+const V41_PREFILL_PATH_LAYERS: usize = 20;
+
 fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usize,
     explicit: Option<usize>) -> Result<PlanReport, PlanError> {
     if available > 8 {
@@ -1259,22 +1265,31 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             }
             return Ok(report);
         }
-        // TJ's reserve rule (#762): the largest page-multiple reserve (at
-        // most the standard 8192) that keeps the RTX expert layers the
-        // reference 2 x 2048 shape onboards, and fits; fit and layers are
-        // monotone in the reserve, so a bisection finds it. The adaptive
-        // executor admits four slots cut from it: depth k runs
-        // roundup64(reserve / k) rows, the widest unit (depth 2) is half the
-        // reserve, and the planner charges the largest split (8192 charges 8256).
-        use crate::serving_capacity::prefill_waves::{unit_rows_in, MAX_WAVES, RESERVE_ROWS, ROW_PAGE};
-        let reference = {
-            let mut pinned = candidate.clone();
-            let layout = pinned.layout.as_mut().unwrap();
-            layout.prefill_rows = 2048;
-            layout.prefill_waves = 2;
-            input.plan(&pinned)?
+        // TJ 2026-10-28: a prefill path with no Spark traffic (every encoder
+        // layer's experts onboarded) has no exchange to hide, so it runs one
+        // unit at a time at the widest unit (1 x 4096) and the reserve is that
+        // one unit; its freed memory goes to onboarding and KV. The first plan
+        // at that shape decides: all prefill-path layers local, take it.
+        let spark_free = {
+            let mut single = candidate.clone();
+            let layout = single.layout.as_mut().unwrap();
+            layout.prefill_rows = SPARK_FREE_UNIT_ROWS;
+            // Depth 1 explicitly (`prefill_waves` 1 means unset to the layout).
+            layout.prefill_lanes = 1;
+            input.plan(&single)?
         };
-        let keep = reference.executable().then_some(reference.onboard_layers).flatten();
+        if spark_free.executable() && spark_free.onboard_layers.is_some_and(|layers| layers >= V41_PREFILL_PATH_LAYERS) {
+            return Ok(spark_free);
+        }
+        // The reserve rule (#762): the standard 8192 rows, capped only when the
+        // card cannot fit it beside its fixed owners (the largest page-multiple
+        // reserve that fits; fit is monotone in the reserve, so a bisection
+        // finds it). It is never shrunk to buy onboarded layers or KV (TJ
+        // 2026-10-28). The adaptive executor admits four slots cut from it:
+        // depth k runs roundup64(reserve / k) rows, the widest unit (depth 2)
+        // is half the reserve, and the planner charges the largest split
+        // (8192 charges 8256).
+        use crate::serving_capacity::prefill_waves::{unit_rows_in, MAX_WAVES, RESERVE_ROWS, ROW_PAGE};
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
                 candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
@@ -1283,32 +1298,28 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
         };
-        let admits = |report: &PlanReport| report.executable()
-            && keep.is_none_or(|layers| report.onboard_layers.is_some_and(|onboard| onboard >= layers));
         // V4.1's executor lives at >= 256 rows per unit (`V41_LIVE_MIN_ROWS`)
         // at every depth it may run.
         let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
             .filter(|&reserve| unit_rows_in(MAX_WAVES, reserve) >= u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS))
             .collect();
         let waves = report.prefill_waves.unwrap_or(2);
-        // The largest candidate (descending) whose report passes `ok`, by
-        // bisection (monotone in the reserve); None when the smallest fails.
-        let mut largest = |ok: &dyn Fn(&PlanReport) -> bool| -> Result<Option<PlanReport>, PlanError> {
+        // The largest candidate (descending) that fits, by bisection; None
+        // when the smallest does not.
+        let mut largest = || -> Result<Option<PlanReport>, PlanError> {
             let full = at(RESERVE_ROWS)?;
-            if ok(&full) { return Ok(Some(full)); }
+            if full.executable() { return Ok(Some(full)); }
             let smallest = at(*candidates.last().unwrap())?;
-            if !ok(&smallest) { return Ok(None); }
+            if !smallest.executable() { return Ok(None); }
             let (mut lo, mut hi, mut best) = (candidates.len() - 1, 0, smallest);
             while lo - hi > 1 {
                 let mid = (lo + hi) / 2;
                 let report = at(candidates[mid])?;
-                if ok(&report) { lo = mid; best = report; } else { hi = mid; }
+                if report.executable() { lo = mid; best = report; } else { hi = mid; }
             }
             Ok(Some(best))
         };
-        if let Some(best) = largest(&admits)? { return Ok(best); }
-        // No reserve keeps the reference layers: the largest that fits.
-        if let Some(best) = largest(&|report: &PlanReport| report.executable())? { return Ok(best); }
+        if let Some(best) = largest()? { return Ok(best); }
         let mut refused = at(RESERVE_ROWS)?;
         refused.hints.push(Hint {
             what: format!("V4.1 prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",

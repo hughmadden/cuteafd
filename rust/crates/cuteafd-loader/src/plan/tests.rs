@@ -3579,29 +3579,33 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
 }
 
 #[test]
-fn v41_reserve_keeps_the_reference_2x2048_onboarded_layers() {
-    // TJ's reserve rule (#762): the largest reserve that onboards at least
-    // the layers 2 x 2048 does; one 64-row step larger loses a layer or no
-    // longer fits (unless 8192 already keeps them).
+fn v41_spark_free_prefill_runs_one_window_and_pins_still_override() {
+    // TJ 2026-10-28: a prefill path with no Spark traffic (every encoder
+    // layer onboarded) plans depth 1 at the widest unit, its reserve that one
+    // unit; an explicit depth (PREFILL_WAVES=2..4) keeps its normal reserve;
+    // a deployment that leaves any encoder layer remote stays adaptive.
     let dir = strict_v41_snapshot(false);
-    for gib in [32u64, 64, 96] {
-        let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-            rtx_bytes: vec![gib << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0),
-            context_tokens: 1 << 20, prefill_rows: 0, ..Default::default() };
-        let reference = plan_spark_count(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-            prefill_rows: 2048, prefill_waves: 2, ..layout.clone() }), ..sparks(4) }, 6, Some(4)).unwrap();
-        let chosen = plan_spark_count(dir.path(), &PlanOptions { layout: Some(layout.clone()), ..sparks(4) }, 6, Some(4)).unwrap();
-        if !reference.executable() { continue; }
-        assert!(chosen.executable(), "{gib} GiB: {}", render(&chosen));
-        let reserve = chosen.prefill_reserve_rows.unwrap();
-        assert!(chosen.onboard_layers >= reference.onboard_layers,
-            "{gib} GiB reserve {reserve}: {:?} layers < reference {:?}", chosen.onboard_layers, reference.onboard_layers);
-        if reserve < 8192 {
-            let larger = plan_spark_count(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-                prefill_reserve_rows: Some(reserve + 64), ..layout.clone() }), ..sparks(4) }, 6, Some(4)).unwrap();
-            assert!(!larger.executable() || larger.onboard_layers < reference.onboard_layers,
-                "{gib} GiB: reserve {} also keeps the layers", reserve + 64);
-        }
+    let two = |gib: u64, waves: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![gib << 30, gib << 30],
+        workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
+        prefill_rows: rows, prefill_waves: waves, ..Default::default() }), ..sparks(4) };
+    let auto = plan_spark_count(dir.path(), &two(96, 0, 0), 6, Some(4)).unwrap();
+    assert!(auto.executable(), "{}", render(&auto));
+    if auto.onboard_layers.is_some_and(|layers| layers >= 20) {
+        assert_eq!((auto.prefill_unit_rows, auto.prefill_waves, auto.prefill_slots), (Some(4096), Some(1), Some(1)),
+            "{}", render(&auto));
+        // An explicit depth keeps the standard reserve and its split.
+        let pinned = plan_spark_count(dir.path(), &two(96, 3, 2752), 6, Some(4)).unwrap();
+        assert!(pinned.executable(), "{}", render(&pinned));
+        assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_slots), (Some(2752), Some(3), Some(3)));
+        assert!(pinned.onboard_layers <= auto.onboard_layers, "one window frees memory for onboarding");
+    } else {
+        panic!("fixture: 2 x 96 GiB should onboard every encoder layer: {}", render(&auto));
+    }
+    // Small cards leave encoder layers on the Sparks: adaptive depths stay.
+    let small = plan_spark_count(dir.path(), &two(32, 0, 0), 6, Some(4)).unwrap();
+    if small.executable() && small.onboard_layers.is_some_and(|layers| layers < 20) {
+        assert!(small.prefill_slots.unwrap_or(0) >= 2, "{}", render(&small));
     }
 }
 
