@@ -2,7 +2,7 @@
 //! heads over the coordinator's two GPUs (MiMo V2.6 Pro, GLM 5.x): the ranks'
 //! devices and streams, and both ends of the exchange between them.
 //!
-//! Exchange: SM pushes into the other GPU's receive buffers with a release
+//! Exchange: size-routed pushes into the other GPU's receive buffers with a release
 //! flag, and a spinning acquire wait on the receiving stream (the
 //! `peer_exchange` kernels; device-side sequence numbers, so graphs replay
 //! them). Every slot has its own flag and sequences: each push into a slot is
@@ -29,33 +29,6 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static PEER_ISSUE: AtomicU64 = AtomicU64::new(1);
-
-/// Copy payload on the appropriate engine, then publish the existing link sequence.
-///
-/// # Safety
-/// Both buffers and control words remain live through `stream`; the caller orders
-/// source production and destination reuse, with peer access enabled both ways.
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn copy_signal(library: &NativeLibrary, destination: cuteafd_ffi::CuteafdDeviceBuffer,
-    source: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize, flag: *mut u32, send_state: *mut u32,
-    stream: *mut c_void, diagnostic: Option<&PeerDiagnostic>) -> Result<()> {
-    let payload = if crate::shared::memory::device::sm_peer_copy_for(true, bytes) { bytes } else {
-        // SAFETY: the caller owns the extents and orders both endpoints. Publication
-        // follows the DMA on this same stream, including during graph replay.
-        unsafe { library.copy_peer_async(destination, source, bytes, stream)?; }
-        0
-    };
-    // SAFETY: the caller retains the link; a zero-byte push only publishes the
-    // existing device-side sequence after the preceding copy completes.
-    unsafe {
-        match diagnostic {
-            Some(d) => library.peer_push_signal_diagnostic(destination.ptr, source.ptr, payload,
-                flag, send_state, 0, stream, d),
-            None => library.peer_push_signal(destination.ptr, source.ptr, payload, flag, send_state, 0, stream),
-        }
-    }
-}
-
 
 /// Probe both directions before admitting or loading a two-GPU layout. Cards
 /// without peer access (including GeForce) retain the single-device path.
@@ -217,6 +190,7 @@ pub(crate) struct PeerExchange<'a> {
     ranks: [RankDevice; 2],
     ends: [End<'a>; 2],
     abort: Option<TerminalAbort<'a>>,
+    decode_lane_bytes: usize,
     trace_name: Cell<&'static str>,
     host_ordinals: RefCell<Vec<[[u64; 2]; 2]>>,
 }
@@ -268,9 +242,17 @@ impl<'a> PeerExchange<'a> {
             ranks,
             ends: [end(0)?, end(1)?],
             abort: None,
+            decode_lane_bytes: usize::MAX,
             trace_name: Cell::new("unnamed"),
             host_ordinals: RefCell::new(if diagnostics { vec![[[0; 2]; 2]; slots + 1] } else { Vec::new() }),
         })
+    }
+
+    /// Admit the largest decode transfer; wider pushes use the copy engine.
+    pub fn with_decode_lane_bytes(mut self, bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0 && bytes % 16 == 0, "decode peer extent must contain aligned rows");
+        self.decode_lane_bytes = bytes;
+        Ok(self)
     }
 
     /// Optional MiMo terminal ownership. Other families retain the legacy ABI.
@@ -579,10 +561,28 @@ impl<'a> PeerExchange<'a> {
         // this stream and untouched until later work on it; the destination is a live
         // buffer of the other GPU that it reads only after its matching wait.
         let result = self.on(from, || unsafe {
-            copy_signal(self.library,
-                cuteafd_ffi::CuteafdDeviceBuffer { ptr: destination, bytes, device_id: self.device(1 - from), flags: 0 },
-                cuteafd_ffi::CuteafdDeviceBuffer { ptr: source.cast_mut(), bytes, device_id: self.device(from), flags: 0 },
-                bytes, theirs.flag(flag), mine.send_state(flag), self.stream(from), diagnostic.as_ref())
+            let bytes = if crate::shared::memory::device::sm_peer_copy_for(true, bytes, self.decode_lane_bytes) {
+                bytes
+            } else {
+                let buffer = |ptr, device_id| cuteafd_ffi::CuteafdDeviceBuffer { ptr, bytes, device_id, flags: 0 };
+                self.library.copy_d2d_async(buffer(destination, self.device(1 - from)),
+                    buffer(source.cast_mut(), self.device(from)), bytes, self.stream(from))?;
+                // Publication follows the copy on the same issuing stream.
+                0
+            };
+            if let Some(d) = &diagnostic {
+                return self.library.peer_push_signal_diagnostic(destination, source, bytes,
+                    theirs.flag(flag), mine.send_state(flag), 0, self.stream(from), d);
+            }
+            self.library.peer_push_signal(
+                destination,
+                source,
+                bytes,
+                theirs.flag(flag),
+                mine.send_state(flag),
+                0,
+                self.ranks[from].stream,
+            )
         });
         self.diagnostic_return(diagnostic, &result);
         result

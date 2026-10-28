@@ -283,7 +283,7 @@ unsafe fn peer_copy(
     // prefill-width ones on the copy engines (`device::sm_peer_copy_for`).
     // The issuing stream is this wave's own, ordered by a
     // `cudaStreamWaitEvent` on the chain head, never a memory wait.
-    match sm.filter(|_| crate::shared::memory::device::sm_peer_copy_for(crate::shared::memory::chain::deferred(), bytes)) {
+    match sm.filter(|_| crate::shared::memory::device::sm_peer_copy_for(crate::shared::memory::chain::deferred(), bytes, crate::shared::memory::device::DECODE_PEER_COPY_BYTES)) {
         Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
         None => unsafe {
             stream

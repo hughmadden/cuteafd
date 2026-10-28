@@ -1348,8 +1348,8 @@ fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
 /// with the DSA index cache `with_engine` resolved (a head split keeps `keys`).
-fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache, spark_bf16: bool) -> engine::StepSettings {
-    engine::StepSettings { spark_bf16, kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
+fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
+    engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
         max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
         decode_rows: args.decode_rows }
@@ -2070,7 +2070,7 @@ impl Opened {
         let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
         let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
-            let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
+            let mut settings = step_settings(args, index_cache);
             settings.max_context = max_context;
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
             let lanes = args.prefill_waves;

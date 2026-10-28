@@ -105,7 +105,7 @@ impl<'a> GlmfEngine<'a> {
         let exchange = self.exchange()?;
         let mut hops = HopLink::new(self.library,
             [0, 1].map(|rank| RankDevice { device: exchange.device(rank), stream: exchange.stream(rank) }),
-            plan.hops(), plan.spec())?;
+            plan.hops(), plan.spec())?.with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 terminal owner")?,
             exchange.abort_word(1)?.context("rank 1 terminal owner")?])?;
         hops.validate_binding(&plan, exchange)?;

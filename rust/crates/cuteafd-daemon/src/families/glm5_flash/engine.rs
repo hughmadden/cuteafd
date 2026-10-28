@@ -851,7 +851,6 @@ pub(crate) struct StepPlan<'p, 'a> {
     /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
     /// scratch is at least this large. 0 with records of their own.
     shared_records: u64,
-    spark_bf16: bool,
 }
 
 /// Expert buffers required by the admitted routed-layer homes.
@@ -869,7 +868,6 @@ pub(crate) struct StepSettings {
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
     pub full_prefill_logits: bool,
-    pub spark_bf16: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
     /// The DSA index cache: the compact one runs the `index_producer_c` programs, whose scratch
@@ -921,7 +919,6 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             },
             decode_rows: settings.decode_rows,
             shared_records,
-            spark_bf16: settings.spark_bf16,
         }
     }
 
@@ -1988,7 +1985,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
-            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?;
+            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?
+            .with_decode_lane_bytes(PackedRoutes::new(self.decode_rows, self.cfg.topk).bytes)?;
         routes.trace_identity("glmf-tp2-routes");
         for (rank, producer) in [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device: peer.device, stream: peer.stream }].into_iter().enumerate() {
@@ -2656,7 +2654,8 @@ impl<'a> GlmfEngine<'a> {
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
-            rows * self.cfg.hidden * self.partial_bytes())?;
+            rows * self.cfg.hidden * self.partial_bytes())?
+            .with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
         ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some()
@@ -3125,7 +3124,7 @@ impl<'a> GlmfEngine<'a> {
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.step_experts,
-            StepSettings { spark_bf16: self.spark_bf16, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })

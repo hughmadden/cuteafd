@@ -79,6 +79,10 @@ pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
         1e3 * one_seconds, 1e3 * two_seconds);
     allocator.release(two);
     allocator.release(one);
+    check_identity(logits, state, paged, depth)
+}
+
+fn check_identity(logits: bool, state: bool, paged: bool, depth: usize) -> Result<()> {
     ensure!(logits && state && paged, "executor N1 and admitted N{depth} differ over the same cuts");
     Ok(())
 }
@@ -114,6 +118,17 @@ mod tests {
             assert!(unit_check_rows(depth * rows, rows, depth, 1 << 20).is_err());
             assert!(unit_check_rows(available, rows, depth, depth * rows).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_depth_oracle_rejects_each_corrupted_component() -> Result<()> {
+        check_identity(true, true, true, 3)?;
+        for identity in [(false, true, true), (true, false, true), (true, true, false)] {
+            assert!(check_identity(identity.0, identity.1, identity.2, 3).is_err());
+        }
+        // Equal floating values still differ when the stored bits differ.
+        assert!(check_identity(0.0f32.to_bits() == (-0.0f32).to_bits(), true, true, 3).is_err());
         Ok(())
     }
 

@@ -19,7 +19,7 @@
 //! exactly the solver's `residual hops` demand.
 use super::{on_device, End, RankDevice};
 use crate::shared::memory::DeviceAllocation;
-use crate::shared::memory::device::{Device, Stream};
+use crate::shared::memory::device::{Device, Event, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HopStorage, HOP_SLOTS};
@@ -89,7 +89,7 @@ impl<'a> DirectInputHop<'a> {
             return device.run(|| unsafe {
                 crate::shared::memory::chain::join(device.library, self.destination.raw)?;
                 for (source, destination) in sources.into_iter().zip(destinations) {
-                    match self.sm.as_ref().filter(|_| crate::shared::memory::device::sm_peer_copy_for(true, source.bytes)) {
+                    match self.sm.as_ref().filter(|_| crate::shared::memory::device::sm_peer_copy_for(true, source.bytes, crate::shared::memory::device::DECODE_PEER_COPY_BYTES)) {
                         Some(sm) => sm.launch(destination, source, source.bytes, self.destination.raw)?,
                         None => device.library.copy_peer_async(destination, source, source.bytes,
                             self.destination.raw)?,
@@ -154,6 +154,8 @@ pub(crate) struct HopLink<'a> {
     /// Receive slots per lane on each GPU (`min(hops into it, HOP_SLOTS)`).
     per_lane: [usize; 2],
     abort: Option<[*const u32; 2]>,
+    decode_lane_bytes: usize,
+    consumer_ready: [Vec<Event<'a>>; 2],
 }
 
 /// A queued push whose matching wait is still owed on the destination.
@@ -200,8 +202,19 @@ impl<'a> HopLink<'a> {
                 })
             })
         };
+        let consumer_ready = [0, 1].map(|rank| (0..spec.lanes)
+            .map(|_| Event::new(Device { library, id: ranks[rank].device })).collect::<Result<Vec<_>>>());
+        let [ready0, ready1] = consumer_ready;
         Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, private_lane: None,
-            hops: hops.to_vec(), per_lane, abort: None })
+            hops: hops.to_vec(), per_lane, abort: None, decode_lane_bytes: usize::MAX,
+            consumer_ready: [ready0?, ready1?] })
+    }
+
+    /// Admit the largest decode residual; wider hops use the copy engine.
+    pub fn with_decode_lane_bytes(mut self, bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0 && bytes % 16 == 0, "decode peer extent must contain aligned rows");
+        self.decode_lane_bytes = bytes;
+        Ok(self)
     }
 
     /// Independent streams carry one logical lane, so allocate only its slots.
@@ -266,7 +279,8 @@ impl<'a> HopLink<'a> {
     }
 
     /// As `send`, optionally landing directly in a persistent consumer operand.
-    /// The caller retains that operand and orders its reuse through the matching land.
+    /// The operand must be persistent and exclusive to this lane. Before the
+    /// sender overwrites it, an event joins all earlier destination readers.
     pub fn send_into(&self, index: usize, lane: usize, source: *const c_void, rows: usize,
         destination: Option<CuteafdDeviceBuffer>) -> Result<HopTicket> {
         let (to, slot) = self.slot_of(index)?;
@@ -276,6 +290,17 @@ impl<'a> HopLink<'a> {
         let (flag, recv) = (physical_lane * HOP_SLOTS as usize + slot, physical_lane * self.per_lane[to] + slot);
         let from = 1 - to;
         let bytes = rows * usize::try_from(self.spec.row_bytes)?;
+        if destination.is_some() {
+            let ready = self.consumer_ready[to][physical_lane].raw;
+            // SAFETY: both streams and the lane's event are retained by this link.
+            // Record before the new land wait, so this cannot wait on its own push.
+            on_device(self.library, self.ranks[to].device, || unsafe {
+                self.library.cuda_event_record(ready, self.ranks[to].stream)
+            })?;
+            on_device(self.library, self.ranks[from].device, || unsafe {
+                self.library.cuda_stream_wait_event(self.ranks[from].stream, ready)
+            })?;
+        }
         let destination = destination.unwrap_or(self.ends[to].recv.get(recv).context("hop receive slot")?.buffer);
         ensure!(destination.device_id == self.ranks[to].device && bytes <= destination.bytes,
             "hop destination device or extent differs from admission");
@@ -285,9 +310,16 @@ impl<'a> HopLink<'a> {
         // destination slot is read only after its matching wait, and the
         // executor reuses a slot only after the destination consumed it.
         on_device(self.library, self.ranks[from].device, || unsafe {
-            super::copy_signal(self.library, destination,
-                CuteafdDeviceBuffer { ptr: source.cast_mut(), bytes, device_id: self.ranks[from].device, flags: 0 },
-                bytes, theirs.flag(flag), mine.send_state(flag), self.ranks[from].stream, None)
+            let payload = if crate::shared::memory::device::sm_peer_copy_for(true, bytes, self.decode_lane_bytes) {
+                bytes
+            } else {
+                self.library.copy_d2d_async(destination,
+                    CuteafdDeviceBuffer { ptr: source.cast_mut(), bytes, device_id: self.ranks[from].device, flags: 0 },
+                    bytes, self.ranks[from].stream)?;
+                0
+            };
+            self.library.peer_push_signal(destination.ptr, source, payload, theirs.flag(flag),
+                mine.send_state(flag), 0, self.ranks[from].stream)
         })?;
         Ok(HopTicket { to, flag, destination: destination.ptr })
     }
