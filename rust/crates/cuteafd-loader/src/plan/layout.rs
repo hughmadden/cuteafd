@@ -589,6 +589,27 @@ mod draft_prefix_tests {
     use super::*;
 
     #[test]
+    fn shared_shape_preserves_admitted_span_instead_of_unit_width() -> anyhow::Result<()> {
+        use crate::plan::{empty_report, testing, Checkpoint, Family, PlanOptions};
+        let checkpoint = Checkpoint { snapshot: std::path::PathBuf::new(),
+            config: testing::glm5_flash_config(2), quantize_config: None,
+            weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+        let model = crate::plan::families::glm::GLM5_FLASH.open(&checkpoint)?;
+        let mut report = empty_report(&checkpoint, &PlanOptions::default())?;
+        let mut options = LayoutOptions { rtx_bytes: vec![96 << 30], prefill_rows: 2752,
+            prefill_unit_rows: Some(2752), prefill_waves: 3, ..Default::default() };
+        report.prefill_span_rows = Some(8256);
+        let shape = Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
+        assert_eq!(shape.prefill_rows, 2752);
+        assert_eq!(report.prefill_span_rows, Some(8256));
+        report.prefill_span_rows = None;
+        options.prefill_rows = 4096;
+        Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
+        assert_eq!(report.prefill_span_rows, Some(4096));
+        Ok(())
+    }
+
+    #[test]
     fn full_context_defaults_preserve_dynamic_families_and_bound_indexed_families() {
         let manifest = serde_json::json!({"capacities": {"max_context": 131072}});
         for policy in [ContextPolicy::Checkpoint, ContextPolicy::ManifestBounded] {
@@ -768,7 +789,7 @@ impl Shape {
         if options.prefill_waves == 1 && options.prefill_unit_rows.is_none() {
             options.prefill_unit_rows = Some(prefill_rows);
         }
-        report.prefill_span_rows = Some(prefill_rows);
+        report.prefill_span_rows.get_or_insert(prefill_rows);
         let decode_rows = manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
         let concurrency = if options.concurrency > 0 { options.concurrency }
             else { cuteafd_core::serving_capacity::default_concurrency(options.rtx_bytes.first().copied().unwrap_or(0)) };

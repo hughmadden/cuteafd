@@ -30,6 +30,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static PEER_ISSUE: AtomicU64 = AtomicU64::new(1);
 
+/// Copy payload on the appropriate engine, then publish the existing link sequence.
+///
+/// # Safety
+/// Both buffers and control words remain live through `stream`; the caller orders
+/// source production and destination reuse, with peer access enabled both ways.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn copy_signal(library: &NativeLibrary, destination: cuteafd_ffi::CuteafdDeviceBuffer,
+    source: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize, flag: *mut u32, send_state: *mut u32,
+    stream: *mut c_void, diagnostic: Option<&PeerDiagnostic>) -> Result<()> {
+    let payload = if crate::shared::memory::device::sm_peer_copy_for(true, bytes) { bytes } else {
+        // SAFETY: the caller owns the extents and orders both endpoints. Publication
+        // follows the DMA on this same stream, including during graph replay.
+        unsafe { library.copy_peer_async(destination, source, bytes, stream)?; }
+        0
+    };
+    // SAFETY: the caller retains the link; a zero-byte push only publishes the
+    // existing device-side sequence after the preceding copy completes.
+    unsafe {
+        match diagnostic {
+            Some(d) => library.peer_push_signal_diagnostic(destination.ptr, source.ptr, payload,
+                flag, send_state, 0, stream, d),
+            None => library.peer_push_signal(destination.ptr, source.ptr, payload, flag, send_state, 0, stream),
+        }
+    }
+}
+
+
 /// Probe both directions before admitting or loading a two-GPU layout. Cards
 /// without peer access (including GeForce) retain the single-device path.
 pub(crate) fn probed_device(library: &NativeLibrary, home: i32, requested: Option<i32>) -> Result<Option<i32>> {
@@ -552,19 +579,10 @@ impl<'a> PeerExchange<'a> {
         // this stream and untouched until later work on it; the destination is a live
         // buffer of the other GPU that it reads only after its matching wait.
         let result = self.on(from, || unsafe {
-            if let Some(d) = &diagnostic {
-                return self.library.peer_push_signal_diagnostic(destination, source, bytes,
-                    theirs.flag(flag), mine.send_state(flag), 0, self.stream(from), d);
-            }
-            self.library.peer_push_signal(
-                destination,
-                source,
-                bytes,
-                theirs.flag(flag),
-                mine.send_state(flag),
-                0,
-                self.ranks[from].stream,
-            )
+            copy_signal(self.library,
+                cuteafd_ffi::CuteafdDeviceBuffer { ptr: destination, bytes, device_id: self.device(1 - from), flags: 0 },
+                cuteafd_ffi::CuteafdDeviceBuffer { ptr: source.cast_mut(), bytes, device_id: self.device(from), flags: 0 },
+                bytes, theirs.flag(flag), mine.send_state(flag), self.stream(from), diagnostic.as_ref())
         });
         self.diagnostic_return(diagnostic, &result);
         result

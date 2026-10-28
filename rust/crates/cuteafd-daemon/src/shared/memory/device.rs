@@ -387,6 +387,11 @@ mod peer_copy_choice_tests {
         assert!(!sm_peer_copy_for(true, 2752 * 10240));
         assert!(!sm_peer_copy_for(true, DECODE_PEER_COPY_BYTES + 1));
         assert!(!sm_peer_copy_for(false, 1 * 10240));
+        // GLM Flash's four-stream residual is wider than a hidden row. Its
+        // complete 64-row decode still fits the same shared size cutoff.
+        assert!(sm_peer_copy_for(true, 64 * 4 * 4096 * 2));
+        assert!(!sm_peer_copy_for(true, 2752 * 4096 * 2));
+        assert!(!sm_peer_copy_for(true, 4096 * 4 * 4096 * 2));
     }
 }
 

@@ -223,8 +223,6 @@ pub struct GlmfLaneBytes {
     pub route_ids: u64,
     pub route_weights: u64,
     pub wire: u64,
-    /// Pinned host staging of the routes and wire rows (Spark experts); not device memory.
-    pub router_host: u64,
 }
 
 impl GlmfLaneBytes {
@@ -302,7 +300,6 @@ pub fn glmf_lane_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape: &Glm
         route_ids: route(t * topk * 4),
         route_weights: route(t * topk * 4),
         wire: route(t * (h + h / 32)),
-        router_host: if shape.lead && shape.spark { t * (topk * 8 + h + h / 32) } else { FLOOR },
     }
 }
 
@@ -598,10 +595,9 @@ mod tests {
         let cfg = glm53_flash();
         let lane = glmf_lane_bytes(&cfg, 4096, false, &spark_shape());
         assert_eq!((lane.zero, lane.sum, lane.routed), (None, None, None));
-        assert_eq!(lane.router_host, 4096 * (8 * 8 + 4096 + 128));
         let local = glmf_lane_bytes(&cfg, 4096, false,
             &GlmfStepShape { local_experts: true, spark: false, ..spark_shape() });
-        assert_eq!((local.routed, local.router_host), (Some(4096 * 4096 * 2), FLOOR));
+        assert_eq!(local.routed, Some(4096 * 4096 * 2));
         // A head split: both ranks keep the sum, rank 1 the zero rows and none of the lead's buffers.
         let lead = glmf_lane_bytes(&cfg, 64, true, &GlmfStepShape { split: true, ..spark_shape() });
         assert_eq!((lead.zero, lead.sum), (None, Some(64 * 4096 * 2)));
@@ -625,7 +621,6 @@ mod tests {
         assert_eq!((peer.route_ids, peer.route_weights, peer.wire), (lead.route_ids, lead.route_weights, lead.wire));
         let old = glmf_lane_bytes(&cfg, 64, true, &GlmfStepShape { tp2_experts: false, ..shape });
         assert_eq!((peer.delta, peer.shared), (old.delta, old.shared));
-        assert_eq!(peer.router_host, FLOOR);
     }
 
     /// The wide decode programs' scratch at capacity in the offline SM 12.0 export of SparkInfer

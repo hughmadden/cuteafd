@@ -17,7 +17,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         Err(error) => return unsupported_prefill(report, error),
     };
     let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
-    report.prefill_span_rows = Some(prefill.span_rows);
     let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
         shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
     let checkpoint = input.checkpoint();
