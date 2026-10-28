@@ -71,7 +71,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         anyhow::ensure!(options.glm5_drafter_disabled || draft_rows.is_some(),
             "native K6 drafter head needs its actual DFlash config, not a bytes-only override");
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
-            ranks, owners.as_deref(), shape.prefill_rows as usize, prefill.slots as usize, draft_rows,
+            ranks, owners.as_deref(), shape.prefill_rows as usize, prefill.waves as usize, draft_rows,
             shape.manifest.as_ref().context("GLM K6 requires PROGRAMS.json with native exports")?)?))
     })();
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {

@@ -190,7 +190,7 @@ def test_release_derives_exlr8_and_passes_it_to_both_legs(tmp_path, monkeypatch)
         SCOPE.derive(tmp_path, matrix, 'glm-exlr8', {'CUTEAFD_RELEASE_EXLR8_AOT': 'yes'})
     requirement = SCOPE.requirements(tmp_path, matrix, 'glm-exlr8')[0]
     assert requirement['exlr8'] and requirement['programs'] == [
-        'dense_trellis_k6', 'glm', 'glm2', 'glm2_stage', 'glm_stage']
+        'dense_trellis_k6', 'glm', 'glm_stage']
     build = (ROOT / 'build.sh').read_text()
     assert build.count('-e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}"') == 2
     artifacts = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
