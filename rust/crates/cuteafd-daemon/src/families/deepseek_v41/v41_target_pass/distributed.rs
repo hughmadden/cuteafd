@@ -412,7 +412,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let result = unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
             // A failed Spark wire released its waits over garbage planes.
-            return result.and_then(|()| crate::shared::spark_waves::healthy());
+            let result = result.and_then(|()| crate::shared::spark_waves::healthy());
+            // Remote layers left their captured routes in the routers' rings.
+            if result.is_ok() { self.drain_route_rings()?; }
+            return result;
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
@@ -427,21 +430,25 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");
         }
         let ring_timed = timed.map(|_| Instant::now());
-        if result.is_ok() && self.resources.capture_routes {
-            // Device-ordered local layers left their routes in the routers' rings.
-            for gpu in 0..self.resources.lanes.len() {
-                let device = self.resources.lanes[gpu].device;
-                let lane = &mut self.resources.lanes[gpu];
-                for layer in device.run(|| lane.get_mut().drain_route_ring())? {
-                    self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
-                }
-            }
-        }
+        // Remote and device-ordered local layers left their routes in the routers' rings.
+        if result.is_ok() { self.drain_route_rings()?; }
         if let Some(t) = ring_timed {
             tracing::debug!(target: "cuteafd::timing", route_ring_us=t.elapsed().as_micros() as u64,
                 "distributed route ring drain");
         }
         result
+    }
+    /// After a drained pass: every ring-captured layer's routes into the capture.
+    fn drain_route_rings(&mut self) -> Result<()> {
+        if !self.resources.capture_routes { return Ok(()); }
+        for gpu in 0..self.resources.lanes.len() {
+            let device = self.resources.lanes[gpu].device;
+            let lane = &mut self.resources.lanes[gpu];
+            for layer in device.run(|| lane.get_mut().drain_route_ring())? {
+                self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
+            }
+        }
+        Ok(())
     }
     async unsafe fn execute_unchained(
         &mut self,
@@ -1306,8 +1313,11 @@ mod tests {
                 }
             })?;
             ensure!(pass.captured_routes().len() == 40, "distributed route history has missing layers");
+            let counts: Vec<usize> = pass.captured_routes().iter().map(Vec::len).collect();
             for (layer, routes) in pass.captured_routes().iter().enumerate() {
-                ensure!(routes.len() == tokens.len(), "distributed route row count differs at layer {layer}");
+                ensure!(routes.len() == tokens.len(),
+                    "distributed route row count differs at layer {layer}: {} rows, expected {} (step {step}, per layer {counts:?})",
+                    routes.len(), tokens.len());
                 ensure!(routes == &pass.resources.lanes[pass.resources.map.attention(layer)?].captured_routes()[layer],
                     "distributed route history differs from its GPU owner");
                 ensure!(routes.iter().all(|row| row.iter().enumerate().all(|(i, id)|
