@@ -5,6 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
 use serde_json::Value;
 use crate::placement::{Demand, ProgramSet};
+use super::resident::Fp8Head;
 
 const BLAS: u64 = 4 << 20;
 const VOCAB: u64 = 129280;
@@ -187,18 +188,38 @@ impl<'a> NativePrograms<'a> {
             + 3 * (self.projection(rows, 5120, 512)? - rows * 10240))
     }
 
-    /// `cuteafd_fp8_w8a16_workspace`: the row-64 base plus runtime-SM split-K.
-    pub fn vocabulary_scratch(&self, rows: u64, n: u64) -> Result<u64> {
+    /// The vocabulary GEMVs' split-K over 128-wide K blocks (gemv_tiles.cuh).
+    fn vocabulary_splits(&self, rows: u64, n: u64) -> Result<u64> {
         ensure!((1..=4096).contains(&rows) && matches!(n, 64640 | VOCAB),
             "invalid V4.1 vocabulary shape");
-        let k = 5120u64;
         let tiles = n / 16;
-        let blocks = k / 128;
+        let blocks = 5120 / 128;
         let wanted = (u64::from(self.sms) * 16).div_ceil(tiles).clamp(1, blocks);
-        let splits = blocks.div_ceil(blocks.div_ceil(wanted));
+        Ok(blocks.div_ceil(blocks.div_ceil(wanted)))
+    }
+
+    /// `cuteafd_fp8_w8a16_workspace`: the row-64 base plus runtime-SM split-K.
+    pub fn vocabulary_scratch(&self, rows: u64, n: u64) -> Result<u64> {
+        let splits = self.vocabulary_splits(rows, n)?;
+        let k = 5120u64;
         let align = |bytes: u64| bytes.div_ceil(256) * 256;
         Ok(align(2 * 64 * 4) + align(k.div_ceil(256) * 64 * 4) + align(k * 64 * 2)
             + if splits > 1 { align(splits * rows.min(64) * n * 4) } else { 0 })
+    }
+
+    /// `cuteafd_packed_head_workspace`: the row-64 B fragments plus runtime-SM split-K.
+    pub fn packed_vocabulary_scratch(&self, rows: u64, n: u64) -> Result<u64> {
+        let splits = self.vocabulary_splits(rows, n)?;
+        let align = |bytes: u64| bytes.div_ceil(256) * 256;
+        Ok(align(5120 * 64 * 2) + if splits > 1 { align(splits * rows.min(64) * n * 4) } else { 0 })
+    }
+
+    /// Scratch of one projection through `mode`'s resident copy of the vocabulary.
+    pub fn head_scratch(&self, mode: Fp8Head, rows: u64, n: u64) -> Result<u64> {
+        match mode {
+            Fp8Head::Packed => self.packed_vocabulary_scratch(rows, n),
+            _ => self.vocabulary_scratch(rows, n),
+        }
     }
 
     /// The prefill slots' one storage set per GPU (`row_window` contract,
@@ -207,7 +228,7 @@ impl<'a> NativePrograms<'a> {
     /// by the daemon's plan == runtime test), plus each of the `slots` slot
     /// passes' private device owners (its verify-width target head and window
     /// batch table). Excludes local expert / TP2 FFN arenas.
-    pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, fp8_head: bool,
+    pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, head_mode: Fp8Head,
         window_batch: bool) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256 && matches!(ranks, 1 | 2)
             && (1..=4).contains(&slots) && (!window_batch || ranks == 1), "invalid V4.1 prefill slot geometry");
@@ -259,13 +280,15 @@ impl<'a> NativePrograms<'a> {
                     + self.scratch(u, 6144, 25600)? + 4));
             }
             if rank == ranks - 1 { add(&mut out, "target taps", r * 30720); }
-            add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, fp8_head)?);
+            add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, head_mode)?);
         }
         Ok(out)
     }
 
-    /// One slot pass's verify-width target head on `rank` (every pass has one).
-    fn head(&self, ranks: usize, rank: usize, fp8_head: bool) -> Result<u64> {
+    /// One slot pass's verify-width target head on `rank` (every pass has one),
+    /// with the GEMV scratch of `head_mode`'s resident copy when target logits
+    /// project through it.
+    fn head(&self, ranks: usize, rank: usize, head_mode: Fp8Head) -> Result<u64> {
         let head_rows = cuteafd_core::V41_VERIFY_ROWS as u64;
         let normalization = head_rows * (40960 + 16 + 10240 + 10240);
         let sampler = head_rows * (64 + 64 + 2 * VOCAB.div_ceil(32) * 4 + 2048 * 4 + 256 * 12 + 32);
@@ -275,22 +298,24 @@ impl<'a> NativePrograms<'a> {
             BLAS + head_rows * (10240 + VOCAB / 2 * 4 + if rank == 0 { 8 } else { 24 })
                 + if rank == 1 { normalization + head_rows * VOCAB * 4 + sampler } else { 0 }
         };
-        Ok(head + if fp8_head { self.vocabulary_scratch(head_rows, VOCAB / ranks as u64)? } else { 0 })
+        Ok(head + if head_mode.target() {
+            self.head_scratch(head_mode, head_rows, VOCAB / ranks as u64)?
+        } else { 0 })
     }
 
     /// Every target owner but the conditional local expert / TP2 FFN arenas,
     /// weights, cache/prefix banks, vision and Spark transports: the two
     /// decode lanes, private at `decode_rows` (`DECODE_LANE_ROWS`), and the
     /// prefill slots' storage ([`Self::prefill_slots`]).
-    pub fn target(&self, decode_rows: u64, reserve: u64, unit: u64, ranks: usize, slots: usize, fp8_head: bool,
+    pub fn target(&self, decode_rows: u64, reserve: u64, unit: u64, ranks: usize, slots: usize, head_mode: Fp8Head,
         window_batch: bool) -> Result<Vec<Demand>> {
-        let mut out = self.decode_lanes(decode_rows, ranks, fp8_head, window_batch)?;
-        out.extend(self.prefill_slots(reserve, unit, ranks, slots, fp8_head, window_batch)?);
+        let mut out = self.decode_lanes(decode_rows, ranks, head_mode, window_batch)?;
+        out.extend(self.prefill_slots(reserve, unit, ranks, slots, head_mode, window_batch)?);
         Ok(out)
     }
 
     /// The two decode lanes, every owner private at `rows`.
-    pub fn decode_lanes(&self, rows: u64, ranks: usize, fp8_head: bool,
+    pub fn decode_lanes(&self, rows: u64, ranks: usize, head_mode: Fp8Head,
         window_batch: bool) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2)
             && (!window_batch || ranks == 1), "invalid V4.1 target owner geometry");
@@ -340,7 +365,7 @@ impl<'a> NativePrograms<'a> {
                         + self.scratch(rows, 6144, 25600)? + 4));
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
-                add(&mut out, "target head", self.head(ranks, rank, fp8_head)?);
+                add(&mut out, "target head", self.head(ranks, rank, head_mode)?);
             }
         }
         Ok(out)
@@ -350,7 +375,7 @@ impl<'a> NativePrograms<'a> {
     /// main-context producers and committed windows are shared across them.
     /// `experts` is the published coordinator (not RTX backbone) manifest.
     pub fn dspark(&self, experts: &Value, rows: u64, requests: u64, width: u64,
-        ranks: usize, fp8_head: bool) -> Result<Vec<Demand>> {
+        ranks: usize, head_mode: Fp8Head) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&rows) && (1..=16).contains(&requests)
             && matches!(width, 5 | 7) && matches!(ranks, 1 | 2), "invalid V4.1 draft owners");
         ensure!(experts["role"].as_str() == Some("coordinator"), "dSpark expert manifest role mismatch");
@@ -393,7 +418,7 @@ impl<'a> NativePrograms<'a> {
             };
             add(rank, "dSpark request lanes", lanes * (terminal
                 + if rank == decoder { chain } else { 0 }
-                + if fp8_head { self.vocabulary_scratch(live, VOCAB / ranks as u64)? } else { 0 }));
+                + if head_mode.draft() { self.head_scratch(head_mode, live, VOCAB / ranks as u64)? } else { 0 }));
         }
         add(decoder, "dSpark main context", self.main_context(rows)?
             + if lanes > 1 { self.main_context(80)? } else { 0 });
@@ -536,7 +561,7 @@ mod tests {
         let manifest = manifest();
         let programs = NativePrograms::new(&manifest, 188)?;
         for ranks in [1, 2] {
-            let target = programs.target(80, 8256, 4096, ranks, 4, false, ranks == 1)?;
+            let target = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::Off, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 // Decode lanes are identical, private, at decode width.
                 for group in ["backbone", "index", "target head"] {
@@ -553,23 +578,33 @@ mod tests {
             // Engram planes live with the gates (layers 1 and 14, GPU0 on two RTX).
             assert!(!target.iter().any(|d| d.gpu != 0 && d.group.contains("engram")));
             // The slot set's rows scale with the reserve, its scratch with the unit.
-            let narrow = programs.prefill_slots(8256, 2048, ranks, 4, false, ranks == 1)?;
-            let short = programs.prefill_slots(4224, 2048, ranks, 4, false, ranks == 1)?;
+            let narrow = programs.prefill_slots(8256, 2048, ranks, 4, Fp8Head::Off, ranks == 1)?;
+            let short = programs.prefill_slots(4224, 2048, ranks, 4, Fp8Head::Off, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 assert!(owner(&narrow, rank, "prefill slots lane") > owner(&short, rank, "prefill slots lane"));
             }
-            let fp8 = programs.target(80, 8256, 4096, ranks, 4, true, ranks == 1)?;
+            let fp8 = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::All, ranks == 1)?;
+            let packed = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::Packed, ranks == 1)?;
+            let draft = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::Draft, ranks == 1)?;
             for rank in 0..ranks as u8 {
-                assert_eq!(owner(&fp8, rank, "lane 0 target head") - owner(&target, rank, "lane 0 target head"), 660992);
+                for group in ["lane 0 target head", "lane 1 target head"] {
+                    assert_eq!(owner(&fp8, rank, group) - owner(&target, rank, group), 660992);
+                    // The exact copy's GEMV packs BF16 activations unscaled: no row scales or maxima.
+                    assert_eq!(owner(&packed, rank, group) - owner(&target, rank, group), 655360);
+                    assert_eq!(owner(&draft, rank, group), owner(&target, rank, group));
+                }
+                // Every slot pass's private head carries its own copy scratch.
+                assert_eq!(owner(&packed, rank, "prefill slots target heads")
+                    - owner(&target, rank, "prefill slots target heads"), 4 * 655360);
             }
         }
-        assert!(programs.target(0, 8256, 4096, 1, 2, true, false).is_err());
-        assert!(programs.target(80, 8256, 4097, 2, 2, true, false).is_err());
-        assert!(programs.target(80, 8256, 4096, 3, 2, true, false).is_err());
-        assert!(programs.target(80, 8256, 4096, 2, 2, true, true).is_err());
-        assert!(programs.prefill_slots(2048, 4096, 1, 2, false, false).is_err(), "unit wider than the reserve");
-        let off = programs.target(80, 8256, 4096, 1, 4, false, false)?;
-        let on = programs.target(80, 8256, 4096, 1, 4, false, true)?;
+        assert!(programs.target(0, 8256, 4096, 1, 2, Fp8Head::All, false).is_err());
+        assert!(programs.target(80, 8256, 4097, 2, 2, Fp8Head::All, false).is_err());
+        assert!(programs.target(80, 8256, 4096, 3, 2, Fp8Head::All, false).is_err());
+        assert!(programs.target(80, 8256, 4096, 2, 2, Fp8Head::All, true).is_err());
+        assert!(programs.prefill_slots(2048, 4096, 1, 2, Fp8Head::Off, false).is_err(), "unit wider than the reserve");
+        let off = programs.target(80, 8256, 4096, 1, 4, Fp8Head::Off, false)?;
+        let on = programs.target(80, 8256, 4096, 1, 4, Fp8Head::Off, true)?;
         assert_eq!(on.iter().map(|d| d.bytes).sum::<u64>() - off.iter().map(|d| d.bytes).sum::<u64>(),
             2 * window_batch_bytes(80)? + 4 * window_batch_bytes(4096)?);
         for rows in [1, 80, 256, 1024, 4096] {
@@ -586,8 +621,8 @@ mod tests {
         let programs = NativePrograms::new(&manifest, 188)?;
         let experts = experts();
         for ranks in [1, 2] {
-            let one = programs.dspark(&experts, 1024, 1, 5, ranks, false)?;
-            let two = programs.dspark(&experts, 1024, 2, 5, ranks, false)?;
+            let one = programs.dspark(&experts, 1024, 1, 5, ranks, Fp8Head::Off)?;
+            let two = programs.dspark(&experts, 1024, 2, 5, ranks, Fp8Head::Off)?;
             let decoder = (ranks - 1) as u8;
             for rank in 0..ranks as u8 {
                 assert_eq!(owner(&two, rank, "dSpark request lanes"),
@@ -597,9 +632,14 @@ mod tests {
                 - owner(&one, decoder, "dSpark main context"), programs.main_context(80)?);
             assert_eq!(owner(&two, decoder, "dSpark windows")
                 - owner(&one, decoder, "dSpark windows"), 3 * 128 * 528);
+            let lanes_packed = programs.dspark(&experts, 1024, 2, 5, ranks, Fp8Head::Packed)?;
+            for rank in 0..ranks as u8 {
+                assert_eq!(owner(&lanes_packed, rank, "dSpark request lanes") - owner(&two, rank, "dSpark request lanes"),
+                    2 * programs.packed_vocabulary_scratch(5, VOCAB / ranks as u64)?);
+            }
             for requests in 1..=16 {
                 for width in [5, 7] {
-                    let demands = programs.dspark(&experts, 1024, requests, width, ranks, true)?;
+                    let demands = programs.dspark(&experts, 1024, requests, width, ranks, Fp8Head::All)?;
                     assert!(demands.iter().all(|d| d.category == Category::Drafter));
                     assert_eq!(owner(&demands, decoder, "dSpark windows"),
                         3 * (requests * 128 * 528 + 1024 * 1024 + 384));
@@ -609,15 +649,15 @@ mod tests {
         for (key, value) in [("input_format", json!("fp8")), ("role", json!("rtx_backbone"))] {
             let mut bad = experts.clone();
             bad[key] = value;
-            assert!(programs.dspark(&bad, 256, 1, 5, 1, false).is_err());
+            assert!(programs.dspark(&bad, 256, 1, 5, 1, Fp8Head::Off).is_err());
         }
         let mut bad = experts.clone();
         bad["geometry"]["kernel_intermediate"] = 2560.into();
-        assert!(programs.dspark(&bad, 256, 1, 5, 1, false).is_err());
+        assert!(programs.dspark(&bad, 256, 1, 5, 1, Fp8Head::Off).is_err());
         let mut duplicate = experts.clone();
         let variant = duplicate["variants"][0].clone();
         duplicate["variants"].as_array_mut().unwrap().push(variant);
-        assert!(programs.dspark(&duplicate, 256, 1, 5, 1, false).is_err());
+        assert!(programs.dspark(&duplicate, 256, 1, 5, 1, Fp8Head::Off).is_err());
         Ok(())
     }
 
@@ -629,14 +669,21 @@ mod tests {
             for rows in [1, 16, 64, 80, 4096] {
                 for n in [64640, VOCAB] {
                     assert_eq!(programs.vocabulary_scratch(rows, n)?, 512 + 5120 + 655360);
+                    assert_eq!(programs.packed_vocabulary_scratch(rows, n)?, 655360);
+                    assert_eq!(programs.head_scratch(Fp8Head::Packed, rows, n)?, 655360);
+                    assert_eq!(programs.head_scratch(Fp8Head::All, rows, n)?, 512 + 5120 + 655360);
                 }
             }
             assert!(programs.vocabulary_scratch(0, VOCAB).is_err());
             assert!(programs.vocabulary_scratch(4097, VOCAB).is_err());
             assert!(programs.vocabulary_scratch(64, u64::MAX).is_err());
+            assert!(programs.packed_vocabulary_scratch(0, VOCAB).is_err());
+            assert!(programs.packed_vocabulary_scratch(64, 4096).is_err());
         }
         let programs = NativePrograms::new(&manifest, 1024)?;
         assert_eq!(programs.vocabulary_scratch(64, 64640)?, 660992 + 5 * 64 * 64640 * 4);
+        assert_eq!(programs.packed_vocabulary_scratch(64, 64640)?, 655360 + 5 * 64 * 64640 * 4);
+        assert_eq!(programs.packed_vocabulary_scratch(3, 64640)?, 655360 + 5 * 3 * 64640 * 4);
         assert!(NativePrograms::new(&manifest, 0).is_err());
         Ok(())
     }
