@@ -9,7 +9,9 @@ pub(crate) struct LocalTp4Client {
     sessions: Vec<Option<VerbsHostProtocolV2PersistentClientSession>>,
     /// Bootstrap seals survive a QP reconnect and are never queried per request.
     expert_grouping: Vec<Option<crate::worker_selection::InstalledExpertGrouping>>,
-    retired: Vec<TcpStream>,
+    /// Retired control streams awaiting the worker's ring-release EOF, with
+    /// the peer each was connected to (a released socket no longer has one).
+    retired: Vec<(TcpStream, SocketAddr)>,
     retirement_error: Option<String>,
     capacity: Option<u32>,
     /// Explicit immutable ModelAdmission endpoint; survives every QP reconnect.
@@ -160,7 +162,7 @@ impl LocalTp4Client {
             let stream = session._stream.try_clone()?;
             stream.shutdown(std::net::Shutdown::Write)?;
             drop(session);
-            self.retired.push(stream);
+            self.retired.push((stream, self.peers[rank]));
         }
         Ok(())
     }
@@ -171,12 +173,11 @@ impl LocalTp4Client {
 
     fn drain_retired_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         if let Some(error) = &self.retirement_error { anyhow::bail!("{error}"); }
-        for stream in &mut self.retired {
-            let result = (|| -> Result<()> {
-                let peer = stream.peer_addr()?;
-                wait_for_ring_release(stream, timeout)
-                    .with_context(|| format!("expert endpoint peer={peer} did not release its rings"))
-            })();
+        for (stream, peer) in &mut self.retired {
+            // Once the worker's EOF crossed ours the socket has no peer address
+            // (ENOTCONN); the EOF it left is still the release to read.
+            let result = wait_for_ring_release(stream, timeout)
+                .with_context(|| format!("expert endpoint peer={peer} did not release its rings"));
             if let Err(error) = result {
                 // EOF was not acknowledged: this transport must never re-admit a replacement.
                 self.retirement_error = Some(format!("{error:#}"));
@@ -653,13 +654,37 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr()?)?;
         let (_server, _) = listener.accept()?;
         let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default(), 0);
-        transport.retired.push(client);
+        let peer = client.peer_addr()?;
+        transport.retired.push((client, peer));
         let first = transport.drain_retired_with_timeout(Duration::from_millis(10)).unwrap_err();
         let started = Instant::now();
         let second = transport.drain_retired_with_timeout(Duration::from_secs(3)).unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(format!("{first:#}"), format!("{second:#}"));
         assert_eq!(transport.retired.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_endpoint_that_already_released_and_closed_drains() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let peer = client.peer_addr()?;
+        client.shutdown(std::net::Shutdown::Write)?;
+        // The worker reads our EOF, releases its rings and closes before the
+        // next connect drains: the FINs crossed and the socket has no peer.
+        assert_eq!(std::io::Read::read(&mut server, &mut [0u8; 1])?, 0);
+        drop(server);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.peer_addr().is_ok() {
+            anyhow::ensure!(Instant::now() < deadline, "loopback close did not complete");
+            std::thread::yield_now();
+        }
+        let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default(), 0);
+        transport.retired.push((client, peer));
+        transport.drain_retired_with_timeout(Duration::from_secs(1))?;
+        assert!(transport.retired.is_empty() && transport.retirement_error.is_none());
         Ok(())
     }
 
