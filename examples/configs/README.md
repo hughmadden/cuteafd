@@ -59,13 +59,15 @@ step S5 unifies this default with the other families'.
 
 ## Families under qualification
 
-These have no release card yet. `run-family.sh` serves them only from a
-`./wip.sh` slot whose binary has the family's serve command (`--wip SLOT`),
-and refuses a release image or an older slot. Text only, no drafter, automatic
-attention placement.
+These have no release card yet. Use a `./wip.sh` slot containing the path
+under qualification (`--wip SLOT`); the image keys remain the promoted pair
+for consistency, not a support claim. Speculator and placement choices are
+listed per recipe. New families without a release serve command are refused
+outside a matching WIP slot.
 
 | Model · quant | Config | Layout |
 | --- | --- | --- |
+| GLM 5.3 · EXL3 K4 + native K6 core | [min](glm53-exl3-k6core-min.config) · [max](glm53-exl3-k6core-max.config) | 1 RTX + 4 Spark / 2 RTX + 6 Spark, DFlash2, pool-first |
 | Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
 | Kimi K3 · EXL3 K2 + K6 core (#273) | [max](kimi-k3-exl3-k6-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 12 routed layers on the RTX, full 1M context, DFlash2 |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
