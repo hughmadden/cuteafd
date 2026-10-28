@@ -12,6 +12,7 @@ SPEC = importlib.util.spec_from_file_location('release_scope', REPO / 'scripts/b
 SCOPE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SCOPE)
 P = 'CUTEAFD_RELEASE_'
+GLM_PROGRAMS = ['dense_trellis_k6', 'glm', 'glm2', 'glm2_stage', 'glm_stage']
 
 
 @pytest.fixture
@@ -94,10 +95,12 @@ def write_json(path, value):
 
 def fake_inventory(root, family='glm'):
     import hashlib
-    write_json(root / 'share/PROGRAMS.json', dict(programs=[dict(family=family, name='norm')]))
+    programs = [dict(family=name, name=f'{name}_norm')
+                for name in GLM_PROGRAMS if family == 'glm'] or [dict(family=family, name='norm')]
+    write_json(root / 'share/PROGRAMS.json', dict(programs=programs))
     for role in ('coordinator', 'expert'):
         target = root / role
-        write_json(target / 'share/PROGRAMS.json', dict(programs=[dict(family=family, name='norm')]))
+        write_json(target / 'share/PROGRAMS.json', dict(programs=programs))
         package = target / 'lib/fp8/fp8-glm'
         layouts = ['tp1', 'tp2']
         files = {}
@@ -121,10 +124,47 @@ def test_inventory_requires_actual_program_family_and_package(fixture_repo, tmp_
     write_json(root / 'coordinator/share/PROGRAMS.json', dict(programs=[dict(family='dsv4f')]))
     with pytest.raises(ValueError, match='entry glm-fp8.*missing program families.*glm'):
         SCOPE.check_inventory(root / 'coordinator', 'coordinator', wanted, symbols=set())
-    write_json(root / 'coordinator/share/PROGRAMS.json', dict(programs=[dict(family='glm')]))
+    write_json(root / 'coordinator/share/PROGRAMS.json', dict(programs=[dict(family=family) for family in GLM_PROGRAMS]))
     (root / 'coordinator/lib/fp8/fp8-glm/manifest.json').unlink()
     with pytest.raises(ValueError, match='entry glm-fp8.*manifest.json'):
         SCOPE.check_inventory(root / 'coordinator', 'coordinator', wanted, symbols=set())
+
+
+@pytest.mark.parametrize('dual', [False, True])
+@pytest.mark.parametrize('missing', GLM_PROGRAMS)
+def test_glm_inventory_requires_full_static_namespaces(fixture_repo, tmp_path, dual, missing):
+    repo, matrix = fixture_repo
+    data = json.loads(matrix.read_text())
+    data['entries'][0]['set']['RTX_GPUS'] = '2' if dual else '1'
+    write_json(matrix, data)
+    wanted = SCOPE.requirements(repo, matrix, 'glm-fp8')
+    assert wanted[0]['programs'] == GLM_PROGRAMS
+    root = fake_inventory(tmp_path / 'images') / 'coordinator'
+    manifest = root / 'share/PROGRAMS.json'
+    data = json.loads(manifest.read_text())
+    if dual:
+        data['programs'].append(dict(family='glm', name='glm_context', op='scored_index_topk'))
+    write_json(manifest, data)
+    SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
+    data['programs'] = [p for p in data['programs'] if p['family'] != missing]
+    write_json(manifest, data)
+    with pytest.raises(ValueError, match=f'missing program families.*{missing}'):
+        SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
+
+
+def test_glm_context_program_must_not_be_satisfied_by_neutral_namespace(fixture_repo, tmp_path):
+    repo, matrix = fixture_repo
+    data = json.loads(matrix.read_text())
+    data['entries'][0]['set']['RTX_GPUS'] = '2'
+    write_json(matrix, data)
+    wanted = SCOPE.requirements(repo, matrix, 'glm-fp8')
+    root = fake_inventory(tmp_path / 'images') / 'coordinator'
+    manifest = root / 'share/PROGRAMS.json'
+    data = json.loads(manifest.read_text())
+    data['programs'].append(dict(family='dense_trellis_k6', op='scored_index_topk'))
+    write_json(manifest, data)
+    with pytest.raises(ValueError, match='missing context-split programs'):
+        SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
 
 
 def test_inventory_rejects_missing_spark_layout_and_corruption(fixture_repo, tmp_path):
@@ -370,4 +410,4 @@ def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
     derived, _ = SCOPE.derive(tmp_path, matrix, 'glm', {})
     assert derived[P + 'KIMIK3_AOT'] == 'OFF'
     assert derived[P + 'GLM_AOT'] == 'ON'
-    assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == ['glm']
+    assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == GLM_PROGRAMS

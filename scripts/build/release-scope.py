@@ -182,9 +182,10 @@ def requirements(repo, matrix, scope):
         if family == 'deepseek_v4':
             tag = 'dsv4p' if any(s.startswith('dsv4p:') for s in experts) else 'dsv4f'
             programs = {tag, tag + '2'} if dual else {tag}
-        elif family in ('glm5', 'glm5_flash'):
-            tag = 'glm' if family == 'glm5' else 'glmf'
-            programs = {tag, tag + '2'} if dual else {tag}
+        elif family == 'glm5':
+            programs = {'glm', 'glm2', 'dense_trellis_k6', 'glm_stage', 'glm2_stage'}
+        elif family == 'glm5_flash':
+            programs = {'glmf', 'glmf2'} if dual else {'glmf'}
         elif family == 'mimo_v2':
             programs = tokens(scopes['CUTEAFD_WIP_MIMO_GEOMETRIES'])
         elif family == 'qwen4':
@@ -295,8 +296,9 @@ def check_inventory(root, role, wanted, symbols=None):
                 missing = set(entry['programs']) - present
                 require(not missing, f'PROGRAMS.json missing program families {sorted(missing)}')
                 if entry['context_split']:
+                    context_families = set(entry['programs']) & {'dsv4f', 'dsv4p', 'glm', 'glmf'}
                     require(any(p.get('op') == 'scored_index_topk'
-                                for p in programs if p.get('family') == entry['programs'][0]),
+                                for p in programs if p.get('family') in context_families),
                             'PROGRAMS.json missing context-split programs')
             if entry.get('exlr8'):
                 # Each role's table carries the fork's EXLR8 set for that role (the
