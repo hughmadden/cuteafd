@@ -205,6 +205,15 @@ impl CoordinatorPrograms<'_> {
             .map(|(_, bytes)| bytes).max().unwrap_or(0)
     }
 
+    /// Unshaped helpers are shared; shaped exports belong only to the arena
+    /// with their compiled row capacity and prefill/decode dispatch mode.
+    pub fn workspace_program(self, name: &str, rows: u64, prefill: bool) -> bool {
+        self.contains(name)
+            && !name.contains(if prefill { "_decode_" } else { "_prefill_" })
+            && name.rsplit_once("_m").and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+                .is_none_or(|capacity| capacity == rows)
+    }
+
     pub fn validate_v4(self, prefill_rows: u64, decode_rows: u64,
         available: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), MissingCoordinatorProgram> {
         let available: std::collections::HashSet<String> = available.into_iter()
@@ -643,6 +652,24 @@ mod tests {
                     assert!(!selected.contains(&format!("{other}2_target")));
                 }
                 assert!(!selected.contains(family));
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_selection_keeps_only_its_shape_and_shared_helpers() {
+        let selected = CoordinatorPrograms { family: "dsv4f", split_family: Some("dsv4f2") };
+        for family in ["dsv4f", "dsv4f2"] {
+            for prefill in [false, true] {
+                let rows = if prefill { 4096 } else { 64 };
+                let mode = if prefill { "prefill" } else { "decode" };
+                assert!(selected.workspace_program(&format!("{family}_producer_m{rows}"), rows, prefill));
+                assert!(selected.workspace_program(&format!("{family}_sparse_mla_{mode}_c128_m{rows}"), rows, prefill));
+                assert!(selected.workspace_program(&format!("{family}_compressor_continuation_c4"), rows, prefill));
+                assert!(!selected.workspace_program(&format!("{family}_producer_m{}", if prefill { 64 } else { 4096 }), rows, prefill));
+                assert!(!selected.workspace_program("unrelated_producer_m64", rows, prefill));
+                let other = if prefill { "decode" } else { "prefill" };
+                assert!(!selected.workspace_program(&format!("{family}_index_topk_{other}_m{rows}"), rows, prefill));
             }
         }
     }

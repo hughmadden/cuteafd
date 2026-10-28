@@ -13,8 +13,6 @@ use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cos
     V4WorkspaceRank};
 use cuteafd_core::memory_layout::{Basis, Category};
 
-/// Outstanding prefill units on the single Spark connection set.
-pub const PREFILL_WAVES: u64 = 2;
 /// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
 /// segment graphs by the exact compressed-table width, so the set grows with
 /// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
@@ -228,10 +226,6 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
-        if rank == 0 && inputs.spark_ranks > 0 {
-            demands.push(Demand::new(gpu, Category::Transport, "Spark egress",
-                (4096 + inputs.decode_rows) * hidden * 2, Basis::Formula));
-        }
         demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
@@ -293,6 +287,13 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             inputs.draft.iter().map(|c| Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes }).collect(), 0)
             .movable(gpus)?]
     };
+    let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(inputs.cfg.dim as u64,
+        inputs.prefill_rows, inputs.decode_rows, inputs.prefill_waves)
+        .map_err(|_| PlacementError::Overflow("V4 TP2 payload"))?;
+    let mut tp2_workspace = inputs.tp2_workspace;
+    for bytes in &mut tp2_workspace {
+        *bytes = bytes.checked_add(payload).ok_or(PlacementError::Overflow("V4 TP2 workspace"))?;
+    }
     let geometry_unit = 256;
     Ok(PlacementRequest {
         pool_bounded: Vec::new(),
@@ -311,7 +312,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         startup: Vec::new(),
         movables,
         expert_workspace: inputs.expert_workspace,
-        tp2_workspace: inputs.tp2_workspace,
+        tp2_workspace,
         onboard: inputs.onboard,
         minimum_expert_layers: 0,
         expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },

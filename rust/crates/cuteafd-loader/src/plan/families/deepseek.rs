@@ -425,9 +425,6 @@ impl FamilyModel for DeepSeekModel {
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         match (self.id, role.component) {
             (_, Component::RoutedExpert) => self.routed(stem, operand),
-            ("deepseek_v4", Component::Speculator | Component::SpeculatorExpert) => {
-                Err("serve-dsv4 does not run the dSpark drafter".into())
-            }
             ("deepseek_v4", Component::Vision) => Err("serve-dsv4 takes no images".into()),
             (_, Component::SpeculatorExpert) => self.routed(stem, operand),
             (_, Component::MappedTable) => require(

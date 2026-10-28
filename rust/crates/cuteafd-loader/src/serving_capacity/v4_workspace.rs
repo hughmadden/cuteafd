@@ -1,6 +1,6 @@
 //! Header/geometry-only counterpart of V4 `workspace_here`/`step_buffers`.
 //! Device allocations are rounded to at least 256 bytes exactly as in the
-//! engine. Prefill has two lanes and decode one; both arenas stay resident.
+//! engine. Prefill has the admitted wave count and decode one lane; both arenas stay resident.
 use super::{product, sum, CacheGeometryError};
 use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ pub fn compiled_c128_width(manifest: &Value, family: &str) -> Result<u64, CacheG
     width.ok_or_else(unsupported)
 }
 
-/// Four peer slots per each of the two prefill lanes, release flags, and
+/// Four peer slots per admitted prefill lane, release flags, and
 /// the local TP2 pair's persistent abort word.
 pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64,
     tp2: bool, exchange_f32: bool, waves: u64) -> Result<u64, CacheGeometryError> {
@@ -48,7 +48,7 @@ pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_ro
     sum("V4 peer exchange", &[product("V4 peer slots", &[4 * waves, slot])?, 256, if tp2 { 256 } else { 0 }])
 }
 
-/// TP2 route-broadcast fallback: two lanes, two parities, per GPU. No
+/// TP2 route-broadcast fallback: admitted lanes, two parities, per GPU. No
 /// hidden/shared packing buffer, peer wire, or direction multiplier.
 pub fn deepseek_v4_expert_exchange_bytes(_hidden: u64, topk: u64, prefill: u64, decode: u64, _rank: usize, waves: u64)
     -> Result<u64, CacheGeometryError> {
@@ -56,12 +56,23 @@ pub fn deepseek_v4_expert_exchange_bytes(_hidden: u64, topk: u64, prefill: u64, 
     sum("V4 route exchange", &[product("V4 route slots", &[2 * waves, payload])?, 256, 256])
 }
 
+/// Payload exists only when the solver places a TP2 expert layer. Charge it
+/// with that conditional arena, not with the always-resident head-split steps.
+pub fn deepseek_v4_tp2_payload_bytes(hidden: u64, prefill: u64, decode: u64, waves: u64)
+    -> Result<u64, CacheGeometryError> {
+    sum("V4 TP2 payload", &[
+        product("V4 prefill payload", &[prefill, hidden, 4, waves])?.max(256),
+        product("V4 decode payload", &[decode, hidden, 4])?.max(256),
+    ])
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct V4WorkspaceScratch {
-    /// Largest non-index-topk scratch of the serving and head-split families.
+    /// Prefill arena's non-index-topk scratch, including full-head draft programs.
     pub shared_bytes: u64,
-    /// Largest selected family's decode/prefill index-topk scratch.
     pub index_topk_bytes: u64,
+    pub decode_shared_bytes: u64,
+    pub decode_index_topk_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,26 +146,19 @@ pub fn deepseek_v4_workspace_scratch(
             }
         }
     }
-    let shared_bytes = selected.shared_scratch(sizes);
     let prefill_kernel_rows = manifest["capacities"]["prefill_rows"].as_u64().unwrap_or(prefill_rows);
-    let mut index_topk_bytes = 0;
-    for name in [
-        format!("{family}_index_topk_prefill_m{prefill_kernel_rows}"),
-        format!("{family}_index_topk_decode_m{decode_rows}"),
-    ] {
-        let program = programs
-            .iter()
-            .find(|p| p["name"].as_str() == Some(name.as_str()))
-            .ok_or_else(unsupported)?;
-        index_topk_bytes = index_topk_bytes.max(
-            program["scratch_bytes_at_capacity"]["scratch"]
-                .as_u64()
-                .ok_or_else(unsupported)?,
-        );
-    }
+    let shared = |rows, prefill| selected.shared_scratch(sizes.iter().copied()
+        .filter(|(name, _)| selected.workspace_program(name, rows, prefill)));
+    let topk = |mode: &str, rows| -> Result<u64, CacheGeometryError> {
+        let name = format!("{family}_index_topk_{mode}_m{rows}");
+        programs.iter().find(|p| p["name"].as_str() == Some(name.as_str()))
+            .and_then(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64()).ok_or_else(unsupported)
+    };
     Ok(V4WorkspaceScratch {
-        shared_bytes,
-        index_topk_bytes,
+        shared_bytes: shared(prefill_kernel_rows, true),
+        index_topk_bytes: topk("prefill", prefill_kernel_rows)?,
+        decode_shared_bytes: shared(decode_rows, false),
+        decode_index_topk_bytes: topk("decode", decode_rows)?,
     })
 }
 
@@ -188,7 +192,11 @@ pub fn deepseek_v4_workspace_geometry(
     (0..ranks)
         .map(|rank| {
             let prefill = step(cfg, prefill_rows, waves, width, rank, ranks, scratch)?;
-            let decode = step(cfg, decode_rows, 1, width, rank, ranks, scratch)?;
+            let decode = step(cfg, decode_rows, 1, width, rank, ranks, V4WorkspaceScratch {
+                shared_bytes: scratch.decode_shared_bytes,
+                index_topk_bytes: scratch.decode_index_topk_bytes,
+                ..scratch
+            })?;
             Ok(V4WorkspaceRank {
                 prefill_waves: waves,
                 fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
@@ -243,8 +251,6 @@ fn step(
         mul(&[rows, c128_width, 4])?,
     ];
     let lane = sum("V4 lane allocations", &lane_allocations.map(|n| n.max(256)))?;
-    let lane = sum("V4 lane payload", &[lane,
-        if ranks == 2 { mul(&[rows, h, 4])?.max(256) } else { 0 }])?;
     let lane = sum(
         "V4 lane metadata",
         &[
@@ -364,11 +370,13 @@ mod tests {
         let scratch = V4WorkspaceScratch {
             shared_bytes: 490_734_592,
             index_topk_bytes: 558_007_296,
+            decode_shared_bytes: 490_734_592,
+            decode_index_topk_bytes: 558_007_296,
         };
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_677_619_184);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_330_410_480);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_677_619_184 - (2 * 4096 + 64) * 4096 * 4);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_330_410_480 - (2 * 4096 + 64) * 4096 * 4);
         assert_eq!(flash[0].pool_unit_device_bytes, (2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
@@ -379,12 +387,13 @@ mod tests {
             2,
             V4WorkspaceScratch {
                 index_topk_bytes: 574_784_512,
+                decode_index_topk_bytes: 574_784_512,
                 ..scratch
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_906_392_560);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_286_554_096);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_906_392_560 - (2 * 4096 + 64) * 7168 * 4);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_286_554_096 - (2 * 4096 + 64) * 7168 * 4);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes
@@ -442,8 +451,40 @@ mod tests {
                 assert_eq!(planned.shared_bytes, runtime);
                 assert_eq!(runtime, if split { 200 } else { 100 });
                 assert_eq!(planned.index_topk_bytes, 300);
+                assert_eq!(planned.decode_shared_bytes, 0);
+                assert_eq!(planned.decode_index_topk_bytes, 40);
             }
         }
+    }
+
+    #[test]
+    fn decode_arena_excludes_prefill_scratch_and_requires_its_own_topk() {
+        let mut manifest = serde_json::json!({"capacities": {"prefill_rows": 4096}, "programs": [
+            {"name": "dsv4f_producer_m4096", "scratch_bytes_at_capacity": {"scratch": 9000}},
+            {"name": "dsv4f_producer_m64", "scratch_bytes_at_capacity": {"scratch": 600}},
+            {"name": "dsv4f_compressor_continuation_c4", "scratch_bytes_at_capacity": {"scratch": 400}},
+            {"name": "dsv4f_index_topk_prefill_m4096", "scratch_bytes_at_capacity": {"scratch": 10000}},
+            {"name": "dsv4f_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 700}}
+        ]});
+        let scratch = deepseek_v4_workspace_scratch(&manifest, "dsv4f", false, 2752, 64).unwrap();
+        assert_eq!((scratch.shared_bytes, scratch.index_topk_bytes), (9000, 10000));
+        assert_eq!((scratch.decode_shared_bytes, scratch.decode_index_topk_bytes), (600, 700));
+        manifest["programs"].as_array_mut().unwrap().pop();
+        assert!(deepseek_v4_workspace_scratch(&manifest, "dsv4f", false, 2752, 64).is_err());
+    }
+
+    #[test]
+    fn tp2_payload_matches_planes_and_is_not_in_head_split_steps() {
+        for hidden in [4096, 7168] {
+            assert_eq!(deepseek_v4_tp2_payload_bytes(hidden, 2752, 64, 3).unwrap(),
+                (3 * 2752 + 64) * hidden * 4);
+        }
+        assert_eq!(deepseek_v4_tp2_payload_bytes(1, 1, 1, 3).unwrap(), 512);
+        assert_eq!(deepseek_v4_tp2_payload_bytes(32, 1, 1, 3).unwrap(), 384 + 256);
+        assert!(deepseek_v4_tp2_payload_bytes(u64::MAX, 2752, 64, 3).is_err());
+        let engine = include_str!("../../../cuteafd-daemon/src/families/deepseek_v4/engine.rs");
+        assert!(engine.contains("let payload = self.tp2.as_ref().map("));
+        assert!(!engine.contains("let payload = self.split_family.map("));
     }
 
     #[test]
@@ -463,9 +504,9 @@ mod tests {
             let without = deepseek_v4_workspace_geometry(&cfg, 2752, 64, 131072, ranks, 3,
                 V4WorkspaceScratch::default()).unwrap();
             for (actual, baseline) in with.iter().zip(&without) {
-                // One fixed compiled top-k allocation per prefill/decode workspace,
-                // not per live row or wave; zero-byte buffers retain a 256-byte floor.
-                assert_eq!(actual.fixed_device_bytes - baseline.fixed_device_bytes, 2 * (300 - 256));
+                // Only prefill needs the 300-byte top-k export; decode's 40
+                // bytes fit the allocation floor, independent of rows or waves.
+                assert_eq!(actual.fixed_device_bytes - baseline.fixed_device_bytes, 300 - 256);
                 assert_eq!(actual.prefill_waves, 3);
                 assert_eq!(actual.pool_unit_device_bytes, baseline.pool_unit_device_bytes);
                 assert_eq!(actual.pinned_host_bytes, baseline.pinned_host_bytes);
@@ -486,7 +527,9 @@ mod tests {
             deepseek_v4_workspace_scratch(&manifest, "dsv4f", false, 4096, 64).unwrap(),
             V4WorkspaceScratch {
                 shared_bytes: 100,
-                index_topk_bytes: 200
+                index_topk_bytes: 200,
+                decode_shared_bytes: 100,
+                decode_index_topk_bytes: 50,
             }
         );
         assert!(deepseek_v4_workspace_scratch(&manifest, "dsv4p", false, 4096, 64).is_err());

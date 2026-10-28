@@ -72,6 +72,10 @@ fn eos_token(snapshot: &Path) -> Result<u32> {
     Ok(config["eos_token_id"].as_u64().context("generation_config.json eos_token_id")? as u32)
 }
 
+fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
+    if position > 0 && input_rows == 1 { probe::ScorePath::Decode } else { probe::ScorePath::Prefill }
+}
+
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let profile = ModelProfile::new(
@@ -727,7 +731,10 @@ fn schedule(
                 let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), engine.full_prefill_logits,
                     &mut (&mut placement, &mut *transports),
                     |(placement, transports), chunk, rows| {
-                        if rows > 1 {
+                        if prefix_score_path(placement.len, chunk.len()) == probe::ScorePath::Decode {
+                            Ok(Some(probe::ScoreLogits::Device(engine.verify_device(
+                                &mut [(&mut **placement, chunk)], transports, runtime)?)))
+                        } else if rows > 1 {
                             Ok(Some(probe::ScoreLogits::Host {
                                 values: engine.prefill(placement, chunk, transports, runtime, rows, None)?,
                                 vocab: engine.cfg.vocab_size }))
@@ -1053,6 +1060,26 @@ mod lane_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_token_scoring_continuations_use_the_decode_link() {
+        for position in [1, 127, 128, 8192] {
+            assert_eq!(prefix_score_path(position, 1), probe::ScorePath::Decode);
+            // One requested logit does not imply a one-token input chunk.
+            for rows in [2, 64, 2752, 8192] {
+                assert_eq!(prefix_score_path(position, rows), probe::ScorePath::Prefill);
+            }
+        }
+        assert_eq!(prefix_score_path(0, 1), probe::ScorePath::Prefill,
+            "the verifier requires an existing prefix");
+        let source = include_str!("serve.rs");
+        let scoring = source.split_once("let scored = probe::score(").unwrap().1
+            .split_once("match scored {").unwrap().0;
+        let decode = scoring.split_once("if prefix_score_path(placement.len, chunk.len())").unwrap().1
+            .split_once("} else if rows > 1 {").unwrap().0;
+        assert!(decode.contains("engine.verify_device("));
+        assert!(!decode.contains("engine.prefill_device("));
+    }
 
     #[test]
     fn action_room_masks_use_runtime_width_capacity_and_skip_ineligible_requests() {

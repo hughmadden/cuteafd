@@ -101,6 +101,10 @@ fn reuse_context(owner: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
+fn retains_draft_rows(rows: &std::ops::Range<usize>, span: usize) -> bool {
+    rows.end > span.saturating_sub(TAP_ROWS)
+}
+
 impl UnitHooks<'_, '_, '_, '_, '_> {
     fn post(&mut self, layer: usize, unit: &Unit, ranks: usize, slot: Option<usize>) -> Result<()> {
         let e = self.engine;
@@ -113,7 +117,9 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
         if let Some(w1) = self.w1 {
             e.peer_post(layer, &w1.slots[unit.slot], unit.slot, w1, rows)?;
         }
-        e.tap(self.w, &self.w.slots[unit.slot], layer, unit.rows.len())?;
+        if retains_draft_rows(&unit.rows, self.tokens.len()) {
+            e.tap(self.w, &self.w.slots[unit.slot], layer, unit.rows.len())?;
+        }
         if let Some(slot) = slot {
             self.transport.as_mut().context("Spark link")?.consumed(slot, e.stream)?;
         }
@@ -245,7 +251,9 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
 
     fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
         let e = self.engine;
-        e.write_draft_kv(self.w, &self.w.slots[unit.slot], unit.rows.len(), e.prefill_rows)?;
+        if retains_draft_rows(&unit.rows, self.tokens.len()) {
+            e.write_draft_kv(self.w, &self.w.slots[unit.slot], unit.rows.len(), e.prefill_rows)?;
+        }
         if self.w1.is_some() {
             // Rank 0 must join the peer's last reader before reusing this slot's entry residual.
             e.record_peer(1, "unit-commit", DIRECT, true, e.cfg.n_layers, unit.slot);
@@ -260,6 +268,37 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_ring_keeps_previous_unit_when_final_tail_is_short() -> Result<()> {
+        for span in [1, 127, 128, 129, 2752, 2753, 5504, 5505, 5631, 5632, 8192, 8257] {
+            let units = prefill_pipeline::sequence_units(span, 2752, 3, 43)?;
+            for start in [0, 1, 127, 8192] {
+                let mut reference = [usize::MAX; TAP_ROWS];
+                let mut pruned = reference;
+                let mut final_only = reference;
+                for unit in &units {
+                    for row in unit.rows.end - unit.rows.len().min(TAP_ROWS)..unit.rows.end {
+                        let position = start + row;
+                        reference[position % TAP_ROWS] = position;
+                        if retains_draft_rows(&unit.rows, span) {
+                            pruned[position % TAP_ROWS] = position;
+                        }
+                        if unit.rows.end == span { final_only[position % TAP_ROWS] = position; }
+                    }
+                }
+                assert_eq!(pruned, reference, "span {span}, start {start}");
+                if units.len() > 1 && units.last().unwrap().rows.len() < TAP_ROWS {
+                    assert_ne!(final_only, reference, "negative control: final unit alone loses previous tail");
+                    assert!(retains_draft_rows(&units[units.len() - 2].rows, span));
+                }
+            }
+        }
+        assert!(!retains_draft_rows(&(0..2752), 8192));
+        assert!(!retains_draft_rows(&(2752..5504), 8192));
+        assert!(retains_draft_rows(&(5504..8192), 8192));
+        Ok(())
+    }
 
     #[test]
     fn c4_staging_reuse_requires_the_same_layers_immediate_predecessor() {
@@ -326,13 +365,14 @@ mod tests {
     }
 
     #[test]
-    fn v4_two_waves_bound_spark_idle_across_slot_reuse() -> Result<()> {
+    fn v4_fixed_three_waves_bound_spark_idle_across_slot_reuse() -> Result<()> {
         use prefill_pipeline::Step;
         for layers in [43, 61] {
             for local in [0usize, 2, 8] {
                 let routes: Vec<_> = (0..layers).map(|l| if l < local { FfnRoute::Local } else { FfnRoute::Spark }).collect();
-                let units = prefill_pipeline::sequence_units(32768, 4096, 2, layers)?;
-                let schedule = prefill_pipeline::prefill_schedule(&routes, &units, 2)?;
+                let units = prefill_pipeline::sequence_units(32768, 2752, 3, layers)?;
+                let schedule = prefill_pipeline::prefill_schedule(&routes, &units, 3)?;
+                assert!(units.len() > 3 && units.iter().any(|unit| unit.slot == 2));
                 let (mut gpu, mut spark, mut idle) = (0.0f64, 0.0f64, 0.0f64);
                 let mut finishes = std::collections::VecDeque::new();
                 let mut sent = 0;

@@ -439,17 +439,17 @@ mod tests {
             let cfg = cfg(heads, topk, ratios);
             let c4 = cfg.compress_ratios.iter().filter(|&&r| r == 4).count();
             let context = V4Context { topk_scratch: 9_178_112, partial_scratch: 4_000_000 };
-            let list = context_workspace(&cfg, 1 << 20, 4096, 64, PREFILL_WAVES as u64, context);
+            let list = context_workspace(&cfg, 1 << 20, 2752, 64, 3, context);
             let charged: u64 = list.iter().map(|&(_, b)| b.max(256)).sum();
             let allocated: u64 = list.iter().filter(|(n, _)| !n.starts_with("C4 scratch")).map(|&(_, b)| b.max(256)).sum();
             let in_pools = (c4 * metadata::C4_SCRATCH_UNITS * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES)) as u64;
             assert_eq!(allocated + in_pools, charged, "{heads} heads");
-            assert_eq!(context_buffers(&cfg, 1 << 20, 4096, 64, PREFILL_WAVES as u64, context).workspace_bytes, charged);
+            assert_eq!(context_buffers(&cfg, 1 << 20, 2752, 64, 3, context).workspace_bytes, charged);
             // The listed order the engine binds: 8 shared buffers, then one commit list per lane.
             let names: Vec<_> = list.iter().map(|(n, _)| *n).filter(|n| !n.starts_with("C4 scratch")).collect();
             assert_eq!(names, ["candidates", "own-head partial", "peer-head partial", "scored top-k scratch",
                 "partial scratch", "gather tables", "local selected lengths", "empty window lengths",
-                "commit blocks", "commit blocks"]);
+                "commit blocks", "commit blocks", "commit blocks"]);
         }
         // One scratch page covers every decode row (a step's discarded groups write distinct rows).
         assert!(metadata::C4_SCRATCH_UNITS as u64

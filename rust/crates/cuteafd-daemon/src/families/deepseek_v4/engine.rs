@@ -146,11 +146,6 @@ const LOCAL_EXPERTS: usize = usize::MAX;
 /// `exchange` result for a layer whose routed experts were skipped.
 const SKIPPED_EXPERTS: usize = usize::MAX - 1;
 
-/// Two-wave reference geometry used by allocation contract tests.
-#[cfg(test)]
-pub(crate) const PREFILL_WAVES: usize = 2;
-
-
 /// Vocabulary logits rows a workspace holds (every decode/verify row; a prefill
 /// lands at most this many rows at once and downloads longer spans in chunks).
 const LOGIT_ROWS: usize = 64;
@@ -481,10 +476,11 @@ impl<'a> Engine<'a> {
         cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.family, split_family: self.split_family }
     }
 
-    /// One shared region for this server's programs; launches are stream ordered.
-    fn scratch_bytes(&self) -> Result<usize> {
+    /// One arena per dispatch shape; launches within an arena are stream ordered.
+    fn scratch_bytes(&self, prefill: bool) -> Result<usize> {
         let mut sizes = Vec::new();
-        for name in self.programs.names().filter(|name| self.selected_programs().contains(name)) {
+        let rows = if prefill { self.prefill_kernel_rows } else { self.decode_rows };
+        for name in self.programs.names().filter(|name| self.selected_programs().workspace_program(name, rows as u64, prefill)) {
             for value in self.programs.spec(name)?.scratch.values() {
                 sizes.push((name, *value));
             }
@@ -681,18 +677,17 @@ impl<'a> Engine<'a> {
         let heads = if rank == 1 { self.cfg.n_heads / 2 } else { self.cfg.n_heads };
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE))?;
-        let mut topk_scratch = 0usize;
-        for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_kernel_rows)] {
-            let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
-            topk_scratch = topk_scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize);
-        }
+        let route = if shared_page_list { format!("prefill_m{}", self.prefill_kernel_rows) }
+            else { format!("decode_m{}", self.decode_rows) };
+        let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
+        let topk_scratch = usize::try_from(*spec.scratch.get("scratch").context("V4 top-k scratch geometry")?)?;
         let plane = |bytes: usize| self.alloc(lanes * bytes);
         let stream_a = plane(t * 4 * h * 2)?;
         let stream_b = plane(t * 4 * h * 2)?;
         let post = plane(t * 4 * 4)?;
         let comb = plane(t * 16 * 4)?;
         let shared = plane(t * h * 2)?;
-        let payload = self.split_family.map(|_| plane(t * h * 4)).transpose()?;
+        let payload = self.tp2.as_ref().map(|_| plane(t * h * 4)).transpose()?;
         let lane = |index: usize| -> Result<UnitSlot<'a>> {
             let slot = UnitSlot {
                 index,
@@ -724,7 +719,7 @@ impl<'a> Engine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            scratch: self.alloc(self.scratch_bytes()?)?,
+            scratch: self.alloc(self.scratch_bytes(shared_page_list)?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4))?,
             main_x: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 2))?,
