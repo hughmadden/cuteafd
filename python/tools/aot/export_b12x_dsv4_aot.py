@@ -166,11 +166,14 @@ def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
                             partial(compile_glm_attention_stage_aot, g, **params)))
         if g.heads == 32:
             for stage in ("query_rope", "absorb"):
-                params = dict(stage=stage, max_rows=rows, query_row=2 * g.heads * g.latent_dim)
-                if stage == "absorb":
-                    params["fp8_only"] = mode
-                out.append((f"{stage}_context_m{rows}", "attention_stage", params,
-                            partial(compile_glm_attention_stage_aot, g, **params)))
+                modes = (mode, None) if stage == "absorb" else (None,)
+                for weights in modes:
+                    params = dict(stage=stage, max_rows=rows, query_row=2 * g.heads * g.latent_dim)
+                    if stage == "absorb":
+                        params["fp8_only"] = weights
+                    suffix = "_bf16" if stage == "absorb" and weights is None else ""
+                    out.append((f"{stage}{suffix}_context_m{rows}", "attention_stage", params,
+                                partial(compile_glm_attention_stage_aot, g, **params)))
     return out
 
 

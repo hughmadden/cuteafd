@@ -529,7 +529,7 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
-@pytest.mark.parametrize("heads,count", [(64, 14), (32, 18)])
+@pytest.mark.parametrize("heads,count", [(64, 14), (32, 20)])
 def test_glm_dormant_stage_catalog(exporter, heads, count):
     geometry = types.SimpleNamespace(heads=heads, latent_dim=576)
     entries = exporter.glm_stage_programs(geometry, 64, 4096)
@@ -556,7 +556,7 @@ def test_glm_dormant_stage_catalog(exporter, heads, count):
             "rank_pack", "query_rope", "index_post", "absorb", "values",
             "absorb_bf16", "values_bf16")}
         if heads == 32:
-            expected |= {f"{stage}_context_m{rows}" for stage in ("query_rope", "absorb")}
+            expected |= {f"{stage}_context_m{rows}" for stage in ("query_rope", "absorb", "absorb_bf16")}
         assert names == expected
 
 

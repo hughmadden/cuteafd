@@ -64,6 +64,36 @@ impl CoreInventory {
         self.projections.get(name.strip_suffix(".weight").unwrap_or(name))
     }
 
+    /// Header-selected compressed owners for one layer. Whole attention follows
+    /// its existing owner; FFNs keep the ordinary intermediate split.
+    pub fn layer_weights(&self, cfg: &GlmDsaConfig, layer: usize, ranks: usize,
+        owner: Option<u8>) -> Result<Vec<BTreeMap<&'static str, crate::formats::trellis_core::CoreWeightLayout>>> {
+        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+        ensure!(layer < cfg.layers && matches!(ranks, 1 | 2)
+            && owner.is_none_or(|gpu| ranks == 2 && usize::from(gpu) < ranks),
+            "GLM native core layer ownership");
+        let root = format!("model.layers.{layer}");
+        let mlp = if layer < cfg.first_moe_layer { "mlp" } else { "mlp.shared_experts" };
+        let mut layouts = (0..ranks).map(|_| BTreeMap::new()).collect::<Vec<_>>();
+        for (key, leaf) in [("q_a", "self_attn.q_a_proj".to_owned()),
+            ("kv_a", "self_attn.kv_a_proj_with_mqa".to_owned()),
+            ("q_b", "self_attn.q_b_proj".to_owned()), ("o", "self_attn.o_proj".to_owned()),
+            ("gate", format!("{mlp}.gate_proj")), ("up", format!("{mlp}.up_proj")),
+            ("down", format!("{mlp}.down_proj"))] {
+            let Some(projection) = self.get_weight(&format!("{root}.{leaf}")) else { continue; };
+            let attention = leaf.starts_with("self_attn.");
+            let world = if projection.split == CoreSplit::Whole || attention && owner.is_some() { 1 } else { ranks };
+            let side = if projection.split == CoreSplit::Input && world > 1 { TrellisSide::Input }
+                else { TrellisSide::Output };
+            for (rank, layouts) in layouts.iter_mut().enumerate() {
+                if attention && owner.is_some_and(|gpu| usize::from(gpu) != rank) { continue; }
+                layouts.insert(key, CoreWeightLayout::new(projection, side,
+                    if world == 1 { 0 } else { rank }, world)?);
+            }
+        }
+        Ok(layouts)
+    }
+
     pub fn validate_groups(&self, cfg: &GlmDsaConfig) -> Result<()> {
         for layer in 0..cfg.layers {
             let root = format!("model.layers.{layer}");
@@ -175,6 +205,40 @@ mod tests {
         let mut duplicate=checkpoint;
         duplicate.weight_map.insert("model.layers.0.self_attn.q_a_proj.weight".into(),"other.safetensors".into());
         assert!(CoreInventory::from_checkpoint(&cfg,&duplicate).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_layer_owners_match_residency_for_head_and_owned_attention() -> Result<()> {
+        use crate::formats::dense_trellis::TrellisSide;
+        let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        cfg.vocab_size = 256;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint(&cfg))?;
+        for layer in 0..cfg.layers {
+            for (ranks, owner) in [(1, None), (2, None), (2, Some(0)), (2, Some(1))] {
+                let layouts = core.layer_weights(&cfg, layer, ranks, owner)?;
+                assert_eq!(layouts.len(), ranks);
+                for (rank, weights) in layouts.iter().enumerate() {
+                    let owns_attention = owner.is_none_or(|gpu| usize::from(gpu) == rank);
+                    assert_eq!(weights.len(), if owns_attention { 7 } else { 3 });
+                    for (&key, weight) in weights {
+                        let projection = &core.projections[&weight.stem];
+                        assert_eq!(weight.bytes as u64, projection.resident_bytes(weight.ranks)?);
+                        assert_eq!(weight.rank, if weight.ranks == 1 { 0 } else { rank });
+                        assert_eq!(weight.side, if ranks == 2 && (key == "down" || key == "o" && owner.is_none()) {
+                            TrellisSide::Input
+                        } else { TrellisSide::Output });
+                        assert!(!weight.stem.contains("indexer") && !weight.stem.contains("kv_b"));
+                    }
+                    if owns_attention { assert_eq!(weights["kv_a"].shape, [640, cfg.hidden]); }
+                }
+            }
+        }
+        for (layer, ranks, owner) in [(cfg.layers, 1, None), (0, 0, None), (0, 1, Some(0)), (0, 2, Some(2))] {
+            assert!(core.layer_weights(&cfg, layer, ranks, owner).is_err());
+        }
+        let ordinary = CoreInventory::default().layer_weights(&cfg, 0, 2, None)?;
+        assert!(ordinary.iter().all(BTreeMap::is_empty));
         Ok(())
     }
 

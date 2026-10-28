@@ -16,7 +16,9 @@
 //! `w_gate_up`) concatenate their grids (every part but the last is a whole
 //! number of 128-row blocks). BF16 operands: norms, the router, the LM head and
 //! `w_ik` (`wk` FP8 dequantized on the GPU with its scales, `weights_proj` BF16).
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::Device};
+use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
+use cuteafd_loader::families::glm5::core::CoreInventory;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -42,6 +44,8 @@ pub(crate) struct GlmLayer<'a> {
     /// The EXLR8 checkpoint's own dense operands (`native_dense::key`), when
     /// the layer runs natively; empty on the official path.
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
+    /// Standard HF K6 payload/vector owners, separate from EXLR8 encodings.
+    pub(crate) core: std::collections::BTreeMap<&'static str, CoreWeights<'a>>,
 }
 
 /// The `{w}_fp8` / `{w}_scale` operand names of an FP8 weight, and its
@@ -72,7 +76,8 @@ impl GlmLayer<'_> {
 
     /// Device bytes of the layer's operands.
     pub fn bytes(&self) -> usize {
-        self.operands.values().chain(self.native.values()).map(|a| a.buffer.bytes).sum()
+        self.operands.values().chain(self.native.values()).map(|a| a.buffer.bytes).sum::<usize>()
+            + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
     }
 
     /// A native operand's device buffer.
@@ -105,12 +110,14 @@ pub(crate) enum GlmHead<'a> {
     Bf16(DeviceAllocation<'a>),
     /// Shared with the token embedding (one rank-0 owner of both tables).
     RowFp8(std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>),
+    K6(CoreWeights<'a>),
 }
 
 impl<'a> GlmHead<'a> {
     /// Device bytes of the head (and, for row-FP8, the embedding the same owner holds).
     pub fn bytes(&self) -> usize {
-        match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.bytes() }
+        match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.bytes(),
+            Self::K6(head) => head.payload.buffer.bytes + head.suh.buffer.bytes + head.svh.buffer.bytes }
     }
 
     /// The device range the L2 prefetch reads after the last layer.
@@ -118,25 +125,28 @@ impl<'a> GlmHead<'a> {
         match self {
             Self::Bf16(head) => (head.buffer.ptr.cast_const(), head.buffer.bytes),
             Self::RowFp8(owner) => (owner.head.payload().ptr.cast_const(), owner.head.payload().bytes),
+            Self::K6(head) => (head.payload.buffer.ptr.cast_const(), head.payload.buffer.bytes),
         }
     }
 
     /// The BF16 head, for diagnostics that read it directly.
     pub fn bf16(&self) -> Result<&DeviceAllocation<'a>> {
         match self { Self::Bf16(head) => Ok(head),
-            Self::RowFp8(_) => anyhow::bail!("this diagnostic reads a BF16 head; the EXLR8 checkpoint's head is row-FP8") }
+            Self::RowFp8(_) => anyhow::bail!("this diagnostic reads a BF16 head; the EXLR8 checkpoint's head is row-FP8"),
+            Self::K6(_) => anyhow::bail!("this diagnostic reads a BF16 head; the checkpoint's head is native K6") }
     }
 
     /// The head the DFlash2 drafter borrows (its only resident copy).
-    pub fn target(&self) -> crate::shared::speculation::dflash::TargetHead<'_> {
+    pub fn target(&self) -> Result<crate::shared::speculation::dflash::TargetHead<'_>> {
         use crate::shared::speculation::dflash::TargetHead;
-        match self {
+        Ok(match self {
             Self::Bf16(head) => TargetHead::Bf16(head),
             // SAFETY (inside): the drafter passes its live normed rows and logits on its stream.
             Self::RowFp8(owner) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| unsafe {
                 owner.head_logits(x, logits, rows, stream)
             })),
-        }
+            Self::K6(_) => anyhow::bail!("native K6 target head needs the drafter's admitted projection scratch"),
+        })
     }
 }
 
@@ -711,7 +721,25 @@ impl<'a> GlmLoader<'a> {
         Ok(out)
     }
 
-    fn attention_operands(&self, cfg: &GlmDsaConfig, layer: usize)
+    fn core_weights(&self, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout,
+        rank: usize) -> Result<CoreWeights<'a>> {
+        let layout = CoreWeightLayout::from_shared(layout);
+        let loaded = layout.read(|name| {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            let tensor = self.catalog.tensor(name)?;
+            Ok(cuteafd_loader::LoadedTensor {
+                info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(), dtype, shape,
+                    byte_offset: tensor.metadata.byte_offset, byte_length: tensor.metadata.byte_length,
+                    role: cuteafd_core::TensorRole::Other, layer_id: None, expert_id: None,
+                    is_quantization_metadata: false }, source_path: self.catalog.snapshot().join(&tensor.shard),
+                bytes, elapsed_micros: 0, sha256: String::new(),
+            })
+        })?;
+        self.on_rank(rank, |_| layout.upload(Device { library: self.library,
+            id: self.library.cuda_get_device()? }, loaded))
+    }
+
+    fn attention_operands(&self, cfg: &GlmDsaConfig, layer: usize, core: bool)
         -> Result<Vec<HashMap<&'static str, DeviceAllocation<'a>>>> {
         let ranks = self.ranks();
         let p = format!("model.layers.{layer}");
@@ -742,7 +770,14 @@ impl<'a> GlmLoader<'a> {
         let qkv_a = [format!("{p}.self_attn.q_a_proj.weight"), format!("{p}.self_attn.kv_a_proj_with_mqa.weight")];
         let attention = [&qkv_a[..], &[format!("{p}.self_attn.q_b_proj.weight"),
             format!("{p}.self_attn.kv_b_proj.weight"), format!("{p}.self_attn.o_proj.weight")]].concat();
-        if self.bf16_native(&attention)? {
+        if core {
+            put(&mut ops, "q_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.q_a_layernorm.weight"))?);
+            put(&mut ops, "kv_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.kv_a_layernorm.weight"))?);
+            for (rank, (uk, uv)) in self.kv_b_bf16(cfg, &p, ranks)?.into_iter().enumerate() {
+                ops[rank].insert("w_uk", uk);
+                ops[rank].insert("w_uv", uv);
+            }
+        } else if self.bf16_native(&attention)? {
             // The checkpoint's BF16 attention as-is (the BF16 programs).
             put(&mut ops, "w_qkv_a", self.upload_all(ranks, &self.bf16_rows(&qkv_a)?.0)?);
             put(&mut ops, "q_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.q_a_layernorm.weight"))?);
@@ -796,7 +831,7 @@ impl<'a> GlmLoader<'a> {
         }
         if full_indexer {
             let wq_b = [format!("{p}.self_attn.indexer.wq_b.weight")];
-            if self.bf16_native(&wq_b)? {
+            if core || self.bf16_native(&wq_b)? {
                 put(&mut ops, "w_iq", self.upload_all(ranks, &self.bf16_rows(&wq_b)?.0)?);
             } else {
                 let (w8_name, scale_name, _) = fp8_operand_names("w_iq");
@@ -836,7 +871,7 @@ impl<'a> GlmLoader<'a> {
     /// latent/indexer operands or loaded whole on `owner`. Residual norms stay
     /// replicated and routers live on rank 0 until local TP2 admission.
     fn layer(&self, cfg: &GlmDsaConfig, layer: usize,
-        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint, owner: Option<u8>,
+        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint, core: &CoreInventory, owner: Option<u8>,
         native_shared: bool) -> Result<Vec<GlmLayer<'a>>> {
         let ranks = self.ranks();
         let p = format!("model.layers.{layer}");
@@ -867,15 +902,16 @@ impl<'a> GlmLoader<'a> {
         };
         put(&mut ops, "input_norm", self.replicated_tensor(ranks, &format!("{p}.input_layernorm.weight"))?);
         put(&mut ops, "post_norm", self.replicated_tensor(ranks, &format!("{p}.post_attention_layernorm.weight"))?);
+        let core_attention = core.get_weight(&format!("{p}.self_attn.q_a_proj")).is_some();
         let attention = if let Some(owner) = owner {
             let (device, stream) = if owner == 0 { (self.device, self.stream) }
                 else { let peer = self.peers.get(usize::from(owner) - 1).context("attention owner")?; (peer.device, peer.stream) };
             let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new(),
                 push: self.push.clone() };
-            let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer))?;
+            let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer, core_attention))?;
             ops[usize::from(owner)].extend(maps.pop().context("whole attention operands")?);
             None
-        } else { Some(self.attention_operands(cfg, layer)?) };
+        } else { Some(self.attention_operands(cfg, layer, core_attention)?) };
         if let Some(attention) = attention {
             for (ops, attention) in ops.iter_mut().zip(attention) { ops.extend(attention); }
         }
@@ -883,7 +919,8 @@ impl<'a> GlmLoader<'a> {
         let mlp_numerics = if native_shared && !dense {
             cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision
         } else { checkpoint.module_numerics(&format!("{mlp}.gate_proj"))? };
-        if dense || !native_shared {
+        let core_ffn = core.get_weight(&format!("{mlp}.gate_proj")).is_some();
+        if (dense || !native_shared) && !core_ffn {
         for projection in ["up_proj", "down_proj"] {
             ensure!(checkpoint.module_numerics(&format!("{mlp}.{projection}"))? == mlp_numerics,
                 "{mlp}: mixed declared MLP arithmetic is unsupported");
@@ -915,8 +952,14 @@ impl<'a> GlmLoader<'a> {
                 && operands.contains_key("w_down_tscale")),
                 "{mlp}: declared W8A8 needs native per-tensor activation scales");
         }
-        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands,
-            native: HashMap::new() }).collect())
+        let layouts = core.layer_weights(cfg, layer, ranks, owner)?;
+        ops.into_iter().zip(layouts).enumerate().map(|(rank, (operands, layouts))| {
+            let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
+                .collect::<Result<_>>()?;
+            Ok(GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1,
+                attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands,
+                native: HashMap::new(), core })
+        }).collect()
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
@@ -929,9 +972,10 @@ impl<'a> GlmLoader<'a> {
             "whole attention needs one owner per layer and two ranks");
         let split = crate::shared::memory::load_timing::Split::start();
         let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
+        let core = CoreInventory::from_checkpoint(cfg, &checkpoint)?;
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
-            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, owners.map(|o| o[layer]), native_shared)?) {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, &core, owners.map(|o| o[layer]), native_shared)?) {
                 share.push(part);
             }
         }
@@ -939,7 +983,12 @@ impl<'a> GlmLoader<'a> {
         let weights = GlmWeights {
             layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
-            head: GlmHead::Bf16(self.one("lm_head.weight")?),
+            head: match core.get_weight("lm_head") {
+                Some(projection) => GlmHead::K6(self.core_weights(
+                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(projection,
+                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?),
+                None => GlmHead::Bf16(self.one("lm_head.weight")?),
+            },
         };
         crate::shared::memory::staging::release_staging();
         split.log("glm5 dense");
@@ -990,7 +1039,8 @@ impl<'a> GlmLoader<'a> {
                         "{p}: native layer operands incomplete on rank {rank}");
                     Ok(GlmLayer { dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full,
                         mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
-                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None, operands, native })
+                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None, operands, native,
+                        core: Default::default() })
                 })?;
                 share.push(part);
             }

@@ -874,7 +874,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                 .collect();
             drafted_requests = seqs.len();
             let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                engine.weights.head.target()));
+                engine.draft_target_head()?));
             drafted_width = drafter.cfg.drafts();
 
             let mut out = vec![None; active.len()];

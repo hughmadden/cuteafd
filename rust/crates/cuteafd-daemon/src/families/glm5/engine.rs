@@ -260,6 +260,7 @@ struct Workspace<'a> {
     /// The cuBLAS LM head (rank 0 only); dropped before its workspace.
     head: Option<Rc<VocabularyHead<'a>>>,
     _head_workspace: Buf<'a>,
+    core_head: Option<Rc<super::core_runtime::CoreHead<'a>>>,
 }
 
 /// A GPU's prefill slots: one view per slot into the same arenas.
@@ -274,6 +275,7 @@ struct SharedStep<'a> {
     router_host: Rc<RefCell<Option<HostAllocation<'a>>>>,
     head: Option<Rc<VocabularyHead<'a>>>,
     head_workspace: Buf<'a>,
+    core_head: Option<Rc<super::core_runtime::CoreHead<'a>>>,
 }
 
 /// A GPU's row arenas (`step_row_widths` order), each `rows` rows, and the
@@ -311,7 +313,8 @@ impl<'a> StepRows<'a> {
             }).transpose()?,
             router_host: shared.router_host.clone(), ids: field(18)?,
             select: self.select.view(first * 8, rows * 8)?,
-            head: shared.head.clone(), _head_workspace: shared.head_workspace.clone() })
+            head: shared.head.clone(), _head_workspace: shared.head_workspace.clone(),
+            core_head: shared.core_head.clone() })
     }
 }
 
@@ -446,6 +449,7 @@ pub(crate) struct GlmEngine<'a> {
     graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
+    draft_core_head: Option<super::core_runtime::CoreHead<'a>>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
@@ -538,7 +542,25 @@ impl<'a> GlmEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_core_head: None, embedding, prefill_w8a8: true })
+    }
+
+    pub(crate) fn bind_draft_core_head(&mut self) -> Result<()> {
+        if let (Some(drafter), super::weights::GlmHead::K6(weights)) = (&self.drafter, &self.weights.head) {
+            let rows = drafter.max_batch_sequences().checked_mul(drafter.cfg.block)
+                .context("GLM K6 drafter head row extent overflow")?;
+            self.draft_core_head = Some(super::core_runtime::CoreHead::new(self.programs, weights, rows,
+                crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draft_target_head(&self) -> Result<crate::shared::speculation::dflash::TargetHead<'_>> {
+        match &self.weights.head {
+            super::weights::GlmHead::K6(weights) => Ok(self.draft_core_head.as_ref()
+                .context("GLM K6 drafter head scratch not admitted")?.target(weights)),
+            head => head.target(),
+        }
     }
 
     /// Arm after graph warmup; only explicit verify rounds record signals.
@@ -801,6 +823,10 @@ impl<'a> GlmEngine<'a> {
                 None
             },
             head_workspace,
+            core_head: if let (true, super::weights::GlmHead::K6(weights)) = (lead, &self.weights.head) {
+                Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, t.min(DECODE_ROWS),
+                    crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream)?))
+            } else { None },
         })
     }
 
@@ -1295,6 +1321,19 @@ impl<'a> GlmEngine<'a> {
     /// through the shared BF16 target-head route ([`crate::shared::target_head`]).
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
+        if let super::weights::GlmHead::K6(weights) = &self.weights.head {
+            ensure!(n <= t && t * h * 2 <= w.x.buffer.bytes && n * self.cfg.vocab_size * 4 <= w.logits.buffer.bytes,
+                "GLM K6 logits/input exceed workspace");
+            let head = w.core_head.as_ref().context("GLM K6 head scratch not admitted")?;
+            for first in (0..n).step_by(DECODE_ROWS) {
+                let rows = (n - first).min(DECODE_ROWS);
+                head.launch(weights,
+                    crate::shared::prefix::view(w.x.buffer, (t - n + first) * h * 2, rows * h * 2)?,
+                    crate::shared::prefix::view(w.logits.buffer, first * self.cfg.vocab_size * 4,
+                        rows * self.cfg.vocab_size * 4)?, rows, self.stream)?;
+            }
+            return Ok(());
+        }
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
             let x = w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast::<std::ffi::c_void>();
@@ -1303,6 +1342,7 @@ impl<'a> GlmEngine<'a> {
                     crate::shared::target_head::TargetHead::configured(), w.head.as_ref().context("LM head")?,
                     x, head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), n, self.stream),
                 super::weights::GlmHead::RowFp8(owner) => owner.head_logits(x, w.logits.buffer.ptr.cast(), n, self.stream),
+                super::weights::GlmHead::K6(_) => unreachable!("K6 head handled before the BF16 routes"),
             }
         }
     }
