@@ -335,6 +335,19 @@ pub(crate) struct Fp8Modules {
     bf16: Option<Fp8MoeModule>,
 }
 impl Fp8Modules {
+    pub(crate) fn segment_pinned_bytes(&self, extent: cuteafd_core::OwnerExtent) -> Result<usize> {
+        Ok(if segment_rows(&self.module, extent).is_some() { extent.staging_rows as usize * 16 } else { 0 })
+    }
+
+    pub(crate) fn owner_workspace_bytes(&self, extent: cuteafd_core::OwnerExtent) -> Result<(usize, usize)> {
+        let (mut scratch, mut io) = self.workspace_bytes(extent.capacity as usize)?;
+        if let Some(rows) = segment_rows(&self.module, extent) {
+            scratch = scratch.max(self.module.segment_scratch_bytes(rows)?);
+            io += worker::Fp8Worker::segment_io_bytes(&self.module, extent)?;
+        }
+        Ok((scratch, io))
+    }
+
     pub(crate) fn workspace_bytes(&self, capacity: usize) -> Result<(usize, usize)> {
         use cuteafd_ffi::fp8_moe::{fp8_slot_io_bytes, fp8_slot_scratch_bytes};
         let mut scratch = fp8_slot_scratch_bytes(self.module.scratch_layout(), capacity)?;
@@ -638,6 +651,14 @@ impl<'a> Fp8Weights<'a> {
         self.layers.iter().flat_map(|layer| layer.regions.iter().flatten()).map(|region| region.buffer.bytes).sum()
     }
 
+    pub(crate) fn owner_scratch_bytes(&self, extent: cuteafd_core::OwnerExtent) -> Result<usize> {
+        let mut scratch = self.slot_scratch_bytes(extent.capacity as usize)?;
+        if let Some(rows) = segment_rows(&self.module, extent) {
+            scratch = scratch.max(self.module.segment_scratch_bytes(rows)?);
+        }
+        Ok(scratch)
+    }
+
     pub fn slot_scratch_bytes(&self, capacity: usize) -> Result<usize> {
         use cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes;
         let primary = fp8_slot_scratch_bytes(self.module.scratch_layout(), capacity)?;
@@ -684,6 +705,11 @@ impl<'a> Fp8Weights<'a> {
         // SAFETY: the execution owner retains private scratch and the caller retains I/O/stream.
         unsafe { module.launch(&pointers, rows, stream) }
     }
+}
+
+fn segment_rows(module: &Fp8MoeModule, extent: cuteafd_core::OwnerExtent) -> Option<u32> {
+    let minimum = module.segment_minimum_rows()?;
+    (extent.staging_rows >= minimum).then(|| extent.segment_rows()).flatten()
 }
 
 /// One serialized execution over resident weights. Local/paged owners keep
@@ -749,6 +775,20 @@ impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
     pub unsafe fn run(&self, index: usize, rows: usize, wire: *mut c_void, ids: *mut c_void, weights: *mut c_void,
         out: *mut c_void, stream: *mut c_void) -> Result<()> {
         self.weights.borrow().run_with(&self.module, self.scratch.buffer, index, rows, wire, ids, weights, out, stream)
+    }
+
+    /// # Safety
+    /// All row addresses, route planes, resident weights and scratch remain
+    /// live on the owner stream until the grouped completion fences.
+    pub(crate) unsafe fn run_segments(&self, index: usize, rows: usize, pointers: [*mut c_void; 4],
+        stream: *mut c_void) -> Result<()> {
+        ensure!(self.scratch.buffer.bytes >= self.module.segment_scratch_bytes(rows.try_into()?)?,
+            "segmented launch exceeds admitted scratch");
+        let [input, ids, weights, output] = pointers;
+        let [w1, s1, w3, s3, w2, s2] = self.layers.get(index).context("segmented layer outside weights")?.pointers();
+        // SAFETY: caller retains all operands and the owner retains scratch/weights.
+        unsafe { self.module.launch_segments(&[input, ids, weights, w1, s1, w3, s3, w2, s2, output,
+            self.scratch.buffer.ptr], rows, stream) }
     }
 
     /// `run` over BF16 input rows through the BF16-input package.

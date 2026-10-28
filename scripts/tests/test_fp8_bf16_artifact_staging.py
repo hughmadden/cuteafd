@@ -209,6 +209,8 @@ def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
         {"capacity": 1024, "scratch_bytes": 163779584},
         {"capacity": 4096, "scratch_bytes": 734346240},
     ]
+    programs.append({"capacity": 16384, "form": "auto", "scratch": 2000000000, "segmented": True})
+    assert [item["capacity"] for item in package_tool.capacity_scratch(programs)] == [16, 1024, 4096]
     source = TOOL.read_text()
     assert '"capacities": capacity_scratch(programs)' in source
     assert "kPrograms[i].scratch > *bytes" in source
@@ -263,12 +265,16 @@ static void mock_launch(void** args, int) {{
   *static_cast<int*>(args[13]) = optins.count({{kernel_library, device}}) ? 0 : 1;
 }}
 """)
-    source = package_tool.bridge_source(
-        [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
+    programs = [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
           "weight_read_grouping": ({"contract": "conservative_route_upper_bound",
               "segments": [{"end_rows": 80, "group_rows": 1}]} if "nvfp4" in geometry else
               {"contract": "exact_grouping", "segments": [
-                  {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}],
+                  {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}]
+    segmented = geometry in ("mimo", "mimof")
+    if segmented:
+        programs.append({**programs[0], "capacity": 16384, "segmented": True,
+                         "minimum_rows": 769, "act_row_bytes": 2048})
+    source = package_tool.bridge_source(programs,
         [5 | (5 if geometry == "step5_bf16" else 4 if "nvfp4" in geometry else 1) << 8 | 1 << 16 | 1 << 24, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
     library = tmp_path / "bridge.so"
@@ -277,6 +283,25 @@ static void mock_launch(void** args, int) {{
                               text=True, capture_output=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
     lib = ctypes.CDLL(str(library))
+    maximum, minimum, act = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    assert lib.cuteafd_fp8moe_segment_info(0, ctypes.byref(maximum), ctypes.byref(minimum), ctypes.byref(act)) == 0
+    assert (maximum.value, minimum.value, act.value) == ((16384, 769, 2048) if segmented else (0, 0, 0))
+    scratch = ctypes.c_uint64()
+    if segmented:
+        align = lambda n: (n + 1023) // 1024 * 1024
+        pairs, bound, experts = 8256 * 8, 16384 * 8, 384
+        tiles = (pairs + 127) // 128 + experts
+        expected = align(4 * (4 + 3 * experts + (bound + 127) // 128 + experts))
+        expected += 2 * align(pairs * 4) + align(tiles * 128 * 2048) + align(pairs * 6144 * 2)
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8256, ctypes.byref(scratch)) == 0
+        assert scratch.value == expected
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(16384, ctypes.byref(scratch)) == 0
+        assert scratch.value > expected
+    else:
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8256, ctypes.byref(scratch)) != 0
+    for rows in (0, 16385):
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(rows, ctypes.byref(scratch)) != 0
+    assert lib.cuteafd_fp8moe_segment_info(3, ctypes.byref(maximum), ctypes.byref(minimum), ctypes.byref(act)) != 0
     lib.cuteafd_fp8moe_destroy.argtypes = [ctypes.c_void_p]
     lib.cuteafd_fp8moe_launch.argtypes = [ctypes.c_void_p, ctypes.c_uint,
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
@@ -295,11 +320,16 @@ static void mock_launch(void** args, int) {{
         context = ctypes.c_void_p()
         assert lib.cuteafd_fp8moe_create(ctypes.byref(context)) == 0
         contexts.append(context)
-    assert lib.mock_initialized() == 1
+    program_count = 2 if segmented else 1
+    assert lib.mock_initialized() == program_count
     pointers = (ctypes.c_void_p * 11)(*([1] * 11))
     for rank in (0, 1):
         lib.mock_device(rank)
         assert lib.cuteafd_fp8moe_launch(contexts[rank], 80, pointers, 80, None) == 0
+    lib.cuteafd_fp8moe_launch_segments.argtypes = [ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
+    assert (lib.cuteafd_fp8moe_launch_segments(contexts[1], pointers, 8256, None) == 0) == segmented
+    assert lib.cuteafd_fp8moe_launch(contexts[1], 16384, pointers, 8256, None) != 0
     for index in range(11):
         pointers[index] = None
         status = lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None)
@@ -315,17 +345,17 @@ static void mock_launch(void** args, int) {{
     lib.mock_device(1)
     assert lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None) == 0
     lib.cuteafd_fp8moe_destroy(contexts[1])
-    assert lib.mock_unloaded() == 1
+    assert lib.mock_unloaded() == program_count
     lib.mock_device(2)
     assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 1
-    assert lib.mock_unloaded() == 2
+    assert lib.mock_unloaded() == program_count + 1
     lib.mock_fail(-1)
     lib.mock_device(0)
     assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 0
-    assert lib.mock_initialized() == 3
+    assert lib.mock_initialized() == 2 * program_count + 1
     assert lib.cuteafd_fp8moe_launch(failed, 80, pointers, 80, None) == 0
     lib.cuteafd_fp8moe_destroy(failed)
-    assert lib.mock_unloaded() == 3
+    assert lib.mock_unloaded() == 2 * program_count + 1
 
 
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION, weights="fp8"):

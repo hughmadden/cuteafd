@@ -39,6 +39,14 @@ int32_t cuteafd_fp8moe_create(void** context);
 // require BF16 input. Validate the static contract before device allocation.
 int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
                               void* stream);
+// Separate segmented stream ABI. maximum=0 means unsupported. minimum is the
+// smallest constituent unit preserving the selected form's existing arithmetic.
+int32_t cuteafd_fp8moe_segment_info(uint32_t form, uint32_t* maximum, uint32_t* minimum,
+                                   uint32_t* act_row_bytes);
+int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t* bytes);
+// Same operands, except x/out are uint64 row-address tables. Populate them on
+// stream before launch and retain all addressed rows until completion.
+int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers, int32_t rows, void* stream);
 void cuteafd_fp8moe_destroy(void* context);
 // options: the large-row form of FP8 programs. 0 the package default (wire rows
 // W8A8: block-scaled E4M3 x E4M3 gate/up; BF16 rows W8A16, exact), 1 W8A16 (the

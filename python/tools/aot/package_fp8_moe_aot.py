@@ -98,6 +98,7 @@ POINTERS = 11
 INFO_WORDS = 16
 # Large-row program forms, in cuteafd_fp8moe_set_options order.
 FORMS = ("auto", "w8a16", "w8a8")
+SEGMENT_MAX_ROWS = 4 * 4096
 
 
 def digest(path: Path) -> str:
@@ -108,6 +109,8 @@ def capacity_scratch(programs: list[dict]) -> list[dict]:
     """Match the static ABI reservation across every retained prefill form."""
     scratch = {}
     for program in programs:
+        if program.get("segmented", False):
+            continue
         capacity = program["capacity"]
         scratch[capacity] = max(scratch.get(capacity, 0), program["scratch"])
     return [{"capacity": capacity, "scratch_bytes": scratch[capacity]}
@@ -117,10 +120,12 @@ def capacity_scratch(programs: list[dict]) -> list[dict]:
 def bridge_source(programs: list[dict], info: list[int]) -> str:
     includes = "\n".join(f'#include "{p["stem"]}.h"' for p in programs)
     rows = ",\n".join(
-        f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
+        f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, {p.get("minimum_rows", 0)}u, {p.get("act_row_bytes", 0)}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
         f'_mlir_cuteafd_{p["stem"]}_cuda_load_to_device, {p["entry"]}}}' for p in programs)
     grouping_rows = []
     for p in programs:
+        if p.get("segmented", False):
+            continue
         grouping = p["weight_read_grouping"]
         contract = {"exact_grouping": 1, "conservative_route_upper_bound": 2}[grouping["contract"]]
         previous = 0
@@ -150,6 +155,7 @@ struct Program {{
   uint32_t capacity;
   uint64_t scratch;
   uint32_t form;  // 0 the default program, 1 its W8A16 form, 2 its W8A8 form
+  uint32_t segmented, minimum_rows, act_row_bytes;
   ModuleFn initialize;
   ModuleFn load;
   LaunchFn launch;
@@ -179,10 +185,10 @@ void unload_libraries() {{
 }};
 // The capacity's program in the requested form; the default program when the
 // capacity has no such form (the forms are the same program there).
-const Program* find(uint32_t capacity, uint32_t form) {{
+const Program* find(uint32_t capacity, uint32_t form, bool segmented = false) {{
   const Program* fallback = nullptr;
   for (uint32_t i = 0; i < kCount; ++i) {{
-    if (kPrograms[i].capacity != capacity) continue;
+    if (kPrograms[i].capacity != capacity || bool(kPrograms[i].segmented) != segmented) continue;
     if (kPrograms[i].form == form) return &kPrograms[i];
     if (!kPrograms[i].form) fallback = &kPrograms[i];
   }}
@@ -220,6 +226,36 @@ extern "C" int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* byt
   for (uint32_t i = 0; i < kCount; ++i)
     if (kPrograms[i].capacity == capacity && kPrograms[i].scratch > *bytes) *bytes = kPrograms[i].scratch;
   return cudaSuccess;
+}}
+
+// The segment bound is a code extent, not an allocation extent. Ordinary
+// capacities and scratch queries never include these programs.
+extern "C" int32_t cuteafd_fp8moe_segment_info(uint32_t form, uint32_t* maximum,
+                                                uint32_t* minimum, uint32_t* act_row_bytes) {{
+  if (form > 2u || !maximum || !minimum || !act_row_bytes) return cudaErrorInvalidValue;
+  const Program* program = find({SEGMENT_MAX_ROWS}u, form, true);
+  *maximum = program ? program->capacity : 0u;
+  *minimum = program ? program->minimum_rows : 0u;
+  *act_row_bytes = program ? program->act_row_bytes : 0u;
+  return cudaSuccess;
+}}
+extern "C" int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t* bytes) {{
+  if (!bytes || !rows || rows > {SEGMENT_MAX_ROWS}u) return cudaErrorInvalidValue;
+  auto align = [](uint64_t n) {{ return (n + 1023u) / 1024u * 1024u; }};
+  const uint64_t pairs = uint64_t(rows) * kInfo[4];
+  const uint64_t groups = pairs < kInfo[3] ? pairs : kInfo[3];
+  const uint64_t tiles = (pairs + 127u) / 128u + groups;
+  *bytes = 0;
+  for (const auto& p : kPrograms) {{
+    if (!p.segmented) continue;
+    const uint64_t bound = uint64_t(p.capacity) * kInfo[4];
+    const uint64_t max_tiles = (bound + 127u) / 128u + (bound < kInfo[3] ? bound : kInfo[3]);
+    const uint64_t size = align(4u * (4u + 3u * kInfo[3] + max_tiles))
+        + 2u * align(4u * pairs) + align(tiles * 128u * p.act_row_bytes)
+        + align(pairs * kInfo[1] * 2u);
+    if (size > *bytes) *bytes = size;
+  }}
+  return *bytes ? cudaSuccess : cudaErrorInvalidValue;
 }}
 
 extern "C" int32_t cuteafd_fp8moe_set_options(void* context, uint32_t options) {{
@@ -266,10 +302,10 @@ extern "C" int32_t cuteafd_fp8moe_create(void** context) {{
   return cudaSuccess;
 }}
 
-extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
-                                         void* stream) {{
+static int32_t launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
+                      void* stream, bool segmented) {{
   if (!context) return cudaErrorInvalidValue;
-  const Program* program = find(capacity, static_cast<Context*>(context)->form);
+  const Program* program = find(capacity, static_cast<Context*>(context)->form, segmented);
   if (!program || !pointers || rows < 1 || uint32_t(rows) > capacity) return cudaErrorInvalidValue;
   void* values[{POINTERS}];
   void* arguments[{POINTERS} + 3];
@@ -286,6 +322,14 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
   arguments[{POINTERS} + 2] = &result;
   program->launch(arguments, {POINTERS} + 3);
   return result;
+}}
+extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers,
+                                         int32_t rows, void* stream) {{
+  return launch(context, capacity, pointers, rows, stream, false);
+}}
+extern "C" int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers,
+                                                  int32_t rows, void* stream) {{
+  return launch(context, {SEGMENT_MAX_ROWS}u, pointers, rows, stream, true);
 }}
 """
 
@@ -383,6 +427,7 @@ def build(args: argparse.Namespace) -> None:
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
         GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes, prefill_forms,
+        fp8_moe_segment_scratch_bytes, auto_large_rows,
     )
 
     props = torch.cuda.get_device_properties(0)
@@ -454,17 +499,26 @@ def build(args: argparse.Namespace) -> None:
             # Each capacity's default program, plus its other large-row forms where they differ.
             forms = [(c, "auto") for c in capacities]
             forms += [(c, form) for c in capacities for form in prefill_forms(g, c, wire)]
-            for capacity, form in forms:
+            exports = [(c, form, False) for c, form in forms]
+            if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
+                exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
+            for capacity, form, segmented in exports:
                 stem = (f"fp8moe_{args.geometry}_{layout.replace('-', '_')}_m{capacity}"
-                        f"{'' if form == 'auto' else '_' + form}")
+                        f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}")
                 with exportable_compilation():
-                    program = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, wire=wire, prefill=form)
+                    program = compile_fp8_moe_aot(g, route="stream" if segmented else "auto",
+                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented)
                 program.export_to_c(str(raw), stem, "cuteafd_" + stem)
                 checked = validate_exported_header(program, raw / f"{stem}.h", "cuteafd_" + stem)
                 if checked["argument_count"] != POINTERS + 2:
                     raise ValueError(f"{stem}: unexpected ABI arity {checked['argument_count']}")
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"], "form": form,
-                                 "scratch": fp8_moe_scratch_bytes(g, "auto", capacity, wire, form),
+                                 "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form) if segmented
+                                             else fp8_moe_scratch_bytes(g, "auto", capacity, wire, form)),
+                                 "segmented": segmented,
+                                 "minimum_rows": auto_large_rows(wire, g.kind, form) + 1 if segmented else 0,
+                                 "act_row_bytes": ((g.slice + g.slice // 32 + 15) // 16 * 16
+                                                   if program.geometry["mxfp4_down_a8"] else 2 * g.slice),
                                  "weight_read_grouping": program.geometry["weight_read_grouping"]})
                 print(f"exported {stem} (scratch {programs[-1]['scratch']} B)", flush=True)
             (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities, wire)))
@@ -479,9 +533,11 @@ def build(args: argparse.Namespace) -> None:
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
                 "weight_read_grouping": [{"capacity": p["capacity"], "form": p["form"],
-                                          **p["weight_read_grouping"]} for p in programs],
+                                          **p["weight_read_grouping"]} for p in programs if not p["segmented"]],
+                "segments": [{k: p[k] for k in ("capacity", "form", "minimum_rows", "act_row_bytes")}
+                             for p in programs if p["segmented"]],
                 "capacities": capacity_scratch(programs),
-                "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form]
+                "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form and not p["segmented"]]
                                   for form in FORMS[1:]}}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
                              for p in sorted(stage.rglob("*")) if p.is_file()}

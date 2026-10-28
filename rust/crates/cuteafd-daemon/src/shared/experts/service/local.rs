@@ -45,6 +45,48 @@ pub(super) fn admit_worker_selection(config: &mut NativeExpertServiceConfig,
 mod selection_tests {
     use super::*;
     #[test]
+    fn received_only_intake_flushes_a_lone_unit_without_a_wait_path() {
+        assert!(continue_intake(true, true, 0, 4));
+        // The next nonblocking poll finds no peer: launch now, no deadline.
+        assert!(!continue_intake(false, true, 1, 4));
+        assert!(!continue_intake(true, false, 0, 4));
+        assert!(!continue_intake(true, true, 3, 4));
+        let source = include_str!("local.rs").rsplit_once("pub(super) fn run(").unwrap().1;
+        let receive = source.find("let launched = connections[index].begin_deferred").unwrap();
+        let direct = source[receive..].find("serve.launch(&mut executions[owner]").unwrap() + receive;
+        let sweep = source[direct..].find("index += 1;").unwrap() + direct;
+        let repeat = source[sweep..].find("continue_intake(received_this_sweep").unwrap() + sweep;
+        assert!(receive < direct && direct < sweep && sweep < repeat);
+        assert!(source.contains("let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)"));
+        // Negative control: repeating the first peer before advancing the normal
+        // sweep delays the decode on peer 1. Production advances first.
+        let normal = ["prefill peer 0", "decode peer 1", "extra intake"];
+        let delayed = ["prefill peer 0", "extra intake", "decode peer 1"];
+        assert!(normal.iter().position(|&e| e == "decode peer 1")
+            < delayed.iter().position(|&e| e == "decode peer 1"));
+    }
+
+    #[test]
+    fn staged_cancellation_neither_publishes_nor_strands_other_credits() -> Result<()> {
+        let owners = cuteafd_core::SparkExecutions::admit(&[64], 4096, 2752, 3, &cuteafd_core::EXL3_CAPACITIES)?;
+        let mut queues = OwnerQueues::new(&owners);
+        let first = queues.record_request(1, 0x1000)?;
+        let second = queues.record_request(1, 0x8000)?;
+        assert!(!queues.ready(first) && !queues.ready(second));
+        assert!(queues.release(first).is_err());
+        queues.cancel_staged(first)?;
+        assert_eq!(queues.retained[1], 1);
+        assert_eq!(queues.pending[1].front(), Some(&second));
+        assert!(queues.cancel_staged(first).is_err());
+        queues.publish_oldest(1, None)?;
+        assert!(queues.ready(second));
+        assert!(queues.cancel_staged(second).is_err());
+        queues.release(second)?;
+        assert_eq!(queues.retained[1], 0);
+        Ok(())
+    }
+
+    #[test]
     fn solved_worker_ids_control_loaded_and_admitted_set() {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let dir = tempfile::tempdir().unwrap();
@@ -341,7 +383,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut execution = {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope(
                     if index < owners.decode.len() { "experts/workspace/decode" } else { "experts/workspace/prefill" });
-                weights.execution(&library, &owner_config, extent.compiled, budget, &mut modules)?
+                weights.execution(&library, &owner_config, extent.compiled, extent, budget, &mut modules)?
             };
             execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize, extent.owner)?;
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
@@ -568,10 +610,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             && last_activity.elapsed() >= idle_spin;
         let wait_index = waiting.then(|| idle_cursor % connections.len());
         let mut index = 0;
+        let mut intake = 0usize;
+        let mut received_this_sweep = false;
         while index < connections.len() {
             let mut execution_failed = false;
             let mut executed = false;
-            let wait = (wait_index == Some(index)).then_some(idle_wait);
+            let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)
+                && wait_index == Some(index)).then_some(idle_wait);
             let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
                 weights: &weights, exchange: &mut exchange, row_indices: &mut row_indices, skip_compute,
                 log_ingress: pending_steady_log };
@@ -593,7 +638,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 };
                 finished.and_then(|finished| {
                     let mut launch_failed = false;
+                    let mut input_address = 0;
                     let launched = connections[index].begin_deferred(wait, deferred_limit, |view, mapped| {
+                        input_address = mapped.hidden_payload.ptr as usize;
                         let owner = execution_owner(&owners, view, mapped.execution_lane)?;
                         queues.admit(owner)?;
                         serve.launch(&mut executions[owner], view, mapped).map(|launched| {
@@ -605,7 +652,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     });
                     match launched {
                         Ok(Some((owner, true))) => {
-                            holding[index].push_back(queues.record(owner)?);
+                            holding[index].push_back(queues.record_request(owner, input_address)?);
                             let queued = queues.pending[owner].len();
                             // Count overlap only while the oldest GPU fence is
                             // incomplete, not merely while replies retain storage.
@@ -622,9 +669,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         // The host-only path drains its owner before using blocking
                         // uploads. Earlier replies still leave in connection order.
                         Ok(Some((owner, false))) => (|| -> Result<bool> {
+                            executions[owner].flush_staged()?;
                             executions[owner].synchronize()?;
                             queues.complete_ready(owner, &mut executions[owner])?;
                             while let Some(earlier) = holding[index].front().copied() {
+                                executions[earlier.owner].flush_staged()?;
                                 executions[earlier.owner].synchronize()?;
                                 queues.complete_ready(earlier.owner, &mut executions[earlier.owner])?;
                                 connections[index].finish_deferred(|view, mapped, emit| {
@@ -668,7 +717,16 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         );
                         pending_steady_log = false;
                     }
+                    received_this_sweep |= processed;
                     index += 1;
+                    // Finish the original connection sweep before any extra
+                    // polling: a decode on another peer is never postponed.
+                    if index == connections.len() && continue_intake(received_this_sweep,
+                        executions.iter().any(Execution::has_staged), intake, deferred_limit) {
+                        intake += 1;
+                        index = 0;
+                        received_this_sweep = false;
+                    }
                 }
                 Err(error) => {
                     // A failed launch can have queued copies before its error,
@@ -680,8 +738,18 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         }
                         return Err(error).context("native GPU execution failed");
                     }
+                    // Staged frames have launched nothing: remove them before
+                    // draining any launched members or releasing their peer rings.
+                    let mut retained = std::collections::VecDeque::new();
+                    for unit in holding[index].drain(..) {
+                        if executions[unit.owner].cancel_staged(unit.input_address)? {
+                            queues.cancel_staged(unit)?;
+                        } else { retained.push_back(unit); }
+                    }
+                    holding[index] = retained;
                     for owner in 0..executions.len() {
                         if holding[index].iter().any(|unit| unit.owner == owner) {
+                            executions[owner].flush_staged()?;
                             crate::shared::decode_graph::fatal_drain(executions[owner].synchronize(), "Spark removed peer");
                             queues.complete_ready(owner, &mut executions[owner])?;
                         }
@@ -690,7 +758,16 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     tracing::warn!(%error, "native RoCE peer removed");
                     connections.swap_remove(index);
                     holding.swap_remove(index);
+                    intake = 0;
                 }
+            }
+        }
+        for execution in &mut executions {
+            if let Err(error) = execution.flush_staged() {
+                for execution in &executions {
+                    crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark grouped launch");
+                }
+                return Err(error).context("native grouped execution failed");
             }
         }
         if progressed {
@@ -706,6 +783,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark owner teardown");
     }
     result
+}
+
+/// Extra intake follows a full ordinary sweep and never waits for an arrival.
+fn continue_intake(received: bool, staged: bool, sweep: usize, bound: usize) -> bool {
+    received && staged && sweep + 1 < bound
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -734,7 +816,7 @@ fn execution_owner(owners: &cuteafd_transport::worker_selection::SparkExecutions
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct HeldUnit { owner: usize, id: u64 }
+struct HeldUnit { owner: usize, id: u64, input_address: usize }
 
 /// GPU publication follows owner FIFO; transport emission follows connection
 /// FIFO. A completed unit still retains its own I/O and admission credit, and
@@ -763,13 +845,23 @@ impl OwnerQueues {
         }
         Ok(())
     }
-    fn record(&mut self, owner: usize) -> Result<HeldUnit> {
+    #[cfg(test)]
+    fn record(&mut self, owner: usize) -> Result<HeldUnit> { self.record_request(owner, self.next_id as usize) }
+    fn record_request(&mut self, owner: usize, input_address: usize) -> Result<HeldUnit> {
         self.admit(owner)?;
-        let unit = HeldUnit { owner, id: self.next_id };
+        let unit = HeldUnit { owner, id: self.next_id, input_address };
         self.next_id = self.next_id.checked_add(1).context("expert unit identity exhausted")?;
         self.retained[owner] += 1;
         self.pending[owner].push_back(unit);
         Ok(unit)
+    }
+    fn cancel_staged(&mut self, unit: HeldUnit) -> Result<()> {
+        ensure!(!self.ready(unit), "cannot cancel a published unit as staged");
+        let position = self.pending[unit.owner].iter().position(|&pending| pending == unit)
+            .context("staged unit missing from owner FIFO")?;
+        self.pending[unit.owner].remove(position);
+        self.retained[unit.owner] = self.retained[unit.owner].checked_sub(1).context("staged credit underflow")?;
+        Ok(())
     }
     fn ready(&self, unit: HeldUnit) -> bool { self.completed.contains_key(&unit) }
     /// A completed unit's pace for its reply header: prefill owner units only.

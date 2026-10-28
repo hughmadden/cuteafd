@@ -66,6 +66,7 @@ pub(crate) struct PendingUnits<'a> {
     library: &'a NativeLibrary,
     completion: Completion<'a>,
     free: std::collections::VecDeque<usize>,
+    reserved: [bool; cuteafd_core::spark_executions::MAX_BUFFERED_PREFILL_UNITS as usize],
     queued: std::collections::VecDeque<(usize, (u64, u32, u32, u64))>,
 }
 impl<'a> PendingUnits<'a> {
@@ -93,13 +94,52 @@ impl<'a> PendingUnits<'a> {
                 spare: std::rc::Rc::new(Event::new(library)?), arrived: None, clock }),
         };
         Ok(Self { library, completion,
-            free: (0..capacity).collect(), queued: std::collections::VecDeque::with_capacity(capacity) })
+            free: (0..capacity).collect(), reserved: [false; cuteafd_core::spark_executions::MAX_BUFFERED_PREFILL_UNITS as usize], queued: std::collections::VecDeque::with_capacity(capacity) })
     }
     /// The staging slot the next unit uses.
     pub(crate) fn next_slot(&self) -> Result<usize> {
         self.free.front().copied().ok_or_else(|| anyhow::anyhow!("expert unit queue exhausted"))
     }
-    pub(crate) fn is_empty(&self) -> bool { self.queued.is_empty() }
+    pub(crate) fn reserve(&mut self) -> Result<usize> {
+        let slot = self.free.pop_front().ok_or_else(|| anyhow::anyhow!("expert unit queue exhausted"))?;
+        self.reserved[slot] = true;
+        Ok(slot)
+    }
+    pub(crate) fn cancel_reserved(&mut self, slot: usize) -> Result<()> {
+        anyhow::ensure!(self.reserved.get(slot) == Some(&true), "unit is not staged");
+        self.reserved[slot] = false;
+        self.free.push_back(slot);
+        Ok(())
+    }
+    /// # Safety
+    /// The reserved slot and stream remain live through record_reserved/pop.
+    pub(crate) unsafe fn arrive_reserved(&mut self, slot: usize, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(self.reserved.get(slot) == Some(&true), "unit is not staged");
+        let Completion::UnitEvents(units) = &self.completion else { anyhow::bail!("decode cannot stage"); };
+        // SAFETY: the reservation exclusively owns this event.
+        unsafe { self.library.cuda_event_record(units.events[slot].0.raw, stream) }
+    }
+    /// # Safety
+    /// Called only after the shared launch on its stream. The staged slot is
+    /// retained until this member fence; cancellation is no longer permitted.
+    pub(crate) unsafe fn record_reserved(&mut self, slot: usize, identity: (u64, u32, u32, u64),
+        stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(self.reserved.get(slot) == Some(&true), "unit is not staged");
+        let Completion::UnitEvents(units) = &mut self.completion else {
+            anyhow::bail!("decode cannot stage units");
+        };
+        if std::rc::Rc::strong_count(&units.events[slot].1) > 1 {
+            std::mem::swap(&mut units.events[slot].1, &mut units.spare);
+        }
+        // SAFETY: the reserved slot owns both events until publication.
+        unsafe {
+            self.library.cuda_event_record(units.events[slot].1.raw, stream)?;
+        }
+        self.reserved[slot] = false;
+        self.queued.push_back((slot, identity));
+        Ok(())
+    }
+    pub(crate) fn is_empty(&self) -> bool { self.queued.is_empty() && !self.reserved.contains(&true) }
     pub(crate) fn len(&self) -> usize { self.queued.len() }
     /// Marks the next prefill unit's arrival on `stream`, before its input
     /// copies (decode: nothing).
@@ -136,7 +176,7 @@ impl<'a> PendingUnits<'a> {
         Ok(())
     }
     pub(crate) fn ready(&self) -> Result<bool> {
-        let Some((slot, _)) = self.queued.front() else { return Ok(true) };
+        let Some((slot, _)) = self.queued.front() else { return Ok(!self.reserved.contains(&true)) };
         // SAFETY: the queued unit retains its owner stream or exclusive event.
         unsafe { match &self.completion {
             Completion::SingleFlight(stream) => self.library.cuda_stream_query(*stream),
@@ -353,6 +393,46 @@ mod worker_tests {
             assert_eq!(record["request_id"], index as u64);
             assert!((record["compute_us"].as_f64().unwrap() - 1.0).abs() < 0.001);
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn staged_descriptor_slots_cannot_publish_or_reuse_before_group_fences() -> anyhow::Result<()> {
+        use super::*;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        library.cuda_set_device(7)?;
+        fixture.configure_memory(&library, 7, 1 << 20)?;
+        fixture.queued_experts(&library)?;
+        let stream = crate::shared::memory::LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1)?;
+        let mut pending = PendingUnits::new(&library, 2)?;
+        let first = pending.reserve()?;
+        let cancelled = pending.reserve()?;
+        assert!(!pending.ready()? && pending.next_slot().is_err());
+        assert!(pending.pop().is_err());
+        pending.cancel_reserved(cancelled)?;
+        assert_eq!(pending.next_slot()?, cancelled);
+        let second = pending.reserve()?;
+        let input = [42u8];
+        // SAFETY: fixture allocations and staging survive all queued copies and fences.
+        unsafe {
+            pending.arrive_reserved(first, stream.raw)?;
+            pending.arrive_reserved(second, stream.raw)?;
+            library.copy_h2d_async(allocation.buffer, &input, stream.raw)?;
+            pending.record_reserved(first, (11, 1, 2752, 0), stream.raw)?;
+            pending.record_reserved(second, (12, 1, 2752, 0), stream.raw)?;
+        }
+        assert!(pending.next_slot().is_err());
+        assert!(pending.cancel_reserved(first).is_err());
+        assert!(!pending.ready()? && pending.pop().is_err());
+        fixture.advance_queued_experts(&library, 1)?;
+        assert_eq!(pending.pop()?.unwrap().0.0, 11);
+        assert_eq!(pending.pop()?.unwrap().0.0, 12);
+        assert_eq!(pending.next_slot()?, first);
         Ok(())
     }
 

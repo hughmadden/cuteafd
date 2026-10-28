@@ -743,3 +743,14 @@ def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_p
     context_file.write_text(json.dumps(context))
     with pytest.raises(ValueError, match="toolchain"):
         compare_sm.compare(left, right, source_comparison=True)
+
+
+def test_indirect_fp8_and_mxfp4_streams_are_in_the_sm_gate():
+    cases = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    for geometry in ("mimo", "mimof"):
+        exporter, args = cases[f"routed-{geometry}-row-addresses"]
+        assert exporter == "package_fp8_moe_aot.py"
+        assert "--row-addresses" in args
+        assert args[args.index("--capacities") + 1] == "2752"
+    ordinary = cases["routed-mimo"][1]
+    assert "--row-addresses" not in ordinary
