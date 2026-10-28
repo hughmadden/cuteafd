@@ -485,6 +485,31 @@ fn tp2_auto_fixed_max_use_the_tighter_rank() {
 }
 
 #[test]
+fn v4_payload_is_charged_only_when_the_tp2_arena_opens() {
+    let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(4096, 2752, 64, 3).unwrap();
+    for layers in [0, 2] {
+        let req = tp2_request([44 * GIB; 2], Onboard::Layers(layers));
+        let baseline = solve(&req).unwrap();
+        let mut charged = req;
+        charged.tp2_workspace.iter_mut().for_each(|bytes| *bytes += payload);
+        let actual = solve(&charged).unwrap();
+        if layers == 0 {
+            assert!(actual.tp2.is_none());
+            assert_eq!(actual, baseline, "a closed TP2 arena must not reserve payload storage");
+        } else {
+            let before = baseline.tp2.unwrap();
+            let after = actual.tp2.unwrap();
+            assert_eq!(before.layers, after.layers);
+            for gpu in 0..2 {
+                assert_eq!(after.peak_bytes[gpu] - before.peak_bytes[gpu], payload);
+            }
+            assert!(actual.pool_tokens < baseline.pool_tokens,
+                "negative control: an open arena must consume the payload bytes");
+        }
+    }
+}
+
+#[test]
 fn tp2_keeps_dspark_tp1_arena_separate() {
     let mut req = tp2_request([44 * GIB; 2], Onboard::Auto);
     req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![],

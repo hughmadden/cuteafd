@@ -811,6 +811,26 @@ fn v4_unused_native_draft_bytes_are_absent_and_selected_dspark_stays() {
     unused_checkpoint_draft_bytes(json!({}), t("mtp.0.main_norm.weight", "BF16", &[4096]), true);
 }
 #[test]
+fn v4_selected_dspark_accepts_native_operands_and_rejects_unsupported_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    write_v4_snapshot_with_dspark(dir.path(), 1);
+    let options = PlanOptions { draft_ownership: Some(spec::DraftOwnership::selected("deepseek_v4", "dspark")),
+        ..sparks(4) };
+    let report = plan(dir.path(), &options).unwrap();
+    for which in [Component::Speculator, Component::SpeculatorExpert] {
+        let draft = component(&report, which);
+        assert!(draft.bytes > 0);
+        assert_ne!(draft.status, Status::Disabled);
+        assert!(rejected(&report, which).is_empty(), "{which:?}: {:?}", rejected(&report, which));
+    }
+    let config: Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+    write_snapshot(dir.path(), &config, &[t("mtp.0.main_proj.weight", "F16", &[4096, 12288])], None);
+    let rejected_report = plan(dir.path(), &options).unwrap();
+    assert!(!rejected(&rejected_report, Component::Speculator).is_empty(),
+        "accepting dSpark must not bypass operand capability checks");
+}
+
+#[test]
 fn v41_unused_native_draft_bytes_are_absent_and_selected_dspark_stays() {
     unused_checkpoint_draft_bytes(v41_config(), t("mtp.0.main_norm.weight", "BF16", &[5120]), false);
 }
@@ -2000,6 +2020,44 @@ fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
 }
 
 #[test]
+fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
+    use cuteafd_core::ExpertGeometry;
+    let dir = v4_snapshot();
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&sparks(4)).unwrap();
+    let spec = report.spec.as_ref().unwrap();
+    let moe = spec.moe.as_ref().unwrap();
+    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
+        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
+    let path = dir.path().join("PROGRAMS.json");
+    for decode in [32, 64] {
+        std::fs::write(&path, json!({"capacities": {"decode_rows": decode}}).to_string()).unwrap();
+        for (unit, waves) in [(2752, 3), (4096, 2)] {
+            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), prefill_unit_rows: Some(unit), prefill_waves: waves,
+                workspace_manifest: Some(path.clone()), ..Default::default() };
+            report.spark_ranks = 4;
+            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            let egress = report.host_ledger.as_ref().unwrap().items.iter()
+                .find(|i| i.group == "transport/egress").unwrap().bytes;
+            let expected = geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves
+                + geometry.compact_wire_bytes(decode, false).unwrap().0 as u64;
+            assert_eq!(egress, expected);
+            assert_ne!(egress, geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves * 2,
+                "the decode endpoint must not reserve another prefill-sized slot per wave");
+            report.spark_ranks = 0;
+            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            assert!(!report.host_ledger.as_ref().unwrap().items.iter().any(|i| i.group == "transport/egress"));
+        }
+    }
+    let planned = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768),
+        ..Default::default() }), ..sparks(4) }).unwrap();
+    assert!(planned.memory_layout.unwrap().devices.iter().all(|device|
+        device.items.iter().all(|item| item.group != "Spark egress")));
+}
+
+#[test]
 fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     use crate::serving_capacity::{compiled_c128_width, deepseek_v4_workspace_geometry,
         deepseek_v4_workspace_scratch};
@@ -2040,7 +2098,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             assert_eq!(records.bytes, (cache.ranks[0].persistent_unit_bytes
                 + cache.ranks[0].pool_metadata_unit_bytes + runtime[0].pool_unit_device_bytes) * (32768 / 256));
             let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
-            // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
+            // Default headroom is independent of the separately charged workspaces and code.
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
                 total, 10 << 30, steps.bytes + code, graph));

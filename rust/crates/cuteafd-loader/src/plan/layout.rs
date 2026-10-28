@@ -1449,8 +1449,22 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
         let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
             !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
-        let egress = (egress_request as u64).checked_mul(options.prefill_waves)
-            .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?;
+        let egress = if family == "deepseek_v4" {
+            let decode = options.workspace_manifest.as_deref().or_else(|| {
+                let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+                path.is_file().then_some(path)
+            }).and_then(|path| std::fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
+            let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
+                .context("V4 decode egress geometry overflow")?.0 as u64;
+            (egress_request as u64).checked_mul(options.prefill_waves)
+                .and_then(|bytes| bytes.checked_add(decode_request))
+                .context("V4 registered egress overflow")?
+        } else {
+            (egress_request as u64).checked_mul(options.prefill_waves)
+                .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?
+        };
         push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.
         let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
