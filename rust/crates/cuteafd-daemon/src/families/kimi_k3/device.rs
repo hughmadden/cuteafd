@@ -245,7 +245,7 @@ impl LaneLayout {
                 Ok((*name, allocation))
             }).collect::<Result<BTreeMap<_, _>>>()?;
         let core = self.core.as_ref().map(|layout| layout.allocate(device)).transpose()?;
-        let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone(), window: None, core };
+        let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone(), window: None, metadata_bank: 0, core };
         lane.prime_attention()?;
         Ok(lane)
     }
@@ -259,6 +259,7 @@ pub(crate) struct Lane<'a> {
     arena: Option<Allocation<'a>>,
     layout: LaneLayout,
     window: Option<std::ops::Range<usize>>,
+    metadata_bank: usize,
     core: Option<super::core_runtime::ProjectionScratch<'a>>,
 }
 
@@ -272,8 +273,12 @@ impl Drop for Lane<'_> {
 
 fn subwave_extent(name: &str, bytes: usize, capacity: usize, window: &std::ops::Range<usize>)
     -> Result<(usize, usize)> {
-    ensure!(capacity > 0 && bytes % capacity == 0 && window.start < window.end && window.end <= capacity,
+    ensure!(capacity > 0 && window.start < window.end && window.end <= capacity,
         "Kimi sub-wave operand {name} differs from admitted row layout");
+    if cuteafd_loader::families::kimi_k3::allocation::HOOK_SCRATCH.contains(&name) {
+        return Ok((0, bytes));
+    }
+    ensure!(bytes % capacity == 0, "Kimi row plane {name} stride differs from admission");
     let stride = bytes / capacity;
     Ok((window.start * stride, window.len() * stride))
 }
@@ -286,8 +291,12 @@ impl Lane<'_> {
         }
         let buffer = self.operands.get(name).map(|allocation| allocation.buffer)
             .ok_or_else(|| anyhow::anyhow!("unknown Kimi lane operand {name}"))?;
+        if ATTENTION_METADATA.contains(&name) {
+            let (offset, bytes) = self.layout.metadata_extent(name, self.metadata_bank)?;
+            return view(buffer, offset, bytes);
+        }
         match &self.window {
-            Some(window) if !ATTENTION_METADATA.contains(&name) => {
+            Some(window) => {
                 let (offset, bytes) = subwave_extent(name, self.layout.operands[name], self.layout.rows, window)?;
                 view(buffer, offset, bytes)
             }
@@ -300,13 +309,16 @@ impl Lane<'_> {
     }
 
     fn prime_attention(&self) -> Result<()> {
-        for name in ATTENTION_METADATA {
-            let buffer = self.buffer(name)?;
-            self.stream.device.run(|| {
-                // SAFETY: fresh admitted destinations and pinned sources stay live
-                // through the ordered copy; this runs before graph capture.
-                unsafe { self.stream.device.library.copy_h2d_ordered(buffer, &vec![0; buffer.bytes], self.stream.raw) }
-            })?;
+        for bank in 0..self.layout.metadata_banks() {
+            for name in ATTENTION_METADATA {
+                let (offset, bytes) = self.layout.metadata_extent(name, bank)?;
+                let buffer = view(self.operands[name].buffer, offset, bytes)?;
+                self.stream.device.run(|| {
+                    // SAFETY: fresh admitted destinations and pinned sources stay
+                    // live through the copy; all banks are primed before capture.
+                    unsafe { self.stream.device.library.copy_h2d_ordered(buffer, &vec![0; buffer.bytes], self.stream.raw) }
+                })?;
+            }
         }
         self.stream.drain()
     }
@@ -442,6 +454,7 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn stage_attention(&mut self, sequences: &[SequenceRows<'_>],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
         self.attention = None;
+        self.lane.metadata_bank = 0;
         ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
             "Kimi metadata page pool differs from admitted MLA bank");
         let metadata = AttentionRows::new(sequences, self.lane.layout.unit, self.kda.slots(),
@@ -449,6 +462,28 @@ impl<'a> LocalLane<'a> {
         self.lane.upload_attention(&metadata)?;
         self.attention = Some(AttentionShape { rows: metadata.rows, sequences: metadata.sequences });
         Ok(())
+    }
+
+    /// Stage immutable metadata in a disjoint admitted bank for every unit.
+    /// Repeated layers only select views; they never upload or fence the host.
+    pub(crate) fn stage_attention_units(&mut self, units: &[crate::shared::prefill_pipeline::Unit],
+        sequence: &SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
+        ensure!(!units.is_empty() && units.len() <= self.lane.layout.metadata_banks(),
+            "Kimi attention units exceed admitted metadata banks");
+        ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
+            "Kimi metadata page pool differs from admitted MLA bank");
+        crate::shared::prefill_pipeline::with_cleanup(self, |local| {
+            for (bank, unit) in units.iter().enumerate() {
+                ensure!(unit.index == bank && unit.sequence == 0 && unit.rows.start < unit.rows.end
+                    && unit.rows.end <= sequence.rows, "Kimi attention unit metadata extent");
+                let metadata = AttentionRows::new(&[SequenceRows { slot: sequence.slot,
+                    start: sequence.start + unit.rows.start, rows: unit.rows.len(), pages: sequence.pages }],
+                    local.lane.layout.unit, local.kda.slots(), local.lane.layout.max_context, pool)?;
+                local.lane.metadata_bank = bank;
+                local.lane.upload_attention(&metadata)?;
+            }
+            Ok(())
+        }, |local| { local.lane.metadata_bank = 0; local.attention = None; Ok(()) })
     }
 
     pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
@@ -498,6 +533,19 @@ impl<'a> LocalLane<'a> {
         ensure!(window.as_ref().is_none_or(|w| w.start < w.end && w.end <= self.lane.layout.rows),
             "Kimi sub-wave outside admitted storage");
         self.lane.window = window;
+        Ok(())
+    }
+
+    pub(crate) fn clear_subwave(&mut self) {
+        self.lane.window = None;
+        self.lane.metadata_bank = 0;
+    }
+
+    pub(crate) fn select_attention_unit(&mut self, bank: usize, rows: usize) -> Result<()> {
+        self.lane.layout.metadata_extent("KDA slots", bank)?;
+        ensure!(rows > 0 && rows <= self.lane.layout.unit, "Kimi attention unit rows");
+        self.lane.metadata_bank = bank;
+        self.attention = Some(AttentionShape { rows, sequences: 1 });
         Ok(())
     }
 
@@ -818,8 +866,7 @@ pub(crate) struct SequenceRows<'p> {
     pub pages: &'p [u32],
 }
 
-const ATTENTION_METADATA: [&str; 6] = ["KDA slots", "KDA first", "MLA slots",
-    "MLA page table", "MLA lengths", "MLA query offsets"];
+use cuteafd_loader::families::kimi_k3::allocation::ATTENTION_METADATA;
 
 #[derive(Clone, Copy)]
 struct AttentionShape {
@@ -915,8 +962,8 @@ impl AttentionRows {
         ensure!(self.rows <= layout.unit && self.width == layout.max_context.div_ceil(64),
             "Kimi metadata differs from admitted row capacity/page stride");
         for (name, bytes) in self.uploads() {
-            ensure!(layout.operands.get(name).is_some_and(|capacity| bytes.len() <= *capacity),
-                "Kimi metadata exceeds admitted operand {name}");
+            let (_, capacity) = layout.metadata_extent(name, 0)?;
+            ensure!(bytes.len() <= capacity, "Kimi metadata exceeds admitted operand {name}");
         }
         Ok(())
     }
@@ -1136,6 +1183,15 @@ mod tests {
             assert_eq!(windows.len(), if waves == 1 { 3 } else { waves });
             for (&name, &bytes) in &layout.operands {
                 if layout.arena_offsets.contains_key(name) || ATTENTION_METADATA.contains(&name) { continue; }
+                if cuteafd_loader::families::kimi_k3::allocation::HOOK_SCRATCH.contains(&name) {
+                    for window in &windows {
+                        assert_eq!(subwave_extent(name, bytes, layout.rows, window)?, (0, bytes));
+                    }
+                    // Negative control: row-plane addressing must not be used for scratch.
+                    assert_ne!(subwave_extent(name, bytes, layout.rows, &windows[1])?,
+                        (windows[1].start * bytes / rows, windows[1].len() * bytes / rows));
+                    continue;
+                }
                 let mut end = 0;
                 for window in &windows {
                     let (offset, len) = subwave_extent(name, bytes, layout.rows, window)?;
@@ -1177,6 +1233,47 @@ mod tests {
             for (offset, slot) in physical.into_iter().enumerate() {
                 let position = start + offset;
                 assert_eq!(slot, i64::from(pages[position / 64]) * 64 + (position % 64) as i64);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unit_metadata_banks_match_individual_staging_including_decode_sized_tail() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layout = LaneLayout::new(&cfg, 8256, 2752, 16384, NativeScratch { kda: 16, mla: [16; 3] })?;
+        for span in [65usize, 2048, 2752, 5505, 8256] {
+            let mut pool = cuteafd_engine::prefix::RefPagePool::new(256, 64);
+            let pages = pool.alloc((span + 63).div_ceil(64))?;
+            let windows = crate::shared::prefill_pipeline::prefill_units(span, 2752, 3, 256)?;
+            let mut banks = ATTENTION_METADATA.into_iter().map(|name|
+                (name, vec![0xa5; layout.operands[name]])).collect::<BTreeMap<_, _>>();
+            let mut expected = Vec::new();
+            for (bank, window) in windows.iter().enumerate() {
+                let metadata = AttentionRows::new(&[SequenceRows { slot: 0, start: 63 + window.start,
+                    rows: window.len(), pages: &pages }], 2752, 1, 16384, &pool)?;
+                metadata.check_layout(&layout)?;
+                for (name, bytes) in metadata.uploads() {
+                    let (offset, capacity) = layout.metadata_extent(name, bank)?;
+                    assert!(bytes.len() <= capacity);
+                    banks.get_mut(name).unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes);
+                }
+                expected.push(metadata);
+            }
+            for (bank, metadata) in expected.iter().enumerate() {
+                for (name, bytes) in metadata.uploads() {
+                    let (offset, _) = layout.metadata_extent(name, bank)?;
+                    assert_eq!(&banks[name][offset..offset + bytes.len()], bytes);
+                }
+            }
+            if span == 5505 {
+                assert_eq!(expected.last().unwrap().rows, 1);
+                assert_eq!(i32_metadata(&expected.last().unwrap().offsets), [0, 1]);
+                // Negative control: a shared bank overwrites the first unit's lengths.
+                let tail = &expected.last().unwrap().lengths;
+                let mut shared = expected[0].lengths.clone();
+                shared[..tail.len()].copy_from_slice(tail);
+                assert_ne!(shared, expected[0].lengths);
             }
         }
         Ok(())
@@ -1284,7 +1381,7 @@ mod tests {
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes)?))).collect::<Result<BTreeMap<_, _>>>())?;
         let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout,
-            window: None, core: None };
+            window: None, metadata_bank: 0, core: None };
         lane.prime_attention()?;
         let primed = fixture.events()?;
         assert_eq!(primed.matches('C').count(), 6);
@@ -1360,7 +1457,7 @@ mod tests {
             arena: Some(Allocation::new(device, 32)?),
             layout: LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout {
                 rows: 1, unit: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
-                arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core: None }, window: None, core: None };
+                arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core: None }, window: None, metadata_bank: 0, core: None };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
         let events = fixture.events()?;
@@ -1586,7 +1683,7 @@ mod tests {
             let layout = LaneLayout::new(&cfg, rows, (rows).min(4096), 1_048_576, scratch)?;
             assert_eq!(layout.operands["residual arena"], KimiResidual::arena_bytes(rows)?);
             assert_eq!(layout.operands["gate-up"], rows * 2 * 16896 * 2);
-            assert_eq!(layout.operands["MLA page table"], rows.min(64) * 16384 * 4);
+            assert_eq!(layout.metadata_extent("MLA page table", 0)?.1, rows.min(64) * 16384 * 4);
             assert_eq!(layout.operands["KDA normalized"], rows * 6144 * 2);
             assert_eq!(layout.operands["MLA query"], rows * 96 * 576 * 2);
             assert_eq!(layout.operands["expert wire"], rows * KimiExpertInput::ROW_BYTES);

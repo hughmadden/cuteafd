@@ -163,6 +163,38 @@ pub(crate) enum FfnRoute {
     Spark,
 }
 
+/// Restore submission-local host state on every exit, without waiting for GPU
+/// work. The enclosing submission owner still aborts/drains queued work on error.
+pub(crate) fn with_cleanup<T, R>(state: &mut T,
+    body: impl FnOnce(&mut T) -> anyhow::Result<R>,
+    cleanup: impl FnOnce(&mut T) -> anyhow::Result<()>) -> anyhow::Result<R> {
+    struct Guard<'a, T, F: FnOnce(&mut T) -> anyhow::Result<()>> {
+        state: &'a mut T,
+        cleanup: Option<F>,
+    }
+    impl<T, F: FnOnce(&mut T) -> anyhow::Result<()>> Drop for Guard<'_, T, F> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.cleanup.take() {
+                if let Err(error) = cleanup(self.state) {
+                    tracing::error!(%error, "prefill scope cleanup failed during unwinding");
+                }
+            }
+        }
+    }
+    let mut guard = Guard { state, cleanup: Some(cleanup) };
+    let result = body(guard.state);
+    let restored = guard.cleanup.take().expect("prefill cleanup is armed")(guard.state);
+    match result {
+        Ok(value) => restored.map(|()| value),
+        Err(error) => {
+            if let Err(cleanup) = restored {
+                tracing::error!(%cleanup, "prefill scope cleanup failed after submission error");
+            }
+            Err(error)
+        }
+    }
+}
+
 /// A family's per-unit, per-layer arithmetic. Every hook enqueues work on the
 /// lane's streams and returns; the executor owns order and waves in flight.
 /// Anything a hook leaves for a later hook lives in the unit's slot, never at a
@@ -431,6 +463,45 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    #[test]
+    fn cleanup_restores_state_on_body_errors_and_preserves_the_cause() {
+        for fail_body in [false, true] {
+            for fail_cleanup in [false, true] {
+                let mut active = true;
+                let result = with_cleanup(&mut active, |active| {
+                    assert!(*active);
+                    anyhow::ensure!(!fail_body, "injected unit-shape failure");
+                    Ok(7)
+                }, |active| {
+                    *active = false;
+                    anyhow::ensure!(!fail_cleanup, "injected cleanup failure");
+                    Ok(())
+                });
+                assert!(!active);
+                match (fail_body, fail_cleanup) {
+                    (true, _) => assert_eq!(result.unwrap_err().to_string(), "injected unit-shape failure"),
+                    (false, true) => assert_eq!(result.unwrap_err().to_string(), "injected cleanup failure"),
+                    (false, false) => assert_eq!(result.unwrap(), 7),
+                }
+            }
+        }
+        // Negative control: an unguarded early return leaks the active state.
+        let mut active = true;
+        let result = with_cleanup(&mut active, |_| Err::<(), _>(anyhow::anyhow!("shape")), |_| Ok(()));
+        assert!(result.is_err() && active);
+    }
+
+    #[test]
+    fn cleanup_restores_state_on_unwinding() {
+        let mut active = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: anyhow::Result<()> = with_cleanup(&mut active, |_| panic!("injected panic"),
+                |active| { *active = false; Ok(()) });
+        }));
+        assert!(result.is_err());
+        assert!(!active);
+    }
 
     fn lcg(seed: &mut u64) -> u64 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

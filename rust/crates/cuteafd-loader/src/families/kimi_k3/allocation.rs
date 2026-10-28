@@ -39,8 +39,8 @@ pub const LANE_ROWS_MAX: usize = (crate::serving_capacity::prefill_waves::RESERV
 pub struct NativeLaneLayout {
     /// Lane rows: the call's row planes, each unit owning its rows of them.
     pub rows: usize,
-    /// Unit rows: hook-local scratch (the phase arena, K6 stages, attention
-    /// metadata) serves one unit's kernel launch at a time.
+    /// Unit rows: hook-local scratch (the phase arena and K6 stages)
+    /// serves one unit's kernel launch at a time.
     pub unit: usize,
     pub max_context: usize,
     pub operands: BTreeMap<&'static str, usize>,
@@ -71,8 +71,30 @@ pub const CORE_PHASES: &[&[&str]] = &[
 ];
 pub const CORE_MEET_PLANES: [&str; 3] = ["K6 attention partial", "K6 FFN partial", "K6 reduced"];
 pub const ARENA_ALIGNMENT: usize = 1024;
+pub const ATTENTION_METADATA: [&str; 6] = ["KDA slots", "KDA first", "MLA slots",
+    "MLA page table", "MLA lengths", "MLA query offsets"];
+/// Consumed entirely on the lane stream inside route/latent_up. Neither peer
+/// exchange nor a pending Spark wave retains these intermediates.
+pub const HOOK_SCRATCH: [&str; 3] = ["router logits", "latent input", "latent normalized"];
 
 impl NativeLaneLayout {
+    fn metadata_banks_for(rows: usize, unit: usize) -> usize {
+        if rows <= 64 { return 1; }
+        rows.div_ceil(unit).max(crate::serving_capacity::prefill_waves::MAX_WAVES as usize)
+    }
+
+    pub fn metadata_banks(&self) -> usize { Self::metadata_banks_for(self.rows, self.unit) }
+
+    /// Each bank has the decode-capable extent; unit tails can be <=64 rows.
+    pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
+        ensure!(ATTENTION_METADATA.contains(&name) && bank < self.metadata_banks(),
+            "Kimi attention metadata bank outside admission");
+        let bytes = self.operands.get(name).context("Kimi metadata plane absent")?;
+        ensure!(bytes % self.metadata_banks() == 0, "Kimi metadata bank stride");
+        let stride = bytes / self.metadata_banks();
+        Ok((bank * stride, stride))
+    }
+
     /// `rows` lane rows hold units of at most `unit` rows; one-unit lanes pass `unit == rows`.
     pub fn new(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
@@ -94,14 +116,13 @@ impl NativeLaneLayout {
         let intermediate = (cfg.dense_intermediate / 2).max(cfg.moe_intermediate * cfg.shared_experts / 2);
         plane("gate-up", &[unit, 2, intermediate, 2])?;
         plane("activated", &[unit, intermediate, 2])?;
-        for name in ["latent input", "expert combined", "latent normalized"] {
-            plane(name, &[rows, cfg.latent, 2])?;
-        }
-        plane("router logits", &[rows, cfg.experts, 4])?;
+        plane("expert combined", &[rows, cfg.latent, 2])?;
+        for name in ["latent input", "latent normalized"] { plane(name, &[unit, cfg.latent, 2])?; }
+        plane("router logits", &[unit, cfg.experts, 4])?;
         for name in ["route ids", "route weights"] { plane(name, &[rows, cfg.topk, 4])?; }
         plane("expert wire", &[rows, (3584 + 3584 / 32)])?;
-        // Phase-arena operands and attention metadata are rewritten inside each
-        // unit's hook: one unit's rows.
+        // Phase-arena operands serve one unit's rows. Metadata has one bank
+        // per possible call unit (sized below), never rewritten per layer.
         plane("KDA normalized", &[unit, 48, 128, 2])?;
         for name in ["KDA slots", "KDA first"] { plane(name, &[unit, 4])?; }
         plane("MLA slots", &[unit, 8])?;
@@ -118,6 +139,13 @@ impl NativeLaneLayout {
         plane("KDA scratch", &[scratch.kda])?;
         for (name, bytes) in ["MLA producer scratch", "MLA attention scratch", "MLA output scratch"]
             .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
+        // A call stages each unit once. Metadata survives all its layers, so
+        // in-flight units require disjoint banks, including a <=64-row tail.
+        let banks = Self::metadata_banks_for(rows, unit);
+        for name in ATTENTION_METADATA {
+            let bytes = operands.get_mut(name).expect("attention metadata plane");
+            *bytes = bytes.checked_mul(banks).context("Kimi metadata banks overflow")?;
+        }
         let mut arena_offsets = BTreeMap::new();
         let mut arena_bytes = 0;
         for phase in SCRATCH_PHASES {
@@ -392,11 +420,11 @@ mod tests {
         assert_eq!(two.arena_bytes, one.arena_bytes, "hook-local scratch serves one unit");
         assert_eq!(two.arena_offsets, one.arena_offsets);
         for name in ["residual arena", "delta", "normalized", "ffn output", "expert combined",
-            "router logits", "route ids", "expert wire"] {
+            "route ids", "expert wire"] {
             assert_eq!(two.operands[name], 2 * one.operands[name], "{name} spans the lane");
         }
         for name in ["gate-up", "activated", "KDA normalized", "KDA slots", "KDA first", "MLA slots",
-            "MLA query", "MLA attention", "MLA page table", "MLA lengths"] {
+            "MLA query", "MLA attention", "MLA page table", "MLA lengths"].into_iter().chain(HOOK_SCRATCH) {
             assert_eq!(two.operands[name], one.operands[name], "{name} is one unit's");
         }
         // Units never exceed the kernels' 4096 rows nor the admitted lane.
@@ -421,14 +449,54 @@ mod tests {
             let one = NativeLaneLayout::new(&cfg, unit as usize, unit as usize, 1_048_576, scratch)?;
             let lane = NativeLaneLayout::new(&cfg, rows as usize, unit as usize, 1_048_576, scratch)?;
             assert_eq!(lane.arena_bytes, one.arena_bytes);
-            for name in ["residual arena", "delta", "expert combined", "router logits", "route ids", "expert wire"] {
+            for name in ["residual arena", "delta", "expert combined", "route ids", "expert wire"] {
                 assert_eq!(lane.operands[name], waves as usize * one.operands[name], "{name}");
             }
-            assert_eq!(lane.operands["KDA slots"], unit as usize * 4);
-            assert_eq!(lane.operands["MLA slots"], unit as usize * 8);
+            for name in HOOK_SCRATCH { assert_eq!(lane.operands[name], one.operands[name], "{name}"); }
+            assert_eq!(lane.metadata_extent("KDA slots", 0)?.1, unit as usize * 4);
+            assert_eq!(lane.metadata_extent("MLA slots", 0)?.1, unit as usize * 8);
             assert_eq!(spark_demand(shape, 0).bytes, rows * 6 * 3584 * 2);
             assert!(prefill_shape_with(rows as usize - 64, waves as usize, Some(unit as usize)).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hook_scratch_is_unit_sized_but_pending_wave_planes_keep_the_span() -> Result<()> {
+        let cfg = cfg();
+        let layout = NativeLaneLayout::new(&cfg, 8256, 2752, 1_048_576,
+            NativeScratch { kda: 16, mla: [16; 3] })?;
+        for name in HOOK_SCRATCH {
+            let stride = if name == "router logits" { cfg.experts * 4 } else { cfg.latent * 2 };
+            assert_eq!(layout.operands[name], layout.unit * stride);
+            assert_ne!(layout.operands[name], layout.rows * stride, "negative control: span-sized scratch");
+        }
+        assert_eq!(layout.operands["expert combined"], layout.rows * cfg.latent * 2);
+        for name in ["normalized", "shared output", "routed output", "delta"] {
+            assert_eq!(layout.operands[name], layout.rows * cfg.hidden * 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_banks_are_disjoint_and_reject_undersized_or_unknown_planes() -> Result<()> {
+        let layout = NativeLaneLayout::new(&cfg(), 8256, 2752, 1_048_576,
+            NativeScratch { kda: 16, mla: [16; 3] })?;
+        for name in ATTENTION_METADATA {
+            let mut end = 0;
+            for bank in 0..layout.metadata_banks() {
+                let (offset, bytes) = layout.metadata_extent(name, bank)?;
+                assert_eq!(offset, end);
+                assert!(bytes >= 16);
+                end += bytes;
+            }
+            assert_eq!(end, layout.operands[name]);
+            assert!(layout.metadata_extent(name, layout.metadata_banks()).is_err());
+        }
+        assert!(layout.metadata_extent("delta", 0).is_err());
+        let mut bad = layout.clone();
+        *bad.operands.get_mut("KDA slots").unwrap() -= 1;
+        assert!(bad.metadata_extent("KDA slots", 0).is_err());
         Ok(())
     }
 

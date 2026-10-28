@@ -107,6 +107,8 @@ impl<'a> Execution<'a> {
         sequence: &super::device::SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool,
         draft: Option<&super::draft::NativeDraft<'a>>) -> Result<CuteafdDeviceBuffer> {
         let protocol = self.protocol(peer, hops)?;
+        ensure!(!units.is_empty(), "Kimi prefill has no units");
+        for lane in local.iter_mut() { lane.stage_attention_units(units, sequence, pool)?; }
         tracing::info!(start = sequence.start, rows = sequence.rows, units = units.len(), waves,
             sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(),
             "Kimi prefill units");
@@ -116,14 +118,18 @@ impl<'a> Execution<'a> {
             units[0].rows.len(), false)?;
         binding.draft = draft;
         binding.defer_publication = true;
-        let mut hooks = UnitHooks { binding, protocol: &protocol, sequence, pool,
+        let mut hooks = UnitHooks { binding, protocol: &protocol,
             state: units.iter().map(|_| UnitState::default()).collect(), consumed:
                 vec![vec![0; self.plan.hops().len()]; units.len()] };
-        crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
-        let UnitHooks { binding, consumed, .. } = hooks;
-        ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi unit hop inventory");
-        for local in binding.local.iter_mut() { local.select_subwave(None)?; }
-        binding.local[1].buffer("normalized")
+        crate::shared::prefill_pipeline::with_cleanup(&mut hooks, |hooks| {
+            crate::shared::prefill_pipeline::run_prefill_units(hooks, units, waves)?;
+            ensure!(hooks.consumed.iter().flatten().all(|&count| count == 1), "Kimi unit hop inventory");
+            Ok(())
+        }, |hooks| {
+            for local in hooks.binding.local.iter_mut() { local.clear_subwave(); }
+            Ok(())
+        })?;
+        hooks.binding.local[1].buffer("normalized")
     }
 
     /// Accepted replay writes every KDA layer on this lane. Publish those exact
@@ -279,6 +285,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn batched_route_transfer_keeps_exact_extents_and_rejects_invalid_planes() -> Result<()> {
+        for rows in [1, 16, 64, 2752] {
+            let lengths = [rows * 16 * 4, rows * 16 * 4, rows * cuteafd_ffi::KimiExpertInput::ROW_BYTES];
+            for bytes in lengths {
+                let source = CuteafdDeviceBuffer { ptr: 0x1000usize as *mut _, bytes, device_id: 3, flags: 0 };
+                let destination = CuteafdDeviceBuffer { ptr: 0x2000usize as *mut _, bytes, device_id: 7, flags: 0 };
+                let plane = transfer_plane(source, destination, bytes)?;
+                assert_eq!((plane.rows, plane.row_bytes, plane.source_pitch, plane.destination_pitch),
+                    (1, bytes as u64, bytes as u64, bytes as u64));
+                assert!(transfer_plane(source, destination, bytes + 16).is_err());
+                assert!(transfer_plane(source, destination, bytes - 1).is_err());
+                assert!(transfer_plane(source, source, bytes).is_err());
+                assert!(transfer_plane(source, CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..destination }, bytes).is_err());
+            }
+        }
+        let code = include_str!("layers.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(code.matches("local.stage_attention(&metadata").count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn lane_one_cannot_bind_only_lane_zero_streams() -> Result<()> {
         let lanes = [[(3, 0x100usize as *mut c_void), (7, 0x200usize as *mut c_void)],
             [(3, 0x300usize as *mut c_void), (7, 0x400usize as *mut c_void)]];
@@ -343,6 +370,16 @@ pub(crate) struct FfnTicket { layer: usize, spark: Option<Spark>, rtx: Option<us
 
 /// The Spark wave of one FFN, on the routed link's exchange.
 type Spark = super::spark::Ticket;
+
+fn transfer_plane(source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffer, bytes: usize)
+    -> Result<cuteafd_ffi::peer_exchange::PeerPlane> {
+    ensure!(bytes > 0 && bytes <= source.bytes && bytes <= destination.bytes
+        && bytes % 16 == 0 && !source.ptr.is_null() && !destination.ptr.is_null()
+        && (source.ptr as usize | destination.ptr as usize) % 16 == 0
+        && source.device_id != destination.device_id, "Kimi canonical transfer extent/device/alignment");
+    Ok(cuteafd_ffi::peer_exchange::PeerPlane { source: source.ptr, destination: destination.ptr,
+        rows: 1, row_bytes: bytes as u64, source_pitch: bytes as u64, destination_pitch: bytes as u64 })
+}
 
 impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     pub(crate) fn new(local: &'e mut [LocalLane<'a>; 2], routed: &'e mut RoutedLane<'a>,
@@ -471,13 +508,25 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     /// Copies into retained lane operands, not a second exchange ring. Both
     /// producer joins include previous readers before any destination overwrite.
     fn transfer(&self, from: usize, name: &str, bytes: usize) -> Result<()> {
+        ensure!(from < 2, "Kimi transfer source rank");
         let to = 1 - from;
-        let source = self.local[from].buffer(name)?;
-        let destination = self.local[to].buffer(name)?;
-        ensure!(bytes <= source.bytes && bytes <= destination.bytes, "Kimi canonical transfer extent");
+        let plane = transfer_plane(self.local[from].buffer(name)?, self.local[to].buffer(name)?, bytes)?;
         self.protocol.producers(self.lane, from)?;
         self.protocol.peer.push_to(from, crate::shared::peer_split::DIRECT,
-            source.ptr, destination.ptr, bytes)?;
+            plane.source, plane.destination, bytes)?;
+        self.protocol.consumer(self.lane, from)?;
+        self.protocol.peer.wait(to, crate::shared::peer_split::DIRECT)?;
+        self.protocol.consumer(self.lane, to)
+    }
+
+    fn transfer_planes(&self, from: usize, operands: &[(&str, usize)]) -> Result<()> {
+        ensure!(from < 2, "Kimi transfer source rank");
+        let to = 1 - from;
+        let planes = operands.iter().map(|&(name, bytes)| {
+            transfer_plane(self.local[from].buffer(name)?, self.local[to].buffer(name)?, bytes)
+        }).collect::<Result<Vec<_>>>()?;
+        self.protocol.producers(self.lane, from)?;
+        self.protocol.peer.push_planes(from, crate::shared::peer_split::DIRECT, &planes)?;
         self.protocol.consumer(self.lane, from)?;
         self.protocol.peer.wait(to, crate::shared::peer_split::DIRECT)?;
         self.protocol.consumer(self.lane, to)
@@ -570,10 +619,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         } else {
             let (canonical, wire) = self.local[owner].route(layer, self.rows)?;
             if rtx || owner == 0 {
-                for (name, bytes) in [("route ids", canonical.ids.bytes),
-                    ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)] {
-                    self.transfer(owner, name, bytes)?;
-                }
+                self.transfer_planes(owner, &[("route ids", canonical.ids.bytes),
+                    ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)])?;
             }
             // The optional shared ring check also preserves remote rank1 routes on GPU0.
             let mut check_remote = false;
@@ -685,19 +732,20 @@ struct UnitState { completed: usize }
 /// Each unit owns its rows of the lane's operands: selecting a unit points
 /// every row plane (residual arena, delta, outputs, router/wire, K6 partials)
 /// at its rows, so another unit's hooks never touch them. Attention metadata
-/// and the phase arena are restaged or rewritten inside each hook.
-struct UnitHooks<'h, 'e, 'a, 's, 'p> {
+/// are immutable per-unit banks; the phase arena is rewritten inside each hook.
+struct UnitHooks<'h, 'e, 'a, 's> {
     binding: Bindings<'e, 'a, 's>,
     protocol: &'h Protocol<'e, 'a>,
-    sequence: &'h super::device::SequenceRows<'p>,
-    pool: &'h cuteafd_engine::prefix::RefPagePool,
     state: Vec<UnitState>,
     consumed: Vec<Vec<usize>>,
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_> {
+impl UnitHooks<'_, '_, '_, '_> {
     fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        for local in self.binding.local.iter_mut() { local.select_subwave(Some(unit.rows.clone()))?; }
+        for local in self.binding.local.iter_mut() {
+            local.select_subwave(Some(unit.rows.clone()))?;
+            local.select_attention_unit(unit.index, unit.rows.len())?;
+        }
         self.binding.rows = unit.rows.len();
         self.binding.completed = self.state[unit.index].completed;
         self.binding.tap_first = unit.rows.start;
@@ -705,7 +753,7 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
     }
 }
 
-impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
+impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_> {
     type Ticket = FfnTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         // Dense and RTX-resident layers complete inside one hook; the Spark
@@ -722,9 +770,6 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
     fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         self.select(unit)?;
         self.binding.pending = None;
-        let metadata = [super::device::SequenceRows { slot: self.sequence.slot,
-            start: self.sequence.start + unit.rows.start, rows: unit.rows.len(), pages: self.sequence.pages }];
-        for local in self.binding.local.iter_mut() { local.stage_attention(&metadata, self.pool)?; }
         crate::shared::peer_split::attention::pipeline_attention(self.protocol, &self.binding.protocol.execution.plan,
             layer, 0, unit.rows.len(), &mut self.binding, &mut self.consumed[unit.index])?;
         Ok(())

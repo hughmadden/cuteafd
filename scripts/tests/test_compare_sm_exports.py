@@ -133,6 +133,51 @@ def test_glm_stage_cross_sm_groups(geometry):
     assert job == (name, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
 
 
+def test_kimik3_package_and_route_registry_are_both_sm_gated(monkeypatch):
+    jobs = compare_sm.jobs("all")
+    for name, exporter, extra in [
+        ("exl3-kimik3", "package_exl3_aot.py", []),
+        ("exl3-kimik3-k23", "package_exl3_aot.py", ["--bits", "2,3"]),
+        ("exl3-routes-kimik3", "export_b12x_exl3_routes_aot.py", []),
+    ]:
+        assert [job for job in jobs if job[0] == name] == [
+            (name, exporter, ["--geometry", "kimik3", "--capacities", compare_sm.EXL3_CAPACITIES, *extra])]
+    # Negative control: the old list silently omitted the route registry.
+    monkeypatch.setattr(compare_sm, "EXL3_GEOMETRIES",
+                        tuple(g for g in compare_sm.EXL3_GEOMETRIES if g != "kimik3"))
+    assert not any(job[0] == "exl3-routes-kimik3" for job in compare_sm.jobs("all"))
+
+
+@pytest.mark.parametrize("drop_tp2", [False, True])
+def test_kimik3_cmake_advertised_layouts_cover_runtime_tp2(tmp_path, drop_tp2):
+    # Evaluate the real geometry/layout CMake branch without a CUDA compiler.
+    recipe = (ROOT / "native/cmake/shared/exl3.cmake").read_text()
+    begin = recipe.index("  set(CUTEAFD_EXL3_GEOMETRY_LAYOUTS ${CUTEAFD_EXL3_LAYOUTS})")
+    end = recipe.index("  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS", begin)
+    branch = recipe[begin:end]
+    if drop_tp2:
+        branch = branch.replace("set(CUTEAFD_EXL3_GEOMETRY_LAYOUTS rtx-tp1 rtx-tp2)",
+                                "set(CUTEAFD_EXL3_GEOMETRY_LAYOUTS rtx-tp1)")
+    script = tmp_path / "layouts.cmake"
+    script.write_text('cmake_minimum_required(VERSION 3.24)\n'
+                      'set(CUTEAFD_EXL3_GEOMETRY kimik3)\n'
+                      'set(CUTEAFD_EXL3_ROLE coordinator)\n'
+                      'set(CUTEAFD_EXL3_LAYOUTS rtx-tp1 rtx-tp2 dspark)\n' + branch +
+                      '\nif(NOT "rtx-tp2" IN_LIST CUTEAFD_EXL3_GEOMETRY_LAYOUTS)\n'
+                      '  message(FATAL_ERROR "Kimi runtime TP2 package missing")\nendif()\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=10)
+    assert (result.returncode != 0) == drop_tp2, result.stderr
+    if drop_tp2:
+        assert "Kimi runtime TP2 package missing" in result.stderr
+    pack_spec = importlib.util.spec_from_file_location("kimi_exl3_package",
+        ROOT / "python/tools/aot/package_exl3_aot.py")
+    pack = importlib.util.module_from_spec(pack_spec)
+    pack_spec.loader.exec_module(pack)
+    profiles = {p[0]: p for p in pack.profiles_for_role("coordinator", "kimik3")}
+    assert profiles["rtx-tp2"][1] == 1536
+    assert profiles["rtx-tp2"][-1] == ["rtx-tp2"]
+
+
 def test_mimop_k32_tp6_uses_production_exact_slice_export():
     job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
     assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",
