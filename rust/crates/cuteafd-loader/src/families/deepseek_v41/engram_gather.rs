@@ -29,7 +29,7 @@ pub enum EngramStagingError {
 pub struct EngramStagingShape { rows: usize, units: usize }
 impl EngramStagingShape {
     pub fn new(rows: usize, units: usize) -> std::result::Result<Self, EngramStagingError> {
-        if !(1..=4096).contains(&rows) || !(2..=4).contains(&units) {
+        if !(1..=4096).contains(&rows) || !(1..=4).contains(&units) {
             return Err(EngramStagingError::Shape { rows, units });
         }
         Ok(Self { rows, units })
@@ -264,8 +264,8 @@ mod lifecycle_tests {
 
     #[test]
     fn engram_copy_pending_pool_reclaims_on_completion_with_bounded_polls() -> Result<()> {
-        for k in 2..=4 {
-            let shape = EngramStagingShape::new((8192usize.div_ceil(k) + 63) / 64 * 64, k)?;
+        for k in 1..=4 {
+            let shape = EngramStagingShape::new(((8192usize.div_ceil(k.max(2)) + 63) / 64 * 64), k)?;
             let drops = Rc::new(RefCell::new(Vec::new()));
             let mut pool = EngramCopyPool::new(shape.host_slots());
             let mut events = Vec::new();
@@ -312,8 +312,8 @@ mod lifecycle_tests {
 
     #[test]
     fn engram_lifecycle_exact_pool_and_adversarial_layer14_admission() -> Result<()> {
-        for k in 2..=4 {
-            let rows = 8192usize.div_ceil(k).div_ceil(64) * 64;
+        for k in 1..=4 {
+            let rows = 8192usize.div_ceil(k.max(2)).div_ceil(64) * 64;
             let shape = EngramStagingShape::new(rows, k)?;
             let n = shape.host_slots();
             assert_eq!(n, 3 * k);
@@ -367,8 +367,8 @@ mod lifecycle_tests {
 
     #[test]
     fn engram_cancel_queued_gathering_ready_and_copy_states_return_once() -> Result<()> {
-        for k in 2..=4 {
-            let n = EngramStagingShape::new(8192usize.div_ceil(k).div_ceil(64) * 64, k)?.host_slots();
+        for k in 1..=4 {
+            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
             // Block the first gather deterministically; the second is queued.
             let (started, seen) = std::sync::mpsc::sync_channel(1);
             let (release, wait) = std::sync::mpsc::sync_channel(1);
@@ -411,8 +411,8 @@ mod lifecycle_tests {
         use std::{future::Future, task::{Context, Poll, Wake, Waker}};
         struct Counter(std::sync::atomic::AtomicUsize);
         impl Wake for Counter { fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Release); } }
-        for k in 2..=4 {
-            let n = EngramStagingShape::new(8192usize.div_ceil(k).div_ceil(64) * 64, k)?.host_slots();
+        for k in 1..=4 {
+            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
             let worker = GatherWorker::new("engram-copy-admit", (0..n).collect::<Vec<_>>(),
                 |_: &mut usize, _: &(usize, usize)| Ok::<_, ()>(()))?;
             let mut copies = EngramCopyPool::new(n);
@@ -442,8 +442,8 @@ mod lifecycle_tests {
         use std::{future::Future, task::{Context, Poll, Wake, Waker}};
         struct Counter(std::sync::atomic::AtomicUsize);
         impl Wake for Counter { fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Release); } }
-        for k in 2..=4 {
-            let n = EngramStagingShape::new(8192usize.div_ceil(k).div_ceil(64) * 64, k)?.host_slots();
+        for k in 1..=4 {
+            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
             let worker = GatherWorker::new("engram-mixed-copy-admit", (0..n).collect::<Vec<_>>(),
                 |_: &mut usize, _: &(usize, usize)| Ok::<_, ()>(()))?;
             let mut copies = EngramCopyPool::new(n);
@@ -485,6 +485,6 @@ mod lifecycle_tests {
         for (rows, units) in [(0, 2), (4097, 2), (8192, 1), (4096, 0), (4096, 5)] {
             assert_eq!(EngramStagingShape::new(rows, units), Err(EngramStagingError::Shape { rows, units }));
         }
-        for k in 2..=4 { assert_eq!(EngramStagingShape::new(4096, k).unwrap().prefetch_units(), k); }
+        for k in 1..=4 { assert_eq!(EngramStagingShape::new(4096, k).unwrap().prefetch_units(), k); }
     }
 }

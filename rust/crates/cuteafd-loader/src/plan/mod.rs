@@ -1255,7 +1255,10 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             report.prefill_reserve_rows = Some(reserve);
             return Ok(report);
         }
-        if layout.prefill_rows != 0 || layout.prefill_unit_rows.is_some() {
+        // An explicit shape (PREFILL_ROWS, or a depth: PREFILL_WAVES pins even
+        // without rows) plans exactly as given, ahead of every automatic rule.
+        if layout.prefill_rows != 0 || layout.prefill_unit_rows.is_some()
+            || layout.prefill_waves > 1 || layout.prefill_lanes > 0 {
             if !report.executable() {
                 let (rows, waves) = (report.prefill_unit_rows.unwrap_or(0), report.prefill_waves.unwrap_or(0));
                 report.hints.push(Hint {

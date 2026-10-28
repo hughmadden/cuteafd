@@ -3594,10 +3594,19 @@ fn v41_spark_free_prefill_runs_one_window_and_pins_still_override() {
     if auto.onboard_layers.is_some_and(|layers| layers >= 20) {
         assert_eq!((auto.prefill_unit_rows, auto.prefill_waves, auto.prefill_slots), (Some(4096), Some(1), Some(1)),
             "{}", render(&auto));
-        // An explicit depth keeps the standard reserve and its split.
+        // An explicit depth keeps the standard reserve and its split, with or
+        // without explicit rows (PREFILL_WAVES alone pins too), and its shape
+        // passes the Engram staging admission as given.
+        for rows in [2752, 0] {
+            let pinned = plan_spark_count(dir.path(), &two(96, 3, rows), 6, Some(4)).unwrap();
+            assert!(pinned.executable(), "{}", render(&pinned));
+            assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_slots), (Some(2752), Some(3), Some(3)),
+                "PREFILL_WAVES=3 rows={rows}: {}", render(&pinned));
+            crate::EngramStagingShape::new(2752, 3).unwrap();
+        }
         let pinned = plan_spark_count(dir.path(), &two(96, 3, 2752), 6, Some(4)).unwrap();
-        assert!(pinned.executable(), "{}", render(&pinned));
-        assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_slots), (Some(2752), Some(3), Some(3)));
+        // The Spark-free default's shape is a valid Engram staging shape too.
+        crate::EngramStagingShape::new(4096, 1).unwrap();
         assert!(pinned.onboard_layers <= auto.onboard_layers, "one window frees memory for onboarding");
     } else {
         panic!("fixture: 2 x 96 GiB should onboard every encoder layer: {}", render(&auto));
