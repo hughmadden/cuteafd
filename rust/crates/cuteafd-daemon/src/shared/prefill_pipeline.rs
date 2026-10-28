@@ -584,11 +584,13 @@ mod tests {
                     let expected = if layer == u.layers.start { None } else { Some(layer - 1) };
                     assert_eq!(residual[u.slot], Some((unit, expected)), "unit {unit} layer {layer} read stale rows");
                     assert_eq!(landed_or_local[unit].last().copied(), expected);
-                    // Same-sequence predecessor attended this layer first.
-                    if let Some(earlier) = units[..unit].iter().rev().find(|o| o.sequence == u.sequence) {
-                        if earlier.layers.contains(&layer) {
-                            assert!(attended[earlier.index].contains(&layer) || commits.contains(&earlier.index),
-                                "unit {unit} attended layer {layer} before unit {}", earlier.index);
+                    // Every participating sequence's predecessor must publish first.
+                    for sequence in u.sequences() {
+                        if let Some(earlier) = units[..unit].iter().rev().find(|o| o.sequences().contains(&sequence)) {
+                            if earlier.layers.contains(&layer) {
+                                assert!(attended[earlier.index].contains(&layer) || commits.contains(&earlier.index),
+                                    "unit {unit} attended layer {layer} before unit {}", earlier.index);
+                            }
                         }
                     }
                     attended[unit].push(layer);
@@ -627,6 +629,53 @@ mod tests {
         }
         assert!(outstanding.is_empty());
         assert_eq!(commits, (0..units.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn packed_fork_join_waits_for_every_member_and_rejects_bad_layouts() -> anyhow::Result<()> {
+        let routes = [FfnRoute::Local, FfnRoute::Local, FfnRoute::Spark, FfnRoute::Spark];
+        let mut units = sequence_units(5 * 64, 64, 3, routes.len())?;
+        let members = [vec![10], vec![20], vec![10, 20], vec![10], vec![20]];
+        for (u, ids) in units.iter_mut().zip(&members) {
+            let width = u.rows.len() / ids.len();
+            u.segments = ids.iter().enumerate().map(|(i, &sequence)| UnitSegment {
+                sequence, rows: i * width..(i + 1) * width, tokens: 0..width,
+                prompt_end: false, snapshot: false, head: false }).collect();
+        }
+        let steps = prefill_schedule(&routes, &units, 3)?;
+        check_schedule(&routes, &units, 3, &steps);
+        // A checker that only watched the first member would accept this corruption.
+        let mut broken = steps.clone();
+        let before = broken.iter().position(|s| *s == Step::Attention { layer: 0, unit: 1 }).unwrap();
+        let after = broken.iter().position(|s| *s == Step::Attention { layer: 0, unit: 2 }).unwrap();
+        broken.swap(before, after);
+        assert!(std::panic::catch_unwind(|| check_schedule(&routes, &units, 3, &broken)).is_err());
+        for bad in 0..4 {
+            let mut invalid = units.clone();
+            match bad {
+                0 => invalid[2].segments[1].sequence = 10,
+                1 => invalid[2].segments[1].rows.start -= 1,
+                2 => invalid[2].segments[1].rows.end += 1,
+                _ => invalid[2].segments[1].tokens.end += 1,
+            }
+            assert!(prefill_schedule(&routes, &invalid, 3).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_singleton_members_preserve_the_exact_schedule() -> anyhow::Result<()> {
+        for span in [1, 65, 2048, 4097] {
+            let units = sequence_units(span, 2048, 3, 4)?;
+            let mut explicit = units.clone();
+            for u in &mut explicit {
+                u.segments.push(UnitSegment { sequence: 0, rows: 0..u.rows.len(), tokens: u.rows.clone(),
+                    prompt_end: u.rows.end == span, snapshot: false, head: u.rows.end == span });
+            }
+            let routes = [FfnRoute::Local, FfnRoute::Local, FfnRoute::Spark, FfnRoute::Spark];
+            assert_eq!(prefill_schedule(&routes, &units, 3)?, prefill_schedule(&routes, &explicit, 3)?);
+        }
+        Ok(())
     }
 
     fn random_units(seed: &mut u64, layers: usize, waves: usize) -> Vec<Unit> {

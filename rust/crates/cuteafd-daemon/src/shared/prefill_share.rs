@@ -622,6 +622,34 @@ mod tests {
     }
 
     #[test]
+    fn packed_round_is_queued_only_bounded_and_never_skips_an_ineligible_member() {
+        let mut queue = PrefillQueue::new(0.2).one_wave_rounds();
+        let mut groups = Vec::new();
+        assert!(queue.round_packed(8, 8, |p: &Prompt| Some(p.left), |_, _| true,
+            |_| panic!("empty queues must not execute or wait")).is_empty());
+        queue.push(Prompt { id: 0, left: 3 });
+        let finished = queue.round_packed(8, 8, |p| Some(p.left), |_, _| true, |group| {
+            groups.push(group.iter().map(|p| p.id).collect::<Vec<_>>());
+            vec![Ok(Chunk::Done)]
+        });
+        assert_eq!(groups, [vec![0]]); // immediate singleton, no partner wait
+        assert_eq!(finished.len(), 1);
+        for (id, left) in [(1, 3), (2, 5), (3, 1), (4, 1)] { queue.push(Prompt { id, left }); }
+        let finished = queue.round_packed(8, 8, |p| Some(p.left), |_, _| true, |group| {
+            assert_eq!(group.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 2]);
+            vec![Err(anyhow::anyhow!("cancelled after submission")), Ok(Chunk::Done)]
+        });
+        assert!(finished[0].1.is_err() && finished[1].1.is_ok());
+        queue.push(Prompt { id: 5, left: 1 });
+        let finished = queue.round_packed(8, 8, |p| (p.id != 4).then_some(p.left), |_, _| true, |group| {
+            assert_eq!(group.iter().map(|p| p.id).collect::<Vec<_>>(), [3]);
+            vec![Ok(Chunk::Done)]
+        });
+        assert_eq!(finished.len(), 1);
+        assert_eq!(queue.iter().map(|p| p.id).collect::<Vec<_>>(), [4, 5]);
+    }
+
+    #[test]
     fn zero_share_finishes_the_oldest_group_before_later_prompts() {
         let mut queue = PrefillQueue::new(0.0);
         for id in 0..3 { queue.push(Prompt { id, left: if id == 2 { 1 } else { 2 } }); }

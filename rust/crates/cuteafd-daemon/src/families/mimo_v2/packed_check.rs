@@ -1,0 +1,163 @@
+//! Mixed-request packing and partner-isolation golden; uses the serving executor.
+use super::engine::{Allocator, MimoEngine, MimoPlacement};
+use crate::shared::prefill_packing::{self, Limits};
+use anyhow::{ensure, Context, Result};
+
+const LENGTHS: [usize; 10] = [29, 40, 7, 64, 65, 127, 1, 129, 255, 100];
+const PREFIX: usize = 300;
+
+fn geometry(members: usize, limits: &Limits) -> Result<Vec<(usize, usize)>> {
+    ensure!((2..=LENGTHS.len()).contains(&members), "--packed-check takes 2 to 10 sequences");
+    let mut chunks = LENGTHS[..members].iter().map(|&rows| (0, rows)).collect::<Vec<_>>();
+    chunks[members - 1] = (PREFIX, 100);
+    prefill_packing::plan(&chunks, limits).context("--packed-check chunks exceed admitted rows/taps/context; take fewer sequences")?;
+    Ok(chunks)
+}
+
+fn prompt(tokens: &[u32], member: usize, rows: usize) -> Vec<u32> {
+    (0..rows).map(|row| tokens[(member * 97 + row) % tokens.len()]).collect()
+}
+
+struct Observed {
+    logits: Vec<f32>,
+    kv: Vec<u8>,
+    frontier: usize,
+}
+
+/// Initialize all allocated pages and rings identically so unused tail bytes are
+/// part of the byte comparison rather than allocator contents. Diagnostic only.
+fn clear(engine: &MimoEngine<'_>, placement: &MimoPlacement) -> Result<()> {
+    for rank in 0..engine.ranks() {
+        engine.on(rank, || {
+            // SAFETY: all prior submissions have their matching peer pushes queued.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
+            for layer in 0..engine.weights.layers.len() {
+                let (attention, buffer, record) = engine.kv_layer_on(rank, layer);
+                let ranges = match attention {
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Full => placement.pages.iter()
+                        .map(|&page| (page as usize * super::engine::PAGE_ROWS, super::engine::PAGE_ROWS)).collect::<Vec<_>>(),
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Sliding =>
+                        vec![(placement.ring as usize * super::engine::RING_ROWS, super::engine::RING_ROWS)],
+                };
+                for (row, rows) in ranges {
+                    let bytes = rows * record;
+                    let offset = row * record;
+                    ensure!(offset + bytes <= buffer.bytes, "packed check clear exceeds KV storage");
+                    let view = cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer };
+                    engine.library.cuda_zero_bytes(view, bytes)?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+fn observe(engine: &MimoEngine<'_>, placement: &MimoPlacement, logits: Vec<f32>) -> Result<Observed> {
+    // Include every byte of allocated full pages, including initialized tail rows,
+    // and all surviving SWA records. kv_rows iterates every TP rank.
+    let page_end = placement.pages.len() * super::engine::PAGE_ROWS;
+    let mut kv = Vec::new();
+    for rank in 0..engine.ranks() {
+        engine.on(rank, || {
+            // SAFETY: this engine owns the rank stream and its submitted readers.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
+            for layer in 0..engine.weights.layers.len() {
+                let (attention, buffer, record) = engine.kv_layer_on(rank, layer);
+                let ranges = match attention {
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Full => placement.pages.iter()
+                        .map(|&page| (page as usize * super::engine::PAGE_ROWS, super::engine::PAGE_ROWS)).collect::<Vec<_>>(),
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Sliding =>
+                        vec![(placement.ring as usize * super::engine::RING_ROWS, super::engine::RING_ROWS)],
+                };
+                for (row, rows) in ranges {
+                    let bytes = rows * record;
+                    let offset = row * record;
+                    ensure!(offset + bytes <= buffer.bytes, "packed check read exceeds KV storage");
+                    let first = kv.len();
+                    kv.resize(first + bytes, 0);
+                    engine.library.copy_d2h(&mut kv[first..], cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    ensure!(placement.len <= page_end, "packed frontier exceeds allocated pages");
+    Ok(Observed { logits, kv, frontier: placement.len })
+}
+
+fn arm(engine: &MimoEngine<'_>, prompts: &[Vec<u32>], chunks: &[(usize, usize)], packed: bool)
+    -> Result<Vec<Observed>> {
+    let mut allocator = Allocator::new(engine.pages, engine.rings);
+    let mut placements = prompts.iter().map(|p| allocator.admit(p.len())).collect::<Result<Vec<_>>>()?;
+    for ((placement, prompt), &(start, _)) in placements.iter_mut().zip(prompts).zip(chunks) {
+        clear(engine, placement)?;
+        for part in prompt[..start].chunks(engine.prefill_capacity()) {
+            engine.prefill_device(placement, part, false, None, None)?;
+        }
+    }
+    let mut logits = vec![Vec::new(); placements.len()];
+    if packed {
+        let mut members = placements.iter_mut().zip(prompts).zip(chunks)
+            .map(|((p, tokens), &(start, _))| (p, &tokens[start..])).collect::<Vec<_>>();
+        let (_, outcomes) = engine.prefill_packed(&mut members, &mut |i, rows| {
+            logits[i] = rows.row_host(engine.library, 0)?;
+            Ok(Ok(()))
+        })?;
+        for outcome in outcomes { outcome?; }
+    } else {
+        for (i, ((p, tokens), &(start, _))) in placements.iter_mut().zip(prompts).zip(chunks).enumerate() {
+            logits[i] = engine.prefill_device(p, &tokens[start..], false, None, None)?
+                .context("packed check requires all layers")?.row_host(engine.library, 0)?;
+        }
+    }
+    placements.iter().zip(logits).map(|(p, logits)| observe(engine, p, logits)).collect()
+}
+
+fn same_logits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+pub(crate) fn run(engine: &MimoEngine<'_>, tokens: &[u32], members: usize) -> Result<()> {
+    ensure!(!tokens.is_empty() && tokens.iter().all(|&t| (t as usize) < engine.cfg.vocab_size), "invalid packed-check tokens");
+    ensure!(engine.weights.layers.len() == engine.cfg.layers, "--packed-check requires every layer");
+    let chunks = geometry(members, &engine.packed_limits())?;
+    let prompts = chunks.iter().enumerate().map(|(i, &(start, rows))| prompt(tokens, i, start + rows)).collect::<Vec<_>>();
+    let packed = arm(engine, &prompts, &chunks, true)?;
+    let alone = arm(engine, &prompts, &chunks, false)?;
+    let mut changed = prompts.clone();
+    for token in &mut changed[1] { *token = ((*token as usize + 1) % engine.cfg.vocab_size) as u32; }
+    let partner = arm(engine, &changed, &chunks, true)?;
+    let mut exact = true;
+    for (i, (a, b)) in packed.iter().zip(&alone).enumerate() {
+        let logits = same_logits(&a.logits, &b.logits);
+        let kv = a.kv == b.kv;
+        let frontier = a.frontier == b.frontier && a.frontier == prompts[i].len();
+        println!("MiMo packed check: member {i} rows {} start {}: logits {logits}, KV {kv}, frontier {frontier}", chunks[i].1, chunks[i].0);
+        exact &= logits && kv && frontier;
+    }
+    let isolated = same_logits(&packed[0].logits, &partner[0].logits)
+        && packed[0].kv == partner[0].kv && packed[0].frontier == partner[0].frontier;
+    println!("MiMo packed check: A unchanged with B replaced at fixed geometry: {isolated}");
+    ensure!(isolated, "packed partner isolation failed");
+    ensure!(exact, "packed differs from alone; characterize expert route changes before accepting numerical differences");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mixed_geometry_keeps_resumed_member_and_capacity_bound() {
+        let limits = Limits { rows: 4096, chunk_rows: 4096, max_context: 4096, taps: Some(1024) };
+        for members in 2..=10 {
+            let chunks = geometry(members, &limits).unwrap();
+            assert_eq!(chunks.len(), members);
+            assert_eq!(chunks[members - 1], (PREFIX, 100));
+        }
+        for members in [0, 1, 11] { assert!(geometry(members, &limits).is_err()); }
+        assert!(geometry(2, &Limits { rows: 128, ..limits }).is_err());
+    }
+}

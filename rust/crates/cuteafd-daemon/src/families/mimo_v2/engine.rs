@@ -486,9 +486,26 @@ impl<'a> Workspace<'a> {
     }
 }
 
-struct PackedMember {
+struct PackedMember<'a> {
     segment: crate::shared::prefill_packing::Segment,
     tables: StepTables,
+    views: Vec<Workspace<'a>>,
+    rope: Vec<u8>,
+}
+
+fn validate_packed_members(members: &[PackedMember<'_>], chunks: &[(usize, usize)]) -> Result<()> {
+    ensure!(members.len() == chunks.len(), "packed member count differs");
+    let mut first = 0;
+    for (member, &(start, rows)) in members.iter().zip(chunks) {
+        let s = member.segment;
+        ensure!(s.first == first && s.start == start && s.rows == rows
+            && member.tables.positions.len() == rows
+            && member.tables.positions.iter().enumerate().all(|(i, &p)| p == (start + i) as i64)
+            && member.tables.slots.len() == rows && member.tables.ring_slots.len() == rows
+            && member.tables.seq_first == vec![0; rows], "packed attention member binding differs");
+        first += rows;
+    }
+    Ok(())
 }
 
 impl<'a> Workspace<'a> {
@@ -521,12 +538,12 @@ struct UnitHooks<'h, 'a> {
     all_logits: bool,
     output: &'h Workspace<'a>,
     last: usize,
-    packed: Option<&'h [PackedMember]>,
+    packed: Option<&'h [PackedMember<'a>]>,
 }
 
 impl UnitHooks<'_, '_> {
     fn packed_attention(&self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
-        members: &[PackedMember]) -> Result<()> {
+        members: &[PackedMember<'_>]) -> Result<()> {
         let e = self.engine;
         let w = &self.work[unit.index];
         let peer = self.peer_work.map(|work| &work[unit.index]);
@@ -540,14 +557,14 @@ impl UnitHooks<'_, '_> {
             }
         }
         // Both ranks finish all members' partials before one packed exchange.
-        for (rank, base) in std::iter::once(w).chain(peer).enumerate() {
+        for rank in 0..e.ranks() {
             for member in members {
                 let s = member.segment;
-                let view = base.member_view(s.first, s.rows, e.cfg.hidden, e.cfg.topk)?;
-                e.stage_member(rank, &view, &member.tables)?;
+                let view = &member.views[rank];
+                e.stage_member(rank, view, &member.tables, &member.rope)?;
                 let (weight, kv) = if rank == 0 { (&e.weights.layers[layer], e.kv[layer].buffer.ptr) }
                     else { let p = e.peer.as_ref().context("MiMo peer")?; (&p.layers[layer], p.kv[layer].buffer.ptr) };
-                e.attention_on(rank, &view, kv, weight, Scalar::I32(s.rows as i32), "m4096", &member.tables)?;
+                e.attention_on(rank, view, kv, weight, Scalar::I32(s.rows as i32), "m4096", &member.tables)?;
             }
         }
         if let Some(w1) = peer {
@@ -578,8 +595,7 @@ impl UnitHooks<'_, '_> {
         if let Some(members) = self.packed {
             for member in members {
                 let s = member.segment;
-                let view = w.member_view(s.first, s.rows, e.cfg.hidden, e.cfg.topk)?;
-                e.moe_front_on(rank, &view, weight, s.rows, bf16)?;
+                e.moe_front_on(rank, &member.views[rank], weight, s.rows, bf16)?;
             }
             Ok(())
         } else { e.moe_front_on(rank, w, weight, rows, bf16) }
@@ -738,9 +754,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
             && unit.rows.end > self.tokens.len().saturating_sub(super::mtp::HIDDEN_ROWS)) {
             if let Some(members) = self.packed {
                 for member in members {
-                    let s = member.segment;
-                    let view = self.work[unit.index].member_view(s.first, s.rows, e.cfg.hidden, e.cfg.topk)?;
-                    e.mtp_tap(mtp, &view, &member.tables)?;
+                    e.mtp_tap(mtp, &member.views[0], &member.tables)?;
                 }
             } else { e.mtp_tap(mtp, &self.work[unit.index], &self.tables[unit.index])?; }
         }
@@ -1473,11 +1487,10 @@ impl<'a> MimoEngine<'a> {
         Ok(workspace)
     }
 
-    /// Replace the existing positions upload with one packed positions/RoPE copy.
-    /// Pointers stay fixed across graph replay; each prefill slot owns its window.
-    fn stage_member(&self, rank: usize, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+    /// Stage a member's immutable metadata into same-stream, hook-local scratch.
+    fn stage_member(&self, rank: usize, w: &Workspace<'_>, tables: &StepTables, rope: &[u8]) -> Result<()> {
         self.on(rank, || {
-            self.put_step_inputs(rank, w, &tables.positions)?;
+            ordered_table_upload(self.library, w.step_inputs.buffer, rope, self.stream_of(rank))?;
             for (plane, bytes) in [(&w.slots, bytes_of(&tables.slots)),
                 (&w.ring_slots, bytes_of(&tables.ring_slots)), (&w.seq_first, bytes_of(&tables.seq_first)),
                 (&w.page_table, bytes_of(&tables.page_table))] {
@@ -1644,9 +1657,16 @@ impl<'a> MimoEngine<'a> {
             let work = [base.unit_view(0, self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim, self.cfg.topk)?];
             let peer_work = peer_owned.as_ref().and_then(|p| p.as_ref()).map(|base|
                 base.unit_view(0, self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim, self.cfg.topk).map(|w| [w])).transpose()?;
-            let members = sequences.iter().zip(&segments).map(|((p, tokens), &segment)|
-                Ok(PackedMember { segment, tables: p.prefill_tables(tokens.len(), self.max_context)? }))
-                .collect::<Result<Vec<_>>>()?;
+            let members = sequences.iter().zip(&segments).map(|((p, tokens), &segment)| {
+                let tables = p.prefill_tables(tokens.len(), self.max_context)?;
+                let mut rope = vec![0; self.prefill_rows * (8 + 2 * self.cfg.rope_dim * 4)];
+                self.rope.fill(&tables.positions, self.prefill_rows, self.max_context, &mut rope)?;
+                let views = std::iter::once(&work[0]).chain(peer_work.as_ref().map(|w| &w[0]))
+                    .map(|w| w.member_view(segment.first, segment.rows, self.cfg.hidden, self.cfg.topk))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(PackedMember { segment, tables, views, rope })
+            }).collect::<Result<Vec<_>>>()?;
+            validate_packed_members(&members, &sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>())?;
             let tokens = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect::<Vec<_>>();
             // Begin's upload is harmless; each attention segment replaces it on its consumer stream.
             let tables = [members[0].tables.clone()];
@@ -3130,6 +3150,34 @@ mod tests {
                 assert_eq!(binding.cos_sin as usize, view.step_inputs.buffer.ptr as usize
                     + rows * 8 + usize::from(sliding) * rows * rope * 4);
             }
+            for (first, count) in [(0, 1), (7, 19), (rows - 1, 1)] {
+                let member = view.member_view(first, count, hidden, topk)?;
+                for (actual, original, stride) in [(&member.h, &view.h, hidden * 2),
+                    (&member.x, &view.x, hidden * 2), (&member.delta, &view.delta, hidden * 2),
+                    (&member.route_ids, &view.route_ids, topk * 4),
+                    (&member.route_weights, &view.route_weights, topk * 4),
+                    (&member.wire, &view.wire, hidden + hidden / 32)] {
+                    assert_eq!(actual.buffer.ptr as usize, original.buffer.ptr as usize + first * stride);
+                    assert_eq!(actual.buffer.bytes, count * stride);
+                }
+                // Metadata is rewritten from member-local rows, never sliced through
+                // the planar full/SWA RoPE layout or the single-sequence cache scratch.
+                assert_eq!(member.rows, view.rows);
+                for attention in [MimoAttention::Full, MimoAttention::Sliding] {
+                    let a = member.attention_bindings(rope, attention);
+                    let b = view.attention_bindings(rope, attention);
+                    assert_eq!(a.cos_sin, b.cos_sin);
+                    assert_eq!(a.producer_positions, b.producer_positions);
+                    assert_eq!(a.attention_positions, b.attention_positions);
+                }
+                assert_eq!(member.page_table.buffer.ptr, view.page_table.buffer.ptr);
+                assert_eq!(member.query.buffer.ptr, view.query.buffer.ptr);
+                assert_eq!(member.kv_wide.buffer.ptr, view.kv_wide.buffer.ptr);
+                assert_eq!(member.logits.buffer.ptr, view.logits.buffer.ptr);
+            }
+            assert!(view.member_view(rows, 1, hidden, topk).is_err());
+            assert!(view.member_view(0, 0, hidden, topk).is_err());
+            assert!(view.member_view(usize::MAX, 2, hidden, topk).is_err());
             assert_eq!(view.query.buffer.ptr, base.query.buffer.ptr);
             assert_eq!(view.attn.buffer.ptr, base.attn.buffer.ptr);
             assert_eq!(view.scratch.buffer.ptr, base.scratch.buffer.ptr);
@@ -3143,6 +3191,27 @@ mod tests {
         }
         assert!(base.unit_view(slots, rows, hidden, rope, topk).is_err());
         assert!(base.unit_view(0, rows + 1, hidden, rope, topk).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packed_attention_rejects_a_swapped_member_start() -> anyhow::Result<()> {
+        use super::*;
+        let placements = [MimoPlacement { pages: vec![8, 9], ring: 2, len: 3 },
+            MimoPlacement { pages: vec![10, 11], ring: 4, len: 70 }];
+        let chunks = [(3, 7), (70, 13)];
+        let layout = crate::shared::prefill_packing::plan(&chunks, &crate::shared::prefill_packing::Limits {
+            rows: 64, chunk_rows: 64, max_context: 128, taps: None })?;
+        let mut members = placements.iter().zip(layout).map(|(p, segment)| Ok(PackedMember {
+            tables: p.prefill_tables(segment.rows, 128)?, segment, views: Vec::new(), rope: Vec::new(),
+        })).collect::<Result<Vec<_>>>()?;
+        validate_packed_members(&members, &chunks)?;
+        let original = members[0].tables.positions.clone();
+        members[0].tables.positions = (70..77).collect();
+        assert!(validate_packed_members(&members, &chunks).is_err(), "wrong sequence position must fail before launch");
+        members[0].tables.positions = original;
+        members[0].segment.first = 7;
+        assert!(validate_packed_members(&members, &chunks).is_err(), "wrong packed row window must fail before launch");
         Ok(())
     }
 

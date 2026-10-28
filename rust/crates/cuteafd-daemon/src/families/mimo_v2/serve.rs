@@ -769,7 +769,13 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     .filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok(),
                 |group| {
                     if group.len() > 1 && group.iter().all(|p| packed_chunk(p).is_some()) {
-                        return prefill_group(engine, family, cache, selector, group);
+                        let rows: usize = group.iter().filter_map(packed_chunk).map(|(_, rows)| rows).sum();
+                        let clock = Instant::now();
+                        let outcomes = prefill_group(engine, family, cache, selector, group);
+                        if policy.chunk_s.is_some() && rows > 0 {
+                            seconds_per_row = (clock.elapsed().as_secs_f64() / rows as f64).max(seconds_per_row * 0.9);
+                        }
+                        return outcomes;
                     }
                     group.iter_mut().map(|prompt| {
                         if policy.chunk_s.is_none() { return prefill_one(engine, family, cache, selector, prompt); }
@@ -1661,16 +1667,16 @@ fn prefill_group(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
             }
             if cache.enabled() && !probe::cold(&job.probe) { **retained = Some(logits.row_host(engine.library, 0)?); }
             if probe::wants_first(&job.probe) {
-                if let Err(error) = probe::device_rows(engine.library, &job.probe, &logits, 0, 1, *len) {
-                    return Ok(Err(error));
-                }
+                probe::device_rows(engine.library, &job.probe, &logits, 0, 1, *len)?;
             }
             Ok(Ok(()))
         })?;
         drop((sequences, outputs));
         if let Some(drafter) = &engine.drafter {
-            for ((p, s), outcome) in group.iter().zip(&segments).zip(&outcomes) {
-                if let (Some(slot), true) = (p.slot, outcome.is_ok()) {
+            // Every placement advanced, including clients that left during execution.
+            // Cancellation can park it, so its draft state must advance as well.
+            for (p, s) in group.iter().zip(&segments) {
+                if let Some(slot) = p.slot {
                     drafter.update(&(0..s.tap_rows).map(|r| ContextRow { tap_row: s.tap_offset + r, slot,
                         position: s.start + s.rows - s.tap_rows + r }).collect::<Vec<_>>())?;
                 }

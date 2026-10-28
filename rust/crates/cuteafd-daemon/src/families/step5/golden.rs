@@ -597,7 +597,7 @@ fn check_prefix_state<'a>(
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(),
             PrefixConfig { entries: 1, mark_slots: 2, keep_logits: false, min_tokens: 1 }, None)?);
         let mut source = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
-            |pages| Placement { pages, sequence: 0, segments: Vec::new(), committed: 0 })?.placement;
+            |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
             &pool, &mut source, input, link)?;
         let expected = canonical_state(&cache, &source)?;
@@ -729,7 +729,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
             Staging::new(devices[1], &programs, &caches[1].borrow(), stage_bytes[1] as usize)?];
         let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
-        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, segments: Vec::new(), committed: 0 })?.placement;
+        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
             vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), None, 1, 17)?;
         let input = Allocation::new(devices[0], rows * H * 4)?;
@@ -755,7 +755,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let staging = Staging::new(device, &programs, &cache.borrow(), staging_bytes as usize)?;
         let family = Step5Prefix::new(vec![&cache])?;
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
-        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, segments: Vec::new(), committed: 0 })?.placement;
+        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved], args.kv_cache)?;
         let input = Allocation::new(device, rows * H * 4)?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
@@ -869,7 +869,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {
         entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
     let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1,
-        |pages| Placement { pages, sequence: 0, segments: Vec::new(), committed: 0 })?.placement;
+        |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
     let execution = Execution::load_units(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
         vec![&stages[0], &stages[1]], unit, rows, available.to_vec(), reservations.to_vec(), Some(transport), 17)?;
     if args.poison_scratch { execution.poison_scratch_between_layers(); }
@@ -1065,7 +1065,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut placement = pool.borrow_mut()
         .admit_cold(&family, 1, 1, |pages| Placement {
             pages,
-            sequence: 0, segments: Vec::new(),
+            sequence: 0,
             committed: 0,
         })?
         .placement;

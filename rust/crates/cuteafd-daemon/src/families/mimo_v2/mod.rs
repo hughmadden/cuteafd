@@ -4,6 +4,7 @@ pub(crate) mod admission;
 pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod mtp;
+mod packed_check;
 mod media;
 pub(crate) mod prefix;
 pub(crate) mod serve;
@@ -322,6 +323,18 @@ mod draft_storage_tests {
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
         let span = args(&["--prefill-rows", "1024", "--prefill-span-rows", "6144"]);
         assert_eq!((span.prefill_rows, span.prefill_span_rows), (1024, 6144));
+    }
+
+    #[test]
+    fn packed_check_cli_matches_existing_golden_conventions() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Command { #[command(flatten)] golden: GoldenArgs }
+        let base = ["mimo-golden", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so",
+            "--golden", "/missing/golden", "--packed-check", "3"];
+        assert_eq!(Command::try_parse_from(base).unwrap().golden.packed_check, Some(3));
+        assert!(Command::try_parse_from(base.into_iter().chain(["--resume-at", "64"])).is_err());
+        assert!(Command::try_parse_from(base.into_iter().chain(["--teacher-force"])).is_err());
     }
 
     #[test]
@@ -687,7 +700,7 @@ pub(crate) struct GoldenArgs {
     /// Write tokens.bin and complete FP32 logits.bin rows from the served unit
     /// executor to a new directory for same-cut byte-identity qualification.
     #[arg(long, requires = "nll", conflicts_with_all = ["timing", "teacher_force", "resume_at",
-        "token_check", "greedy_digest", "draft_oracle", "draft_replay", "mtp_oracle"])]
+        "token_check", "greedy_digest", "draft_oracle", "draft_replay", "mtp_oracle", "packed_check"])]
     pub save_logits: Option<PathBuf>,
     /// Skip the per-layer comparison (each layer's rows are otherwise copied
     /// back), so prefill and decode times are the engine's.
@@ -729,6 +742,12 @@ pub(crate) struct GoldenArgs {
     /// --prefill-chunk rows; a straight prefill without the boundary at P is reported too.
     #[arg(long)]
     pub resume_at: Option<usize>,
+    /// Compare N (2 to 10) mixed-length packed prefills with independent passes,
+    /// then replace one partner at fixed geometry. Checks logits, KV bytes and
+    /// frontiers on every rank; requires every layer and enough request rings.
+    #[arg(long, conflicts_with_all = ["resume_at", "token_check", "greedy_digest", "teacher_force",
+        "draft_oracle", "draft_replay", "mtp_oracle"])]
+    pub packed_check: Option<usize>,
     /// Token I/O gate after the golden prompt (--prefill N truncates it),
     /// then stop: the resident embedding table against the shard, device
     /// against host greedy selection over this many decode steps, and device
@@ -1487,6 +1506,9 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if let Some(members) = args.packed_check {
+        return packed_check::run(engine, &tokens, members);
+    }
     if let Some(at) = args.resume_at {
         return resume_check(args, engine, &tokens, at);
     }

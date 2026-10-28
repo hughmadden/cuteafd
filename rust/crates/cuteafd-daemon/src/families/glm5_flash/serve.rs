@@ -1762,9 +1762,7 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
                 **prompt_row = Some(logits.row_host(cx.library, 0)?);
             }
             if probe::wants_first(&job.probe) {
-                if let Err(error) = probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len) {
-                    return Ok(Err(error));
-                }
+                probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len)?;
             }
             let mut batch = SelectBatch::default();
             if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
@@ -2020,12 +2018,12 @@ mod packed_member_tests {
     }
 
     #[test]
-    fn a_shared_failure_fails_every_member_and_a_short_outcome_list_the_rest() {
+    fn shared_failure_or_malformed_outcomes_fail_every_member() {
         let all = member_outcomes(3, Err(anyhow::anyhow!("head failed")));
         assert_eq!(all.iter().map(|o| o.as_ref().unwrap_err().to_string()).collect::<Vec<_>>(),
             vec!["packed prefill of 3 prompts: head failed"; 3]);
         let short = member_outcomes(3, Ok(vec![Ok(())]));
-        assert_eq!(short.iter().map(Result::is_ok).collect::<Vec<_>>(), [true, false, false]);
+        assert_eq!(short.iter().map(Result::is_ok).collect::<Vec<_>>(), [false, false, false]);
     }
 
     #[test]
