@@ -111,6 +111,31 @@ impl P2pTest {
     }
 }
 
+/// One rank's reply frames for [`NativeLibrary::pull_frames`]
+/// (`cuteafd_pull_frames_t`): written by the host in mapped pinned memory,
+/// read by the kernel when it runs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PullFrames {
+    pub count: u32,
+    pub reserved: u32,
+    pub frame: [PullEntry; PULL_MAX_FRAMES],
+}
+
+/// One frame of a [`PullFrames`]: `bytes` from the device-visible `source`
+/// to `offset` bytes into the rank's plane (all 4-byte multiples).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PullEntry {
+    pub source: u64,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// Frames per rank and ranks per [`NativeLibrary::pull_frames`] launch.
+pub const PULL_MAX_FRAMES: usize = 4;
+pub const PULL_MAX_RANKS: usize = 8;
+
 impl NativeLibrary {
     /// Preload diagnostic variants before an exchange can enqueue any wait.
     pub fn peer_diagnostic_initialize(&self) -> Result<()> {
@@ -443,6 +468,31 @@ impl NativeLibrary {
         let status = unsafe { self.lib.get::<F>(b"cuteafd_sm_copy_regions")?(destinations.as_ptr(), sources.as_ptr(),
             bytes.as_ptr(), regions.len() as u32, stream) };
         ensure!(status == 0, "SM region copy failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// Pulls each rank's published reply frames ([`PullFrames`], in mapped
+    /// pinned memory, read when the kernel runs) into its device plane on
+    /// `stream` (see `cuteafd_pull_frames`). One launch for up to
+    /// [`PULL_MAX_RANKS`] ranks.
+    ///
+    /// # Safety
+    /// Every `replies[i]` is the device-visible address of a live mapped
+    /// [`PullFrames`] whose frames (when its count is non-zero by the time the
+    /// kernel runs) are live mapped pinned memory, unchanged until the kernel
+    /// completes; every plane is a live device buffer of its capacity on the
+    /// stream's device, unread until later work on the stream.
+    pub unsafe fn pull_frames(&self, replies: &[*const PullFrames], planes: &[(*mut c_void, u64)],
+        stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const *const PullFrames, *const *mut c_void, *const u64, u32, *mut c_void) -> i32;
+        ensure!((1..=PULL_MAX_RANKS).contains(&replies.len()) && replies.len() == planes.len(),
+            "{} replies into {} planes in one pull", replies.len(), planes.len());
+        let destinations: Vec<_> = planes.iter().map(|plane| plane.0).collect();
+        let capacity: Vec<_> = planes.iter().map(|plane| plane.1).collect();
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_pull_frames") }?;
+        // SAFETY: the caller vouches for the descriptors and planes; native copies the arrays.
+        let status = unsafe { f(replies.as_ptr(), destinations.as_ptr(), capacity.as_ptr(), replies.len() as u32, stream) };
+        ensure!(status == 0, "pulling {} ranks' reply frames failed with CUDA error {status}", replies.len());
         Ok(())
     }
 

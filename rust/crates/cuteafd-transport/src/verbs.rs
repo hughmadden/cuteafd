@@ -2286,6 +2286,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
         })
     }
 
+    /// Final reply frames this session can leave with consumers at once.
+    pub(crate) fn retained_reply_slots(&self) -> usize {
+        if self.retained_response_ring.is_some() { self.response_ring.depth } else { 0 }
+    }
+
     fn take_response_frame(
         &mut self,
         response_wire_bytes: usize,

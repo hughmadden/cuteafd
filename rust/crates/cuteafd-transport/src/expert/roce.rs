@@ -303,6 +303,12 @@ impl SparkExperts {
         self.clients.landing_ranks()
     }
 
+    /// Per rank: reply frames its session can leave with a consumer at once
+    /// (the receive ring depth; 0 when replies are copied out instead).
+    pub fn retained_reply_slots(&self) -> Vec<usize> {
+        self.clients.retained_reply_slots()
+    }
+
     /// Send the same canonical request to all ranks and accept every route row.
     /// The synchronous sink must consume/copy its frame slice before returning.
     /// It runs on the polling thread, allowing CUDA owners to stay thread-local.

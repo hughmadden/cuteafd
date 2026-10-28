@@ -233,6 +233,11 @@ impl LocalTp4Client {
     pub(crate) fn landing_ranks(&self) -> Vec<bool> {
         self.sessions.iter().map(|s| s.as_ref().is_some_and(|s| s.gpu_landing)).collect()
     }
+    /// Per rank: how many final reply frames its live session can leave with
+    /// consumers at once (its response ring depth; 0 without a retained ring).
+    pub(crate) fn retained_reply_slots(&self) -> Vec<usize> {
+        self.sessions.iter().map(|s| s.as_ref().map_or(0, |s| s.retained_reply_slots())).collect()
+    }
     pub(crate) fn reset(&mut self) {
         if self.terminal_owner.is_some() {
             // submit's terminal path first quiesces every QP, then drains
