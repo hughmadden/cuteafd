@@ -119,6 +119,33 @@ int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
 int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
     const uint64_t* bytes, uint32_t count, void* stream);
 
+// One Spark rank's reply for `cuteafd_pull_frames`: the frames it arrived in
+// (`count` of them, at most CUTEAFD_PULL_MAX_FRAMES), each `bytes` from
+// `source` (a device-visible address of mapped pinned host memory: a
+// registered receive slot) to `offset` bytes into the rank's plane. The host
+// exchange worker writes it in mapped pinned memory before it publishes the
+// rank's arrival; the kernel reads it when it runs, so a captured launch
+// pulls whatever the worker published for that replay. A count of 0 copies
+// nothing (the worker clears counts before it releases waits after a failure).
+#define CUTEAFD_PULL_MAX_FRAMES 4
+#define CUTEAFD_PULL_MAX_RANKS 8
+typedef struct cuteafd_pull_entry {
+  uint64_t source;
+  uint64_t offset;
+  uint64_t bytes;
+} cuteafd_pull_entry_t;
+typedef struct cuteafd_pull_frames {
+  uint32_t count;
+  uint32_t reserved;
+  cuteafd_pull_entry_t frame[CUTEAFD_PULL_MAX_FRAMES];
+} cuteafd_pull_frames_t;
+// On the stream: pulls `count` (1..8) ranks' published frames
+// (`replies[i]`, mapped) into device planes `planes[i]` (16-byte aligned,
+// `capacity[i]` bytes). Frames 4-byte aligned in source, offset and size; a
+// frame past its plane or misaligned copies nothing.
+int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, void* stream);
+
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time
 // per operation in microseconds (median of 5 repeats of `iterations` ops):
