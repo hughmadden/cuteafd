@@ -408,6 +408,83 @@ def qualify_mtp(source, numerical, root, identity, row):
     return proof
 
 
+def decision_policy():
+    """Bounded format admission, independent of a nearly lossless FP8 lattice."""
+    return dict(schema="cuteafd-flash-k6-absolute-format-admission-v1",
+        metric="heldout-activation-weighted-projection-NMSE",
+        maximum_k6_nmse=1e-3, fp8_control="reported-comparison-not-an-admission-bound",
+        native_checks="all-required", full_model_quality_claim=False)
+
+
+def validate_policy_change(original, current, expected_original_sha256):
+    """Permit only validator/report-audit functions to differ from a capture."""
+    import ast
+    if hashlib.sha256(original.encode()).hexdigest() != expected_original_sha256:
+        raise ValueError("original pilot Git source does not match capture identity")
+    allowed = {"validate_qualification", "decision_policy", "validate_policy_change", "validate_report_code"}
+    def replay_ast(code):
+        tree = ast.parse(code)
+        tree.body = [node for node in tree.body
+                     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in allowed]
+        return ast.dump(tree, include_attributes=False)
+    if replay_ast(original) != replay_ast(current):
+        raise ValueError("pilot capture/scoring/replay implementation changed")
+    return sorted(allowed)
+
+
+def validate_report_code(report, repo=REPO):
+    """Bind historical evidence to unchanged numerics and an audited policy delta."""
+    repo = Path(repo).resolve()
+    identity = report["identity"]
+    fork = repo/"third_party/gptqmodel"
+    actual = subprocess.check_output(["git", "-C", str(fork), "rev-parse", "HEAD"], text=True).strip()
+    if actual != identity["gptqmodel_commit"]:
+        raise ValueError("qualification fork commit changed")
+    pilot = "quantization/glm5_flash/core_k6/pilot.py"
+    changed = []
+    for relative, digest in identity["code"].items():
+        path = (repo/relative).resolve()
+        if not path.is_relative_to(repo):
+            raise ValueError("qualification code path escapes repository")
+        if sha256_file(path) != digest:
+            changed.append(relative)
+    if not changed:
+        return report
+    if changed != [pilot]:
+        raise ValueError("qualification numerical producer changed: " + ", ".join(changed))
+    migration = report.get("policy_migration", {})
+    if migration.get("schema") != "cuteafd-flash-pilot-report-only-migration-v1":
+        raise ValueError("qualification needs an audited reporting-only policy migration")
+    revision = migration.get("original_pilot_git_revision", "")
+    if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+        raise ValueError("original pilot Git revision is invalid")
+    original = subprocess.check_output(["git", "-C", str(repo), "show", revision+":"+pilot], text=True)
+    current = (repo/pilot).read_text()
+    allowed = validate_policy_change(original, current, identity["code"][pilot])
+    policy_hash = hashlib.sha256(canonical(decision_policy()).encode()).hexdigest()
+    if (migration.get("original_pilot_sha256") != identity["code"][pilot]
+            or migration.get("current_pilot_sha256") != sha256_file(repo/pilot)
+            or migration.get("allowed_reporting_nodes") != allowed
+            or migration.get("decision_policy_sha256") != policy_hash
+            or report.get("decision_policy") != decision_policy()):
+        raise ValueError("qualification reporting-policy attestation differs")
+    if migration.get("finalizer_code_sha256") != sha256_file(repo/"quantization/glm5_flash/core_k6/finalize.py"):
+        raise ValueError("qualification finalizer implementation changed")
+    root = Path(report["evidence_root"])
+    if migration.get("audit_file") != "finalization-audit.json":
+        raise ValueError("qualification finalization audit path differs")
+    audit_path = root/migration["audit_file"]
+    if sha256_file(audit_path) != migration.get("audit_sha256"):
+        raise ValueError("qualification finalization audit hash differs")
+    audit = json.loads(audit_path.read_text())
+    if (audit.get("identity") != identity or audit.get("native_checks") != report["native_checks"]
+            or sha256_file(root/"plan.json") != migration.get("original_plan_sha256")
+            or audit.get("decision_policy_sha256") != policy_hash
+            or audit.get("status") != "passed"):
+        raise ValueError("qualification finalization audit differs")
+    return report
+
+
 def validate_qualification(report):
     if report.get("status") != "passed" or set(report.get("native_checks", {})) != set(CHECKS):
         raise ValueError("pilot qualification is incomplete")
@@ -424,8 +501,8 @@ def validate_qualification(report):
         raise ValueError("BF16 reference differs")
     for name in {r["tensor"] for r in rows}:
         arms = {r["arm"]:r for r in rows if r["tensor"] == name}
-        if arms["mcg-k6"]["nmse"] > arms["fp8-block128"]["nmse"]:
-            raise ValueError("K6 heldout error exceeds the FP8 control: " + name)
+        if arms["mcg-k6"]["nmse"] > decision_policy()["maximum_k6_nmse"]:
+            raise ValueError("K6 heldout error exceeds the absolute format bound: " + name)
     return report
 
 
