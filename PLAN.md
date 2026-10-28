@@ -6051,3 +6051,10 @@ and numerical producer identities are unchanged. Completed artifact and
 model card remain at the export path above. Publication is not started:
 the brief explicitly requires TJ's confirmation before upload. Full-model
 quality, long-context behavior and serving qualification remain separate work.
+
+TJ approved publication with "Yep publish it" on 2026-10-28. The completed
+export already organizes all 58,923 diagnostic records into 80 subdirectories
+(at most 776 files each), below the Hub's folder-entry ceiling. Every exported
+record independently matches its original numerical evidence byte-for-byte.
+Publication uses the existing CPU-only publisher and exact completed producer;
+no numerical or weight changes are needed.
