@@ -26,7 +26,38 @@ pub struct Phase {
     pub assessments: Vec<String>,
     #[serde(default)]
     pub health: BTreeMap<String, cuteafd_transport::fabric_health::Verdict>,
+    /// Contention on the coordinator host during this phase; absent when the
+    /// host did not report pressure. Recorded even when quiet, so a card can
+    /// show the run was taken on an idle host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_load: Option<HostLoad>,
 }
+
+/// Coordinator-host contention over one phase. Pressure is the peak 10 s
+/// "some" average seen at the window boundaries; scanning is pages/s across
+/// the window. Values are kept low when the host was quiet.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HostLoad {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_some_avg10: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_some_avg10: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgscan_pages_per_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+    /// Host-local observation window the values describe.
+    #[serde(default)]
+    pub seconds: f64,
+}
+
+/// CPU pressure, memory pressure and reclaim rates above which a phase's
+/// timing cannot be trusted: concurrent cargo gates and kernel reclaim made
+/// the V4.1 Engram gather 2-3x slower on the coordinator (#895).
+const HOST_CPU_PRESSURE_WARN: f64 = 10.0;
+const HOST_MEMORY_PRESSURE_WARN: f64 = 5.0;
+const HOST_SCAN_PAGES_PER_S_WARN: f64 = 1_000.0;
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Port {
@@ -181,11 +212,26 @@ pub fn exchange_bytes(phase: &Phase, port: &Port) -> (Option<u64>, Option<u64>) 
      port.engine_received_bytes.map(|local| local.max(rx.unwrap_or(0))))
 }
 
-/// Only measured background traffic and a down engine port call for another A/B.
-/// Reassess raw evidence so reports from older seals do not repeat stale labels.
+/// Only measured background traffic, host contention and a down engine port
+/// call for another A/B. Reassess raw evidence so reports from older seals do
+/// not repeat stale labels.
 pub fn rerun_reasons(phase: &Phase) -> Vec<String> {
     if !phase.timed { return Vec::new(); }
     let mut reasons = Vec::new();
+    if let Some(load) = &phase.host_load {
+        if load.cpu_some_avg10.is_some_and(|cpu| cpu > HOST_CPU_PRESSURE_WARN) {
+            reasons.push(format!("host load: coordinator CPU pressure {:.1}% (>{}%)",
+                load.cpu_some_avg10.unwrap_or_default(), HOST_CPU_PRESSURE_WARN));
+        }
+        if load.memory_some_avg10.is_some_and(|memory| memory > HOST_MEMORY_PRESSURE_WARN) {
+            reasons.push(format!("host load: coordinator memory pressure {:.1}% (>{}%)",
+                load.memory_some_avg10.unwrap_or_default(), HOST_MEMORY_PRESSURE_WARN));
+        }
+        if load.pgscan_pages_per_s.is_some_and(|scan| scan > HOST_SCAN_PAGES_PER_S_WARN) {
+            reasons.push(format!("host load: coordinator page reclaim {:.0} pages/s (>{} pages/s)",
+                load.pgscan_pages_per_s.unwrap_or_default(), HOST_SCAN_PAGES_PER_S_WARN));
+        }
+    }
     for p in &phase.ports {
         let label = format!("{} {}/{}", p.host, p.device, p.port);
         if (p.engine_sent_bytes.is_some_and(|n| n > 0) || p.engine_received_bytes.is_some_and(|n| n > 0))
@@ -215,6 +261,38 @@ pub fn rerun_reasons(phase: &Phase) -> Vec<String> {
         }
     }
     reasons
+}
+
+/// Coordinator-host contention across a phase window. The peak boundary
+/// pressure is used because the 10 s PSI average at either end covers the
+/// phase; scanning is a cumulative-counter delta over the same window.
+fn host_load(before: &Snapshot, after: &Snapshot) -> Option<HostLoad> {
+    let (bc, ac) = (before.hosts.get("coordinator")?, after.hosts.get("coordinator")?);
+    // A restarted coordinator resets the cumulative scan counters.
+    if bc.incarnation.is_empty() || ac.incarnation != bc.incarnation { return None; }
+    let b = bc.host_load.as_ref()?;
+    let a = ac.host_load.as_ref()?;
+    let seconds = ac.sampled_s - bc.sampled_s;
+    if !(seconds > 0.0) || !seconds.is_finite() { return None; }
+    let peak = |old: Option<f64>, new: Option<f64>| match (old, new) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+    let scanned = |load: &cuteafd_transport::traffic::HostLoad| load.pgscan_kswapd.zip(load.pgscan_direct)
+        .map(|(kswapd, direct)| kswapd.saturating_add(direct));
+    let pages_per_s = scanned(a).zip(scanned(b)).and_then(|(now, then)| now.checked_sub(then))
+        .map(|pages| pages as f64 / seconds);
+    let load = HostLoad {
+        cpu_some_avg10: peak(b.cpu_some_avg10, a.cpu_some_avg10),
+        memory_some_avg10: peak(b.memory_some_avg10, a.memory_some_avg10),
+        pgscan_pages_per_s: pages_per_s,
+        load1: peak(b.load1, a.load1),
+        seconds,
+    };
+    // An older coordinator reports no counters; keep the phase silent then.
+    (load.cpu_some_avg10.is_some() || load.memory_some_avg10.is_some() || load.pgscan_pages_per_s.is_some())
+        .then_some(load)
 }
 
 /// Fabric recovery and missing telemetry are informational, never invalid results.
@@ -354,6 +432,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
                 idle_xmit_wait_ticks_per_s: port.idle_xmit_wait_ticks_per_s, peers });
         }
     }
+    phase.host_load = host_load(before, after);
     phase.assessments.extend(rerun_reasons(&phase));
     for host in before.hosts.keys().chain(after.hosts.keys()) {
         phase.health.insert(host.clone(), cuteafd_transport::fabric_health::verdict(phase.ports.iter()
@@ -572,6 +651,51 @@ mod tests {
         assert!(!caveats(&[phase]).iter().any(|s| s.contains("retransmits")));
         assert!(caveats(&[interval("warmup", false, &before, &after)]).is_empty());
     }
+    #[test]
+    fn coordinator_host_load_flags_pressure_and_reclaim() {
+        use cuteafd_transport::traffic::HostLoad as Sample;
+        fn snapshot(time: f64, load: Sample) -> Snapshot {
+            Snapshot { hosts: BTreeMap::from([("coordinator".into(), HostSample {
+                incarnation: "one".into(), sampled_s: time, host_load: Some(load), ..Default::default() })]) }
+        }
+        let sample = |cpu, memory, kswapd, direct, load1| Sample {
+            cpu_some_avg10: Some(cpu), memory_some_avg10: Some(memory),
+            pgscan_kswapd: Some(kswapd), pgscan_direct: Some(direct), load1: Some(load1) };
+        let caveat = |before: Sample, after: Sample, timed| {
+            caveats(&[interval("decode", timed, &snapshot(10.0, before), &snapshot(20.0, after))])
+        };
+
+        // A quiet host records its values and produces no caveat.
+        let quiet = caveat(sample(1.0, 0.5, 1_000, 0, 0.4), sample(2.0, 1.0, 1_000, 0, 0.5), true);
+        assert!(quiet.is_empty(), "{quiet:?}");
+        let phase = interval("decode", true, &snapshot(10.0, sample(1.0, 0.5, 1_000, 0, 0.4)),
+            &snapshot(20.0, sample(2.0, 1.0, 1_000, 0, 0.5)));
+        let load = phase.host_load.expect("quiet values are recorded");
+        assert_eq!(load.cpu_some_avg10, Some(2.0));
+        assert_eq!(load.memory_some_avg10, Some(1.0));
+        assert_eq!(load.pgscan_pages_per_s, Some(0.0));
+        assert_eq!(load.seconds, 10.0);
+
+        let cpu = caveat(sample(2.0, 0.5, 0, 0, 0.4), sample(25.0, 1.0, 0, 0, 0.5), true);
+        assert_eq!(cpu.len(), 1, "{cpu:?}");
+        assert!(cpu[0].contains("host load") && cpu[0].contains("CPU pressure") && cpu[0].contains("25.0%"),
+            "{cpu:?}");
+        assert!(cpu[0].contains("quiet window"), "{cpu:?}");
+
+        let memory = caveat(sample(2.0, 0.5, 0, 0, 0.4), sample(2.0, 9.0, 0, 0, 0.5), true);
+        assert_eq!(memory.len(), 1, "{memory:?}");
+        assert!(memory[0].contains("memory pressure") && memory[0].contains("9.0%"), "{memory:?}");
+
+        // 15k + 5k pages over 10 s is 2000 pages/s of kswapd + direct reclaim.
+        let reclaim = caveat(sample(2.0, 0.5, 0, 0, 0.4), sample(2.0, 1.0, 15_000, 5_000, 0.5), true);
+        assert_eq!(reclaim.len(), 1, "{reclaim:?}");
+        assert!(reclaim[0].contains("page reclaim") && reclaim[0].contains("2000 pages/s"), "{reclaim:?}");
+
+        // Warm-up and other untimed phases never gate.
+        let untimed = caveat(sample(2.0, 0.5, 0, 0, 0.4), sample(90.0, 90.0, 900_000, 900_000, 9.0), false);
+        assert!(untimed.is_empty(), "{untimed:?}");
+    }
+
     #[test]
     fn disappeared_or_restarted_evidence_is_unknown() {
         let before = snapshot(1.0, 0, 0);

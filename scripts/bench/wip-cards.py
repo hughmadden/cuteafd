@@ -1142,11 +1142,23 @@ def classify(row, launched):
 
 
 def fabric_rerun_reasons(phases):
-    """Reconcile wire bytes with both endpoints, including older RX meters."""
+    """Reconcile wire bytes with both endpoints, including older RX meters,
+    and flag coordinator-host contention that makes timings untrustworthy."""
     reasons = []
     for phase in phases:
         if not phase.get('timed'):
             continue
+        name = phase.get('name', '?')
+        load = phase.get('host_load') or {}
+        cpu = load.get('cpu_some_avg10')
+        if cpu is not None and cpu > 10:
+            reasons.append(f"{name}: host load: coordinator CPU pressure {cpu:.1f}% (>10%)")
+        memory = load.get('memory_some_avg10')
+        if memory is not None and memory > 5:
+            reasons.append(f"{name}: host load: coordinator memory pressure {memory:.1f}% (>5%)")
+        scan = load.get('pgscan_pages_per_s')
+        if scan is not None and scan > 1000:
+            reasons.append(f"{name}: host load: coordinator page reclaim {scan:.0f} pages/s (>1000 pages/s)")
         ports = phase.get('ports', [])
         for p in ports:
             label = f"{p.get('host')} {p.get('device')}/{p.get('port')}"

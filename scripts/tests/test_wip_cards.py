@@ -1961,6 +1961,31 @@ def test_fabric_health_caveat_only_gates_timed_phases():
     assert cards.fabric_rerun_reasons(phases) == []
 
 
+def test_coordinator_host_load_makes_the_ab_rerun(tmp_path):
+    # A quiet coordinator records low values and stays eligible; CPU pressure,
+    # memory pressure and reclaim each independently force a rerun.
+    quiet = dict(name='decode', timed=True, ports=[],
+                 host_load=dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0, seconds=10))
+    assert cards.fabric_rerun_reasons([quiet]) == []
+    assert cards.fabric_assessment([quiet]) == []
+    contaminated = [
+        dict(cpu_some_avg10=25.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0),
+        dict(cpu_some_avg10=1.0, memory_some_avg10=9.0, pgscan_pages_per_s=0.0),
+        dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=2000.0),
+    ]
+    phases = [dict(name='decode', timed=True, ports=[], host_load=load) for load in contaminated]
+    reasons = cards.fabric_rerun_reasons(phases)
+    assert any('host load' in r and 'CPU pressure' in r and '25.0%' in r for r in reasons), reasons
+    assert any('memory pressure' in r and '9.0%' in r for r in reasons), reasons
+    assert any('page reclaim' in r and '2000 pages/s' in r for r in reasons), reasons
+    assert cards.fabric_rerun_reasons([dict(phases[0], timed=False)]) == []
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10, fabric=phases)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'rerun'
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'host load' in text
+
+
 def _checkout(path, run_sh=True):
     path.mkdir(parents=True)
     subprocess.run(['git', 'init', '-q', str(path)], check=True)
