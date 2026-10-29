@@ -5441,7 +5441,7 @@ mod prefill_lane_tests {
             // `fp8_gemv_shipped_warps`; a tuning entry moves only the grid, never the warps.
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
             // Additive prefill-only F32 MMA router; every decode projection remains unchanged.
-            ("integration/cuteafd/glmf.py", 0xcffc01cfe0179071_u64),
+            ("integration/cuteafd/glmf.py", 0x9384fb38251982be_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
