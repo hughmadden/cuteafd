@@ -227,6 +227,21 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         self
     }
 
+    /// Score retained packed target rows before another target pass replaces them.
+    #[cfg(test)]
+    pub(super) fn diagnostic_packed_logits(&self, rows: &[usize]) -> Result<Vec<Vec<f32>>> {
+        let rank = self.execution.ownership().execution().spec().head_gpu as usize;
+        let stages = self.execution.stages();
+        let stream = &stages[rank].stream;
+        let head = self.execution.head()?;
+        rows.iter().map(|&row| {
+            let source = super::mtp::slice(self.inputs.residual.buffer, row * H * 4, H * 4)?;
+            let logits = head.device_logits_on(source, 1, stream)?;
+            stream.drain()?;
+            logits.row_host(self.library, 0)
+        }).collect()
+    }
+
     #[cfg(test)]
     pub(super) fn diagnostic_state(&self, placement: &Placement) -> Result<Vec<Vec<u8>>> {
         self.state.retire();

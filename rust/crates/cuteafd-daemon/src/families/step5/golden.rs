@@ -193,7 +193,7 @@ fn selected_layers() -> Result<Vec<usize>> {
         .collect()
 }
 
-fn reference_identity(meta: &Value, fp8_diagnostic: bool) -> Result<()> {
+pub(super) fn reference_identity(meta: &Value, fp8_diagnostic: bool) -> Result<()> {
     let (checkpoint, revision) = if fp8_diagnostic {
         ("stepfun-ai/Step-5-Preview", FP8_REVISION)
     } else {

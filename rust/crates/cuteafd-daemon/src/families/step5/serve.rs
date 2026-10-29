@@ -685,17 +685,41 @@ mod tests {
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
         args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
             .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
-        let bytes = std::fs::read(std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?)
-            .join("windows/original-page-leases/tokens.bin"))?;
+        let fixtures = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures.join("meta.json"))?)?;
+        super::super::golden::reference_identity(&meta, false)?;
+        use sha2::{Digest, Sha256};
+        let tokenizer = format!("{:x}", Sha256::digest(std::fs::read(args.snapshot.join("tokenizer.json"))?));
+        ensure!(meta["snapshot_identity"]["tokenizer_sha256"] == tokenizer,
+            "packed reference tokenizer differs from target");
+        let window = meta["windows"].as_array().context("packed reference windows")?.iter()
+            .find(|w| w["id"] == "original-page-leases" && w["path"] == "windows/original-page-leases")
+            .context("packed reference window absent")?;
+        let positions = window["positions"].as_array().context("packed reference positions")?.iter()
+            .map(|p| p.as_u64().map(|p| p as usize).context("invalid packed reference position"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!positions.is_empty() && positions.windows(2).all(|p| p[0] < p[1]),
+            "packed reference positions must increase");
+        let folder = fixtures.join("windows/original-page-leases");
+        let bytes = std::fs::read(folder.join("tokens.bin"))?;
         ensure!(bytes.len() % 4 == 0, "packed exactness token byte extent");
         let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
         ensure!(tokens.len() >= 192, "packed exactness needs 192 real tokens");
+        let reference_bytes = std::fs::read(folder.join("logits.bin"))?;
+        let vocab = window["vocab"].as_u64().context("packed reference vocabulary")? as usize;
+        ensure!(vocab > 0 && reference_bytes.len() == positions.len() * vocab * 4,
+            "packed reference logit extent");
+        let reference_logits = reference_bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        let precision = cuteafd_bench::fidelity_precision::resolve("step5-packed-target", Some(&args.snapshot),
+            &serde_json::json!({}), "stepfun-ai/Step-5-Preview-BF16", None)?;
         with_backend(&args, |backend, _| {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 4)?;
             let mut placements = (0..4).map(|sequence| pool.admit_cold(&family, 192, 256,
                 |pages| Placement { pages, sequence, committed: 0 }).map(|a| a.placement)).collect::<std::result::Result<Vec<_>, _>>()?;
             let mut drafts = (0..4).map(|_| DraftState::default()).collect::<Vec<_>>();
-            let prompts = [&tokens[..128], &tokens[31..159]];
+            ensure!(backend.geometry().vocab_size == vocab, "packed reference vocabulary mismatch");
+            let prompts = [&tokens[..128], &tokens[..159]];
             for (i, (p, draft)) in placements.iter_mut().zip(&mut drafts).enumerate() {
                 let prompt = prompts[i % 2];
                 backend.bind_request(p, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, prompt.len())?, prompt, 0)?;
@@ -704,7 +728,7 @@ mod tests {
                     backend.prefill_draft(p, 0, &prompt[..65], prompt.get(65).copied(), draft)?;
                 }
             }
-            let chunks = [&prompts[0][..29], &prompts[1][65..105]];
+            let chunks = [&prompts[0][..96], &prompts[1][65..105]];
             let limits = backend.packed_limits().context("Step-5 packing limits missing")?;
             let layout = [(0, chunks[0].len()), (65, chunks[1].len())];
             let groups = crate::shared::prefill_packing::groups(2, |range|
@@ -728,6 +752,30 @@ mod tests {
                         Ok(Ok(()))
                     })?;
                     for outcome in outcomes { outcome?; }
+                    // Each stored position p predicts token p from the true prefix [0, p).
+                    // MTP/head scratch may change, but the packed residual has its own owner.
+                    for i in 0..2 {
+                        let (start, rows) = layout[i];
+                        let selected = positions.iter().enumerate().filter(|(_, p)|
+                            **p > start && **p <= start + rows).collect::<Vec<_>>();
+                        ensure!(!selected.is_empty(), "packed member {i} has no official scored rows");
+                        let offset = chunks[..i].iter().map(|c| c.len()).sum::<usize>();
+                        let packed_rows = selected.iter().map(|(_, p)| offset + **p - start - 1).collect::<Vec<_>>();
+                        let actual = backend.diagnostic_packed_logits(&packed_rows)?;
+                        let expected = selected.iter().flat_map(|(row, _)|
+                            reference_logits[row * vocab..(row + 1) * vocab].iter().copied()).collect::<Vec<_>>();
+                        let actual = actual.into_iter().flatten().collect::<Vec<_>>();
+                        let (kl, _) = crate::shared::golden_scores::scored_kl(&expected, &actual, vocab)?;
+                        let argmax = |row: &[f32]| row.iter().enumerate()
+                            .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                        let agreement = expected.chunks_exact(vocab).zip(actual.chunks_exact(vocab))
+                            .filter(|(a, b)| argmax(a) == argmax(b)).count();
+                        let top1 = agreement as f64 / selected.len() as f64;
+                        println!("Step-5 packed official member={i} rows={} KL={kl:.9e} top1={top1:.6} tier={:?} kl_max={} top1_min={}",
+                            selected.len(), precision.tier, precision.tier_kl_max, precision.tier_top1_min);
+                        ensure!(kl <= precision.tier_kl_max && top1 >= precision.tier_top1_min,
+                            "packed member {i} exceeds official reference fidelity tier");
+                    }
                 }
             }
             let exact = args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact;
