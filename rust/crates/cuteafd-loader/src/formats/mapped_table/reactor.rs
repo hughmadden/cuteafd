@@ -21,12 +21,16 @@ struct Queue {
     decode: VecDeque<Request>, prefill: VecDeque<Request>, buffers: Vec<Buffer>,
     borrowed: usize, prefill_borrowed: usize, decode_waiters: usize,
 }
-struct Shared { queue: Mutex<Queue>, available: Condvar, wake: OwnedFd, ready: AtomicBool }
+struct Shared { queue: Mutex<Queue>, available: Condvar, wake: OwnedFd, ready: AtomicBool, failed: AtomicBool }
 pub(super) struct Reactor { shared: Arc<Shared> }
 static REACTOR: OnceLock<Mutex<Option<Arc<Reactor>>>> = OnceLock::new();
 
 pub(super) fn started() -> bool {
     REACTOR.get().is_some_and(|global| global.lock().unwrap_or_else(|p| p.into_inner()).is_some())
+}
+pub(super) fn ready() -> bool {
+    REACTOR.get().is_some_and(|global| global.lock().unwrap_or_else(|p| p.into_inner())
+        .as_ref().is_some_and(|reactor| reactor.ready()))
 }
 
 fn error(context: &str, source: std::io::Error) -> MappedTableError {
@@ -61,7 +65,7 @@ pub(super) fn global() -> Result<Arc<Reactor>> {
     if fd < 0 { return Err(error("creating table reactor eventfd", std::io::Error::last_os_error())); }
     // SAFETY: fd is freshly allocated and transferred exactly once.
     let wake = unsafe { OwnedFd::from_raw_fd(fd) };
-    let shared = Arc::new(Shared { queue: Mutex::new(Queue::default()), available: Condvar::new(), wake, ready: AtomicBool::new(false) });
+    let shared = Arc::new(Shared { queue: Mutex::new(Queue::default()), available: Condvar::new(), wake, ready: AtomicBool::new(false), failed: AtomicBool::new(false) });
     let owner = Arc::clone(&shared);
     let (started, ready) = mpsc::sync_channel(1);
     std::thread::Builder::new().name("table-read-reactor".into()).spawn(move || run(owner, started))
@@ -94,6 +98,10 @@ impl Reactor {
                     if decode { queue.decode_waiters -= 1; }
                     break 'fill;
                 }
+                if self.shared.failed.load(Ordering::Acquire) {
+                    if decode { queue.decode_waiters -= 1; }
+                    return Err(invalid("table read reactor owner exited"));
+                }
                 queue = self.shared.available.wait(queue).unwrap_or_else(|p| p.into_inner());
             }
             if decode { queue.decode_waiters -= 1; } else { queue.prefill_borrowed += 1; }
@@ -109,7 +117,10 @@ impl Reactor {
             let request = Request { buffer, width, priority, reply: send };
             {
                 let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-                if decode { queue.decode.push_back(request); } else { queue.prefill.push_back(request); }
+                if self.shared.failed.load(Ordering::Acquire) {
+                    let _ = request.reply.send(Reply { buffer: request.buffer,
+                        result: Err(invalid("table read reactor owner exited")) });
+                } else if decode { queue.decode.push_back(request); } else { queue.prefill.push_back(request); }
             }
             // A nonblocking eventfd is latched even when the owner is between
             // inspecting queues and arming PollAdd. No polling or lost wakeup.
@@ -178,7 +189,7 @@ impl Engine {
             self.jobs[index] = Some(Job { request, next: 0, left, error: None, stats: Default::default() });
         }
     }
-    fn enqueue(&mut self, mut active: Active) -> Result<()> {
+    fn enqueue(&mut self, active: Active) -> Result<()> {
         let index = self.free.pop().ok_or_else(|| invalid("reactor capacity exceeded"))?;
         let job = self.jobs[active.job].as_mut().expect("live read job");
         let read = &job.request.buffer.reads[active.row];
@@ -191,7 +202,6 @@ impl Engine {
             .offset(read.offset + active.done as u64).build().flags(io_uring::squeue::Flags::ASYNC).user_data(index as u64);
         // SAFETY: the owned job and the draining engine retain fd and destination.
         unsafe { self.ring.submission().push(&entry) }.map_err(|_| invalid("reactor read queue full"))?;
-        active.submitted = Instant::now();
         self.active[index] = Some(active);
         self.outstanding += 1;
         Ok(())
@@ -199,25 +209,35 @@ impl Engine {
     fn schedule(&mut self) -> Result<()> {
         let reserve = (self.active.len() / 8).clamp(1, 64);
         while self.outstanding < self.active.len() {
-            let decode = self.jobs.iter().position(|job| job.as_ref().is_some_and(|job|
-                job.request.priority == ReadPriority::Decode && job.next < job.request.buffer.reads.len()));
-            let prefill = self.jobs.iter().position(|job| job.as_ref().is_some_and(|job|
-                job.request.priority == ReadPriority::Prefill && job.next < job.request.buffer.reads.len()));
+            let candidate = |priority| self.retry.iter().find(|active|
+                self.jobs[active.job].as_ref().is_some_and(|job| job.request.priority == priority))
+                .map(|active| active.job).or_else(|| self.jobs.iter().position(|job| job.as_ref().is_some_and(|job|
+                    job.request.priority == priority && job.next < job.request.buffer.reads.len())));
+            let decode = candidate(ReadPriority::Decode);
+            let prefill = candidate(ReadPriority::Prefill);
             // Bound starvation under a continuous decode stream, without using
             // decode's reserved admission capacity for prefill.
             let prefill_allowed = self.outstanding < self.active.len() - reserve;
             let selected = if self.decode_streak >= 256 && prefill_allowed { prefill.or(decode) }
                 else { decode.or(if prefill_allowed { prefill } else { None }) };
-            if let Some(id) = selected {
+            let retry = self.retry.iter().position(|active|
+                self.jobs[active.job].as_ref().is_some_and(|job| {
+                    let priority = job.request.priority;
+                    (priority == ReadPriority::Decode || prefill_allowed) &&
+                        selected.is_none_or(|id| self.jobs[id].as_ref().unwrap().request.priority == priority)
+                }));
+            if let Some(at) = retry {
+                let active = self.retry.remove(at).expect("selected retry");
+                if self.jobs[active.job].as_ref().unwrap().request.priority == ReadPriority::Decode {
+                    self.decode_streak += 1;
+                } else { self.decode_streak = 0; }
+                self.enqueue(active)?;
+            } else if let Some(id) = selected {
                 let job = self.jobs[id].as_mut().expect("selected job");
                 let row = job.next;
                 job.next += 1;
                 if job.request.priority == ReadPriority::Decode { self.decode_streak += 1; } else { self.decode_streak = 0; }
                 self.enqueue(Active { job: id, row, done: 0, submitted: Instant::now() })?;
-            } else if let Some(at) = self.retry.iter().position(|active| prefill_allowed ||
-                self.jobs[active.job].as_ref().is_some_and(|job| job.request.priority == ReadPriority::Decode)) {
-                let active = self.retry.remove(at).expect("selected retry");
-                self.enqueue(active)?;
             } else { break; }
         }
         Ok(())
@@ -290,7 +310,19 @@ fn reject(shared: &Shared) {
         let _ = request.reply.send(Reply { buffer: request.buffer, result: Err(invalid("table reactor temporarily unavailable; retry via mmap")) });
     }
 }
+fn supervise(shared: &Shared, owner: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(owner)).is_err() {
+        tracing::error!("table read reactor owner panicked; rejecting queued work");
+    }
+    shared.failed.store(true, Ordering::Release);
+    shared.ready.store(false, Ordering::Release);
+    reject(shared);
+    shared.available.notify_all();
+}
 fn run(shared: Arc<Shared>, started: mpsc::SyncSender<()>) {
+    supervise(&shared, || run_owner(&shared, started));
+}
+fn run_owner(shared: &Shared, started: mpsc::SyncSender<()>) {
     let mut engine = match uring::new_ring() {
         Ok(ring) => { shared.ready.store(true, Ordering::Release); Some(Engine::new(ring)) },
         Err(error) => { tracing::warn!(%error, "table reactor setup failed; batches can retry"); None },
@@ -399,6 +431,50 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn owner_panic_rejects_queued_and_later_requests() -> Result<()> {
+        // SAFETY: eventfd returns a fresh descriptor with no borrowed pointers.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 { return Err(error("test eventfd", std::io::Error::last_os_error())); }
+        let shared = Arc::new(Shared { queue: Mutex::new(Queue::default()), available: Condvar::new(),
+            // SAFETY: the descriptor is fresh and transferred exactly once.
+            wake: unsafe { OwnedFd::from_raw_fd(fd) }, ready: AtomicBool::new(true), failed: AtomicBool::new(false) });
+        let (send, reply) = mpsc::sync_channel(1);
+        shared.queue.lock().unwrap().prefill.push_back(Request { buffer: Buffer::default(), width: 1,
+            priority: ReadPriority::Prefill, reply: send });
+        supervise(&shared, || panic!("injected owner panic"));
+        assert!(reply.recv_timeout(Duration::from_secs(1)).unwrap().result.is_err());
+        assert!(!shared.ready.load(Ordering::Acquire));
+        let owner = Reactor { shared };
+        let file = tempfile::NamedTempFile::new().map_err(|source| error("test file", source))?;
+        file.as_file().set_len(1).map_err(|source| error("test file size", source))?;
+        // SAFETY: immutable file remains live until the rejected request returns.
+        let part = unsafe { super::super::MappedRows::open(file.path(), 0, 1, 1)? };
+        let reads = [uring::Read { part: &part, row: 0, slot: 0 }];
+        assert!(owner.read(&reads, &mut [0], 1, ReadPriority::Decode).is_err());
+        let queue = owner.shared.queue.lock().unwrap();
+        assert_eq!((queue.borrowed, queue.prefill_borrowed, queue.decode_waiters), (0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn retries_preserve_first_submit_time_and_decode_fairness() -> Result<()> {
+        let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
+        let mut engine = Engine::new(ring);
+        let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
+        let (send, _reply) = mpsc::sync_channel(1);
+        engine.jobs[0] = Some(Job { request: Request { buffer: Buffer { bytes: vec![0; 2],
+            reads: vec![Read { file, offset: 0 }] }, width: 2, priority: ReadPriority::Decode, reply: send },
+            next: 1, left: 1, error: None, stats: Default::default() });
+        let first = Instant::now() - Duration::from_millis(20);
+        engine.retry.push_back(Active { job: 0, row: 0, done: 1, submitted: first });
+        engine.schedule()?;
+        assert_eq!(engine.decode_streak, 1);
+        assert_eq!(engine.active.iter().flatten().next().unwrap().submitted, first);
+        drop(engine);
+        Ok(())
+    }
+
+    #[test]
     fn eventfd_wake_admits_decode_within_one_owner_iteration() -> Result<()> {
         let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
         // SAFETY: eventfd returns a fresh descriptor with no memory references.
@@ -406,7 +482,7 @@ mod tests {
         if fd < 0 { return Err(error("test eventfd", std::io::Error::last_os_error())); }
         // SAFETY: this scope assumes unique ownership of the fresh descriptor.
         let shared = Shared { queue: Mutex::new(Queue::default()), available: Condvar::new(),
-            wake: unsafe { OwnedFd::from_raw_fd(fd) }, ready: AtomicBool::new(true) };
+            wake: unsafe { OwnedFd::from_raw_fd(fd) }, ready: AtomicBool::new(true), failed: AtomicBool::new(false) };
         let mut engine = Engine::new(ring);
         engine.arm(&shared.wake)?;
         engine.ring.submit().map_err(|source| error("submitting test wake", source))?;

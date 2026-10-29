@@ -32,9 +32,8 @@ fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
     let initial = reader.snapshot();
     assert_eq!(initial[0].cumulative, TableStatsSnapshot::default());
     stats.record_gather(2, 8, Duration::from_micros(4), [0; 3]);
-    stats.uring.store(true, Ordering::Relaxed);
     let fresh = reader.snapshot();
-    assert_eq!(fresh[0].backend, "mincore-routed");
+    assert_eq!(fresh[0].backend, stats.backend().to_string());
     assert_eq!(fresh[0].cumulative.gathers, 1);
     assert_eq!(fresh[0].cumulative.rows, 2);
     assert!(fresh[0].interval.is_none());
@@ -55,7 +54,7 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
         context: "injected io_uring_setup seccomp failure".into(),
         source: std::io::Error::from_raw_os_error(libc::EPERM),
     }));
-    assert_eq!(table.backend(), TableBackend::Mmap);
+    assert_eq!(table.backend() == TableBackend::MincoreRouted, reactor::ready());
     let mut output = [0; 12];
     table.gather_into(&[7, 2, 7], &mut output)?;
     assert_eq!(output, [7, 7, 7, 7, 2, 2, 2, 2, 7, 7, 7, 7]);
@@ -191,7 +190,6 @@ fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestRe
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: the test owns immutable shards until both tables are dropped.
     let mmap = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    mmap.stats.uring.store(false, Ordering::Relaxed);
     // SAFETY: same immutable test files.
     let uring = unsafe { MappedTable::open(&parts, u8_rows(4))? };
     uring.initialize_reads();
@@ -258,7 +256,6 @@ fn hybrid_and_fallback_gather_identical_random_cold_and_warm_rows() -> TestResul
             // SAFETY: the test owns immutable shards until this table is dropped.
             let table = unsafe { MappedTable::open(&parts, u8_rows(width))? };
             table.initialize_reads();
-            if backend == TableBackend::Mmap { table.stats.uring.store(false, Ordering::Relaxed); }
             if table.backend() != backend {
                 assert!(std::env::var("CUTEAFD_REQUIRE_URING").as_deref() != Ok("1"),
                     "required backend {backend:?} unavailable");
@@ -324,7 +321,6 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
         // SAFETY: test file is immutable while the table lives.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
         table.initialize_reads();
-        if backend == TableBackend::Mmap { table.stats.uring.store(false, Ordering::Relaxed); }
         if backend == TableBackend::MincoreRouted && table.backend() != backend {
             eprintln!("SKIP NOWAIT miss execution: unsupported kernel/seccomp/filesystem");
             continue;
@@ -420,6 +416,27 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
 }
 
 #[test]
+fn failed_misses_keep_initial_residency_and_copy_hits_only_once() -> TestResult {
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    file.write_all(&vec![0x5a; 8 * page])?;
+    file.as_file().sync_all()?;
+    // SAFETY: test-owned immutable file outlives all owned reads and mappings.
+    let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    std::hint::black_box(table.row(1)?[0]);
+    assert_eq!(table.residency(&[1, 3, 6], false)?, [true, false, false]);
+    uring::fail_next_setup(libc::EPERM);
+    let mut output = vec![0; 3 * page];
+    table.gather_into(&[1, 3, 6], &mut output)?;
+    assert!(output.iter().all(|&byte| byte == 0x5a));
+    let stats = table.stats().snapshot();
+    assert_eq!((stats.page_hits, stats.page_misses, stats.resident_copy_rows), (1, 2, 1));
+    assert_eq!(stats.miss_ns, 0);
+    Ok(())
+}
+
+#[test]
 fn mincore_routing_keeps_hits_on_caller_and_falls_back_safely() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: test-owned shard files remain immutable through the table lifetime.
@@ -438,7 +455,7 @@ fn mincore_routing_keeps_hits_on_caller_and_falls_back_safely() -> TestResult {
         context: "injected unavailable io_uring".into(),
         source: std::io::Error::from_raw_os_error(libc::EPERM),
     }));
-    assert_eq!(table.backend(), TableBackend::Mmap);
+    assert_eq!(table.backend() == TableBackend::MincoreRouted, reactor::ready());
     let mut output = [0; 12];
     table.gather_into(&[7, 2, 7], &mut output)?;
     assert_eq!(output, [7, 7, 7, 7, 2, 2, 2, 2, 7, 7, 7, 7]);
@@ -861,7 +878,6 @@ fn residency_overhead_measurement() -> TestResult {
     file.as_file().sync_all()?;
     // SAFETY: immutable fixture survives every gather and mapping.
     let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(), offset: 0, rows: rows as u64 }], u8_rows(width))? };
-    table.stats.uring.store(false, Ordering::Relaxed);
     for count in [24, 384, 1536, 3072] {
         let ids: Vec<_> = (0..count).map(|i| (i as u64 * 7919) % rows as u64).collect();
         let mut output = vec![0; count * width];
@@ -1039,9 +1055,7 @@ fn shared_table_small_and_large_gathers_preserve_native_order() -> TestResult {
     shard.write_all(&bytes)?;
     // SAFETY: this test retains the immutable shard for the mapping lifetime.
     let table = unsafe { MappedTable::single(shard.path(), 0, count as u64, u8_rows(width))? };
-    // Force the mmap fallback so the large arm actually exercises Rayon;
-    // the existing routed-backend tests separately cover io_uring.
-    table.stats.uring.store(false, Ordering::Relaxed);
+    // The shared size dispatch preserves canonical row slots on either backend.
     let gather = RowGather::new("table-size-test", 2)?;
     for n in [32, count] {
         let ids: Vec<_> = (0..n).map(|i| ((n - 1 - i) / 2) as u64).collect();

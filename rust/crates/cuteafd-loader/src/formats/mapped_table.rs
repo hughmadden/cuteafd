@@ -817,14 +817,8 @@ impl MappedTable {
             }
             return Ok(());
         }
-        match self.uring_reads(rows, &reads, output, false, priority) {
-            Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
-            Err(error) => self.uring_fallback(&error),
-        }
-        self.record_residency(rows)?;
-        for read in reads {
-            output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
-        }
+        let stats = self.uring_reads(rows, &reads, output, false, priority)?;
+        self.stats.record_reads(stats, false);
         Ok(())
     }
 
@@ -900,7 +894,21 @@ impl MappedTable {
         stats.resident_copy_rows = stats.hits;
         stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
         if !pending.is_empty() {
-            let misses = uring::gather_priority(&pending, output, self.row_bytes(), &vec![Some(false); pending.len()], priority)?;
+            let misses = match uring::gather_priority(&pending, output, self.row_bytes(), &vec![Some(false); pending.len()], priority) {
+                Ok(misses) => misses,
+                Err(error) => {
+                    self.uring_fallback(&error);
+                    let mut misses = uring::ReadStats::default();
+                    for read in &pending {
+                        let width = self.row_bytes();
+                        output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
+                        misses.misses += 1;
+                        misses.miss_bytes += width as u64;
+                        misses.device_bytes_estimate += read.part.pages(read.row)?.count() as u64 * read.part.page_bytes as u64;
+                    }
+                    misses
+                },
+            };
             stats.misses = misses.misses;
             stats.miss_bytes = misses.miss_bytes;
             stats.device_bytes_estimate = misses.device_bytes_estimate;
@@ -937,7 +945,6 @@ impl MappedTable {
         let result = probe();
         let available = result.is_ok();
         if let Err(error) = result { tracing::warn!(%error, "io_uring unavailable (kernel/filesystem/seccomp); using mmap fallback"); }
-        self.stats.uring.store(available, Ordering::Relaxed);
         self.stats.nowait.store(self.parts.iter().all(|part| part.nowait.load(Ordering::Relaxed)), Ordering::Relaxed);
         tracing::info!(backend = %self.backend(), max_ring_entries = uring::MAX_BATCH,
             iowq_max_workers = uring::IOWQ_MAX_WORKERS,
@@ -1037,7 +1044,6 @@ pub struct TableStats {
     prefetch_jobs: AtomicU64,
     prefetch_pages: AtomicU64,
     prefetch_dropped: AtomicU64,
-    uring: AtomicBool,
     nowait: AtomicBool,
     approximate: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
@@ -1174,7 +1180,7 @@ pub struct TableStatsSnapshot {
 impl TableStats {
     fn backend(&self) -> TableBackend {
         if self.resident.load(Ordering::Relaxed) { TableBackend::Resident }
-        else if !self.uring.load(Ordering::Relaxed) { TableBackend::Mmap }
+        else if !reactor::ready() { TableBackend::Mmap }
         else { TableBackend::MincoreRouted }
     }
     fn accounting(&self) -> &'static str {
@@ -1607,7 +1613,7 @@ impl GatherPool {
         let chunk = slots.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
-        if table.backend() != TableBackend::Mmap || reactor::global().is_ok() {
+        if table.backend() != TableBackend::Mmap || reactor::global().is_ok_and(|owner| owner.ready()) {
             table.gather_slots(rows, slots, output)?;
         } else {
             table.record_residency(rows)?;
