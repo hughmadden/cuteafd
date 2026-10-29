@@ -2,7 +2,7 @@
 use super::*;
 use crate::shared::{dense_trellis::{CoreHead, CoreWeights, Projection, ProjectionLayout, ProjectionScratch, codebook, retain_partial},
     memory::device::{Allocation, Device}};
-use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf16F32Add};
+use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf16F32Add, F32Bf16Narrow};
 use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names};
 use std::collections::BTreeMap;
 
@@ -36,6 +36,7 @@ pub(super) struct Rank<'a> {
     projections: BTreeMap<Key, Projection<'a>>,
     scratch: [Option<Rc<Scratch<'a>>>; 2],
     add: Bf16F32Add<'a>,
+    narrow: F32Bf16Narrow<'a>,
 }
 pub(super) struct Slot<'a> {
     scratch: Rc<Scratch<'a>>,
@@ -82,7 +83,7 @@ impl<'a> Rank<'a> {
                 .map(|(&n, &b)| Ok((n, Allocation::new(device, b)?))).collect::<Result<_>>()?;
             Ok(Some(Rc::new(Scratch { projection, stages })))
         };
-        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.bf16_f32_add()? })
+        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.bf16_f32_add()?, narrow: engine.library.f32_bf16_narrow()? })
     }
     fn slot(&self, engine: &GlmfEngine<'a>, rank: usize, rows: usize, decode: bool, lane: usize) -> Result<Option<Slot<'a>>> {
         let Some(scratch) = &self.scratch[usize::from(!decode)] else { return Ok(None); };
@@ -173,7 +174,7 @@ impl<'a> GlmfEngine<'a> {
                 let bytes = retained_bytes(rows, self.cfg.hidden)?;
                 ensure!(bytes <= slot.retained[plane].buffer.bytes, "Flash K6 retained rows exceed slot");
                 let result = projection.core(rows, input, weights, &slot.scratch.projection, self.stream_of(rank))?;
-                retain_partial(self.library, result, slot.retained[plane].buffer,
+                retain_partial(&self.core_rank(rank)?.narrow, result, slot.retained[plane].buffer,
                     rows * self.cfg.hidden, self.stream_of(rank))
             } else { projection.local(rows, input, weights, &slot.scratch.projection, output, self.stream_of(rank)) }
         })

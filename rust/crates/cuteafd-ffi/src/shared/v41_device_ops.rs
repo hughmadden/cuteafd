@@ -48,14 +48,34 @@ impl F32Add<'_> {
         Ok(())
     }
 }
-type Bf16F32AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut f32, usize, *mut c_void) -> i32;
+pub(crate) type Bf16F32AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut f32, usize, i32, *mut c_void) -> i32;
+pub(crate) type NarrowFn = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i32, *mut c_void) -> i32;
+/// Per-device narrowing launch bound once before capture or hot-path execution.
+pub struct F32Bf16Narrow<'a> { _library: &'a NativeLibrary, launch: NarrowFn, sms: i32 }
+impl NativeLibrary {
+    pub fn f32_bf16_narrow(&self) -> Result<F32Bf16Narrow<'_>> {
+        Ok(F32Bf16Narrow { _library: self, launch: self.cuteafd_load_narrow_f32_bf16()?,
+            sms: i32::try_from(self.sm_count()?)? })
+    }
+}
+impl F32Bf16Narrow<'_> {
+    /// # Safety
+    /// Operands and stream belong to the device active at construction and
+    /// remain live and disjoint through the ordered launch.
+    pub unsafe fn launch(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(n > 0 && n <= (i64::MAX - 255) as usize, "invalid F32 narrowing extent");
+        // SAFETY: caller owns typed extents and ordering; owner retains the DSO.
+        let status = unsafe { (self.launch)(src, dst, i64::try_from(n)?, self.sms, stream) };
+        ensure!(status == 0, "F32 load narrowing failed with {status}");
+        Ok(())
+    }
+}
 /// Exact BF16 widening and rank-ordered F32 addition before a single K6 egress.
-pub struct Bf16F32Add<'a> { _library: &'a NativeLibrary, launch: Bf16F32AddFn }
+pub struct Bf16F32Add<'a> { _library: &'a NativeLibrary, launch: Bf16F32AddFn, sms: i32 }
 impl NativeLibrary {
     pub fn bf16_f32_add(&self) -> Result<Bf16F32Add<'_>> {
-        // SAFETY: the symbol accepts two BF16 inputs and a distinct F32 output.
-        Ok(Bf16F32Add { _library: self,
-            launch: unsafe { *self.lib.get(b"cuteafd_bf16_f32_add_async")? } })
+        Ok(Bf16F32Add { _library: self, launch: self.cuteafd_bf16_f32_add_async()?,
+            sms: i32::try_from(self.sm_count()?)? })
     }
 }
 impl Bf16F32Add<'_> {
@@ -66,7 +86,7 @@ impl Bf16F32Add<'_> {
         output: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
         validate_bf16_f32_add_buffers(a, b, output, count)?;
         // SAFETY: validated typed extents and disjoint output; caller owns ordering.
-        let status = unsafe { (self.launch)(a.ptr.cast(), b.ptr.cast(), output.ptr.cast(), count, stream) };
+        let status = unsafe { (self.launch)(a.ptr.cast(), b.ptr.cast(), output.ptr.cast(), count, self.sms, stream) };
         ensure!(status == 0, "shared BF16/F32 addition failed with CUDA status {status}");
         Ok(())
     }

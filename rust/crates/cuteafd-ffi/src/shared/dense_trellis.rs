@@ -541,14 +541,14 @@ fn reduced_egress<T>(reduce: impl FnOnce()->Result<T>,egress:impl FnOnce(T)->Res
 impl DenseTrellisDispatch<'_> {
     /// Both rank partials are retained/published as BF16. Widen before the
     /// rank-ordered F32 add, then perform exactly one H128/svh egress.
-    pub fn reduce_output(&self,add:&crate::Bf16F32Add<'_>,rows:usize,local:Buffer,peer:Buffer,
+    pub fn reduce_output(&self,add:&crate::Bf16F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,
         reduced:Buffer,svh:Buffer,output:Buffer,stream:*mut c_void)->Result<()> {
         self.native.rows(rows)?;
         if self.policy.side!=2 { return Err(DenseTrellisError::Invalid("K-split reduction side")); }
         reduced_egress(|| {
             // SAFETY: Bf16F32Add validates disjoint extents/devices; the caller
             // publishes peer input first and retains all owners through drain.
-            unsafe { add.launch(local,peer,reduced,rows*self.policy.output,stream)?; }
+            unsafe { add.launch(rank0,rank1,reduced,rows*self.policy.output,stream)?; }
             Ok(reduced)
         },|sum|self.output(rows,sum,svh,output,stream))
     }

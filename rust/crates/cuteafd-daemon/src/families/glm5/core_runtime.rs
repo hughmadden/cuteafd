@@ -3,7 +3,7 @@ use crate::shared::{dense_trellis::{CoreWeights, Projection, ProjectionLayout, P
     memory::device::{Allocation, Device}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, programs::Programs,
-    Bf16F32Add, V41PeerCopy};
+    Bf16F32Add, F32Bf16Narrow, V41PeerCopy};
 use std::{collections::BTreeMap, ffi::c_void};
 
 /// Every actual header-selected geometry is resolved before capture. Projection
@@ -13,6 +13,7 @@ pub(crate) struct CorePrograms<'a> {
     layouts: [ProjectionLayout; 2],
     stages: [cuteafd_loader::families::glm5::core::CoreStageLayout; 2],
     pub add: Bf16F32Add<'a>,
+    pub narrow: F32Bf16Narrow<'a>,
     pub copy: V41PeerCopy<'a>,
 }
 impl<'a> CorePrograms<'a> {
@@ -59,7 +60,7 @@ impl<'a> CorePrograms<'a> {
             cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, unit, ranks, owned)?];
         ensure!(admitted.stages.as_ref() == Some(&stages), "GLM K6 loaded BF16 stages differ from admission");
         Ok(Some(Self { projections, layouts, stages,
-            add: programs.library().bf16_f32_add()?, copy: programs.library().v41_peer_copy()? }))
+            add: programs.library().bf16_f32_add()?, narrow: programs.library().f32_bf16_narrow()?, copy: programs.library().v41_peer_copy()? }))
     }
     /// Include native input/core/output policy entries, including split-K's
     /// row transition. Missing exporter metadata disables exact packing.

@@ -5,7 +5,7 @@ use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_loader::{LoadedTensor, placement::Demand, formats::{
     dense_trellis::{LoadedDenseTrellis, TrellisSide}, exl3_storage::exl3_module,
     trellis_core::ProjectionScratchLayout}};
-use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, programs::Programs, Bf16F32Add, NativeLibrary,
+use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, programs::Programs, Bf16F32Add, F32Bf16Narrow,
     dense_trellis::{DenseTrellisBuffers, DenseTrellisDispatch, DenseTrellisPolicy,
         TrellisDType, GroupedWorkspace, GROUPS}};
 use std::{collections::BTreeMap, ffi::c_void};
@@ -157,12 +157,12 @@ impl ProjectionScratch<'_> {
 }
 /// Replace the producer's retained copy with one exact RNE narrowing launch.
 /// Callers serialize the source accumulator and retain destination through drain.
-pub(crate) fn retain_partial(library: &NativeLibrary, source: Buffer, destination: Buffer,
+pub(crate) fn retain_partial(narrow: &F32Bf16Narrow<'_>, source: Buffer, destination: Buffer,
     count: usize, stream: *mut c_void) -> Result<()> {
     validate_retained_partial(source, destination, count)?;
     // SAFETY: checked distinct typed extents and device; the serialized lane
     // orders the producer and retains both owners until this stream drains.
-    unsafe { library.load_narrow_f32_bf16(source.ptr, destination.ptr, count, stream) }
+    unsafe { narrow.launch(source.ptr, destination.ptr, count, stream) }
 }
 fn validate_retained_partial(source: Buffer, destination: Buffer, count: usize) -> Result<()> {
     let input = count.checked_mul(4).filter(|&n| n > 0).context("K6 partial F32 extent overflow")?;
@@ -226,9 +226,9 @@ impl<'a> Projection<'a> {
         let core=self.core(rows,input,weights,scratch,stream)?;
         self.program.output(rows,core,weights.svh.buffer,output,stream)?;Ok(())
     }
-    pub(crate) fn reduced(&self,add:&Bf16F32Add<'_>,rows:usize,local:Buffer,published_peer:Buffer,reduced:Buffer,
+    pub(crate) fn reduced(&self,add:&Bf16F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,reduced:Buffer,
         weights:&CoreWeights<'_>,output:Buffer,stream:*mut c_void)->Result<()> {
-        self.program.reduce_output(add,rows,local,published_peer,reduced,weights.svh.buffer,output,stream)?;Ok(())
+        self.program.reduce_output(add,rows,rank0,rank1,reduced,weights.svh.buffer,output,stream)?;Ok(())
     }
 }
 

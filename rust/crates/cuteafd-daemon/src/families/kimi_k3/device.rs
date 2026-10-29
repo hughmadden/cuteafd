@@ -826,7 +826,7 @@ impl<'a> LocalLane<'a> {
                 projection.local(rows,normalized,weight,scratch,output,stream.raw)?;
             } else {
                 let partial=projection.core(rows,normalized,weight,scratch,stream.raw)?;
-                crate::shared::dense_trellis::retain_partial(stream.device.library,partial,output,rows*7168,stream.raw)?;
+                crate::shared::dense_trellis::retain_partial(&programs.narrow,partial,output,rows*7168,stream.raw)?;
             }
             Ok(output)
         })
@@ -841,7 +841,7 @@ impl<'a> LocalLane<'a> {
             let partial=super::core_runtime::ffn_projected(projected("ffn.gate")?,projected("ffn.up")?,projected("ffn.down")?,
                 &programs.situ,&programs.copy,rows,self.plane("normalized",rows,7168)?,self.lane.buffer("K6 FFN gate")?,
                 self.lane.buffer("K6 FFN up")?,self.lane.buffer("gate-up")?,self.lane.buffer("activated")?,self.stream().raw)?;
-            crate::shared::dense_trellis::retain_partial(self.stream().device.library,partial,output,rows*7168,self.stream().raw)?;
+            crate::shared::dense_trellis::retain_partial(&programs.narrow,partial,output,rows*7168,self.stream().raw)?;
             Ok(output)
         })
     }

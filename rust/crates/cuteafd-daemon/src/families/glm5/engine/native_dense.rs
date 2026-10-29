@@ -409,7 +409,7 @@ impl<'a> GlmEngine<'a> {
             if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
                 let core = projection.core(rows, input, weights, &scratch.projection, stream)?;
                 let retained = retained.context("GLM K6 split core has no retained row storage")?;
-                crate::shared::dense_trellis::retain_partial(self.library, core, retained,
+                crate::shared::dense_trellis::retain_partial(&programs.narrow, core, retained,
                     rows * weights.shape[0], stream)
             } else { projection.local(rows, input, weights, &scratch.projection, output, stream) }
         })

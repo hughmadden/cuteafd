@@ -5,7 +5,7 @@ use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer,programs::Programs,
     dense_trellis::{TrellisDType,
         GroupedMember,GroupedPolicy,GroupedTrellis},
-    KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiMlaRankBatch,KimiSitu,Bf16F32Add,F32Add,V41PeerCopy};
+    KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiMlaRankBatch,KimiSitu,Bf16F32Add,F32Bf16Narrow,V41PeerCopy};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 
@@ -82,8 +82,9 @@ pub(crate) struct CorePrograms<'a> {
     pub layout:ProjectionLayout,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
-    pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,pub add:F32Add<'a>,
+    pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,
     pub core_add:Bf16F32Add<'a>,
+    pub narrow:F32Bf16Narrow<'a>,
 }
 impl<'a> CorePrograms<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
@@ -145,7 +146,7 @@ impl<'a> CorePrograms<'a> {
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
         Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
-            copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?,
+            copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {

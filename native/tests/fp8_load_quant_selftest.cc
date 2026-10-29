@@ -28,12 +28,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "retained BF16 partial RNE/cancellation mismatch\n");
     return 1;
   }
+  if (lq::f32_bits(lq::partial_add_bf16_f32(0x7f80, 0x7f80)) != 0x7f800000u
+      || lq::f32_bits(lq::partial_add_bf16_f32(0xff80, 0xff80)) != 0xff800000u) return 1;
   for (uint32_t bits = 0; bits < 65536; ++bits) {
     // Finite/subnormal/zero/infinity widening must be exact; NaN payloads are
     // governed by CUDA's existing addition, not a new narrowing of the sum.
-    if ((bits & 0x7f80u) == 0x7f80u) continue;
+    if ((bits & 0x7f80u) == 0x7f80u && (bits & 0x7fu) != 0) continue;
     const auto a = uint16_t(bits), b = uint16_t((bits * 37u + 17u) & 0xffffu);
-    if ((b & 0x7f80u) == 0x7f80u) continue;
+    if ((b & 0x7f80u) == 0x7f80u && (b & 0x7fu) != 0) continue;
     const float diagnostic = lq::fadd(lq::bits_f32(lq::widen_bf16(a)), lq::bits_f32(lq::widen_bf16(b)));
     if (lq::f32_bits(lq::partial_add_bf16_f32(a, b)) != lq::f32_bits(diagnostic)) return 1;
   }
