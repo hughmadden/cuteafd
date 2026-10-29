@@ -82,8 +82,22 @@ mod selection_tests {
         }
         let source = include_str!("local.rs").rsplit_once("pub(super) fn run(").unwrap().1;
         assert!(source.find("try_deferred_capacity").unwrap() < source.find(".begin_deferred(").unwrap());
-        let stop = source.find("if intake_blocked { break; }").unwrap();
-        assert!(source[stop..].contains("for execution in &mut executions {\n            if let Err(error) = execution.flush_staged()"));
+        let stop = source.find("if intake_blocked {\n                        sweep_blocked = true;\n                        break;").unwrap();
+        assert!(source[stop..].contains("flush_after_sweep(execution.has_staged(), sweep_blocked,"));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_sweep_waits_for_idle_unless_intake_is_blocked() -> Result<()> {
+        assert!(!flush_after_sweep(true, false, || Ok(false))?);
+        assert!(flush_after_sweep(true, false, || Ok(true))?);
+        assert!(flush_after_sweep(true, true, || panic!("blocked intake must flush even while busy"))?);
+        assert!(!flush_after_sweep(false, false, || panic!("no staged work needs no stream query"))?);
+        assert!(flush_after_sweep(true, false, || anyhow::bail!("query failed")).is_err());
+        // A lone staged unit stays nonblocking until the next sweep sees idle.
+        for idle in [false, false, true] {
+            assert_eq!(flush_after_sweep(true, false, || Ok(idle))?, idle);
+        }
         Ok(())
     }
 
@@ -634,6 +648,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let mut intake = 0usize;
         let mut intake_stats = IntakeStats::default();
         let mut received_this_sweep = false;
+        let mut sweep_blocked = false;
         while index < connections.len() {
             let mut execution_failed = false;
             let mut executed = false;
@@ -759,7 +774,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     }
                     // A full reply ring cannot delay the staged wave behind a
                     // SEND wait. Launch it now, then resume the ordinary sweep.
-                    if intake_blocked { break; }
+                    if intake_blocked {
+                        sweep_blocked = true;
+                        break;
+                    }
                     received_this_sweep |= received;
                     index += 1;
                     // Finish the original connection sweep before any extra
@@ -811,7 +829,16 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 sweeps = intake + 1, "Spark intake flush decision");
         }
         for execution in &mut executions {
-            if let Err(error) = execution.flush_staged() {
+            // Keep arrivals staged behind active compute, not in its CUDA queue.
+            // Staged work disables receive waits, so an empty intake keeps polling.
+            let flush = (|| -> Result<()> {
+                if flush_after_sweep(execution.has_staged(), sweep_blocked,
+                    || execution.stream_idle())? {
+                    execution.flush_staged()?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = flush {
                 for execution in &executions {
                     crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark grouped launch");
                 }
@@ -835,6 +862,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
 
 #[derive(Default)]
 struct IntakeStats { received: u64, send_ring_full: u64, empty_second_receive: u64 }
+
+fn flush_after_sweep(staged: bool, blocked: bool, idle: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    Ok(staged && (blocked || idle()?))
+}
 
 fn intake_has_capacity(sweep: usize, staged: bool, check: impl FnOnce() -> Result<bool>) -> Result<bool> {
     if sweep == 0 && !staged { return Ok(true); }

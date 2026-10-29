@@ -193,6 +193,10 @@ impl<'a> Fp8Worker<'a> {
         }
         ensure!(executor_id == self.executor_id && request.layer() as usize == self.experts.layers[self.layer].layer,
             "staged expert identity mismatch");
+        if self.segments.as_ref().is_some_and(|segments| {
+            let staged_rows: usize = segments.staged.iter().map(|unit| unit.identity.2 as usize).sum();
+            staged_rows + rows > segments.rows.min(2 * segments.unit_rows)
+        }) { self.flush_staged()?; }
         let segments = self.segments.as_mut().unwrap();
         let slot = self.pending.next_slot()?;
         self.route_staging.pack(slot, request)?;
@@ -227,7 +231,10 @@ impl<'a> Fp8Worker<'a> {
         segments.staged_units += 1;
         tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = segments.staged_units,
             staged = segments.staged.len(), rows, slot, "Spark unit copied and staged");
-        if singleton { self.flush_staged()?; }
+        let staged_rows: usize = segments.staged.iter().map(|unit| unit.identity.2 as usize).sum();
+        let full = segments.staged.len() == segments.copied.len().min(2)
+            || staged_rows >= segments.rows.min(2 * segments.unit_rows);
+        if singleton || full { self.flush_staged()?; }
         Ok(true)
     }
 
@@ -599,6 +606,19 @@ mod tests {
     }
 
     #[test]
+    fn staging_boundaries_flush_without_waiting_for_stream_idle() {
+        let stage = include_str!("worker.rs").split("    fn stage(").nth(1).unwrap()
+            .split("    /// Exact retained").next().unwrap();
+        assert!(!stage.contains("stream_idle"));
+        assert!(stage.contains("if singleton {\n            tracing::debug!"));
+        assert!(stage.contains("unit.layer != self.layer"));
+        assert!(stage.contains("staged_rows + rows > segments.rows.min(2 * segments.unit_rows)"));
+        assert!(stage.contains("segments.staged.len() == segments.copied.len().min(2)"));
+        assert!(stage.contains("staged_rows >= segments.rows.min(2 * segments.unit_rows)"));
+        assert!(stage.contains("if singleton || full { self.flush_staged()?; }"));
+    }
+
+    #[test]
     fn staged_input_copy_is_host_triggered_and_compute_waits_on_recorded_event() {
         let source = include_str!("worker.rs");
         let stage = source.split("    fn stage(").nth(1).unwrap().split("    /// Exact retained").next().unwrap();
@@ -709,13 +729,14 @@ mod tests {
                 worker.bind_layer(0)?;
                 // SAFETY: frames/replies remain owned until both completion fences retire.
                 unsafe { worker.execute_mapped_payload(&request, worker.executor_id, &mut exchange, mapped)?; }
-                let staged = &worker.segments.as_ref().unwrap().staged[unit];
-                assert_ne!(staged.input.ptr, mapped.hidden_payload.ptr, "FC1 must not gather mapped host rows");
-                assert!(continue_intake(true, worker.has_staged(), unit, 3));
+                if let Some(staged) = worker.segments.as_ref().unwrap().staged.last() {
+                    assert_ne!(staged.input.ptr, mapped.hidden_payload.ptr, "FC1 must not gather mapped host rows");
+                }
+                assert_eq!(continue_intake(true, worker.has_staged(), unit, 3), unit == 0);
             }
             assert!(!continue_intake(false, worker.has_staged(), 2, 3));
-            assert_eq!(worker.segments.as_ref().unwrap().staged.len(), 2);
-            assert_eq!(worker.segments.as_ref().unwrap().flushes, 0);
+            assert_eq!(worker.segments.as_ref().unwrap().staged.len(), 0);
+            assert_eq!(worker.segments.as_ref().unwrap().flushes, 1, "the second unit forces a pair flush");
             fixture.advance_queued_experts(&library, 2)?; // both input copies, no FC1
             if bf16_sibling {
                 let bf16_bytes = worker.capacity * hidden * 2;
@@ -741,10 +762,10 @@ mod tests {
             return Ok(());
         }
         for unit in 0..4 {
-            if unit == 3 && segmented {
-                // Cancel one retained peer before any launch. The other two
-                // descriptors survive, and the freed slot holds the fourth peer.
-                let cancelled = worker.segments.as_ref().unwrap().staged[1].source_address;
+            if unit == 1 && segmented {
+                // Cancel the first peer before a second unit forces the pair
+                // to launch. Later units reuse its slot without publishing it.
+                let cancelled = worker.segments.as_ref().unwrap().staged[0].source_address;
                 assert!(worker.cancel_staged(cancelled)?);
                 assert!(!worker.cancel_staged(cancelled)?);
                 assert!(!worker.unit_ready()?);
@@ -778,8 +799,9 @@ mod tests {
             }
         }
         if segmented {
-            assert!(worker.has_staged());
-            assert_eq!(worker.pending.len(), 0);
+            assert!(worker.has_staged(), "the third surviving unit waits behind the flushed pair");
+            assert_eq!(worker.segments.as_ref().unwrap().flushes, 1);
+            assert_eq!(worker.pending.len(), 2);
             assert!(worker.pending.next_slot().is_err());
             let segments = worker.segments.as_ref().unwrap();
             assert_eq!(segments.rows, 3 * 769);
@@ -793,40 +815,36 @@ mod tests {
             assert_eq!(segments.descriptors.iter().map(|a| a.buffer.bytes).sum::<usize>(), 3 * 769 * 16);
             worker.flush_staged()?;
             assert!(!worker.unit_ready()? && worker.pending.next_slot().is_err());
-            // Two uncancelled copies remain after cancellation retired copies0/1,
-            // followed by four route/address uploads per member before FC1.
-            fixture.advance_queued_experts(&library, 14)?;
-            assert!(!worker.unit_ready()?);
-            for reply in &replies { assert!(reply.bytes().iter().all(|&b| b == 0xa5)); }
-            fixture.advance_queued_experts(&library, 1)?;
-            for unit in [0, 2, 3] {
+            // The pair and trailing singleton retain separate completion fences.
+            worker.synchronize()?;
+            for unit in [1, 2, 3] {
                 assert!(worker.unit_ready()?);
                 worker.complete()?;
                 assert_eq!(&replies[unit].bytes()[prefix..prefix + expected[unit].len()], expected[unit]);
                 assert!(replies[unit].bytes()[..prefix].iter().all(|&b| b == 0xa5));
                 assert!(replies[unit].bytes()[prefix + expected[unit].len()..].iter().all(|&b| b == 0xa5));
             }
-            assert!(replies[1].bytes().iter().all(|&b| b == 0xa5), "cancelled peer must not launch");
+            assert!(replies[0].bytes().iter().all(|&b| b == 0xa5), "cancelled peer must not launch");
             assert!(worker.stream_idle()? && worker.pending.is_empty());
             // Reuse the cancelled peer as a lone unit. It launches the ordinary
             // recipe, with one input copy/two route uploads and no descriptors.
-            let view = ExpertProtocolV2RequestView::parse(frames[1].bytes())?;
-            let request = BackboneRequest::parse(frames[1].bytes(), 4096)?;
-            let alias = library.cuda_host_buffer_device_alias(frames[1].buffer)?;
+            let view = ExpertProtocolV2RequestView::parse(frames[0].bytes())?;
+            let request = BackboneRequest::parse(frames[0].bytes(), 4096)?;
+            let alias = library.cuda_host_buffer_device_alias(frames[0].buffer)?;
             let mapped = ProtocolV2RequestDevicePayload {
                 hidden_payload: CuteafdDeviceBuffer { ptr: view.hidden_payload().as_ptr().cast_mut().cast(),
                     bytes: view.hidden_payload().len(), ..alias }, execution_lane: 0,
-                response_slot: Some(library.cuda_host_buffer_device_alias(replies[1].buffer)?) };
+                response_slot: Some(library.cuda_host_buffer_device_alias(replies[0].buffer)?) };
             // SAFETY: the source and reply remain retained through the completion below.
             unsafe { worker.execute_mapped_payload(&request, worker.executor_id, &mut exchange, mapped)?; }
             worker.flush_staged()?;
             fixture.advance_queued_experts(&library, 3)?;
             assert!(!worker.unit_ready()?);
-            assert!(replies[1].bytes().iter().all(|&b| b == 0xa5));
+            assert!(replies[0].bytes().iter().all(|&b| b == 0xa5));
             fixture.advance_queued_experts(&library, 1)?;
             assert!(worker.unit_ready()?);
             worker.complete()?;
-            assert_eq!(&replies[1].bytes()[prefix..prefix + expected[1].len()], expected[1]);
+            assert_eq!(&replies[0].bytes()[prefix..prefix + expected[0].len()], expected[0]);
             assert!(worker.stream_idle()? && worker.pending.is_empty());
             return Ok(());
         }
