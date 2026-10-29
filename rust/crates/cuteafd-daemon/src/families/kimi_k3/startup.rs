@@ -115,8 +115,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         library.v41_compact_reducer()?.require_plane_reduction(6)?;
         Ok(())
     })?;
-    let lane_layouts = vec![[native[0].lane_layout(full, rows, unit, options.max_context)?,
-        native[1].lane_layout(full, rows, unit, options.max_context)?]];
+    let lane_layouts = vec![[native[0].lane_layout(full, 0, rows, unit, options.max_context)?,
+        native[1].lane_layout(full, 1, rows, unit, options.max_context)?]];
     let verify_rows = match options.verify_rows {
         0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),
         rows => rows,

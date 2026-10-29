@@ -79,7 +79,7 @@ pub(crate) struct CorePrograms<'a> {
     grouped:BTreeMap<(usize,usize,usize,String),GroupedTrellis<'a>>,
     /// Diagnostic only: false forces the four standalone launches (bitwise A/B).
     grouped_enabled:std::cell::Cell<bool>,
-    pub layout:ProjectionLayout,
+    pub layouts:[Option<ProjectionLayout>;2],
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
     pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,
@@ -119,6 +119,7 @@ impl<'a> CorePrograms<'a> {
                 }
             }
         }
+        let mut layouts=[layout.clone(),layout];
         if let Some(head)=inventory.get_weight("language_model.lm_head") {
             let weight=CoreWeightLayout::new(head,
                 cuteafd_loader::formats::dense_trellis::TrellisSide::Output,0,1)?;
@@ -128,14 +129,16 @@ impl<'a> CorePrograms<'a> {
             // Head logits are consumed in <=64-row spans, while this scratch
             // owner also serves full-capacity serialized layer projections.
             required.rows=rows;
-            if let Some(layout)=&mut layout {layout.merge(&required)?;}else{layout=Some(required);}
+            if let Some(layout)=&mut layouts[1] {layout.merge(&required)?;}else{layouts[1]=Some(required);}
             projections.insert(key,projection);
         }
-        let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound projections");};
         let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch(cfg,inventory,rows,
-            programs.family_metadata("dense_trellis_k6")?)?.context("K6 planned scratch absent")?;
-        ensure!(layout.extents==planned.extents && layout.rows==planned.rows,
-            "K6 runtime/planner aggregate scratch differs");
+            programs.family_metadata("dense_trellis_k6")?)?;
+        for rank in 0..2 {
+            ensure!(layouts[rank].as_ref().map(|p|(&p.extents,p.rows))
+                ==planned[rank].as_ref().map(|p|(&p.extents,p.rows)),
+                "K6 runtime/planner rank {rank} scratch differs");
+        }
         let kda=[KimiKdaCore::load(programs,"kda_core_h48_m64",64,true)?,
             KimiKdaCore::load(programs,"kda_core_h48_m4096",4096,false)?];
         let mut mla=BTreeMap::new();
@@ -145,7 +148,7 @@ impl<'a> CorePrograms<'a> {
             mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
-        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
+        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
             copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }
@@ -256,26 +259,29 @@ mod runtime_layout_tests {
                 let empty=CoreInventory::default();
                 let core=if on {&inventory}else{&empty};
                 let charged=CoreCharges::from_package(&cfg,core,rows,unit,&manifest)?;
-                let mut runtime:Option<ProjectionLayout>=None;
-                if on {
-                    for ((k,n,side,_),()) in &geometries {
-                        let live=if *n==cfg.vocab_size {unit.min(64)}else{unit};
-                        let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
-                            input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
-                        let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
-                            ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
-                        let layout=ProjectionLayout{extents,rows:unit};
-                        if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
-                    }
-                }
-                assert_eq!(charged.projection.as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
-                assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false)?[0].bytes as usize
-                    -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
                 let expected_stages=if on {core::lane_extents(rows,unit,1024,4096,2048,2048)?}else{BTreeMap::new()};
-                assert_eq!(charged.stages,expected_stages);
-                let sum=charged.demands()?.iter().filter(|d|d.gpu==0).map(|d|d.bytes).sum::<u64>();
-                assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
-                    +charged.stage_bytes as u64+charged.receive as u64);
+                for rank in 0..2 {
+                    let mut runtime:Option<ProjectionLayout>=None;
+                    if on {
+                        for ((k,n,side,_),()) in &geometries {
+                            if *n==cfg.vocab_size && rank==0 {continue;}
+                            let live=if *n==cfg.vocab_size {unit.min(64)}else{unit};
+                            let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
+                                input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
+                            let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
+                                ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
+                            let layout=ProjectionLayout{extents,rows:unit};
+                            if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
+                        }
+                    }
+                    assert_eq!(charged.projection[rank].as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
+                    assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false)?[0].bytes as usize
+                        -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
+                    assert_eq!(charged.stages,expected_stages);
+                    let sum=charged.demands()?.iter().filter(|d|usize::from(d.gpu)==rank).map(|d|d.bytes).sum::<u64>();
+                    assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
+                        +charged.stage_bytes as u64+charged.receive as u64);
+                }
                 if on {
                     let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows, unit,
                         1_048_576, cuteafd_loader::families::kimi_k3::allocation::NativeScratch::from_manifest(&manifest)?)?;
