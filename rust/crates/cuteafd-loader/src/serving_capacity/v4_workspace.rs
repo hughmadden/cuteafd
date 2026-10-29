@@ -429,10 +429,15 @@ mod tests {
         // The table floors are still exact for a custom one-row manifest.
         let tiny =
             deepseek_v4_workspace_geometry(&config(false), 1, 1, 128, 1, 2, scratch).unwrap()[0];
-        assert_eq!(
-            tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes,
-            3 * 256
-        );
+        let padding = (V4_PACKED_MEMBERS * 3 * 4) as u64;
+        for units in [0, 1, 2, 4, 5, 1032] {
+            let runtime_prefill = (V4_PACKED_MEMBERS as u64 * (units + 3) * 4).max(256);
+            let runtime_decode = (units * 4).max(256);
+            // fixed_device_bytes already includes padding for both prefill lanes.
+            assert_eq!(tiny.device_bytes(units).unwrap() - tiny.fixed_device_bytes + 2 * padding,
+                2 * runtime_prefill + runtime_decode);
+        }
+        assert_eq!(tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes, 384);
     }
 
     #[test]
