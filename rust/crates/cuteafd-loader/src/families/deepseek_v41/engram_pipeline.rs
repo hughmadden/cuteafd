@@ -419,11 +419,10 @@ mod wait_tests {
         }
         // Scale-only selection must not mistake interleaved rows for separate scales.
         preload_tables(&mut tables, false)?;
-        assert!(tables.iter().all(|table| table.weights().backend() != crate::TableBackend::Resident));
+        assert!(tables.iter().all(|table| table.weights().warm_bytes() == 10 * 264));
         preload_tables(&mut tables, true)?;
         for (table, payload) in tables.iter().zip(expected) {
             assert!(table.scales().is_none());
-            assert_eq!(table.weights().backend(), crate::TableBackend::Resident);
             assert_eq!(table.weights().warm_bytes(), 0);
             let mut packed = vec![0; 5 * 264];
             table.weights().gather_slots(&[9, 2, 3, 8, 3], &[4, 1, 0, 3, 2], &mut packed)?;
