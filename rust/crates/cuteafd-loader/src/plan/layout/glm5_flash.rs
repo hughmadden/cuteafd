@@ -145,7 +145,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let path = path.ok_or_else(|| anyhow::anyhow!("DFlash2 config missing: provide --glmf-drafter-snapshot or disable the drafter"))?;
             let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
             let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
-                usize::try_from(sequences)?, usize::try_from(options.draft_sequences)?,
+                usize::try_from(sequences)?, usize::try_from(options.glm_draft_sequences())?,
                 options.draft_context_slots.map(usize::try_from).transpose()?);
             let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch)?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);

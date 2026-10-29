@@ -99,8 +99,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     if engine_args.draft_context_slots.is_none() {
-        engine_args.draft_context_slots = Some(20.max(engine_args.draft_sequences)
-            .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
+        engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
+            engine_args.draft_sequences, args.max_sequences, None));
     }
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     let policy = Policy { fixed: args.draft_fixed,

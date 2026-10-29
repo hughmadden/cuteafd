@@ -3219,7 +3219,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
         let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
-            draft_sequences:8, draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
+            draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
             context_tokens:131_072, ..Default::default() };
         let run = |options: &layout::LayoutOptions| {
             let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),

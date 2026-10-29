@@ -457,9 +457,9 @@ pub(crate) struct PlanArgs {
     /// MiMo Spark activation format for --layout (matches serve-mimo).
     #[arg(long, value_enum, default_value = "fp8")]
     pub(crate) expert_input: crate::families::mimo_v2::engine::ExpertInput,
-    /// MiMo drafter batch sequences for --layout (serving raises to concurrency).
-    #[arg(long, default_value_t = 4)]
-    pub(crate) draft_sequences: u64,
+    /// Drafter batch sequences for --layout (defaults to the family serving value).
+    #[arg(long)]
+    pub(crate) draft_sequences: Option<u64>,
     /// Shared GQA drafter-ring format for layout admission.
     #[arg(long, default_value = "fp8")]
     pub(crate) draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,

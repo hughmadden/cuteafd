@@ -927,7 +927,7 @@ mod tests {
             mimo_rings: 16,
             mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Int8,
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
-            draft_sequences: 4,
+            draft_sequences: None,
             draft_context_slots: None,
             mimo_decode_graphs: false,
             physical_sms: None,
@@ -1149,6 +1149,78 @@ mod tests {
     }
 
     #[test]
+    fn planner_and_serving_share_draft_head_capacity_and_charge() {
+        use clap::Parser;
+        use cuteafd_loader::families::{glm5::draft_representation as glm, mimo_v2::draft_representation as mimo};
+        use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
+        let config = serde_json::json!({"hidden_size":4096, "intermediate_size":12288,
+            "num_hidden_layers":5, "num_attention_heads":32, "num_key_value_heads":8,
+            "head_dim":128, "vocab_size":154880,
+            "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
+                "selector_rank":256, "block_size":8}});
+        for command in ["serve-glmf", "serve-glm", "serve-mimo"] {
+            for concurrency in [1usize, 16, 32] {
+                for extra in [vec![], vec!["--draft-sequences", "8"],
+                    vec!["--draft-sequences", "8", "--draft-context-slots", "40"]] {
+                    let count = concurrency.to_string();
+                    let plan = crate::cli::Cli::try_parse_from(
+                        ["cuteafd", "plan", "/not-read", "--layout", "--concurrency", &count]
+                            .into_iter().chain(extra.iter().copied())).unwrap();
+                    let crate::cli::Commands::Plan(args) = plan.command else { unreachable!() };
+                    let layout = options(&args).unwrap().layout.unwrap();
+                    let serving = crate::cli::Cli::try_parse_from(
+                        ["cuteafd", command, "--snapshot", "/not-read", "--native-lib", "/not-loaded",
+                            "--max-sequences", &count].into_iter().chain(extra.iter().copied())).unwrap();
+                    let (planned, started) = match serving.command {
+                        crate::cli::Commands::ServeGlmf(args) => {
+                            let (slots, batch) = glm::flash_serving_draft_limits(concurrency,
+                                layout.glm_draft_sequences() as usize, layout.draft_context_slots.map(|n| n as usize));
+                            let planned = glm::flash_draft_capacity(&config, slots, batch).unwrap();
+                            let (slots, batch) = crate::families::glm5_flash::serve::draft_capacity(
+                                args.max_sequences, args.engine.draft_sequences, args.engine.draft_context_slots);
+                            let started = glm::flash_draft_capacity(&config, slots, batch).unwrap();
+                            assert_eq!(planned, started);
+                            (planned.block_rows, started.block_rows)
+                        }
+                        crate::cli::Commands::ServeGlm(args) => {
+                            let batch = layout.glm_draft_sequences() as usize;
+                            let slots = glm::serving_draft_context_slots(batch, concurrency,
+                                layout.draft_context_slots.map(|n| n as usize));
+                            let startup_slots = glm::serving_draft_context_slots(args.engine.draft_sequences,
+                                args.max_sequences, args.engine.draft_context_slots);
+                            let planned = glm::GlmDraftCapacity::new(slots, batch, 8).unwrap();
+                            let started = glm::GlmDraftCapacity::new(startup_slots, args.engine.draft_sequences, 8).unwrap();
+                            assert_eq!(planned, started);
+                            (planned.block_rows, started.block_rows)
+                        }
+                        crate::cli::Commands::ServeMimo(args) => {
+                            let batch = layout.mimo_draft_sequences().max(layout.concurrency);
+                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings.max(layout.concurrency),
+                                layout.draft_context_slots);
+                            let startup_batch = args.engine.draft_sequences.max(args.max_sequences);
+                            let startup_slots = mimo::mimo_draft_context_slots(startup_batch as u64,
+                                args.engine.rings.max(args.max_sequences) as u64,
+                                args.engine.draft_context_slots.map(|n| n as u64));
+                            let planned = mimo::MimoDraftCapacity::new(slots as usize, batch as usize, 8).unwrap();
+                            let started = mimo::MimoDraftCapacity::new(startup_slots as usize, startup_batch, 8).unwrap();
+                            assert_eq!(planned, started);
+                            (planned.block_rows, started.block_rows)
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(planned, started, "{command} {concurrency} {extra:?}");
+                    let charge = |rows| ProjectionScratchLayout::new(4096, 154880, rows).unwrap().bytes().unwrap();
+                    assert_eq!(charge(planned), charge(started), "{command} draft head charge");
+                    if command == "serve-glmf" && concurrency == 16 && extra.is_empty() {
+                        assert_eq!(planned, 128);
+                        assert_eq!(charge(planned), 397_541_448);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn planner_threads_warm_draft_context_override() {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout",
@@ -1158,7 +1230,7 @@ mod tests {
         let layout = options(&args).unwrap().layout.unwrap();
         assert!(layout.mimo_prefix_draft);
         assert_eq!(layout.mimo_rings, 20);
-        assert_eq!(layout.draft_sequences, 8);
+        assert_eq!(layout.draft_sequences, Some(8));
         assert_eq!(layout.draft_context_slots, Some(25));
         assert_eq!(layout.glm5_attention_plan_rows, Some(8));
         assert_eq!(layout.qwen_attention_plan_rows, Some(8));

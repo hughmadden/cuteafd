@@ -87,7 +87,7 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub draft: Option<PathBuf>,
     /// Maximum members of one draft batch, independent of context slots.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_DRAFT_SEQUENCES)]
     pub draft_sequences: usize,
     /// Context slots (default max(20, draft_sequences)); target head is shared.
     #[arg(long)]

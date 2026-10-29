@@ -3,6 +3,13 @@
 //! head with --fp8-head); the drafter borrows it and never copies it.
 use thiserror::Error;
 
+/// Serving and standalone admission use the same drafter batch default.
+pub const DEFAULT_DRAFT_SEQUENCES: usize = 16;
+
+pub fn serving_draft_context_slots(sequences: usize, concurrency: usize, explicit: Option<usize>) -> usize {
+    explicit.unwrap_or_else(|| 20.max(sequences).max(concurrency.saturating_mul(5).div_ceil(4)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmDraftRepresentation {
     Bf16Only,
