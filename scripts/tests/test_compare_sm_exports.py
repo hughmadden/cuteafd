@@ -528,7 +528,9 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
         ("glmf", [("m80", 80, 288, 8, 8), ("m256", 256, 288, 8, 64),
                   ("m1024", 1024, 288, 8, 64)]),
         ("dsv4p", [("m80", 80, 384, 6, 8), ("m256", 256, 384, 6, 8), ("m1024", 1024, 384, 6, 64)]),
-        ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 8), ("m1024", 1024, 896, 16, 64)]),
+        # Kimi K3's coordinator exports are warp-specialized from m256 up, so
+        # the route gate covers its 64-row block there as well as at m1024.
+        ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 64), ("m1024", 1024, 896, 16, 64)]),
     ):
         recorded = []
         monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(
