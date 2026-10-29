@@ -883,7 +883,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
     if args.prefill_units.is_some() {
         let units = crate::shared::prefill_pipeline::prefill_units(rows, unit, waves, 64)?.into_iter().enumerate()
-            .map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0, rows,
+            .map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0, segments: Vec::new(), rows,
                 layers: 0..92, slot: index % waves, barrier: false }).collect::<Vec<_>>();
         println!("Step-5 shared prefill units rows={rows} unit={unit} waves={waves} sizes={:?}",
             units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>());

@@ -279,7 +279,10 @@ impl<'a> GlmfEngine<'a> {
             } else { [tables.clone(), tables.clone()] };
             for t in &mut pair { t.lane = index % waves; }
             ranked.push(pair);
-            units.push(Unit { index, sequence: 0, rows: first..first + tokens.len(),
+            let segments = tables.segments.iter().enumerate().map(|(sequence, s)|
+                crate::shared::prefill_pipeline::UnitSegment { sequence, rows: s.first..s.end_row(),
+                    tokens: s.start..s.start + s.rows, prompt_end: false, snapshot: false, head: true }).collect();
+            units.push(Unit { index, sequence: 0, segments, rows: first..first + tokens.len(),
                 layers: 0..self.weights.layers.len(), slot: index % waves, barrier: false });
             first += tokens.len();
         }

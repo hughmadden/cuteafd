@@ -762,14 +762,30 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 }
             }
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|prompt| {
-                if policy.chunk_s.is_none() { return prefill_one(engine, family, cache, selector, prompt); }
-                let rows = prompt.plan.chunks.get(prompt.chunks).copied().unwrap_or(prompt.tokens.len()) - prompt.done;
-                let clock = Instant::now();
-                let outcome = prefill_one(engine, family, cache, selector, prompt);
-                if rows > 0 { seconds_per_row = (clock.elapsed().as_secs_f64() / rows as f64).max(seconds_per_row * 0.9); }
-                outcome
-            });
+            let limits = engine.packed_limits();
+            let finished = prefills.round_packed(limits.rows, DECODE_ROWS,
+                |p| packed_chunk(p).map(|(_, rows)| rows),
+                |group, next| crate::shared::prefill_packing::plan(&group.iter().chain([next])
+                    .filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok(),
+                |group| {
+                    if group.len() > 1 && group.iter().all(|p| packed_chunk(p).is_some()) {
+                        let rows: usize = group.iter().filter_map(packed_chunk).map(|(_, rows)| rows).sum();
+                        let clock = Instant::now();
+                        let outcomes = prefill_group(engine, family, cache, selector, group);
+                        if policy.chunk_s.is_some() && rows > 0 {
+                            seconds_per_row = (clock.elapsed().as_secs_f64() / rows as f64).max(seconds_per_row * 0.9);
+                        }
+                        return outcomes;
+                    }
+                    group.iter_mut().map(|prompt| {
+                        if policy.chunk_s.is_none() { return prefill_one(engine, family, cache, selector, prompt); }
+                        let rows = prompt.plan.chunks.get(prompt.chunks).copied().unwrap_or(prompt.tokens.len()) - prompt.done;
+                        let clock = Instant::now();
+                        let outcome = prefill_one(engine, family, cache, selector, prompt);
+                        if rows > 0 { seconds_per_row = (clock.elapsed().as_secs_f64() / rows as f64).max(seconds_per_row * 0.9); }
+                        outcome
+                    }).collect()
+                });
             if engine.is_terminal() {
                 let mut primary = None;
                 let mut affected = Vec::new();
@@ -1612,6 +1628,77 @@ fn split_timed_chunk(plan: &mut cuteafd_engine::prefix::PointPlan, chunk: usize,
     }
 }
 
+
+fn packed_chunk(p: &Prefill<'_>) -> Option<(usize, usize)> {
+    if p.job.events.is_closed() || p.done == p.tokens.len() || p.logits.is_some()
+        || !p.media.spans().is_empty() || p.job.probe.as_ref().is_some_and(|probe|
+            probe.spec.cold_steps.get(p.chunks).is_some_and(|step| step.decode)) { return None; }
+    Some((p.placement.len, p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()) - p.done))
+}
+
+fn prefill_group(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, group: &mut [Prefill<'_>])
+    -> Vec<Result<Chunk>> {
+    let timer = Instant::now();
+    let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
+    let counts = group.iter().zip(&ends).map(|(p, end)| end - p.done).collect::<Vec<_>>();
+    cuteafd_transport::route_log::step(|| group.iter().zip(&counts)
+        .map(|(p, &count)| (p.ticket.id(), count as u32)).collect());
+    let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| {
+        let mut sequences = Vec::new();
+        let mut outputs = Vec::new();
+        for (p, &end) in group.iter_mut().zip(&ends) {
+            let Prefill { job, constraint, tokens, done, placement, first, logits, .. } = p;
+            sequences.push((placement, &tokens[*done..end]));
+            outputs.push((&*job, constraint, first, logits, tokens.len(), end));
+        }
+        let (segments, outcomes) = engine.prefill_packed(&mut sequences, &mut |i, logits| {
+            let (job, constraint, first, retained, len, end) = &mut outputs[i];
+            if job.events.is_closed() { return Ok(Err(anyhow::anyhow!("client went away"))); }
+            if end != len { return Ok(Ok(())); }
+            let mut batch = SelectBatch::default();
+            if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
+                return Ok(Err(error));
+            }
+            let selected = selector.select(&logits, &batch)?;
+            match take(constraint.as_mut(), &selected[0]) {
+                Ok(token) => **first = Some(token),
+                Err(error) => return Ok(Err(error)),
+            }
+            if cache.enabled() && !probe::cold(&job.probe) { **retained = Some(logits.row_host(engine.library, 0)?); }
+            if probe::wants_first(&job.probe) {
+                probe::device_rows(engine.library, &job.probe, &logits, 0, 1, *len)?;
+            }
+            Ok(Ok(()))
+        })?;
+        drop((sequences, outputs));
+        if let Some(drafter) = &engine.drafter {
+            // Every placement advanced, including clients that left during execution.
+            // Cancellation can park it, so its draft state must advance as well.
+            for (p, s) in group.iter().zip(&segments) {
+                if let Some(slot) = p.slot {
+                    drafter.update(&(0..s.tap_rows).map(|r| ContextRow { tap_row: s.tap_offset + r, slot,
+                        position: s.start + s.rows - s.tap_rows + r }).collect::<Vec<_>>())?;
+                }
+            }
+        }
+        Ok(outcomes)
+    }));
+    let elapsed = timer.elapsed().as_secs_f64();
+    for (((p, &end), &count), share) in group.iter_mut().zip(&ends).zip(&counts)
+        .zip(crate::shared::prefill_packing::row_shares(&counts)) {
+        p.done = end;
+        p.cancelled = p.job.events.is_closed();
+        add_phases(&mut p.phases, phases.map(|seconds| seconds * share));
+        p.busy += elapsed * share;
+        p.ticket.prefill(count, p.chunks, p.plan.chunks.len(), timer);
+    }
+    let outcomes = crate::shared::prefill_packing::member_outcomes(group.len(), result);
+    group.iter_mut().zip(outcomes).map(|(p, outcome)| {
+        outcome?;
+        complete_prefill_chunk(family, cache, p)
+    }).collect()
+}
 
 fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, p: &mut Prefill<'_>)

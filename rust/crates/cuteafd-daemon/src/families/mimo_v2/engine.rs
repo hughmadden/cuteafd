@@ -160,6 +160,7 @@ const MTP_STEP_ROWS: usize = 16;
 const DECODE_SPLITS: i32 = 16;
 
 /// Host tables of one step.
+#[derive(Clone)]
 struct StepTables {
     decode: bool,
     positions: Vec<i64>,
@@ -485,6 +486,48 @@ impl<'a> Workspace<'a> {
     }
 }
 
+struct PackedMember<'a> {
+    segment: crate::shared::prefill_packing::Segment,
+    tables: StepTables,
+    views: Vec<Workspace<'a>>,
+    rope: Vec<u8>,
+}
+
+fn validate_packed_members(members: &[PackedMember<'_>], chunks: &[(usize, usize)]) -> Result<()> {
+    ensure!(members.len() == chunks.len(), "packed member count differs");
+    let mut first = 0;
+    for (member, &(start, rows)) in members.iter().zip(chunks) {
+        let s = member.segment;
+        ensure!(s.first == first && s.start == start && s.rows == rows
+            && member.tables.positions.len() == rows
+            && member.tables.positions.iter().enumerate().all(|(i, &p)| p == (start + i) as i64)
+            && member.tables.slots.len() == rows && member.tables.ring_slots.len() == rows
+            && member.tables.seq_first == vec![0; rows], "packed attention member binding differs");
+        first += rows;
+    }
+    Ok(())
+}
+
+impl<'a> Workspace<'a> {
+    /// Only persistent row planes are offset. Attention metadata and scratch are
+    /// rewritten and consumed serially per member, including planar RoPE inputs.
+    fn member_view(&self, first: usize, rows: usize, hidden: usize, topk: usize) -> Result<Self> {
+        ensure!(rows > 0 && first.checked_add(rows).is_some_and(|end| end <= self.rows),
+            "MiMo packed member exceeds the unit");
+        let mut view = self.clone();
+        for (plane, stride) in [(&mut view.h, hidden * 2), (&mut view.x, hidden * 2),
+            (&mut view.delta, hidden * 2), (&mut view.route_ids, topk * 4),
+            (&mut view.route_weights, topk * 4)] {
+            *plane = plane.view(first * stride, rows * stride)?;
+        }
+        if view.wire.buffer.bytes > 256 {
+            let stride = hidden + hidden / 32;
+            view.wire = view.wire.view(first * stride, rows * stride)?;
+        }
+        Ok(view)
+    }
+}
+
 struct UnitHooks<'h, 'a> {
     engine: &'h MimoEngine<'a>,
     tokens: &'h [u32],
@@ -495,9 +538,69 @@ struct UnitHooks<'h, 'a> {
     all_logits: bool,
     output: &'h Workspace<'a>,
     last: usize,
+    packed: Option<&'h [PackedMember<'a>]>,
 }
 
 impl UnitHooks<'_, '_> {
+    fn packed_attention(&self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
+        members: &[PackedMember<'_>]) -> Result<()> {
+        let e = self.engine;
+        let w = &self.work[unit.index];
+        let peer = self.peer_work.map(|work| &work[unit.index]);
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        let bytes = unit.rows.len() * e.cfg.hidden * 2;
+        if let Some(w1) = peer {
+            if layer == 0 {
+                e.wait(1, unit_slot(0, false, unit.slot))?;
+                e.norm_on(1, w1, e.peer.as_ref().context("MiMo peer")?.layers[layer].ptr("input_norm")?,
+                    0, rows, w1.delta.buffer.ptr)?;
+            }
+        }
+        // Both ranks finish all members' partials before one packed exchange.
+        for rank in 0..e.ranks() {
+            for member in members {
+                let s = member.segment;
+                let view = &member.views[rank];
+                e.stage_member(rank, view, &member.tables, &member.rope)?;
+                let (weight, kv) = if rank == 0 { (&e.weights.layers[layer], e.kv[layer].buffer.ptr) }
+                    else { let p = e.peer.as_ref().context("MiMo peer")?; (&p.layers[layer], p.kv[layer].buffer.ptr) };
+                e.attention_on(rank, view, kv, weight, Scalar::I32(s.rows as i32), "m4096", &member.tables)?;
+            }
+        }
+        if let Some(w1) = peer {
+            let slot = unit_slot(layer, false, unit.slot);
+            e.push(1, slot, w1.delta.buffer.ptr, bytes)?;
+            e.push(0, slot, w.delta.buffer.ptr, bytes)?;
+            for (rank, base) in [(0, w), (1, w1)] {
+                e.wait(rank, slot)?;
+                let weight = if rank == 0 { &e.weights.layers[layer] }
+                    else { &e.peer.as_ref().context("MiMo peer")?.layers[layer] };
+                e.norm_on(rank, base, weight.ptr("post_norm")?, 2, rows, e.recv(rank, slot))?;
+            }
+            let weight = &e.peer.as_ref().context("MiMo peer")?.layers[layer];
+            if weight.dense {
+                e.dense_ffn(1, w1, weight, rows, "m4096", false)?;
+                e.push(1, unit_slot(layer, true, unit.slot), w1.delta.buffer.ptr, bytes)?;
+            } else if e.tp2_layer(layer) {
+                self.member_routes(1, w1, weight, unit.rows.len(), true)?;
+                e.tp2_experts(1, layer, unit.slot, w1, unit.rows.len())?;
+            }
+            Ok(())
+        } else { e.norm(w, e.weights.layers[layer].ptr("post_norm")?, 1, rows) }
+    }
+
+    fn member_routes(&self, rank: usize, w: &Workspace<'_>, weight: &MimoLayer<'_>, rows: usize,
+        bf16: bool) -> Result<()> {
+        let e = self.engine;
+        if let Some(members) = self.packed {
+            for member in members {
+                let s = member.segment;
+                e.moe_front_on(rank, &member.views[rank], weight, s.rows, bf16)?;
+            }
+            Ok(())
+        } else { e.moe_front_on(rank, w, weight, rows, bf16) }
+    }
+
     fn after_ffn(&self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let e = self.engine;
         let w = &self.work[unit.index];
@@ -514,6 +617,13 @@ impl UnitHooks<'_, '_> {
         e.norm_on(0, w, weight, if dense_split { 2 } else { 1 }, rows,
             if dense_split { e.recv(0, ffn) } else { w.delta.buffer.ptr })?;
         if let Some(drafter) = &e.drafter {
+            if let Some(members) = self.packed {
+                for member in members {
+                    let s = member.segment;
+                    drafter.tap_at(layer, w.h.buffer.ptr, s.end_row() - s.tap_rows, s.tap_offset, s.tap_rows)?;
+                }
+                return Ok(());
+            }
             let tail = self.tokens.len().saturating_sub(super::dflash::TAP_ROWS);
             let first = unit.rows.start.max(tail);
             if first < unit.rows.end {
@@ -569,6 +679,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let e = self.engine;
         let w = &self.work[unit.index];
         e.unit_index.set(Some(unit.index));
+        if let Some(members) = self.packed { return self.packed_attention(layer, unit, members); }
         let rows = Scalar::I32(unit.rows.len() as i32);
         let tables = &self.tables[unit.index];
         let bytes = unit.rows.len() * e.cfg.hidden * 2;
@@ -592,7 +703,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
             e.dense_ffn(0, w, weight, Scalar::I32(t as i32), "m4096", false)?;
             if self.peer_work.is_some() { e.push(0, unit_slot(layer, true, unit.slot), w.delta.buffer.ptr, t * e.cfg.hidden * 2)?; }
         } else {
-            e.moe_front(w, weight, t, e.expert_bf16_input(false))?;
+            self.member_routes(0, w, weight, t, e.expert_bf16_input(false))?;
             if e.tp2_layer(layer) { e.tp2_experts(0, layer, unit.slot, w, t)?; }
             else {
                 e.moe_run(w, layer, t, false)?;
@@ -608,7 +719,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let w = &self.work[unit.index];
         let Some(Experts::Spark { prefill: transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
         let bf16 = e.expert_input.bf16(false);
-        e.moe_front(w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
+        self.member_routes(0, w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
         e.wave_send(w, layer, unit.rows.len(), ExpertV2SourceKind::Prefill, bf16, transport.borrow_mut().exchange()?)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: crate::shared::spark_waves::WaveTicket) -> Result<()> {
@@ -621,7 +732,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
     }
     fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let e = self.engine;
-        if e.weights.layers.len() != e.cfg.layers { return Ok(()); }
+        if e.weights.layers.len() != e.cfg.layers || self.packed.is_some() { return Ok(()); }
         let w = &self.work[unit.index];
         if self.all_logits {
             let bytes = unit.rows.len() * e.cfg.vocab_size * 4;
@@ -641,7 +752,11 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let e = self.engine;
         if let (Some(mtp), true) = (&e.mtp, e.weights.layers.len() == e.cfg.layers
             && unit.rows.end > self.tokens.len().saturating_sub(super::mtp::HIDDEN_ROWS)) {
-            e.mtp_tap(mtp, &self.work[unit.index], &self.tables[unit.index])?;
+            if let Some(members) = self.packed {
+                for member in members {
+                    e.mtp_tap(mtp, &member.views[0], &member.tables)?;
+                }
+            } else { e.mtp_tap(mtp, &self.work[unit.index], &self.tables[unit.index])?; }
         }
         if self.peer_work.is_some() {
             // SAFETY: the event and peer stream belong to this engine and all
@@ -1372,8 +1487,20 @@ impl<'a> MimoEngine<'a> {
         Ok(workspace)
     }
 
-    /// Replace the existing positions upload with one packed positions/RoPE copy.
-    /// Pointers stay fixed across graph replay; each prefill slot owns its window.
+    /// Stage a member's immutable metadata into same-stream, hook-local scratch.
+    fn stage_member(&self, rank: usize, w: &Workspace<'_>, tables: &StepTables, rope: &[u8]) -> Result<()> {
+        self.on(rank, || {
+            ordered_table_upload(self.library, w.step_inputs.buffer, rope, self.stream_of(rank))?;
+            for (plane, bytes) in [(&w.slots, bytes_of(&tables.slots)),
+                (&w.ring_slots, bytes_of(&tables.ring_slots)), (&w.seq_first, bytes_of(&tables.seq_first)),
+                (&w.page_table, bytes_of(&tables.page_table))] {
+                ensure!(bytes.len() <= plane.buffer.bytes, "MiMo member metadata exceeds storage");
+                ordered_table_upload(self.library, plane.buffer, bytes, self.stream_of(rank))?;
+            }
+            Ok(())
+        })
+    }
+
     fn put_step_inputs(&self, rank: usize, w: &Workspace<'_>, positions: &[i64]) -> Result<()> {
         let mut bytes = w.step_host.borrow_mut();
         self.rope.fill(positions, w.rows, self.max_context, &mut bytes)?;
@@ -1498,7 +1625,7 @@ impl<'a> MimoEngine<'a> {
         let peer_work = peer_base.map(|base| units.iter().map(|unit| base.unit_view(unit.slot,
             self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim, self.cfg.topk)).collect::<Result<Vec<_>>>()).transpose()?;
         let mut hooks = UnitHooks { engine: self, tokens, tables: &tables, work: &work,
-            peer_work: peer_work.as_deref(), media, all_logits, output: base, last: units.len() - 1,
+            peer_work: peer_work.as_deref(), media, all_logits, output: base, last: units.len() - 1, packed: None,
         };
         let result = run_prefill_units(&mut hooks, &units, waves);
         self.unit_index.set(None);
@@ -1506,6 +1633,62 @@ impl<'a> MimoEngine<'a> {
         self.finish_tp2_route_step()?;
         Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(base,
             if all_logits { tokens.len() } else { 1 }, false)))
+    }
+
+    pub(crate) fn packed_limits(&self) -> crate::shared::prefill_packing::Limits {
+        crate::shared::prefill_packing::Limits { rows: self.prefill_rows, chunk_rows: self.prefill_rows,
+            max_context: self.max_context, taps: self.drafter.as_ref().map(|_| super::dflash::TAP_ROWS) }
+    }
+
+    /// One admitted packed unit on the ordinary executor, with sequence-local attention.
+    /// Logits are consumed before the shared head scratch is reused for the next member.
+    pub(crate) fn prefill_packed(&self, sequences: &mut [(&mut MimoPlacement, &[u32])],
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<(Vec<crate::shared::prefill_packing::Segment>, Vec<Result<()>>)> {
+        use crate::shared::prefill_pipeline::{Unit, UnitSegment, run_prefill_units};
+        ensure!(self.weights.layers.len() == self.cfg.layers, "packed prefill requires every layer");
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>(), &self.packed_limits())?;
+        self.submit(|| {
+            self.prepare_scoring_prefill()?;
+            let owned = self.workspace.borrow();
+            let base = owned.as_ref().context("prefill workspace")?;
+            let peer_owned = self.peer.as_ref().map(|p| p.workspace.borrow());
+            let work = [base.unit_view(0, self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim, self.cfg.topk)?];
+            let peer_work = peer_owned.as_ref().and_then(|p| p.as_ref()).map(|base|
+                base.unit_view(0, self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim, self.cfg.topk).map(|w| [w])).transpose()?;
+            let members = sequences.iter().zip(&segments).map(|((p, tokens), &segment)| {
+                let tables = p.prefill_tables(tokens.len(), self.max_context)?;
+                let mut rope = vec![0; self.prefill_rows * (8 + 2 * self.cfg.rope_dim * 4)];
+                self.rope.fill(&tables.positions, self.prefill_rows, self.max_context, &mut rope)?;
+                let views = std::iter::once(&work[0]).chain(peer_work.as_ref().map(|w| &w[0]))
+                    .map(|w| w.member_view(segment.first, segment.rows, self.cfg.hidden, self.cfg.topk))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(PackedMember { segment, tables, views, rope })
+            }).collect::<Result<Vec<_>>>()?;
+            validate_packed_members(&members, &sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>())?;
+            let tokens = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect::<Vec<_>>();
+            // Begin's upload is harmless; each attention segment replaces it on its consumer stream.
+            let tables = [members[0].tables.clone()];
+            let units = [Unit { index: 0, sequence: 0, rows: 0..tokens.len(), layers: 0..self.cfg.layers,
+                slot: 0, barrier: false, segments: segments.iter().enumerate().map(|(sequence, s)| UnitSegment {
+                    sequence, rows: s.first..s.end_row(), tokens: s.start..s.start + s.rows,
+                    prompt_end: false, snapshot: false, head: true }).collect() }];
+            self.prepare_tp2_route_step(&[tokens.len()])?;
+            let mut hooks = UnitHooks { engine: self, tokens: &tokens, tables: &tables, work: &work,
+                peer_work: peer_work.as_ref().map(|w| &w[..]), media: None, all_logits: false,
+                output: base, last: 0, packed: Some(&members) };
+            let result = run_prefill_units(&mut hooks, &units, self.prefill_waves());
+            self.unit_index.set(None);
+            result?;
+            self.finish_tp2_route_step()?;
+            for (placement, tokens) in sequences.iter_mut() { placement.len += tokens.len(); }
+            let outcomes = crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
+                self.launch_head(&work[0], segments[i].end_row(), 1, false)?;
+                Ok(self.device_logits(&work[0], 1, false))
+            }, on_logits)?;
+            Ok((segments, outcomes))
+        })
     }
 
     /// Appends each sequence's tokens (one for decode, several for a
@@ -2967,6 +3150,34 @@ mod tests {
                 assert_eq!(binding.cos_sin as usize, view.step_inputs.buffer.ptr as usize
                     + rows * 8 + usize::from(sliding) * rows * rope * 4);
             }
+            for (first, count) in [(0, 1), (7, 19), (rows - 1, 1)] {
+                let member = view.member_view(first, count, hidden, topk)?;
+                for (actual, original, stride) in [(&member.h, &view.h, hidden * 2),
+                    (&member.x, &view.x, hidden * 2), (&member.delta, &view.delta, hidden * 2),
+                    (&member.route_ids, &view.route_ids, topk * 4),
+                    (&member.route_weights, &view.route_weights, topk * 4),
+                    (&member.wire, &view.wire, hidden + hidden / 32)] {
+                    assert_eq!(actual.buffer.ptr as usize, original.buffer.ptr as usize + first * stride);
+                    assert_eq!(actual.buffer.bytes, count * stride);
+                }
+                // Metadata is rewritten from member-local rows, never sliced through
+                // the planar full/SWA RoPE layout or the single-sequence cache scratch.
+                assert_eq!(member.rows, view.rows);
+                for attention in [MimoAttention::Full, MimoAttention::Sliding] {
+                    let a = member.attention_bindings(rope, attention);
+                    let b = view.attention_bindings(rope, attention);
+                    assert_eq!(a.cos_sin, b.cos_sin);
+                    assert_eq!(a.producer_positions, b.producer_positions);
+                    assert_eq!(a.attention_positions, b.attention_positions);
+                }
+                assert_eq!(member.page_table.buffer.ptr, view.page_table.buffer.ptr);
+                assert_eq!(member.query.buffer.ptr, view.query.buffer.ptr);
+                assert_eq!(member.kv_wide.buffer.ptr, view.kv_wide.buffer.ptr);
+                assert_eq!(member.logits.buffer.ptr, view.logits.buffer.ptr);
+            }
+            assert!(view.member_view(rows, 1, hidden, topk).is_err());
+            assert!(view.member_view(0, 0, hidden, topk).is_err());
+            assert!(view.member_view(usize::MAX, 2, hidden, topk).is_err());
             assert_eq!(view.query.buffer.ptr, base.query.buffer.ptr);
             assert_eq!(view.attn.buffer.ptr, base.attn.buffer.ptr);
             assert_eq!(view.scratch.buffer.ptr, base.scratch.buffer.ptr);
@@ -2980,6 +3191,27 @@ mod tests {
         }
         assert!(base.unit_view(slots, rows, hidden, rope, topk).is_err());
         assert!(base.unit_view(0, rows + 1, hidden, rope, topk).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packed_attention_rejects_a_swapped_member_start() -> anyhow::Result<()> {
+        use super::*;
+        let placements = [MimoPlacement { pages: vec![8, 9], ring: 2, len: 3 },
+            MimoPlacement { pages: vec![10, 11], ring: 4, len: 70 }];
+        let chunks = [(3, 7), (70, 13)];
+        let layout = crate::shared::prefill_packing::plan(&chunks, &crate::shared::prefill_packing::Limits {
+            rows: 64, chunk_rows: 64, max_context: 128, taps: None })?;
+        let mut members = placements.iter().zip(layout).map(|(p, segment)| Ok(PackedMember {
+            tables: p.prefill_tables(segment.rows, 128)?, segment, views: Vec::new(), rope: Vec::new(),
+        })).collect::<Result<Vec<_>>>()?;
+        validate_packed_members(&members, &chunks)?;
+        let original = members[0].tables.positions.clone();
+        members[0].tables.positions = (70..77).collect();
+        assert!(validate_packed_members(&members, &chunks).is_err(), "wrong sequence position must fail before launch");
+        members[0].tables.positions = original;
+        members[0].segment.first = 7;
+        assert!(validate_packed_members(&members, &chunks).is_err(), "wrong packed row window must fail before launch");
         Ok(())
     }
 

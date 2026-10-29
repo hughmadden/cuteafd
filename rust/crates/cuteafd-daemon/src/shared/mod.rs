@@ -25,6 +25,7 @@ pub(crate) mod peer_split;
 pub(crate) mod placement;
 pub(crate) mod prefill_depth;
 pub(crate) mod prefill_pipeline;
+pub(crate) mod prefill_packing;
 pub(crate) mod prefill_share;
 pub(crate) mod prefix;
 pub(crate) mod probe;

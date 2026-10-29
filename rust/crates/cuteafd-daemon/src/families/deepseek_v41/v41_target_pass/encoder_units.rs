@@ -106,7 +106,7 @@ pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
             let end = start + chunk.len();
             let unit = Unit {
                 index,
-                sequence: 0,
+                sequence: 0, segments: Vec::new(),
                 rows: start..end,
                 layers: 0..20,
                 slot: 0,
@@ -120,7 +120,7 @@ pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
 
 pub(in crate::families::deepseek_v41) fn decoder_unit(index: usize, rows: std::ops::Range<usize>) -> Result<Unit> {
     ensure!(!rows.is_empty() && rows.len() <= 128, "decoder replay suffix capacity differs");
-    Ok(Unit { index, sequence: 0, rows, layers: 20..40, slot: 0, barrier: true })
+    Ok(Unit { index, sequence: 0, segments: Vec::new(), rows, layers: 20..40, slot: 0, barrier: true })
 }
 
 struct UnitSlot<'s, 'w, 'a> {

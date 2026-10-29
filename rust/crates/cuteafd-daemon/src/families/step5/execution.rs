@@ -1709,7 +1709,7 @@ mod executor_schedule_tests {
             else { base..base + bytes }
         };
         let units = prefill_units(rows, unit_rows, waves, 64).map_err(|e| e.to_string())?.into_iter().enumerate()
-            .map(|(index, rows)| Unit { index, sequence: 0, rows, layers: 0..LAYERS, slot: index % waves, barrier: false })
+            .map(|(index, rows)| Unit { index, sequence: 0, segments: Vec::new(), rows, layers: 0..LAYERS, slot: index % waves, barrier: false })
             .collect::<Vec<_>>();
         let routes = (0..LAYERS).map(|l| if routed(l) { FfnRoute::Spark } else { FfnRoute::Local }).collect::<Vec<_>>();
         let steps = prefill_schedule(&routes, &units, waves).map_err(|e| e.to_string())?;
