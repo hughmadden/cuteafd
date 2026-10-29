@@ -148,7 +148,6 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
                 projection.stem, matching.len());
             let policy = matching[0];
             let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows})?;
-            layout.rows = rows;
             if let Some(grouped) = policy.get("grouped") {
                 let groups = grouped["groups"].as_u64().and_then(|v| usize::try_from(v).ok())
                     .context("Kimi K6 grouped row-policy groups")?;
@@ -156,7 +155,13 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
             }
             // Only GPU1 projects the vocabulary; body projections run on both ranks.
             for target in combined.iter_mut().skip(if head { 1 } else { 0 }) {
-                if let Some(combined) = target { combined.merge(&layout)?; } else { *target = Some(layout.clone()); }
+                if let Some(combined) = target {
+                    if !head { combined.rows = rows; }
+                    let mut required = layout.clone();
+                    // A body owner has full-row storage; a head-only owner stays bounded.
+                    required.rows = combined.rows;
+                    combined.merge(&required)?;
+                } else { *target = Some(layout.clone()); }
             }
         }
     }
@@ -427,7 +432,7 @@ mod draft_head_tests {
             let layouts=projection_scratch(&cfg,&head_only,rows,&head_policy(book))?;
             assert!(layouts[0].is_none());
             let expected=ProjectionScratchLayout::new(7168,163840,rows.min(64))?;
-            assert_eq!(layouts[1].as_ref().map(|p|&p.extents),Some(&expected.extents));
+            assert_eq!(layouts[1].as_ref().map(|p|(&p.extents,p.rows)),Some((&expected.extents,expected.rows)));
         }
         Ok(())
     }

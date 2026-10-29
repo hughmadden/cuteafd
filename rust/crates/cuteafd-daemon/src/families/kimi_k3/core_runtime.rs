@@ -126,10 +126,11 @@ impl<'a> CorePrograms<'a> {
             let key=projection_key(weight.shape,weight.side,weight.codebook);
             let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows.min(64),TrellisDType::F32)?;
             let mut required=ProjectionLayout::new(&projection.program,rows.min(64))?;
-            // Head logits are consumed in <=64-row spans, while this scratch
-            // owner also serves full-capacity serialized layer projections.
-            required.rows=rows;
-            if let Some(layout)=&mut layouts[1] {layout.merge(&required)?;}else{layouts[1]=Some(required);}
+            if let Some(layout)=&mut layouts[1] {
+                // Only a body owner also serves full-capacity layer projections.
+                required.rows=layout.rows;
+                layout.merge(&required)?;
+            }else{layouts[1]=Some(required);}
             projections.insert(key,projection);
         }
         let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch(cfg,inventory,rows,
