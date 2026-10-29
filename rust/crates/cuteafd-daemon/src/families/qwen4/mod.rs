@@ -910,7 +910,8 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     }
     ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
     let windows = if args.golden.join("manifest.json").try_exists()? && args.packed_check.is_some() {
-        Some(fidelity_windows(&args.golden, None)?)
+        Some(fidelity_windows(&args.golden, None,
+            args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted)?)
     } else if args.golden.join("manifest.json").try_exists()? {
         ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.teacher_force && args.spec_keep.is_none()
@@ -920,7 +921,7 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
         let output = args.save_logits.as_deref().unwrap();
         ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
             "Qwen fidelity output needs an existing parent and a new directory");
-        Some(fidelity_windows(&args.golden, args.window.as_deref())?)
+        Some(fidelity_windows(&args.golden, args.window.as_deref(), false)?)
     } else {
         ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
         None
@@ -939,7 +940,7 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
             if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted {
                 let windows = windows.as_ref().context("unrestricted packed check needs the sealed official reference")?;
                 let first = args.window.as_deref().unwrap_or(&windows.first().context("empty packed reference")?.id);
-                let selected = crate::shared::qwen::packed_check::reference_windows(windows, first, members)?;
+                let selected = crate::shared::qwen::packed_check::reference_windows(windows, first, members, true)?;
                 let precision = cuteafd_bench::fidelity_precision::resolve("qwen-packed-check", Some(&args.engine.snapshot),
                     &serde_json::json!([]), "Qwen/Qwen3.8-Flash-Next", None)?;
                 let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
@@ -1025,7 +1026,7 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
     (agree, next_ok, golden_next, nll, scored)
 }
 
-fn fidelity_windows(root: &std::path::Path, selected: Option<&str>) -> Result<Vec<cuteafd_bench::reference::Window>> {
+fn fidelity_windows(root: &std::path::Path, selected: Option<&str>, packed: bool) -> Result<Vec<cuteafd_bench::reference::Window>> {
     use cuteafd_bench::fidelity_dataset;
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(root.join("manifest.json"))?;
@@ -1035,7 +1036,9 @@ fn fidelity_windows(root: &std::path::Path, selected: Option<&str>) -> Result<Ve
     ensure!(manifest["config"] == fidelity_dataset::QWEN_CONFIG && manifest["vocab"] == 248320,
         "Qwen fidelity config/vocabulary differs");
     let reference = fidelity_dataset::load(root, &manifest)?;
-    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    // Packed qualification needs long genuine generations from the full panel;
+    // ordinary fidelity cards retain their immutable quick subset.
+    let mut windows = if packed { reference.windows.clone() } else { fidelity_dataset::quick_windows(&reference)? };
     if let Some(id) = selected {
         windows.retain(|window| window.id == id);
         ensure!(windows.len() == 1, "Qwen fidelity window must belong to the sealed quick subset");
@@ -1397,7 +1400,7 @@ mod golden_tests {
     fn shared_fidelity_rejects_an_unpublished_manifest() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
-        assert!(fidelity_windows(dir.path(), None).unwrap_err().to_string().contains("immutable publication"));
+        assert!(fidelity_windows(dir.path(), None, false).unwrap_err().to_string().contains("immutable publication"));
     }
 }
 

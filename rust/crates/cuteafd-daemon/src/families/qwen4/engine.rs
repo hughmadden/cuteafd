@@ -4231,6 +4231,117 @@ impl Drop for Qwen4Engine<'_> {
 }
 
 #[cfg(test)]
+mod packed_route_fixture {
+    use super::*;
+    use super::super::{speculate, prefix};
+    use crate::shared::qwen::scheduler::PrefillSeq;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        engine: super::super::EngineArgs,
+    }
+
+    fn regions(engine: &Qwen4Engine<'_>, slot: i32) -> Result<Vec<Vec<u8>>> {
+        engine.slot_regions(slot as usize).into_iter().map(|buffer| {
+            // SAFETY: the engine retains the region and its owning execution stream.
+            unsafe { engine.library.cuda_stream_synchronize(engine.state_stream(buffer.device_id)?)?; }
+            let mut bytes = vec![0; buffer.bytes];
+            engine.library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes)
+        }).collect()
+    }
+
+    #[test]
+    #[ignore = "requires sealed Qwen native artifact, official reference and GPU"]
+    fn packed_native_genuine_rows() -> Result<()> {
+        #[derive(Parser)]
+        struct Cli { #[command(flatten)] args: super::super::GoldenArgs }
+        let snapshot = std::env::var("CUTEAFD_FIXTURE_MODEL")?;
+        let golden = std::env::var("CUTEAFD_FIXTURE_REFERENCE")?;
+        let args = Cli::try_parse_from(["fixture", "--snapshot", &snapshot, "--golden", &golden,
+            "--local-experts", "--mtp", "3", "--pool-tokens", "65536", "--slots", "16",
+            "--packed-check", "8", "--prefill-packing", "unrestricted"])?;
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+            .block_on(super::super::run_golden(args.args))
+    }
+
+    #[test]
+    #[ignore = "requires sealed Qwen native artifact, checkpoint, reference and GPU"]
+    fn packed_totals_at_most_64_discriminator() -> Result<()> {
+        let snapshot = std::env::var("CUTEAFD_FIXTURE_MODEL")?;
+        let golden = std::env::var("CUTEAFD_FIXTURE_REFERENCE")?;
+        let args = Args::try_parse_from(["fixture", "--snapshot", &snapshot,
+            "--local-experts", "--mtp", "3", "--pool-tokens", "65536",
+            "--slots", "16", "--prefill-packing", "unrestricted"])?;
+        let windows = super::super::fidelity_windows(std::path::Path::new(&golden), None, false)?;
+        let opened = super::super::open(&args.engine)?;
+        opened.with_engine(&args.engine, |engine| {
+            let mut names = Vec::new();
+            for (layer, home) in engine.state_map.layers.iter().enumerate() {
+                if home.gdn_ordinal.is_some() {
+                    names.push(format!("rank{} layer{layer} GDN.conv", home.owner));
+                    names.push(format!("rank{} layer{layer} GDN.recurrent", home.owner));
+                }
+            }
+            if engine.ple_state.is_some() {
+                names.push(format!("rank0 layer{} PLE.conv", engine.cfg.ple_layers[0]));
+            }
+            let mut every_equal = true;
+            let shapes: &[&[usize]] = if std::env::var_os("CUTEAFD_FIXTURE_REVERSE").is_some() {
+                &[&[29, 9, 7], &[40, 24]]
+            } else { &[&[7, 9], &[7, 17], &[7, 9, 29], &[24, 40]] };
+            for &lengths in shapes {
+                let total: usize = lengths.iter().sum();
+                let mut allocator = Allocator::new(engine.pages, engine.slots, &engine.cfg);
+                let mut packed = lengths.iter().map(|&n| allocator.admit(n + 1)).collect::<Result<Vec<_>>>()?;
+                let mut alone = lengths.iter().map(|&n| allocator.admit(n + 1)).collect::<Result<Vec<_>>>()?;
+                let tokens = lengths.iter().enumerate().map(|(i, &n)| {
+                    let source = &windows[i].tokens;
+                    (0..n).map(|j| source[(i * 97 + j) % source.len()]).collect::<Vec<_>>()
+                }).collect::<Vec<_>>();
+                let mut drafts = vec![speculate::MtpSeq::default(); lengths.len()];
+                let mut logits = vec![Vec::new(); lengths.len()];
+                let mut sequences = packed.iter_mut().zip(&tokens).zip(&mut drafts).map(|((placement, tokens), draft)| {
+                    PrefillSeq { placement, tokens, start: 0, next: None, draft, neural: true }
+                }).collect::<Vec<_>>();
+                for result in engine.prefill_packed(&mut sequences, &mut |i, head| {
+                    logits[i] = head.row_host(engine.library, 0)?;
+                    Ok(Ok(()))
+                })? { result?; }
+                drop(sequences);
+                for i in 0..lengths.len() {
+                    let head = engine.prefill_device(&mut alone[i], &tokens[i], None, None, 1)?
+                        .context("singleton full-model head")?.row_host(engine.library, 0)?;
+                    let mut draft = speculate::MtpSeq::default();
+                    speculate::prefill_chunk(engine, &alone[i], 0, &tokens[i], None, &mut draft)?;
+                    let equal = logits[i].iter().map(|x| x.to_bits()).eq(head.iter().map(|x| x.to_bits()));
+                    let state = prefix::packed_state(engine, &packed[i])? == prefix::packed_state(engine, &alone[i])?;
+                    let a = regions(engine, packed[i].slot)?;
+                    let b = regions(engine, alone[i].slot)?;
+                    ensure!(a.len() == names.len() && b.len() == names.len(), "state labels drifted");
+                    let first = a.iter().zip(&b).enumerate().find(|(_, (a, b))| a != b);
+                    let ple = names.iter().position(|n| n.contains("PLE.conv"))
+                        .map(|p| a[p] == b[p]);
+                    if let Some((plane, (a, b))) = first {
+                        let byte = a.iter().zip(b).position(|(a, b)| a != b).unwrap();
+                        println!("discriminator total{total} member{i}: first differing tensor {} byte{byte}", names[plane]);
+                    } else if !state {
+                        println!("discriminator total{total} member{i}: target slot planes equal; first differing canonical plane is paged KV/index or MTP stash/history");
+                    }
+                    let (kl, _) = crate::shared::golden_scores::scored_kl(&head, &logits[i], head.len())?;
+                    println!("discriminator total{total} member{i} rows{}: logits_bytes={equal} canonical_state_bytes={state} PLE.conv_equal={ple:?} KL={kl:.9}", lengths[i]);
+                    every_equal &= equal && state;
+                }
+            }
+            println!("discriminator all totals <=64 byte-identical: {every_equal}");
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
 mod owner_state_tests {
     use super::*;
 

@@ -100,7 +100,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         let reference = fidelity_dataset::load(golden, &manifest)?;
         ensure!(reference.vocab == cfg.vocab, "dense packed reference vocabulary differs");
         Some(crate::shared::qwen::packed_check::reference_windows(&reference.windows,
-            &args.window, args.packed_check.unwrap())?)
+            &args.window, args.packed_check.unwrap(),
+            args.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted)?)
     } else { None };
     let (directory, positions) = if packed_windows.is_some() { (golden.to_owned(), None) } else {
         let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
@@ -250,6 +251,20 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    #[ignore = "requires sealed dense Qwen artifact, official reference and GPU"]
+    fn packed_native_mtp_raw_rows() -> anyhow::Result<()> {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: super::GoldenArgs }
+        let model = std::env::var("CUTEAFD_FIXTURE_MODEL")?;
+        let reference = std::env::var("CUTEAFD_FIXTURE_REFERENCE")?;
+        let parsed = Cli::try_parse_from(["fixture", "--snapshot", &model, "--golden", &reference,
+            "--packed-check", "8", "--window", "a00", "--packed-mtp", "--pool-tokens", "262144",
+            "--prefill-packing", "unrestricted"])?;
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(super::run_golden(parsed.args))
+    }
+
     #[test]
     fn packed_mtp_requires_a_packed_fixture_and_excludes_other_drafters() {
         #[derive(clap::Parser)]
