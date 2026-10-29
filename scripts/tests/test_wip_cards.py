@@ -2615,3 +2615,19 @@ def test_existing_arm_adopts_its_containers_wip_mount_root(tmp_path, monkeypatch
     assert arms['built']['root'] == '/built/root'
     assert 'root' not in arms['release'] and 'root' not in arms['gone']
     assert calls == ['cuteafd-coordinator-wip-shared', 'cuteafd-coordinator-wip-g']
+
+
+def test_arm_env_takes_only_private_diagnostics():
+    arms = {'off': {}, 'on': {}}
+    assert cards.arm_env_from(['on:CUTEAFD_DIAG_K6_BF16_PARTIALS=1'], arms) == {'on': {'CUTEAFD_DIAG_K6_BF16_PARTIALS': '1'}}
+    for bad in ['on:RUST_LOG=debug', 'on:CUTEAFD_PREFILL_PACKING=exact', 'gone:CUTEAFD_DIAG_X=1', 'on:CUTEAFD_DIAG_X=a\nb']:
+        with pytest.raises(ValueError):
+            cards.arm_env_from([bad], arms)
+
+
+def test_arm_env_reaches_only_its_own_job():
+    text = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    launch = text[text.index("job_env = dict(env)"):text.index("process = detached(smoke_command(")]
+    # Inherited private diagnostics never leak into an arm that did not ask for them.
+    assert "if k.startswith('CUTEAFD_DIAG_')" in launch and "del job_env[key]" in launch
+    assert "job_env.update(job.get('arm_env', {}))" in launch

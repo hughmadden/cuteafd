@@ -234,6 +234,22 @@ def overrides_from(items):
     return overrides
 
 
+def arm_env_from(items, arms):
+    """Per-arm private diagnostics, so one sealed binary can run an off/on pair.
+    Only CUTEAFD_DIAG_* names: the launcher forwards exactly those, and nothing
+    else may differ between arms through the environment."""
+    out = {}
+    for item in items:
+        name, setting = item.split(':', 1)
+        key, value = setting.split('=', 1)
+        if name not in arms:
+            raise ValueError('unknown --arm-env arm: ' + name)
+        if not re.fullmatch(r'CUTEAFD_DIAG_[A-Z0-9_]+', key) or '\n' in value or '\r' in value:
+            raise ValueError('--arm-env takes CUTEAFD_DIAG_* names only: ' + key)
+        out.setdefault(name, {})[key] = value
+    return out
+
+
 def probe_selection(items, cards, arms):
     probes = {card['name']: set(card.get('probes', [])) | {'fabric'} for card in cards}
     scoped = {}
@@ -2115,6 +2131,9 @@ def main():
                         'slot binary (<WIP_ROOT>/slots/<slot>/coordinator/workspace/.cuteafd-wip/cuteafd)')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
     parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
+    parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:CUTEAFD_DIAG_NAME=VALUE',
+                        help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
+                        'the launcher forwards those to the coordinator unchanged)')
     parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
@@ -2228,6 +2247,7 @@ def main():
             raise ValueError('arm override names must be selected cards')
         for card, values in parsed.items():
             arm_overrides.setdefault(name, {}).setdefault(card, {}).update(values)
+    arm_env = arm_env_from(args.arm_env, arms)
     if args.post_load_c1 and not args.levels:
         parser.error('--post-load-c1 needs --levels')
     if args.post_load_repeat and not args.post_load_c1:
@@ -2363,6 +2383,8 @@ def main():
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
         # Per arm: an A/B of two builds runs each arm's own smoke runner.
         job['binary'] = resolve_binary(args.binary, arms[job['arm']], args.dry_run)
+        if arm_env.get(job['arm']):
+            job['arm_env'] = arm_env[job['arm']]
         save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
     parallel_safe(jobs, args.parallel)
     for job in jobs:
@@ -2491,6 +2513,9 @@ def main():
         job_env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
         if job.get('nonce_seed'):
             job_env['CUTEAFD_BENCH_NONCE_SEED'] = job['nonce_seed']
+        for key in [k for k in job_env if k.startswith('CUTEAFD_DIAG_')]:
+            del job_env[key]
+        job_env.update(job.get('arm_env', {}))
         if STOP['signal'] is not None:
             return cancelled_row(job)
         process = detached(smoke_command(job['binary'], job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
