@@ -47,6 +47,64 @@ pub struct EngineSample {
     pub packets_received: Option<u64>,
 }
 
+/// Host contention seen by the observer while a phase runs. Pressure is the
+/// kernel's 10 s "some" average (percent of time at least one task stalled);
+/// scan counters are cumulative pages, so a phase window yields pages/s.
+/// Every field is absent rather than zero when the kernel does not report it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HostLoad {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_some_avg10: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_some_avg10: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgscan_kswapd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgscan_direct: Option<u64>,
+    /// 1-minute load average, context for the pressure readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+}
+
+/// Parse the `some avg10=` value out of a PSI file's first matching line.
+fn psi_some_avg10(text: &str) -> Option<f64> {
+    text.lines().find(|line| line.trim_start().starts_with("some "))?
+        .split_whitespace().find_map(|field| field.strip_prefix("avg10="))?
+        .parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn vmstat_pages(text: &str, prefix: &str) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        // Kernels with zone lists expose pgscan_kswapd_<zone>; sum them all.
+        if name != prefix && !name.starts_with(&format!("{prefix}_")) { continue; }
+        let Some(value) = fields.next().and_then(|v| v.parse::<u64>().ok()) else { continue };
+        total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+    total
+}
+
+/// Read the coordinator host's pressure, reclaim and load counters. A file
+/// that is missing or unparsable leaves its fields absent, never zero.
+pub fn read_host_load(root: &Path) -> HostLoad {
+    let read = |relative: &str| std::fs::read_to_string(root.join(relative)).ok();
+    let load1 = read("proc/loadavg").and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let mut load = HostLoad {
+        cpu_some_avg10: read("proc/pressure/cpu").as_deref().and_then(psi_some_avg10),
+        memory_some_avg10: read("proc/pressure/memory").as_deref().and_then(psi_some_avg10),
+        load1,
+        ..Default::default()
+    };
+    if let Some(text) = read("proc/vmstat") {
+        load.pgscan_kswapd = vmstat_pages(&text, "pgscan_kswapd");
+        load.pgscan_direct = vmstat_pages(&text, "pgscan_direct");
+    }
+    load
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostSample {
     /// Process incarnation; a restart must not be interpreted as a counter wrap.
@@ -58,6 +116,10 @@ pub struct HostSample {
     /// only to a worker's reply to the coordinator. Absent from older workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpus: Option<serde_json::Value>,
+    /// Host contention at this sample, so a phase window can tell a busy
+    /// coordinator from a quiet one. Absent from older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_load: Option<HostLoad>,
     /// Seconds on this host's monotonic clock, never compared across hosts.
     pub sampled_s: f64,
     /// Start of the continuous demand-driven observation window, host-local.
@@ -426,7 +488,8 @@ fn start() {
                 let mut local = HostSample { incarnation: incarnation.clone(), sampled_s: 0.0, hostname: hostname.clone(),
                     ports: read_ports(Path::new("/sys/class/infiniband")),
                     engine: counters.iter().map(|counter| counter.sample()).collect(),
-                    sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect(), ..Default::default() };
+                    sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect(),
+                    host_load: Some(read_host_load(Path::new("/"))), ..Default::default() };
                 local.sampled_s = clock.elapsed().as_secs_f64();
                 if let Some(before) = previous.as_ref() {
                     // Freeze the first quiet interval per port as its idle reference.
@@ -472,6 +535,38 @@ fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_load_reads_pressure_vmstat_and_load() {
+        let root = std::env::temp_dir().join(format!("host-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("proc/pressure")).unwrap();
+        std::fs::write(root.join("proc/pressure/cpu"),
+            "some avg10=12.50 avg60=4.00 avg300=1.00 total=99\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").unwrap();
+        std::fs::write(root.join("proc/pressure/memory"),
+            "some avg10=6.25 avg60=2.00 avg300=1.00 total=9\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").unwrap();
+        std::fs::write(root.join("proc/vmstat"),
+            "pgscan_kswapd 1000\npgscan_kswapd_normal 500\npgscan_kswapd_dma32 250\npgscan_direct 40\npgscan_direct_normal 10\nnr_free_pages 5\n").unwrap();
+        std::fs::write(root.join("proc/loadavg"), "0.75 0.50 0.25 1/100 1234\n").unwrap();
+        let load = read_host_load(&root);
+        assert_eq!(load.cpu_some_avg10, Some(12.5));
+        assert_eq!(load.memory_some_avg10, Some(6.25));
+        // Every zone suffix and direct/kswapd split is cumulative pages scanned.
+        assert_eq!(load.pgscan_kswapd, Some(1750));
+        assert_eq!(load.pgscan_direct, Some(50));
+        assert_eq!(load.load1, Some(0.75));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_load_missing_or_unparsable_files_stay_unknown() {
+        let root = std::env::temp_dir().join(format!("host-load-missing-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("proc/pressure")).unwrap();
+        std::fs::write(root.join("proc/pressure/cpu"), "no pressure here\n").unwrap();
+        std::fs::write(root.join("proc/vmstat"), "pgscan_kswapd nope\n").unwrap();
+        let load = read_host_load(&root);
+        assert_eq!(load, HostLoad::default());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn old_worker_samples_without_hostname_or_gpus_still_parse() {
         let old = r#"{"incarnation":"1-2","sampled_s":3.5,"ports":[],"engine":[]}"#;

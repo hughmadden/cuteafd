@@ -707,6 +707,38 @@ def test_cleanup_leaves_another_instances_legacy_slot_registration(tmp_path):
     assert result.returncode and 'refusing foreign registration' in result.stderr
 
 
+def test_cleanup_multi_slot_instance_slot_by_slot(tmp_path):
+    # An instance can hold several slots; each cleanup removes only its own
+    # build root, overlay and registrations, and the last one takes the root.
+    home = tmp_path / 'home'
+    root = home / '.cache/cuteafd/builds/wip-test'
+    for slot in ('a', 'b'):
+        (root / 'slots' / slot / 'coordinator').mkdir(parents=True)
+    (root / '.wip-card-owner.json').write_text(json.dumps(dict(task='task', instance='test')))
+    runs = home / '.cache/cuteafd/wip-run' / 'test'
+    slots = home / '.cache/cuteafd/wip-slots' / 'test'
+    for slot in ('a', 'b'):
+        (runs / slot).mkdir(parents=True)
+        slots.mkdir(parents=True, exist_ok=True)
+        (slots / f'{slot}.json').write_text(json.dumps(dict(wip_instance='test', slot=slot)))
+    prefix = 'import subprocess\nsubprocess.check_output=lambda cmd,**kw: ""\n'
+    env = {**os.environ, 'HOME': str(home)}
+    clean = lambda slot: subprocess.run(
+        [sys.executable, '-c', prefix + cards.cleanup_script(dict(instance='test', slot=slot), 'task')],
+        env=env, text=True, capture_output=True)
+
+    first = clean('a')
+    assert first.returncode == 0, first.stderr
+    assert root.exists() and (root / 'slots' / 'b').exists() and not (root / 'slots' / 'a').exists()
+    assert (runs / 'b').exists() and not (runs / 'a').exists()
+    assert (slots / 'b.json').exists() and not (slots / 'a.json').exists()
+
+    second = clean('b')
+    assert second.returncode == 0, second.stderr
+    assert not root.exists()
+    assert not (runs / 'b').exists() and not (slots / 'b.json').exists()
+
+
 def test_summary_medians_paired_not_ratio_of_medians():
     rows = [dict(card='c', arm=arm, repeat=i, status='pass', simulated=False, C1=v) for i, values in enumerate(((10, 20), (100, 110), (20, 40)), 1) for arm, v in zip(('base', 'candidate'), values)]
     medians, paired = cards.summary_math(rows, ['base', 'candidate'])
@@ -1959,6 +1991,31 @@ def test_fabric_health_caveat_only_gates_timed_phases():
     phases[1]['ports'] = [dict(health=dict(retransmit_pct=0.6, retransmit_judged=True))]
     assert 'results remain valid' in cards.fabric_assessment(phases)[0]
     assert cards.fabric_rerun_reasons(phases) == []
+
+
+def test_coordinator_host_load_makes_the_ab_rerun(tmp_path):
+    # A quiet coordinator records low values and stays eligible; CPU pressure,
+    # memory pressure and reclaim each independently force a rerun.
+    quiet = dict(name='decode', timed=True, ports=[],
+                 host_load=dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0, seconds=10))
+    assert cards.fabric_rerun_reasons([quiet]) == []
+    assert cards.fabric_assessment([quiet]) == []
+    contaminated = [
+        dict(cpu_some_avg10=25.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0),
+        dict(cpu_some_avg10=1.0, memory_some_avg10=9.0, pgscan_pages_per_s=0.0),
+        dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=2000.0),
+    ]
+    phases = [dict(name='decode', timed=True, ports=[], host_load=load) for load in contaminated]
+    reasons = cards.fabric_rerun_reasons(phases)
+    assert any('host load' in r and 'CPU pressure' in r and '25.0%' in r for r in reasons), reasons
+    assert any('memory pressure' in r and '9.0%' in r for r in reasons), reasons
+    assert any('page reclaim' in r and '2000 pages/s' in r for r in reasons), reasons
+    assert cards.fabric_rerun_reasons([dict(phases[0], timed=False)]) == []
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10, fabric=phases)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'rerun'
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'host load' in text
 
 
 def _checkout(path, run_sh=True):
