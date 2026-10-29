@@ -58,6 +58,9 @@ use std::time::Instant;
 /// What every GLM 5.3 Flash command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
+    #[arg(long, value_enum)]
+    pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
     /// Shared GQA drafter-ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -469,6 +472,14 @@ mod draft_cli_tests {
             resolve_prefill(&mut args, true).unwrap();
         }
         args
+    }
+
+    #[test]
+    fn packed_mode_cli_preserves_default_and_accepts_both_values() {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(parse(&[]).prefill_packing.unwrap_or_default(), PackingMode::Unrestricted);
+        assert_eq!(parse(&["--prefill-packing", "exact"]).prefill_packing, Some(PackingMode::Exact));
+        assert_eq!(parse(&["--prefill-packing", "unrestricted"]).prefill_packing, Some(PackingMode::Unrestricted));
     }
 
     #[test]
@@ -2173,6 +2184,7 @@ impl Opened {
             draft.prime(&engine.embedding, engine.draft_head())?;
         }
         probe("expert-prime")?;
+        engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
                 engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?;
@@ -2345,7 +2357,9 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
-fn golden(args: GoldenArgs) -> Result<()> {
+fn golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.prefill_packing = Some(crate::shared::prefill_packing::PackingMode::resolve(
+        args.engine.prefill_packing, args.packed_check.is_some()));
     let opened = open(&args.engine)?;
     if let Some(rows) = args.expert_row_check {
         return expert_rows::check(&args.engine, &opened, rows);

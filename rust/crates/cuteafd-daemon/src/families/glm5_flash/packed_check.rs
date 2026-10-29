@@ -36,8 +36,12 @@ pub(crate) fn packed_check(engine: &GlmfEngine<'_>, tokens: &[u32], sequences: u
     let resumed = lengths.len() - 1;
     let prefix = |i: usize| if i == resumed { RESUMED.1 } else { 0 };
     let chunks: Vec<(usize, usize)> = lengths.iter().enumerate().map(|(i, &len)| (prefix(i), len)).collect();
-    ensure!(super::packing::fits(&chunks, &limits), "--packed-check's {} sequences ({chunks:?}) do not fit one pass \
-        ({limits:?}): take fewer", lengths.len());
+    for chunk in &chunks {
+        ensure!(super::packing::fits(&[*chunk], &super::packing::Limits { rows: limits.chunk_rows, ..limits }),
+            "--packed-check member exceeds admitted rows/taps/tables/context");
+    }
+    let groups = crate::shared::prefill_packing::groups(chunks.len(), |range|
+        super::packing::fits(&chunks[range], &limits));
     let n = lengths.len();
     let prompts: Vec<Vec<u32>> = lengths.iter().enumerate().map(|(i, &len)| sequence(tokens, i, prefix(i) + len))
         .collect();
@@ -53,16 +57,24 @@ pub(crate) fn packed_check(engine: &GlmfEngine<'_>, tokens: &[u32], sequences: u
     }
     engine.synchronize()?;
     let chunk = |i: usize| &prompts[i][prompts[i].len() - lengths[i]..];
-    // Arm A: one packed pass.
+    // Arm A: cap-bounded packs, with unchanged singleton execution for leftovers.
     let started = std::time::Instant::now();
     let mut packed_logits = vec![Vec::new(); n];
-    {
-        let mut segments: Vec<(&mut GlmfPlacement, &[u32])> = packed.iter_mut().enumerate()
-            .map(|(i, placement)| (placement, chunk(i))).collect();
-        engine.prefill_packed(&mut segments, &mut |i, logits| {
-            packed_logits[i] = logits.row_host(engine.library, 0)?;
+    for range in &groups {
+        if range.len() == 1 {
+            let i = range.start;
+            let logits = engine.prefill_device(&mut packed[i], chunk(i))?.context("--packed-check needs the head")?;
+            packed_logits[i] = logits.row_host(engine.library, logits.rows - 1)?;
+            continue;
+        }
+        let first = range.start;
+        let mut segments: Vec<(&mut GlmfPlacement, &[u32])> = packed[range.clone()].iter_mut().enumerate()
+            .map(|(i, placement)| (placement, chunk(first + i))).collect();
+        let (_, outcomes) = engine.prefill_packed(&mut segments, &mut |i, logits| {
+            packed_logits[first + i] = logits.row_host(engine.library, 0)?;
             Ok(Ok(()))
         })?;
+        for outcome in outcomes { outcome?; }
     }
     engine.synchronize()?;
     let packed_ms = 1e3 * started.elapsed().as_secs_f64();
@@ -89,8 +101,8 @@ pub(crate) fn packed_check(engine: &GlmfEngine<'_>, tokens: &[u32], sequences: u
             KDA state {}, paged units {} (alone {:.1} ms)", lengths[i], prompts[i].len() - lengths[i], verdict(logits),
             argmax(a), argmax(b), verdict(state), verdict(paged), alone_ms[i]);
     }
-    println!("packed check: {n} sequences, {} rows: one packed pass {packed_ms:.1} ms, their own passes {:.1} ms; {}",
-        lengths.iter().sum::<usize>(), alone_ms.iter().sum::<f64>(),
+    println!("packed check: {n} sequences, {} rows: {} pack/singleton passes {packed_ms:.1} ms, their own passes {:.1} ms; {}",
+        lengths.iter().sum::<usize>(), groups.len(), alone_ms.iter().sum::<f64>(),
         if all { "every sequence identical" } else { "a sequence DIFFERS" });
     for placement in packed.into_iter().chain(alone) {
         allocator.release(placement);

@@ -33,6 +33,9 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
+    #[arg(long, value_enum)]
+    pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
     /// Decode lanes; MiMo runs one (`LaneSupport::One`; the planner reports why).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
@@ -323,6 +326,14 @@ mod draft_storage_tests {
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
         let span = args(&["--prefill-rows", "1024", "--prefill-span-rows", "6144"]);
         assert_eq!((span.prefill_rows, span.prefill_span_rows), (1024, 6144));
+    }
+
+    #[test]
+    fn packed_mode_cli_preserves_default_and_accepts_both_values() {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(args(&[]).prefill_packing.unwrap_or_default(), PackingMode::Unrestricted);
+        assert_eq!(args(&["--prefill-packing", "exact"]).prefill_packing, Some(PackingMode::Exact));
+        assert_eq!(args(&["--prefill-packing", "unrestricted"]).prefill_packing, Some(PackingMode::Unrestricted));
     }
 
     #[test]
@@ -1223,6 +1234,7 @@ impl Opened {
             if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             }
+            engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
             body(&engine, preflight.host_config)
         })();
         let submission_failed = engine.submission_failed();
@@ -1420,7 +1432,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
-fn golden(args: GoldenArgs) -> Result<()> {
+fn golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.prefill_packing = Some(crate::shared::prefill_packing::PackingMode::resolve(
+        args.engine.prefill_packing, args.packed_check.is_some()));
     if let Some(dir) = &args.save_logits {
         let parent = dir.parent().filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));

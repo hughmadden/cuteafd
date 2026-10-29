@@ -1402,6 +1402,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// a serial prefill runs in the first).
     prefill_slots: RefCell<Vec<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
+    packed_row_cap: Cell<Option<usize>>,
     dense_nvfp4: Option<DenseNvfp4<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     /// Host seconds per phase: GPU work until each expert exchange (waiting
@@ -1771,7 +1772,7 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
-            experts: None, tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            experts: None, packed_row_cap: Cell::new(None), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -3415,10 +3416,51 @@ impl<'a> GlmfEngine<'a> {
         Ok(logits)
     }
 
-    /// What one packed prefill pass ([`Self::prefill_packed`]) may hold: the first prefill lane's
-    /// rows, one sequence's table columns, and the drafter's tap rows.
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::{log_mode, PackingMode};
+        if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
+        let mut cap = self.prefill_rows;
+        // This family's packed executor is single-GPU only.
+        if !self.packs_prefill() { cap = 0; }
+        else {
+            let reports = match &self.experts {
+                Some(Experts::Spark { transport }) => transport.borrow().installed_grouping()?,
+                _ => Vec::new(),
+            };
+            let mut local_seen = Vec::new();
+            for (i, layer) in self.weights.layers.iter().enumerate() {
+                if layer.dense { continue; }
+                match self.routed_experts(i) {
+                    Some(Experts::Local(local)) => {
+                        let identity = std::ptr::from_ref(local);
+                        if !local_seen.contains(&identity) {
+                            cap = cap.min(local.experts.borrow().packed_row_cap(true, cap)?);
+                            local_seen.push(identity);
+                        }
+                    },
+                    Some(Experts::Spark { .. }) => {
+                        let mut found = false;
+                        for report in &reports {
+                            if report.layers().iter().any(|range| (range.first as usize..range.end as usize).contains(&i)) {
+                                cap = cap.min(report.packed_row_cap(self.spark_bf16));
+                                found = true;
+                            }
+                        }
+                        if !found { cap = 0; }
+                    }
+                    Some(Experts::LocalExl3(_)) | None => cap = 0,
+                    Some(Experts::Skip) => {},
+                }
+            }
+        }
+        self.packed_row_cap.set(Some(cap));
+        log_mode(mode, cap);
+        Ok(())
+    }
+
+    /// The admitted unit, table and tap bounds plus an optional exact-route cap.
     pub(crate) fn packed_limits(&self) -> packing::Limits {
-        packing::Limits { rows: self.prefill_rows,
+        packing::Limits { rows: self.packed_row_cap.get().unwrap_or(self.prefill_rows),
             chunk_rows: self.prefill_rows,
             table_pages: self.table_pages, table_pool_pages: self.table_pool_pages,
             taps: self.drafter.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),

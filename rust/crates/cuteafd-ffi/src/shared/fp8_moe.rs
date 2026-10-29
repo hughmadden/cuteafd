@@ -136,6 +136,7 @@ type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
 type SetOptions = unsafe extern "C" fn(*mut c_void, u32) -> i32;
 type WeightReadGroup = unsafe extern "C" fn(u32, u32, u32, *mut u32, *mut u32) -> i32;
+type ArithmeticRoute = unsafe extern "C" fn(u32, u32, u32, *mut u32, *mut u32) -> i32;
 
 /// A traffic bound must never masquerade as an installed kernel tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +203,7 @@ pub struct Fp8MoeModule {
     destroy: Destroy,
     set_options: Option<SetOptions>,
     weight_read_group: Option<WeightReadGroup>,
+    arithmetic_route: Option<ArithmeticRoute>,
     prefill: Fp8MoePrefill,
     _owner_thread: PhantomData<Rc<()>>,
 }
@@ -321,13 +323,14 @@ impl Fp8MoeModule {
         // Packages built before the W8A16 fallback forms have no options.
         let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
         let weight_read_group = library.get::<WeightReadGroup>(b"cuteafd_fp8moe_weight_read_group").ok().map(|f| *f);
+        let arithmetic_route = library.get::<ArithmeticRoute>(b"cuteafd_fp8moe_arithmetic_route").ok().map(|f| *f);
         let Fp8MoeMetadata { info, scratch } = metadata;
         let mut context = std::ptr::null_mut();
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
         let context = NonNull::new(context).context("FP8 expert package returned a null context")?;
         Ok(Self { _library: library, context, info, scratch, launch, destroy, set_options,
-            weight_read_group, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
+            weight_read_group, arithmetic_route, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
     }
 
     /// Selects the programs large row counts run. A package without the
@@ -375,6 +378,24 @@ impl Fp8MoeModule {
             u32::try_from(rows)?, &mut group, &mut contract) };
         ensure!(status == 0, "FP8 expert weight-read grouping query failed ({status})");
         Fp8MoeTrafficContract::from_words(group, contract)
+    }
+
+    /// Arithmetic identity and inclusive interval end of the selected program.
+    /// Missing/unknown metadata disables exact packing, not ordinary execution.
+    pub fn arithmetic_route_for_capacity(&self, capacity: usize, rows: usize)
+        -> Result<Option<(u32, usize)>> {
+        ensure!(self.info.capacities.contains(&capacity) && (1..=capacity).contains(&rows),
+            "FP8 arithmetic query names an uninstalled row/capacity");
+        let Some(query) = self.arithmetic_route else { return Ok(None); };
+        let (mut route, mut end) = (0u32, 0u32);
+        // SAFETY: static function belongs to the live library and writes two live
+        // words without CUDA/context access, exactly like the traffic query.
+        let status = unsafe { query(u32::try_from(capacity)?, self.prefill.option(),
+            u32::try_from(rows)?, &mut route, &mut end) };
+        ensure!(status == 0, "FP8 arithmetic route query failed ({status})");
+        ensure!(route <= 3 && (rows..=capacity).contains(&(end as usize)),
+            "invalid FP8 arithmetic route interval");
+        Ok((route != 0).then_some((route, end as usize)))
     }
 
     /// Scratch bytes of the program for `capacity`.
