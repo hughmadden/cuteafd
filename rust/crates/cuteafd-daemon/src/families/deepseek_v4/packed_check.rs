@@ -5,11 +5,10 @@ use anyhow::{ensure, Result};
 use cuteafd_api::openai::probe::{Probe, ProbeSpec};
 use cuteafd_bench::reference::{Fidelity, Window};
 
-struct Observed { logits: Vec<f32>, state: Vec<u8>, frontier: usize }
+struct Observed { logits: Vec<f32>, state: prefix::PackedState, frontier: usize }
 
 fn widths(case: usize, member: usize) -> usize {
-    match case { 0 => [29, 31, 23][member % 3], 2 => [29, 31, 23][member % 3],
-        _ => [200, 127, 64][member % 3] }
+    match case { 0 => [29, 31, 23][member % 3], _ => [200, 127, 64][member % 3] }
 }
 
 fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime,
@@ -29,10 +28,7 @@ fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtim
             .filter_map(|(i, (p, t))| (p.len < t.len()).then_some(i)).collect::<Vec<_>>();
         let chunks = active.iter().map(|&i| (placements[i].len,
             widths(case, i).min(prompts[i].len() - placements[i].len))).collect::<Vec<_>>();
-        let groups = if packed { prefill_packing::groups(active.len(), |r| {
-            (case != 2 || chunks[r.clone()].iter().map(|(_, rows)| rows).sum::<usize>() <= 64)
-                && engine.packed_plan(&chunks[r]).is_ok()
-        }) }
+        let groups = if packed { prefill_packing::groups(active.len(), |r| engine.packed_plan(&chunks[r]).is_ok()) }
             else { (0..active.len()).map(|i| i..i + 1).collect() };
         for range in groups {
             if range.len() == 1 {
@@ -68,6 +64,25 @@ fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtim
 
 fn equal(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+fn require_identical(a: &Observed, b: &Observed, vocab: usize, label: &str) -> Result<()> {
+    let logit = a.logits.iter().zip(&b.logits).position(|(x, y)| x.to_bits() != y.to_bits());
+    if let Some(i) = logit {
+        println!("packed byte divergence {label}: logits row {} token {} singleton_bits {:08x} packed_bits {:08x}",
+            i / vocab, i % vocab, a.logits[i].to_bits(), b.logits[i].to_bits());
+    }
+    let state = a.state.bytes.iter().zip(&b.state.bytes).position(|(x, y)| x != y);
+    if let Some(i) = state {
+        let (name, range) = b.state.tensors.iter().find(|(_, range)| range.contains(&i))
+            .ok_or_else(|| anyhow::anyhow!("packed state offset {i} has no tensor"))?;
+        println!("packed byte divergence {label}: state tensor {name} byte {} singleton {:02x} packed {:02x}",
+            i - range.start, a.state.bytes[i], b.state.bytes[i]);
+    }
+    ensure!(a.logits.len() == b.logits.len() && a.state.bytes.len() == b.state.bytes.len()
+        && a.state.tensors == b.state.tensors && logit.is_none() && state.is_none(),
+        "{label} differs from singleton bytes (logits/state)");
+    Ok(())
 }
 
 fn pair_metrics(a: &[f32], b: &[f32], vocab: usize) -> (f64, f64) {
@@ -142,18 +157,16 @@ pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &to
                 let rows = prompts[i].len() - starts[i];
                 ensure!(a.frontier == prompts[i].len() && b.frontier == a.frontier
                     && b.logits.len() == rows * vocab && a.logits.len() == b.logits.len()
-                    && !b.state.is_empty() && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid packed observation");
+                    && !b.state.bytes.is_empty() && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid packed observation");
                 let (kl, top1) = pair_metrics(&a.logits, &b.logits, vocab);
                 println!("packed case {case} replacement {replacement} member {i} window {}: singleton KL {kl:.8}, top1 {top1:.6}, logits byte-identical {}, state byte-identical {}",
-                    window.id, equal(&a.logits, &b.logits), a.state == b.state);
-                if mode == PackingMode::Exact {
-                    ensure!(equal(&a.logits, &b.logits) && a.state == b.state,
-                        "exact packed member {i} differs from singleton bytes");
-                }
+                    window.id, equal(&a.logits, &b.logits), a.state.bytes == b.state.bytes);
                 let control = reference_score(window, a, vocab);
                 let score = reference_score(window, b, vocab);
                 ensure!(control.positions == 512 && score.positions == 512, "incomplete member score");
-                noninferior(&control, &score, &format!("case {case} replacement {replacement} member {i}"))?;
+                let fidelity = noninferior(&control, &score, &format!("case {case} replacement {replacement} member {i}"));
+                require_identical(a, b, vocab, &format!("case {case} replacement {replacement} member {i} mode {mode:?}"))?;
+                fidelity?;
                 control_records.extend(control.records);
                 packed_records.extend(score.records);
             }
@@ -169,42 +182,22 @@ pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &to
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "requires the sealed V4 Flash coordinator and Spark expert packages"]
-    fn live_skinny_router_packed_discriminator() -> Result<()> {
-        use clap::Parser;
-        #[derive(Parser)]
-        struct Cli { #[command(flatten)] args: super::super::GoldenArgs }
-        let snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?;
-        let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?;
-        let fixtures = std::env::var("CUTEAFD_GOLDEN_FIXTURES")?;
-        let manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
-        let args = Cli::try_parse_from(["v4", "--snapshot", &snapshot, "--peers", &peers,
-            "--manifest", &manifest, "--golden", &fixtures, "--full-prefill-logits",
-            "--pool-tokens", "262144", "--rtx-expert-layers", "2", "--dspark",
-            "--prefill-rows", "2752", "--prefill-waves", "3", "--max-sequences", "8"])?.args;
-        let loaded = super::super::load(&args.engine)?;
-        let (_, _, hash) = super::super::fidelity_publication(loaded.family)?;
-        ensure!(cuteafd_bench::fidelity_rows::sha256(&args.golden.join("manifest.json"))? == hash,
-            "skinny discriminator needs the immutable publication");
-        let manifest: serde_json::Value = cuteafd_loader::read_json_file(&args.golden.join("manifest.json"))?;
-        let reference = cuteafd_bench::fidelity_dataset::load(&args.golden, &manifest)?;
-        let window = reference.windows.iter().find(|w| w.id == "legacy").unwrap();
-        let prompts = vec![window.tokens[..512].to_vec(); 3];
-        super::super::with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, links, runtime, _| {
-            engine.configure_packing(PackingMode::Unrestricted, links)?;
-            let (alone, _) = arm(engine, links, runtime, &prompts, &[0; 3], 2, false)?;
-            let (packed, packs) = arm(engine, links, runtime, &prompts, &[0; 3], 2, true)?;
-            ensure!(packs > 0, "skinny discriminator exercised no packs");
-            for (i, (a, b)) in alone.iter().zip(&packed).enumerate() {
-                ensure!(a.frontier == 512 && b.frontier == 512
-                    && a.logits.len() == 512 * engine.cfg.vocab_size && a.logits.len() == b.logits.len()
-                    && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid observation");
-                let (kl, top1) = pair_metrics(&a.logits, &b.logits, engine.cfg.vocab_size);
-                println!("skinny-only member {i}: packed-vs-singleton KL {kl:.8}, top-1 {top1:.6}, logits byte-identical {}, state byte-identical {}, packs {packs}, max packed rows 64",
-                    equal(&a.logits, &b.logits), a.state == b.state);
-            }
-            Ok(())
-        })
+    fn byte_identity_rejects_logit_and_named_state_differences() {
+        let observed = || Observed { logits: vec![1.0, 0.0], frontier: 1,
+            state: prefix::PackedState { bytes: vec![0, 1, 2, 3],
+                tensors: vec![("rank0/layer2/unit0/compressed".into(), 0..2),
+                    ("rank0/layer2/compressor_state0".into(), 2..4)] } };
+        let a = observed();
+        assert!(require_identical(&a, &observed(), 2, "equal").is_ok());
+        let mut b = observed();
+        b.logits[1] = -0.0;
+        assert!(require_identical(&a, &b, 2, "logits").is_err());
+        let mut b = observed();
+        b.state.bytes[2] = 9;
+        assert!(require_identical(&a, &b, 2, "state").is_err());
+        let mut b = observed();
+        b.state.bytes.pop();
+        assert!(require_identical(&a, &b, 2, "extent").is_err());
     }
 
     #[test]

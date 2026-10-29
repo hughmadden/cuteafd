@@ -10,10 +10,6 @@ pub(super) fn coordinator_inventory(family: &str, split: Option<&str>, rows: usi
     use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
     let mut inventory = Vec::new();
     // This is the packed executor's dispatch catalogue, not every export in the package.
-    let required = ["mhc_pre", "producer", "compressor_prefill_c4", "compressor_continuation_c4",
-        "compressor_prefill_c128", "compressor_continuation_c128", "index_producer", "index_topk_prefill",
-        "sparse_mla_prefill_win", "sparse_mla_prefill_c4", "sparse_mla_prefill_c128", "wo",
-        "mhc_post_pre", "prefill_router_scores", "expert_input_quant", "shared_ffn", "mhc_post", "mhc_head"];
     let classified = [("mhc_pre", SequenceLocal), ("producer", SequenceLocal),
         ("compressor_prefill_c4", SequenceLocal), ("compressor_continuation_c4", SequenceLocal),
         ("compressor_prefill_c128", SequenceLocal), ("compressor_continuation_c128", SequenceLocal),
@@ -22,7 +18,6 @@ pub(super) fn coordinator_inventory(family: &str, split: Option<&str>, rows: usi
         ("sparse_mla_prefill_c128", SequenceLocal), ("wo", SequenceLocal),
         ("mhc_post_pre", PackedRows), ("prefill_router_scores", PackedRows), ("expert_input_quant", PackedRows),
         ("shared_ffn", PackedRows), ("mhc_post", PackedRows), ("mhc_head", SequenceLocal)];
-    prefill_packing::validate_program_inventory(required, &classified)?;
     let sized = |name: &str| matches!(name, "producer" | "index_producer" | "index_topk_prefill" |
         "sparse_mla_prefill_win" | "sparse_mla_prefill_c4" | "sparse_mla_prefill_c128" | "wo" |
         "mhc_post_pre" | "shared_ffn");

@@ -527,30 +527,50 @@ fn mark(family: &Dsv4Prefix<'_, '_>, slot: u32, len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[derive(Default)]
+pub(super) struct PackedState {
+    pub bytes: Vec<u8>,
+    pub tensors: Vec<(String, std::ops::Range<usize>)>,
+}
+
 /// Diagnostic-only: compare whole initialized rings/pages and compressor carry,
 /// including dSpark state, at identical physical placements in both arms.
-pub(super) fn packed_state(engine: &Engine<'_>, placement: &Placement, clear: bool) -> Result<Vec<u8>> {
+pub(super) fn packed_state(engine: &Engine<'_>, placement: &Placement, clear: bool) -> Result<PackedState> {
     engine.drain_state()?;
     let family = Dsv4Prefix::new(engine, |_| 0)?;
     let mut ranges = Vec::new();
     for &unit in &placement.units {
-        ranges.extend(family.unit_ranges(unit)?.into_iter().map(|(rank, buffer, _)| (rank, buffer)));
-    }
-    for layer in &family.layers {
-        let bytes = engine.shape.ring_pages * MAIN_PAGE_BYTES;
-        ranges.push((layer.rank, view(layer.main, placement.state * bytes, bytes)?));
-        for &(state, stride) in &layer.states {
-            ranges.push((layer.rank, view(state, placement.state * stride, stride)?));
+        for (rank, buffer, _) in family.unit_ranges(unit)? {
+            let (layer_index, plane) = family.layers.iter().enumerate().find_map(|(i, layer)| {
+                if layer.rank != rank { return None; }
+                let inside = |pool: CuteafdDeviceBuffer| {
+                    let offset = (buffer.ptr as usize).checked_sub(pool.ptr as usize);
+                    offset.is_some_and(|n| n <= pool.bytes && buffer.bytes <= pool.bytes - n)
+                };
+                if layer.compressed.is_some_and(|(_, pool)| inside(pool)) { Some((i, "compressed")) }
+                else if layer.index.is_some_and(inside) { Some((i, "index")) } else { None }
+            }).context("packed diagnostic page has no layer")?;
+            ranges.push((rank, format!("rank{rank}/layer{layer_index}/unit{unit}/{plane}"), buffer));
         }
     }
-    let mut out = Vec::new();
-    for (rank, buffer) in ranges {
+    for (i, layer) in family.layers.iter().enumerate() {
+        let bytes = engine.shape.ring_pages * MAIN_PAGE_BYTES;
+        ranges.push((layer.rank, format!("rank{}/layer{i}/window", layer.rank),
+            view(layer.main, placement.state * bytes, bytes)?));
+        for (plane, &(state, stride)) in layer.states.iter().enumerate() {
+            ranges.push((layer.rank, format!("rank{}/layer{i}/compressor_state{plane}", layer.rank),
+                view(state, placement.state * stride, stride)?));
+        }
+    }
+    let mut out = PackedState::default();
+    for (rank, name, buffer) in ranges {
         engine.on(rank, || {
             if clear { engine.library.cuda_zero_bytes(buffer, buffer.bytes)?; }
             else {
-                let first = out.len();
-                out.resize(first + buffer.bytes, 0);
-                engine.library.copy_d2h(&mut out[first..], buffer)?;
+                let first = out.bytes.len();
+                out.bytes.resize(first + buffer.bytes, 0);
+                engine.library.copy_d2h(&mut out.bytes[first..], buffer)?;
+                out.tensors.push((name, first..out.bytes.len()));
             }
             Ok(())
         })?;
