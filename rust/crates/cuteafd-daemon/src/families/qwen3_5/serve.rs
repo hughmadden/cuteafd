@@ -239,7 +239,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         Some(crate::shared::prefill_packing::Limits {
             // The small and prefill FP8 FFNs have different projection arithmetic.
-            rows: if self.packing == crate::shared::prefill_packing::PackingMode::Exact { 64 } else { 4096 },
+            rows: if self.packing == crate::shared::prefill_packing::PackingMode::Exact { 64 } else { cuteafd_loader::placement::families::qwen3_5::PREFILL_ROWS },
             chunk_rows: self.geometry().prefill_rows, max_context: self.engine.borrow().cfg.max_context,
             taps: self.drafter.as_ref().map(|_| TAP_ROWS),
         })
