@@ -4247,8 +4247,23 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     tensors.extend(super::families::glm::glm_flash_vision_tensors().into_iter()
         .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)));
     let dir = snapshot(cfg, &tensors);
+    let share = dir.path().join("share");
+    let package = dir.path().join("lib/fp8/fp8-glmf");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":{
+        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let manifest = share.join("PROGRAMS.json");
+    std::fs::write(&manifest, json!({"capacities":{"max_context":262144},"programs":programs}).to_string()).unwrap();
     let options = PlanOptions { vision: MediaMode::Off,
         layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 262144,
+            workspace_manifest: Some(manifest),
             pool_tokens: Some(262144), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
         ..sparks(0) };
     let reference = plan(dir.path(), &options).unwrap();
