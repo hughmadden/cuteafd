@@ -32,6 +32,7 @@ pub(crate) struct Engine<'a> {
     /// Prefill units: the unit and the waves in flight.
     prefill: PrefillUnits,
     packed_row_cap: Cell<Option<usize>>,
+    coordinator_packing_cap: usize,
     /// The same shape as the shared prefill depth.
     depth: crate::shared::prefill_depth::PrefillDepth,
 }
@@ -41,8 +42,9 @@ pub(crate) struct Engine<'a> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrefillUnits { pub unit_rows: usize, pub waves: usize }
 
-fn packed_row_cap(mode: crate::shared::prefill_packing::PackingMode) -> Option<usize> {
-    (mode == crate::shared::prefill_packing::PackingMode::Exact).then_some(0)
+fn packed_row_cap(mode: crate::shared::prefill_packing::PackingMode,
+    coordinator: usize, expert: usize) -> Option<usize> {
+    (mode == crate::shared::prefill_packing::PackingMode::Exact).then_some(coordinator.min(expert))
 }
 
 impl Drop for Engine<'_> {
@@ -85,12 +87,27 @@ mod tests {
         use crate::shared::prefill_packing::{self, PackingMode, Limits};
         let chunks = [(0, 17), (4, 31), (0, 65)];
         let groups = |mode| {
-            let limits = Limits { rows: packed_row_cap(mode).unwrap_or(2752), chunk_rows: 2752,
+            let limits = Limits { rows: packed_row_cap(mode, 64, 0).unwrap_or(2752), chunk_rows: 2752,
                 max_context: 1024, taps: Some(2048) };
             prefill_packing::groups(chunks.len(), |range| prefill_packing::plan(&chunks[range], &limits).is_ok())
         };
         assert_eq!(groups(PackingMode::Exact), [0..1, 1..2, 2..3]);
         assert_eq!(groups(PackingMode::Unrestricted), [0..3]);
+    }
+
+    #[test]
+    fn exact_packing_intersects_coordinator_and_expert_routes() {
+        use crate::shared::prefill_packing::{self, PackingMode, Limits};
+        assert_eq!(packed_row_cap(PackingMode::Exact, 64, 128), Some(64));
+        assert_eq!(packed_row_cap(PackingMode::Exact, 128, 32), Some(32));
+        assert_eq!(packed_row_cap(PackingMode::Exact, 0, 128), Some(0));
+        assert_eq!(packed_row_cap(PackingMode::Unrestricted, 0, 0), None);
+        let chunks = [(0, 29), (0, 31), (0, 80), (0, 17)];
+        let limits = Limits { rows: packed_row_cap(PackingMode::Exact, 64, 128).unwrap(),
+            chunk_rows: 256, max_context: 1024, taps: Some(2048) };
+        assert_eq!(prefill_packing::groups(chunks.len(), |range|
+            prefill_packing::plan(&chunks[range], &limits).is_ok()), [0..2, 2..3, 3..4]);
+        assert_eq!(chunks[2].1, 80, "oversized singleton is not rechunked");
     }
 
     #[test]
@@ -139,6 +156,7 @@ impl<'a> Engine<'a> {
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() == 6,
             "Kimi startup needs process latent geometry and six real expert ranks");
+        let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
         hops.validate_binding(&plan, &peer)?;
@@ -231,7 +249,7 @@ impl<'a> Engine<'a> {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         Ok(Self { depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, exchange_streams, prefill, packed_row_cap: Cell::new(None) })
+            hops, peer, exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -267,9 +285,9 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
         use crate::shared::prefill_packing::log_mode;
-        // EXL3 capacity selection and K6 projection dispatch do not yet publish
-        // arithmetic-route bounds. Unknown routes must run alone.
-        let cap = packed_row_cap(mode);
+        // Coordinator metadata and the expert route both constrain exact packs.
+        // EXL3 arithmetic bounds remain unknown, so that route still runs alone.
+        let cap = packed_row_cap(mode, self.coordinator_packing_cap, 0);
         self.packed_row_cap.set(cap);
         log_mode(mode, cap.unwrap_or(self.prefill.unit_rows));
         Ok(())

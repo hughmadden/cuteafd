@@ -93,6 +93,102 @@ impl<'a> W8<'a> {
     }
 }
 
+/// Explicit packed-path catalogue. Attention keeps its singleton row geometry;
+/// dense K6 stages remain conservatively bounded even inside attention producers.
+fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, crate::shared::prefill_packing::ProgramRows)>> {
+    use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    let mut inventory = BTreeMap::new();
+    let mut add = |name: String, role| -> Result<()> {
+        if let Some(previous) = inventory.insert(name, role) {
+            ensure!(previous == role, "Kimi packed program has conflicting row roles");
+        }
+        Ok(())
+    };
+    for name in ["kimik3_kda_commit", "kimik3_kda_m64", "kimik3_kda_m4096"] {
+        add(name.into(), SequenceLocal)?;
+    }
+    for heads in [48, 96] {
+        let suffix = if heads == 48 { "" } else { "_h96" };
+        for capacity in [64, 4096] {
+            add(format!("kimik3_mla_output{suffix}_m{capacity}"), SequenceLocal)?;
+            add(format!("kda_core_h{heads}_m{capacity}"), SequenceLocal)?;
+            add(format!("mla_query_h{heads}_m{capacity}"), SequenceLocal)?;
+            add(format!("mla_gate_output_h{heads}_m{capacity}"), SequenceLocal)?;
+            for cache in ["", "_fp8"] {
+                add(format!("kimik3_mla_producer{suffix}{cache}_m{capacity}"), SequenceLocal)?;
+                for stride in [576, 640] {
+                    add(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"), SequenceLocal)?;
+                }
+                for mode in if capacity == 64 { &["decode", "verify"][..] } else { &["extend"][..] } {
+                    add(format!("kimik3_dense_mla_{mode}{suffix}{cache}_m{capacity}"), SequenceLocal)?;
+                }
+            }
+        }
+    }
+    // The drafter consumes each member's private context after packed target work.
+    add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
+    for cache in ["", "_fp8"] {
+        add(format!("kimik3_mla_draft_producer{cache}_m64"), SequenceLocal)?;
+        for mode in ["full", "w4096"] {
+            add(format!("kimik3_mla_draft_attention_{mode}{cache}_m64"), SequenceLocal)?;
+        }
+    }
+    add("kimik3_attn_res_c1_keep_append".into(), PackedRows)?;
+    for candidates in 2..=9 {
+        for prefix in ["add", "replace", "keep"] {
+            add(format!("kimik3_attn_res_c{candidates}_{prefix}"), PackedRows)?;
+        }
+        if candidates <= 8 { add(format!("kimik3_attn_res_c{candidates}_add_append"), PackedRows)?; }
+    }
+    for intermediate in [3072, 6144, 16896, 33792] {
+        for stem in ["situ", "ffn_gate_up", "ffn_down"] {
+            add(format!("kimik3_{stem}_i{intermediate}"), PackedRows)?;
+        }
+        add(format!("kimik3_ffn_gate_up_i{intermediate}_comp"), PackedRows)?;
+    }
+    for name in ["kimik3_rmsnorm_h3584", "kimik3_rmsnorm_h7168", "kimik3_latent_down",
+        "kimik3_latent_up", "kimik3_router_scores", "kimik3_expert_input_quant"] {
+        add(name.into(), PackedRows)?;
+    }
+    if let Some(core) = core {
+        let policies = core["row_policies"].as_array().context("Kimi K6 row policies missing")?;
+        for value in policies {
+            let policy = cuteafd_ffi::dense_trellis::DenseTrellisPolicy::parse(value)?;
+            for name in [policy.native_input, policy.native, policy.output_program] {
+                add(format!("dense_trellis_k6_{name}"), PackedRows)?;
+            }
+            if let Some(grouped) = cuteafd_ffi::dense_trellis::GroupedPolicy::parse(value)? {
+                for name in [grouped.native_input, grouped.native, grouped.output_program] {
+                    add(name, PackedRows)?;
+                }
+            }
+        }
+    }
+    Ok(inventory.into_iter().collect())
+}
+
+fn packing_program(name: &str, core: bool) -> bool {
+    name.starts_with("kimik3_") || core && (name.starts_with("kda_core_")
+        || name.starts_with("mla_rank_norm_") || name.starts_with("mla_query_")
+        || name.starts_with("mla_gate_output_") || name.starts_with("dense_trellis_k6_"))
+}
+
+fn classify_packing_inventory<'a>(names: impl IntoIterator<Item = &'a str>,
+    catalogue: &'a [(String, crate::shared::prefill_packing::ProgramRows)])
+    -> Result<Vec<(&'a str, crate::shared::prefill_packing::ProgramRows)>> {
+    let names = names.into_iter().collect::<std::collections::BTreeSet<_>>();
+    let inventory = catalogue.iter().filter(|(name, _)| names.contains(name.as_str()))
+        .map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+    crate::shared::prefill_packing::validate_program_inventory(names.iter().copied(), &inventory)?;
+    Ok(inventory)
+}
+
+fn coordinator_packing_cap(programs: &Programs<'_>, core: bool, rows: usize) -> Result<usize> {
+    let catalogue = packing_inventory(core.then(|| programs.family_metadata("dense_trellis_k6")).transpose()?)?;
+    let inventory = classify_packing_inventory(programs.names().filter(|name| packing_program(name, core)), &catalogue)?;
+    crate::shared::prefill_packing::coordinator_row_cap(programs, inventory, rows)
+}
+
 /// Native module handles for one coordinator device. Load on each actual rank
 /// before measuring its CUDA baseline; this allocates no family tensor storage.
 /// The shared layer executor, not this table, owns cross-device ordering.
@@ -108,6 +204,7 @@ pub(crate) struct NativePrograms<'a> {
     pub wire: KimiExpertInput<'a>,
     pub add: Bf16Add<'a>,
     pub core:Option<super::core_runtime::CorePrograms<'a>>,
+    pub(crate) packing_cap: usize,
     scratch: NativeScratch,
     wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
 }
@@ -132,6 +229,7 @@ impl<'a> NativePrograms<'a> {
         inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize) -> Result<Self> {
         ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
             "Kimi programs and device must share their native library");
+        let packing_cap = coordinator_packing_cap(programs, !inventory.projections.is_empty(), rows)?;
         device.run(|| {
             let kda = [KimiKda::load(programs, 64, true)?, KimiKda::load(programs, 4096, false)?];
             // Admission can select owned MLA or explicit head split. Resolve
@@ -149,7 +247,7 @@ impl<'a> NativePrograms<'a> {
             Ok(Self { device, w8: W8::load(cfg, programs, ffn_mode)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
                 kda, commit: KimiKdaCommit::load(programs)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
-                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load(programs,cfg,inventory,rows,cache_format)?, scratch,
+                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load(programs,cfg,inventory,rows,cache_format)?, packing_cap, scratch,
                 wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
     }
@@ -1216,6 +1314,45 @@ impl Ops for Pending {
     fn latent_up(&mut self, _: usize, _: &Plane) -> Result<Plane> { pending("latent_up") }
     fn shared_ffn(&mut self, _: usize, _: &Plane) -> Result<Plane> { pending("shared_ffn") }
     fn add(&mut self, _: &Plane, _: &Plane) -> Result<Plane> { pending("add") }
+}
+
+#[cfg(test)]
+mod packing_inventory_tests {
+    use super::*;
+    use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+
+    #[test]
+    fn packed_coordinator_catalogue_classifies_k6_and_rejects_new_programs() -> Result<()> {
+        let core = serde_json::json!({"row_policies": [{"shape":"shared", "input_features":7168,
+            "output_features":3072, "sharded_side":1, "codebook":"mcg",
+            "native_input":"input", "native_program":"core", "output_program":"output",
+            "grouped":{"groups":4, "max_rows":4096, "native_input":"input_g4",
+                "native_program":"core_g4", "output_program":"output_g4"}}]});
+        let catalogue = packing_inventory(Some(&core))?;
+        let inventory = classify_packing_inventory(catalogue.iter().map(|(name, _)| name.as_str()), &catalogue)?;
+        let roles = inventory.iter().copied().collect::<BTreeMap<_, _>>();
+        for name in ["kimik3_router_scores", "kimik3_ffn_gate_up_i16896", "kimik3_rmsnorm_h7168",
+            "dense_trellis_k6_input", "dense_trellis_k6_core", "dense_trellis_k6_output",
+            "dense_trellis_k6_input_g4", "dense_trellis_k6_core_g4", "dense_trellis_k6_output_g4"] {
+            assert_eq!(roles[name], PackedRows, "{name}");
+        }
+        for name in ["kimik3_kda_m64", "kimik3_kda_m4096", "kda_core_h48_m4096",
+            "kimik3_dense_mla_extend_h96_fp8_m4096", "mla_rank_norm_h48_kv640_fp8_m64",
+            "mla_query_h96_m4096", "kimik3_mla_draft_attention_full_m64"] {
+            assert_eq!(roles[name], SequenceLocal, "{name}");
+        }
+        for name in ["kimik3_new_projection", "dense_trellis_k6_new_projection", "mla_query_new"] {
+            assert!(packing_program(name, true));
+            assert!(classify_packing_inventory(inventory.iter().map(|(name, _)| *name)
+                .chain(std::iter::once(name)), &catalogue).is_err());
+        }
+        let missing = catalogue.iter().filter(|(name, _)| name != "kimik3_router_scores")
+            .cloned().collect::<Vec<_>>();
+        assert!(classify_packing_inventory(inventory.iter().map(|(name, _)| *name), &missing).is_err());
+        assert!(!packing_program("glm_stage_router", true));
+        assert!(!packing_program("dense_trellis_k6_core", false));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
