@@ -6,7 +6,7 @@ pub(crate) enum PackingMode {
     /// Fill the admitted unit, accepting the same route switches as long prompts.
     #[default]
     Unrestricted,
-    /// Keep packs on the first loaded expert route; unknown routes run alone.
+    /// Keep packs on the first coordinator and expert routes; unknown routes run alone.
     Exact,
 }
 
@@ -14,6 +14,39 @@ impl PackingMode {
     pub(crate) fn resolve(explicit: Option<Self>, packed_check: bool) -> Self {
         explicit.unwrap_or(if packed_check { Self::Exact } else { Self::Unrestricted })
     }
+}
+
+/// How a coordinator program receives rows in a packed pass. No implicit role:
+/// even a projection may be sequence-local when fused into an attention producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramRows { PackedRows, SequenceLocal }
+
+/// Intersect the first arithmetic routes published by all packed-row programs.
+/// Missing/invalid metadata is not evidence of row invariance: run alone.
+pub(crate) fn coordinator_row_cap<'a>(programs: &cuteafd_ffi::programs::Programs<'_>,
+    inventory: impl IntoIterator<Item = (&'a str, ProgramRows)>, capacity: usize) -> Result<usize> {
+    let mut cap = capacity;
+    for (name, role) in inventory {
+        let spec = programs.spec(name)?;
+        if role == ProgramRows::PackedRows { cap = cap.min(manifest_row_cap(&spec.geometry)); }
+    }
+    Ok(cap)
+}
+
+fn manifest_row_cap(geometry: &serde_json::Value) -> usize {
+    geometry.get("exact_row_cap").and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok()).unwrap_or(0)
+}
+
+/// Compare the owner's packed-path catalogue against its explicitly classified
+/// inventory. A newly added program cannot silently inherit a role.
+pub(crate) fn validate_program_inventory<'a>(required: impl IntoIterator<Item = &'a str>,
+    inventory: &[(&str, ProgramRows)]) -> Result<()> {
+    let required: std::collections::BTreeSet<_> = required.into_iter().collect();
+    let classified: std::collections::BTreeSet<_> = inventory.iter().map(|(name, _)| *name).collect();
+    ensure!(classified.len() == inventory.len() && required == classified,
+        "packed program inventory differs: required {required:?}, classified {classified:?}");
+    Ok(())
 }
 
 /// Greedy adjacent groups, retaining oversized requests as ordinary singletons.
@@ -34,8 +67,8 @@ pub(crate) fn groups(members: usize, fits: impl Fn(std::ops::Range<usize>) -> bo
 pub(crate) fn log_mode(mode: PackingMode, rows: usize) {
     if mode == PackingMode::Exact {
         if rows == 0 {
-            tracing::info!("exact packed prefill disabled: loaded expert route metadata cannot bound arithmetic transitions (including occupancy-dependent NVFP4 sparse/wide); requests run alone");
-        } else { tracing::info!(rows, "exact packed prefill uses the minimum loaded expert route cap"); }
+            tracing::info!("exact packed prefill disabled: loaded coordinator/expert route metadata cannot bound arithmetic transitions (including occupancy-dependent NVFP4 sparse/wide); requests run alone");
+        } else { tracing::info!(rows, "exact packed prefill uses the minimum loaded coordinator/expert route cap"); }
     }
 }
 
@@ -113,6 +146,32 @@ pub(crate) fn row_shares(rows: &[usize]) -> Vec<f64> {
 mod tests {
     use super::*;
     fn limits() -> Limits { Limits { rows: 256, chunk_rows: 256, max_context: 4096, taps: Some(128) } }
+    #[test]
+    fn coordinator_routes_fail_closed_and_inventory_is_exhaustive() {
+        use ProgramRows::*;
+        assert_eq!(manifest_row_cap(&serde_json::json!({"exact_row_cap": 64})), 64);
+        for value in [serde_json::json!({}), serde_json::json!({"exact_row_cap": -1}),
+            serde_json::json!({"exact_row_cap": "64"}), serde_json::json!({"exact_row_cap": 0})] {
+            assert_eq!(manifest_row_cap(&value), 0);
+        }
+        let inventory = [("router", PackedRows), ("attention", SequenceLocal)];
+        validate_program_inventory(["router", "attention"], &inventory).unwrap();
+        assert!(validate_program_inventory(["router", "attention", "new_projection"], &inventory).is_err());
+        assert!(validate_program_inventory(["router"], &inventory).is_err());
+        assert!(validate_program_inventory(["router"], &[("router", PackedRows), ("router", SequenceLocal)]).is_err());
+    }
+
+    #[test]
+    fn exact_coordinator_router_boundary_retains_large_singletons() {
+        let chunks = [(0, 32), (0, 80), (0, 16), (0, 48)];
+        let cap = 256usize.min(manifest_row_cap(&serde_json::json!({"exact_row_cap": 64})));
+        let split = groups(chunks.len(), |range| plan(&chunks[range], &Limits {
+            rows: cap, chunk_rows: 256, max_context: 4096, taps: None }).is_ok());
+        assert_eq!(split, vec![0..1, 1..2, 2..4]);
+        assert!(plan(&chunks[..2], &Limits { rows: 256, taps: None, ..limits() }).is_ok());
+        assert_eq!(chunks[1].1, 80, "a singleton must not be rechunked at the pack cap");
+    }
+
     #[test]
     fn exact_groups_split_at_cap_without_rechunking_singletons() {
         assert_eq!(PackingMode::default(), PackingMode::Unrestricted);
