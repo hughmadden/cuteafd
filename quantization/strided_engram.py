@@ -298,6 +298,9 @@ def upload(args):
     evidence = json.loads((output.parent / "source-verified.json").read_text())
     if remote["sha"] != REVISION or len(remote["siblings"]) != result["source_files"]:
         raise ValueError("source inventory revision/count mismatch")
+    for shard, receipt in result["shards"].items():
+        if receipt.get("source_tensor_hashes") != evidence[shard]["tensors"]:
+            raise ValueError(f"repack source tensor attestation mismatch: {shard}")
     storage, original_index = storage_and_index(source, result["shards"])
     original_config = json.loads((source / "config.json").read_text())
     original_config["engram_storage"] = storage

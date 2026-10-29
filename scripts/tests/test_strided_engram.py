@@ -128,6 +128,14 @@ def test_segmented_upload_inventory_and_storage_declaration(tmp_path, monkeypatc
     assert len(operations_seen) == len(siblings) + 6
     assert {op.path_in_repo for op in operations_seen} >= {
         f"engram-{layer:02}-part-{part:05}.safetensors" for layer in [1, 14] for part in range(3)}
+    receipt_path = tmp_path / "repack-verified.json"
+    original_receipt = receipt_path.read_text()
+    mixed = json.loads(original_receipt)
+    mixed["shards"]["model-00047-of-00048.safetensors"]["source_tensor_hashes"] = {"wrong-source": "bad"}
+    repack.write_json(receipt_path, mixed)
+    with pytest.raises(ValueError, match="source tensor attestation mismatch"):
+        repack.upload(args)
+    receipt_path.write_text(original_receipt)
     # Rehashing the actual operation inputs must reject post-verification changes.
     (output / "engram-01-part-00000.safetensors").write_bytes(b"changed")
     with pytest.raises(ValueError, match="changed after verification"):

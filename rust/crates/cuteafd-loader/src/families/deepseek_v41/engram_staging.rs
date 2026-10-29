@@ -175,9 +175,11 @@ impl EngramBatchStaging {
             // One shared-table gather per unique row; split opaque bytes only
             // after I/O, leaving the GPU's native FP8 staging unchanged.
             let mut packed = vec![0; addresses.len() * 264];
+            // The owning Engram gather worker records the logical batch once.
+            let packed_slots: Vec<_> = (0..addresses.len()).collect();
             match gather {
-                Some(gather) => gather.gather(table.weights(), &addresses, &mut packed)?,
-                None => table.weights().gather_into(&addresses, &mut packed)?,
+                Some(gather) => gather.gather_slots(table.weights(), &addresses, &packed_slots, &mut packed)?,
+                None => table.weights().gather_slots(&addresses, &packed_slots, &mut packed)?,
             }
             for (row, &slot) in packed.chunks_exact(264).zip(&slots) {
                 weights[slot * 256..(slot + 1) * 256].copy_from_slice(&row[..256]);
@@ -299,6 +301,8 @@ mod tests {
                 assert_eq!(actual.text_mask, expected.text_mask);
                 assert_eq!(actual.global_scale.to_bits(), expected.global_scale.to_bits());
                 assert_eq!(actual.encoding, expected.encoding);
+                assert_eq!(strided.weights().stats().snapshot().gathers, 0,
+                    "staging must leave logical gather accounting to its owner");
             }
         }
         assert!(EngramTable::new_strided(map(&weight, 256)?).is_err());
