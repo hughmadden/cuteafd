@@ -1588,8 +1588,8 @@ impl Opened {
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
             kda_prefill_expanded: args.kda_prefill_expanded, index_compact: index == engine::IndexCache::Compact,
             kda_state: args.kda_state.into() };
-        let native = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&self.cfg, &headers)?
-            .scratch_mask(&self.cfg, layers);
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&self.cfg, &headers)?;
+        let native = core.scratch_mask(&self.cfg, layers);
         let decode = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true, native)?;
         let mut prefill = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false, native)?;
         if args.replay_records == engine::ReplayRecords::Shared {
@@ -1599,7 +1599,7 @@ impl Opened {
         let (table_pages, table_pool_pages) = glmf_table_pages(args.max_context as u64);
         let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
             tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
-            output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
+            output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits && core.get_weight("lm_head").is_none(), table_pages, table_pool_pages };
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let mut workspace = workspaces(spark_ranks > 0, lanes);
@@ -2140,7 +2140,7 @@ impl Opened {
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache);
             settings.max_context = max_context;
-            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, matches!(model.head, head::GlmfHead::K6(_)), step_experts, settings);
             let lanes = args.prefill_waves;
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };

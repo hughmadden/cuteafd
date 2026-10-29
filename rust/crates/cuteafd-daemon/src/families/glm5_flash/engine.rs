@@ -888,7 +888,7 @@ pub(crate) struct StepSettings {
 impl<'p, 'a> StepPlan<'p, 'a> {
     /// The plan of an engine over `layers` with `experts` and `settings` (rank 0's shape).
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: &'p GlmNextConfig,
-        layers: &[GlmfLayer<'_>], experts: StepExperts, settings: StepSettings) -> Self {
+        layers: &[GlmfLayer<'_>], native_head: bool, experts: StepExperts, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
         let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
@@ -923,7 +923,8 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 spark: experts.spark,
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
-                full_prefill_logits: settings.full_prefill_logits,
+                // K6 scoring downloads tiles through the ordinary bounded staging.
+                full_prefill_logits: settings.full_prefill_logits && !native_head,
                 table_pages,
                 table_pool_pages,
             },
@@ -1425,8 +1426,8 @@ pub(crate) struct GlmfEngine<'a> {
     /// for the routes and wire rows), the Spark exchanges, and the head (final
     /// norm, vocabulary projection, logits download).
     pub profile: RefCell<[f64; 3]>,
-    /// Prefill steps keep every row's logits (golden scoring); otherwise the
-    /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
+    /// Permit scoring every prefill row. Native K6 consumes bounded tiles on
+    /// the host; other heads retain full-row device logits.
     pub full_prefill_logits: bool,
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
@@ -3155,7 +3156,7 @@ impl<'a> GlmfEngine<'a> {
     /// Every prefill workspace teacher-forced scoring runs in, before readiness (`--full-prefill-logits`
     /// admits them): both ranks' prefill lanes, as a Spark prefill takes them. A serial prefill, a
     /// short chunk and the prefix captures run in lane 0, so there is no third workspace, and the
-    /// all-row logits live once, in the lanes' shared temporaries.
+    /// logits staging lives once in shared temporaries (bounded tiles for K6).
     pub fn prepare_scoring_prefill(&self) -> Result<()> {
         let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
         for rank in 0..self.ranks() {
@@ -3166,7 +3167,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
-        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.step_experts,
+        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, matches!(self.weights.head, GlmfHead::K6(_)), self.step_experts,
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
