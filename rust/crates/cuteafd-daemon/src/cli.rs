@@ -737,6 +737,21 @@ mod tests {
     }
 
     #[test]
+    fn base_model_is_an_optional_hugging_face_id_on_native_serve() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        for (flags, expected) in [(vec![], None),
+            (vec!["--base-model", "deepseek-ai/DeepSeek-V4.1-Flash-1017"], Some("deepseek-ai/DeepSeek-V4.1-Flash-1017"))] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags))
+                .unwrap().command else { panic!("expected native serve"); };
+            assert_eq!(args.base_model.as_deref(), expected);
+        }
+        for value in ["no-slash", "a/b/c", "../x", "org/", "/name", "org/na me"] {
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--base-model", value])).is_err(), "{value}");
+        }
+    }
+
+    #[test]
     fn plan_mimo_prefix_marks_stay_experimental_and_off() {
         use clap::{CommandFactory, Parser};
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
@@ -1266,6 +1281,11 @@ pub(crate) struct NativeServeArgs {
     #[arg(long)] pub snapshot: PathBuf,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)] pub model_id: Option<String>,
+    /// The model a checkpoint without its own model card derives from (a local
+    /// composition or quant), as that card's `base_model` would name it: it joins
+    /// the lineage the V4.1 history rule follows only where the checkpoint's own
+    /// files name no ancestry, and must agree with any they do.
+    #[arg(long, value_parser = parse_base_model)] pub base_model: Option<String>,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
@@ -1348,6 +1368,11 @@ impl NativeServeArgs {
 pub(crate) fn reject_peer_expert_ranges(text: &str) -> Result<bool, String> {
     if text == "false" { return Ok(false); }
     Err("GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); drop --peer-expert-ranges".into())
+}
+
+fn parse_base_model(value: &str) -> Result<String, String> {
+    if cuteafd_bench::fidelity_match::is_repo_id(value) { Ok(value.to_owned()) }
+    else { Err(format!("{value}: expected an ORG/NAME Hugging Face id")) }
 }
 
 fn parse_scale_preload_gib(value: &str) -> Result<f64, String> {

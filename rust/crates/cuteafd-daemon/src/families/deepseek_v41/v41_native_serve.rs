@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
-    let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
+    let mut profile = served_profile(args.model_id.clone(), args.base_model.as_deref(), &args.snapshot)?;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
     let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
     let vision_health = readiness
@@ -66,21 +66,33 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
 /// own id. The checkpoint is identified from its own files (hub path id,
 /// model-card base_model ancestry, or its encoding/encoding.py against the
 /// known V4.1 releases), never assumed; an unidentifiable plain directory
-/// without --model-id fails closed. The history rule follows the lineage.
-fn served_profile(model_id: Option<String>, snapshot: &std::path::Path) -> Result<cuteafd_api::openai::ModelProfile> {
+/// without --model-id or --base-model fails closed. `--base-model` stands in for
+/// the card a checkpoint lacks (a local alias of a composition, say): it joins
+/// the lineage only where the checkpoint's own files name no ancestry and no
+/// V4.1 release, and must agree with any they do name. The history rule
+/// follows the lineage.
+fn served_profile(model_id: Option<String>, base_model: Option<&str>, snapshot: &std::path::Path)
+    -> Result<cuteafd_api::openai::ModelProfile> {
     use cuteafd_api::openai::{chat::deepseek::v41_turns, snapshot_model_id, ModelEncoding, ModelProfile, V41Turns};
     let hub_id = snapshot_model_id(snapshot);
     // A plain directory's own card: its base_model ancestors (the walk lists the directory itself first).
     let card_ancestors = if hub_id.is_none() {
         cuteafd_bench::fidelity_match::lineage("local/snapshot", Some(snapshot)).split_off(1)
     } else { Vec::new() };
-    let identity = v41_turns::identify(snapshot, hub_id, &card_ancestors, model_id.as_deref())?;
-    let lineage: Vec<String> = identity.iter()
+    let identity = v41_turns::identify(snapshot, hub_id, &card_ancestors, model_id.as_deref().or(base_model))?;
+    let mut lineage: Vec<String> = identity.iter()
         .flat_map(|id| cuteafd_bench::fidelity_match::lineage(id, (identity.len() == 1).then_some(snapshot)))
         .collect();
+    if let Some(base) = base_model.filter(|base| !lineage.iter().any(|id| id == base)) {
+        let named = lineage.len() > 1
+            || lineage.iter().any(|id| [v41_turns::V41_1017_MODEL_ID, v41_turns::V41_ORIGINAL_MODEL_ID].contains(&id.as_str()));
+        anyhow::ensure!(!named, "--base-model {base} disagrees with the lineage the checkpoint's own files name: {lineage:?}");
+        lineage.extend(cuteafd_bench::fidelity_match::lineage(base, None));
+    }
     let turns = V41Turns::for_lineage(lineage.iter().map(String::as_str));
     let checkpoint = identity[0].clone();
-    tracing::info!(checkpoint, ?lineage, ?turns, "V4.1 prompt history rule from the checkpoint lineage");
+    tracing::info!(checkpoint, ?lineage, declared_base_model = base_model, ?turns,
+        "V4.1 prompt history rule from the checkpoint lineage");
     Ok(ModelProfile::new(model_id.unwrap_or(checkpoint), ModelEncoding::DeepseekV41).with_v41_turns(turns))
 }
 
@@ -203,21 +215,53 @@ mod served_profile_tests {
     #[test]
     fn plain_directory_is_identified_or_refused_never_assumed_original() {
         let dir = tempfile::tempdir().unwrap();
-        let error = served_profile(None, dir.path()).unwrap_err().to_string();
+        let error = served_profile(None, None, dir.path()).unwrap_err().to_string();
         assert!(error.contains("--model-id"), "{error}");
-        let aliased = served_profile(Some("org/served".into()), dir.path()).unwrap();
+        let aliased = served_profile(Some("org/served".into()), None, dir.path()).unwrap();
         assert_eq!((aliased.id.as_str(), aliased.v41_turns), ("org/served", V41Turns::KeepReasoning));
         // A hub path names its checkpoint; the rule follows it.
         let hub = dir.path().join("models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/abc");
         std::fs::create_dir_all(&hub).unwrap();
-        let profile = served_profile(None, &hub).unwrap();
+        let profile = served_profile(None, None, &hub).unwrap();
         assert_eq!((profile.id.as_str(), profile.v41_turns), ("deepseek-ai/DeepSeek-V4.1-Flash-1017", V41Turns::DropCompleted));
         // A plain directory whose own card names 1017 as base_model.
         let quant = dir.path().join("my-quant");
         std::fs::create_dir(&quant).unwrap();
         std::fs::write(quant.join("README.md"), "---\nbase_model: deepseek-ai/DeepSeek-V4.1-Flash-1017\nbase_model_relation: quantized\n---\n").unwrap();
-        let profile = served_profile(Some("served".into()), &quant).unwrap();
+        let profile = served_profile(Some("served".into()), None, &quant).unwrap();
         assert_eq!((profile.id.as_str(), profile.v41_turns), ("served", V41Turns::DropCompleted));
+    }
+
+    #[test]
+    fn declared_base_model_stands_in_only_for_a_missing_card() {
+        const ORIGINAL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+        const FLASH_1017: &str = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
+        let dir = tempfile::tempdir().unwrap();
+        // A local hub alias with no card (a composition): the declared base sets the rule.
+        let alias = dir.path().join("models--local--composed-checkpoint/snapshots/abc");
+        std::fs::create_dir_all(&alias).unwrap();
+        let profile = served_profile(None, None, &alias).unwrap();
+        assert_eq!((profile.id.as_str(), profile.v41_turns), ("local/composed-checkpoint", V41Turns::KeepReasoning));
+        let profile = served_profile(None, Some(FLASH_1017), &alias).unwrap();
+        assert_eq!((profile.id.as_str(), profile.v41_turns), ("local/composed-checkpoint", V41Turns::DropCompleted));
+        // A plain directory with nothing to identify it: the base names it, as its card would.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let profile = served_profile(None, Some(FLASH_1017), &plain).unwrap();
+        assert_eq!((profile.id.as_str(), profile.v41_turns), (FLASH_1017, V41Turns::DropCompleted));
+        let profile = served_profile(Some("served".into()), Some(FLASH_1017), &plain).unwrap();
+        assert_eq!((profile.id.as_str(), profile.v41_turns), ("served", V41Turns::DropCompleted));
+        // The checkpoint's own files win: an agreeing base changes nothing, a different one is refused.
+        let release = dir.path().join("models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/abc");
+        std::fs::create_dir_all(&release).unwrap();
+        assert_eq!(served_profile(None, Some(FLASH_1017), &release).unwrap().v41_turns, V41Turns::DropCompleted);
+        let error = served_profile(None, Some(ORIGINAL), &release).unwrap_err().to_string();
+        assert!(error.contains("disagrees"), "{error}");
+        let carded = dir.path().join("carded");
+        std::fs::create_dir(&carded).unwrap();
+        std::fs::write(carded.join("README.md"), format!("---\nbase_model: {ORIGINAL}\n---\n")).unwrap();
+        let error = served_profile(Some("served".into()), Some(FLASH_1017), &carded).unwrap_err().to_string();
+        assert!(error.contains("disagrees"), "{error}");
     }
 }
 

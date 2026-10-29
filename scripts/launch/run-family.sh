@@ -435,6 +435,7 @@ API_KEY_FILE
 ATTENTION_PLACEMENT
 ATTENTION_PLAN_ROWS
 AUDIO
+BASE_MODEL
 CONCURRENCY
 DECODE_LANES
 CONSOLE_ASSETS
@@ -956,6 +957,13 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 # with RAM for the tables whose checkpoint store has slow random reads.
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
+# BASE_MODEL (ORG/NAME; default unset): the model a checkpoint without its own model card derives
+# from, for a local alias such as a SparkNest composition (serve-native --base-model). It joins the
+# lineage the history rule follows only where the checkpoint's files name none; a conflict fails startup.
+v41_base_model="$(get BASE_MODEL)"
+[[ -z "$v41_base_model" || "$v41_base_model" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] &&
+  release_path_has_no_dot_segment "${v41_base_model:-x/x}" ||
+  release_die "BASE_MODEL must be an ORG/NAME Hugging Face id"
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
@@ -1461,6 +1469,7 @@ fi
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
 [[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
 [[ "$v41_engram_warm" != on ]] || args+=(--engram-warm)
+[[ -z "$v41_base_model" ]] || args+=(--base-model "$v41_base_model")
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then

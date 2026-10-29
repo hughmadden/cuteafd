@@ -36,7 +36,8 @@ pub enum IdentifyError {
     Read { path: std::path::PathBuf, source: std::io::Error },
     #[error("cannot identify the V4.1 checkpoint at {snapshot}: its path names no Hugging Face repository, \
              its model card has no base_model, and encoding/encoding.py (sha256 {encoding}) matches no known \
-             V4.1 release; pass --model-id with the checkpoint's repository id")]
+             V4.1 release; pass --model-id with the checkpoint's repository id, or --base-model with the \
+             release it derives from")]
     Unknown { snapshot: std::path::PathBuf, encoding: String },
 }
 

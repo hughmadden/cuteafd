@@ -369,6 +369,36 @@ def test_v41_engram_warm_key_reaches_only_the_coordinator_command(tmp_root, monk
         assert not any("engram-warm" in arg or "ENGRAM_WARM" in arg for arg in worker["argv"])
 
 
+@pytest.mark.parametrize("value", [None, "deepseek-ai/DeepSeek-V4.1-Flash-1017", "no-slash", "org/.."])
+def test_v41_base_model_key_reaches_only_the_coordinator_command(tmp_root, monkeypatch, value) -> None:
+    """BASE_MODEL=ORG/NAME adds serve-native --base-model for a checkpoint without its own card;
+    unset passes nothing; anything but an ORG/NAME id fails before any container. Plans and Spark
+    workers never see it."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"BASE_MODEL={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value in ("no-slash", "org/.."):
+        with pytest.raises(RuntimeError, match=r"BASE_MODEL must be an ORG/NAME Hugging Face id"):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    assert command.count("--base-model") == (0 if value is None else 1)
+    if value is not None:
+        assert command[command.index("--base-model") + 1] == value
+    assert not any("base-model" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("base-model" in arg or "BASE_MODEL" in arg for arg in worker["argv"])
+
+
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
     """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
     import v41_launch_capture as capture_module

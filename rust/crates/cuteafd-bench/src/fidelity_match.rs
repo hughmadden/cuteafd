@@ -92,6 +92,12 @@ fn card(snapshot: &Path) -> Result<Option<Card>> {
     bail!("malformed model-card YAML: missing closing front-matter delimiter")
 }
 
+/// Whether `model` is an `ORG/NAME` Hugging Face id, as the card walk accepts
+/// for a `base_model` parent.
+pub fn is_repo_id(model: &str) -> bool {
+    repo_parts(model).is_some()
+}
+
 fn repo_parts(model: &str) -> Option<(&str, &str)> {
     let (org, name) = model.split_once('/')?;
     let valid = |s: &str| !s.is_empty() && s != "." && s != ".."
