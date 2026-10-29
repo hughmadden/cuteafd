@@ -3425,9 +3425,10 @@ impl<'a> GlmfEngine<'a> {
             let item = (format!("glmf_{name}"), role);
             if !inventory.contains(&item) { inventory.push(item); }
         };
-        for name in ["mhc_pre", "mhc_post", "mhc_post_pre_m4096", "head"] {
+        for name in ["mhc_pre", "mhc_post", "mhc_post_pre_m4096"] {
             add(name.into(), SequenceLocal);
         }
+        add("head".into(), PackedRows);
         for layer in &self.weights.layers {
             match layer.attention {
                 GlmNextAttention::Kda => {

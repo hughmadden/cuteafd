@@ -1641,25 +1641,25 @@ impl<'a> MimoEngine<'a> {
     fn packed_program_inventory(&self) -> Vec<(String, crate::shared::prefill_packing::ProgramRows)> {
         use crate::shared::prefill_packing::ProgramRows::*;
         let mut inventory = Vec::new();
-        for (rank, layers) in std::iter::once(&self.weights.layers)
-            .chain(self.peer.as_ref().map(|p| &p.layers)).enumerate() {
-            let split = rank != 0;
-            let mut add = |name: String, role| {
-                let item = (self.program_name(&name, split), role);
-                if !inventory.contains(&item) { inventory.push(item); }
-            };
-            add("mimo_norm".into(), PackedRows);
+        let mut add = |name: String, split, role| {
+            let item = (self.program_name(&name, split), role);
+            if !inventory.contains(&item) { inventory.push(item); }
+        };
+        // Norms/router/wire quant always use full-width exports on both ranks.
+        add("mimo_norm".into(), false, PackedRows);
+        for layers in std::iter::once(&self.weights.layers)
+            .chain(self.peer.as_ref().map(|p| &p.layers)) {
             for layer in layers {
                 // The fused producer and output projection run within packed_attention's member loop.
                 let k = kind(layer.attention);
                 let kv = self.kv_cache.of(layer.attention).program_tag();
-                add(format!("mimo_{k}_producer{kv}_m4096"), SequenceLocal);
-                add(format!("mimo_{k}_attention{kv}_prefill_m4096"), SequenceLocal);
-                add(format!("mimo_o{}_m4096", if layer.has("w_o_fp8") { "_w8" } else { "" }), SequenceLocal);
-                if layer.dense { add("mimo_ffn_m4096".into(), PackedRows); }
+                add(format!("mimo_{k}_producer{kv}_m4096"), layer.split, SequenceLocal);
+                add(format!("mimo_{k}_attention{kv}_prefill_m4096"), layer.split, SequenceLocal);
+                add(format!("mimo_o{}_m4096", if layer.has("w_o_fp8") { "_w8" } else { "" }), layer.split, SequenceLocal);
+                if layer.dense { add("mimo_ffn_m4096".into(), layer.split, PackedRows); }
                 else {
-                    add("mimo_router_scores".into(), SequenceLocal);
-                    if !self.expert_bf16_input(false) { add("mimo_expert_input_quant".into(), SequenceLocal); }
+                    add("mimo_router_scores".into(), false, SequenceLocal);
+                    if !self.expert_bf16_input(false) { add("mimo_expert_input_quant".into(), false, SequenceLocal); }
                 }
             }
         }
