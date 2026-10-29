@@ -197,18 +197,7 @@ pub struct V41ExpertStaging<'a> {
 
 impl OfficialV41Catalog {
     pub fn expert_staging(&self, selection: V41ExpertSelection) -> Result<V41ExpertStaging<'_>> {
-        if self.exl3().is_some() {
-            // Raw EXL3 publications keep draft experts at native FP4 source
-            // precision; only those selections may use the native packer.
-            ensure!(
-                self.native_dspark_experts(),
-                "EXL3 experts require compressed projection staging, not the native FP4 packer"
-            );
-            ensure!(
-                matches!(selection, V41ExpertSelection::Dspark { .. }),
-                "source-precision drafts are the only native experts in an EXL3 checkpoint"
-            );
-        }
+
         let config = self.routed_experts();
         let (prefix, rank, intermediate, geometry) = match selection {
             V41ExpertSelection::BackboneTp {

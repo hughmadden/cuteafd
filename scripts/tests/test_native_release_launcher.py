@@ -646,26 +646,7 @@ spark_tp_roles=
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
 
-    def package_identity(self, manifest: dict) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ['bash', '-c', 'source scripts/lib/release-common.sh; release_exl3_package_identity test-revision'],
-            cwd=ROOT, input=json.dumps(manifest), text=True, capture_output=True,
-        )
 
-    def test_exl3_preflight_identity_binds_layout_and_package(self) -> None:
-        manifest = dict(schema='cuteafd.exl3-package.v1', role='spark',
-                        sparkinfer_revision='test-revision', files={'kernel': 'first'})
-        disjoint = self.package_identity(manifest)
-        self.assertEqual(disjoint.returncode, 0, disjoint.stderr)
-        self.assertTrue(disjoint.stdout.startswith('disjoint:'))
-        manifest['files']['kernel'] = 'second'
-        self.assertNotEqual(disjoint.stdout, self.package_identity(manifest).stdout)
-        for field, value in [('role', 'coordinator'), ('schema', 'wrong'),
-                             ('sparkinfer_revision', 'another-build')]:
-            with self.subTest(field=field, value=value):
-                result = self.package_identity({**manifest, field: value})
-                self.assertEqual(result.returncode, 2)
-                self.assertIn('invalid Spark EXL3 package identity', result.stderr)
 
     def test_shell_is_valid_and_help_exposes_native_controls(self) -> None:
         subprocess.run(

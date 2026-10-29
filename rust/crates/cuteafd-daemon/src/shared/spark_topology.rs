@@ -38,19 +38,9 @@ pub(crate) fn resolve(
     Ok(Some(topology))
 }
 
-/// Compact V4.1 EXL3 TP3 always uses the existing EP1 ownership contract,
-/// including direct CLI and golden callers that omit explicit topology flags.
-pub(crate) fn for_checkpoint(
-    topology: Option<SparkTopology>,
-    world: usize,
-    v41_exl3: bool,
-) -> Option<SparkTopology> {
-    topology.or_else(|| (v41_exl3 && world == 3).then_some(SparkTopology::NATIVE_TP3_EP1))
-}
-
 /// Resolve the declared wire independently from the physical TP/EP layout.
-/// Omitted CLI keys choose canonical pure TP, except the compact V4.1 TP3
-/// ownership protocol. No transport derives rank identities from a fallback.
+/// Omitted CLI keys choose canonical pure TP. No transport derives rank
+/// identities from a fallback.
 pub(crate) fn world(topology: Option<SparkTopology>, ranks: usize) -> Result<SparkWorld> {
     let world = match topology {
         Some(topology) => SparkWorld::owned(topology)?,
@@ -71,13 +61,9 @@ pub(crate) fn require_supported(
     if let Some(topology) = topology {
         ensure!(catalog.fp8().is_none(),
             "generic expert programs require canonical Spark wire");
-        ensure!(if catalog.exl3().is_some() {
-            topology == SparkTopology::NATIVE_TP3_EP1
-                && catalog.routed_experts().geometry()?.family() == Some("v41")
-        } else {
-            catalog.nvfp4().is_none()
-                || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))
-        }, "unsupported Spark ownership wire {}x{} for this checkpoint; supported: native experts on TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3; NVFP4 on TP3EP1, TP4EP1, TP6EP1; compact V4.1 EXL3 on TP3EP1",
+        ensure!(catalog.exl3().is_none() && (catalog.nvfp4().is_none()
+                || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))),
+            "unsupported Spark ownership wire {}x{} for this checkpoint; supported: native experts on TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3; NVFP4 on TP3EP1, TP4EP1, TP6EP1",
             topology.tp(), topology.ep());
         SparkWorld::owned(topology)?;
     }
@@ -170,7 +156,7 @@ mod tests {
         for exl3 in [false, true] {
             let root = tempfile::tempdir()?;
             if exl3 {
-                cuteafd_loader::plan::testing::write_v41_exl3_snapshot(root.path(), 3);
+                cuteafd_loader::plan::testing::write_v4_pro_exl3_snapshot(root.path());
             } else {
                 cuteafd_loader::plan::testing::write_v41_nvfp4_snapshot(root.path());
             }
@@ -179,7 +165,6 @@ mod tests {
                 .unwrap_err().to_string();
             assert!(error.contains("ownership wire 2x1"), "{error}");
             assert!(error.contains("NVFP4 on TP3EP1, TP4EP1, TP6EP1"), "{error}");
-            assert!(error.contains("compact V4.1 EXL3 on TP3EP1"), "{error}");
         }
         Ok(())
     }
@@ -224,21 +209,6 @@ mod tests {
             let resolved = world(None, count).unwrap();
             assert_eq!(resolved.topology().world_size(), count);
             assert!(!resolved.supports_device_exchange());
-        }
-    }
-
-    #[test]
-    fn compact_exl3_tp3_is_always_the_same_ep1_topology() {
-        let tp3 = Some(SparkTopology::NATIVE_TP3_EP1);
-        assert_eq!(for_checkpoint(None, 3, true), tp3);
-        assert_eq!(for_checkpoint(tp3, 3, true), tp3);
-        assert_eq!(for_checkpoint(None, 3, false), None);
-        for world in [0, 1, 2, 4, 6] {
-            assert_eq!(for_checkpoint(None, world, true), None);
-        }
-        for rank in 0..3 {
-            assert_eq!(tp3.unwrap().executor_id(rank).unwrap(), 7 + rank as u64);
-            assert_eq!(tp3.unwrap().group(rank).unwrap(), 0);
         }
     }
 

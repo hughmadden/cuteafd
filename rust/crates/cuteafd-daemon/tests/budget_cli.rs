@@ -331,3 +331,58 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
     assert_eq!(tested + skipped, total);
     eprintln!("installed example deployments: {tested} tested, {skipped} skipped ({skipped_programs} missing PROGRAMS), {total} configs, families={families:?}");
 }
+
+#[test]
+fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
+    let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
+    let hf_home = std::path::PathBuf::from(hf_home);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let matrix: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../scripts/bench/release-smoke-v4.json")).unwrap();
+    for entry in matrix["entries"].as_array().unwrap() {
+        let example = root.join(entry["config"].as_str().unwrap());
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let mut config = raw.lines().filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned())).collect::<std::collections::BTreeMap<_, _>>();
+        if let Some(overrides) = entry["set"].as_object() {
+            for (key, value) in overrides { if let Some(value) = value.as_str() {
+                config.insert(key.clone(), value.to_owned());
+            } }
+        }
+        let revision = config.get("MODEL_REVISION").map(String::as_str);
+        let Some(snapshot) = installed_example_snapshot(&config["MODEL_ID"], revision, &hf_home) else { continue; };
+        let ranks = entry["sparks"].as_array().map_or(0, Vec::len);
+        use cuteafd_loader::plan::{family, format, spec::Component, Checkpoint};
+        // Exercise production recipe construction from real tensor headers without
+        // running the unrelated memory-placement search for every matrix entry.
+        let checkpoint = Checkpoint::open(&snapshot).unwrap();
+        let family = family::detect(&checkpoint).unwrap();
+        let model = family.open(&checkpoint).unwrap();
+        let Some(moe) = model.spec().moe.as_ref() else { continue; };
+        let tensors = checkpoint.tensors.iter().filter(|tensor|
+            family.classify(model.spec(), &tensor.meta.name)
+                .is_some_and(|role| role.component == Component::RoutedExpert))
+            .cloned().collect::<Vec<_>>();
+        let mut packages = std::collections::BTreeSet::new();
+        for members in format::group_by_stem(&tensors).values() {
+            let operand = format::detect(members).unwrap();
+            if let Some(contract) = model.experts(&operand) { packages.insert(contract.package); }
+        }
+        if config.contains_key("EXLR8_MANIFEST") {
+            // EXLR8 is admitted by exlr8_native_plan, not spark_recipe.
+            assert!(packages.is_empty(), "{}: EXLR8 unexpectedly selected a generic package", entry["name"]);
+            continue;
+        }
+        assert!(!packages.is_empty(), "{}: missing routed recipe", entry["name"]);
+        for package in packages {
+            // Local-only coordinators need no Spark TP1 package, but their IDs
+            // must parse against a registered Spark world.
+            let world = if ranks == 0 {
+                *cuteafd_loader::plan::experts::spark_worlds(&package, moe.intermediate).first()
+                    .unwrap_or_else(|| panic!("{}: unrecognized recipe {package}", entry["name"]))
+            } else { ranks };
+            cuteafd_loader::plan::experts::spark_recipe(&package, moe.intermediate, world)
+                .unwrap_or_else(|error| panic!("{}: {package}: {error}", entry["name"]));
+        }
+    }
+}

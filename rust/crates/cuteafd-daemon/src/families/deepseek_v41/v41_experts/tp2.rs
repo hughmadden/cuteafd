@@ -3,7 +3,6 @@
 use crate::shared::{
     experts::rtx::{
         combine::{Combine, OwnerReduce},
-        exl3::Exl3Tp2,
         native::{NativeOutputPolicy, NativeTp2},
         pair::{OwnerInputs, OwnerPair, OwnerWeights},
         ExpertInput, PartialDtype, PartialLayout, Routes, RtxExpertLayer, RtxSelectionPolicy,
@@ -15,7 +14,7 @@ use anyhow::{ensure, Result};
 #[cfg(test)]
 use cuteafd_ffi::CuteafdDeviceBuffer;
 #[cfg(test)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(test)]
 #[path = "tp2/shared_tests.rs"]
@@ -25,96 +24,6 @@ mod shared_tests;
 mod tests {
     use super::*;
     use cuteafd_ffi::NativeLibrary;
-
-    #[test]
-    #[ignore = "requires EXL3 snapshot, TP2 package and two CUDA devices"]
-    fn exl3_single_rank_capacity_launch_probe() -> Result<()> {
-        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        lib.cuda_set_device(0)?;
-        let device = Device {
-            library: &lib,
-            id: 0,
-        };
-        let catalog = cuteafd_loader::read_official_v41_catalog(Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
-        )?;
-        let package = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
-        let devices = [
-            device,
-            Device {
-                library: &lib,
-                id: 1,
-            },
-        ];
-        let weights = Exl3Tp2::load_pair_weights(
-            devices,
-            &catalog,
-            cuteafd_core::expert_geometry(),
-            [&package; 2],
-            vec![0],
-            16,
-            [4_000_000_000; 2],
-            RtxSelectionPolicy::FirstCapacity,
-        )?;
-        let inputs = [
-            Allocation::new(device, 16 * 5280)?,
-            Allocation::new(device, 16 * 24)?,
-            Allocation::new(device, 16 * 24)?,
-        ];
-        let producer = Stream::new(device)?;
-        let mut wave = weights[0].execution()?;
-        let mut wire = vec![0u8; 16 * 5280];
-        for row in wire.chunks_exact_mut(5280) {
-            row[..5120].fill(0x38);
-            row[5120..].fill(127);
-        }
-        lib.copy_h2d(inputs[0].buffer, &wire)?;
-        lib.copy_h2d(
-            inputs[1].buffer,
-            &(0..96i32)
-                .flat_map(|i| (i % 6).to_ne_bytes())
-                .collect::<Vec<_>>(),
-        )?;
-        lib.copy_h2d(
-            inputs[2].buffer,
-            &(0..96)
-                .flat_map(|_| (1f32 / 6.).to_ne_bytes())
-                .collect::<Vec<_>>(),
-        )?;
-        for rows in [16, 1, 3, 16] {
-            unsafe {
-                wave.enqueue(
-                    0,
-                    rows,
-                    ExpertInput::Fp8K32(inputs[0].buffer.ptr),
-                    Routes {
-                        ids: inputs[1].buffer.ptr,
-                        weights: inputs[2].buffer.ptr,
-                    },
-                    producer.raw,
-                    &mut || {},
-                )?;
-            }
-            producer.drain()?;
-            let mut bytes = vec![0; rows as usize * 5120 * 4];
-            let output = CuteafdDeviceBuffer {
-                bytes: bytes.len(),
-                ptr: wave.output(),
-                device_id: device.id,
-                flags: 0,
-            };
-            lib.copy_d2h(&mut bytes, output)?;
-            let values: Vec<_> = bytes
-                .chunks_exact(4)
-                .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
-                .collect();
-            ensure!(
-                values.iter().all(|v| v.is_finite()) && values.iter().any(|v| *v != 0.),
-                "invalid rank output"
-            );
-            eprintln!("single rank rows={rows} passed finite/nonzero launch");
-        }
-        Ok(())
-    }
 
     #[test]
     #[ignore = "requires official CUTEAFD_SNAPSHOT, TP2 CUTEAFD_NATIVE_LIB and two GPUs"]
@@ -140,14 +49,12 @@ mod tests {
                 id: 1,
             },
         ];
-        let package = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default());
         let weights = super::super::tp2_ffn::load_routed_weights(
             devices,
             &catalog,
             1,
             capacity,
             [4_000_000_000; 2],
-            &package,
         )?;
         let mut first = OwnerPair::new(
             weights.clone(),
@@ -389,7 +296,3 @@ mod tests {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "tp2/reference_tests.rs"]
-mod reference_tests;

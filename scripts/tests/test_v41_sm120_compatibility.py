@@ -237,7 +237,7 @@ int main() {
 
 
 @pytest.mark.parametrize("options,message", [
-    (dict(bits=(3, 4, 5)), "compact weights require a disjoint two-tier export"),
+    (dict(bits=(3, 4, 5)), "export requires two distinct K2..K5 decoder tiers"),
     # Compact warp specialization is a measured Spark prefill cell, so the
     # remaining rejection is a contract the kernel cannot run (8-row blocks).
     (dict(warp_specialized=True, route_block=8),
@@ -256,7 +256,18 @@ def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(
         exporter.export(tmp_path, 384, 256, 16, **kwargs)
 
 
-@pytest.mark.parametrize("bits,compact", [((3, 4), True), ((2, 3, 4), False), ((2, 3, 4, 5), False)])
+@pytest.mark.parametrize("bits", [(2, 3, 4), (2, 3, 4, 5)])
+def test_exl3_export_refuses_multitier_before_cuda(monkeypatch, tmp_path, bits):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "multitier_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    with pytest.raises(ValueError, match="requires two distinct K2..K5 decoder tiers"):
+        exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed")
+
+
+@pytest.mark.parametrize("bits,compact", [((3, 4), True), ((3, 4), False)])
 def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path, bits, compact):
     from types import SimpleNamespace
 
@@ -280,8 +291,7 @@ def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path
         "b12x.moe._shared.kernels.w4a16.host": dict(route_pack_capacity=lambda *a, **k: (0, 128)),
         "b12x.moe._shared.kernels.w4a16.mixed_trellis": dict(
             EXL3_AOT_MAX_SMS={(12, 0): 188}, compile_mixed_trellis=compile_kernel,
-            compile_mixed_trellis3=compile_kernel, make_mixed_trellis_buffers=None),
-        "b12x.moe._shared.kernels.w4a16.mixed_trellis4": dict(compile_mixed_trellis4=compile_kernel),
+            make_mixed_trellis_buffers=None),
         "b12x.moe.fused_moe._impl": dict(_projection_mixed_direct_topk_routes=lambda *a, **k: False,
             _projection_mixed_tile_config=lambda *a, **k: (64, 128, 64, 128)),
     }

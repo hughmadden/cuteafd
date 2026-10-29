@@ -45,10 +45,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         args.peers.len(),
         "serve-native",
     )?;
-    // Reject an explicit non-native checkpoint before any expert allocation,
-    // KV reservation or readiness publication.
-    let topology = crate::shared::spark_topology::for_checkpoint(
-        topology, args.peers.len(), catalog.exl3().is_some());
     let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
     crate::shared::spark_topology::require_world(spark_world, &catalog,
         &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
@@ -57,10 +53,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
     let format = crate::families::deepseek_v41::v41_experts::ExpertFormat::of(&catalog);
-    let compressed = format.is_exl3();
-    let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
-    let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp2");
-    let mut exl3_modules = [None, None];
     // Two private decode lanes at decode width, and `slots` prefill slots on
     // one shared storage set per GPU (PLAN "Prefill contract"). The prefill
     // slots' TP2 FFN is one execution arena per GPU at the unit cap.
@@ -71,25 +63,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let decode_rows = super::DECODE_LANE_ROWS;
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
-        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
-        if compressed {
-            // One module set for the slots' shared FFN, one per decode lane.
-            let mut sets = admission::preload_exl3(&lib, &exl3_directory, capacity, 2, 1)?;
-            sets.extend(admission::preload_exl3(&lib, &exl3_directory, decode_rows, 2, 2)?);
-            exl3_modules[gpu as usize] = Some(sets);
-        }
+        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some())?;
         Ok(())
     })?;
     memory_checkpoint("after native preload")?;
-    // Each GPU's admitted EXL3 modules (None without EXL3): the slots' shared
-    // FFN first, then the two decode lanes'.
-    let mut lane_modules = (0..3).map(|_| [None, None]).collect::<Vec<_>>();
-    for (rank, modules) in exl3_modules.into_iter().enumerate() {
-        for (owner, modules) in modules.into_iter().flatten().enumerate() {
-            lane_modules[owner][rank] = Some(modules);
-        }
-    }
-    let mut lane_modules = lane_modules.into_iter();
     let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
@@ -353,14 +330,12 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // the native plans and AOT packages, sample with no draft allocation, solve
     // with the drafter as a shared Movable, then load with the admitted bytes.
     let draft_width = if args.dspark_draft_limit > 5 { 7 } else { 5 };
-    let dspark_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
-        &args.native_lib, exl3_tiers, "dspark");
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
             &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
-            Some(&dspark_directory), 64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
+            64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
@@ -373,8 +348,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // TP2 FFN arenas per GPU: the prefill slots' one shared arena (planes at
     // the reserve, scratch at the unit) and each decode lane's own.
     let ffn_bytes = |rows: u32, unit: u32| -> Result<usize> { match format {
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 =>
-            tp2_ffn::Storage::exl3_storage_bytes(&exl3_directory, &lib, rows, unit),
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => unreachable!("Flash EXL3 refused by the loader"),
         crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => tp2_ffn::Storage::storage_bytes(&lib, rows, unit, true),
         crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => tp2_ffn::Storage::storage_bytes(&lib, rows, unit, false),
     } };
@@ -407,7 +381,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
                 capacity,args.concurrency,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
         } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
-            capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width, Some(&dspark_directory)))?})
+            capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width))?})
     } else { None };
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
@@ -475,7 +449,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                 [left.native()?, right.native()?])?
         }
         _ => tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
-            rank_budgets, &exl3_directory)?,
+            rank_budgets)?,
     };
     drop(records);
     // Every recorded scale pack ran (Done or mount fill): release raw scales.
@@ -488,14 +462,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // The prefill slots' TP2 FFN: one execution arena per GPU at the unit cap,
     // its planes at the reserve (WP7), every slot's wave on it.
     let ffn_storage = tp2_ffn::Storage::new(routed.clone(), shared.clone(), expert_layers, prefill_reserve as u32,
-        capacity, lane_modules.next().context("missing admitted TP2 prefill arena")?)?;
+        capacity, [None, None])?;
     // Decode lanes own a link each at decode width; prefill slot 0 holds the
     // one prefill link (endpoint after the lanes'), every slot's units send on it.
     let mut decode_transport = |lane: usize| -> Result<_> {
         let mut transport = devices[1].own(|| NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, decode_rows,
             timing, spark_world, u32::try_from(lane)?)?, wave_bytes))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows,
-            lane_modules.next().context("missing admitted TP2 decode lane")?)?)?;
+            [None, None])?)?;
         Ok(transport)
     };
     let [mut transport, mut second_transport] = lanes.try_map(|lane| decode_transport(lane.index()))?;

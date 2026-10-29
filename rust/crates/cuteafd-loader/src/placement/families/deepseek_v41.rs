@@ -168,12 +168,6 @@ pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     }
 }
 
-/// EXL3 needs a canonical wide decode export even for narrow lane admission.
-/// Keep the existing explicit prefill state set for local owners.
-pub fn exl3_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
-    expert_capacities(if rows > 1 && rows < 80 { 80 } else { rows }, local)
-}
-
 /// The native packer's four resident planes, independent of staging format.
 /// NVFP4 scales remain the checkpoint's calibrated K16 planes and vectors.
 pub fn resident_planes(hidden: u64, stored: u64, nvfp4: bool) -> anyhow::Result<[u64; 4]> {
@@ -227,15 +221,6 @@ pub fn expert_cost(
         matches!(world, 1 | 2) && rank < world && layer < 40,
         "invalid V4.1 RTX expert selection"
     );
-    if let Some(exl3) = catalog.exl3() {
-        return Ok(Bytes2 {
-            resident: exl3
-                .residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?
-                .device_arena_layout()?
-                .1 as u64,
-            staging: 0,
-        });
-    }
     let selection = if world == 1 {
         crate::V41ExpertSelection::BackboneFull { layer, expert: 0 }
     } else {
@@ -318,49 +303,7 @@ fn expert_workspace(
     let role = if local { "rtx_backbone" } else { "rtx_tp2" };
     // A compiled capacity on one RTX (the caller covers live rows); TP2 rows.
     let capacity = rows;
-    let (stored, routed) = if let Some(exl3) = catalog.exl3() {
-        let tiers: String = exl3.decoder_tiers().iter().map(usize::to_string).collect();
-        let layout = if local { "rtx-tp1" } else { "rtx-tp2" };
-        let stem = format!("exl3-k{tiers}");
-        let package = [
-            parent.join("exl3").join(&stem).join(layout),
-            parent.join("../lib/exl3").join(&stem).join(layout),
-            parent.join("exl3").join(layout),
-        ]
-        .into_iter()
-        .find(|p| p.is_dir())
-        .context("missing V4.1 EXL3 expert workspace package")?;
-        let manifests = exl3_capacities(capacity, local)?
-            .into_iter()
-            .map(|c| {
-                let path = package.join(format!("m{c}/v41_exl3.json"));
-                let value: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-                )?;
-                ensure!(
-                    value["capacity"].as_u64() == Some(c)
-                        && value["hidden"].as_u64() == Some(shape.hidden as u64)
-                        && value["experts"].as_u64() == Some(shape.experts as u64)
-                        && value["intermediate"].as_u64() == Some((shape.intermediate / gpus) as u64)
-                        && value["top_k"].as_u64() == Some(shape.topk as u64),
-                    "V4.1 EXL3 workspace geometry mismatch"
-                );
-                Ok(value)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let scratch = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?;
-        let output = capacity * shape.hidden as u64 * if local { 2 } else { 4 };
-        (
-            0,
-            scratch
-                + output
-                + if local {
-                    0
-                } else {
-                    owner_workspace(capacity, shape.hidden as u64, shape.topk as u64)?
-                },
-        )
-    } else {
+    let (stored, routed) = {
         let format = if catalog.nvfp4().is_some() {
             "nvfp4"
         } else {
@@ -856,12 +799,6 @@ mod tests {
         manifest["variants"].as_array_mut().unwrap().push(duplicate);
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_backbone",256,5120,1152,256,6).is_err());
-        assert_eq!(exl3_capacities(4096,true).unwrap(), [1,16,80,4096]);
-        assert_eq!(exl3_capacities(16,true).unwrap(), [1,16,80]);
-        assert_eq!(exl3_capacities(16,false).unwrap(), [1,16,80]);
-        assert_eq!(exl3_capacities(1,true).unwrap(), [1]);
-        assert!(exl3_capacities(0,true).is_err());
-        assert!(exl3_capacities(4097,false).is_err());
         assert_eq!(expert_capacities(4096,true).unwrap(), [1,16,80,4096]);
         assert_eq!(expert_capacities(81,false).unwrap(), [1,16,80,256]);
         assert!(expert_capacities(81,true).is_err());

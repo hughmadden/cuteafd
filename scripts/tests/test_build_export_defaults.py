@@ -62,7 +62,7 @@ def test_every_fingerprinted_build_input_reaches_both_build_containers():
         if name not in consumed:
             continue
         assert name in coordinator, f'{name} is fingerprinted but not passed to the coordinator build'
-    assert 'CUTEAFD_WIP_EXL3_BITS' in spark
+    assert 'CUTEAFD_WIP_EXL3_BITS' not in spark
 
 
 def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
@@ -84,11 +84,12 @@ def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
         assert f'-DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${{{variable}:-OFF}}" || echo OFF)"' in build
 
 
-def test_v41_release_exports_all_decoder_families_and_compact_companions():
+def test_exl3_release_exports_named_families_and_compact_companions():
     cmake = (ROOT / 'native/cmake/shared/exl3.cmake').read_text()
     release = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
-    assert 'set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING' in cmake
-    assert '${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}' in release
+    assert 'CUTEAFD_V41_EXL3_BIT_FAMILIES' not in cmake
+    assert 'CUTEAFD_RELEASE_EXL3_BIT_FAMILIES' not in release
+    assert 'release_family_list' in release
     assert '--compact-companions' in cmake
 
 

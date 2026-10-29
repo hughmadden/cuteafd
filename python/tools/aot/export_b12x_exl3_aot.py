@@ -23,6 +23,8 @@ import _pinned_sparkinfer
 
 def write_bridge(output: Path, manifest: dict) -> None:
     """Generate a small owned-device C bridge; reject unfamiliar exported types."""
+    if len(manifest['bits']) != 2:
+        raise ValueError('EXL3 export requires two decoder tiers')
     if (manifest['blocks_per_sm'] not in (1, 2)
             or not 1 <= manifest['sms'] <= (2**31 - 1) // manifest['blocks_per_sm']):
         raise ValueError('invalid EXL3 cooperative grid capacity')
@@ -120,6 +122,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False, activation: str = "silu",
            compact_weights: bool = False) -> dict:
+    if len(bits) != 2 or len(set(bits)) != len(bits) or any(b not in range(2, 6) for b in bits):
+        raise ValueError("export requires two distinct K2..K5 decoder tiers")
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -177,17 +181,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     import torch
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
-        EXL3_AOT_MAX_SMS, compile_mixed_trellis, compile_mixed_trellis3, make_mixed_trellis_buffers,
+        EXL3_AOT_MAX_SMS, compile_mixed_trellis, make_mixed_trellis_buffers,
     )
-    from b12x.moe._shared.kernels.w4a16.mixed_trellis4 import compile_mixed_trellis4
     from b12x.moe.fused_moe._impl import (
         _projection_mixed_direct_topk_routes, _projection_mixed_tile_config,
     )
 
-    if len(bits) not in (2, 3, 4) or len(set(bits)) != len(bits) or any(b not in range(2, 6) for b in bits):
-        raise ValueError("export requires two to four distinct K2..K5 decoder tiers")
-    if blocks_per_sm is not None and len(bits) != 2:
-        raise ValueError("explicit residency is currently supported only for two-tier exports")
     # swiglu_limit None is b12x's unclamped SwiGLU (GLM); DeepSeek clamps at 10.
     if swiglu_limit is not None and not swiglu_limit > 0:
         raise ValueError("SwiGLU limit must be positive or None (no clamp)")
@@ -205,11 +204,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     workspace_sms = EXL3_AOT_MAX_SMS[(props.major, props.minor)]
     if props.multi_processor_count > workspace_sms:
         raise ValueError("EXL3 device exceeds the declared AOT workspace SM capacity")
-    direct = _projection_mixed_direct_topk_routes(capacity, topk, direct_exl3=len(bits) == 2)
+    direct = _projection_mixed_direct_topk_routes(capacity, topk, direct_exl3=True)
     if routing != "auto":
         direct = routing == "direct"
-    if direct and len(bits) != 2:
-        raise ValueError("three/four-tier export requires packed routing")
     block_m = 8 if direct else route_block
     route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
@@ -225,29 +222,22 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         route_ids_dtype=torch.int32)
     if activation != "silu":
         options["activation"] = activation
-    if len(bits) == 2:
-        rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
-        if fused_input_rotation and not direct:
-            rotation = {"fused_input_rotation": True}
-        if warp_specialized and not direct:
-            rotation = {"warp_specialized": True}
-            if wire_input:
-                rotation["input_format"] = "e4m3_k32"
-            if ws_input_stages is not None:
-                rotation["ws_input_stages"] = ws_input_stages
-            if ws_dynamic_tiles:
-                rotation["ws_dynamic_tiles"] = True
-        if compact_weights:
-            rotation["compact_weights"] = True
-        schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
-        launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
-                                      force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
-    elif len(bits) == 3:
-        launch = compile_mixed_trellis3(**options, tier2_num_experts=experts, tier2_bits=bits[2],
-            decode_schedule=decode_schedule)
-    else:
-        launch = compile_mixed_trellis4(**options, tier2_num_experts=experts, tier2_bits=bits[2],
-            tier3_num_experts=experts, tier3_bits=bits[3], decode_schedule=decode_schedule)
+    rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
+    if fused_input_rotation and not direct:
+        rotation = {"fused_input_rotation": True}
+    if warp_specialized and not direct:
+        rotation = {"warp_specialized": True}
+        if wire_input:
+            rotation["input_format"] = "e4m3_k32"
+        if ws_input_stages is not None:
+            rotation["ws_input_stages"] = ws_input_stages
+        if ws_dynamic_tiles:
+            rotation["ws_dynamic_tiles"] = True
+    if compact_weights:
+        rotation["compact_weights"] = True
+    schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
+    launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
+                                  force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
     output.mkdir(parents=True, exist_ok=True)
     objects = []
     for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", launch.topk_sum.compiled)]:

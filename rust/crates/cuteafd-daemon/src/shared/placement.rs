@@ -714,22 +714,25 @@ mod tests {
     }
 
     #[test]
-    fn v41_exl3_tp4_reconciles_checkpoint_layout() -> Result<()> {
+    fn v4_pro_exl3_tp4_tp6_reconcile_checkpoint_layout() -> Result<()> {
         let root = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_v41_exl3_snapshot(root.path(), 4);
+        cuteafd_loader::plan::testing::write_v4_pro_exl3_snapshot(root.path());
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        let working = SparkWorkingSet { spark_layers: vec![17, 39], spark_ranks: 4,
+        for world in [4, 6] {
+        let working = SparkWorkingSet { spark_layers: vec![1, 3], spark_ranks: world,
             prefill_lanes: 2, ..Default::default() };
-        let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
-            &working, 4, None, fixture_model())?;
+        let plan = SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
+            &working, world, None, fixture_model())?;
         for (rank, assignment) in plan.assignments.iter().enumerate() {
-            let expected = [17, 39].into_iter().map(|layer| -> Result<u64> {
+            let expected = [1, 3].into_iter().map(|layer| -> Result<u64> {
                 catalog.exl3().unwrap().balanced_residency(
-                    cuteafd_loader::V41Exl3Layer::Backbone(layer), 4, rank).and_then(|plan| Ok(plan.device_arena_layout()?.1 as u64))
+                    cuteafd_loader::V41Exl3Layer::Backbone(layer), world, rank).and_then(|plan| Ok(plan.device_arena_layout()?.1 as u64))
             }).collect::<Result<Vec<_>>>()?;
             assert_eq!(assignment.resident_bytes, expected.iter().sum::<u64>());
         }
-        check_reports(&plan)
+        check_reports(&plan)?;
+        }
+        Ok(())
     }
 
     #[test]

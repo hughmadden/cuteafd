@@ -31,7 +31,7 @@ def load_tool():
     return module
 
 
-@pytest.mark.parametrize("geometry", ["dsv4f", "dsv4p", "glm", "glmf", "qwen4"])
+@pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4"])
 def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
     tool = load_tool()
     intermediate = tool.GEOMETRIES[geometry][1]
@@ -54,7 +54,7 @@ def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
             assert max(ranks.values()) - min(ranks.values()) <= 128
 
 
-@pytest.mark.parametrize("geometry", ["dsv4f", "dsv4p", "glm", "glmf", "qwen4"])
+@pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4"])
 def test_all_counts_are_opt_in_and_legacy_build_profiles_remain(geometry):
     tool = load_tool()
     legacy = tool.build_profiles("spark", geometry)

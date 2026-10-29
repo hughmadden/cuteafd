@@ -332,49 +332,6 @@ release_bulk_ssh() {
   release_ssh "${release_bulk_ssh_opts[@]}" ${route[@]+"${route[@]}"} "$host" "$@"
 }
 
-# Inference images verify package payload hashes when built. Compare their
-# immutable manifests before changing services so all peers select one layout.
-release_exl3_package_identity() {
-  local revision="$1" manifest layout digest
-  manifest="$(cat)"
-  layout="$(jq -er --arg revision "$revision" '
-    if .schema == "cuteafd.exl3-package.v1" and .role == "spark"
-      and .sparkinfer_revision == $revision
-    then "disjoint"
-    else error("invalid Spark EXL3 package identity") end
-  ' <<<"$manifest")" || release_die "invalid Spark EXL3 package identity"
-  digest="$(printf '%s' "$manifest" | sha256sum | awk '{print $1}')"
-  printf '%s:%s\n' "$layout" "$digest"
-}
-
-# Compact Spark EXL3 package admission. Every physical rank r needs its
-# tp<degree>-rank<r>/m<capacity> package for every worker capacity up to the
-# launch capacity, with the exact shard width 2304/degree (1152 at TP2, 768 at
-# TP3). This runs in the per-host preflight loop, so a missing package fails
-# before any service change. TP2 is the default degree.
-release_validate_exl3_compact_variants() {
-  local capacity="$1" family="$2" tp="${3:-2}"
-  [[ "$tp" == 2 || "$tp" == 3 || "$tp" == 6 ]] || release_die "EXL3 variant admission supports TP2, TP3 or TP6, got TP$tp"
-  local width=$((2304 / tp))
-  [[ "$family" =~ ^k([23])([34])$ && ( "$family" == k23 || "$family" == k34 ) ]] || release_die "cannot resolve compact EXL3 package bit tiers"
-  local low="${BASH_REMATCH[1]}" high="${BASH_REMATCH[2]}"
-  jq -e --argjson capacity "$capacity" --argjson low "$low" --argjson high "$high" --argjson tp "$tp" --argjson width "$width" '
-    . as $manifest | .compute == [12,1] and
-    all([1,16,80,256,1024,4096][] | select(. <= $capacity); . as $m |
-      all(range(0; $tp); . as $rank |
-        [$manifest.variants[]? |
-          select(.directory == ("tp" + ($tp|tostring) + "-rank" + ($rank|tostring) + "/m" + ($m|tostring))) |
-          select(.capacity == $m and .intermediate == $width and .experts == 384
-                 and .top_k == 6 and .output_dtype == "bf16"
-                 and .bits == [$low,$high])] | length == 1))
-  ' >/dev/null || release_die "Spark EXL3 package lacks required TP$tp rank/capacity/shape/bit variants"
-}
-
-# Historical name: the TP2-degree call keeps working for older harnesses.
-release_validate_exl3_tp2_variants() {
-  release_validate_exl3_compact_variants "$1" "$2" 2
-}
-
 release_model_list_matches() {
   local model_id="$1"
   local full_model_id="${model_id}-full"
@@ -1586,13 +1543,6 @@ release_validate_spark_topology() {
 
   [[ "$SPARK_COUNT" =~ ^[1-6]$ ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..6"
-  if [[ "$EXPERT_FORMAT" == exl3 ]]; then
-    [[ "$SPARK_TP" == 3 && "$SPARK_EP" == 1 && "$SPARK_COUNT" == 3 ]] ||
-      release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native except compact EXL3 TP3EP1"
-    [[ "$SPARKINFER_EXL3" != disable ]] ||
-      release_die "compact EXL3 TP3EP1 requires SPARKINFER_EXL3=auto or force"
-    return 0
-  fi
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
   [[ "$SPARKINFER_EXL3" == disable ]] ||

@@ -394,35 +394,51 @@ mod tests {
     }
 
     #[test]
-    fn exl3_catalog_charges_one_prefill_owner_and_two_v41_decode_owners() -> anyhow::Result<()> {
+    fn native_v41_catalog_charges_one_prefill_owner_and_two_decode_owners() -> anyhow::Result<()> {
+        for nvfp4 in [false, true] {
+            let root = tempfile::tempdir()?;
+            if nvfp4 { crate::plan::testing::write_v41_nvfp4_snapshot(root.path()); }
+            else { crate::plan::testing::write_v41_snapshot(root.path()); }
+            let input = crate::plan::PlanInput::open(root.path())?;
+            let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
+                prefill_lanes: 2, ..Default::default() };
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
+                items: vec![], kv_tokens: 0 };
+            let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
+            for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (256, 3)] {
+                let executions = crate::plan::spark_executions::admit_family("deepseek_v41", &exports, None, unit, waves)?;
+                assert_eq!(executions.decode.len(), 2);
+                let bytes = owner_bytes(&input, &working, "deepseek_v41", 0)?;
+                let prefill = bytes(executions.owners().last().unwrap())?;
+                let decode = bytes(executions.owners().next().unwrap())?;
+                charge_executions(&mut device, &input, &working, "deepseek_v41", &executions)?;
+                let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
+                assert_eq!(find("execution owners"), prefill.scratch + prefill.io + 2 * (decode.scratch + decode.io));
+                assert_eq!(find("execution staging"), 2 * 64 * 6 * 8 + unit * waves * 6 * 8);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exl3_pro_catalog_charges_one_prefill_owner_and_one_decode_owner() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        crate::plan::testing::write_v41_exl3_snapshot(root.path(), 3);
+        crate::plan::testing::write_v4_pro_exl3_snapshot(root.path());
         let input = crate::plan::PlanInput::open(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
             prefill_lanes: 2, ..Default::default() };
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
             items: vec![], kv_tokens: 0 };
         let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
-        let decode = 2 * (51 * (1 << 20) + 64 * (5120 + 5120 / 32 + 6 * 8));
-        let charge = |device: &mut DeviceLayout, family: &str, unit: u64, waves: u64| -> anyhow::Result<(u64, u64)> {
-            let executions = crate::plan::spark_executions::admit_family(family, &exports, None, unit, waves)?;
-            charge_executions(device, &input, &working, "deepseek_v41", &executions)?;
-            let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
-            Ok((find("execution owners"), find("execution staging")))
-        };
-        // V4.1 on the shared ladder: two units of its live rows in flight.
-        for live in [256, 1024, 4096] {
-            let (owners, staging) = charge(&mut device, "deepseek_v41", live, 2)?;
-            let prefill = if live <= 80 { 51 * (1 << 20) } else { 810 * (1 << 20) - 4096 * (5120 + 5120 / 32 + 6 * 8) };
-            assert_eq!(owners, prefill + live * (5120 + 5120 / 32 + 6 * 8) + decode);
-            assert_eq!(staging, 2 * 64 * 6 * 8 + 2 * live * 6 * 8);
-        }
-        // A static ladder owner retains only the selected unit's device I/O;
-        // the calibrated scratch bound stays conservative at smaller exports.
+        let row = 7168 + 7168 / 32 + 6 * 8;
+        let decode = 51 * (1 << 20) + 64 * row;
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (256, 3)] {
-            let (owners, staging) = charge(&mut device, "deepseek_v4", unit, waves)?;
-            assert_eq!(owners, 810 * (1 << 20) - (4096 - unit) * (5120 + 5120 / 32 + 6 * 8) + decode / 2);
-            assert_eq!(staging, 64 * 6 * 8 + unit * waves * 6 * 8);
+            let executions = crate::plan::spark_executions::admit_family("deepseek_v4", &exports, None, unit, waves)?;
+            assert_eq!(executions.decode.len(), 1);
+            charge_executions(&mut device, &input, &working, "deepseek_v4", &executions)?;
+            let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
+            assert_eq!(find("execution owners"), 810 * (1 << 20) - (4096 - unit) * row + decode);
+            assert_eq!(find("execution staging"), 64 * 6 * 8 + unit * waves * 6 * 8);
         }
         Ok(())
     }

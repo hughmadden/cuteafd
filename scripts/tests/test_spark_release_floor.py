@@ -20,7 +20,6 @@ def test_release_floor_matches_previous_generic_counts_and_native_packages():
         if not key.endswith(':*'):
             expected[key] |= expected.get(key.split(':')[0] + ':*', set())
     assert {key: set(value) for key, value in floor.items() if not key.startswith('v41:')} == expected
-    native = scope.previous_release_packages()['expert']['exl3/exl3-k23']
-    assert set(floor['v41:exl3']) == {int(layout.split('-')[0][2:]) for layout in native}
+    assert 'v41:exl3' not in floor
     assert floor['v41:mxfp4'] == floor['dsv4f:*']
     assert floor['v41:nvfp4'] == floor['dsv4f:*']

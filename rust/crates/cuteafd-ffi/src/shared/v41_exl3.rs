@@ -54,7 +54,7 @@ impl V41Exl3Info {
                 && words[3] >= words[5]
                 && words[4] > 0
                 && (1..=16).contains(&words[5])
-                && matches!(words[6], 2..=4),
+                && words[6] == 2,
             "invalid EXL3 native geometry: {words:?}"
         );
         let tier_count = words[6] as usize;
@@ -88,7 +88,6 @@ impl V41Exl3Info {
             sum_scalars: words[10] as usize,
         })
     }
-
 }
 
 type Launch = unsafe extern "C" fn(*mut c_void, *const *mut c_void, *const i32, *mut c_void) -> i32;
@@ -281,25 +280,6 @@ mod info_tests {
     }
 
     #[test]
-    #[ignore = "requires a CUDA GPU, CUTEAFD_NATIVE_LIB and four-tier CUTEAFD_EXL3_AOT"]
-    fn native_four_tier_library_loads_through_rust_owner() -> Result<()> {
-        let native = unsafe { crate::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        native.cuda_set_device(0)?;
-        let path =
-            std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?).join("libcuteafd_exl3.so");
-        let first = unsafe { V41Exl3Kernel::load(&path)? };
-        let second = unsafe { V41Exl3Kernel::load(&path)? };
-        assert_eq!(first.info().tier_count, 4);
-        assert_eq!(first.info().bits, [2, 3, 4, 5]);
-        assert_eq!(first.info(), second.info());
-        drop(first);
-        drop(second);
-        let reloaded = unsafe { V41Exl3Kernel::load(&path)? };
-        assert_eq!(reloaded.info().tier_count, 4);
-        Ok(())
-    }
-
-    #[test]
     fn compact_native_info_requires_two_tiers_and_explicit_version() {
         let base = [3u32, 5120, 384, 384, 16, 6, 2, 44, 18, 7, 3, 3, 4, 0, 0, 2];
         assert_eq!(V41Exl3Info::from_words(base).unwrap().version, 3);
@@ -315,7 +295,7 @@ mod info_tests {
     }
 
     #[test]
-    fn native_info_accepts_two_through_four_distinct_tiers() {
+    fn native_info_requires_two_distinct_tiers() {
         for bits in [&[2, 5][..], &[2, 3, 5], &[2, 3, 4, 5]] {
             let mut words = [
                 2,
@@ -336,9 +316,14 @@ mod info_tests {
                 2,
             ];
             words[11..11 + bits.len()].copy_from_slice(bits);
-            let info = V41Exl3Info::from_words(words).unwrap();
-            assert_eq!(info.tier_count, bits.len());
-            assert_eq!(&info.bits[..bits.len()], bits);
+            let result = V41Exl3Info::from_words(words);
+            if bits.len() == 2 {
+                let info = result.unwrap();
+                assert_eq!(info.tier_count, bits.len());
+                assert_eq!(&info.bits[..bits.len()], bits);
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 
@@ -413,8 +398,9 @@ mod info_tests {
 
     #[test]
     fn native_info_rejects_invalid_tier_headers_before_slicing() {
-        let valid = [2, 5120, 512, 6, 16, 6, 4, 44, 18, 7, 3, 2, 3, 4, 5, 2];
-        for count in [0, 1, 5, u32::MAX] {
+        let valid = [2, 5120, 512, 6, 16, 6, 2, 32, 11, 6, 3, 2, 3, 0, 0, 2];
+        assert!(V41Exl3Info::from_words(valid).is_ok());
+        for count in [0, 1, 3, 4, 5, u32::MAX] {
             let mut words = valid;
             words[6] = count;
             assert!(V41Exl3Info::from_words(words).is_err());
@@ -425,7 +411,7 @@ mod info_tests {
             assert!(V41Exl3Info::from_words(words).is_err());
         }
         let mut nonzero_padding = valid;
-        nonzero_padding[6] = 3;
+        nonzero_padding[13] = 4;
         assert!(V41Exl3Info::from_words(nonzero_padding).is_err());
     }
 }

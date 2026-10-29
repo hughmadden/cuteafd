@@ -129,28 +129,6 @@ release_stop_wip_containers
             self.assertEqual(self.helper(*args).returncode, 2)
         self.assertEqual(self.helper('start-coordinator', '1', MEMORY_RESERVATION='33GiB').returncode, 2)
 
-    def test_package_variants_cover_every_worker_capacity_and_shape(self):
-        variants = [dict(directory=f'tp2-rank{rank}/m{capacity}', capacity=capacity,
-                         intermediate=1152, experts=384, top_k=6, output_dtype='bf16', bits=[2,3])
-                    for rank in range(2) for capacity in [1,16,80,256,1024,4096]]
-        base = dict(compute=[12,1], variants=variants)
-        def check(manifest, capacity=4096):
-            return subprocess.run(['bash', '-euc',
-                'source scripts/lib/release-common.sh; release_validate_exl3_tp2_variants "$1" k23',
-                'test', str(capacity)], cwd=ROOT, input=json.dumps(manifest), text=True, capture_output=True)
-        self.assertEqual(check(base).returncode, 0)
-        for field, value in [('intermediate', 576), ('experts', 383), ('top_k', 5),
-                             ('output_dtype', 'fp32'), ('bits', [3,2]), ('capacity', 2)]:
-            with self.subTest(field=field):
-                candidate = json.loads(json.dumps(base))
-                candidate['variants'][0][field] = value
-                self.assertEqual(check(candidate).returncode, 2)
-        self.assertEqual(check(dict(base, compute=[12,0])).returncode, 2)
-        self.assertEqual(check(dict(base, variants=variants[1:])).returncode, 2)
-        self.assertEqual(check(dict(base, variants=variants + variants[:1])).returncode, 2)
-        small = dict(base, variants=[v for v in variants if v['capacity'] <= 80])
-        self.assertEqual(check(small, 80).returncode, 0)
-        self.assertEqual(check(small).returncode, 2)
 
     # --- v10 three-rank profiles: implicit compact TP3, explicit native bypass --
 
@@ -179,9 +157,10 @@ release_stop_wip_containers
         self.assertEqual(result.returncode, 0, result.stderr)   # no 256 cap
         self.assertEqual(result.stdout, '4096')
         self.assertNotIn('caps PREFILL_BATCH_TOKENS', result.stderr)
-    def test_explicit_compact_tp3_exl3_is_admitted(self):
+    def test_explicit_flash_exl3_topology_is_refused(self):
         result = self.config('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires EXPERT_FORMAT=native', result.stderr)
 
     def test_malformed_partial_three_rank_topologies_are_rejected(self):
         for settings, message in [
@@ -211,42 +190,6 @@ release_stop_wip_containers
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn('unsupported native Spark topology', result.stderr)
 
-    def test_compact_tp3_package_variants_admission(self):
-        # 2304/3 = 768-column shards for every rank and worker capacity; a
-        # missing rank must fail admission even when ranks 0 and 1 are whole.
-        variants = [dict(directory=f'tp3-rank{rank}/m{capacity}', capacity=capacity,
-                         intermediate=768, experts=384, top_k=6, output_dtype='bf16', bits=[2, 3])
-                    for rank in range(3) for capacity in [1, 16, 80, 256, 1024, 4096]]
-        base = dict(compute=[12, 1], variants=variants)
-        def check(manifest, capacity=4096):
-            return subprocess.run(['bash', '-euc',
-                'source scripts/lib/release-common.sh; release_validate_exl3_compact_variants "$1" k23 3',
-                'test', str(capacity)], cwd=ROOT, input=json.dumps(manifest), text=True,
-                capture_output=True)
-        passed = check(base)
-        self.assertEqual(passed.returncode, 0, passed.stderr)
-        missing_rank2 = dict(base, variants=[v for v in variants
-                                             if not v['directory'].startswith('tp3-rank2')])
-        failed = check(missing_rank2)
-        self.assertEqual(failed.returncode, 2)
-        self.assertIn('lacks required TP3', failed.stderr)
-        for field, value in [('intermediate', 1152), ('intermediate', 576), ('bits', [3, 2])]:
-            with self.subTest(field=field, value=value):
-                candidate = json.loads(json.dumps(base))
-                candidate['variants'][0][field] = value
-                self.assertEqual(check(candidate).returncode, 2)
-        self.assertEqual(check(dict(base, compute=[12, 0])).returncode, 2)
-        # Whole-width variant admission includes TP6 but not padded TP4.
-        rejected = subprocess.run(['bash', '-euc',
-            'source scripts/lib/release-common.sh; release_validate_exl3_compact_variants 256 k23 4',
-            'test'], cwd=ROOT, input=json.dumps(base), text=True, capture_output=True)
-        self.assertEqual(rejected.returncode, 2)
-        self.assertIn('supports TP2, TP3 or TP6', rejected.stderr)
-        # A TP3 layout never passes the TP2 shim and vice versa.
-        shim = subprocess.run(['bash', '-euc',
-            'source scripts/lib/release-common.sh; release_validate_exl3_tp2_variants 256 k23',
-            'test'], cwd=ROOT, input=json.dumps(base), text=True, capture_output=True)
-        self.assertEqual(shim.returncode, 2)
 
     def test_daemon_remote_arguments_preserve_world(self):
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()

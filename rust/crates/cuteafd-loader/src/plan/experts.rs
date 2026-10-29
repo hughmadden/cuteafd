@@ -211,7 +211,10 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let key = package.split_whitespace().next().unwrap_or(package);
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
-    let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
+    let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
+        && bits.bytes().all(|bit| (b'2'..=b'5').contains(&bit))
+        && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
+        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
         || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
@@ -220,9 +223,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    // V4.1 EXL3 TP6 remains unqualified pending a capped-local fidelity gate.
     // Kimi K3's only Spark layout is TP6 width 512 (#273: TP4 needs 160 GiB/rank).
-    if (family == "v41" && exl3 && world == 6) || (family == "kimik3" && world != 6) {
+    if family == "kimik3" && world != 6 {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let block = if nvfp4 { 16 } else if mxfp4 { 32 } else { 128 };
@@ -425,10 +427,8 @@ mod tests {
         for package in ["mimo:fp8", "glm:nvfp4", "glmf:exl3-k34", "qwen4:nvfp4"] {
             assert!(spark_recipe(package, 2048, 6).is_ok());
         }
-        assert!(matches!(spark_recipe("v41:exl3-k23 (expertd-native)", 2304, 6),
-            Err(SparkRecipeRefusal::MissingPackage { .. })));
-        assert_eq!(spark_recipe("v41:exl3-k23 (expertd-native)", 2304, 3).unwrap().widths, [768; 3]);
-        assert_eq!(spark_worlds("v41:exl3-k23", 2304), [2, 3, 4]);
+        assert!(spark_worlds("v41:exl3-k23", 2304).is_empty());
+        assert!(spark_worlds("dsv4f:exl3-k23", 2048).is_empty());
         assert_eq!(spark_worlds("v41:mxfp4", 2304), [2, 3, 4, 6]);
         assert_eq!(spark_worlds("v41:nvfp4", 2304), [2, 3, 4, 6]);
         for package in ["qwen4:nvfp4", "qwen4:exl3-k45", "qwen4:fp8"] {
@@ -516,11 +516,7 @@ mod tests {
         let cases: &[(&str, usize, &[usize])] = &[
             ("v41:mxfp4", 2304, &[2, 3, 4, 6]),
             ("v41:nvfp4", 2304, &[2, 3, 4, 6]),
-            ("v41:exl3-k23", 2304, &[2, 3, 4]),
-            ("v41:exl3-k34", 2304, &[2, 3, 4]),
-            ("v41:exl3-k45", 2304, &[2, 3, 4]),
             ("dsv4f:mxfp4", 2048, &[2, 4]),
-            ("dsv4f:exl3-k23", 2048, &[2, 3, 4, 6]),
             ("dsv4p:mxfp4", 3072, &[2, 3, 4, 6]),
             ("dsv4p:exl3-k23", 3072, &[2, 3, 4, 6]),
             ("glm:fp8", 2048, &[2, 4, 6]),
@@ -592,7 +588,7 @@ mod tests {
         for intermediate in [640, 2048, 2304, 3072] {
             for package in ["mimo:fp8", "mimof:fp8", "mimop:fp8", "glm:nvfp4",
                 "glmf:nvfp4a4", "glm:exl3-k34", "glmf:exl3-k34", "v41:mxfp4",
-                "dsv4f:exl3-k23", "dsv4p:exl3-k23", "qwen4:exl3-k45", "qwen4:nvfp4"] {
+                "dsv4p:exl3-k23", "qwen4:exl3-k45", "qwen4:nvfp4"] {
                 let worlds = spark_worlds(package, intermediate);
                 assert!(!worlds.iter().any(|world| matches!(world, 7 | 8)));
                 if package != "glmf:nvfp4a4" { assert!(!worlds.contains(&5)); }
