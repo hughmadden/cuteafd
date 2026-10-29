@@ -309,6 +309,22 @@ impl<'a> Engine<'a> {
         on_logits: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
             -> crate::shared::prefill_packing::MemberOutcome)
         -> Result<Vec<Result<()>>> {
+        self.prefill_packed_heads::<false>(sequences, pool, &mut |i, _, logits| on_logits(i, logits))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefill_packed_all_rows(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        self.prefill_packed_heads::<true>(sequences, pool, on_logits)
+    }
+
+    fn prefill_packed_heads<const ALL_ROWS: bool>(&self,
+        sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
         self.require_live()?;
         ensure!(self.provisional.borrow().is_none(), "Kimi packed prefill cannot overwrite pending verify");
         let segments = crate::shared::prefill_packing::plan(&sequences.iter()
@@ -330,14 +346,22 @@ impl<'a> Engine<'a> {
             for (placement, tokens) in sequences.iter_mut() {
                 family.commit(placement, placement.len, tokens.len())?;
             }
-            crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
-                let row = segments[i].end_row() - 1;
-                let input = crate::shared::prefix::view(normalized, row * 7168 * 2, 7168 * 2)?;
-                let logits = io[0][1].project(input, 1, &local[0][1])?;
-                Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: 1,
-                    vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
-                    stream: local[0][1].stream().raw, greedy: None })
-            }, on_logits)
+            crate::shared::prefill_packing::finish_members(sequences.len(), |i| Ok(i), &mut |i, _| {
+                let segment = segments[i];
+                let first = if ALL_ROWS { 0 } else { segment.rows - 1 };
+                for offset in (first..segment.rows).step_by(64) {
+                    let count = if ALL_ROWS { (segment.rows - offset).min(64) } else { 1 };
+                    let input = crate::shared::prefix::view(normalized,
+                        (segment.first + offset) * 7168 * 2, count * 7168 * 2)?;
+                    let logits = io[0][1].project(input, count, &local[0][1])?;
+                    let row = crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: count,
+                        vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
+                        stream: local[0][1].stream().raw, greedy: None };
+                    // Consume every diagnostic tile before reusing shared head scratch.
+                    if let Err(error) = on_logits(i, offset, row)? { return Ok(Err(error)); }
+                }
+                Ok(Ok(()))
+            })
         })
     }
 
