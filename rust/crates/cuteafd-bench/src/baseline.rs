@@ -1,5 +1,6 @@
 //! The mandatory baseline: the basic card (C1 decode on code, prose and JSON
-//! with thinking off; C1/C4/C8/C16 code aggregate tok/s; 8K prefill rate and TTFT) and quick quality (logit
+//! with thinking off; C1 code and C4/C8/C16 aggregate tok/s with a distinct prompt per stream; 8K prefill rate
+//! and TTFT) and quick quality (logit
 //! fidelity against eight sealed published windows, prefix-cache restore exactness,
 //! lossless speculation, chat-template round trip, C1 vs C4 divergence).
 //! Budgeted to about three minutes so Release smoke fits five with the load.
@@ -66,13 +67,14 @@ fn concurrent_estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     }).sum()
 }
 
-fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64) -> ConcurrentRate {
+fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64, prompts: &str) -> ConcurrentRate {
     let mut per: Vec<_> = results.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let first = results.iter().map(common::Timed::first).fold(f64::INFINITY, f64::min);
     let last = results.iter().map(common::Timed::last).fold(0.0, f64::max);
     ConcurrentRate { width: results.len(), aggregate_tok_s: common::aggregate(&results),
         per_stream_median_tok_s: common::median(&mut per), decode_s: (last - first).max(0.0), warmup_s,
-        runs: results.into_iter().map(|r| ConcurrentTiming { sent_s: r.sent, timing: r.chat.timing }).collect() }
+        runs: results.into_iter().map(|r| ConcurrentTiming { sent_s: r.sent, timing: r.chat.timing }).collect(),
+        prompts: Some(prompts.into()) }
 }
 
 struct Run<'a> {
@@ -168,7 +170,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         }
         if *content == "code" {
             run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
-                run.baseline.card.warmup_s.unwrap_or_default()));
+                run.baseline.card.warmup_s.unwrap_or_default(), "code"));
         }
         run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
             runs: vec![chat.timing], acceptance: None });
@@ -178,19 +180,19 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let levels = concurrent_levels(info);
     anyhow::ensure!(!levels.is_empty(), "server admits no concurrent sequences");
     for (i, width) in levels.iter().copied().filter(|width| *width > 1).enumerate() {
-        run.step(0.28 + 0.035 * i as f64, &format!("C{width} code warm-up"));
+        run.step(0.28 + 0.035 * i as f64, &format!("C{width} warm-up"));
         let warmup = Instant::now();
-        speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
-            .with_context(|| format!("C{width} code warm-up"))?;
+        speed::distinct_batch(client, width, SWEEP_TOKENS, 1).into_iter().collect::<Result<Vec<_>>>()
+            .with_context(|| format!("C{width} warm-up"))?;
         let warmup_s = warmup.elapsed().as_secs_f64();
         client.check()?;
         let fabric_mark = client.fabric_mark();
-        let batch = speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
-            .with_context(|| format!("C{width} code decode"))?;
-        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/code/c{width}"), true) {
+        let batch = speed::distinct_batch(client, width, SWEEP_TOKENS, 0).into_iter().collect::<Result<Vec<_>>>()
+            .with_context(|| format!("C{width} decode"))?;
+        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/distinct/c{width}"), true) {
             run.baseline.fabric.push(phase);
         }
-        run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s));
+        run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s, speed::DISTINCT_PROMPTS));
         run.publish();
     }
     // 8K prefill: a cold prompt sized from the fit.
@@ -878,8 +880,9 @@ mod tests {
                 ..StreamTiming::default() }, ..Chat::default() } };
         let results = vec![timed(0.0, 1.0, 4.0, 321), timed(0.5, 1.5, 2.0, 161)];
         let expected = common::aggregate(&results);
-        let rate = concurrent_rate(results, 9.0);
+        let rate = concurrent_rate(results, 9.0, speed::DISTINCT_PROMPTS);
         assert_eq!(rate.width, 2);
+        assert_eq!((rate.prompts.as_deref(), rate.prompt_label()), (Some("distinct-v1"), "distinct prompts"));
         assert_eq!(rate.aggregate_tok_s, expected);
         // 320 + 160 emitted decode tokens over [1, 5], not a sum of stream rates.
         assert_eq!(rate.aggregate_tok_s, 120.0);

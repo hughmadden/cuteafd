@@ -568,7 +568,8 @@ pub struct BasicCard {
     pub thinking: Option<String>,
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
-    /// Code decode sweep, thinking off; aggregate over each batch's decode interval.
+    /// Decode sweep, thinking off; aggregate over each batch's decode interval.
+    /// Each point names its prompt set ([`ConcurrentRate::prompts`]).
     #[serde(default)]
     pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
@@ -719,6 +720,23 @@ pub struct ConcurrentRate {
     pub runs: Vec<ConcurrentTiming>,
     /// Wall seconds of the untimed batch at the same width.
     pub warmup_s: f64,
+    /// The prompts behind the point: `code` (the C1 code decode) or a versioned
+    /// distinct set (`distinct-v1`: each stream its own style and topic).
+    /// Absent on earlier reports, whose waves sent the code prompt to every
+    /// stream; those share experts and drafts and are not comparable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<String>,
+}
+
+impl ConcurrentRate {
+    /// How the point's streams were prompted, for captions and tables.
+    pub fn prompt_label(&self) -> &str {
+        match self.prompts.as_deref() {
+            None => "one code prompt",
+            Some("code") => "code",
+            Some(_) => "distinct prompts",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

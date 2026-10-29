@@ -604,9 +604,11 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
         out.push_str("</tr>\n");
     }
     out.push_str("</table>\n\n");
-    out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent code with thinking \
-        off, cold 8K prefill, logit fidelity against the family golden reference, prefix-cache restore exactness \
-        and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).\n");
+    out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking \
+        off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and \
+        drafts and reads higher), cold 8K prefill, logit fidelity against the family golden reference, prefix-cache \
+        restore exactness and lossless speculation. Older releases, other profiles and every report: \
+        [benchmarks](benchmarks/README.md).\n");
     out.push_str(&retired);
     Ok(out)
 }
