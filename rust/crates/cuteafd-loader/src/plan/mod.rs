@@ -313,6 +313,8 @@ impl PlanReport {
 pub struct PlanOptions {
     /// None preserves each family's qualified decode-view default.
     pub decode_lanes: Option<u8>,
+    /// Host RAM cap for mapped tables: every table (rows and scales) when all fit,
+    /// else the separate per-row scales when they fit; 0 keeps all mapped.
     pub mapped_scale_preload_bytes: u64,
     /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
     pub mapped_scale_host_budget_bytes: Option<u64>,
@@ -388,6 +390,7 @@ impl PlanOptions {
 pub fn mapped_scale_preload_bytes(gib: f64) -> Result<u64, PlanError> {
     if gib == 0.0 { Ok(0) } else { budget_bytes("--mapped-scale-preload-gib", gib) }
 }
+
 
 /// The shared routed-expert weight budget per Spark rank, for families
 /// without their own (`FamilyModel::spark_budget_bytes`).
@@ -850,6 +853,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     let mut names = BTreeSet::new();
     let mut scales = 0;
     let mut scale_bytes = 0;
+    let mut table_bytes = 0;
     for tensor in mapped {
         let meta = &tensor.meta;
         if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
@@ -861,13 +865,17 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             scales += 1;
         }
         if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
+        table_bytes += meta.byte_length;
     }
-    let host_budget = if scales == 0 { 0 } else {
+    // Rows join the scales only where the runtime preloads every table.
+    let table_bytes = if model.mapped_table_preload() { table_bytes } else { 0 };
+    let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
         options.mapped_scale_host_budget_bytes.unwrap_or_else(||
             crate::formats::mapped_preload::host_budget_bytes().unwrap_or(0))
     };
     report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
-        names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget);
+        names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget)
+        .admit_tables(table_bytes);
     if report.mapped_placement.preloaded_bytes > 0 {
         report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
     }

@@ -206,6 +206,18 @@ impl MappedRows {
         self.file.read_exact_at(buffer, self.file_offset + offset)
     }
 
+    /// Release the page cache of a payload range already copied elsewhere.
+    /// Advice only: a page still mapped somewhere stays, and a refusal leaves
+    /// ordinary reclaimable cache.
+    fn drop_cached(&self, offset: u64, length: usize) {
+        // SAFETY: fadvise only asks the kernel to drop clean cached pages of
+        // this live descriptor's range; no memory is accessed.
+        unsafe {
+            libc::posix_fadvise(self.file.as_raw_fd(), (self.file_offset + offset) as libc::off_t,
+                length as libc::off_t, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+
     fn row_offset(&self, row: u64) -> Result<usize> {
         if row >= self.rows {
             return Err(MappedTableError::RowRange { row, rows: self.rows });
@@ -289,6 +301,78 @@ impl Drop for MappedRows {
             libc::munmap(self.base.as_ptr().cast(), self.mapped_len);
         }
     }
+}
+
+/// A preloaded table's bytes in private anonymous memory. The kernel supplies
+/// zero pages on first touch, so a preload pays no zeroing pass before its
+/// reads overwrite every byte, and an allocation failure is an error rather
+/// than an abort.
+struct ResidentBytes {
+    base: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is owned and written only through `&mut self` before a
+// table publishes it; afterwards every access is a read.
+unsafe impl Send for ResidentBytes {}
+// SAFETY: as above; shared access only reads.
+unsafe impl Sync for ResidentBytes {}
+
+impl ResidentBytes {
+    fn new(len: usize) -> Result<Self> {
+        if len == 0 || len > isize::MAX as usize {
+            return Err(invalid("invalid table preload size"));
+        }
+        // SAFETY: a fresh private anonymous mapping; no existing memory is touched.
+        let raw = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(os_error("allocating table preload"));
+        }
+        let Some(base) = NonNull::new(raw.cast::<u8>()) else {
+            // SAFETY: raw/len come from the successful mmap above.
+            unsafe {
+                libc::munmap(raw, len);
+            }
+            return Err(invalid("table preload mapping returned a null address"));
+        };
+        Ok(Self { base, len })
+    }
+}
+
+impl std::ops::Deref for ResidentBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the live, zero-initialized mapping this value owns.
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for ResidentBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in deref; `&mut self` makes this the only access.
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for ResidentBytes {
+    fn drop(&mut self) {
+        // SAFETY: base/len describe the mapping this value owns.
+        unsafe {
+            libc::munmap(self.base.as_ptr().cast(), self.len);
+        }
+    }
+}
+
+/// One positioned payload read: `length` bytes at `offset` within a part,
+/// into `destination` (a preload) or a reader's scratch buffer (a warm).
+struct PayloadChunk<'a> {
+    part: usize,
+    offset: u64,
+    length: usize,
+    destination: Option<&'a mut [u8]>,
 }
 
 /// Where one part of a table lives: an absolute byte offset inside a shard.
@@ -409,7 +493,7 @@ thread_local! {
 /// A row space over one or more mapped parts, with its stats.
 pub struct MappedTable {
     parts: Vec<MappedRows>,
-    resident: Option<Vec<u8>>,
+    resident: Option<ResidentBytes>,
     /// First global row of each part, then the total.
     starts: Vec<u64>,
     /// Rows of every part but possibly the last (division lookup), else 0.
@@ -521,21 +605,25 @@ impl MappedTable {
         &self.stats
     }
 
-    /// Publish only after every read succeeds; a failure leaves all tables mapped.
-    pub fn preload_all(tables: &mut [&mut Self]) -> Result<()> {
+    /// Hold every table in host memory, all or none: read each payload once on
+    /// `readers` threads ([`Self::read_chunks`]) into the table's own anonymous
+    /// memory, releasing the page cache behind every chunk so the host never
+    /// holds the bytes twice, then publish all of them together. A failure
+    /// leaves every table mapped.
+    pub fn preload_all(tables: &mut [&mut Self], readers: usize) -> Result<()> {
+        Self::preload_chunked(tables, readers, PAYLOAD_CHUNK_BYTES)
+    }
+
+    fn preload_chunked(tables: &mut [&mut Self], readers: usize, chunk: usize) -> Result<()> {
+        let stop = AtomicBool::new(false);
         let buffers = tables.iter().map(|table| {
             let size = usize::try_from(table.bytes()).map_err(|_| invalid("preload size overflow"))?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(size).map_err(|error| invalid(format!("allocating scale preload: {error}")))?;
-            bytes.resize(size, 0);
-            let mut start = 0;
+            let mut bytes = ResidentBytes::new(size)?;
+            table.read_chunks(table.payload_chunks(chunk, Some(&mut bytes[..])), readers, &stop, &|_: u64| (),
+                true, "preload")?;
+            // Pages shared by two chunks' edges stay cached until every chunk is read.
             for part in &table.parts {
-                let size = usize::try_from(part.payload_bytes()).map_err(|_| invalid("preload part overflow"))?;
-                for (i, chunk) in bytes[start..start + size].chunks_mut(PAYLOAD_CHUNK_BYTES).enumerate() {
-                    part.read_payload((i * PAYLOAD_CHUNK_BYTES) as u64, chunk)
-                        .map_err(|source| MappedTableError::Io { context: "reading scale preload".into(), source })?;
-                }
-                start += size;
+                part.drop_cached(0, part.payload_bytes() as usize);
             }
             Ok(bytes)
         }).collect::<Result<Vec<_>>>()?;
@@ -552,73 +640,100 @@ impl MappedTable {
         if self.resident.is_some() { 0 } else { self.bytes() }
     }
 
-    /// Advisory page-cache warm: read every part's payload once with
-    /// [`PAYLOAD_CHUNK_BYTES`] positioned reads on `readers` scoped threads,
-    /// which take chunk indices from a shared counter and check `stop` between
-    /// chunks; `progress` receives each finished chunk's bytes on the reader
-    /// threads. The pages stay ordinary page cache the kernel may evict. The
-    /// mapping, its `MADV_RANDOM` advice and every gather path are untouched:
-    /// reads use each part's own descriptor (a FUSE reopen without keep-cache
-    /// would drop the inode's cached pages), whose `POSIX_FADV_RANDOM` keeps
-    /// each read to its own chunk. A resident table returns at once with zero
-    /// bytes.
+    /// Advisory page-cache warm: read every part's payload once in
+    /// [`PAYLOAD_CHUNK_BYTES`] reads on `readers` threads
+    /// ([`Self::read_chunks`]), checking `stop` between chunks; `progress`
+    /// receives each finished chunk's bytes on the reader threads. The pages
+    /// stay ordinary page cache the kernel may evict. The mapping, its
+    /// `MADV_RANDOM` advice and every gather path are untouched. A resident
+    /// table returns at once with zero bytes.
     pub fn warm(&self, readers: usize, stop: &AtomicBool, progress: impl Fn(u64) + Sync) -> Result<WarmReport> {
         let started = Instant::now();
         if self.resident.is_some() {
             return Ok(WarmReport::default());
         }
-        let chunk = PAYLOAD_CHUNK_BYTES as u64;
-        // The first chunk index of each part, then the total.
-        let mut starts = Vec::with_capacity(self.parts.len() + 1);
-        let mut total = 0u64;
-        for part in &self.parts {
-            starts.push(total);
-            total += part.payload_bytes().div_ceil(chunk);
+        let bytes = self.read_chunks(self.payload_chunks(PAYLOAD_CHUNK_BYTES, None), readers, stop, &progress,
+            false, "warm")?;
+        Ok(WarmReport { bytes, elapsed: started.elapsed() })
+    }
+
+    /// Every part's payload as `chunk`-byte reads, in order. With `buffer`
+    /// (the table's bytes, parts back to back), each read lands in its own
+    /// disjoint slice of it.
+    fn payload_chunks<'a>(&self, chunk: usize, buffer: Option<&'a mut [u8]>) -> Vec<PayloadChunk<'a>> {
+        let mut chunks = Vec::new();
+        let mut rest = buffer;
+        for (part, rows) in self.parts.iter().enumerate() {
+            // A mapped payload fits in usize: MappedRows::open bounds it by isize::MAX.
+            let size = rows.payload_bytes() as usize;
+            match rest.take().map(|bytes| bytes.split_at_mut(size)) {
+                Some((mine, tail)) => {
+                    rest = Some(tail);
+                    chunks.extend(mine.chunks_mut(chunk).enumerate().map(|(index, destination)| PayloadChunk {
+                        part, offset: (index * chunk) as u64, length: destination.len(), destination: Some(destination) }));
+                }
+                None => chunks.extend((0..size).step_by(chunk).map(|offset| PayloadChunk {
+                    part, offset: offset as u64, length: (size - offset).min(chunk), destination: None })),
+            }
         }
-        starts.push(total);
-        let buffer_bytes = self.parts.iter().map(MappedRows::payload_bytes).max().unwrap_or(0).min(chunk) as usize;
-        let next = AtomicU64::new(0);
+        chunks
+    }
+
+    /// Read `chunks` once on `readers` scoped threads named `table-{what}-N`,
+    /// each taking the next chunk from a shared queue and checking `stop`
+    /// between chunks. Reads use each part's own descriptor (a FUSE reopen
+    /// without keep-cache would drop the inode's cached pages), whose
+    /// `POSIX_FADV_RANDOM` keeps every read to its own chunk. `progress`
+    /// receives each finished chunk's bytes on its reader thread; with
+    /// `drop_cached` the chunk's page cache is released once copied. Returns
+    /// the bytes read, fewer than the chunks hold after a stop.
+    fn read_chunks(&self, chunks: Vec<PayloadChunk<'_>>, readers: usize, stop: &AtomicBool,
+        progress: &(impl Fn(u64) + Sync), drop_cached: bool, what: &'static str) -> Result<u64> {
+        let scratch = chunks.iter().filter(|chunk| chunk.destination.is_none()).map(|chunk| chunk.length).max()
+            .unwrap_or(0);
+        let readers = readers.max(1).min(chunks.len());
+        let queue = Mutex::new(chunks.into_iter());
         let failed = AtomicBool::new(false);
         let read = || -> Result<u64> {
-            let mut buffer = vec![0; buffer_bytes];
+            let mut buffer = vec![0; scratch];
             let mut bytes = 0;
             while !stop.load(Ordering::Acquire) && !failed.load(Ordering::Relaxed) {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= total {
-                    break;
-                }
-                let part = starts.partition_point(|&start| start <= index) - 1;
-                let offset = (index - starts[part]) * chunk;
-                let length = (self.parts[part].payload_bytes() - offset).min(chunk) as usize;
-                if let Err(source) = self.parts[part].read_payload(offset, &mut buffer[..length]) {
+                let Some(chunk) = queue.lock().unwrap_or_else(|p| p.into_inner()).next() else { break };
+                let part = &self.parts[chunk.part];
+                let target = match chunk.destination {
+                    Some(destination) => destination,
+                    None => &mut buffer[..chunk.length],
+                };
+                if let Err(source) = part.read_payload(chunk.offset, target) {
                     failed.store(true, Ordering::Relaxed);
-                    return Err(MappedTableError::Io { context: "warming mapped table".into(), source });
+                    return Err(MappedTableError::Io { context: format!("mapped table {what} read"), source });
                 }
-                bytes += length as u64;
-                progress(length as u64);
+                if drop_cached {
+                    part.drop_cached(chunk.offset, chunk.length);
+                }
+                bytes += chunk.length as u64;
+                progress(chunk.length as u64);
             }
             Ok(bytes)
         };
-        let readers = readers.max(1).min(usize::try_from(total).unwrap_or(usize::MAX));
         let results = thread::scope(|scope| {
             let mut results = Vec::with_capacity(readers);
             let mut handles = Vec::with_capacity(readers);
             for index in 0..readers {
-                match thread::Builder::new().name(format!("table-warm-{index}")).spawn_scoped(scope, &read) {
+                match thread::Builder::new().name(format!("table-{what}-{index}")).spawn_scoped(scope, &read) {
                     Ok(handle) => handles.push(handle),
                     Err(source) => {
                         failed.store(true, Ordering::Relaxed);
-                        results.push(Err(MappedTableError::Io { context: "starting mapped table warm reader".into(), source }));
+                        results.push(Err(MappedTableError::Io { context: format!("starting mapped table {what} reader"), source }));
                         break;
                     }
                 }
             }
             results.extend(handles.into_iter().map(|handle| handle.join()
-                .unwrap_or(Err(MappedTableError::Stopped("mapped table warm reader panicked")))));
+                .unwrap_or(Err(MappedTableError::Stopped("mapped table reader panicked")))));
             results
         });
-        let bytes = results.into_iter().sum::<Result<u64>>()?;
-        Ok(WarmReport { bytes, elapsed: started.elapsed() })
+        results.into_iter().sum::<Result<u64>>()
     }
 
     fn locate(&self, row: u64) -> Result<(usize, u64)> {

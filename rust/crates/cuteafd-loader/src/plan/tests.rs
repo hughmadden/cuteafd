@@ -4492,6 +4492,33 @@ fn ple_plan_counts_row_spaces_not_shards_or_global_scale() {
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.mapped_placement.label(), "PLE 2 mapped");
     assert_eq!(report.mapped_placement.scale_bytes, 0);
+    // Qwen's runtime keeps its rows mapped: even a cap that holds them preloads nothing.
+    let report = plan(dir.path(), &PlanOptions { mapped_scale_preload_bytes: 1 << 40,
+        mapped_scale_host_budget_bytes: Some(1 << 40), ..Default::default() }).unwrap();
+    assert_eq!(report.mapped_placement.label(), "PLE 2 mapped");
+    assert_eq!(report.mapped_placement.table_bytes, 0);
+}
+
+#[test]
+fn mapped_table_plan_preloads_every_v41_table_when_the_cap_holds_them() {
+    let dir = snapshot(v41_config(), &[
+        t("layers.1.engram.embed.weight", "F8_E4M3", &[16, 64]),
+        t("layers.1.engram.embed.scale", "F8_E8M0", &[16, 2]),
+        t("layers.14.engram.embed.weight", "F8_E4M3", &[16, 64]),
+        t("layers.14.engram.embed.scale", "F8_E8M0", &[16, 2]),
+    ]);
+    let (scales, tables) = (2 * 16 * 2, 2 * 16 * 64 + 2 * 16 * 2);
+    // (cap, host budget) -> preloaded tables and bytes: all four, the two scale tables, or none.
+    for (cap, host, preloaded, bytes) in [(tables, tables, 4, tables), (tables - 1, tables, 2, scales),
+        (tables, tables - 1, 2, scales), (0, tables, 0, 0)] {
+        let report = plan(dir.path(), &PlanOptions { mapped_scale_preload_bytes: cap,
+            mapped_scale_host_budget_bytes: Some(host), ..Default::default() }).unwrap();
+        let p = &report.mapped_placement;
+        assert_eq!((p.mapped, p.preloaded, p.preloaded_bytes, p.table_bytes), (4 - preloaded, preloaded, bytes, tables));
+        assert_eq!(p.tables_preloaded(), preloaded == 4);
+        assert_eq!(report.bytes_by_owner.get("host-preloaded").copied().unwrap_or(0), bytes);
+        assert!(render(&report).contains(&p.label()));
+    }
 }
 
 #[test]

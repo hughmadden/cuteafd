@@ -197,7 +197,9 @@ pub(crate) struct PlanArgs {
     /// prefill lane's MX8 records, as `serve-glm --exlr8-prefill-activations a8` admits them.
     #[arg(long, value_parser = exlr8_prefill_activations_parser())]
     pub(crate) exlr8_prefill_activations: Option<cuteafd_loader::plan::exlr8::PrefillActivations>,
-    /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
+    /// Host RAM cap for preloading mapped tables: every table (rows and scales)
+    /// when all fit and the runtime preloads rows (V4.1 Engram), else all separate
+    /// per-row scales when they fit; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=8))]
@@ -1104,7 +1106,9 @@ pub(crate) struct NativeServeArgs {
     /// V4.1 has a fixed pair of decode views; 1 is unsupported.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
-    /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
+    /// Host RAM cap for preloading mapped tables: every table (rows and scales)
+    /// when all fit and the runtime preloads rows (V4.1 Engram), else all separate
+    /// per-row scales when they fit; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
     /// After readiness, read both Engram tables once into the page cache on a

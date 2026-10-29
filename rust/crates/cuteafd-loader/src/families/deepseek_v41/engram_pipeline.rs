@@ -135,30 +135,43 @@ impl EngramPipeline {
         catalog: &OfficialV41Catalog,
         token_map: EngramTokenMap,
         shape: crate::EngramStagingShape,
-        scale_preload_cap: u64,
+        preload_cap: u64,
     ) -> Result<Self> {
         let capacity = shape.rows();
         // SAFETY: forwarded from this constructor's immutable checkpoint contract.
         let mut tables = unsafe { [catalog.map_engram(ENGRAM_LAYERS[0] as usize)?,
             catalog.map_engram(ENGRAM_LAYERS[1] as usize)?] };
-        use crate::formats::mapped_preload::{host_budget_bytes, MappedPlacement};
+        use crate::formats::mapped_preload::{host_budget_bytes, MappedPlacement, PRELOAD_READERS};
         let host_budget = host_budget_bytes().unwrap_or_else(|error| {
-            tracing::warn!(%error, "cannot admit mapped scale preload; keeping all scales mapped");
+            tracing::warn!(%error, "cannot admit mapped table preload; keeping all tables mapped");
             0
         });
-        let bytes = tables.iter().map(|table| table.scales().bytes()).sum();
-        let mut placement = MappedPlacement::resolve(4, 2, bytes, scale_preload_cap, host_budget);
+        let scale_bytes = tables.iter().map(|table| table.scales().bytes()).sum();
+        let table_bytes = tables.iter().map(|table| table.weights().bytes()).sum::<u64>() + scale_bytes;
+        let mut placement = MappedPlacement::resolve(4, 2, scale_bytes, preload_cap, host_budget)
+            .admit_tables(table_bytes);
         let started = std::time::Instant::now();
         if placement.preloaded > 0 {
             let [first, second] = &mut tables;
-            if let Err(error) = crate::MappedTable::preload_all(&mut [first.scales_mut(), second.scales_mut()]) {
+            let [first_weights, first_scales] = first.tables_mut();
+            let [second_weights, second_scales] = second.tables_mut();
+            // Scales first: every row read needs one, at a fraction of the weight bytes.
+            let mut targets = vec![first_scales, second_scales];
+            if placement.tables_preloaded() {
+                tracing::info!(table_bytes, readers = PRELOAD_READERS, "mapped table preload started");
+                targets.extend([first_weights, second_weights]);
+            }
+            if let Err(error) = crate::MappedTable::preload_all(&mut targets, PRELOAD_READERS) {
                 placement.fallback(&error);
             }
         }
-        tracing::info!(placement = %placement.label(), scale_bytes = bytes,
-            preloaded_bytes = placement.preloaded_bytes, cap_bytes = scale_preload_cap,
+        let elapsed = started.elapsed();
+        tracing::info!(placement = %placement.label(), scale_bytes, table_bytes,
+            preloaded_bytes = placement.preloaded_bytes, cap_bytes = preload_cap,
             host_budget_bytes = host_budget, reason = %placement.reason,
-            elapsed_ms = started.elapsed().as_millis(), "mapped scale preload admission");
+            elapsed_ms = elapsed.as_millis(),
+            gb_per_s = placement.preloaded_bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9,
+            "mapped scale preload admission");
         let tables = tables.map(Arc::new);
         Ok(Self {
             identity: Arc::new(()),
@@ -180,8 +193,8 @@ impl EngramPipeline {
     /// ([`TableWarm::start`](crate::formats::mapped_warm::TableWarm::start)):
     /// once `ready` holds and available host memory admits them, `readers`
     /// threads read the scale tables (every row read needs one, at a fraction
-    /// of the weight bytes), then the weights. Resident (preloaded) scales are
-    /// skipped. Dropping the pipeline stops it between chunks.
+    /// of the weight bytes), then the weights. Preloaded tables are skipped.
+    /// Dropping the pipeline stops it between chunks.
     pub fn start_warm(&mut self, readers: usize, ready: impl Fn() -> bool + Send + 'static) -> Result<()> {
         ensure!(self.warm.is_none(), "engram warm already started");
         self.warm = Some(crate::formats::mapped_warm::TableWarm::start("engram", self.tables.clone(),

@@ -61,6 +61,10 @@ pub trait FamilyModel: Send + Sync {
     /// Placement accounts for executable runtime owners, not only checkpoint inventory.
     fn native_serving_admission(&self) -> bool { false }
 
+    /// The runtime holds every mapped table in host memory when
+    /// `--mapped-table-preload-gib` admits them; the plan admits it only then.
+    fn mapped_table_preload(&self) -> bool { false }
+
     /// Resolve automatic vision to the mode this executor can actually admit.
     fn vision_mode(&self, mode: super::MediaMode) -> super::MediaMode { mode }
 

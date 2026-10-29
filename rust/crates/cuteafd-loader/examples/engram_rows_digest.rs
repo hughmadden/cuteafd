@@ -1,6 +1,7 @@
 //! Digest of engram rows gathered through the serving pipeline (prefetch,
 //! gather worker, staging) for a fixed pseudo-random token stream: compare
-//! two builds for byte-identical gathers. Usage: SNAPSHOT [WAVES] [SCALE_PRELOAD_GIB].
+//! two builds, or mapped against preloaded tables, for byte-identical gathers.
+//! Usage: SNAPSHOT [WAVES] [PRELOAD_GIB] (8 holds the scales; 190 every table).
 use anyhow::{Context, Result};
 use cuteafd_loader::{read_official_v41_catalog, EngramGatherPoll, EngramPipeline, EngramRequestTokens, EngramTokenMap};
 use sha2::{Digest, Sha256};

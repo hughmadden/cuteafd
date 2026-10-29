@@ -273,8 +273,9 @@ const ENGRAM_WARM_READERS: usize = 8;
 
 /// The Engram pipeline both V4.1 layouts serve: host staging for `slots`
 /// prefill units of `rows` and the decode lanes (admitted against host
-/// memory), the admitted scale preload and, with `--engram-warm`, a
-/// background page-cache warm that starts once the API reports ready.
+/// memory), the admitted scale or whole-table preload and, with
+/// `--engram-warm`, a background page-cache warm that starts once the API
+/// reports ready (and skips preloaded tables).
 fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs, rows: usize, slots: usize) -> Result<cuteafd_loader::EngramPipeline> {
     let map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
