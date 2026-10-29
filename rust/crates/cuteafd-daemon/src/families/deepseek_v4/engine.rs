@@ -31,10 +31,14 @@ mod context;
 mod dspark;
 mod tp2;
 mod prefill;
+mod packing;
+#[cfg(test)]
+mod packed_check;
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
 
+#[derive(Clone)]
 pub(crate) struct Dev<'a> {
     pub(crate) buffer: cuteafd_ffi::CuteafdDeviceBuffer,
     _owner: std::rc::Rc<DeviceAllocation<'a>>,
@@ -83,6 +87,7 @@ pub(crate) struct Engine<'a> {
     rope_compressed: Dev<'a>,
     /// Prefill and decode workspaces, reused across steps.
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
+    packed_row_cap: Cell<Option<usize>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     pub profile: RefCell<Profile>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
@@ -313,7 +318,7 @@ struct UnitSlot<'a> {
     payload: Option<Dev<'a>>,
     tables: StepBuffers<'a>,
     /// dSpark target taps of the lane's last TAP_ROWS rows, BF16
-    /// [TAP_ROWS, taps * dim] (empty without a drafter).
+    /// [admitted tap rows, taps * dim] (empty without a drafter).
     taps: Dev<'a>,
 }
 
@@ -355,6 +360,7 @@ struct Workspace<'a> {
 }
 
 /// Device copies of one step's tables.
+#[derive(Clone)]
 struct StepBuffers<'a> {
     /// Rows these buffers hold; tables are copied in per step.
     rows: usize,
@@ -588,6 +594,7 @@ impl<'a> Engine<'a> {
             attention_reduction,
             shape: parts.shape,
             prefill_workspace: RefCell::new(None),
+            packed_row_cap: Cell::new(None),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
             graphs: RefCell::new(std::collections::HashMap::new()),
@@ -699,7 +706,8 @@ impl<'a> Engine<'a> {
                 tokens: self.alloc(t * 4)?,
                 shared: shared.rows(index, t * h * 2),
                 tables: self.step_buffers(t, if shared_page_list { 1 } else { t })?,
-                taps: self.alloc(draft_bytes(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
+                taps: self.alloc(draft_bytes(cuteafd_loader::serving_capacity::deepseek_v4_tap_rows(t, shared_page_list)
+                    * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
             };
             self.reserve_slot_uploads(&slot, lead)?;
             Ok(slot)
@@ -1898,7 +1906,7 @@ impl<'a> Engine<'a> {
     /// builds (row positions start at `first`) and posts the request once they
     /// complete. This thread does not wait for the GPU.
     fn wave_send(&self, layer: usize, t: usize, w: &Workspace<'_>, first: u64,
-        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        members: Vec<(usize, usize, usize, usize)>, transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
         let timer = Instant::now();
@@ -1909,6 +1917,12 @@ impl<'a> Engine<'a> {
                 Box::new(move |routes, wire| {
                     let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
                     for row in &mut request.rows { row.token_position += first; }
+                    for &(first_row, rows, start, state) in &members {
+                        for (offset, row) in request.rows[first_row..first_row + rows].iter_mut().enumerate() {
+                            row.source_request_id = state as u64 + 1;
+                            row.token_position = (start + offset) as u64;
+                        }
+                    }
                     Ok(request)
                 }))?
         };

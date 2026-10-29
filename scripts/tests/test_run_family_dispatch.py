@@ -1969,11 +1969,12 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
                "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
-@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5"])
+@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5", "deepseek_v4"])
 @pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
 def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     config = {"glm5_flash": GLMF_CONFIG, "mimo_v2": {
         "model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "deepseek_v4": {"model_type": "deepseek_v4"},
         "step5": {"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
             "moe_layer_list": list(range(3, 91))}}}[family]
     keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n" + (f"PREFILL_PACKING={mode}\n" if mode else "")
@@ -1983,7 +1984,7 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     result = _family_launch_result(tmp_path, config, "test/packed", keys,
         encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else None)
     assert result.returncode == 0, result.stderr
-    command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5"}[family]
+    command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5", "deepseek_v4": "serve-dsv4"}[family]
     launch = next(shlex.split(line) for line in result.stderr.splitlines() if f"cuteafd {command}" in line)
     if mode is None:
         assert "--prefill-packing" not in launch

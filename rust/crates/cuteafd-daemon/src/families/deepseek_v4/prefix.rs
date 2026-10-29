@@ -527,6 +527,38 @@ fn mark(family: &Dsv4Prefix<'_, '_>, slot: u32, len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Diagnostic-only: compare whole initialized rings/pages and compressor carry,
+/// including dSpark state, at identical physical placements in both arms.
+pub(super) fn packed_state(engine: &Engine<'_>, placement: &Placement, clear: bool) -> Result<Vec<u8>> {
+    engine.drain_state()?;
+    let family = Dsv4Prefix::new(engine, |_| 0)?;
+    let mut ranges = Vec::new();
+    for &unit in &placement.units {
+        ranges.extend(family.unit_ranges(unit)?.into_iter().map(|(rank, buffer, _)| (rank, buffer)));
+    }
+    for layer in &family.layers {
+        let bytes = engine.shape.ring_pages * MAIN_PAGE_BYTES;
+        ranges.push((layer.rank, view(layer.main, placement.state * bytes, bytes)?));
+        for &(state, stride) in &layer.states {
+            ranges.push((layer.rank, view(state, placement.state * stride, stride)?));
+        }
+    }
+    let mut out = Vec::new();
+    for (rank, buffer) in ranges {
+        engine.on(rank, || {
+            if clear { engine.library.cuda_zero_bytes(buffer, buffer.bytes)?; }
+            else {
+                let first = out.len();
+                out.resize(first + buffer.bytes, 0);
+                engine.library.copy_d2h(&mut out[first..], buffer)?;
+            }
+            Ok(())
+        })?;
+    }
+    engine.drain_state()?;
+    Ok(out)
+}
+
 /// One `--resume-at` case.
 pub(crate) struct ResumeCase {
     pub at: usize,

@@ -2,6 +2,7 @@
 pub(crate) mod engine;
 pub(crate) mod admission;
 mod draft_binding;
+mod packed_check;
 #[cfg(test)]
 mod placement_tests;
 pub(crate) mod local;
@@ -121,6 +122,11 @@ pub(crate) struct GoldenArgs {
     /// Published shared fidelity directory, or tokens.bin/layerNN.bin/logits.bin from golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Compare actual multi-member serving units with singleton logits and all KV/state bytes.
+    #[arg(long, conflicts_with_all = ["nll", "prefill", "draft", "verify_rows", "token_check", "resume_at"])]
+    pub packed_check: Option<usize>,
+    #[arg(long, value_enum)]
+    pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
     /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
     #[arg(long)]
     pub nll: bool,
@@ -199,6 +205,18 @@ mod prefill_shape_tests {
     struct Cli {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    #[test]
+    fn packed_check_cli_uses_explicit_arithmetic_mode_and_rejects_other_diagnostics() {
+        #[derive(Parser)]
+        struct Golden { #[command(flatten)] args: GoldenArgs }
+        let base = ["v4", "--snapshot", "/missing", "--native-lib", "/missing.so", "--golden", "/golden",
+            "--packed-check", "3", "--prefill-packing", "exact"];
+        let args = Golden::try_parse_from(base).unwrap().args;
+        assert_eq!(args.packed_check, Some(3));
+        assert_eq!(args.prefill_packing, Some(crate::shared::prefill_packing::PackingMode::Exact));
+        assert!(Golden::try_parse_from(base.into_iter().chain(["--nll"])).is_err());
     }
 
     #[test]
@@ -723,7 +741,8 @@ fn golden(args: GoldenArgs) -> Result<()> {
     if shared {
         ensure!(args.nll && args.save_logits.is_some(), "shared V4 fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.draft && args.verify_rows.is_none()
-            && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none(),
+            && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none()
+            && args.packed_check.is_none(),
             "shared V4 fidelity cannot be combined with legacy golden diagnostics");
         let output = args.save_logits.as_deref().unwrap();
         ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
@@ -739,7 +758,14 @@ fn golden(args: GoldenArgs) -> Result<()> {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
             started.elapsed().as_secs_f64(), before.0, before.1);
-        let result = if let Some(windows) = &windows {
+        let mode = crate::shared::prefill_packing::PackingMode::resolve(args.prefill_packing, args.packed_check.is_some());
+        engine.configure_packing(mode, transports)?;
+        let result = if let Some(members) = args.packed_check {
+            let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+            ensure!(bytes.len() % 4 == 0, "golden tokens contain a partial token");
+            let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            packed_check::run(engine, transports, runtime, &tokens, members, mode)
+        } else if let Some(windows) = &windows {
             score_fidelity(&args, engine, transports, runtime, windows)
         } else { match args.token_check {
             Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),

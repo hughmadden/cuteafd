@@ -6,6 +6,14 @@ use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Maximum queued prompts sharing a V4 prefill unit and its private tap tails.
+pub const V4_PACKED_MEMBERS: usize = 16;
+
+/// Decode retains one window; packed prefill admits one window per member.
+pub fn deepseek_v4_tap_rows(rows: usize, prefill: bool) -> usize {
+    rows.min(128 * if prefill { V4_PACKED_MEMBERS } else { 1 })
+}
+
 /// Exact workspaces and graphs sit beside a fixed free-memory floor.
 /// Larger caller-requested reserves retain their total-envelope semantics.
 pub fn deepseek_v4_headroom_bytes(total_bytes: u64, reserve_bytes: u64, workspace_bytes: u64,
@@ -190,12 +198,12 @@ pub fn deepseek_v4_workspace_geometry(
         .ok_or(CacheGeometryError::Overflow("V4 C128 table extent"))?;
     (0..ranks)
         .map(|rank| {
-            let prefill = step(cfg, prefill_rows, waves, width, rank, ranks, scratch)?;
+            let prefill = step(cfg, prefill_rows, waves, width, rank, ranks, scratch, true)?;
             let decode = step(cfg, decode_rows, 1, width, rank, ranks, V4WorkspaceScratch {
                 shared_bytes: scratch.decode_shared_bytes,
                 index_topk_bytes: scratch.decode_index_topk_bytes,
                 ..scratch
-            })?;
+            }, false)?;
             Ok(V4WorkspaceRank {
                 prefill_waves: waves,
                 fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
@@ -219,6 +227,7 @@ fn step(
     rank: usize,
     ranks: usize,
     scratch: V4WorkspaceScratch,
+    prefill: bool,
 ) -> Result<(u64, u64, u64), CacheGeometryError> {
     let mul = |values: &[u64]| product("V4 workspace allocation", values);
     let h = cfg.dim as u64;
@@ -238,7 +247,7 @@ fn step(
         mul(&[rows, 4])?,
         mul(&[rows, h, 2])?,
         draft(mul(&[
-            rows.min(128),
+            deepseek_v4_tap_rows(rows as usize, prefill) as u64,
             cfg.dspark_target_layer_ids.len() as u64,
             h,
             2,
@@ -428,8 +437,8 @@ mod tests {
             // Runtime workspace_here allocates taps per lane plus six shared
             // draft buffers per step, each with the same 256-byte floor.
             let h = cfg.dim as u64;
-            let removed: u64 = [(4096u64, 2u64), (64, 1)].into_iter().map(|(rows, lanes)| {
-                let taps = rows.min(128) * cfg.dspark_target_layer_ids.len() as u64 * h * 2;
+            let removed: u64 = [(4096u64, 2u64, true), (64, 1, false)].into_iter().map(|(rows, lanes, prefill)| {
+                let taps = deepseek_v4_tap_rows(rows as usize, prefill) as u64 * cfg.dspark_target_layer_ids.len() as u64 * h * 2;
                 let shared = [rows.min(128) * h * 2, rows.min(128) * h * 4,
                     rows * 4, rows * 4, rows * 256 * 8, rows * 4];
                 lanes * (taps.max(256) - 256)
