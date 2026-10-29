@@ -656,3 +656,163 @@ def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
         params = dict(width=width, outputs=outputs)
         assert calls[f"latent_{direction}"] == ("bf16_projection", params,
             ("pointwise", "compile_bf16_projection_aot", (), params))
+
+
+def _route_property(relative, owner):
+    """Exercise exported arithmetic metadata without importing CUDA/CuTe."""
+    source = ROOT / "third_party/sparkinfer/b12x" / relative
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == owner)
+    prop = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "exact_row_cap")
+    prop.decorator_list = []
+    module = ast.Module(body=[prop], type_ignores=[])
+    scope = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    scope[target.id] = node.value.value
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
+    return scope["exact_row_cap"]
+
+
+def test_coordinator_first_route_metadata_is_derived_from_projection_dispatch():
+    bf16 = _route_property("gemm/bf16_gemv/_skinny.py", "RoutedBf16Projection")
+    assert bf16(types.SimpleNamespace(max_skinny_rows=64)) == 64
+    assert bf16(types.SimpleNamespace(max_skinny_rows=160)) == 160
+    assert bf16(types.SimpleNamespace(max_skinny_rows=0)) == 2**31 - 1
+    fp8 = _route_property("integration/cuteafd/_fp8_weights.py", "Fp8Projection")
+    assert fp8(types.SimpleNamespace(prefill=True)) == 2**31 - 1
+    assert fp8(types.SimpleNamespace(prefill=False)) == 0  # runtime fp8_rows is unbounded metadata
+    switch = _route_property("integration/cuteafd/glmf.py", "_Fp8Switch")
+    assert switch(types.SimpleNamespace(prefill=object(), bf16=types.SimpleNamespace(exact_row_cap=64),
+                                        activation_quant_row_threshold=8)) == 8
+    assert switch(types.SimpleNamespace(prefill=None, bf16=types.SimpleNamespace(exact_row_cap=64), fp8=None)) == 64
+    assert switch(types.SimpleNamespace(prefill=None, bf16=types.SimpleNamespace(exact_row_cap=64), fp8=object())) == 0
+
+
+def test_native_trellis_first_arithmetic_routes():
+    cap = _route_property("gemm/trellis_linear/_native.py", "NativeTrellisLinear")
+    for bits, e4m3, splits, bf16, expected in [
+        (4, True, 2, False, 16), (4, True, 6, False, 8),
+        (4, True, 6, True, 64), (6, False, 6, True, 129),
+        (6, True, 6, True, 64),
+    ]:
+        assert cap(types.SimpleNamespace(bits=bits, e4m3=e4m3, splits=splits,
+                                         input_bf16=bf16)) == expected
+
+
+@pytest.mark.parametrize("filename,functions", [
+    ("trellis_linear.py", {"compile_trellis_linear_aot"}),
+    ("scaled_linear.py", {"compile_scaled_linear_aot"}),
+    ("trellis_transform.py", {"compile_trellis_input_aot", "compile_trellis_output_aot"}),
+    ("trellis_unpack.py", {"compile_trellis_unpack_e4m3_aot"}),
+    ("native_dense.py", {"compile_swiglu_split_aot", "compile_f32_narrow_pack_aot",
+                         "compile_trellis_fp8_prefill_aot"}),
+    ("dense_mxfp8.py", {"compile_dense_mxfp8_quant_aot", "compile_dense_mxfp8_aot"}),
+    ("pointwise.py", {"compile_bf16_projection_aot"}),
+])
+def test_every_native_dense_export_publishes_cap_without_rekeying(filename, functions):
+    tree = ast.parse((ROOT / "third_party/sparkinfer/b12x/integration/cuteafd" / filename).read_text())
+    found = set()
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name not in functions:
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == "compile_program"]
+        assert calls
+        for call in calls:
+            geometry = next(kw.value for kw in call.keywords if kw.arg == "geometry")
+            if isinstance(geometry, ast.Dict):
+                assert "exact_row_cap" in [k.value for k in geometry.keys if isinstance(k, ast.Constant)]
+            else:
+                assert isinstance(geometry, ast.Call) and any(k.arg == "exact_row_cap" for k in geometry.keywords)
+            key = next(kw.value for kw in call.keywords if kw.arg == "key")
+            assert "exact_row_cap" not in ast.unparse(key)
+        found.add(fn.name)
+    assert found == functions
+
+
+@pytest.mark.parametrize("filename,programs", [
+    ("mimo_ffn.py", {"compile_mimo_norm_aot", "compile_mimo_ffn_aot", "compile_mimo_router_scores_aot"}),
+    ("glmf.py", {"compile_glmf_mla_producer_aot", "compile_glmf_ffn_aot", "compile_glmf_o_aot",
+                  "compile_glmf_router_scores_aot", "compile_glmf_add_aot", "compile_glmf_head_aot"}),
+    ("glm_ffn.py", {"compile_glm_router_scores_aot", "_compile_glm_ffn_w8", "compile_glm_norm_aot", "_compile_glm_ffn_tensor_w8"}),
+    ("dsv4_ffn.py", {"compile_dsv4_router_scores_aot", "compile_dsv4_shared_ffn_aot"}),
+])
+def test_coordinator_composites_publish_first_route_caps(filename, programs):
+    source = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd" / filename
+    tree = ast.parse(source.read_text())
+    found = set()
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef) or function.name not in programs:
+            continue
+        for call in ast.walk(function):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != "compile_program":
+                continue
+            geometry = next(kw.value for kw in call.keywords if kw.arg == "geometry")
+            assert isinstance(geometry, ast.Dict)
+            assert "exact_row_cap" in [key.value for key in geometry.keys if isinstance(key, ast.Constant)], function.name
+        found.add(function.name)
+    assert found == programs
+
+
+def _rust_methods(source, names):
+    methods = re.split(r"\n    (?=(?:pub(?:\([^)]*\))? )?fn )", source)
+    selected = {}
+    for method in methods:
+        match = re.match(r"(?:pub(?:\([^)]*\))? )?fn (\w+)\(", method)
+        if match and match[1] in names:
+            selected[match[1]] = method
+    assert set(selected) == set(names)
+    return selected
+
+
+@pytest.mark.parametrize("family,methods,launches,inventory_names", [
+    ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on"},
+     {"mimo_norm", "mimo_{k}_producer{kv}_{cap}", "mimo_{k}_attention{}_{mode}_{cap}",
+      "mimo_o_w8_{cap}", "mimo_o_{cap}", "mimo_ffn_{cap}", "mimo_router_scores", "mimo_expert_input_quant"},
+     {"mimo_norm", "mimo_{k}_producer{kv}_m4096", "mimo_{k}_attention{kv}_prefill_m4096",
+      "mimo_o{}_m4096", "mimo_ffn_m4096", "mimo_router_scores", "mimo_expert_input_quant"}),
+    ("glm5_flash", {"pre_at", "post_pre_at", "mhc_post_at", "kda_on", "kda_w8", "ffn_on",
+                   "mla_producer_into", "index_producer_part", "mla_output", "mla_over", "moe_front", "moe_experts"},
+     {"mhc_pre", "mhc_post_pre_{cap}", "mhc_post", "kda_w8{dtype}{expanded}_{cap}",
+      "ffn_i{inter}_{cap}", "mla_producer_{cap}", "index_producer_{cap}", "index_producer_c_{cap}",
+      "o_{cap}", "index_topk_{mode}_{cap}", "index_expand", "sparse_mla_{mode}_{cap}",
+      "router_scores", "expert_input_quant", "add"},
+     {"mhc_pre", "mhc_post", "mhc_post_pre_m4096", "head", "kda_w8{}_m4096", "mla_producer_m4096",
+      "o_m4096", "index_producer{}_m4096", "index_topk_prefill_m4096", "index_expand",
+      "sparse_mla_prefill_m4096", "ffn_i{inter}_m4096", "router_scores", "add", "expert_input_quant"}),
+])
+def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, methods, launches, inventory_names):
+    source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/engine.rs").read_text()
+    selected = _rust_methods(source, methods)
+    # Pin every literal program template in the audited packed launch helpers.
+    # Dynamic KDA state variants are selected explicitly by the inventory too.
+    actual = set()
+    for method in selected.values():
+        for line in method.splitlines():
+            if re.search(r"self\.run(?:_on)?\(", line) or "let name = format!(" in line or "let name = if " in line:
+                if "self.run" in line:
+                    line = re.split(r",\s*&\[", line[line.index("self.run"):])[0]
+                match = re.search(r'"([a-z][a-z0-9_{}]*)"', line)
+                if match:
+                    actual.add(match[1])
+    actual.discard("rank")
+    assert actual == launches
+    inventory = _rust_methods(source, {"packed_program_inventory"})["packed_program_inventory"]
+    names = set(re.findall(r'"([a-z][a-z0-9_{}]*)"', inventory))
+    assert names - {"w_o_fp8", "w_in_fp8", "nvfp4_w1", "glmf_{name}"} == inventory_names
+    assert "PackedRows" in inventory and "SequenceLocal" in inventory
+    assert "self.packed_programs.check(" in source
+    assert "self.packed_programs.enter(|| self.packed_program_inventory())?" in source
+    if family == "mimo_v2":
+        assert "rank != 0" not in inventory
+        assert 'self.program_name(&name, split)' in inventory
+        assert 'layer.split, PackedRows' in inventory
+        assert 'false, SequenceLocal' in inventory
+    else:
+        # Final mean/norm runs across the pack, unlike per-member mHC sites.
+        assert 'add("head".into(), PackedRows)' in inventory
+        units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
+        assert 'e.run("head"' in units

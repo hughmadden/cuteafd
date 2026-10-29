@@ -949,7 +949,8 @@
         "inter": 2048
       },
       "geometry": {
-        "inter": 2048
+        "inter": 2048,
+        "exact_row_cap": 2147483647
       },
       "pointers": [
         {
@@ -990,7 +991,8 @@
         "inter": 12288
       },
       "geometry": {
-        "inter": 12288
+        "inter": 12288,
+        "exact_row_cap": 2147483647
       },
       "pointers": [
         {
@@ -2319,7 +2321,8 @@
         "inter": 1024
       },
       "geometry": {
-        "inter": 1024
+        "inter": 1024,
+        "exact_row_cap": 2147483647
       },
       "pointers": [
         {
@@ -2360,7 +2363,8 @@
         "inter": 6144
       },
       "geometry": {
-        "inter": 6144
+        "inter": 6144,
+        "exact_row_cap": 2147483647
       },
       "pointers": [
         {
