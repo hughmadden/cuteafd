@@ -51,7 +51,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 4096)]
     pub max_output: u32,
     /// Sequences decoding at once (each holds an SWA ring).
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = cuteafd_loader::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
     /// Bounded pending API requests (default 16).
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH")]

@@ -121,7 +121,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
     }
     if options.mimo_prefix_draft && checkpoint.snapshot.join("dflash/config.json").is_file() {
-        let slots = draft_representation::mimo_draft_context_slots(options.draft_sequences.max(concurrency),
+        let slots = draft_representation::mimo_draft_context_slots(options.mimo_draft_sequences().max(concurrency),
             options.mimo_rings.max(concurrency), options.draft_context_slots);
         notes.push(format!("MiMo DFlash context slots {slots}"));
     }
@@ -261,7 +261,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         if rank == 0 {
             additional.extend(sampling_reservations(cfg.vocab_size)?);
             if let Some(draft) = &draft {
-                let sequences = options.draft_sequences.max(concurrency);
+                let sequences = options.mimo_draft_sequences().max(concurrency);
                 let slots = draft_representation::mimo_draft_context_slots(sequences, rings, options.draft_context_slots);
                 let mut capacity = draft_representation::MimoDraftCapacity::new(slots as usize, sequences as usize, draft.block)?;
                 capacity.kv_cache = options.draft_kv_cache;

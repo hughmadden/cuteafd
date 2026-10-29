@@ -141,8 +141,8 @@ pub struct LayoutOptions {
     pub mimo_swa_kv: crate::families::mimo_v2::MimoKvCache,
     /// MiMo Spark activation format, matching serving's --expert-input.
     pub mimo_expert_input: crate::families::mimo_v2::MimoExpertInput,
-    /// MiMo drafter batch limit (serving raises it to concurrency).
-    pub draft_sequences: u64,
+    /// Drafter batch override; absent uses the family serving default.
+    pub draft_sequences: Option<u64>,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -182,6 +182,26 @@ pub struct LayoutOptions {
     pub workspace_manifest: Option<std::path::PathBuf>,
     /// Per-GPU budget for resident weights (`--coordinator-weight-budget-gib`).
     pub weight_budget_bytes: u64,
+}
+
+impl LayoutOptions {
+    pub fn resolved_concurrency(&self, family: &str) -> u64 {
+        if self.concurrency > 0 { return self.concurrency; }
+        match family {
+            "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
+            "glm5" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
+        }
+    }
+
+    pub fn glm_draft_sequences(&self) -> u64 {
+        self.draft_sequences.unwrap_or(crate::families::glm5::draft_representation::DEFAULT_DRAFT_SEQUENCES as u64)
+    }
+
+    pub fn mimo_draft_sequences(&self) -> u64 {
+        self.draft_sequences.unwrap_or(crate::families::mimo_v2::draft_representation::DEFAULT_DRAFT_SEQUENCES as u64)
+    }
 }
 
 impl Default for LayoutOptions {
@@ -242,7 +262,7 @@ impl Default for LayoutOptions {
             mimo_rings: 16,
             mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
-            draft_sequences: 4,
+            draft_sequences: None,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,
@@ -803,8 +823,7 @@ impl Shape {
         }
         report.prefill_span_rows.get_or_insert(prefill_rows);
         let decode_rows = manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
-        let concurrency = if options.concurrency > 0 { options.concurrency }
-            else { cuteafd_core::serving_capacity::default_concurrency(options.rtx_bytes.first().copied().unwrap_or(0)) };
+        let concurrency = options.resolved_concurrency(report.family.as_deref().unwrap_or("unknown"));
         let checkpoint_context = report.cache_requirements.as_ref()
             .and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
         let context_tokens = resolved_context(policy.context, options.context_tokens, checkpoint_context,

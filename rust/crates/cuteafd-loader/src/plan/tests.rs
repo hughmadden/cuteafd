@@ -3219,7 +3219,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
         let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
-            draft_sequences:8, draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
+            draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
             context_tokens:131_072, ..Default::default() };
         let run = |options: &layout::LayoutOptions| {
             let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),
@@ -3512,8 +3512,12 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
                 glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default()
             }), ..sparks(4) };
             let automatic = plan(dir.path(), &options).unwrap();
-            options.layout.as_mut().unwrap().concurrency =
-                cuteafd_core::serving_capacity::default_concurrency(bytes);
+            options.layout.as_mut().unwrap().concurrency = match automatic.family.as_deref() {
+                Some("glm5") => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+                Some("glm5_flash") => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
+                Some("mimo_v2") => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+                _ => cuteafd_core::serving_capacity::default_concurrency(bytes),
+            };
             let explicit = plan(dir.path(), &options).unwrap();
             assert_eq!(automatic.memory_layout, explicit.memory_layout, "family {:?}, {bytes}", automatic.family);
             assert_eq!(automatic.placement_supported, explicit.placement_supported);

@@ -5,6 +5,9 @@ pub mod core_admission;
 pub mod resident;
 pub use config::{GlmNextAttention, GlmNextConfig};
 
+/// Default scheduler concurrency, shared by serving and standalone admission.
+pub const DEFAULT_MAX_SEQUENCES: usize = 4;
+
 /// The same projection contract drives native loading and offline checkpoint stitching.
 /// KDA and the vocabulary head retain their checkpoint BF16 representation.
 pub fn core_fp8_projections(kind: &str) -> Vec<String> {

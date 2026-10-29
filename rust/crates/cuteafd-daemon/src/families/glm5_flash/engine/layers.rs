@@ -221,10 +221,9 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    pub(super) fn layer_head(&self, w: &Workspace<'_>, rows: usize, wanted: usize) -> Result<()> {
+    pub(super) fn normalize_head(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-            ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])?;
-        self.logits(w, rows, wanted, false)
+            ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])
     }
 }
 

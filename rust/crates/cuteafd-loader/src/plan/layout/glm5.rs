@@ -311,8 +311,9 @@ fn drafter_admission(options: &LayoutOptions) -> anyhow::Result<(u64, u64, Optio
                     .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
                 crate::resolve_snapshot_at_revision("incoai/GLM-5.3-DFlash2", Some(&home), None).ok().and_then(|r| r.snapshot_path)
             }).ok_or_else(|| anyhow::anyhow!("GLM drafter config unavailable; pass its snapshot, --drafter-gib, or disable speculation"))?;
-            let sequences = options.draft_sequences as usize;
-            let slots = options.draft_context_slots.unwrap_or(20.max(options.draft_sequences)) as usize;
+            let sequences = usize::try_from(options.glm_draft_sequences())?;
+            let slots = crate::families::glm5::draft_representation::serving_draft_context_slots(
+                sequences, usize::try_from(options.resolved_concurrency("glm5"))?, options.draft_context_slots.map(usize::try_from).transpose()?);
             let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
             let (_, block) = crate::families::glm5::draft_representation::draft_geometry(&config)?;
             let drafts = usize::try_from(block)?.checked_sub(1)

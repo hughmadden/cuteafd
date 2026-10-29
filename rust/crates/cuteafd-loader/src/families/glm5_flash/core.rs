@@ -367,6 +367,33 @@ mod tests {
     }
 
     #[test]
+    fn target_and_borrowed_head_scratch_do_not_scale_with_prefill() -> Result<()> {
+        use super::super::core_admission::CoreCharges;
+        use crate::formats::trellis_core::ProjectionScratchLayout;
+        let (cfg, checkpoint) = fixture();
+        let mut core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        core.projections.retain(|name, _| name == "lm_head");
+        let manifest = executable_package(&cfg, &core)?;
+        let head = core.get_weight("lm_head").unwrap();
+        for (ranks, decode_rows) in [(1, 64), (1, 128), (2, 64)] {
+            for unit in [1, 64, 512, 4096] {
+                let charges = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None,
+                    unit, 3, decode_rows, Some(64), false, &manifest)?;
+                let target = ProjectionScratchLayout::new(head.shape[1], head.shape[0], decode_rows)?;
+                let draft = ProjectionScratchLayout::new(head.shape[1], head.shape[0], 64)?;
+                assert_eq!(charges.ranks[0].target_head.as_ref(), Some(&target));
+                assert_eq!(charges.ranks[0].draft_head.as_ref(), Some(&draft));
+                assert_eq!(charges.bytes(cfg.hidden)?[0], (target.bytes()? + draft.bytes()?) as u64);
+                assert!(charges.ranks.iter().skip(1).all(|r| r.target_head.is_none() && r.draft_head.is_none()));
+            }
+        }
+        let before = ProjectionScratchLayout::new(4096, 154880, 4096)?;
+        let after = ProjectionScratchLayout::new(4096, 154880, 64)?;
+        assert_eq!(before.bytes()? - after.bytes()?, 2_692_009_984);
+        Ok(())
+    }
+
+    #[test]
     fn owned_short_prefix_and_mixed_kda_suffix_match_runtime_contract() -> Result<()> {
         use super::super::core_admission::{CoreCharges, CoreStageLayout, owned_mla, receive_suffix_bytes};
         let (cfg, checkpoint) = fixture();

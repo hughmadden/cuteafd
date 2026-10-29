@@ -122,7 +122,7 @@ pub(crate) struct EngineArgs {
     pub mtp: usize,
     /// Maximum number of sequences in one draft batch. Context ring slots
     /// can be larger through --draft-context-slots.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = cuteafd_loader::families::mimo_v2::draft_representation::DEFAULT_DRAFT_SEQUENCES)]
     pub draft_sequences: usize,
     /// Drafter context ring slots (default: --draft-sequences; serving also
     /// covers every target ring slot). Does not widen a draft batch.

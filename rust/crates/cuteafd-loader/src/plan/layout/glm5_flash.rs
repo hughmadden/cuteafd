@@ -145,7 +145,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let path = path.ok_or_else(|| anyhow::anyhow!("DFlash2 config missing: provide --glmf-drafter-snapshot or disable the drafter"))?;
             let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
             let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
-                usize::try_from(sequences)?, usize::try_from(options.draft_sequences)?,
+                usize::try_from(sequences)?, usize::try_from(options.glm_draft_sequences())?,
                 options.draft_context_slots.map(usize::try_from).transpose()?);
             let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch)?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
@@ -218,7 +218,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-            full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
+            full_prefill_logits: if options.full_prefill_logits && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,

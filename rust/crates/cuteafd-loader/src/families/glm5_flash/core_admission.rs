@@ -88,7 +88,7 @@ impl CoreCharges {
             let book = weight.codebook.marker();
             programs.extend(cuteafd_ffi::dense_trellis::validate_package_geometry(manifest,
                 weight.shape[1], weight.shape[0], if weight.side == TrellisSide::Input { 2 } else { 1 }, book,
-                unit.max(decode_rows).max(draft_rows.unwrap_or(1)),
+                if weight.stem == "lm_head" { decode_rows.max(draft_rows.unwrap_or(1)) } else { unit.max(decode_rows) },
                 if weight.stem == "lm_head" { cuteafd_ffi::dense_trellis::TrellisDType::F32 }
                 else { cuteafd_ffi::dense_trellis::TrellisDType::Bf16 })?);
         }
@@ -132,7 +132,7 @@ impl CoreCharges {
                     CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(true)?)?,
                     CoreStageLayout::new(cfg, unit, ranks, owned, scratch(false)?)?]) },
                 decode: projection(&body, decode_rows)?, prefill: projection(&body, unit)?,
-                target_head: if rank == 0 { head_scratch(decode_rows.max(unit))? } else { None },
+                target_head: if rank == 0 { head_scratch(decode_rows)? } else { None },
                 draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },
                 retained_rows: if body.is_empty() { 0 } else { retained_rows },
                 receive_suffix: if split { receive } else { 0 }, body,

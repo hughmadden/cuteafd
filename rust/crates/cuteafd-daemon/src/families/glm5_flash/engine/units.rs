@@ -2,6 +2,11 @@
 use super::*;
 use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, run_prefill_units};
 
+/// Normalized terminal rows, consumed in order through one bounded logits buffer.
+fn head_spans(total: usize, wanted: usize, capacity: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (total - wanted..total).step_by(capacity).map(move |start| start..(start + capacity).min(total))
+}
+
 enum Ticket { Spark(crate::shared::spark_waves::WaveTicket), Mixed(layers::Ticket) }
 
 /// The MLA ordinal, not the absolute layer, selects Flash's two staging views.
@@ -235,13 +240,20 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
         }
         let wanted = unit.rows.end.saturating_sub((self.total - self.wanted).max(unit.rows.start));
         if wanted > 0 {
-            e.layer_head(w, unit.rows.len(), wanted)?;
+            e.normalize_head(w, unit.rows.len())?;
             if self.device {
+                e.logits(w, unit.rows.len(), wanted, false)?;
                 ensure!(wanted == self.wanted, "device logits must lie in the last unit");
                 self.result = Some(e.device_logits(w, wanted, false));
             } else {
-                self.logits.extend(e.download(&w.logits, wanted * e.cfg.vocab_size * 4)?
-                    .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                // Native K6 scoring consumes decode-sized tiles before reusing the
+                // head scratch and logits staging. Other heads keep their M geometry.
+                let capacity = if matches!(e.weights.head, GlmfHead::K6(_)) { DECODE_ROWS } else { wanted };
+                for rows in head_spans(unit.rows.len(), wanted, capacity) {
+                    e.logits(w, rows.end, rows.len(), false)?;
+                    self.logits.extend(e.download(&w.logits, rows.len() * e.cfg.vocab_size * 4)?
+                        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                }
             }
         }
         Ok(())
@@ -266,6 +278,8 @@ impl<'a> GlmfEngine<'a> {
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
         }
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
+        ensure!(!device || !matches!(self.weights.head, GlmfHead::K6(_)) || logit_rows <= DECODE_ROWS,
+            "native K6 device prefill logits exceed admitted rows");
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits exceed admitted rows");
         let mut ranked = Vec::new();
@@ -340,6 +354,20 @@ mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
     use std::collections::VecDeque;
+
+    #[test]
+    fn head_tiles_cover_only_wanted_rows_in_order_with_bounded_tails() {
+        for total in [1, 63, 64, 65, 129, 512, 4096] {
+            for wanted in [0, 1, total / 2, total] {
+                let spans = head_spans(total, wanted, DECODE_ROWS).collect::<Vec<_>>();
+                assert!(spans.iter().all(|s| !s.is_empty() && s.len() <= DECODE_ROWS));
+                assert_eq!(spans.into_iter().flatten().collect::<Vec<_>>(),
+                    (total - wanted..total).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(head_spans(4096, 129, 64).collect::<Vec<_>>(),
+            vec![3967..4031, 4031..4095, 4095..4096]);
+    }
 
     #[test]
     fn mla_staging_requires_same_layer_immediate_predecessor() {
