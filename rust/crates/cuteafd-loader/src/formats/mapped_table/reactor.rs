@@ -143,10 +143,10 @@ impl Reactor {
     }
 }
 
-struct Job { request: Request, next: usize, left: usize, started: Instant,
+struct Job { request: Request, next: usize, left: usize,
     error: Option<MappedTableError>, stats: uring::ReadStats }
 #[derive(Clone, Copy)]
-struct Active { job: usize, row: usize, done: usize }
+struct Active { job: usize, row: usize, done: usize, submitted: Instant }
 struct Engine {
     ring: IoUring, jobs: Vec<Option<Job>>, active: Vec<Option<Active>>,
     retry: VecDeque<Active>, free: Vec<usize>, outstanding: usize, wake_armed: bool, decode_streak: usize,
@@ -171,10 +171,10 @@ impl Engine {
         while let Some(index) = self.jobs.iter().position(Option::is_none) {
             let Some(request) = queue.decode.pop_front().or_else(|| queue.prefill.pop_front()) else { break; };
             let left = request.buffer.reads.len();
-            self.jobs[index] = Some(Job { request, next: 0, left, started: Instant::now(), error: None, stats: Default::default() });
+            self.jobs[index] = Some(Job { request, next: 0, left, error: None, stats: Default::default() });
         }
     }
-    fn enqueue(&mut self, active: Active) -> Result<()> {
+    fn enqueue(&mut self, mut active: Active) -> Result<()> {
         let index = self.free.pop().ok_or_else(|| invalid("reactor capacity exceeded"))?;
         let job = self.jobs[active.job].as_mut().expect("live read job");
         let read = &job.request.buffer.reads[active.row];
@@ -187,6 +187,7 @@ impl Engine {
             .offset(read.offset + active.done as u64).build().flags(io_uring::squeue::Flags::ASYNC).user_data(index as u64);
         // SAFETY: the owned job and the draining engine retain fd and destination.
         unsafe { self.ring.submission().push(&entry) }.map_err(|_| invalid("reactor read queue full"))?;
+        active.submitted = Instant::now();
         self.active[index] = Some(active);
         self.outstanding += 1;
         Ok(())
@@ -208,7 +209,7 @@ impl Engine {
                 let row = job.next;
                 job.next += 1;
                 if job.request.priority == ReadPriority::Decode { self.decode_streak += 1; } else { self.decode_streak = 0; }
-                self.enqueue(Active { job: id, row, done: 0 })?;
+                self.enqueue(Active { job: id, row, done: 0, submitted: Instant::now() })?;
             } else if let Some(at) = self.retry.iter().position(|active| prefill_allowed ||
                 self.jobs[active.job].as_ref().is_some_and(|job| job.request.priority == ReadPriority::Decode)) {
                 let active = self.retry.remove(at).expect("selected retry");
@@ -233,7 +234,7 @@ impl Engine {
             if count > 0 && count as usize <= job.request.width - active.done {
                 active.done += count as usize;
                 if active.done < job.request.width { self.retry.push_back(active); continue; }
-                let elapsed = job.started.elapsed().as_nanos() as u64;
+                let elapsed = active.submitted.elapsed().as_nanos() as u64;
                 job.stats.miss_ns += elapsed;
                 job.stats.miss_max_ns = job.stats.miss_max_ns.max(elapsed);
                 job.stats.miss_histogram[uring::tier(elapsed)] += 1;
@@ -377,8 +378,7 @@ mod tests {
             let (reply, receiver) = mpsc::sync_channel(1);
             drop(receiver); // caller cancellation must never free in-flight storage
             let buffer = Buffer { bytes: vec![0; count], reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0 }).collect() };
-            Job { request: Request { buffer, width: 1, priority, reply }, next: 0, left: count,
-                started: Instant::now(), error: None, stats: Default::default() }
+            Job { request: Request { buffer, width: 1, priority, reply }, next: 0, left: count, error: None, stats: Default::default() }
         };
         let limit = engine.active.len();
         let reserve = (limit / 8).clamp(1, 64);
@@ -394,4 +394,53 @@ mod tests {
         drop(engine);
         Ok(())
     }
+    #[test]
+    fn eventfd_wake_admits_decode_within_one_owner_iteration() -> Result<()> {
+        let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
+        // SAFETY: eventfd returns a fresh descriptor with no memory references.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 { return Err(error("test eventfd", std::io::Error::last_os_error())); }
+        // SAFETY: this scope assumes unique ownership of the fresh descriptor.
+        let shared = Shared { queue: Mutex::new(Queue::default()), available: Condvar::new(),
+            wake: unsafe { OwnedFd::from_raw_fd(fd) }, ready: AtomicBool::new(true) };
+        let mut engine = Engine::new(ring);
+        engine.arm(&shared.wake)?;
+        engine.ring.submit().map_err(|source| error("submitting test wake", source))?;
+        let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
+        let request = |priority, rows| {
+            let (reply, receiver) = mpsc::sync_channel(1);
+            let buffer = Buffer { bytes: vec![0; rows], reads: (0..rows).map(|_| Read { file: Arc::clone(&file), offset: 0 }).collect() };
+            (Request { buffer, width: 1, priority, reply }, receiver)
+        };
+        let (prefill, _prefill_reply) = request(ReadPriority::Prefill, engine.active.len() * 2);
+        let rows = prefill.buffer.reads.len();
+        engine.jobs[0] = Some(Job { request: prefill, next: 0, left: rows, error: None, stats: Default::default() });
+        engine.schedule()?;
+        let before = engine.outstanding;
+        // Keep prefill SQEs queued but unsubmitted, so only the already armed
+        // eventfd can produce a CQE. A delayed producer wakes an idle owner.
+        let (decode, _decode_reply) = request(ReadPriority::Decode, 1);
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                shared.queue.lock().unwrap().decode.push_back(decode);
+                signal(&shared.wake).expect("test reactor wake");
+            });
+            // SAFETY: zero submissions, GETEVENTS waits for the existing PollAdd;
+            // no extended arguments or signal mask, all ring storage stays live.
+            unsafe { engine.ring.submitter().enter::<libc::sigset_t>(0, 1, 1, None) }
+                .map_err(|source| error("test eventfd-only wait", source))?;
+            Ok(())
+        })?;
+        // Normal owner iteration: handle completions, accept, rearm, schedule.
+        engine.complete(&shared)?;
+        engine.accept(&shared);
+        engine.arm(&shared.wake)?;
+        engine.schedule()?;
+        assert!(engine.jobs.iter().flatten().any(|job| job.request.priority == ReadPriority::Decode && job.next == 1));
+        assert!(before > 0);
+        drop(engine);
+        Ok(())
+    }
+
 }

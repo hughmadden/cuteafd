@@ -59,12 +59,10 @@ impl EngramBatchStaging {
     /// hash set. This conservative bound includes vector growth (at most 2x),
     /// two pages per <=264-byte table row, and tree/hash allocation slack.
     ///
-    /// The fixed 1 MiB additionally covers MAX_BATCH=4096: one SQ ring (64-byte
-    /// SQEs + 4-byte indices), default 2x CQ (16-byte CQEs), rounded ring headers,
-    /// retry/done/nowait/missed arrays (18 bytes/entry), 4096 mincore bytes and
-    /// <=16 borrowed batch references. Weights/scales and L1/L14 run serially,
-    /// so these terms occur once per worker. Thread stacks, request batches,
-    /// allocator bookkeeping and OS page cache are not staging workspace.
+    /// The fixed 1 MiB covers caller-side residency scratch and metadata.
+    /// The process-wide reactor budget is charged separately by the staging
+    /// shape, once rather than once per prefill/decode worker. Thread stacks,
+    /// request batches, allocator bookkeeping and OS page cache are excluded.
     pub fn worker_bytes(rows: usize) -> Result<usize> {
         Self::storage_bytes(rows)?;
         Ok(rows * 24 * 1024 + (1 << 20))

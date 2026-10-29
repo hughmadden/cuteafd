@@ -10,7 +10,7 @@ fn fixed_staging_charges_actual_wave_count_and_separate_decode_rows() -> TestRes
         let staging = MappedStaging::new(2048 * 16, k, 64 * 16, 320)?;
         assert_eq!(staging.slot_bytes().collect::<Vec<_>>(),
             std::iter::repeat_n(2048 * 16 * 320, 2 * k).chain(std::iter::repeat_n(64 * 16 * 320, 2)).collect::<Vec<_>>());
-        assert_eq!(staging.workspace_bytes, (2048 + 64) * 16 * 1024 + (2 << 20));
+        assert_eq!(staging.workspace_bytes, (2048 + 64) * 16 * 1024 + (2 << 20) + TABLE_REACTOR_WORKSPACE_BYTES);
         assert_eq!(staging.total_bytes, 2 * (k * 2048 + 64) * 16 * 320 + staging.workspace_bytes);
         assert_eq!(staging.slot_bytes().sum::<usize>() + staging.workspace_bytes, staging.total_bytes);
     }

@@ -51,7 +51,8 @@ impl EngramStagingShape {
     pub fn host_resident_bytes(self) -> usize {
         self.host_slots() * EngramBatchStaging::storage_bytes(self.rows).expect("validated shape")
     }
-    pub fn host_workspace_bytes(self) -> usize { EngramBatchStaging::worker_bytes(self.rows).expect("validated shape") }
+    pub fn host_workspace_bytes(self) -> usize { EngramBatchStaging::worker_bytes(self.rows).expect("validated shape")
+        + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES }
     /// Exact persistent pool plus a documented upper bound for its one worker.
     /// Decode has its own pool/worker, so concurrent decode cannot starve prefill.
     pub fn host_bytes(self) -> usize { self.host_resident_bytes() + self.host_workspace_bytes() }
@@ -293,7 +294,7 @@ mod lifecycle_tests {
             let n = shape.host_slots();
             assert_eq!(n, 4 * k);
             assert_eq!(shape.host_resident_bytes(), n * EngramBatchStaging::storage_bytes(rows)?);
-            assert_eq!(shape.host_bytes(), shape.host_resident_bytes() + rows * 24 * 1024 + (1 << 20));
+            assert_eq!(shape.host_bytes(), shape.host_resident_bytes() + rows * 24 * 1024 + (1 << 20) + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES);
             assert_eq!(shape.decode_host_bytes(), 4 * EngramBatchStaging::storage_bytes(256)? + 256 * 24 * 1024 + (1 << 20));
             assert_eq!(shape.device_bytes(), k * rows * ENGRAM_DEVICE_ROW_BYTES);
             assert_eq!(shape.validate_slots(n - 1), Err(EngramStagingError::Slots { required: n, available: n - 1 }));

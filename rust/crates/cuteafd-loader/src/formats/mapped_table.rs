@@ -35,6 +35,9 @@ mod reactor;
 /// Explicit priority from the decode/prefill pipeline, never inferred from row count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadPriority { Decode, #[default] Prefill }
+/// Conservative process-wide admission: 16 MiB miss buffers plus descriptors,
+/// SQ/CQ storage and owner scratch. Charged once per table pipeline group.
+pub const TABLE_REACTOR_WORKSPACE_BYTES: usize = 18 << 20;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -104,7 +107,7 @@ impl MappedStaging {
         // Bound row IDs, validation/read descriptors and backend scratch for
         // the independent prefill/decode workers; no GPU handshake counters.
         let workspace_bytes = prefill_rows.checked_add(decode_rows).and_then(|n| n.checked_mul(1024))
-            .and_then(|n| n.checked_add(2 << 20)).ok_or_else(overflow)?;
+            .and_then(|n| n.checked_add(TABLE_REACTOR_WORKSPACE_BYTES + (2 << 20))).ok_or_else(overflow)?;
         let total_bytes = prefill_bytes.checked_mul(prefill_slots)
             .and_then(|n| decode_bytes.checked_mul(2).and_then(|d| n.checked_add(d))).and_then(|n| n.checked_add(workspace_bytes)).ok_or_else(overflow)?;
         Ok(Self { prefill_bytes, prefill_slots, decode_bytes, workspace_bytes, total_bytes })
@@ -807,11 +810,9 @@ impl MappedTable {
             }
             return Ok(());
         }
-        {
-            match self.uring_reads(rows, &reads, output, false, priority) {
-                Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
-                Err(error) => self.uring_fallback(&error),
-            }
+        match self.uring_reads(rows, &reads, output, false, priority) {
+            Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
+            Err(error) => self.uring_fallback(&error),
         }
         self.record_residency(rows)?;
         for read in reads {
@@ -932,7 +933,7 @@ impl MappedTable {
             accounting = self.stats.accounting(),
             reason = if !available { "reactor setup pending; recoverable batch fallback" }
                 else { "caller resident memcpy and process-wide miss reactor" },
-            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "NOWAIT capability is probed per file" },
+            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "mincore residency is a snapshot, not a physical-read counter" },
             "mapped table backend");
     }
 
