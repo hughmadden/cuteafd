@@ -757,20 +757,22 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 });
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
-                if let Err(error) = &prefilled {
-                    if p.cancelled {
-                        p.ticket.cancel();
-                        // The client left during the prefill: keep what it computed for a retry.
-                        if placement.len > resume && !probe::cold(&p.job.probe) {
-                            cache.capture_session(p.ticket.session());
-                            if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
-                                tracing::warn!("parking a cancelled prefill: {error:#}");
-                            }
+                if p.cancelled || p.job.events.is_closed() {
+                    p.ticket.cancel();
+                    // A skipped final head is still successful computed KV.
+                    // Park it before either the error or missing-logits path.
+                    if placement.len > resume && !probe::cold(&p.job.probe) {
+                        cache.capture_session(p.ticket.session());
+                        if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
+                            tracing::warn!("parking a cancelled prefill: {error:#}");
                         }
-                    } else {
-                        tracing::warn!("prefill failed: {error:#}");
-                        let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
+                    release(&family, &mut cache, &mut free_slots, &placement, slot);
+                    continue;
+                }
+                if let Err(error) = &prefilled {
+                    tracing::warn!("prefill failed: {error:#}");
+                    let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     release(&family, &mut cache, &mut free_slots, &placement, slot);
                     continue;
                 }
@@ -1162,6 +1164,23 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
 
 #[cfg(test)]
 mod lane_tests {
+    #[test]
+    fn final_chunk_cancellation_parks_before_error_or_missing_head() {
+        let source = include_str!("serve.rs");
+        let finish = source.split_once(concat!("for (mut p, pre", "filled) in finished {")).unwrap().1
+            .split_once("let logits = p.logits.clone();").unwrap().0;
+        let cancel = finish.find("if p.cancelled || p.job.events.is_closed()").unwrap();
+        let park = finish.find("cache.park(").unwrap();
+        let error = finish.find("if let Err(error) = &prefilled").unwrap();
+        let missing_head = finish.find("prefill produced no logits").unwrap();
+        assert!(cancel < park && park < error && error < missing_head);
+        let cancelled = &finish[cancel..error];
+        assert!(cancelled.contains("p.ticket.cancel()"));
+        assert!(cancelled.contains("placement.len > resume"));
+        assert!(cancelled.contains("release(&family") && cancelled.contains("continue;"));
+        assert!(!cancelled.contains("prefilled.is_err()"));
+    }
+
     #[test]
     fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
         let source = include_str!("serve.rs");

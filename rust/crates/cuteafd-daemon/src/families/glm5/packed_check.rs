@@ -58,7 +58,9 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::
     let fallback = exact && limits.rows == 0;
     ensure!(fallback || groups.iter().any(|group| group.len() > 1),
         "packed-check must exercise a pack when packing is enabled");
-    if fallback { println!("packed check: explicit exact mode has unknown routes; singleton fallback only, NOT a packing gate"); }
+    if fallback {
+        println!("packed check: exact singleton fallback only, NOT a packing gate: {}", engine.packed_fallback_reason());
+    }
     let prompts = lengths.iter().enumerate().map(|(i, &rows)| sequence(tokens, i, prefix(i) + rows)).collect::<Vec<_>>();
     let mut allocator = PageAllocator::new(engine);
     let mut packed = prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>()?;
@@ -113,6 +115,7 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::
     } else {
         let agreement = top1 as f64 / members as f64;
         println!("packed versus singleton (informational): worst member KL {worst_kl:.8}, top-1 {agreement:.4}");
+        ensure!(equal, "unrestricted prefill logits/live cache differ from singleton after the uniform prefill route");
         golden_fidelity(engine, tokens, golden, members, transport, runtime)?;
     }
     Ok(())
@@ -169,6 +172,7 @@ impl Fidelity {
 fn golden_fidelity(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::Path,
     members: usize, mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
+    use sha2::{Digest, Sha256};
     let resumed = members - 1;
     let start = |i| if i == resumed { 1024 } else { 0 };
     let lengths = LENGTHS[..resumed].iter().copied().chain([100]).collect::<Vec<_>>();
@@ -189,16 +193,21 @@ fn golden_fidelity(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::P
     let groups = prefill_packing::groups(members, |range| prefill_packing::plan(&chunks[range], &limits).is_ok());
     ensure!(groups.iter().any(|g| g.len() > 1), "stored-golden fidelity must exercise a real pack");
     let mut scores = (0..members).map(|_| Fidelity::default()).collect::<Vec<_>>();
-    let mut score_segment = |i: usize, segment, score: &mut Fidelity| -> Result<()> {
+    let mut score_segment = |i: usize, segment, score: &mut Fidelity| -> Result<Vec<[u8; 32]>> {
+        let mut digests = Vec::new();
         engine.packed_check_logits(segment, &mut |offset, logits| {
             let logits = logits.to_host(engine.library)?;
+            let bytes = logits.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect::<Vec<_>>();
+            digests.push(Sha256::digest(&bytes).into());
             let mut bytes = vec![0u8; logits.len() * 4];
             reference.seek(SeekFrom::Start(((start(i) + offset) * vocab * 4) as u64))?;
             reference.read_exact(&mut bytes)?;
             let golden = bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
             score.add(&logits, &golden, vocab)
-        })
+        })?;
+        Ok(digests)
     };
+    let mut packed_digests = vec![Vec::new(); members];
     for range in groups {
         let first = range.start;
         let mut sequences = placements[range.clone()].iter_mut().enumerate().map(|(j, p)| {
@@ -209,11 +218,12 @@ fn golden_fidelity(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::P
         for outcome in outcomes { outcome?; }
         for (j, segment) in segments.into_iter().enumerate() {
             let i = first + j;
-            score_segment(i, segment, &mut scores[i])?;
+            packed_digests[i] = score_segment(i, segment, &mut scores[i])?;
         }
     }
     for p in placements { allocator.release(p); }
     let mut controls = (0..members).map(|_| Fidelity::default()).collect::<Vec<_>>();
+    let mut identical = true;
     for (i, control) in controls.iter_mut().enumerate() {
         let mut placement = allocator.admit(start(i) + lengths[i] + 1)?;
         for part in tokens[..start(i)].chunks(engine.prefill_capacity()) {
@@ -224,8 +234,11 @@ fn golden_fidelity(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::P
         ensure!(lengths[i] < 512, "singleton fidelity control must retain one unit");
         engine.prefill_device(&mut placement, &tokens[start(i)..start(i) + lengths[i]],
             transport.as_deref_mut().map(|t| (t, runtime)), 0)?;
-        score_segment(i, prefill_packing::Segment { first: 0, rows: lengths[i], start: start(i),
+        let digests = score_segment(i, prefill_packing::Segment { first: 0, rows: lengths[i], start: start(i),
             tap_offset: 0, tap_rows: 0 }, control)?;
+        let same = packed_digests[i] == digests;
+        println!("packed stored golden: member {i} all-row byte digests {}", if same { "identical" } else { "DIFFER" });
+        identical &= same;
         allocator.release(placement);
     }
     for (i, (score, control)) in scores.iter().zip(&controls).enumerate() {
@@ -239,6 +252,7 @@ fn golden_fidelity(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::P
     let (base_kl, base_top1) = control.metrics()?;
     println!("packed stored golden pooled: {} rows, KL {kl:.8}, top-1 {top1:.4}; singleton KL {base_kl:.8}, top-1 {base_top1:.4}; delta KL {:.8}, delta top-1 {:.4}; absolute K4 tier 0.05/0.93 INFORMATIONAL ONLY",
         pooled.rows, kl - base_kl, top1 - base_top1);
+    ensure!(identical, "unrestricted packed stored-prefix logits differ bytewise from singleton controls");
     for (i, (score, control)) in scores.iter().zip(&controls).enumerate() {
         score.non_inferior(control).with_context(|| format!("packed stored golden member {i}"))?;
     }

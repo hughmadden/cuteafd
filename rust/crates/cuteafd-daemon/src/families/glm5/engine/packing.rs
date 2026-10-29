@@ -4,24 +4,32 @@ use crate::shared::prefill_packing::{self, Limits, MemberOutcome, PackingMode, S
 
 impl<'a> GlmEngine<'a> {
     pub(crate) fn configure_packing(&self, mode: PackingMode) -> Result<()> {
+        self.packed_fallback_reason.borrow_mut().clear();
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
+        let mut reasons = Vec::new();
         let inventory = coordinator_inventory(self.programs.names(), self.peer.is_some())?;
-        let mut cap = prefill_packing::coordinator_row_cap(self.programs,
-            inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows)?;
+        let mut cap = exact_program_cap(self.programs,
+            inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows, &mut reasons)?;
         for owner in self.native_dense.iter().flatten() {
-            cap = prefill_packing::coordinator_row_cap(self.programs,
-                owner.packed_programs().map(|name| (name, prefill_packing::ProgramRows::PackedRows)), cap)?;
+            cap = native_owner_cap(exact_program_cap(self.programs,
+                owner.packed_programs().map(|name| (name, prefill_packing::ProgramRows::PackedRows)), cap, &mut reasons)?);
         }
         for owner in self.core_programs.iter().flatten() {
-            cap = prefill_packing::coordinator_row_cap(self.programs,
-                owner.packed_programs().map(|name| (name, prefill_packing::ProgramRows::PackedRows)), cap)?;
+            cap = exact_program_cap(self.programs,
+                owner.packed_programs().map(|name| (name, prefill_packing::ProgramRows::PackedRows)), cap, &mut reasons)?;
         }
         // The native shared expert's bounded 64-row executor has no route
         // attestation yet; do not infer invariance from its staging capacity.
-        if !self.native_experts.is_empty() { cap = 0; }
+        if !self.native_experts.is_empty() {
+            cap = 0;
+            reasons.push("native shared EXLR8 expert has no arithmetic-route attestation".into());
+        }
         // TP2's erased backend does not publish arithmetic-route bounds yet.
         // Exact validation fails closed; unrestricted serving still packs.
-        if self.tp2.is_some() { cap = 0; }
+        if self.tp2.is_some() {
+            cap = 0;
+            reasons.push("TP2 backend has no arithmetic-route attestation".into());
+        }
         let reports = self.prefill_link.borrow().as_ref().map(|link| link.installed_grouping()).transpose()?
             .unwrap_or_default();
         for (index, layer) in self.weights.layers.iter().enumerate() {
@@ -29,16 +37,29 @@ impl<'a> GlmEngine<'a> {
             let mut found = false;
             for report in &reports {
                 if report.layers().iter().any(|range| (range.first as usize..range.end as usize).contains(&index)) {
-                    cap = cap.min(report.packed_row_cap(self.spark_bf16));
+                    let expert_cap = report.packed_row_cap(self.spark_bf16);
+                    if expert_cap == 0 {
+                        reasons.push(format!("Spark expert layer {index} has no bounded arithmetic route"));
+                    }
+                    cap = cap.min(expert_cap);
                     found = true;
                 }
             }
-            if !found { cap = 0; }
+            if !found {
+                cap = 0;
+                reasons.push(format!("Spark expert layer {index} has no installed route report"));
+            }
         }
         self.packed_row_cap.set(Some(cap));
-        prefill_packing::log_mode(mode, cap);
+        *self.packed_fallback_reason.borrow_mut() = reasons.join("; ");
+        if cap == 0 {
+            tracing::info!(reason = %self.packed_fallback_reason.borrow(),
+                "exact GLM packed prefill disabled; requests run alone");
+        } else { prefill_packing::log_mode(mode, cap); }
         Ok(())
     }
+
+    pub(crate) fn packed_fallback_reason(&self) -> String { self.packed_fallback_reason.borrow().clone() }
 
     pub(crate) fn packed_limits(&self) -> Limits {
         Limits { rows: self.packed_row_cap.get().unwrap_or(self.prefill_rows), chunk_rows: self.prefill_rows,
@@ -93,6 +114,32 @@ impl<'a> GlmEngine<'a> {
             consume(first, self.device_logits(w, rows, false))?;
         }
         Ok(())
+    }
+}
+
+// Program-local metadata cannot attest the owner's F16/BF16/A8 switch.
+fn native_owner_cap(cap: usize) -> usize { cap.min(native_dense::NATIVE_DECODE_ROWS) }
+
+fn exact_program_cap<'n>(programs: &Programs<'_>,
+    inventory: impl IntoIterator<Item = (&'n str, prefill_packing::ProgramRows)>, capacity: usize,
+    reasons: &mut Vec<String>) -> Result<usize> {
+    let inventory = inventory.into_iter().collect::<Vec<_>>();
+    for &(name, role) in &inventory {
+        if role == prefill_packing::ProgramRows::PackedRows {
+            if let Some(reason) = program_fallback_reason(name, &programs.spec(name)?.geometry) {
+                reasons.push(reason);
+            }
+        }
+    }
+    prefill_packing::coordinator_row_cap(programs, inventory, capacity)
+}
+
+fn program_fallback_reason(name: &str, geometry: &serde_json::Value) -> Option<String> {
+    match geometry.get("exact_row_cap").and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok()) {
+        Some(cap) if cap > 0 => None,
+        Some(_) => Some(format!("program {name} publishes exact_row_cap=0")),
+        None => Some(format!("program {name} is missing valid exact_row_cap metadata")),
     }
 }
 
@@ -173,6 +220,30 @@ fn packed_tables(sequences: &[(&mut GlmPlacement, &[u32])], segments: &[Segment]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_owner_dispatch_cap_preserves_smaller_program_caps() {
+        for cap in [0, 8, 16, 64, 129, 4096] {
+            assert_eq!(native_owner_cap(cap), cap.min(64));
+        }
+        let limits = Limits { rows: native_owner_cap(4096), chunk_rows: 4096, max_context: 4096, taps: None };
+        let chunks = [(0, 29), (0, 7), (0, 64), (0, 65)];
+        assert_eq!(prefill_packing::groups(4, |r| prefill_packing::plan(&chunks[r], &limits).is_ok()),
+            [0..2, 2..3, 3..4]);
+    }
+
+    #[test]
+    fn exact_fallback_names_program_and_metadata_reason() {
+        use serde_json::json;
+        assert!(program_fallback_reason("glm_norm", &json!({})).unwrap().contains("glm_norm is missing"));
+        assert!(program_fallback_reason("glm_norm", &json!({"exact_row_cap": 0})).unwrap().contains("=0"));
+        for value in [json!(-1), json!("64"), json!(null)] {
+            assert!(program_fallback_reason("route", &json!({"exact_row_cap": value})).unwrap().contains("missing valid"));
+        }
+        for cap in [8, 16, 64, 129] {
+            assert!(program_fallback_reason("route", &json!({"exact_row_cap": cap})).is_none());
+        }
+    }
 
     #[test]
     fn packed_tables_equal_singletons_and_ignore_partner_pages() -> Result<()> {
