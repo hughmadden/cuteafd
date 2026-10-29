@@ -1290,6 +1290,59 @@ fn split_finisher_panic_keeps_other_finisher_and_preparer_live() -> TestResult {
 }
 
 #[test]
+fn split_both_finisher_panics_reject_prepared_and_queued_jobs() -> TestResult {
+    let (entered, finishing) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = Arc::clone(&gate);
+    let (preparing, prepared) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    let (dropped, drops) = mpsc::channel();
+    struct Prepared(usize, mpsc::Sender<usize>);
+    impl Drop for Prepared { fn drop(&mut self) { let _ = self.1.send(self.0); } }
+    let mut worker = GatherWorker::split("split-both-panic", vec![(); 4],
+        move |_: &mut (), job: &usize| {
+            if *job == 2 {
+                preparing.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok::<_, ()>(Prepared(*job, dropped.clone()))
+        }, move |_, job: &usize, _: Prepared| {
+            entered.send(*job).unwrap();
+            let released = blocked.0.lock().unwrap();
+            let (released, _) = blocked.1.wait_timeout_while(released,
+                Duration::from_secs(5), |done| !*done).unwrap();
+            drop(released);
+            panic!("injected finisher panic");
+        })?;
+    let mut tickets = Vec::new();
+    for job in 0..2 {
+        tickets.push(worker.try_submit(job, false)?.unwrap());
+        assert_eq!(finishing.recv_timeout(Duration::from_secs(5))?, job);
+    }
+    tickets.push(worker.try_submit(2, false)?.unwrap());
+    tickets.push(worker.try_submit(3, false)?.unwrap());
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    prepared.recv_timeout(Duration::from_secs(5))?;
+    // With both permits in finishers, no prepared channel job can coexist.
+    // Join both dead receivers before allowing the next prepared send: it must
+    // disconnect, recycle its payload and reject the still-queued fourth job.
+    for finisher in worker.finishers.drain(..) { assert!(finisher.join().is_err()); }
+    release.send(())?;
+    for ticket in &mut tickets {
+        assert!(matches!(ticket.wait_timeout(Duration::from_secs(5)), Err(GatherFailure::Worker(_))));
+    }
+    let slots = Arc::clone(&worker.slots);
+    drop(worker);
+    let mut recycled = (0..3).map(|_| drops.recv_timeout(Duration::from_secs(5)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    recycled.sort_unstable();
+    assert_eq!(recycled, [0, 1, 2]);
+    assert_eq!(slots.free.lock().unwrap().len(), 4);
+    Ok(())
+}
+
+#[test]
 fn split_cancel_and_shutdown_recycle_prepared_and_queued_jobs() -> TestResult {
     let (entered, started) = mpsc::channel();
     let (release, resume) = mpsc::sync_channel(1);
