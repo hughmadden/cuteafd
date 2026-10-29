@@ -60,7 +60,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 4096)]
     pub max_output: u32,
     /// Sequences decoding at once (each holds two KDA state slots).
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]

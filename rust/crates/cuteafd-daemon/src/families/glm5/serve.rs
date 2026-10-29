@@ -50,7 +50,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 4096)]
     pub max_output: u32,
     /// Sequences decoding at once (at most the decode programs' 64 rows).
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]

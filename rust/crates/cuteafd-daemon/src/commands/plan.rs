@@ -1159,23 +1159,26 @@ mod tests {
             "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
                 "selector_rank":256, "block_size":8}});
         for command in ["serve-glmf", "serve-glm", "serve-mimo"] {
-            for concurrency in [1usize, 16, 32] {
+            for concurrency in [0usize, 1, 16, 32] {
                 for extra in [vec![], vec!["--draft-sequences", "8"],
                     vec!["--draft-sequences", "8", "--draft-context-slots", "40"]] {
                     let count = concurrency.to_string();
+                    let family = match command { "serve-glmf" => "glm5_flash", "serve-glm" => "glm5", _ => "mimo_v2" };
                     let plan = crate::cli::Cli::try_parse_from(
                         ["cuteafd", "plan", "/not-read", "--layout", "--concurrency", &count]
                             .into_iter().chain(extra.iter().copied())).unwrap();
                     let crate::cli::Commands::Plan(args) = plan.command else { unreachable!() };
                     let layout = options(&args).unwrap().layout.unwrap();
-                    let serving = crate::cli::Cli::try_parse_from(
-                        ["cuteafd", command, "--snapshot", "/not-read", "--native-lib", "/not-loaded",
-                            "--max-sequences", &count].into_iter().chain(extra.iter().copied())).unwrap();
+                    let resolved = layout.resolved_concurrency(family) as usize;
+                    let mut argv = vec!["cuteafd", command, "--snapshot", "/not-read", "--native-lib", "/not-loaded"];
+                    if concurrency > 0 { argv.extend(["--max-sequences", &count]); }
+                    let serving = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
                     let (planned, started) = match serving.command {
                         crate::cli::Commands::ServeGlmf(args) => {
-                            let (slots, batch) = glm::flash_serving_draft_limits(concurrency,
+                            let (slots, batch) = glm::flash_serving_draft_limits(resolved,
                                 layout.glm_draft_sequences() as usize, layout.draft_context_slots.map(|n| n as usize));
                             let planned = glm::flash_draft_capacity(&config, slots, batch).unwrap();
+                            assert_eq!(resolved, args.max_sequences);
                             let (slots, batch) = crate::families::glm5_flash::serve::draft_capacity(
                                 args.max_sequences, args.engine.draft_sequences, args.engine.draft_context_slots);
                             let started = glm::flash_draft_capacity(&config, slots, batch).unwrap();
@@ -1183,8 +1186,9 @@ mod tests {
                             (planned.block_rows, started.block_rows)
                         }
                         crate::cli::Commands::ServeGlm(args) => {
+                            assert_eq!(resolved, args.max_sequences);
                             let batch = layout.glm_draft_sequences() as usize;
-                            let slots = glm::serving_draft_context_slots(batch, concurrency,
+                            let slots = glm::serving_draft_context_slots(batch, resolved,
                                 layout.draft_context_slots.map(|n| n as usize));
                             let startup_slots = glm::serving_draft_context_slots(args.engine.draft_sequences,
                                 args.max_sequences, args.engine.draft_context_slots);
@@ -1194,8 +1198,9 @@ mod tests {
                             (planned.block_rows, started.block_rows)
                         }
                         crate::cli::Commands::ServeMimo(args) => {
-                            let batch = layout.mimo_draft_sequences().max(layout.concurrency);
-                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings.max(layout.concurrency),
+                            assert_eq!(resolved, args.max_sequences);
+                            let batch = layout.mimo_draft_sequences().max(resolved as u64);
+                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings.max(resolved as u64),
                                 layout.draft_context_slots);
                             let startup_batch = args.engine.draft_sequences.max(args.max_sequences);
                             let startup_slots = mimo::mimo_draft_context_slots(startup_batch as u64,
@@ -1209,7 +1214,11 @@ mod tests {
                         _ => unreachable!(),
                     };
                     assert_eq!(planned, started, "{command} {concurrency} {extra:?}");
-                    let charge = |rows| ProjectionScratchLayout::new(4096, 154880, rows).unwrap().bytes().unwrap();
+                    let charge = |rows| if command == "serve-mimo" {
+                        // MiMo borrows a BF16/FP8 head, not K6: F32 logits plus fixed GEMM workspace.
+                        cuteafd_loader::families::mimo_v2::admission::allocation_bytes("draft.workspace.logits",
+                            &[rows, 154880, 4]).unwrap() as usize + (4 << 20)
+                    } else { ProjectionScratchLayout::new(4096, 154880, rows).unwrap().bytes().unwrap() };
                     assert_eq!(charge(planned), charge(started), "{command} draft head charge");
                     if command == "serve-glmf" && concurrency == 16 && extra.is_empty() {
                         assert_eq!(planned, 128);

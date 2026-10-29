@@ -278,6 +278,8 @@ impl<'a> GlmfEngine<'a> {
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
         }
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
+        ensure!(!device || !matches!(self.weights.head, GlmfHead::K6(_)) || logit_rows <= DECODE_ROWS,
+            "native K6 device prefill logits exceed admitted rows");
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits exceed admitted rows");
         let mut ranked = Vec::new();

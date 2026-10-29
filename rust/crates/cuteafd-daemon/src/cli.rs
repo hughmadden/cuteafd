@@ -418,7 +418,7 @@ pub(crate) struct PlanArgs {
     /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU).
     #[arg(long, value_enum, default_value = "own")]
     pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
-    /// Concurrent sequences for --layout (0: 8 at <=32 GiB logical GPU memory, otherwise 16).
+    /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
     /// The engine's recurrent-state slots for --layout, when they differ from the family's rule
