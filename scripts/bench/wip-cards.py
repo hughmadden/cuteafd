@@ -467,6 +467,25 @@ def serving_turn(jobs, env, wait):
         yield
 
 
+def adopt_roots(arms):
+    """An existing (not --build) arm's root is its coordinator container's /wip
+    mount source, the same root the seal check reads, so the smoke binary and the
+    launch config's WIP_ROOT name the slot that was checked. A build that used a
+    custom WIP_ROOT otherwise resolved to the default wip-<instance> layout."""
+    for arm in arms.values():
+        if 'release' in arm or arm.get('root'):
+            continue
+        container = 'cuteafd-coordinator-wip-' + arm.get('wip_instance', arm['instance'])
+        try:
+            found = subprocess.run(['docker', 'inspect', '-f',
+                                    '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}', container],
+                                   capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if found.returncode == 0 and found.stdout.strip():
+            arm['root'] = found.stdout.strip()
+
+
 def slot_binary(arm):
     """The smoke runner a sealed WIP slot ships: the arm's own coordinator build."""
     root = arm.get('root') or str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + arm.get('wip_instance', arm['instance'])))
@@ -2315,6 +2334,7 @@ def main():
             variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
             build_cards.append(variant)
     build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
+    adopt_roots(arms)
     if args.build_only:
         save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': []})
         return 0

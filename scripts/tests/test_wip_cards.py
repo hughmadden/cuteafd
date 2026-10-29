@@ -2587,3 +2587,31 @@ def test_771_registered_storage_above_threshold_is_not_hidden_by_own_slack():
         sparknest_sent_bytes=600_000_000, sparknest_received_bytes=0)
     reasons = cards.fabric_rerun_reasons([dict(timed=True, ports=[port])])
     assert len(reasons) == 1 and 'SparkNest traffic:' in reasons[0]
+
+
+def test_existing_arm_adopts_its_containers_wip_mount_root(tmp_path, monkeypatch):
+    # A build with a custom WIP_ROOT: the seal check finds it from the container's
+    # /wip mount, so the smoke binary and WIP_ROOT must name that same root.
+    root = tmp_path / 'custom-root'
+    binary = root / 'slots/s/coordinator/workspace/.cuteafd-wip/cuteafd'
+    binary.parent.mkdir(parents=True)
+    binary.write_text('')
+    calls = []
+
+    def inspect(cmd, **kwargs):
+        calls.append(cmd[-1])
+        mounted = cmd[-1] == 'cuteafd-coordinator-wip-shared'
+        return SimpleNamespace(returncode=0 if mounted else 1, stdout=str(root) + '\n' if mounted else '')
+
+    monkeypatch.setattr(cards.subprocess, 'run', inspect)
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    arms = {'base': dict(instance='a', slot='s', wip_instance='shared'),
+            'built': dict(instance='b', slot='s', root='/built/root'),
+            'release': dict(instance='r', slot=None, release='v3.0.1'),
+            'gone': dict(instance='g', slot='s')}
+    cards.adopt_roots(arms)
+    assert arms['base']['root'] == str(root)
+    assert cards.resolve_binary(None, arms['base']) == str(binary)
+    assert arms['built']['root'] == '/built/root'
+    assert 'root' not in arms['release'] and 'root' not in arms['gone']
+    assert calls == ['cuteafd-coordinator-wip-shared', 'cuteafd-coordinator-wip-g']
