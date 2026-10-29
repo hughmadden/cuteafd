@@ -2767,13 +2767,18 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
-        let (placed, graphs, working) = glmf::solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        let (placed, graphs, working) = glmf::solve_attention_working_set_with_graphs(&input, None,
+            2 << 20, false, 188, true).unwrap();
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);
         let spark = !working.spark_layers.is_empty();
         assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, lanes) } else { (0, lanes) });
         let mut admitted = input.clone();
         admitted.graphs = graphs;
+        let home = glmf::embedding_home(&placed) as usize;
+        let embedding_bytes = admitted.resident.iter().map(|rank| rank.embedding).sum();
+        for rank in &mut admitted.resident { rank.embedding = 0; }
+        admitted.resident[home].embedding = embedding_bytes;
         let request = glmf::request_for_working_set(&admitted, &working).unwrap();
         assert_eq!(request.inventory.spark_ranks, working.spark_ranks);
         assert_eq!(request.hops.lanes, working.prefill_lanes);
@@ -4230,6 +4235,61 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
 /// Explicit VISION=spark on a GLM Flash layout whose routed experts never
 /// open a Spark worker. The launcher attaches the encoder to an expert rank,
 /// so the planner refuses instead of inventing a vision-only worker.
+#[test]
+fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(16);
+    cfg["text_config"]["n_routed_experts"] = json!(8);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let mut tensors = glm5_flash_tensors(&cfg);
+    tensors.extend(super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)));
+    let dir = snapshot(cfg, &tensors);
+    let share = dir.path().join("share");
+    let package = dir.path().join("lib/fp8/fp8-glmf");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":{
+        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let manifest = share.join("PROGRAMS.json");
+    std::fs::write(&manifest, json!({"capacities":{"max_context":262144},"programs":programs}).to_string()).unwrap();
+    let options = PlanOptions { vision: MediaMode::Off,
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 262144,
+            workspace_manifest: Some(manifest),
+            pool_tokens: Some(262144), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+        ..sparks(0) };
+    let reference = plan(dir.path(), &options).unwrap();
+    assert!(reference.fits, "{}", render(&reference));
+    let gpu = &reference.memory_layout.as_ref().unwrap().devices[0];
+    let required: u64 = gpu.items.iter().map(|item| item.bytes).sum();
+    let mut constrained = options.clone();
+    let layout = constrained.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![required + layout.headroom_bytes + (256 << 20)];
+    layout.pool_tokens = None;
+    let off = plan(dir.path(), &constrained).unwrap();
+    assert!(off.fits, "{}", render(&off));
+    let auto = plan(dir.path(), &PlanOptions { vision: MediaMode::Auto, ..constrained.clone() }).unwrap();
+    assert!(auto.fits && auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.vision, MediaMode::Auto);
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    assert!(auto.encoder.as_ref().unwrap().reason.contains("pool floor"));
+    assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
+    assert!(auto.memory_layout.as_ref().unwrap().devices.iter().flat_map(|device| &device.items)
+        .all(|item| !item.group.starts_with("vision ")));
+    let strict = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..constrained }).unwrap();
+    assert!(!strict.fits && !strict.placement_supported, "{}", render(&strict));
+    assert!(strict.hints.iter().any(|hint| hint.what.contains("floor")), "{:?}", strict.hints);
+}
+
 #[test]
 fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
     use super::encoder::EncoderKind;

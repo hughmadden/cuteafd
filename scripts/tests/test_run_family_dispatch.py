@@ -813,12 +813,14 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           program_manifest: dict | None = None,
                           launcher_source: Path | None = None,
                           deployment_overrides: dict | None = None,
-                          probe_fails: bool = False) -> subprocess.CompletedProcess[str]:
+                          probe_fails: bool = False, root_launcher: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
+    if root_launcher:
+        copy_input(ROOT / "run.sh", repo / "run.sh")
     copy_input(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
@@ -998,7 +1000,7 @@ print(json.dumps(deployment))
     # behind the launcher when it exits.
     stdout_path, stderr_path = tmp_path / "launch.stdout", tmp_path / "launch.stderr"
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-        completed = subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
+        completed = subprocess.run(["bash", str(repo / "run.sh" if root_launcher else repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
                                     *(["--restart"] if restart else []), *extra_args],
                                    env=env, stdout=stdout, stderr=stderr, timeout=30)
 
@@ -4006,3 +4008,23 @@ def test_dense_qwen_forwards_speculation_trace(tmp_path: Path) -> None:
     assert f"CUTEAFD_SPECULATION_TRACE={trace}" in launch
     assert f"{trace.parent}:{trace.parent}" in launch
 
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_glmf_max_root_launcher_auto_vision_uses_planned_peer(tmp_path: Path, dry_run: bool) -> None:
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 0,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": 1}, "replicas": []}}
+    result = _family_launch_result(tmp_path, GLMF_VISION,
+        "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
+        "RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nVISION=auto\nPOOL_TOKENS=auto\n",
+        encoder_plan=plan, root_launcher=True, extra_args=("--dry-run",) if dry_run else ())
+    assert result.returncode == 0, result.stderr
+    if dry_run:
+        assert "serve-glmf --snapshot" not in result.stderr
+        assert "docker run -d" not in result.stderr
+    else:
+        serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf --snapshot" in line)
+        assert "--vision rtx:1" in serve
+        assert "--split-device 1" in serve
+        assert "--local-experts" in serve

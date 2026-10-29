@@ -63,6 +63,16 @@ pub fn default_encoder_placement(hardware: &EncoderHardware, weights: u64, scrat
     encoder_placement(MediaMode::Auto, hardware, weights, scratch, 1)
 }
 
+/// Logical RTX owner for the planner and direct serving defaults. Explicit
+/// indices are validated by the caller against its own device namespace.
+pub fn rtx_encoder_gpu(mode: MediaMode, v41: bool, gpus: usize) -> usize {
+    match mode {
+        MediaMode::Rtx(Some(gpu)) => gpu,
+        _ if v41 => 0,
+        _ => gpus.saturating_sub(1),
+    }
+}
+
 pub fn encoder_placement(mode: MediaMode, hardware: &EncoderHardware, weights: u64, scratch: u64, copies: usize) -> EncoderPlacement {
     let required = weights.saturating_add(scratch);
     let off = |reason: &str, shortfall| EncoderPlacement {
@@ -99,11 +109,7 @@ pub fn encoder_placement(mode: MediaMode, hardware: &EncoderHardware, weights: u
             return off("requested Spark encoder/replicas unavailable", spark_required.saturating_add(GIB).saturating_sub(room));
         }
     }
-    let preferred = match mode {
-        MediaMode::Rtx(Some(gpu)) => gpu,
-        _ if hardware.v41 => 0,
-        _ => hardware.gpus.len().saturating_sub(1),
-    };
+    let preferred = rtx_encoder_gpu(mode, hardware.v41, hardware.gpus.len());
     if let Some(gpu) = hardware.gpus.get(preferred) {
         if gpu.free_bytes >= required.saturating_add(gpu.kv_target_bytes) {
             return make(EncoderKind::Rtx { gpu: preferred }, vec![], "RTX: KV target preserved after tower + scratch admission");
@@ -120,6 +126,20 @@ mod tests {
         EncoderHardware { v41: false, gpus: (0..gpus).map(|_| EncoderGpuBudget { free_bytes: gib * GIB, kv_target_bytes: 8 * GIB }).collect(),
             sparks: (0..sparks).map(|rank| EncoderSparkBudget { rank, host: format!("spark{rank}"), idle: false, expert_bytes: (10 - rank as u64) * GIB, free_bytes: 20 * GIB }).collect() }
     }
+    #[test]
+    fn rtx_default_owner_matches_placement_policy() {
+        for gpus in [1, 2] {
+            for mode in [MediaMode::Auto, MediaMode::Rtx(None), MediaMode::Rtx(Some(0))] {
+                for v41 in [false, true] {
+                    let mut hardware = hw(gpus, 0, 96);
+                    hardware.v41 = v41;
+                    assert_eq!(encoder_placement(mode, &hardware, GIB, GIB, 1).kind,
+                        EncoderKind::Rtx { gpu: rtx_encoder_gpu(mode, v41, gpus) });
+                }
+            }
+        }
+    }
+
     #[test]
     fn g9_hardware_matrix_and_fallback() {
         for (gpus, gib) in [(1, 96), (2, 96), (1, 32)] {

@@ -533,6 +533,38 @@ pub fn solve_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: boo
 pub fn solve_attention_working_set_with_graphs(i: &GlmfInputs<'_>,
     alternate_resident: Option<&[GlmfResidentRank]>, target: u64, automatic_context: bool,
     sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
+    let original = solve_attention_owner_with_graphs(i, alternate_resident, target, automatic_context, sms, rtx_experts);
+    if i.gpus.len() != 2 || i.resident.len() != 2 || i.resident[0].embedding == 0
+        || i.resident[1].embedding != 0 || alternate_resident.is_some_and(|resident| resident.len() != 2) {
+        return original;
+    }
+    // Price both homes with all weights, graphs, draft scratch and experts in
+    // place. Pre-weight free memory alone misses asymmetric runtime costs.
+    let mut alternate = i.clone();
+    alternate.resident[1].embedding = alternate.resident[0].embedding;
+    alternate.resident[0].embedding = 0;
+    let alternate_resident = alternate_resident.map(|resident| {
+        let mut resident = resident.to_vec();
+        resident[1].embedding = resident[0].embedding;
+        resident[0].embedding = 0;
+        resident
+    });
+    let candidate = solve_attention_owner_with_graphs(&alternate, alternate_resident.as_deref(),
+        target, automatic_context, sms, rtx_experts);
+    select_attention_working_set(i.onboard, original, candidate)
+}
+
+/// The fixed embedding demand is also the executor's immutable table home.
+/// Host-mapped tables have no device demand and retain the entry GPU's alias.
+pub fn embedding_home(placed: &Placement) -> u8 {
+    placed.items.iter().position(|items| items.iter().any(|item|
+        item.category == Category::Embedding && item.group == "embedding" && item.bytes > 0))
+        .unwrap_or(0) as u8
+}
+
+fn solve_attention_owner_with_graphs(i: &GlmfInputs<'_>,
+    alternate_resident: Option<&[GlmfResidentRank]>, target: u64, automatic_context: bool,
+    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
     let Some(resident) = alternate_resident else {
         return solve_working_set_with_graphs(i, target, automatic_context, sms, rtx_experts);
     };
@@ -1674,7 +1706,9 @@ mod tests {
             assert_eq!(planned.0.movables, [(MovableId::Drafter, 0)]);
             let selected = solve_attention_working_set_with_graphs(&input, Some(&alternate.resident),
                 2 << 20, false, 188, true).unwrap();
-            assert_eq!(selected.0, planned.0);
+            assert_eq!(placed_attention(input.attention, &selected.0).first_owner, expected);
+            assert!(attention_owner_score(input.onboard, &selected.0).unwrap()
+                >= attention_owner_score(input.onboard, &planned.0).unwrap());
             let mut measured_input = input.clone();
             for (capacity, baseline) in &mut measured_input.gpus {
                 let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
@@ -1688,6 +1722,54 @@ mod tests {
                 let bytes: u64 = planned.0.items[rank].iter().filter(|i| i.group == "target weights")
                     .map(|i| i.bytes).sum();
                 assert_eq!(bytes, resident[rank].weights);
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_home_equalizes_complete_inventory_and_matches_measured_admission() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for requested in [None, Some(262_144)] {
+            for expected in [0, 1] {
+                let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+                input.spark_ranks = 0;
+                input.requested_pool = requested;
+                input.graphs = GraphSet::budget(&[64 << 20; 2]);
+                // Include a cold tower/foreign reservation in the sampled baseline,
+                // not a device-index preference. Reverse it to reverse the home.
+                let busy = 1 - expected;
+                let Baseline::Planned { loaded_bytes, .. } = &mut input.gpus[busy].1 else { unreachable!() };
+                *loaded_bytes += 8 << 30;
+                let (planned, _, _) = solve_attention_working_set_with_graphs(&input, None,
+                    2 << 20, false, 188, true).unwrap();
+                assert_eq!(embedding_home(&planned), expected as u8);
+                assert_eq!(planned.movables, [(MovableId::Drafter, 0)]);
+                let bytes = input.resident[0].embedding;
+                for rank in 0..2 {
+                    let charged: u64 = planned.items[rank].iter().filter(|item|
+                        item.category == Category::Embedding).map(|item| item.bytes).sum();
+                    assert_eq!(charged, if rank == expected { bytes } else { 0 });
+                }
+                let mut sampled = input.clone();
+                for (capacity, baseline) in &mut sampled.gpus {
+                    let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+                    *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
+                }
+                let (runtime, _, _) = solve_attention_working_set_with_graphs(&sampled, None,
+                    2 << 20, false, 188, true).unwrap();
+                assert_eq!(runtime, planned);
+                if expected == 1 {
+                    let baseline = solve_attention_owner_with_graphs(&input, None,
+                        2 << 20, false, 188, true).unwrap().0;
+                    assert!(attention_owner_score(input.onboard, &planned).unwrap()
+                        > attention_owner_score(input.onboard, &baseline).unwrap());
+                }
+                input.resident[0].embedding = 0;
+                let host = solve_attention_working_set_with_graphs(&input, None,
+                    2 << 20, false, 188, true).unwrap().0;
+                assert_eq!(embedding_home(&host), 0);
+                assert!(host.items.iter().flatten().filter(|item| item.category == Category::Embedding)
+                    .all(|item| item.bytes == 0));
             }
         }
     }
@@ -1741,9 +1823,21 @@ mod tests {
                 else { cache::GlmfIndexCache::Compact };
             let original = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
             let placed = solve_attention_working_set_with_graphs(&input, None, 2 << 20, false, 188, true).unwrap();
-            assert_eq!(original.0, placed.0);
+            let mut peer = input.clone();
+            peer.resident[1].embedding = peer.resident[0].embedding;
+            peer.resident[0].embedding = 0;
+            let candidate = solve_working_set_with_graphs(&peer, 2 << 20, false, 188, true).unwrap();
+            let expected = select_attention_working_set(input.onboard, Ok(original), Ok(candidate)).unwrap();
+            assert_eq!(expected.0, placed.0);
             assert_eq!(placed_attention(input.attention, &placed.0), input.attention);
             assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&input.resident),
+                2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));
+        }
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.attention.mode = AttentionPlacement::Layers;
+        for count in [0, 1, 3] {
+            let malformed = vec![input.resident[0].clone(); count];
+            assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&malformed),
                 2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));
         }
     }

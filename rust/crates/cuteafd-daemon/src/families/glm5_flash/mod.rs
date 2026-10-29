@@ -2055,9 +2055,16 @@ impl Opened {
             })
         };
         let embed = self.embed_source()?;
+        let embedding_rank = cuteafd_loader::placement::families::glm5_flash::embedding_home(&placement) as usize;
+        let embedding_device = crate::shared::memory::device::Device { library: &self.library,
+            id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
+        // Gather still runs on the entry GPU: peer access reads only the selected
+        // token rows, not a second resident table. The drafter borrows it too.
         // Admission is complete; overlap the drafter read with pushed expert/dense operands.
         let draft_read = args.draft.as_deref().map(dspark::DraftRead::start).transpose()?;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
+            let load_embedding = || embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
+                &self.library, embed.clone(), args.token_io.embed_placement, || Ok(())));
             let (pushed, loaded) = match coordinator_push.take() {
                 Some((push, sparks, devices, (model, operands, steps, dense))) => {
                     // The planned dense operands (and the TP2 halves) arrive in one
@@ -2065,10 +2072,7 @@ impl Opened {
                     let catalog = self.experts.as_ref().filter(|_| !tp2_layers.is_empty());
                     // Receive (or fallback fill) through landing: the dense load's wall time.
                     let split = crate::shared::memory::load_timing::Split::start();
-                    let (pushed, embedding) = push.receive_with(devices, catalog, sparks, Some(Ok(dense)), || {
-                        crate::shared::token_io::TokenEmbedding::load(&self.library, embed, args.token_io.embed_placement,
-                            || Ok(()))
-                    });
+                    let (pushed, embedding) = push.receive_with(devices, catalog, sparks, Some(Ok(dense)), load_embedding);
                     let pushed = pushed?;
                     let (embedding, ()) = embedding?;
                     if pushed.is_none() {
@@ -2087,15 +2091,24 @@ impl Opened {
                     };
                     (pushed, (embedding, model))
                 }
-                None => (None, crate::shared::token_io::TokenEmbedding::load(&self.library, embed,
+                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library, embed.clone(),
                     args.token_io.embed_placement, || {
-                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        loader.model(&self.cfg, &execution)
-                    })?),
+                        crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
+                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                            loader.model(&self.cfg, &execution)
+                        })
+                    }))?),
             };
             let tp2 = if tp2_layers.is_empty() { None } else { Some(tp2_weights(pushed)?) };
             Ok((loaded.0, (loaded.1, tp2)))
         })?;
+        ensure!(embedding.owner().id == embedding_device.id
+            && embedding.device_bytes() as u64 == placement.items[embedding_rank].iter()
+                .filter(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
+                    && item.group == "embedding" && item.bytes > 0)
+                .map(|item| item.bytes).sum::<u64>(), "GLM Flash embedding differs from admitted owner/bytes");
+        tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
+            "GLM Flash embedding matches admission (peer-readable single residency)");
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
