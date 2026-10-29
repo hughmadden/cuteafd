@@ -1045,11 +1045,30 @@ mod tests {
         distributed_prefill_fixture(true)
     }
 
+    fn packed_reference_windows() -> Result<Vec<cuteafd_bench::reference::Window>> {
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+        let manifest = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let reference = cuteafd_bench::fidelity_dataset::load(&root, &manifest)?;
+        ensure!(reference.checkpoint == "deepseek-ai/DeepSeek-V4.1-Flash-1017" && reference.vocab == 129280,
+            "packed fixture requires the published V4.1 reference");
+        ["c00", "c04", "c08"].iter().map(|id| {
+            let mut window = reference.windows.iter().find(|w| w.id == *id)
+                .with_context(|| format!("missing short reference window {id}"))?.clone();
+            ensure!(window.media.is_empty() && window.positions.len() >= 20
+                && window.positions[19].pos <= 1024, "reference window does not fit packed fixture");
+            window.positions.truncate(20);
+            Ok(window)
+        }).collect()
+    }
+
     fn distributed_prefill_fixture(packed_check: bool) -> Result<()> {
         use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let snapshot = std::env::var("CUTEAFD_SNAPSHOT")?;
+        let packed_windows = if packed_check { Some(packed_reference_windows()?) } else { None };
+        let unit_rows = if packed_check { 2048 } else { 16 };
+        let reserve_rows = 2 * unit_rows;
         let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot),
         )?;
         lib.cuda_set_device(0)?;
@@ -1122,7 +1141,7 @@ mod tests {
         })?;
         eprintln!("loading all 20 encoder expert layers as TP2");
         let routed = tp2_ffn::load_routed_weights(
-            devices, &catalog, 20, 16, [73_000_000_000; 2],
+            devices, &catalog, 20, unit_rows, [73_000_000_000; 2],
         )?;
         let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = [0, 1]
             .map(|r| {
@@ -1213,18 +1232,18 @@ mod tests {
             }
             Ok(pass)
         };
-        // Two prefill slots on one storage set per GPU (reserve 32, unit 16),
+        // Two prefill slots on one storage set per GPU (reserve = 2 * unit, unit conditional on reference fixture),
         // as serve assembles them (`shared::memory::row_window`).
         let slot_storage = || -> Result<_> {
             let both = [0, 1];
             Ok((
-                [devices[0].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, 32, 16, &both))?,
-                 devices[1].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, 32, 16, &both))?],
-                [IndexLane::storage_on_device(&iw, 32, 16, 0, &both)?, IndexLane::storage_on_device(&iw, 32, 16, 1, &both)?],
-                crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(&lib, map, 32, 16)?,
-                devices[0].own(|| TargetEmbeddingWave::storage(&lib, 32, 16))?,
-                PlacedEngram::storage(&ew, 32, 16)?,
-                devices[1].own(|| TargetTapWave::storage(&lib, 32, 16))?,
+                [devices[0].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, reserve_rows, unit_rows, &both))?,
+                 devices[1].own(|| crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, reserve_rows, unit_rows, &both))?],
+                [IndexLane::storage_on_device(&iw, reserve_rows, unit_rows, 0, &both)?, IndexLane::storage_on_device(&iw, reserve_rows, unit_rows, 1, &both)?],
+                crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(&lib, map, reserve_rows as usize, unit_rows as usize)?,
+                devices[0].own(|| TargetEmbeddingWave::storage(&lib, reserve_rows as usize, unit_rows as usize))?,
+                PlacedEngram::storage(&ew, reserve_rows as usize, unit_rows as usize)?,
+                devices[1].own(|| TargetTapWave::storage(&lib, reserve_rows as usize, unit_rows as usize))?,
             ))
         };
         let (lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage) = slot_storage()?;
@@ -1259,8 +1278,8 @@ mod tests {
             &std::path::Path::new(&snapshot).join("tokenizer.json"),
         )?;
         let pipeline =
-            unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, cuteafd_loader::EngramStagingShape::new(16, 2)?, 0)? };
-        let pages = [4, 4, 4, 8];
+            unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, cuteafd_loader::EngramStagingShape::new(unit_rows as usize, 2)?, 0)? };
+        let pages = if packed_check { BackboneCache::pages_for_context(2, 1024)? } else { [4, 4, 4, 8] };
         let mut requests = Requests::new_distributed(
             &lib,
             pipeline,
@@ -1280,7 +1299,7 @@ mod tests {
         // the Sparks, two prefill units) before any link. Endpoints admit the
         // decode owners' verify width (64 rows); the fixture's 16-row links fit.
         crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(std::path::Path::new(&snapshot),
-            &catalog, 20, peers.len(), cuteafd_core::V41_VERIFY_ROWS as u32, 2,
+            &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2,
             // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
             Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
@@ -1485,29 +1504,47 @@ mod tests {
         // The prefill slots: two passes on shared storage; slot 0's FFN owner
         // holds the one prefill link (execution lane 2), two return slots of
         // 16 rows; one TP2 FFN arena for both (reserve 32, unit 16).
-        let ffn_storage = tp2_ffn::Storage::new(routed, shared, 20, 32, 16, [None, None])?;
+        let ffn_storage = tp2_ffn::Storage::new(routed, shared, 20, reserve_rows, unit_rows, [None, None])?;
         let link = devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
-            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16,
-                crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 2)?, 2, 16))?;
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, unit_rows,
+                crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 2)?, 2, unit_rows))?;
         let mut slot_transports = [devices[1].own(|| NativeTp4Wave::with_link(&lib, link.into_inner()))?,
-            devices[1].own(|| NativeTp4Wave::unlinked(&lib, 16))?];
+            devices[1].own(|| NativeTp4Wave::unlinked(&lib, unit_rows))?];
         for transport in &mut slot_transports { transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?; }
         devices[1].run(|| slot_transports[0].get_mut().bootstrap(20, nvfp4))?;
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
             slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
         };
-        if packed_check {
+        if let Some(windows) = packed_windows {
             use clap::Parser;
+            let rows = unit_rows.to_string();
             let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-native", "--snapshot", &snapshot,
-                "--native-lib", &std::env::var("CUTEAFD_NATIVE_LIB")?, "--prefill-batch-tokens", "16",
+                "--native-lib", &std::env::var("CUTEAFD_NATIVE_LIB")?, "--prefill-batch-tokens", &rows,
                 "--prefill-waves", "2", "--prefill-packing", "unrestricted"])?;
             let crate::cli::Commands::ServeNative(args) = cli.command else { unreachable!() };
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
-                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
-            return crate::families::deepseek_v41::v41_native_serve::scheduler::exercise_packed_prefill(
-                &lib, &runtime, &mut requests, &mut prefill_slots, &args,
-                &[&prompt[..3], &prompt], Some(draft.get_mut()));
+                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], unit_rows, 2)?;
+            let samples: Vec<_> = (0..20).flat_map(|sample| windows.iter().map(move |window|
+                (window, window.positions[sample].pos))).collect();
+            let mut scored = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for pack in samples.chunks(2) {
+                let rows = crate::families::deepseek_v41::v41_native_serve::scheduler::exercise_packed_prefill(
+                    &lib, &runtime, &mut requests, &mut prefill_slots, &args, pack, Some(draft.get_mut()))?;
+                for ((window, _), row) in pack.iter().zip(rows) {
+                    scored.entry(window.id.clone()).or_default().push(row);
+                }
+            }
+            let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Strict.bars();
+            for window in windows {
+                let fidelity = window.score(scored.get(&window.id).context("missing packed reference rows")?);
+                eprintln!("V4.1 packed/reference window={} positions={} KL={:.8} top1={:.6}",
+                    window.id, fidelity.positions, fidelity.kl, fidelity.top1);
+                ensure!(fidelity.positions == 20 && fidelity.missing == 0 && fidelity.non_finite == 0
+                    && fidelity.kl <= kl_max && fidelity.top1 >= top1_min,
+                    "packed/reference window {} failed strict fidelity: {fidelity:?}", window.id);
+            }
+            return Ok(());
         }
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;

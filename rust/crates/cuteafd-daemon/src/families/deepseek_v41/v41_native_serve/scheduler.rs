@@ -248,12 +248,50 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
 type PackedAdmission = (admission::Prepared, u64, CacheLease, usize, ImageKeys,
     Option<(usize, Option<RetainedScores>)>, (Instant, Instant));
 
+fn native_coordinator_exact_cap(manifest: &serde_json::Value) -> Result<usize> {
+    use crate::shared::prefill_packing::{validate_program_inventory, ProgramRows::*};
+    // The projection catalogue is NativePrograms' V41_FP8_AOT manifest, not
+    // generic PROGRAMS.json. Native ABI operations also have explicit roles.
+    let inventory = [
+        ("engram", PackedRows), ("ffn_up", PackedRows), ("ffn_down", PackedRows),
+        ("main", PackedRows), ("q_a", PackedRows), ("q_b", PackedRows),
+        ("kv", PackedRows), ("o_b", PackedRows), ("o_a", PackedRows),
+        ("index_q", PackedRows), ("q_b_tp2", PackedRows), ("o_b_tp2", PackedRows),
+        ("ffn_tp2_up", PackedRows), ("ffn_tp2_down", PackedRows),
+        ("hc_project", PackedRows), ("hc_lagged", PackedRows),
+        ("embedding", PackedRows), ("router", PackedRows), ("expert_input_quantizer", PackedRows),
+        ("attention_ops", PackedRows), ("engram_gate", PackedRows),
+        ("vocabulary_head", PackedRows), ("target_taps", PackedRows),
+        ("sparse_attention", SequenceLocal), ("index_scores", SequenceLocal),
+        ("index_topk", SequenceLocal), ("candidate_blocks", SequenceLocal),
+        ("compressor", SequenceLocal), ("compressed_kv", SequenceLocal), ("window_kv", SequenceLocal),
+    ];
+    let native_ops = ["embedding", "router", "expert_input_quantizer", "attention_ops", "engram_gate",
+        "vocabulary_head", "target_taps", "sparse_attention", "index_scores", "index_topk",
+        "candidate_blocks", "compressor", "compressed_kv", "window_kv"];
+    let mut required = manifest["projections"].as_array().context("missing native projection catalogue")?
+        .iter().map(|p| p["name"].as_str().context("missing native projection name"))
+        .collect::<Result<Vec<_>>>()?;
+    for name in ["hc_project", "hc_lagged"] {
+        ensure!(manifest[name].is_object(), "missing native program {name}");
+        required.push(name);
+    }
+    required.extend(native_ops);
+    validate_program_inventory(required, &inventory)?;
+    // No native ABI route attestation exists for ANY of these owners yet.
+    // Manifest scratch/capacity recipes are not arithmetic-route guarantees.
+    Ok(NATIVE_COORDINATOR_EXACT_CAP)
+}
+
+const NATIVE_EXPERT_EXACT_CAP: usize = 0;
+const NATIVE_COORDINATOR_EXACT_CAP: usize = 0;
+
 fn packing_limits(mode: crate::shared::prefill_packing::PackingMode, rows: usize,
-    max_context: usize, taps: Option<usize>) -> crate::shared::prefill_packing::Limits {
+    max_context: usize, taps: Option<usize>, coordinator_cap: usize) -> crate::shared::prefill_packing::Limits {
     // Native V4.1 owners expose traffic groups, not arithmetic-route attestation.
     // Until that ABI is attested, exact packs must fail closed to singletons.
     crate::shared::prefill_packing::Limits {
-        rows: if mode == crate::shared::prefill_packing::PackingMode::Exact { 0 } else { rows },
+        rows: if mode == crate::shared::prefill_packing::PackingMode::Exact { rows.min(coordinator_cap).min(NATIVE_EXPERT_EXACT_CAP) } else { rows },
         chunk_rows: rows, max_context, taps,
     }
 }
@@ -269,7 +307,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
     use crate::shared::prefill_packing;
     let mut out = std::collections::BTreeMap::new();
     let limits = packing_limits(args.prefill_packing, args.prefill_batch_tokens as usize,
-        args.max_context_tokens as usize, draft.as_ref().map(|d| d.prefill_tap_capacity()));
+        args.max_context_tokens as usize, draft.as_ref().map(|d| d.prefill_tap_capacity()), NATIVE_COORDINATOR_EXACT_CAP);
     let eligible: Vec<_> = admitted.iter().enumerate().filter_map(|(i, (prepared, _, lease, _, _, hit, _))| {
         (hit.is_none() && prepared.images.is_empty() && !prepared.prompt.is_empty()
             && prepared.prompt.len() <= limits.chunk_rows
@@ -348,11 +386,12 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
     lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
     prefill: &mut super::prefill_target::PrefillSlots<'a,
         crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>>,
-    args: &crate::cli::NativeServeArgs, prompts: &[&[u32]],
+    args: &crate::cli::NativeServeArgs, samples: &[(&cuteafd_bench::reference::Window, usize)],
     mut draft: Option<&mut DraftRuntime<'w, 'a,
         crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain<'w, 'a>>>,
-) -> Result<()> {
+) -> Result<Vec<cuteafd_api::openai::probe::ProbeRow>> {
     type P<'w, 'a> = crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>;
+    let prompts: Vec<_> = samples.iter().map(|(window, position)| &window.tokens[..*position]).collect();
     let mut prefixes = PrefixCache::disabled();
     let mut receivers = Vec::new();
     let mut admitted = Vec::new();
@@ -379,7 +418,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
     }
     let mut agree = 0;
     let mut kl_sum = 0.0;
-    let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Strict.bars();
+    let mut reference_rows = Vec::new();
     for (member, (prepared, id, _, slot, _, _, _)) in admitted.into_iter().enumerate() {
         let lease = requests.admit(slot, id)?;
         if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
@@ -388,6 +427,9 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         let packed = packed.remove(&member).context("missing packed hardware result")??;
         let (a, b) = (alone.logits()?, packed.logits()?);
         ensure!(a.iter().chain(&b).all(|x| x.is_finite()), "nonfinite packed comparison");
+        let (window, position) = samples[member];
+        let wanted = window.want().remove(&position).context("missing published reference position")?;
+        reference_rows.push(cuteafd_api::openai::probe::summarize(position, &b, 1, &wanted));
         let log_probs = |values: &[f32]| {
             let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
             let norm = values.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln() + max;
@@ -396,17 +438,15 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         let (a, b) = (log_probs(&a), log_probs(&b));
         let kl = a.iter().zip(&b).map(|(&a, &b)| a.exp() * (a - b)).sum::<f64>();
         let same = alone.select(None)? == packed.select(None)?;
-        eprintln!("V4.1 packed member={member} rows={} KL={kl:.8} top1={same}", prepared.prompt.len());
-        ensure!(kl <= kl_max, "packed member {member} KL {kl} exceeds strict {kl_max}");
+        eprintln!("V4.1 packed/singleton informational member={member} window={} rows={} KL={kl:.8} top1={same}", window.id, prepared.prompt.len());
         kl_sum += kl;
         agree += usize::from(same);
         requests.release_if_present(lease)?;
         if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
     }
     let top1 = agree as f64 / prompts.len() as f64;
-    eprintln!("V4.1 packed {} prompts: mean KL={:.8} top1={top1:.6}", prompts.len(), kl_sum / prompts.len() as f64);
-    ensure!(top1 >= top1_min, "packed top1 {top1} below strict {top1_min}");
-    Ok(())
+    eprintln!("V4.1 packed/singleton informational {} prompts: mean KL={:.8} top1={top1:.6}", prompts.len(), kl_sum / prompts.len() as f64);
+    Ok(reference_rows)
 }
 
 /// Serve until the request channel closes, prefilling each prompt whole at admission.
@@ -421,6 +461,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
+    if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact {
+        let manifest = cuteafd_loader::placement::families::deepseek_v41::owners::native_manifest(
+            &args.native_lib, "V41_FP8_AOT.json")?;
+        ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
+            "native coordinator exact cap differs from validated inventory");
+    }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
@@ -2234,7 +2280,7 @@ mod sampling_tests {
         use crate::shared::prefill_packing::{groups, plan, PackingMode};
         let chunks = [(0, 29), (0, 40), (0, 129), (0, 7)];
         let split = |mode, taps| {
-            let limits = packing_limits(mode, 256, 1048576, taps);
+            let limits = packing_limits(mode, 256, 1048576, taps, NATIVE_COORDINATOR_EXACT_CAP);
             groups(chunks.len(), |range| plan(&chunks[range], &limits).is_ok())
         };
         assert_eq!(split(PackingMode::Unrestricted, None), [0..4]);
@@ -2250,6 +2296,26 @@ mod sampling_tests {
         })?;
         assert_eq!(completed, [0, 1, 2]);
         assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn native_exact_inventory_fails_closed_for_small_member_and_wide_partner() -> Result<()> {
+        use crate::shared::prefill_packing::{groups, plan, PackingMode};
+        let names = ["engram", "ffn_up", "ffn_down", "main", "q_a", "q_b", "kv", "o_b", "o_a",
+            "index_q", "q_b_tp2", "o_b_tp2", "ffn_tp2_up", "ffn_tp2_down"];
+        let mut manifest = serde_json::json!({"projections": names.map(|name| serde_json::json!({"name":name})),
+            "hc_project": {}, "hc_lagged": {}});
+        let cap = native_coordinator_exact_cap(&manifest)?;
+        assert_eq!(cap, 0);
+        let chunks = [(0, 64), (0, 129)];
+        let limits = packing_limits(PackingMode::Exact, 256, 1048576, None, cap);
+        assert_eq!(groups(2, |range| plan(&chunks[range], &limits).is_ok()), [0..1, 1..2]);
+        manifest["projections"].as_array_mut().unwrap().push(serde_json::json!({"name":"new_projection"}));
+        assert!(native_coordinator_exact_cap(&manifest).is_err());
+        manifest["projections"].as_array_mut().unwrap().pop();
+        manifest["projections"].as_array_mut().unwrap().remove(0);
+        assert!(native_coordinator_exact_cap(&manifest).is_err());
         Ok(())
     }
 
