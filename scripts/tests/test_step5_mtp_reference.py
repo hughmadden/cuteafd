@@ -40,7 +40,10 @@ def test_mtp_shared_arena_target_history_and_logits_retire_before_prefill_draft(
 
     # These consumers must remain in the final-chunk branch before the hook that
     # aliases target scratch, including retained prompt/probe rows and selection.
-    chunk = scheduler.split("let finished = prefills.round(|p|", 1)[1].split("p.done += chunk.len();", 1)[0]
+    dispatch = scheduler.split("let finished = prefills.round_packed(", 1)[1]
+    ordered(dispatch, "if group.len() > 1 {", "return prefill_group(",
+            "group.iter_mut().map(|p|")
+    chunk = dispatch.split("group.iter_mut().map(|p|", 1)[1].split("p.done += chunk.len();", 1)[0]
     ordered(chunk, "engine.prefill_device(", "if end == p.tokens.len() {",
             "p.prompt_row = Some(logits.row_host(", "probe::device_rows(",
             "selector.select(&logits, &batch)?", "p.first = Some(take(",
