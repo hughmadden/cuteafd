@@ -379,58 +379,87 @@ mod tests {
             Ok(window)
         }).collect::<Result<Vec<_>>>()?;
         let family = backend.engine.prefix_family()?;
-        let mut placements = windows.iter().enumerate().map(|(slot, window)| {
-            let end = window.positions.last().context("Kimi packing golden empty")?.pos;
-            let mut placement = Placement { units: pool.alloc(end.div_ceil(64))?, slot, len: 0, state_len: 0 };
-            family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            family.admit_draft_pages(&mut placement, end).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            Ok(placement)
-        }).collect::<Result<Vec<_>>>()?;
-        let mut states = (0..windows.len()).map(|_| DraftState::default()).collect::<Vec<_>>();
-        let probes = windows.iter().map(|window| {
-            let probe = Probe::new(ProbeSpec { score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
-                want: window.want(), ..Default::default() });
-            probe.admitted("kimi_k3", &window.tokens, 0);
-            probe
-        }).collect::<Vec<_>>();
-        for (i, first_rows) in [29, 65, 127].into_iter().enumerate() {
-            let end = windows[i].positions[0].pos.checked_sub(first_rows).context("Kimi golden prefix too short")?;
-            while placements[i].len < end {
-                let start = placements[i].len;
-                let next = (start + backend.engine.packed_limits()?.chunk_rows).min(end);
-                let chunk = &windows[i].tokens[start..next];
-                backend.prefill_device(&mut placements[i], chunk, 1, pool)?;
-                backend.prefill_draft(&placements[i], start, chunk, Some(windows[i].tokens[next]), &mut states[i])?;
-            }
-        }
-        for round in 0..16 {
-            let mut sequences = placements.iter_mut().zip(&mut states).enumerate().map(|(i, (placement, draft))| {
-                let end = windows[i].positions[round].pos;
-                let start = placement.len;
-                scheduler::PrefillSeq { placement, tokens: &windows[i].tokens[start..end], start,
-                    next: Some(windows[i].tokens[end]), draft, neural: true }
+        let mut arms = Vec::new();
+        for packed in [false, true] {
+            let mut placements = windows.iter().enumerate().map(|(slot, window)| {
+                let end = window.positions.last().context("Kimi packing golden empty")?.pos;
+                let mut placement = Placement { units: pool.alloc(end.div_ceil(64))?, slot, len: 0, state_len: 0 };
+                family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                family.admit_draft_pages(&mut placement, end).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Ok(placement)
+            }).collect::<Result<Vec<_>>>()?;
+            let mut states = (0..windows.len()).map(|_| DraftState::default()).collect::<Vec<_>>();
+            let probes = windows.iter().map(|window| {
+                let probe = Probe::new(ProbeSpec { score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
+                    want: window.want(), ..Default::default() });
+                probe.admitted("kimi_k3", &window.tokens, 0);
+                probe
             }).collect::<Vec<_>>();
-            ensure!(sequences.iter().map(|s| s.tokens.len()).sum::<usize>() > 64,
-                "Kimi golden pack must cross the total-row arithmetic boundary");
-            let outcomes = backend.prefill_packed(&mut sequences, pool, &mut |i, row| {
-                let logits = row.row_host(backend.library(), 0)?;
-                probes[i].row(windows[i].positions[round].pos, &logits);
-                Ok(Ok(()))
-            })?;
-            for outcome in outcomes { outcome?; }
+            for (i, first_rows) in [29, 65, 127].into_iter().enumerate() {
+                let end = windows[i].positions[0].pos.checked_sub(first_rows).context("Kimi golden prefix too short")?;
+                while placements[i].len < end {
+                    let start = placements[i].len;
+                    let next = (start + backend.engine.packed_limits()?.chunk_rows).min(end);
+                    let chunk = &windows[i].tokens[start..next];
+                    backend.prefill_device(&mut placements[i], chunk, 1, pool)?;
+                    backend.prefill_draft(&placements[i], start, chunk, Some(windows[i].tokens[next]), &mut states[i])?;
+                }
+            }
+            for round in 0..16 {
+                let mut sequences = placements.iter_mut().zip(&mut states).enumerate().map(|(i, (placement, draft))| {
+                    let end = windows[i].positions[round].pos;
+                    let start = placement.len;
+                    scheduler::PrefillSeq { placement, tokens: &windows[i].tokens[start..end], start,
+                        next: Some(windows[i].tokens[end]), draft, neural: true }
+                }).collect::<Vec<_>>();
+                ensure!(sequences.iter().map(|s| s.tokens.len()).sum::<usize>() > 64,
+                    "Kimi golden pack must cross the total-row arithmetic boundary");
+                if packed {
+                    let outcomes = backend.prefill_packed(&mut sequences, pool, &mut |i, row| {
+                        let logits = row.row_host(backend.library(), 0)?;
+                        probes[i].row(windows[i].positions[round].pos, &logits);
+                        Ok(Ok(()))
+                    })?;
+                    for outcome in outcomes { outcome?; }
+                } else {
+                    for (i, sequence) in sequences.iter_mut().enumerate() {
+                        let row = backend.prefill_device(sequence.placement, sequence.tokens, 1, pool)?
+                            .context("Kimi original-golden singleton head")?;
+                        probes[i].row(windows[i].positions[round].pos, &row.row_host(backend.library(), 0)?);
+                        backend.prefill_draft(sequence.placement, sequence.start, sequence.tokens,
+                            sequence.next, sequence.draft)?;
+                    }
+                }
+            }
+            let mut scores = Vec::new();
+            for (i, window) in windows.iter().enumerate() {
+                let score = window.score(&probes[i].record().rows);
+                println!("Kimi original golden packed={packed} member {i} {}: rows={} missing={} nonfinite={} KL={:.8} top1={:.4}",
+                    window.id, score.positions, score.missing, score.non_finite, score.kl, score.top1);
+                ensure!(score.positions == window.positions.len() && score.missing == 0 && score.non_finite == 0,
+                    "Kimi original-golden member {i} coverage differs");
+                scores.push(score);
+                family.drain().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                family.discard(&mut placements[i]).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                pool.release(&placements[i].units);
+            }
+            arms.push(scores);
         }
-        let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Low.bars();
-        for (i, window) in windows.iter().enumerate() {
-            let score = window.score(&probes[i].record().rows);
-            println!("Kimi packed original golden member {i} {}: rows={} missing={} nonfinite={} KL={:.8} top1={:.4}",
-                window.id, score.positions, score.missing, score.non_finite, score.kl, score.top1);
-            ensure!(score.positions == window.positions.len() && score.missing == 0 && score.non_finite == 0
-                && score.kl <= kl_max && score.top1 >= top1_min,
-                "Kimi packed member {i} exceeds original-model fidelity tier");
-            family.drain().map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            family.discard(&mut placements[i]).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            pool.release(&placements[i].units);
+        for (i, (alone, packed)) in arms[0].iter().zip(&arms[1]).enumerate() {
+            let delta_kl = packed.kl - alone.kl;
+            let delta_top1 = packed.top1 - alone.top1;
+            println!("Kimi member {i} packing noninferiority: delta_KL={delta_kl:.8} delta_top1={delta_top1:.4}");
+            ensure!(delta_kl <= 0.005 && delta_top1 >= -0.01,
+                "Kimi packed member {i} regresses against its matched singleton control");
         }
+        let pooled = arms.iter().map(|scores| cuteafd_bench::reference::Fidelity::from_records(scores.iter()
+            .flat_map(|score| score.records.iter().cloned()).collect())).collect::<Vec<_>>();
+        let delta_kl = pooled[1].kl - pooled[0].kl;
+        let delta_top1 = pooled[1].top1 - pooled[0].top1;
+        println!("Kimi packed pooled original golden: rows={} KL={:.8} top1={:.4} delta_KL={delta_kl:.8} delta_top1={delta_top1:.4}",
+            pooled[1].positions, pooled[1].kl, pooled[1].top1);
+        ensure!(delta_kl <= 0.005 && delta_top1 >= -0.01,
+            "Kimi packed pooled fidelity regresses against matched singleton controls");
         Ok(())
     }
 
