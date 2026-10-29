@@ -5565,7 +5565,9 @@ mod prefill_lane_tests {
             // Fork #150 reads each GLM Flash projection's shipped warps from
             // `fp8_gemv_shipped_warps`; a tuning entry moves only the grid, never the warps.
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
-            ("integration/cuteafd/glmf.py", 0xc997a51c631cd643_u64),
+            // Fork c81a39a2/0b9292f1 add a separate prefill-router exporter; decode projection
+            // dispatch, shapes, arithmetic and capacity thresholds are unchanged.
+            ("integration/cuteafd/glmf.py", 0x9384fb38251982be_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
