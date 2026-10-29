@@ -7,6 +7,13 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub(super) const MAX_BATCH: usize = 4096;
+/// io-wq workers per ring, bounded and unbound. Each cold FUSE read blocks a
+/// worker, but the connection's max_background (128 on raptor) and store
+/// daemon (~250 threads) bound useful depth. More workers consume the
+/// container's pids budget, not useful depth: cold reads once exhausted its
+/// 16,384-task limit. Thirty-two per ring leaves ample in-flight reads across
+/// gather pools. Deep O_DIRECT/native store I/O is separate from these reads.
+pub(super) const IOWQ_MAX_WORKERS: u32 = 32;
 thread_local! { static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) }; }
 #[cfg(test)]
 thread_local! { static SETUP_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
@@ -172,7 +179,25 @@ fn new_ring(entries: u32) -> Result<IoUring> {
             std::io::Error::from_raw_os_error(-result),
         ));
     }
+    // Bound io-wq before any buffered read can block; a ring without the
+    // bound is refused (the caller falls back to mmap).
+    let mut workers = [IOWQ_MAX_WORKERS; 2];
+    ring.submitter()
+        .register_iowq_max_workers(&mut workers)
+        .map_err(|error| io("io_uring IOWQ_MAX_WORKERS", error))?;
     Ok(ring)
+}
+
+/// The io-wq worker bounds a fresh ring carries (zero entries query without
+/// changing them).
+#[cfg(test)]
+pub(super) fn ring_worker_bounds() -> Result<[u32; 2]> {
+    let ring = new_ring(2)?;
+    let mut bounds = [0; 2];
+    ring.submitter()
+        .register_iowq_max_workers(&mut bounds)
+        .map_err(|error| io("io_uring IOWQ_MAX_WORKERS query", error))?;
+    Ok(bounds)
 }
 
 /// Checks both ring setup (including seccomp) and this file's buffered NOWAIT

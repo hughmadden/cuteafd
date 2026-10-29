@@ -251,9 +251,9 @@ def test_serving_containers_keep_namespace_paths_and_host_identity() -> None:
         assert run["command"][run["command"].index("--snapshot") + 1].startswith("<root>/hf/hub/")
 
 
-@pytest.mark.parametrize("value", [None, "off", "draft", "all"])
+@pytest.mark.parametrize("value", [None, "off", "draft", "all", "packed"])
 def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch, value) -> None:
-    """V41_FP8_HEAD=off|draft|all forwards CUTEAFD_V41_FP8_HEAD to the coordinator and
+    """V41_FP8_HEAD=off|draft|all|packed forwards CUTEAFD_V41_FP8_HEAD to the coordinator and
     the planner (both read it); unset forwards nothing (the engine default, all)."""
     import v41_launch_capture as capture_module
 
@@ -278,6 +278,37 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert result["containers"][0]["argv"].count(f"CUTEAFD_V41_FP8_HEAD={value}") == 1
     for worker in result["containers"][1:]:
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
+
+
+@pytest.mark.parametrize("value", [None, "LAZY", "EAGER", "eager"])
+def test_v41_module_loading_key_reaches_only_the_coordinator(tmp_root, monkeypatch, value) -> None:
+    """CUDA_MODULE_LOADING=LAZY|EAGER sets the coordinator's CUDA_MODULE_LOADING; unset
+    passes nothing (the CUDA default); other spellings fail before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"CUDA_MODULE_LOADING={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value == "eager":
+        with pytest.raises(RuntimeError, match=r"CUDA_MODULE_LOADING must be LAZY or EAGER"):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = parse_run(result["containers"][0]["argv"])["env"]
+    if value is None:
+        assert "CUDA_MODULE_LOADING" not in coordinator
+    else:
+        assert coordinator["CUDA_MODULE_LOADING"] == value
+        assert result["containers"][0]["argv"].count(f"CUDA_MODULE_LOADING={value}") == 1
+    assert not any("CUDA_MODULE_LOADING" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert "CUDA_MODULE_LOADING" not in parse_run(worker["argv"])["env"]
 
 
 @pytest.mark.parametrize("value", [None, "off", "auto", "48", "on"])
@@ -311,6 +342,33 @@ def test_v41_l2_prefetch_key_reaches_only_the_coordinator_command(tmp_root, monk
         assert not any("l2-prefetch" in arg or "L2_PREFETCH" in arg for arg in worker["argv"])
 
 
+@pytest.mark.parametrize("value", [None, "off", "on", "yes"])
+def test_v41_engram_warm_key_reaches_only_the_coordinator_command(tmp_root, monkeypatch, value) -> None:
+    """ENGRAM_WARM=on adds serve-native --engram-warm; off or unset passes nothing (the
+    engine default, off); other values fail before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"ENGRAM_WARM={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value == "yes":
+        with pytest.raises(RuntimeError, match=r"ENGRAM_WARM must be on or off"):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    assert command.count("--engram-warm") == (1 if value == "on" else 0)
+    assert not any("engram-warm" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("engram-warm" in arg or "ENGRAM_WARM" in arg for arg in worker["argv"])
+
+
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
     """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
     import v41_launch_capture as capture_module
@@ -337,7 +395,7 @@ def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeyp
     env["HF_HOME"] = str(tmp_root / "hf")
     result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--dry-run"],
                             capture_output=True, text=True, env=env)
-    assert result.returncode == 2 and "V41_FP8_HEAD must be off, draft or all" in result.stderr
+    assert result.returncode == 2 and "V41_FP8_HEAD must be off, draft, all or packed" in result.stderr
     result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--set", "V41_FP8_HEAD=off",
                              "--dry-run"], capture_output=True, text=True,
                             env={**env, "CUTEAFD_V41_FP8_HEAD": "draft"})

@@ -48,13 +48,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
     let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
     let mode = Fp8Head::configured();
-    let fp8_head = mode.target();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     // The prefill slots, one storage set over their units; two decode lanes
     // at decode width.
     let slots = usize::try_from(prefill.waves)?;
     let span = slots as u64 * rows;
-    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, fp8_head, window_batch)?;
+    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, mode, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
@@ -101,7 +100,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let bytes = resident.iter().flatten().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum();
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, 5, ranks,
-            mode.draft())?, marks: marks * 3 * 128 * 528,
+            mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
             loader_peak: [bytes, 0], ..Default::default() })
     } else { None };

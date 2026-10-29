@@ -461,3 +461,22 @@ elif a[0] == 'tag':
                    env={**os.environ, 'PATH': f'{tools}:{os.environ["PATH"]}'})
     tags = (tmp_path / 'tags').read_text().splitlines()
     assert tags == ['sha256:' + 'o' * 64 + ' repo:prev-' + 'o' * 12, 'repo:tc-1 repo']
+
+
+def test_dev_image_identity_is_its_layers_not_its_store_specific_id(tmp_path):
+    # Docker's classic and containerd image stores give the same image different
+    # IDs after save/load; only a host whose layers differ needs the image.
+    script = _function('spark_image_layers') + _function('distribute_spark_dev_image') + '''
+release_die() { echo "die: $*" >&2; exit 2; }
+stream_between_hosts() { printf 'send %s -> %s\\n' "$1" "$3" >> "$TRACE"; }
+seed_host=ostrich wip_target_hosts=(dodo emu kiwi) wip_seed_rdma=1 SPARK_EXPERT_DOCKER_DEV=img
+distribute_spark_dev_image
+'''
+    ssh = '''host=$3
+case "$*" in
+  *RootFS.Layers*) case "$host" in kiwi) echo '["sha256:old"]' ;; *) echo '["sha256:new"]' ;; esac ;;
+  *) exit 1 ;;
+esac'''
+    result, trace = _bash(script, tmp_path, {'ssh': ssh})
+    assert result.returncode == 0, result.stderr
+    assert trace.splitlines() == ['send ostrich -> kiwi']

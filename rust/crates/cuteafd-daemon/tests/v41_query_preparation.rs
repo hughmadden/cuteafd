@@ -17,6 +17,7 @@ mod shared {
     pub(crate) mod fp8_linear;
     pub(crate) mod fp8_load_quant;
     pub(crate) mod memory;
+    pub(crate) mod packed_head;
     pub(crate) mod target_head;
     pub(crate) mod experts {
         pub(crate) mod rtx {

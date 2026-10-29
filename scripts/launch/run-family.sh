@@ -446,6 +446,7 @@ COORDINATOR_GPU_BUDGET_GIB
 COORDINATOR_GPU_HEADROOM_GIB
 COORDINATOR_GPU_PCI_BUS_ID
 COORDINATOR_GPU_UUID
+CUDA_MODULE_LOADING
 DRAFT_POLICY
 DRAFT_ROW_COST
 DRAFT_SURVIVAL_LENGTHS
@@ -453,6 +454,7 @@ DSPARK_DRAFT_LIMIT
 DSPARK_DRAFT_POLICY
 EMBEDDING
 ENABLE_BENCH
+ENGRAM_WARM
 EXPERT_FORMAT
 EXPERT_PORT
 FP8_EXPERT_PREFILL
@@ -866,8 +868,9 @@ case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "G
 # trace and policy switches, profile wrappers, graph census, thermal sampler,
 # probe dumps, Spark intake, console text, API keys and console, serving
 # identity) comes from the shared helpers above, so it reaches V4.1 with no
-# V4.1 code. Engram tables need nothing here: they are read from the
-# checkpoint under the full namespace mount, kept local on raptor by sparknest.
+# V4.1 code. Engram tables need no mount of their own: they are read from the
+# checkpoint under the full namespace mount, kept local on raptor by sparknest
+# (ENGRAM_WARM below optionally warms them into the page cache after readiness).
 # ---------------------------------------------------------------------------
 launch_deepseek_v41() {
 # The release loader validates every key (run.sh --set overrides are in $config).
@@ -918,16 +921,29 @@ dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
 release_validate_verbs_device_map
 # V41_FP8_HEAD: which vocabulary heads run from one resident E4M3 copy: all
 # (target and dSpark draft), draft (the draft only; the target keeps its BF16
-# head) or off. Unset passes nothing: the engine default is all. Planner and
-# server read the same CUTEAFD_V41_FP8_HEAD, so both get it.
+# head) or off. packed (opt-in, unqualified) keeps one exact 12-bit copy of
+# the BF16 head instead: target logits read it exactly, dSpark its coarse
+# plane. Unset passes nothing: the engine default is all. Planner and server
+# read the same CUTEAFD_V41_FP8_HEAD, so both get it.
 v41_fp8_head_args=()
 case "${V41_FP8_HEAD:-}" in
   "") ;;
-  off|draft|all)
+  off|draft|all|packed)
     [[ -z "${CUTEAFD_V41_FP8_HEAD:-}" || "$CUTEAFD_V41_FP8_HEAD" == "$V41_FP8_HEAD" ]] ||
       release_die "V41_FP8_HEAD=$V41_FP8_HEAD conflicts with CUTEAFD_V41_FP8_HEAD=$CUTEAFD_V41_FP8_HEAD in the environment; set one"
     v41_fp8_head_args=(-e "CUTEAFD_V41_FP8_HEAD=$V41_FP8_HEAD") ;;
-  *) release_die "V41_FP8_HEAD must be off, draft or all" ;;
+  *) release_die "V41_FP8_HEAD must be off, draft, all or packed" ;;
+esac
+# CUDA_MODULE_LOADING (LAZY or EAGER; unset: the CUDA default, LAZY), coordinator
+# only. A lazily loaded kernel's first launch waits for the device to idle, which
+# never happens behind a stream wait only the engine thread releases (a cold 5090
+# card hung in a first-shape cuBLAS draft GEMM). EAGER loads every library kernel
+# at startup instead: about 17 s and 212 MiB more on an RTX 5090.
+v41_module_loading_args=()
+case "$(get CUDA_MODULE_LOADING)" in
+  "") ;;
+  LAZY|EAGER) v41_module_loading_args=(-e "CUDA_MODULE_LOADING=$(get CUDA_MODULE_LOADING)") ;;
+  *) release_die "CUDA_MODULE_LOADING must be LAZY or EAGER" ;;
 esac
 # L2_PREFETCH (off, auto = 3/4 of the L2, or MiB; unset: off): one-lane decode and
 # verify passes pull the next layer's weights into L2 while each layer's routed
@@ -935,6 +951,11 @@ esac
 v41_l2_prefetch="$(get L2_PREFETCH)"
 [[ -z "$v41_l2_prefetch" || "$v41_l2_prefetch" =~ ^(off|auto|[0-9]+)$ ]] ||
   release_die "L2_PREFETCH must be off, auto or a MiB count"
+# ENGRAM_WARM (on|off; default off): after readiness, read both Engram tables once
+# into the page cache on a background thread (serve-native --engram-warm), for hosts
+# with RAM for the tables whose checkpoint store has slow random reads.
+v41_engram_warm="$(get ENGRAM_WARM off)"
+case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
@@ -1412,7 +1433,7 @@ for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_FP8_HEAD
   [[ "$switch_name" != CUTEAFD_V41_FP8_HEAD || ${#v41_fp8_head_args[@]} == 0 ]] || continue
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
 done
-rdma_env_args+=(${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"})
+rdma_env_args+=(${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} ${v41_module_loading_args[@]+"${v41_module_loading_args[@]}"})
 # RDMA_BOND_BALANCE (off, labels or probe): the coordinator's RoCE flow labels on a
 # bonded port; see the generic launch below.
 case "${RDMA_BOND_BALANCE:-off}" in
@@ -1488,6 +1509,7 @@ fi
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
 [[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
+[[ "$v41_engram_warm" != on ]] || args+=(--engram-warm)
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then
@@ -1598,7 +1620,7 @@ for i in "${!hosts[@]}"; do
 done
 
 start_coordinator
-api_url="http://127.0.0.1:${ADDR##*:}"
+api_url="$(release_probe_url "$ADDR")"
 until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
   release_api_advertises_native_model "$api_url" "$RELEASE_NATIVE_API_MODEL_ID"; do
   [[ "$(docker inspect -f '{{.State.Status}}' "$coordinator" 2>/dev/null)" == running ]] || { docker logs --tail 200 "$coordinator" >&2 || true; release_die "native coordinator exited during startup"; }
@@ -3112,7 +3134,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
-url="http://127.0.0.1:${addr##*:}"
+url="$(release_probe_url "$addr")"
 ready_deadline=$((SECONDS + 900))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do
   if (( SECONDS >= ready_deadline )); then

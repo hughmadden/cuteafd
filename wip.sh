@@ -501,13 +501,22 @@ stream_between_hosts() {
   fi
 }
 
+# spark_image_layers HOST IMAGE: the image's layer digests on HOST, empty when it
+# is absent. Unlike .Id, they are the same on Docker's classic and containerd
+# image stores: after `docker image save | docker image load` across stores the
+# same image has different IDs, so Sparks on mixed stores would never match.
+spark_image_layers() {
+  ssh -o BatchMode=yes "$1" "docker image inspect -f '{{json .RootFS.Layers}}' '$2' 2>/dev/null || true"
+}
+
 distribute_spark_dev_image() {
   local seed_id
-  seed_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  seed_id="$(spark_image_layers "$seed_host" "$SPARK_EXPERT_DOCKER_DEV")"
+  [[ -n "$seed_id" ]] || release_die "$seed_host has no $SPARK_EXPERT_DOCKER_DEV"
   local -a targets=()
   local host remote_id
   for host in "${wip_target_hosts[@]}"; do
-    remote_id="$(ssh -o BatchMode=yes "$host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV' 2>/dev/null || true")"
+    remote_id="$(spark_image_layers "$host" "$SPARK_EXPERT_DOCKER_DEV")"
     [[ "$remote_id" == "$seed_id" ]] || targets+=("$host")
   done
   ((${#targets[@]})) || return 0
@@ -613,9 +622,9 @@ preflight_existing_container_images() {
       release_die "$coordinator_container is not bound to the configured physical GPU; rerun ./wip.sh --recreate"
   fi
   ((wip_spark_leg)) || return 0
-  expected="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  expected="$(spark_image_layers "$seed_host" "$SPARK_EXPERT_DOCKER_DEV")"
   for host in "${wip_container_hosts[@]}"; do
-    actual="$(ssh -o BatchMode=yes "$host" "docker inspect -f '{{.Image}}' '$spark_container' 2>/dev/null || true")"
+    actual="$(ssh -o BatchMode=yes "$host" "id=\$(docker inspect -f '{{.Image}}' '$spark_container' 2>/dev/null) && docker image inspect -f '{{json .RootFS.Layers}}' \"\$id\" 2>/dev/null || true")"
     [[ -z "$actual" || "$actual" == "$expected" ]] ||
       release_die "$host $spark_container uses an old development image; rerun ./wip.sh --recreate"
   done
@@ -641,7 +650,7 @@ ensure_local_container() {
     [[ "$container_id" == "$image_id" ]] ||
       release_die "$coordinator_container uses an old development image; rerun ./wip.sh --recreate"
     if [[ -n "$wip_mount_root" ]]; then
-      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$(realpath "$wip_mount_root")" ]] ||
+      [[ "$(realpath -m "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")")" == "$(realpath "$wip_mount_root")" ]] ||
         release_die "$coordinator_container has a different /wip build mount; rerun ./wip.sh --recreate"
     fi
     cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash" dry >/dev/null
@@ -747,7 +756,7 @@ if docker container inspect "$container" >/dev/null 2>&1; then
     exit 2
   fi
   if [[ -n "$root" ]]; then
-    [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$container")" == "$(realpath "$root")" ]] ||
+    [[ "$(realpath -m "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$container")")" == "$(realpath "$root")" ]] ||
       { echo "$container has a different /wip build mount; rerun ./wip.sh --recreate" >&2; exit 2; }
   fi
   [ "$(docker inspect -f '{{.State.Running}}' "$container")" = true ] || docker start "$container" >/dev/null

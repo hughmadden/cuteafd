@@ -13,8 +13,8 @@ struct LocalHead<'w, 'a> {
     kernel: V41VocabularyProjection<'a>,
     _workspace: DeviceAllocation<'a>,
     weights: &'w VocabularyHead<'a>,
-    /// Scratch of the FP8 head copy (`CUTEAFD_V41_FP8_HEAD`).
-    fp8_scratch: Option<DeviceAllocation<'a>>,
+    /// Scratch of the head copy (`CUTEAFD_V41_FP8_HEAD`; a packed head's coarse plane).
+    fp8_scratch: Option<crate::families::deepseek_v41::v41_tensors::HeadScratch<'a>>,
 }
 
 /// Width-dependent Markov/sample positions followed by raw confidence, on one
@@ -68,7 +68,7 @@ impl<'library> DsparkWeights<'library> {
             ensure!(weights.device_id() == library.cuda_get_device()?, "dSpark head device differs");
             let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
             let kernel = unsafe { library.v41_vocabulary_head(workspace.buffer)? };
-            let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.fp8(),
+            let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.copy(),
                 capacity * self.draft_width, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
             Ok(LocalHead { kernel, _workspace: workspace, weights, fp8_scratch })
         }).transpose()?;
@@ -244,7 +244,7 @@ impl DsparkTerminal<'_, '_> {
             self.enqueue_normalize_on(requests, stream)?;
             let span = self.timing.begin_retained("head", "head", None, requests * self.width, stream)?;
             crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &head.kernel,
-                head.weights.weight(), head.weights.fp8().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
+                head.weights.weight(), head.weights.copy().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
                 self.shared_logits.buffer, requests * self.width, stream)?;
             self.timing.end_retained(span, stream)?;
             self.enqueue_sampling_on(requests, stream)

@@ -14,8 +14,9 @@ struct Rank<'w, 'a> {
     weights: &'w VocabularyShard<'a>,
     capacity: usize,
     graphs: [crate::shared::decode_graph::RowGraphs<'a>; 2],
-    /// Scratch of the shard's FP8 copy when this wave projects through it.
-    fp8_scratch: Option<DeviceAllocation<'a>>,
+    /// Scratch of the shard's copy (E4M3, or exact 12-bit read exactly for target
+    /// logits and through its coarse plane for drafts) when this wave projects through it.
+    fp8_scratch: Option<crate::families::deepseek_v41::v41_tensors::HeadScratch<'a>>,
     /// Device-ordered passes: SM peer reads of the other GPU's normalized rows.
     sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
 }
@@ -47,7 +48,7 @@ impl<'w, 'a> Rank<'w, 'a> {
         let lib = self.stream.library;
         unsafe {
             crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(lib, &self.projection, self.weights.weight(),
-                self.weights.fp8().zip(self.fp8_scratch.as_ref()), self.input.buffer, self.logits.buffer, rows,
+                self.weights.copy().zip(self.fp8_scratch.as_ref()), self.input.buffer, self.logits.buffer, rows,
                 self.stream.raw)?;
             if greedy {
                 let (ids, scores) = self.candidates(rows)?;
@@ -142,15 +143,16 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         Ok([V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + split * 4 + 8),
             V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + (129280 - split) * 4 + 24)])
     }
-    /// Projects through the shards' FP8 copies when `site` uses them
-    /// (`CUTEAFD_V41_FP8_HEAD`); call before the first execution.
+    /// Projects through the shards' copies when `site` uses them
+    /// (`CUTEAFD_V41_FP8_HEAD`; `Fp8Head::All` for target logits, `Fp8Head::Draft`
+    /// for the drafter); call before the first execution.
     pub fn use_fp8(&mut self, site: crate::families::deepseek_v41::v41_tensors::Fp8Head) -> Result<()> {
         let capacity = self.capacity;
         for rank in &mut self.ranks {
             let device = rank.device;
             let rank = rank.get_mut();
             rank.fp8_scratch = device.run(|| crate::families::deepseek_v41::v41_tensors::fp8_scratch(device.library,
-                rank.weights.fp8(), capacity, site))?;
+                rank.weights.copy(), capacity, site))?;
             if matches!(site, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft) {
                 rank.draft_timing = Some(device.run(|| crate::shared::draft::timing::DraftTiming::from_env(
                     device.library, "v41-head"))?);
