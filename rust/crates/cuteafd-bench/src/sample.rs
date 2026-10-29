@@ -260,6 +260,7 @@ mod tests {
         // The full configuration retains even the options omitted from the strip.
         let full = render::report::panel_svg(&report, "configuration");
         assert!(full.contains("api-key-file"));
+        assert!(!card.contains("api-key-file"));
         report.server.configuration.settings = ["CUTEAFD_HOST_ISA_SELECTED", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS",
             "CUTEAFD_THERMAL", "request-timeout", "rtx-expert-ranges", "route-source", "max-output"]
             .into_iter().map(|name| Setting { name: name.into(),

@@ -194,8 +194,9 @@ pub fn env_settings() -> Vec<Setting> {
 
 /// Option names that describe the deployment rather than a tuning choice:
 /// never shown as chips (they are in the hardware and configuration panels).
-pub const DEPLOYMENT: [&str; 10] = ["snapshot", "native-lib", "native_lib", "peers", "listen", "model-id",
-    "model_id", "hf-home", "hf_home", "device"];
+pub const DEPLOYMENT: [&str; 16] = ["snapshot", "native-lib", "native_lib", "peers", "listen", "model-id",
+    "model_id", "hf-home", "hf_home", "device", "api-key-file", "usage-dir", "console-secret-file", "enable-bench",
+    "CUTEAFD_CONSOLE_LINK_COMMAND", "CUTEAFD_FIDELITY_CACHE"];
 
 #[cfg(test)]
 mod tests {

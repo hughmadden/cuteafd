@@ -327,6 +327,9 @@ impl<'a> View<'a> {
         if let Some(layout) = &c.layout {
             y += row(doc, t, 0.0, y, w, "Layout", layout);
         }
+        for setting in c.non_default().filter(|s| DEPLOYMENT.contains(&s.name.as_str())) {
+            y += row(doc, t, 0.0, y, w, &setting.name, setting.value.as_deref().unwrap_or("unset"));
+        }
         let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
             && s.name != "rtx-expert-layers")
             .map(|s| s.chip()).collect();
