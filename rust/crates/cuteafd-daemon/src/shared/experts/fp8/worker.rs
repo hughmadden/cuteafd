@@ -768,7 +768,7 @@ mod tests {
                 let cancelled = worker.segments.as_ref().unwrap().staged[0].source_address;
                 assert!(worker.cancel_staged(cancelled)?);
                 assert!(!worker.cancel_staged(cancelled)?);
-                assert!(!worker.unit_ready()?);
+                assert!(worker.unit_ready()?, "cancelling the lone staged unit leaves no fence");
             }
             if unit == 3 && !segmented {
                 fixture.advance_queued_experts(&library, 1)?;
