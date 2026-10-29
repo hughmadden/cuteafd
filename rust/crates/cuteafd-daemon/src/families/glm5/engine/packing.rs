@@ -5,7 +5,20 @@ use crate::shared::prefill_packing::{self, Limits, MemberOutcome, PackingMode, S
 impl<'a> GlmEngine<'a> {
     pub(crate) fn configure_packing(&self, mode: PackingMode) -> Result<()> {
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
-        let mut cap = self.prefill_rows;
+        let inventory = coordinator_inventory(self.programs.names(), self.peer.is_some())?;
+        let mut cap = prefill_packing::coordinator_row_cap(self.programs,
+            inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows)?;
+        for owner in self.native_dense.iter().flatten() {
+            cap = prefill_packing::coordinator_row_cap(self.programs,
+                owner.packed_programs().map(|name| (name, prefill_packing::ProgramRows::PackedRows)), cap)?;
+        }
+        for owner in self.core_programs.iter().flatten() {
+            cap = prefill_packing::coordinator_row_cap(self.programs,
+                owner.packed_programs().map(|name| (name, prefill_packing::ProgramRows::PackedRows)), cap)?;
+        }
+        // The native shared expert's bounded 64-row executor has no route
+        // attestation yet; do not infer invariance from its staging capacity.
+        if !self.native_experts.is_empty() { cap = 0; }
         // TP2's erased backend does not publish arithmetic-route bounds yet.
         // Exact validation fails closed; unrestricted serving still packs.
         if self.tp2.is_some() { cap = 0; }
@@ -83,6 +96,50 @@ impl<'a> GlmEngine<'a> {
     }
 }
 
+/// Classify the startup catalogue explicitly; new prefill exports fail closed
+/// until their row ownership is reviewed. Decode-only exports never see packs.
+fn coordinator_inventory<'n>(names: impl IntoIterator<Item = &'n str>, split: bool)
+    -> Result<Vec<(String, prefill_packing::ProgramRows)>> {
+    use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+        family: "glm", split_family: split.then_some("glm2") };
+    let required = names.into_iter().filter(|name| {
+        (selected.contains(name)
+            || cuteafd_loader::families::glm5::DensePrograms::Trellis.stage(name, split))
+            && !name.ends_with("_m64") && !name.contains("_decode_")
+    }).collect::<Vec<_>>();
+    let mut inventory = Vec::new();
+    for &name in &required {
+        let suffix = name.strip_prefix("glm_").or_else(|| name.strip_prefix("glm2_"))
+            .context("GLM packed catalogue namespace")?;
+        let role = match suffix {
+            "norm" | "router_scores" | "expert_input_quant" => PackedRows,
+            "dsa_candidate_merge" | "lse_combine2" | "paged_staging_gather_kv"
+                | "paged_staging_gather_index" => SequenceLocal,
+            _ => {
+                let stem = suffix.strip_suffix("_m4096").unwrap_or(suffix);
+                if matches!(stem, "producer" | "producer_bf16" | "index_producer"
+                    | "index_producer_bf16" | "o" | "o_bf16" | "index_topk_prefill"
+                    | "sparse_mla_prefill" | "stage_rank_pack" | "stage_query_rope"
+                    | "stage_index_post" | "stage_absorb" | "stage_absorb_bf16"
+                    | "stage_values" | "stage_values_bf16" | "stage_query_rope_context"
+                    | "stage_absorb_context" | "stage_absorb_bf16_context") {
+                    SequenceLocal
+                } else if stem.strip_prefix("ffn_i").is_some_and(|shape| {
+                    let size = shape.strip_suffix("_bf16").or_else(|| shape.strip_suffix("_pt")).unwrap_or(shape);
+                    size.parse::<usize>().is_ok_and(|n| n > 0)
+                }) || stem.strip_prefix("stage_swiglu_i").is_some_and(|n| n.parse::<usize>().is_ok_and(|n| n > 0)) {
+                    PackedRows
+                } else { anyhow::bail!("GLM packed program {name} has no reviewed row role"); }
+            }
+        };
+        inventory.push((name.to_owned(), role));
+    }
+    let classified = inventory.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+    prefill_packing::validate_program_inventory(required, &classified)?;
+    Ok(inventory)
+}
+
 pub(super) fn sequence_tables(placement: &GlmPlacement, start: usize, rows: usize, topk: usize) -> Result<StepTables> {
     let used = (start + rows).div_ceil(PAGE_ROWS);
     ensure!(used <= placement.pages.len(), "prefill past sequence pages");
@@ -141,6 +198,33 @@ mod tests {
         assert_eq!(tables.segments[0].1.slots, changed.segments[0].1.slots);
         assert_ne!(tables.segments[1].1.slots, changed.segments[1].1.slots);
         assert_eq!(segments.iter().map(|s| (s.tap_offset, s.tap_rows)).collect::<Vec<_>>(), [(0, 12), (12, 9)]);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_inventory_reviews_startup_programs_and_rejects_new_routes() -> Result<()> {
+        use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+        let names = ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
+            "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_producer_m4096",
+            "glm_index_topk_prefill_m4096", "glm_stage_swiglu_i2048",
+            "glm2_ffn_i1024_bf16_m4096", "glm2_stage_query_rope_context_m4096",
+            "glm_sparse_mla_decode_m64"];
+        let inventory = coordinator_inventory(names, true)?;
+        for name in ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
+            "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_stage_swiglu_i2048",
+            "glm2_ffn_i1024_bf16_m4096"] {
+            assert!(inventory.contains(&(name.to_owned(), PackedRows)));
+        }
+        assert!(inventory.contains(&("glm_producer_m4096".into(), SequenceLocal)));
+        assert!(inventory.contains(&("glm2_stage_query_rope_context_m4096".into(), SequenceLocal)));
+        assert!(!inventory.iter().any(|(n, _)| n.ends_with("_m64")));
+        assert!(coordinator_inventory(["glm_new_projection_m4096"], false).is_err());
+        assert!(coordinator_inventory(["glm_stage_new_transform_m4096"], false).is_err());
+        let limits = Limits { rows: 64, chunk_rows: 4096, max_context: 4096, taps: None };
+        let chunks = [(0, 29), (0, 200), (100, 40), (0, 24)];
+        assert_eq!(prefill_packing::groups(4, |r| prefill_packing::plan(&chunks[r], &limits).is_ok()),
+            [0..1, 1..2, 2..4]);
+        assert!(prefill_packing::plan(&chunks[..2], &Limits { rows: 4096, ..limits }).is_ok());
         Ok(())
     }
 

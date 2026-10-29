@@ -61,6 +61,15 @@ impl<'a> CorePrograms<'a> {
         Ok(Some(Self { projections, layouts, stages,
             add: programs.library().f32_add()?, copy: programs.library().v41_peer_copy()? }))
     }
+    /// Include native input/core/output policy entries, including split-K's
+    /// row transition. Missing exporter metadata disables exact packing.
+    pub(crate) fn packed_programs(&self) -> impl Iterator<Item = &str> {
+        self.projections.values().flat_map(|projection| {
+            let p = projection.program.policy();
+            [p.native_input.as_str(), p.native.as_str(), p.output_program.as_str()]
+        })
+    }
+
     pub(crate) fn projection(&self, weights: &CoreWeights<'_>) -> Result<&Projection<'a>> {
         self.projections.get(&projection_key(weights)).context("GLM K6 geometry not bound before capture")
     }

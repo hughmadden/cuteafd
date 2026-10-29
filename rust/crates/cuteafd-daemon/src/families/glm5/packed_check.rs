@@ -103,11 +103,6 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::
         println!("packed check: sequence {i}: {} rows at {}: logits {}, live cache {}, KL {kl:.8}, top-1 {same_top1}",
             lengths[i], prefix(i), if same_logits { "identical" } else { "DIFFER" },
             if same_state { "identical" } else { "DIFFER" });
-        // On the vendor-dense EXL3 gate, >64-row members stay on the wide
-        // router route. Their live pages also cover post-attention context commits.
-        if !exact && lengths[i] > 64 && engine.weights.layers.iter().all(|l| !l.is_native() && l.core.is_empty()) {
-            ensure!(same_logits && same_state, "wide-route member {i} changed logits or committed live pages");
-        }
         equal &= same_logits && same_state;
     }
     for placement in packed.into_iter().chain(alone) { allocator.release(placement); }
