@@ -25,6 +25,10 @@ struct Shared { queue: Mutex<Queue>, available: Condvar, wake: OwnedFd, ready: A
 pub(super) struct Reactor { shared: Arc<Shared> }
 static REACTOR: OnceLock<Mutex<Option<Arc<Reactor>>>> = OnceLock::new();
 
+pub(super) fn started() -> bool {
+    REACTOR.get().is_some_and(|global| global.lock().unwrap_or_else(|p| p.into_inner()).is_some())
+}
+
 fn error(context: &str, source: std::io::Error) -> MappedTableError {
     MappedTableError::Io { context: context.into(), source }
 }

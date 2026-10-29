@@ -136,11 +136,24 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
     -> Result<cuteafd_core::memory_layout::HostLayout> {
     let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let snapshot = cuteafd_ffi::memory_ledger::snapshot();
-    let resident = host_resident_items(snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
+    let mut resident = host_resident_items(snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
+    // One singleton serves every mapped table and GPU owner in this process.
+    // Its reusable buffers are lazy, so retain the full future reservation.
+    append_table_reactor(&mut resident, usize::from(
+        cuteafd_loader::formats::mapped_table::table_reactor_started()));
     let ledger = host_admission(memory, resident, cache, tables, deferred_logits, headroom)?;
     tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
         "coordinator host memory admitted");
     Ok(ledger)
+}
+
+fn append_table_reactor(items: &mut Vec<cuteafd_core::memory_layout::Item>, mapped_tables: usize) {
+    use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
+    let bytes = cuteafd_loader::formats::mapped_table::table_reactor_workspace_bytes(mapped_tables);
+    if bytes > 0 {
+        items.push(Item::new(Category::Workspace, "workspace/table-read-reactor", "process-wide", bytes as u64,
+            Basis::Formula).with_lifetime(ItemLifetime::PostReadyReserve));
+    }
 }
 
 fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, usize>, formulas: &[(&str, u64)])
@@ -178,6 +191,18 @@ fn host_admission((total, available): (u64, u64),
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
+
+    #[test]
+    fn reactor_reservation_is_once_per_process_not_per_table() -> Result<()> {
+        for count in [0, 1, 2, 8] {
+            let mut items = Vec::new();
+            append_table_reactor(&mut items, count);
+            let ledger = host_admission((2 << 30, 1 << 30), items, 0, &[], 0, 0)?;
+            assert_eq!(ledger.items.iter().filter(|item| item.group == "workspace/table-read-reactor").count(), usize::from(count > 0));
+            assert_eq!(ledger.deferred_bytes, if count == 0 { 0 } else { 18 << 20 });
+        }
+        Ok(())
+    }
 
     #[test]
     fn mapped_table_host_workspace_remains_deferred_at_every_depth() -> Result<()> {

@@ -167,6 +167,10 @@ impl EngramPipeline {
             elapsed_ms = elapsed.as_millis(),
             gb_per_s = placement.preloaded_bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9,
             "mapped scale preload admission");
+        for table in &tables {
+            table.weights().prepare_reads();
+            table.scales().prepare_reads();
+        }
         let tables = tables.map(Arc::new);
         Ok(Self {
             identity: Arc::new(()),

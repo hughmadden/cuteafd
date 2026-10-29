@@ -570,6 +570,9 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                 let host = report.host_ledger.as_ref().unwrap();
                 let staging = host.items.iter().filter(|item| item.group == "staging/mapped-table").collect::<Vec<_>>();
                 assert_eq!(staging.len(), 1, "a dual-owner engine still has one PLE table");
+                let reactors: Vec<_> = host.items.iter().filter(|item| item.group == "workspace/table-read-reactor").collect();
+                assert_eq!(reactors.len(), 1);
+                assert_eq!(reactors[0].bytes, 18 << 20);
                 let runtime = MappedStaging::new(unit * cfg.ple_rows(), k, 64 * cfg.ple_rows(), row_bytes).unwrap();
                 assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.workspace_bytes);
                 assert_eq!(staging[0].bytes as usize, 2 * (k * unit + 64) * cfg.ple_rows() * row_bytes + runtime.workspace_bytes);

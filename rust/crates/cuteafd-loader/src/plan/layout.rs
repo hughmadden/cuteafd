@@ -1585,6 +1585,10 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .try_fold(0u64, |n, c| n.checked_add(c.bytes)).context("host embedding overflow")?;
         push(Category::Embedding, "embedding", "checkpoint", bytes, Basis::Exact);
     }
+    let reactor = crate::formats::mapped_table::table_reactor_workspace_bytes(report.mapped_placement.mapped);
+    if reactor > 0 {
+        push(Category::Workspace, "workspace/table-read-reactor", "process-wide", reactor as u64, Basis::Formula);
+    }
     push(Category::Tables, "mapped-tables/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
         && report.vision != super::MediaMode::Off)

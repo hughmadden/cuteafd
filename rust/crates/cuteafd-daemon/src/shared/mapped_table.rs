@@ -53,6 +53,7 @@ pub(crate) struct MappedTableDevice<'a> {
 impl<'a> MappedTableDevice<'a> {
     pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable, args: &MappedTableArgs,
         prefill_rows: usize, prefill_slots: usize, decode_rows: usize) -> Result<Self> {
+        table.prepare_reads();
         let _scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
         let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(prefill_rows, prefill_slots, decode_rows, table.row_bytes())?;
         super::memory::budget::admit_host_memory(0, &[("staging/mapped-table", staging.total_bytes as u64)], 0, 0)?;

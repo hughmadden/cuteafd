@@ -10,7 +10,7 @@ fn fixed_staging_charges_actual_wave_count_and_separate_decode_rows() -> TestRes
         let staging = MappedStaging::new(2048 * 16, k, 64 * 16, 320)?;
         assert_eq!(staging.slot_bytes().collect::<Vec<_>>(),
             std::iter::repeat_n(2048 * 16 * 320, 2 * k).chain(std::iter::repeat_n(64 * 16 * 320, 2)).collect::<Vec<_>>());
-        assert_eq!(staging.workspace_bytes, (2048 + 64) * 16 * 1024 + (2 << 20) + TABLE_REACTOR_WORKSPACE_BYTES);
+        assert_eq!(staging.workspace_bytes, (2048 + 64) * 16 * 1024 + (2 << 20));
         assert_eq!(staging.total_bytes, 2 * (k * 2048 + 64) * 16 * 320 + staging.workspace_bytes);
         assert_eq!(staging.slot_bytes().sum::<usize>() + staging.workspace_bytes, staging.total_bytes);
     }
@@ -1057,5 +1057,30 @@ fn shared_table_small_and_large_gathers_preserve_native_order() -> TestResult {
             assert_eq!(&output[slot * width..(slot + 1) * width], &bytes[id as usize * width..(id as usize + 1) * width]);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn fully_preloaded_tables_never_start_the_process_reactor() -> TestResult {
+    const CHILD: &str = "CUTEAFD_TEST_PRELOADED_REACTOR_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "formats::mapped_table::tests::fully_preloaded_tables_never_start_the_process_reactor", "--nocapture"])
+            .env(CHILD, "1").status()?;
+        assert!(status.success());
+        return Ok(());
+    }
+    assert!(!table_reactor_started());
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: test-owned shards remain immutable for the table's lifetime.
+    let mut table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    assert!(!table_reactor_started(), "opening is not final placement");
+    MappedTable::preload_all(&mut [&mut table], 2)?;
+    table.prepare_reads();
+    let mut output = [0; 8];
+    table.gather_into(&[0, 7], &mut output)?;
+    assert!(!table_reactor_started(), "private gathers do not need a reactor");
+    assert_eq!(table_reactor_workspace_bytes(0), 0);
+    assert_eq!(table_reactor_workspace_bytes(8), 18 << 20);
     Ok(())
 }

@@ -36,8 +36,16 @@ mod reactor;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadPriority { Decode, #[default] Prefill }
 /// Conservative process-wide admission: 16 MiB miss buffers plus descriptors,
-/// SQ/CQ storage and owner scratch. Charged once per table pipeline group.
+/// SQ/CQ storage and owner scratch. Charged once per process, not per table.
 pub const TABLE_REACTOR_WORKSPACE_BYTES: usize = 18 << 20;
+
+/// Setup retries retain the process-wide reservation after initialization.
+pub fn table_reactor_started() -> bool { reactor::started() }
+
+/// One process-wide reservation regardless of table groups or device owners.
+pub fn table_reactor_workspace_bytes(tables: usize) -> usize {
+    if tables > 0 { TABLE_REACTOR_WORKSPACE_BYTES } else { 0 }
+}
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -107,7 +115,7 @@ impl MappedStaging {
         // Bound row IDs, validation/read descriptors and backend scratch for
         // the independent prefill/decode workers; no GPU handshake counters.
         let workspace_bytes = prefill_rows.checked_add(decode_rows).and_then(|n| n.checked_mul(1024))
-            .and_then(|n| n.checked_add(TABLE_REACTOR_WORKSPACE_BYTES + (2 << 20))).ok_or_else(overflow)?;
+            .and_then(|n| n.checked_add(2 << 20)).ok_or_else(overflow)?;
         let total_bytes = prefill_bytes.checked_mul(prefill_slots)
             .and_then(|n| decode_bytes.checked_mul(2).and_then(|d| n.checked_add(d))).and_then(|n| n.checked_add(workspace_bytes)).ok_or_else(overflow)?;
         Ok(Self { prefill_bytes, prefill_slots, decode_bytes, workspace_bytes, total_bytes })
@@ -551,7 +559,6 @@ impl MappedTable {
             }
         }
         table.stats.approximate.store(table.parts.iter().any(|part| part.fuse), Ordering::Relaxed);
-        table.initialize_reads();
         Ok(table)
     }
 
@@ -914,8 +921,12 @@ impl MappedTable {
         self.stats.backend()
     }
 
-    /// Initialize the qualified hybrid; mmap is only an unavailable-ring fallback.
-    /// Called before any workers start.
+    /// Finalize after preload admission, before readiness or gather workers.
+    /// Fully private tables need neither a ring nor its process-wide workspace.
+    pub fn prepare_reads(&self) {
+        if self.resident.is_none() { self.initialize_reads(); }
+    }
+
     fn initialize_reads(&self) {
         self.initialize_with_probe(|| self.parts.iter().try_for_each(|part| {
             part.nowait.store(uring::probe(part)?, Ordering::Relaxed);
