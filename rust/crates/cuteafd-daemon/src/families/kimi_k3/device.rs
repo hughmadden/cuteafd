@@ -264,13 +264,14 @@ impl<'a> NativePrograms<'a> {
     }
 
     /// `rows` lane rows of units of at most `unit` rows (the programs' launch capacity).
-    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize) -> Result<LaneLayout> {
+    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rank: usize, rows: usize, unit: usize, max_context: usize) -> Result<LaneLayout> {
         self.check_config(cfg)?;
+        ensure!(rank < 2, "Kimi lane logical rank outside TP2");
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
         let mut layout=LaneLayout::new(cfg, rows, unit, max_context, self.scratch)?;
         if let Some(core)=&self.core {
-            layout.core=Some(core.layout.clone());
+            layout.core=core.layouts[rank].clone();
             // Split producers consume the same named scratch planes as fused
             // producers; admission retains the larger exact requirement.
             let kda=core.kda.iter().map(|p|p.scratch_bytes()).max().unwrap_or(0);

@@ -82,7 +82,7 @@ pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct CoreCharges {
-    pub projection: Option<ProjectionScratchLayout>,
+    pub projection: [Option<ProjectionScratchLayout>; 2],
     pub stages: BTreeMap<&'static str,usize>,
     pub stage_bytes: usize,
     pub receive: usize,
@@ -107,10 +107,11 @@ impl CoreCharges {
     }
     pub fn demands(&self) -> Result<Vec<crate::placement::Demand>> {
         use cuteafd_core::memory_layout::{Basis,Category};
-        let projection=self.projection.as_ref().map_or(Ok(0),|layout|layout.bytes())?;
+        let projection=[self.projection[0].as_ref().map_or(Ok(0),|layout|layout.bytes())?,
+            self.projection[1].as_ref().map_or(Ok(0),|layout|layout.bytes())?];
         let stages=self.stage_bytes;
         Ok((0..2).flat_map(|gpu|[
-            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 projection scratch",projection as u64,Basis::Exact),
+            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 projection scratch",projection[gpu as usize] as u64,Basis::Exact),
             crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 split-stage operands",stages as u64,Basis::Exact),
             crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 peer receive",self.receive as u64,Basis::Exact),
         ]).collect())
@@ -119,12 +120,12 @@ impl CoreCharges {
 
 /// The package selects native projection geometry. Headers select projections; no second export table.
 pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
-    metadata: &serde_json::Value) -> Result<Option<ProjectionScratchLayout>> {
-    if core.projections.is_empty() { return Ok(None); }
+    metadata: &serde_json::Value) -> Result<[Option<ProjectionScratchLayout>; 2]> {
+    if core.projections.is_empty() { return Ok([None, None]); }
     core.validate_runtime_groups(cfg)?;
     ensure!(metadata["abi_version"] == 1, "Kimi K6 row-policy ABI");
     let policies = metadata["row_policies"].as_array().context("Kimi K6 row-policy list")?;
-    let mut combined: Option<ProjectionScratchLayout> = None;
+    let mut combined: [Option<ProjectionScratchLayout>; 2] = [None, None];
     for projection in core.projections.values() {
         let head = projection.stem == "language_model.lm_head";
         let mla = projection.stem.contains(".self_attn.") && projection.stem
@@ -147,13 +148,21 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
                 projection.stem, matching.len());
             let policy = matching[0];
             let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows})?;
-            layout.rows = rows;
             if let Some(grouped) = policy.get("grouped") {
                 let groups = grouped["groups"].as_u64().and_then(|v| usize::try_from(v).ok())
                     .context("Kimi K6 grouped row-policy groups")?;
                 layout.merge(&ProjectionScratchLayout::grouped(k, n, rows, groups)?)?;
             }
-            if let Some(combined) = &mut combined { combined.merge(&layout)?; } else { combined = Some(layout); }
+            // Only GPU1 projects the vocabulary; body projections run on both ranks.
+            for target in combined.iter_mut().skip(if head { 1 } else { 0 }) {
+                if let Some(combined) = target {
+                    if !head { combined.rows = rows; }
+                    let mut required = layout.clone();
+                    // A body owner has full-row storage; a head-only owner stays bounded.
+                    required.rows = combined.rows;
+                    combined.merge(&required)?;
+                } else { *target = Some(layout.clone()); }
+            }
         }
     }
     Ok(combined)
@@ -316,12 +325,16 @@ mod scratch_admission_tests {
             assert_eq!(layout.extents["accumulator"],rows*98_304);
             for (k,n) in [(7168,6144),(6144,7168),(7168,3072),(3072,7168),(7168,3584),
                 (3584,7168),(7168,1536),(7168,640),(1536,18432),(1536,9216),
-                (7168,12288),(12288,7168),(7168,163840)] {
-                let mut single=ProjectionScratchLayout::new(k,n,if n==163840 {64}else{rows})?;
-                single.rows=rows;
-                layout.merge(&single)?;
+                (7168,12288),(12288,7168)] {
+                layout.merge(&ProjectionScratchLayout::new(k,n,rows)?)?;
             }
+            let body=layout.bytes()?;
+            let mut head=ProjectionScratchLayout::new(7168,163840,64)?;
+            head.rows=rows;
+            layout.merge(&head)?;
             assert_eq!(layout.bytes()?,expected);
+            assert_eq!(layout.bytes()? - body,204_832_768);
+            assert_eq!(layout.extents["partial"],293_601_280);
         }
         Ok(())
     }
@@ -413,6 +426,14 @@ mod draft_head_tests {
         assert!(draft_head_demand(&core, 65, &head_policy(book)).is_err());
         assert!(draft_head_demand(&core, 64, &head_policy(if book == "mcg" { "mul1" } else { "mcg" })).is_err());
         assert!(draft_head_demand(&CoreInventory::default(), 64, &head_policy(book))?.is_none());
+        let mut head_only=core.clone();
+        head_only.projections.retain(|stem,_| stem=="language_model.lm_head");
+        for rows in [1,64,256,4096] {
+            let layouts=projection_scratch(&cfg,&head_only,rows,&head_policy(book))?;
+            assert!(layouts[0].is_none());
+            let expected=ProjectionScratchLayout::new(7168,163840,rows.min(64))?;
+            assert_eq!(layouts[1].as_ref().map(|p|(&p.extents,p.rows)),Some((&expected.extents,expected.rows)));
+        }
         Ok(())
     }
 }
