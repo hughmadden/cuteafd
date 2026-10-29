@@ -8,7 +8,8 @@ use cuteafd_bench::{fidelity_precision::Precision, reference::Window};
 struct Observed { logits: Vec<f32>, state: Vec<u8>, frontier: usize }
 
 fn widths(case: usize, member: usize) -> usize {
-    match case { 0 => [29, 40, 59][member % 3], _ => [200, 127, 64][member % 3] }
+    match case { 0 => [29, 40, 59][member % 3], 2 => [29, 31, 23][member % 3],
+        _ => [200, 127, 64][member % 3] }
 }
 
 fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime,
@@ -23,7 +24,10 @@ fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtim
             .filter_map(|(i, (p, t))| (p.len < t.len()).then_some(i)).collect::<Vec<_>>();
         let chunks = active.iter().map(|&i| (placements[i].len,
             widths(case, i).min(prompts[i].len() - placements[i].len))).collect::<Vec<_>>();
-        let groups = if packed { prefill_packing::groups(active.len(), |r| engine.packed_plan(&chunks[r]).is_ok()) }
+        let groups = if packed { prefill_packing::groups(active.len(), |r| {
+            (case != 2 || chunks[r.clone()].iter().map(|(_, rows)| rows).sum::<usize>() <= 64)
+                && engine.packed_plan(&chunks[r]).is_ok()
+        }) }
             else { (0..active.len()).map(|i| i..i + 1).collect() };
         for range in groups {
             if range.len() == 1 {
@@ -138,6 +142,45 @@ pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &to
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires the sealed V4 Flash coordinator and Spark expert packages"]
+    fn live_skinny_router_packed_discriminator() -> Result<()> {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli { #[command(flatten)] args: super::super::GoldenArgs }
+        let snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?;
+        let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?;
+        let fixtures = std::env::var("CUTEAFD_GOLDEN_FIXTURES")?;
+        let manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
+        let args = Cli::try_parse_from(["v4", "--snapshot", &snapshot, "--peers", &peers,
+            "--manifest", &manifest, "--golden", &fixtures, "--full-prefill-logits",
+            "--pool-tokens", "262144", "--rtx-expert-layers", "2", "--dspark",
+            "--prefill-rows", "2752", "--prefill-waves", "3", "--max-sequences", "8"])?.args;
+        let loaded = super::super::load(&args.engine)?;
+        let (_, _, hash) = super::super::fidelity_publication(loaded.family)?;
+        ensure!(cuteafd_bench::fidelity_rows::sha256(&args.golden.join("manifest.json"))? == hash,
+            "skinny discriminator needs the immutable publication");
+        let manifest: serde_json::Value = cuteafd_loader::read_json_file(&args.golden.join("manifest.json"))?;
+        let reference = cuteafd_bench::fidelity_dataset::load(&args.golden, &manifest)?;
+        let window = reference.windows.iter().find(|w| w.id == "legacy").unwrap();
+        let prompts = vec![window.tokens[..512].to_vec(); 3];
+        super::super::with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, links, runtime, _| {
+            engine.configure_packing(PackingMode::Unrestricted, links)?;
+            let (alone, _) = arm(engine, links, runtime, &prompts, 2, false)?;
+            let (packed, packs) = arm(engine, links, runtime, &prompts, 2, true)?;
+            ensure!(packs > 0, "skinny discriminator exercised no packs");
+            for (i, (a, b)) in alone.iter().zip(&packed).enumerate() {
+                ensure!(a.frontier == 512 && b.frontier == 512
+                    && a.logits.len() == 512 * engine.cfg.vocab_size && a.logits.len() == b.logits.len()
+                    && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid observation");
+                let (kl, top1) = pair_metrics(&a.logits, &b.logits, engine.cfg.vocab_size);
+                println!("skinny-only member {i}: packed-vs-singleton KL {kl:.8}, top-1 {top1:.6}, logits byte-identical {}, state byte-identical {}, packs {packs}, max packed rows 64",
+                    equal(&a.logits, &b.logits), a.state == b.state);
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn diagnostic_widths_cover_router_boundary_and_pair_metrics_are_informational() {
         assert_eq!((widths(0, 0), widths(0, 1), widths(0, 2)), (29, 40, 59));
