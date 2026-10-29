@@ -716,7 +716,7 @@ def test_failed_group_does_not_discard_other_completed_reports(tmp_path, monkeyp
     def compare(left, right):
         if left.parent.name == "bad":
             raise ValueError("missing pair")
-        return {"programs": []}
+        return {"programs": [], "added_programs": [], "removed_programs": []}
 
     monkeypatch.setattr(compare_sm, "compare", compare)
     assert compare_sm.main() == 1
