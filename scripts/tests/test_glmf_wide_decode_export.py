@@ -737,7 +737,7 @@ def test_every_native_dense_export_publishes_cap_without_rekeying(filename, func
     ("mimo_ffn.py", {"compile_mimo_norm_aot", "compile_mimo_ffn_aot", "compile_mimo_router_scores_aot"}),
     ("glmf.py", {"compile_glmf_mla_producer_aot", "compile_glmf_ffn_aot", "compile_glmf_o_aot",
                   "compile_glmf_router_scores_aot", "compile_glmf_add_aot", "compile_glmf_head_aot"}),
-    ("glm_ffn.py", {"compile_glm_router_scores_aot", "_compile_glm_ffn_w8"}),
+    ("glm_ffn.py", {"compile_glm_router_scores_aot", "_compile_glm_ffn_w8", "compile_glm_norm_aot", "_compile_glm_ffn_tensor_w8"}),
     ("dsv4_ffn.py", {"compile_dsv4_router_scores_aot", "compile_dsv4_shared_ffn_aot"}),
 ])
 def test_coordinator_composites_publish_first_route_caps(filename, programs):
