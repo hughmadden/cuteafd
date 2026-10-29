@@ -450,6 +450,17 @@ impl OfficialV41Catalog {
             table.name_stats(format!("engram.{layer}.{suffix}"));
             Ok(table)
         };
+        if self.config().strided_engram() {
+            let parts = self.config().engram_parts(layer).iter().map(|part| {
+                let tensor = self.tensor(&part.tensor)?;
+                Ok(crate::TablePart { path: self.snapshot.join(&tensor.shard),
+                    offset: tensor.metadata.byte_offset, rows: part.rows as u64 })
+            }).collect::<Result<Vec<_>>>()?;
+            // SAFETY: forwarded from this function's immutable checkpoint contract.
+            let table = unsafe { crate::MappedTable::open(&parts, crate::RowFormat::of(DType::U8, 264)?)? };
+            table.name_stats(format!("engram.{layer}.strided"));
+            return crate::EngramTable::new_strided(table);
+        }
         crate::EngramTable::new(map("weight")?, map("scale")?)
     }
 
@@ -660,6 +671,22 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
     );
     let index: Index = serde_json::from_slice(&bytes)?;
     let mut expected = expected_tensors()?;
+    if config.strided_engram() {
+        ensure!(nvfp4.is_none(), "strided FP8 engram requires native official quantization");
+        for layer in &config.text().engram_layer_ids {
+            let prefix = format!("layers.{layer}.engram.embed");
+            let weight = expected.remove(&format!("{prefix}.weight")).context("missing engram weight")?;
+            let scale = expected.remove(&format!("{prefix}.scale")).context("missing engram scale")?;
+            let parts = config.engram_parts(*layer);
+            ensure!(parts.iter().map(|part| part.rows).sum::<usize>() == weight.shape[0]
+                && weight.bytes + scale.bytes == weight.shape[0] as u64 * 264, "invalid strided row count");
+            for part in parts {
+                expected.insert(part.tensor.clone(), ExpectedTensor {
+                    dtype: DType::U8, shape: vec![part.rows, 264], bytes: part.rows as u64 * 264,
+                });
+            }
+        }
+    }
     if let Some(contract) = &nvfp4 {
         // ModelOpt NVFP4 replaces the two native routed-expert tensors with a
         // packed E2M1 payload, an E4M3 per-16 scale plane, a global weight
@@ -673,9 +700,19 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
         expected.len(),
         index.weight_map.len()
     );
-    let allowed_shards: BTreeSet<String> = (1..=48u32)
+    let mut allowed_shards: BTreeSet<String> = (1..=48u32)
         .map(|i| format!("model-{i:05}-of-00048.safetensors"))
         .collect();
+    if config.strided_engram() {
+        for layer in &config.text().engram_layer_ids {
+            for (number, part) in config.engram_parts(*layer).iter().enumerate() {
+                let shard = format!("engram-{layer:02}-part-{number:05}.safetensors");
+                ensure!(index.weight_map.get(&part.tensor) == Some(&shard),
+                    "strided part {} must be in {shard}", part.tensor);
+                allowed_shards.insert(shard);
+            }
+        }
+    }
     let shard_count = allowed_shards.len();
     let mut shards: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (name, shard) in &index.weight_map {
@@ -1641,6 +1678,100 @@ mod tests {
             |name| vision(name) || name == "layers.1.engram.embed.scale").unwrap_err());
         assert!(error.contains("role vision needs tensor layers.1.engram.embed.scale"), "{error}");
     }
+    #[test]
+    fn strided_role_catalog_requires_declared_exact_headers_and_maps_one_table() -> Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let mut config: serde_json::Value = serde_json::from_slice(include_bytes!("official-v41-config.json"))?;
+        let mut parts = serde_json::Map::new();
+        let mut expected = expected_tensors()?;
+        for layer in [1, 14] {
+            let prefix = format!("layers.{layer}.engram.embed");
+            let weight = expected.remove(&format!("{prefix}.weight")).unwrap();
+            expected.remove(&format!("{prefix}.scale")).unwrap();
+            let chunk = weight.shape[0].div_ceil(3);
+            let mut declared = Vec::new();
+            for number in 0..3 {
+                let rows = chunk.min(weight.shape[0] - number * chunk);
+                let name = format!("{prefix}.strided_{number:05}");
+                declared.push(serde_json::json!({"tensor": name, "rows": rows}));
+                expected.insert(name, ExpectedTensor { dtype: DType::U8,
+                    shape: vec![rows, 264], bytes: rows as u64 * 264 });
+            }
+            parts.insert(layer.to_string(), declared.into());
+        }
+        config["engram_storage"] = serde_json::json!({"layout": "fp8_row_interleaved_v1",
+            "weight_bytes": 256, "scale_bytes": 8, "tensor_suffix": "strided", "parts": parts});
+        std::fs::write(dir.path().join("config.json"), config.to_string())?;
+        let selected = |name: &str| name.contains(".engram.embed.strided_");
+        let shard = |i: usize| format!("model-{i:05}-of-00048.safetensors");
+        let part_shard = |name: &str| {
+            let fields: Vec<_> = name.split('.').collect();
+            format!("engram-{:02}-part-{}.safetensors", fields[1].parse::<usize>().unwrap(),
+                fields[4].strip_prefix("strided_").unwrap())
+        };
+        let mut weight_map: BTreeMap<_, _> = expected.keys().enumerate().map(|(i, name)| {
+            (name.clone(), if selected(name) { part_shard(name) } else { shard(1 + i % 48) })
+        }).collect();
+        let index = dir.path().join("model.safetensors.index.json");
+        std::fs::write(&index, serde_json::json!({"weight_map": weight_map}).to_string())?;
+        let write_header = |dtype: &str, width: usize| -> Result<()> {
+            for (name, spec) in expected.iter().filter(|(name, _)| selected(name)) {
+                let header = serde_json::to_vec(&serde_json::json!({name: {"dtype": dtype,
+                    "shape": [spec.shape[0], width], "data_offsets": [0, spec.bytes]}}))?;
+                let mut file = File::create(dir.path().join(part_shard(name)))?;
+                file.write_all(&(header.len() as u64).to_le_bytes())?;
+                file.write_all(&header)?;
+                file.set_len(8 + header.len() as u64 + spec.bytes)?;
+            }
+            Ok(())
+        };
+        write_header("U8", 264)?;
+        let catalog = read_official_v41_role_catalog(dir.path(), "engram", selected)?;
+        assert_eq!(catalog.tensors().len(), 6);
+        // SAFETY: this immutable sparse fixture outlives both mapped tables.
+        let table = unsafe { catalog.map_engram(1)? };
+        assert!(table.is_strided());
+        assert!(table.scales().is_none());
+        assert_eq!(table.weights().row_bytes(), 264);
+        drop(table);
+        let mut generic = cuteafd_core::TensorCatalog {
+            model_id: "synthetic-strided".into(), snapshot_path: dir.path().to_string_lossy().into(),
+            facts: Default::default(), tensors: catalog.tensors().iter().filter(|t| t.metadata.name.starts_with("layers.1.")).map(|t| {
+                cuteafd_core::TensorInfo { name: t.metadata.name.clone(), file: t.shard.clone(),
+                    dtype: t.metadata.dtype.clone(), shape: t.metadata.shape.clone(),
+                    byte_offset: t.metadata.byte_offset, byte_length: t.metadata.byte_length,
+                    role: cuteafd_core::TensorRole::Other, layer_id: Some(1), expert_id: None,
+                    is_quantization_metadata: false }
+            }).collect(),
+        };
+        // SAFETY: the sparse fixture is immutable while this mapped table is alive.
+        let generic_table = unsafe { crate::EngramTable::from_catalog(&generic, 1)? };
+        assert_eq!(generic_table.weights().rows(), 384_006_168);
+        let boundary = generic.tensors[0].shape[0] as u64;
+        let mut gathered = [1; 4 * 264];
+        generic_table.weights().gather_into(&[boundary - 1, boundary, boundary + 1, 384_006_167], &mut gathered)?;
+        assert_eq!(gathered, [0; 4 * 264]);
+        drop(generic_table);
+        generic.tensors[1].shape[0] -= 1;
+        // SAFETY: unchanged fixture; invalid catalog is rejected before mapping.
+        assert!(unsafe { crate::EngramTable::from_catalog(&generic, 1) }.is_err());
+        write_header("I8", 264)?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        write_header("U8", 263)?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        write_header("U8", 264)?;
+        weight_map.insert("layers.1.engram.embed.weight".into(), shard(1));
+        std::fs::write(&index, serde_json::json!({"weight_map": weight_map}).to_string())?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        weight_map.remove("layers.1.engram.embed.weight");
+        std::fs::write(&index, serde_json::json!({"weight_map": weight_map}).to_string())?;
+        config.as_object_mut().unwrap().remove("engram_storage");
+        std::fs::write(dir.path().join("config.json"), config.to_string())?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        Ok(())
+    }
+
     #[test]
     fn rejects_same_byte_count_with_wrong_representation() {
         let spec = ExpectedTensor {

@@ -1045,6 +1045,35 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn strided_engram_planner_detects_headers_and_requires_matching_config() {
+    let mut config = v41_config();
+    config["engram_storage"] = serde_json::json!({"layout": "fp8_row_interleaved_v1",
+        "weight_bytes": 256, "scale_bytes": 8, "tensor_suffix": "strided", "parts": {
+            "1": [{"tensor":"layers.1.engram.embed.strided_00000", "rows":7},
+                  {"tensor":"layers.1.engram.embed.strided_00001", "rows":9}],
+            "14": [{"tensor":"layers.14.engram.embed.strided_00000", "rows":1}]}});
+    let dir = snapshot(config.clone(), &[t("layers.1.engram.embed.strided_00000", "U8", &[7, 264]),
+        t("layers.1.engram.embed.strided_00001", "U8", &[9, 264])]);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let mapped = component(&report, Component::MappedTable);
+    assert_eq!(mapped.bytes, 16 * 264);
+    assert!(mapped.formats.contains_key("fp8-strided264/ue8m0"));
+    assert_eq!(report.mapped_placement.mapped, 1);
+    assert_eq!(report.mapped_placement.scale_bytes, 0);
+    assert!(report.hints.iter().all(|h| !h.what.contains("strided engram")), "{:?}", report.hints);
+    // Matching total bytes cannot hide a changed part boundary.
+    let changed = snapshot(config.clone(), &[t("layers.1.engram.embed.strided_00000", "U8", &[8, 264]),
+        t("layers.1.engram.embed.strided_00001", "U8", &[8, 264])]);
+    let changed_report = plan(changed.path(), &PlanOptions::default()).unwrap();
+    assert!(changed_report.hints.iter().any(|h| h.what.contains("strided engram")));
+    for (cfg, shape) in [(v41_config(), vec![16, 264]), (config, vec![16, 263])] {
+        let dir = snapshot(cfg, &[t("layers.1.engram.embed.strided_00000", "U8", &shape)]);
+        let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+        assert!(report.hints.iter().any(|h| h.what.contains("strided engram")), "{:?}", report.hints);
+    }
+}
+
+#[test]
 fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     for nvfp4 in [false, true] {

@@ -13,7 +13,47 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Constructed only after every official architecture and quantization field agrees.
 #[derive(Debug, Clone)]
-pub struct OfficialV41Config(V41CheckpointConfig);
+pub struct OfficialV41Config(V41CheckpointConfig, Option<EngramStorage>);
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EngramPart {
+    pub tensor: String,
+    pub rows: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EngramStorage {
+    layout: String,
+    weight_bytes: usize,
+    scale_bytes: usize,
+    tensor_suffix: String,
+    pub parts: std::collections::BTreeMap<String, Vec<EngramPart>>,
+}
+
+impl EngramStorage {
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
+        let storage: Self = serde_json::from_value(value.clone())?;
+        ensure!(storage.layout == "fp8_row_interleaved_v1" && storage.weight_bytes == 256
+            && storage.scale_bytes == 8 && storage.tensor_suffix == "strided",
+            "unsupported config.engram_storage");
+        ensure!(storage.parts.keys().map(String::as_str).collect::<Vec<_>>() == ["1", "14"],
+            "strided engram requires parts for layers 1 and 14");
+        for (layer, parts) in &storage.parts {
+            ensure!(!parts.is_empty() && parts.len() <= 1024, "invalid engram part count");
+            let mut total = 0usize;
+            for (index, part) in parts.iter().enumerate() {
+                ensure!(part.tensor == format!("layers.{layer}.engram.embed.strided_{index:05}")
+                    && part.rows > 0 && part.rows as u64 <= 45_000_000_000 / 264,
+                    "invalid ordered engram part {}", part.tensor);
+                total = total.checked_add(part.rows).context("engram row count overflow")?;
+            }
+        }
+        Ok(storage)
+    }
+}
+
 
 impl OfficialV41Config {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
@@ -21,14 +61,29 @@ impl OfficialV41Config {
             bytes.len() as u64 <= MAX_CONFIG_BYTES,
             "V4.1 config exceeds one MiB"
         );
-        let actual: Value =
+        let mut actual: Value =
             serde_json::from_slice(bytes).context("parsing official V4.1 config")?;
+        let strided = actual.as_object_mut().and_then(|v| v.remove("engram_storage"))
+            .map(|storage| EngramStorage::parse(&storage)).transpose()?;
+        if let Some(storage) = &strided {
+            for (layer, rows) in [("1", 384_006_168usize), ("14", 384_016_682)] {
+                ensure!(storage.parts[layer].iter().map(|part| part.rows).sum::<usize>() == rows,
+                    "strided engram total rows differ at layer {layer}");
+            }
+        }
         let expected: Value =
             serde_json::from_str(OFFICIAL_CONFIG).expect("embedded official config");
         validate_fields("config", &expected, &actual)?;
         Ok(Self(
-            serde_json::from_value(actual).context("decoding official V4.1 config")?,
+            serde_json::from_value(actual).context("decoding official V4.1 config")?, strided,
         ))
+    }
+
+    pub fn strided_engram(&self) -> bool { self.1.is_some() }
+
+    pub(crate) fn engram_parts(&self, layer: usize) -> &[EngramPart] {
+        self.1.as_ref().and_then(|storage| storage.parts.get(&layer.to_string()))
+            .map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn architectures(&self) -> &[String] {
@@ -230,6 +285,39 @@ struct V41CheckpointConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strided_engram_requires_exact_declared_storage_without_changing_quantization() {
+        let mut config: Value = serde_json::from_str(OFFICIAL_CONFIG).unwrap();
+        assert!(!OfficialV41Config::from_json(&serde_json::to_vec(&config).unwrap()).unwrap().strided_engram());
+        config["engram_storage"] = serde_json::json!({"layout": "fp8_row_interleaved_v1",
+            "weight_bytes": 256, "scale_bytes": 8, "tensor_suffix": "strided", "parts": {
+                "1": [{"tensor": "layers.1.engram.embed.strided_00000", "rows": 128002056},
+                      {"tensor": "layers.1.engram.embed.strided_00001", "rows": 128002056},
+                      {"tensor": "layers.1.engram.embed.strided_00002", "rows": 128002056}],
+                "14": [{"tensor": "layers.14.engram.embed.strided_00000", "rows": 128005561},
+                       {"tensor": "layers.14.engram.embed.strided_00001", "rows": 128005561},
+                       {"tensor": "layers.14.engram.embed.strided_00002", "rows": 128005560}]}});
+        assert!(OfficialV41Config::from_json(&serde_json::to_vec(&config).unwrap()).unwrap().strided_engram());
+        let good = config["engram_storage"].clone();
+        for mutation in ["rows", "order", "empty", "missing"] {
+            config["engram_storage"] = good.clone();
+            match mutation {
+                "rows" => config["engram_storage"]["parts"]["1"][0]["rows"] = 1.into(),
+                "order" => config["engram_storage"]["parts"]["1"].as_array_mut().unwrap().swap(0, 1),
+                "empty" => config["engram_storage"]["parts"]["1"] = serde_json::json!([]),
+                "missing" => { config["engram_storage"]["parts"].as_object_mut().unwrap().remove("14"); },
+                _ => unreachable!(),
+            }
+            assert!(OfficialV41Config::from_json(&serde_json::to_vec(&config).unwrap()).is_err(), "{mutation}");
+        }
+        for bad in [Value::Null, serde_json::json!({"layout": "fp8_row_interleaved_v2"}),
+            serde_json::json!({"layout": "fp8_row_interleaved_v1", "weight_bytes": 256,
+                "scale_bytes": 9, "tensor_suffix": "strided"})] {
+            config["engram_storage"] = bad;
+            assert!(OfficialV41Config::from_json(&serde_json::to_vec(&config).unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn official_nested_architecture_has_distinct_dspark_and_ced_geometry() {

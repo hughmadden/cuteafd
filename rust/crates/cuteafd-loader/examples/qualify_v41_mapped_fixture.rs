@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         let mut weights = vec![0; 3 * 256];
         let mut scales = vec![0; 3 * 8];
         table.weights().gather_into(&rows, &mut weights)?;
-        table.scales().gather_into(&rows, &mut scales)?;
+        table.scales().unwrap().gather_into(&rows, &mut scales)?;
         ensure!(
             weights[..256].iter().all(|&b| b == 29),
             "last weight row mismatch"

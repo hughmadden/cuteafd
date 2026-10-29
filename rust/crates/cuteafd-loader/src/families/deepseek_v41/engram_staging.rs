@@ -57,7 +57,7 @@ impl EngramBatchStaging {
     /// mapped-table validation tree + read descriptors, selected/unsupported
     /// rows, residency flags and retained TLS page vectors, and io_uring's slot
     /// hash set. This conservative bound includes vector growth (at most 2x),
-    /// two pages per <=256-byte table row, and tree/hash allocation slack.
+    /// two pages per <=264-byte table row, and tree/hash allocation slack.
     ///
     /// The fixed 1 MiB additionally covers MAX_BATCH=4096: one SQ ring (64-byte
     /// SQEs + 4-byte indices), default 2x CQ (16-byte CQEs), rounded ring headers,
@@ -171,11 +171,26 @@ impl EngramBatchStaging {
             match gather { Some(gather) => gather.gather_slots(table, &addresses, &slots, output),
                 None => Ok(table.gather_slots(&addresses, &slots, output)?) }
         };
-        read(table.weights(), &mut weights[..rows * 24 * weight_bytes])?;
-        if encoding == EngramEncoding::Fp8 {
-            read(table.scales(), &mut scales[..rows * 24 * scale_bytes])?;
+        if table.is_strided() {
+            // One shared-table gather per unique row; split opaque bytes only
+            // after I/O, leaving the GPU's native FP8 staging unchanged.
+            let mut packed = vec![0; addresses.len() * 264];
+            match gather {
+                Some(gather) => gather.gather(table.weights(), &addresses, &mut packed)?,
+                None => table.weights().gather_into(&addresses, &mut packed)?,
+            }
+            for (row, &slot) in packed.chunks_exact(264).zip(&slots) {
+                weights[slot * 256..(slot + 1) * 256].copy_from_slice(&row[..256]);
+                scales[slot * 8..(slot + 1) * 8].copy_from_slice(&row[256..]);
+            }
         } else {
-            read(table.scales(), &mut weights[scale_base..scale_base + rows * 24 * scale_bytes])?;
+            read(table.weights(), &mut weights[..rows * 24 * weight_bytes])?;
+            let scale_table = table.scales().context("paired engram has no scale table")?;
+            if encoding == EngramEncoding::Fp8 {
+                read(scale_table, &mut scales[..rows * 24 * scale_bytes])?;
+            } else {
+                read(scale_table, &mut weights[scale_base..scale_base + rows * 24 * scale_bytes])?;
+            }
         }
         let mut previous = None;
         for &(address, slot) in &self.order {
@@ -225,6 +240,7 @@ mod tests {
         // multiplying a transient worker allocation by the number of leases.
         let per_lookup = 8 + word // distinct addresses and canonical slots
             + 256 + 2 * (std::mem::size_of::<u64>() + 2 * word) // validation tree, reads
+            + 264 // optional interleaved readback, split after gathering
             + 2 * word + 2 * 8 + 2 // unsupported indices, selected rows, hit flags
             + 2 * (2 * 2 * word + 2) + 2 // TLS pages/residency and returned hits
             + 2 * (8 + 2 * word) + 2 + 64; // pending reads/hits and hash slots
@@ -237,6 +253,55 @@ mod tests {
         }
         assert!(EngramBatchStaging::worker_bytes(0).is_err());
         assert!(EngramBatchStaging::worker_bytes(4097).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn strided_gather_matches_paired_bytes_across_parts_duplicates_images_and_gather_interfaces() -> Result<()> {
+        let batch = cuteafd_core::EngramHistory::new(0)?.prepare(0, &[Some(7), None, Some(31)], 3)?;
+        let weight = tempfile::NamedTempFile::new()?;
+        let scale = tempfile::NamedTempFile::new()?;
+        let packed = tempfile::NamedTempFile::new()?;
+        weight.as_file().set_len(ENGRAM_ROWS[0] * 256)?;
+        scale.as_file().set_len(ENGRAM_ROWS[0] * 8)?;
+        packed.as_file().set_len(ENGRAM_ROWS[0] * 264)?;
+        for hashes in batch.hashes() {
+            for &address in &hashes[0] {
+                let row: Vec<_> = (0..264).map(|col| ((address + col) % 251) as u8).collect();
+                weight.as_file().write_all_at(&row[..256], address * 256)?;
+                scale.as_file().write_all_at(&row[256..], address * 8)?;
+                packed.as_file().write_all_at(&row, address * 264)?;
+            }
+        }
+        let map = |file: &tempfile::NamedTempFile, width| {
+            // SAFETY: test owns immutable files throughout all gathers.
+            unsafe { crate::MappedTable::single(file.path(), 0, ENGRAM_ROWS[0],
+                crate::RowFormat::of(cuteafd_core::DType::U8, width)?) }
+        };
+        let paired = EngramTable::new(map(&weight, 256)?, map(&scale, 8)?)?;
+        let boundary = batch.hashes().iter().flat_map(|hashes| hashes[0].iter()).copied().min().unwrap() + 1;
+        let parts = [crate::TablePart { path: packed.path().into(), offset: 0, rows: boundary },
+            crate::TablePart { path: packed.path().into(), offset: boundary * 264, rows: ENGRAM_ROWS[0] - boundary }];
+        // SAFETY: test owns the immutable packed file throughout both parts' lifetime.
+        let strided = EngramTable::new_strided(unsafe { crate::MappedTable::open(&parts,
+            crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? })?;
+        assert!(strided.scales().is_none());
+        let mut before = EngramBatchStaging::new(8)?;
+        let mut after = EngramBatchStaging::new(8)?;
+        let row_gather = crate::shared::token_table::RowGather::new("strided-test", 2)?;
+        for copies in [2, 1, 2] {
+            let batches = vec![&batch; copies];
+            let expected = before.gather(&paired, &batches, 0)?;
+            for backend in [None, Some(&row_gather)] {
+                let actual = after.gather_on(&strided, &batches, 0, backend)?;
+                assert_eq!(actual.weights, expected.weights);
+                assert_eq!(actual.scales, expected.scales);
+                assert_eq!(actual.text_mask, expected.text_mask);
+                assert_eq!(actual.global_scale.to_bits(), expected.global_scale.to_bits());
+                assert_eq!(actual.encoding, expected.encoding);
+            }
+        }
+        assert!(EngramTable::new_strided(map(&weight, 256)?).is_err());
         Ok(())
     }
 

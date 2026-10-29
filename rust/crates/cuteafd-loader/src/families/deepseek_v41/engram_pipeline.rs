@@ -146,22 +146,17 @@ impl EngramPipeline {
             tracing::warn!(%error, "cannot admit mapped table preload; keeping all tables mapped");
             0
         });
-        let scale_bytes = tables.iter().map(|table| table.scales().bytes()).sum();
+        let scales = tables.iter().filter_map(|table| table.scales()).count();
+        let scale_bytes = tables.iter().filter_map(|table| table.scales()).map(|table| table.bytes()).sum();
         let table_bytes = tables.iter().map(|table| table.weights().bytes()).sum::<u64>() + scale_bytes;
-        let mut placement = MappedPlacement::resolve(4, 2, scale_bytes, preload_cap, host_budget)
+        let mut placement = MappedPlacement::resolve(2 + scales, scales, scale_bytes, preload_cap, host_budget)
             .admit_tables(table_bytes);
         let started = std::time::Instant::now();
         if placement.preloaded > 0 {
-            let [first, second] = &mut tables;
-            let [first_weights, first_scales] = first.tables_mut();
-            let [second_weights, second_scales] = second.tables_mut();
-            // Scales first: every row read needs one, at a fraction of the weight bytes.
-            let mut targets = vec![first_scales, second_scales];
             if placement.tables_preloaded() {
                 tracing::info!(table_bytes, readers = PRELOAD_READERS, "mapped table preload started");
-                targets.extend([first_weights, second_weights]);
             }
-            if let Err(error) = crate::MappedTable::preload_all(&mut targets, PRELOAD_READERS) {
+            if let Err(error) = preload_tables(&mut tables, placement.tables_preloaded()) {
                 placement.fallback(&error);
             }
         }
@@ -198,7 +193,8 @@ impl EngramPipeline {
     pub fn start_warm(&mut self, readers: usize, ready: impl Fn() -> bool + Send + 'static) -> Result<()> {
         ensure!(self.warm.is_none(), "engram warm already started");
         self.warm = Some(crate::formats::mapped_warm::TableWarm::start("engram", self.tables.clone(),
-            |[first, second]| vec![first.scales(), second.scales(), first.weights(), second.weights()],
+            |[first, second]| first.scales().into_iter().chain(second.scales())
+                .chain([first.weights(), second.weights()]).collect(),
             readers, ready)?);
         Ok(())
     }
@@ -359,6 +355,20 @@ impl EngramWave {
     }
 }
 
+// Preload scales first when separate, then whole row payloads when admitted.
+fn preload_tables(tables: &mut [EngramTable], include_rows: bool) -> Result<()> {
+    let mut targets = Vec::new();
+    let mut rows = Vec::new();
+    for table in tables {
+        let (weights, scales) = table.tables_mut();
+        targets.extend(scales);
+        if include_rows { rows.push(weights); }
+    }
+    targets.extend(rows);
+    crate::MappedTable::preload_all(&mut targets, crate::formats::mapped_preload::PRELOAD_READERS)?;
+    Ok(())
+}
+
 // A lease contains both weight and scale rows. Its consumer wait belongs to
 // the layer/pair, not each tensor; store it on weights so totals never double.
 fn record_layer_wait(table: &EngramTable, elapsed: std::time::Duration, decode: bool) {
@@ -508,7 +518,7 @@ mod wait_tests {
         record_layer_wait(&table, std::time::Duration::from_micros(7), true);
         record_layer_wait(&table, std::time::Duration::from_micros(3), false);
         let weight = table.weights().stats().snapshot();
-        let scale = table.scales().stats().snapshot();
+        let scale = table.scales().unwrap().stats().snapshot();
         assert_eq!((weight.consumer_steps, weight.stall_ns), (2, 10_000));
         assert_eq!((weight.decode_steps, weight.decode_stall_ns), (1, 7_000));
         assert_eq!((scale.consumer_steps, scale.stall_ns, scale.decode_steps, scale.decode_stall_ns), (0, 0, 0, 0));

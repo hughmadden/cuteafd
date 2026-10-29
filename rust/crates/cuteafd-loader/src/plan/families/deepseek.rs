@@ -78,7 +78,14 @@ impl Family for DeepSeek {
             Some(DeepseekV4Config::read(&checkpoint.snapshot, dspark_stages(checkpoint))
                 .map_err(ConfigError::from_anyhow)?)
         } else { None };
-        Ok(Box::new(DeepSeekModel { id: self.id, spec, v4_config, config: checkpoint.config.clone() }))
+        let mut strided_parts: std::collections::BTreeMap<String, Vec<(String, usize)>> = Default::default();
+        for tensor in &checkpoint.tensors {
+            let (stem, suffix) = crate::plan::format::split_stem(&tensor.meta.name);
+            if suffix.starts_with("strided_") && tensor.meta.shape.len() == 2 {
+                strided_parts.entry(stem.into()).or_default().push((tensor.meta.name.clone(), tensor.meta.shape[0]));
+            }
+        }
+        Ok(Box::new(DeepSeekModel { strided_parts, id: self.id, spec, v4_config, config: checkpoint.config.clone() }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -346,6 +353,7 @@ struct DeepSeekModel {
     spec: ModelSpec,
     v4_config: Option<DeepseekV4Config>,
     config: Value,
+    strided_parts: std::collections::BTreeMap<String, Vec<(String, usize)>>,
 }
 
 /// The routed projection shape `[N, K]` a stem names: w1/w3 (gate/up) are
@@ -443,10 +451,26 @@ impl FamilyModel for DeepSeekModel {
             (_, Component::RoutedExpert) => self.routed(stem, operand),
             ("deepseek_v4", Component::Vision) => Err("serve-dsv4 takes no images".into()),
             (_, Component::SpeculatorExpert) => self.routed(stem, operand),
-            (_, Component::MappedTable) => require(
-                operand.is_fp8_row_groups(32, &[ScaleEncoding::Ue8m0]) || operand.is_nvfp4(),
-                || format!("engram rows are E4M3 with UE8M0 1x32 scales or NVFP4; found {}", describe(operand)),
-            ),
+            (_, Component::MappedTable) => {
+                let strided = operand.companions.iter().any(|s| s == "strided");
+                if strided {
+                    require(self.id == "deepseek_v41", || "strided engram requires V4.1".into())?;
+                    let storage = self.config.get("engram_storage")
+                        .ok_or_else(|| "strided engram requires the checkpoint's fp8_row_interleaved_v1 declaration".to_string())?;
+                    let storage = crate::families::deepseek_v41::v41_config::EngramStorage::parse(storage)
+                        .map_err(|error| format!("strided engram: {error:#}"))?;
+                    let layer = role.layer.ok_or_else(|| "strided engram has no layer".to_string())?;
+                    let parts = storage.parts.get(&layer.to_string())
+                        .ok_or_else(|| "strided engram declared at unsupported layer".to_string())?;
+                    require(parts.iter().map(|part| part.rows).sum::<usize>() == operand.logical[0]
+                        && self.strided_parts.get(stem) == Some(&parts.iter().map(|p| (p.tensor.clone(), p.rows)).collect()),
+                        || "strided engram config/header part rows differ".into())?;
+                }
+                require(self.config.get("engram_storage").is_none() || strided,
+                    || "declared strided engram has a paired tensor layout".into())?;
+                require(operand.is_fp8_row_groups(32, &[ScaleEncoding::Ue8m0]) || operand.is_nvfp4(),
+                    || format!("engram rows are E4M3 with UE8M0 1x32 scales or NVFP4; found {}", describe(operand)))
+            },
             _ => self.coordinator(operand),
         }
     }
