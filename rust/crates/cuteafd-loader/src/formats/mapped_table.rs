@@ -4,7 +4,7 @@
 //! A table is one or more safetensors tensors (parts) viewed as one row space.
 //! Parts are mapped read-only and page-cache backed with `MADV_RANDOM` (no
 //! sequential read-ahead across a hash table). Buffered io_uring reads use
-//! POSIX_FADV_RANDOM and NOWAIT, retrying misses without O_DIRECT.
+//! POSIX_FADV_RANDOM; a process-wide reactor reads only mincore misses without O_DIRECT.
 //! Rows reach the GPU in three steps, each bounded:
 //!
 //! - prefetch: as soon as row ids are known (a prefill chunk ahead, a wave's
@@ -18,7 +18,7 @@
 //!
 //! Page cache is the host cache: under memory pressure the kernel evicts table
 //! pages and the next gather brings them back. [`TableStats`] distinguishes
-//! NOWAIT hits from mmap residency snapshots, not just major faults.
+//! caller-side residency snapshots from completed miss reads, not just major faults.
 use cuteafd_core::DType;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -30,6 +30,28 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 
 mod uring;
+mod reactor;
+
+/// Explicit priority from the decode/prefill pipeline, never inferred from row count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadPriority { DecodeFirst, Decode, PrefillFirst, #[default] Prefill }
+impl ReadPriority {
+    pub(crate) fn is_decode(self) -> bool { matches!(self, Self::DecodeFirst | Self::Decode) }
+    pub(crate) fn first(self) -> Self {
+        if self.is_decode() { Self::DecodeFirst } else { Self::PrefillFirst }
+    }
+}
+/// Conservative process-wide admission: 16 MiB miss buffers plus descriptors,
+/// SQ/CQ storage and owner scratch. Charged once per process, not per table.
+pub const TABLE_REACTOR_WORKSPACE_BYTES: usize = 18 << 20;
+
+/// Setup retries retain the process-wide reservation after initialization.
+pub fn table_reactor_started() -> bool { reactor::started() }
+
+/// One process-wide reservation regardless of table groups or device owners.
+pub fn table_reactor_workspace_bytes(tables: usize) -> usize {
+    if tables > 0 { TABLE_REACTOR_WORKSPACE_BYTES } else { 0 }
+}
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -121,7 +143,7 @@ pub struct MappedRows {
     rows: u64,
     row_bytes: usize,
     page_bytes: usize,
-    file: File,
+    file: Arc<File>,
     file_offset: u64,
     nowait: AtomicBool,
     fuse: bool,
@@ -179,7 +201,7 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file };
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         // SAFETY: advice over exactly the mapping created above.
         if unsafe { libc::madvise(raw, mapped_len, libc::MADV_RANDOM) } != 0 {
@@ -237,6 +259,7 @@ impl MappedRows {
 
     /// Copy selected rows in input order, retaining duplicates and allocating no staging memory.
     pub fn gather_into(&self, rows: &[u64], output: &mut [u8]) -> Result<()> {
+
         let size = rows.len().checked_mul(self.row_bytes).ok_or_else(|| invalid("gather size overflow"))?;
         if output.len() != size {
             return Err(invalid("gather output size does not match requested rows"));
@@ -542,7 +565,6 @@ impl MappedTable {
             }
         }
         table.stats.approximate.store(table.parts.iter().any(|part| part.fuse), Ordering::Relaxed);
-        table.initialize_reads();
         Ok(table)
     }
 
@@ -764,6 +786,9 @@ impl MappedTable {
     /// Copy selected rows in input order, retaining duplicates and allocating
     /// no staging memory; the whole batch is validated before any write.
     pub fn gather_into(&self, rows: &[u64], output: &mut [u8]) -> Result<()> {
+        self.gather_into_priority(rows, output, ReadPriority::Prefill)
+    }
+    pub fn gather_into_priority(&self, rows: &[u64], output: &mut [u8], priority: ReadPriority) -> Result<()> {
         let size = rows.len().checked_mul(self.row_bytes()).ok_or_else(|| invalid("gather size overflow"))?;
         if output.len() != size {
             return Err(invalid("gather output size does not match requested rows"));
@@ -772,7 +797,7 @@ impl MappedTable {
             self.locate(row)?;
         }
         let slots: Vec<_> = (0..rows.len()).collect();
-        self.gather_slots(rows, &slots, output)?;
+        self.gather_slots_priority(rows, &slots, output, priority)?;
         Ok(())
     }
 
@@ -780,32 +805,59 @@ impl MappedTable {
     /// destination layout is shared by both backends; all rows are validated
     /// before any write, and every io_uring batch drains before returning.
     pub fn gather_slots(&self, rows: &[u64], slots: &[usize], output: &mut [u8]) -> Result<()> {
+        self.gather_slots_priority(rows, slots, output, ReadPriority::Prefill)
+    }
+    pub fn gather_slots_priority(&self, rows: &[u64], slots: &[usize], output: &mut [u8], priority: ReadPriority) -> Result<()> {
+        let pending = self.prepare_gather(rows, slots, output, priority, 2)?;
+        pending.finish(self, output)
+    }
+
+    /// Copy hits now and submit only misses. The returned ticket owns its I/O
+    /// buffers/files, not the destination, so another table can start first.
+    pub(crate) fn prepare_gather(&self, rows: &[u64], slots: &[usize], output: &mut [u8],
+        priority: ReadPriority, window: usize) -> Result<PreparedTableGather> {
         if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
         let width = self.row_bytes();
         let mut unique = BTreeSet::new();
-        let reads: Vec<_> = rows.iter().zip(slots).map(|(&row, &slot)| {
+        let locations = rows.iter().zip(slots).map(|(&row, &slot)| {
             let (part, local) = self.locate(row)?;
             if slot.checked_add(1).and_then(|n| n.checked_mul(width)).is_none_or(|n| n > output.len())
                 || !unique.insert(slot) { return Err(invalid("invalid or overlapping gather slots")); }
-            Ok(uring::Read { part: &self.parts[part], row: local, slot })
-        }).collect::<Result<_>>()?;
+            Ok((part, local, slot))
+        }).collect::<Result<Vec<_>>>()?;
+        let mut prepared = PreparedTableGather { misses: Vec::new(), stream: None,
+            stats: Default::default(), output_len: output.len(), width };
         if self.resident.is_some() {
             for (&row, &slot) in rows.iter().zip(slots) {
                 output[slot * width..(slot + 1) * width].copy_from_slice(self.row(row)?);
             }
-            return Ok(());
+            return Ok(prepared);
         }
-        if self.backend() != TableBackend::Mmap {
-            match self.uring_reads(rows, &reads, output, false) {
-                Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
+        let hits = self.residency(rows, false)?;
+        let before = thread_faults();
+        for ((part, row, slot), hit) in locations.into_iter().zip(hits) {
+            if hit {
+                output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
+                prepared.stats.hits += 1;
+                prepared.stats.hit_bytes += width as u64;
+            } else {
+                prepared.misses.push((part, row, slot));
+                prepared.stats.misses += 1;
+                prepared.stats.miss_bytes += width as u64;
+                prepared.stats.device_bytes_estimate += self.parts[part].pages(row)?.count() as u64 * self.parts[part].page_bytes as u64;
+            }
+        }
+        prepared.stats.resident_copy_rows = prepared.stats.hits;
+        prepared.stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
+        if !prepared.misses.is_empty() {
+            let reads = prepared.misses.iter().map(|&(part, row, slot)| reactor::Read {
+                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot }).collect();
+            match uring::start(reads, width, priority, window) {
+                Ok(stream) => prepared.stream = Some(stream),
                 Err(error) => self.uring_fallback(&error),
             }
         }
-        self.record_residency(rows)?;
-        for read in reads {
-            output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
-        }
-        Ok(())
+        Ok(prepared)
     }
 
     /// mincore snapshots every requested page before copying any rows. Pages
@@ -861,59 +913,66 @@ impl MappedTable {
         Ok(())
     }
 
-    fn uring_reads(&self, rows: &[u64], reads: &[uring::Read<'_>], output: &mut [u8], prefetch: bool) -> Result<uring::ReadStats> {
-        let unsupported: Vec<_> = reads.iter().enumerate().filter_map(|(i, read)|
-            (!read.part.nowait.load(Ordering::Relaxed)).then_some(i)).collect();
-        let selected: Vec<_> = unsupported.iter().map(|&i| rows[i]).collect();
-        let mut hits = vec![None; reads.len()];
-        if !selected.is_empty() {
-            for (index, hit) in unsupported.into_iter().zip(self.residency(&selected, prefetch)?) { hits[index] = Some(hit); }
+    fn uring_reads(&self, rows: &[u64], reads: &[uring::Read<'_>], output: &mut [u8], prefetch: bool,
+        priority: ReadPriority) -> Result<uring::ReadStats> {
+        // All residency snapshots and cache-hit copies stay on the caller.
+        // mincore is intentionally approximate, including on NOWAIT-capable files.
+        let hits = self.residency(rows, prefetch)?;
+        let mut pending = Vec::with_capacity(reads.len());
+        let before = thread_faults();
+        let mut stats = uring::ReadStats::default();
+        for (read, hit) in reads.iter().zip(hits) {
+            if hit {
+                let width = self.row_bytes();
+                output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
+                stats.hits += 1;
+                stats.hit_bytes += width as u64;
+            } else { pending.push(uring::Read { part: read.part, row: read.row, slot: read.slot }); }
         }
-        if hits.contains(&Some(true)) {
-            // Unsupported-file resident rows use mmap; NOWAIT-capable files
-            // retain exact completion-based classification in this mode too.
-            let mut pending = Vec::with_capacity(reads.len());
-            let mut pending_hits = Vec::with_capacity(reads.len());
-            let before = thread_faults();
-            let mut copied = 0;
-            for (read, hit) in reads.iter().zip(hits) {
-                if hit == Some(true) {
-                    let width = self.row_bytes();
-                    output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
-                    copied += 1;
-                } else {
-                    pending.push(uring::Read { part: read.part, row: read.row, slot: read.slot });
-                    pending_hits.push(hit);
-                }
-            }
-            // Minor faults can merely populate PTEs for cached pages. Major
-            // faults during these copies witness late faults, not evicted rows.
-            let late = thread_faults_since(before)[1].max(0) as u64;
-            let mut stats = if pending.is_empty() { uring::ReadStats::default() }
-                else { uring::gather(&pending, output, self.row_bytes(), &pending_hits)? };
-            stats.hits += copied;
-            stats.hit_bytes += copied * self.row_bytes() as u64;
-            stats.resident_copy_rows += copied;
-            stats.late_major_faults += late;
-            return Ok(stats);
+        stats.resident_copy_rows = stats.hits;
+        stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
+        if !pending.is_empty() {
+            let misses = match uring::gather_priority(&pending, output, self.row_bytes(), &vec![Some(false); pending.len()], priority) {
+                Ok(misses) => misses,
+                Err(error) => {
+                    self.uring_fallback(&error);
+                    let mut misses = uring::ReadStats::default();
+                    for read in &pending {
+                        let width = self.row_bytes();
+                        output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
+                        misses.misses += 1;
+                        misses.miss_bytes += width as u64;
+                        misses.device_bytes_estimate += read.part.pages(read.row)?.count() as u64 * read.part.page_bytes as u64;
+                    }
+                    misses
+                },
+            };
+            stats.misses = misses.misses;
+            stats.miss_bytes = misses.miss_bytes;
+            stats.device_bytes_estimate = misses.device_bytes_estimate;
+            stats.miss_histogram = misses.miss_histogram;
+            stats.miss_ns = misses.miss_ns;
+            stats.miss_max_ns = misses.miss_max_ns;
         }
-        uring::gather(reads, output, self.row_bytes(), &hits)
+        Ok(stats)
     }
 
     fn uring_fallback(&self, error: &MappedTableError) {
-        // A demand/prefetch worker can fail concurrently with another worker.
-        // Only the first transition warns; subsequent batches use mmap.
-        if self.stats.uring.swap(false, Ordering::Relaxed) {
-            tracing::warn!(%error, "mapped table io_uring unavailable; falling back to mmap");
-        }
+        // Only this batch falls back. The shared owner retries a failed ring
+        // with bounded backoff instead of permanently disabling a table.
+        tracing::warn!(%error, "mapped table read batch unavailable; using mmap for this batch");
     }
 
     fn backend(&self) -> TableBackend {
         self.stats.backend()
     }
 
-    /// Initialize the qualified hybrid; mmap is only an unavailable-ring fallback.
-    /// Called before any workers start.
+    /// Finalize after preload admission, before readiness or gather workers.
+    /// Fully private tables need neither a ring nor its process-wide workspace.
+    pub fn prepare_reads(&self) {
+        if self.resident.is_none() { self.initialize_reads(); }
+    }
+
     fn initialize_reads(&self) {
         self.initialize_with_probe(|| self.parts.iter().try_for_each(|part| {
             part.nowait.store(uring::probe(part)?, Ordering::Relaxed);
@@ -924,15 +983,13 @@ impl MappedTable {
         let result = probe();
         let available = result.is_ok();
         if let Err(error) = result { tracing::warn!(%error, "io_uring unavailable (kernel/filesystem/seccomp); using mmap fallback"); }
-        self.stats.uring.store(available, Ordering::Relaxed);
         self.stats.nowait.store(self.parts.iter().all(|part| part.nowait.load(Ordering::Relaxed)), Ordering::Relaxed);
         tracing::info!(backend = %self.backend(), max_ring_entries = uring::MAX_BATCH,
             iowq_max_workers = uring::IOWQ_MAX_WORKERS,
             accounting = self.stats.accounting(),
-            reason = if !available { "io_uring unavailable" }
-                else if !self.stats.nowait.load(Ordering::Relaxed) { "resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
-                else { "NOWAIT supported" },
-            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "NOWAIT capability is probed per file" },
+            reason = if !available { "reactor setup pending; recoverable batch fallback" }
+                else { "caller resident memcpy and process-wide miss reactor" },
+            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "mincore residency is a snapshot, not a physical-read counter" },
             "mapped table backend");
     }
 
@@ -963,13 +1020,13 @@ impl MappedTable {
                 }
             }
         }
-        if self.backend() != TableBackend::Mmap && !rows.is_empty() {
+        if !rows.is_empty() {
             let mut output = vec![0; rows.len().checked_mul(self.row_bytes()).ok_or_else(|| invalid("prefetch size overflow"))?];
             let reads: Vec<_> = rows.iter().enumerate().map(|(slot, &row)| {
                 let (part, local) = self.locate(row)?;
                 Ok(uring::Read { part: &self.parts[part], row: local, slot })
             }).collect::<Result<_>>()?;
-            match self.uring_reads(rows, &reads, &mut output, true) {
+            match self.uring_reads(rows, &reads, &mut output, true, ReadPriority::Prefill) {
                 Ok(stats) => { self.stats.record_reads(stats, true); return Ok(pages.len()); }
                 Err(error) => self.uring_fallback(&error),
             }
@@ -1025,7 +1082,6 @@ pub struct TableStats {
     prefetch_jobs: AtomicU64,
     prefetch_pages: AtomicU64,
     prefetch_dropped: AtomicU64,
-    uring: AtomicBool,
     nowait: AtomicBool,
     approximate: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
@@ -1162,12 +1218,11 @@ pub struct TableStatsSnapshot {
 impl TableStats {
     fn backend(&self) -> TableBackend {
         if self.resident.load(Ordering::Relaxed) { TableBackend::Resident }
-        else if !self.uring.load(Ordering::Relaxed) { TableBackend::Mmap }
+        else if !reactor::ready() { TableBackend::Mmap }
         else { TableBackend::MincoreRouted }
     }
     fn accounting(&self) -> &'static str {
         if self.resident.load(Ordering::Relaxed) { "resident; no page-in" }
-        else if self.uring.load(Ordering::Relaxed) && self.nowait.load(Ordering::Relaxed) { "nowait-exact" }
         else if self.backend() == TableBackend::MincoreRouted {
             if self.approximate.load(Ordering::Relaxed) { "fuse: mincore-routed (approx)" } else { "mincore-routed" }
         }
@@ -1583,6 +1638,14 @@ impl GatherPool {
         use rayon::prelude::*;
         let started = Instant::now();
         let row_bytes = table.row_bytes();
+        let routed = table.resident.is_some() || reactor::global().is_ok_and(|owner| {
+            if let Err(error) = owner.wake() { tracing::warn!(%error, "cannot wake table reactor recovery"); }
+            owner.ready()
+        });
+        if routed {
+            table.gather_slots(rows, slots, output)?;
+            return Ok(GatherReport { rows: rows.len(), elapsed: started.elapsed(), major_faults: 0 });
+        }
         if rows.len() != slots.len() { return Err(invalid("gather row/slot count mismatch")); }
         let mut unique = BTreeSet::new();
         for (&row, &slot) in rows.iter().zip(slots) {
@@ -1596,9 +1659,7 @@ impl GatherPool {
         let chunk = slots.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
-        if table.backend() != TableBackend::Mmap {
-            table.gather_slots(rows, slots, output)?;
-        } else {
+        {
             table.record_residency(rows)?;
             self.pool.install(|| {
                 rows.par_chunks(chunk).zip(slots.par_chunks(chunk)).try_for_each(|(addresses, indices)| -> Result<()> {
@@ -1673,6 +1734,49 @@ impl GatherPool {
     }
 }
 
+/// Split-phase gather with no borrowed destination or mapping pointer. The
+/// table owner supplies the same immutable table and destination at completion.
+pub(crate) struct PreparedTableGather {
+    misses: Vec<(usize, u64, usize)>, stream: Option<reactor::ReadStream>,
+    stats: uring::ReadStats, output_len: usize, width: usize,
+}
+impl PreparedTableGather {
+    pub(crate) fn step(&mut self, table: &MappedTable, output: &mut [u8]) -> Result<bool> {
+        if output.len() != self.output_len || table.row_bytes() != self.width {
+            return Err(invalid("prepared gather destination changed"));
+        }
+        if let Some(stream) = &mut self.stream {
+            if let Err(error) = stream.step(output) {
+                // Drop drains submitted reads before mmap fallback or storage reuse.
+                drop(self.stream.take());
+                table.uring_fallback(&error);
+            } else if !stream.finished() { return Ok(false); }
+            else {
+                let stats = stream.stats();
+                self.stats.miss_ns = stats.miss_ns;
+                self.stats.miss_max_ns = stats.miss_max_ns;
+                self.stats.miss_histogram = stats.miss_histogram;
+                table.stats.record_reads(self.stats, false);
+                self.misses.clear();
+                self.stream = None;
+                self.stats = Default::default();
+                return Ok(true);
+            }
+        }
+        for &(part, row, slot) in &self.misses {
+            output[slot * self.width..(slot + 1) * self.width].copy_from_slice(table.parts[part].row(row)?);
+        }
+        table.stats.record_reads(self.stats, false);
+        self.misses.clear();
+        self.stats = Default::default();
+        Ok(true)
+    }
+    pub(crate) fn finish(mut self, table: &MappedTable, output: &mut [u8]) -> Result<()> {
+        while !self.step(table, output)? {}
+        Ok(())
+    }
+}
+
 /// Recorded only when the job was submitted with timing (trace enabled).
 #[derive(Debug, Clone, Copy)]
 pub struct GatherTiming {
@@ -1721,11 +1825,26 @@ struct GatherSlots<S> {
     admission: GatherAdmission,
     stopped: AtomicBool,
 }
-struct GatherWorkerExit<S>(Arc<GatherSlots<S>>);
-impl<S> Drop for GatherWorkerExit<S> {
+struct GatherWorkerExit<S: Send + 'static, J, E> {
+    slots: Arc<GatherSlots<S>>,
+    queue: GatherQueue<S, J, E>,
+}
+impl<S: Send + 'static, J, E> Drop for GatherWorkerExit<S, J, E> {
     fn drop(&mut self) {
-        self.0.stopped.store(true, Ordering::Release);
-        self.0.admission.notify();
+        self.slots.stopped.store(true, Ordering::Release);
+        let (lock, ready) = &*self.queue;
+        let rejected = {
+            let mut queues = lock.lock().unwrap_or_else(|p| p.into_inner());
+            queues.closed = true;
+            let mut rejected = std::mem::take(&mut queues.priority);
+            rejected.append(&mut queues.normal);
+            rejected
+        };
+        // Completion senders wake queued tickets on unwind; recycle leases
+        // outside the queue lock so admission callbacks cannot re-enter it.
+        drop(rejected);
+        ready.notify_all();
+        self.slots.admission.notify();
     }
 }
 
@@ -1907,6 +2026,24 @@ struct GatherQueues<S: Send + 'static, J, E> {
 }
 type GatherQueue<S, J, E> = Arc<(Mutex<GatherQueues<S, J, E>>, std::sync::Condvar)>;
 
+struct GatherPermit(Arc<(Mutex<usize>, std::sync::Condvar)>);
+impl GatherPermit {
+    fn acquire(state: Arc<(Mutex<usize>, std::sync::Condvar)>) -> Self {
+        let (lock, available) = &*state;
+        let mut free = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *free == 0 { free = available.wait(free).unwrap_or_else(|p| p.into_inner()); }
+        *free -= 1;
+        drop(free);
+        Self(state)
+    }
+}
+impl Drop for GatherPermit {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.0.1.notify_one();
+    }
+}
+
 /// Bounded background gathers into a fixed pool of reusable staging slots:
 /// the pool bounds queued, in-flight and completed-but-unconsumed storage, and
 /// submission never waits (None is backpressure). Priority submissions run
@@ -1914,6 +2051,7 @@ type GatherQueue<S, J, E> = Arc<(Mutex<GatherQueues<S, J, E>>, std::sync::Condva
 pub struct GatherWorker<S: Send + 'static, J: Send + 'static, E: Send + 'static> {
     queue: GatherQueue<S, J, E>,
     worker: Option<JoinHandle<()>>,
+    finishers: Vec<JoinHandle<()>>,
     slots: Arc<GatherSlots<S>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -1933,6 +2071,7 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&shutdown);
         let worker_slots = Arc::clone(&slots);
+        let exit_queue = Arc::clone(&queue);
         let next = move || -> Option<WorkerJob<S, J, E>> {
             let (lock, ready) = &*jobs;
             let mut queues = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1945,7 +2084,7 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
         let worker = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                let _exit = GatherWorkerExit(worker_slots);
+                let _exit = GatherWorkerExit { slots: worker_slots, queue: exit_queue };
                 while let Some(mut job) = next() {
                     if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
                         let _ = job.completion.send(Ok(None));
@@ -1982,7 +2121,85 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
                 }
             })
             .map_err(|source| MappedTableError::Io { context: format!("starting {name}"), source })?;
-        Ok(Self { queue, worker: Some(worker), slots, shutdown })
+        Ok(Self { queue, worker: Some(worker), finishers: Vec::new(), slots, shutdown })
+    }
+
+    /// One ordered preparation owner and two persistent completion workers.
+    /// The permit is held from preparation through completion, so at most two
+    /// jobs may own miss windows, independent of queued staging capacity.
+    pub(crate) fn split<P: Send + 'static>(name: &str, staging: Vec<S>,
+        mut prepare: impl FnMut(&mut S, &J) -> std::result::Result<P, E> + Send + 'static,
+        finish: impl Fn(&mut S, &J, P) -> std::result::Result<(), E> + Send + Sync + 'static) -> Result<Self> {
+        if staging.is_empty() { return Err(invalid("a gather worker needs at least one staging slot")); }
+        let slots = Arc::new(GatherSlots { free: Mutex::new(staging), admission: GatherAdmission::default(),
+            stopped: AtomicBool::new(false) });
+        let queue: GatherQueue<S, J, E> = Arc::new((Mutex::new(GatherQueues {
+            priority: Default::default(), normal: Default::default(), closed: false }), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let permits = Arc::new((Mutex::new(2usize), std::sync::Condvar::new()));
+        let (send, receive) = mpsc::sync_channel::<(WorkerJob<S, J, E>, P, GatherPermit, Option<Instant>)>(2);
+        let receive = Arc::new(Mutex::new(receive));
+        let finish = Arc::new(finish);
+        let mut finishers = Vec::new();
+        for index in 0..2 {
+            let (receive, finish, stopping) = (Arc::clone(&receive), Arc::clone(&finish), Arc::clone(&shutdown));
+            finishers.push(thread::Builder::new().name(format!("{name}-finish-{index}")).spawn(move || {
+                loop {
+                    let item = receive.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                    let Ok((mut job, prepared, _permit, started)) = item else { break; };
+                    let before = job.submitted.and_then(|_| thread_faults());
+                    let result = if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
+                        drop(prepared);
+                        let _ = job.completion.send(Ok(None));
+                        continue;
+                    } else { finish(job.lease.slot.as_mut().expect("admitted staging"), &job.lease.job, prepared) };
+                    if let (Some(submitted), Some(started)) = (job.submitted, started) {
+                        let completed = Instant::now();
+                        let faults = thread_faults_since(before);
+                        job.lease.timing = Some(GatherTiming { queued: started.duration_since(submitted),
+                            gather: completed.duration_since(started), completed,
+                            minor_faults: faults[0], major_faults: faults[1], input_blocks: faults[2] });
+                    }
+                    let result = if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
+                        Ok(None)
+                    } else { result.map(|()| Some(job.lease)) };
+                    let _ = job.completion.send(result);
+                }
+            }).map_err(|source| MappedTableError::Io { context: format!("starting {name} finisher"), source })?);
+        }
+        let (jobs, worker_slots, stopping) = (Arc::clone(&queue), Arc::clone(&slots), Arc::clone(&shutdown));
+        let exit_queue = Arc::clone(&queue);
+        let worker = thread::Builder::new().name(name.into()).spawn(move || {
+            let _exit = GatherWorkerExit { slots: worker_slots, queue: exit_queue };
+            loop {
+                // Keep queued jobs visible to priority admission while both
+                // finishers own their permits; choose only after one returns.
+                let permit = GatherPermit::acquire(Arc::clone(&permits));
+                let mut job = {
+                    let (lock, ready) = &*jobs;
+                    let mut queues = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(job) = queues.priority.pop_front().or_else(|| queues.normal.pop_front()) { break job; }
+                        if queues.closed { return; }
+                        queues = ready.wait(queues).unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+                if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
+                    let _ = job.completion.send(Ok(None));
+                    continue;
+                }
+                let started = job.submitted.map(|_| Instant::now());
+                // Fault counters are per-thread; finishers measure their own
+                // work rather than subtracting the preparation owner's values.
+                match prepare(job.lease.slot.as_mut().expect("admitted staging"), &job.lease.job) {
+                    Ok(prepared) => {
+                        if send.send((job, prepared, permit, started)).is_err() { return; }
+                    },
+                    Err(error) => { let _ = job.completion.send(Err(error)); },
+                }
+            }
+        }).map_err(|source| MappedTableError::Io { context: format!("starting {name} preparation"), source })?;
+        Ok(Self { queue, worker: Some(worker), finishers, slots, shutdown })
     }
 
     /// Submit early, when row ids become available. None is bounded
@@ -2082,6 +2299,9 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> Drop for GatherWor
             if worker.join().is_err() {
                 tracing::error!("gather worker panicked during shutdown");
             }
+        }
+        for worker in self.finishers.drain(..) {
+            if worker.join().is_err() { tracing::error!("gather finisher panicked during shutdown"); }
         }
     }
 }

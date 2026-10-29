@@ -43,7 +43,7 @@ impl EngramStagingShape {
         self.decode_slots() * EngramBatchStaging::storage_bytes(self.decode_rows()).expect("validated shape")
     }
     pub fn decode_host_workspace_bytes(self) -> usize {
-        EngramBatchStaging::worker_bytes(self.decode_rows()).expect("validated shape")
+        3 * EngramBatchStaging::worker_bytes(self.decode_rows()).expect("validated shape")
     }
     pub fn decode_host_bytes(self) -> usize { self.decode_host_resident_bytes() + self.decode_host_workspace_bytes() }
     pub fn prefetch_units(self) -> usize { self.units }
@@ -51,10 +51,16 @@ impl EngramStagingShape {
     pub fn host_resident_bytes(self) -> usize {
         self.host_slots() * EngramBatchStaging::storage_bytes(self.rows).expect("validated shape")
     }
-    pub fn host_workspace_bytes(self) -> usize { EngramBatchStaging::worker_bytes(self.rows).expect("validated shape") }
-    /// Exact persistent pool plus a documented upper bound for its one worker.
+    pub fn host_workspace_bytes(self) -> usize { 3 * EngramBatchStaging::worker_bytes(self.rows).expect("validated shape") }
+    /// Exact persistent pool plus preparation and two bounded finish workspaces.
     /// Decode has its own pool/worker, so concurrent decode cannot starve prefill.
     pub fn host_bytes(self) -> usize { self.host_resident_bytes() + self.host_workspace_bytes() }
+    /// Preload runs before either staging pool or its lazy worker scratch is
+    /// allocated. Keep their complete working set and the shared read owner.
+    pub fn preload_budget(self, available: u64) -> u64 {
+        available.saturating_sub((self.host_bytes() + self.decode_host_bytes()
+            + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64)
+    }
     pub fn device_bytes(self) -> usize { self.units * self.rows * ENGRAM_DEVICE_ROW_BYTES }
     pub fn validate_slots(self, available: usize) -> std::result::Result<(), EngramStagingError> {
         if available != self.host_slots() { return Err(EngramStagingError::Slots {
@@ -147,34 +153,40 @@ impl EngramGatherer {
             "engram gather pool exceeds host staging budget"
         );
         let staging = (0..slots).map(|_| EngramBatchStaging::new(capacity)).collect::<Result<Vec<_>>>()?;
-        Self::with_staging(capacity, staging)
+        Self::with_staging(capacity, staging, false)
     }
     pub fn new_pinned(library: &cuteafd_ffi::NativeLibrary, shape: EngramStagingShape) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("v41/engram-prefill");
         let staging = (0..shape.host_slots()).map(|_| EngramBatchStaging::new_pinned(library, shape.rows))
             .collect::<Result<Vec<_>>>()?;
         shape.validate_slots(staging.len())?;
-        Self::with_staging(shape.rows, staging)
+        Self::with_staging(shape.rows, staging, false)
     }
     pub fn new_decode(library: &cuteafd_ffi::NativeLibrary, shape: EngramStagingShape) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("v41/engram-decode");
         let staging = (0..shape.decode_slots()).map(|_| EngramBatchStaging::new_pinned(library, shape.decode_rows()))
             .collect::<Result<Vec<_>>>()?;
-        Self::with_staging(shape.decode_rows(), staging)
+        Self::with_staging(shape.decode_rows(), staging, true)
     }
     pub fn copy_capacity_stalled(&self) -> Result<bool> {
         self.worker.copy_capacity_stalled()
     }
-    fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>) -> Result<Self> {
-        let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?;
-        let worker = TablePipeline::new("engram-gather", staging, move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
-            let started = Instant::now();
-            let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();
-            let view = staging.gather_on(&job.table, &batches, job.layer, Some(&gather))?;
-            let bytes = view.weights.len() + view.scales.len();
-            job.table.weights().stats().record_gather(view.rows * 24, bytes, started.elapsed(), [0; 3]);
-            Ok(())
-        }, EngramBatchStaging::copy_ready)
+    fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>, decode: bool) -> Result<Self> {
+        let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?
+            .with_priority(if decode { crate::formats::mapped_table::ReadPriority::Decode } else { crate::formats::mapped_table::ReadPriority::Prefill });
+        let worker = TablePipeline::split("engram-gather", staging,
+            move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
+                let started = Instant::now();
+                let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();
+                Ok((staging.prepare(&job.table, &batches, job.layer, Some(&gather))?, started))
+            },
+            |staging: &mut EngramBatchStaging, job: &EngramGatherJob, (prepared, started)| {
+                staging.finish(&job.table, prepared)?;
+                let view = staging.view()?;
+                let bytes = view.weights.len() + view.scales.len();
+                job.table.weights().stats().record_gather(view.rows * 24, bytes, started.elapsed(), [0; 3]);
+                Ok(())
+            }, EngramBatchStaging::copy_ready)
         .context("starting engram gather worker")?;
         Ok(Self { worker, capacity })
     }
@@ -237,6 +249,19 @@ mod lifecycle_tests {
     impl Drop for CopyLease { fn drop(&mut self) { self.drops.borrow_mut().push(self.id); } }
 
     #[test]
+    fn preload_budget_reserves_every_staging_owner_and_lazy_workspace() -> Result<()> {
+        for (rows, units) in [(2752, 3), (4096, 2), (2048, 4)] {
+            let shape = EngramStagingShape::new(rows, units)?;
+            let future = (shape.host_bytes() + shape.decode_host_bytes()
+                + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
+            assert_eq!(shape.preload_budget(future - 1), 0);
+            assert_eq!(shape.preload_budget(future), 0);
+            assert_eq!(shape.preload_budget(future + 123), 123);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn engram_copy_pending_pool_reclaims_on_completion_with_bounded_polls() -> Result<()> {
         for k in 1..=4 {
             let shape = EngramStagingShape::new(((8192usize.div_ceil(k.max(2)) + 63) / 64 * 64), k)?;
@@ -292,8 +317,8 @@ mod lifecycle_tests {
             let n = shape.host_slots();
             assert_eq!(n, 4 * k);
             assert_eq!(shape.host_resident_bytes(), n * EngramBatchStaging::storage_bytes(rows)?);
-            assert_eq!(shape.host_bytes(), shape.host_resident_bytes() + rows * 24 * 1024 + (1 << 20));
-            assert_eq!(shape.decode_host_bytes(), 4 * EngramBatchStaging::storage_bytes(256)? + 256 * 24 * 1024 + (1 << 20));
+            assert_eq!(shape.host_bytes(), shape.host_resident_bytes() + 3 * (rows * 24 * 1024 + (1 << 20)));
+            assert_eq!(shape.decode_host_bytes(), 4 * EngramBatchStaging::storage_bytes(256)? + 3 * (256 * 24 * 1024 + (1 << 20)));
             assert_eq!(shape.device_bytes(), k * rows * ENGRAM_DEVICE_ROW_BYTES);
             assert_eq!(shape.validate_slots(n - 1), Err(EngramStagingError::Slots { required: n, available: n - 1 }));
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));

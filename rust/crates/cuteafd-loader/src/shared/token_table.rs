@@ -7,22 +7,24 @@ use std::sync::Mutex;
 /// parallelism. io_uring retains its batched backend at either size.
 pub const PARALLEL_GATHER_BYTES: usize = 1 << 20;
 
-pub struct RowGather { pool: GatherPool }
+pub struct RowGather { pool: GatherPool, priority: crate::formats::mapped_table::ReadPriority }
 impl RowGather {
-    pub fn new(name: &str, threads: usize) -> Result<Self> { Ok(Self { pool: GatherPool::new(name, threads)? }) }
+    pub fn new(name: &str, threads: usize) -> Result<Self> { Ok(Self { pool: GatherPool::new(name, threads)?, priority: Default::default() }) }
+    pub(crate) fn priority(&self) -> crate::formats::mapped_table::ReadPriority { self.priority }
+    pub fn with_priority(mut self, priority: crate::formats::mapped_table::ReadPriority) -> Self { self.priority = priority; self }
     pub fn parallel(bytes: usize) -> bool { bytes >= PARALLEL_GATHER_BYTES }
     pub fn gather(&self, table: &MappedTable, rows: &[u64], output: &mut [u8]) -> Result<()> {
-        if Self::parallel(output.len()) { self.pool.gather(table, rows, output)?; }
+        if self.priority == crate::formats::mapped_table::ReadPriority::Prefill && Self::parallel(output.len()) { self.pool.gather(table, rows, output)?; }
         else {
             let started = std::time::Instant::now();
-            table.gather_into(rows, output)?;
+            table.gather_into_priority(rows, output, self.priority)?;
             table.stats().record_gather(rows.len(), output.len(), started.elapsed(), [0; 3]);
         }
         Ok(())
     }
     pub fn gather_slots(&self, table: &MappedTable, rows: &[u64], slots: &[usize], output: &mut [u8]) -> Result<()> {
-        if Self::parallel(rows.len().saturating_mul(table.row_bytes())) { self.pool.gather_slots(table, rows, slots, output)?; }
-        else { table.gather_slots(rows, slots, output)?; }
+        if self.priority == crate::formats::mapped_table::ReadPriority::Prefill && Self::parallel(rows.len().saturating_mul(table.row_bytes())) { self.pool.gather_slots(table, rows, slots, output)?; }
+        else { table.gather_slots_priority(rows, slots, output, self.priority)?; }
         Ok(())
     }
 
@@ -150,6 +152,14 @@ impl<S: Send + 'static, J: Send + 'static> TablePipeline<S, J> {
         copy_ready: fn(&mut S) -> Result<bool>) -> Result<Self> {
         let capacity = slots.len();
         Ok(Self { worker: GatherWorker::new(name, slots, gather)?, copies: Mutex::new(CopyPool::new(capacity)), copy_ready })
+    }
+    pub(crate) fn split<P: Send + 'static>(name: &str, slots: Vec<S>,
+        prepare: impl FnMut(&mut S, &J) -> Result<P> + Send + 'static,
+        finish: impl Fn(&mut S, &J, P) -> Result<()> + Send + Sync + 'static,
+        copy_ready: fn(&mut S) -> Result<bool>) -> Result<Self> {
+        let capacity = slots.len();
+        Ok(Self { worker: GatherWorker::split(name, slots, prepare, finish)?,
+            copies: Mutex::new(CopyPool::new(capacity)), copy_ready })
     }
     pub fn reclaim_copies(&self) -> Result<()> {
         self.copies.lock().unwrap_or_else(|p| p.into_inner()).reclaim(|lease|

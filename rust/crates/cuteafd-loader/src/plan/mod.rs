@@ -970,9 +970,25 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
+        let mut memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
+        if family.id() == "deepseek_v41" && !memory.devices.is_empty() {
+            let shape = (|| -> anyhow::Result<crate::EngramStagingShape> {
+                use anyhow::Context;
+                Ok(crate::EngramStagingShape::new(
+                    usize::try_from(layout_options.prefill_unit_rows.context("V4.1 prefill unit missing")?)?,
+                    usize::try_from(layout_options.prefill_waves)?)?)
+            })()?;
+            report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
+                names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes,
+                shape.preload_budget(host_budget)).admit_tables(table_bytes);
+            report.bytes_by_owner.remove("host-preloaded");
+            if report.mapped_placement.preloaded_bytes > 0 {
+                report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
+            }
+            layout::mapped_table_note(&report, &mut memory.notes);
+        }
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
             report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);

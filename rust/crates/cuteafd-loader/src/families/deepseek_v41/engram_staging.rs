@@ -18,6 +18,12 @@ pub struct EngramBatchStaging {
     order: Vec<(u64, usize)>,
     ready: Option<(usize, usize, EngramEncoding, f32)>,
 }
+pub(crate) struct PreparedEngram {
+    weight: crate::formats::mapped_table::PreparedTableGather,
+    scale: Option<crate::formats::mapped_table::PreparedTableGather>,
+    packed: Option<Vec<u8>>, slots: Vec<usize>,
+    rows: usize, layer: usize, encoding: EngramEncoding, global_scale: f32,
+}
 /// Token-major native rows: 24 embeddings of width 256 per token.
 /// Image embeddings are zero, scales are one, and the text mask is zero.
 pub struct EngramGatherView<'a> {
@@ -59,12 +65,10 @@ impl EngramBatchStaging {
     /// hash set. This conservative bound includes vector growth (at most 2x),
     /// two pages per <=264-byte table row, and tree/hash allocation slack.
     ///
-    /// The fixed 1 MiB additionally covers MAX_BATCH=4096: one SQ ring (64-byte
-    /// SQEs + 4-byte indices), default 2x CQ (16-byte CQEs), rounded ring headers,
-    /// retry/done/nowait/missed arrays (18 bytes/entry), 4096 mincore bytes and
-    /// <=16 borrowed batch references. Weights/scales and L1/L14 run serially,
-    /// so these terms occur once per worker. Thread stacks, request batches,
-    /// allocator bookkeeping and OS page cache are not staging workspace.
+    /// The fixed 1 MiB covers caller-side residency scratch and metadata.
+    /// The process-wide reactor budget is charged separately by the staging
+    /// shape, once rather than once per prefill/decode worker. Thread stacks,
+    /// request batches, allocator bookkeeping and OS page cache are excluded.
     pub fn worker_bytes(rows: usize) -> Result<usize> {
         Self::storage_bytes(rows)?;
         Ok(rows * 24 * 1024 + (1 << 20))
@@ -106,6 +110,12 @@ impl EngramBatchStaging {
     }
     pub(crate) fn gather_on(&mut self, table: &EngramTable, batches: &[&EngramBatch], layer_index: usize,
         gather: Option<&crate::shared::token_table::RowGather>) -> Result<EngramGatherView<'_>> {
+        let prepared = self.prepare(table, batches, layer_index, gather)?;
+        self.finish(table, prepared)?;
+        self.view()
+    }
+    pub(crate) fn prepare(&mut self, table: &EngramTable, batches: &[&EngramBatch], layer_index: usize,
+        gather: Option<&crate::shared::token_table::RowGather>) -> Result<PreparedEngram> {
         self.ready = None;
         ensure!(
             !batches.is_empty() && batches.len() <= 16,
@@ -165,33 +175,53 @@ impl EngramBatchStaging {
                 slots.push(slot);
             }
         }
-        // Both backends read the same distinct rows into the same canonical
-        // slots; batching is not an io_uring-only optimization.
-        let read = |table: &crate::MappedTable, output: &mut [u8]| -> Result<()> {
-            match gather { Some(gather) => gather.gather_slots(table, &addresses, &slots, output),
-                None => Ok(table.gather_slots(&addresses, &slots, output)?) }
-        };
-        if table.is_strided() {
-            // One shared-table gather per unique row; split opaque bytes only
-            // after I/O, leaving the GPU's native FP8 staging unchanged.
+        // One buffer per table: paired tables together occupy a two-buffer
+        // window, and both start before waiting for either one's completion.
+        let priority = gather.map_or(Default::default(), |gather| gather.priority());
+        let priority = if layer_index == 0 { priority.first() } else { priority };
+        let (weight, scale, packed) = if table.is_strided() {
             let mut packed = vec![0; addresses.len() * 264];
-            // The owning Engram gather worker records the logical batch once.
             let packed_slots: Vec<_> = (0..addresses.len()).collect();
-            match gather {
-                Some(gather) => gather.gather_slots(table.weights(), &addresses, &packed_slots, &mut packed)?,
-                None => table.weights().gather_slots(&addresses, &packed_slots, &mut packed)?,
-            }
-            for (row, &slot) in packed.chunks_exact(264).zip(&slots) {
+            let pending = table.weights().prepare_gather(&addresses, &packed_slots, &mut packed, priority, 2)?;
+            (pending, None, Some(packed))
+        } else {
+            let weight = table.weights().prepare_gather(&addresses, &slots,
+                &mut weights[..rows * 24 * weight_bytes], priority, 1)?;
+            let scale_table = table.scales().context("paired engram has no scale table")?;
+            let destination = if encoding == EngramEncoding::Fp8 { &mut scales[..rows * 24 * scale_bytes] }
+                else { &mut weights[scale_base..scale_base + rows * 24 * scale_bytes] };
+            let scale = scale_table.prepare_gather(&addresses, &slots, destination, priority, 1)?;
+            (weight, Some(scale), None)
+        };
+        Ok(PreparedEngram { weight, scale, packed, slots, rows, layer: layer_index,
+            encoding, global_scale: table.global_scale() })
+    }
+    pub(crate) fn finish(&mut self, table: &EngramTable, mut prepared: PreparedEngram) -> Result<()> {
+        let PreparedEngram { rows, layer, encoding, global_scale, .. } = prepared;
+        let weight_bytes = encoding.weight_bytes();
+        let scale_bytes = encoding.scale_bytes();
+        let scale_base = self.capacity * 24 * 128;
+        let (weights, rest) = self.payload.bytes_mut().split_at_mut(self.capacity * 24 * 256);
+        let (scales, _) = rest.split_at_mut(self.capacity * 24 * 8);
+        if let Some(mut packed) = prepared.packed.take() {
+            prepared.weight.finish(table.weights(), &mut packed)?;
+            for (row, &slot) in packed.chunks_exact(264).zip(&prepared.slots) {
                 weights[slot * 256..(slot + 1) * 256].copy_from_slice(&row[..256]);
                 scales[slot * 8..(slot + 1) * 8].copy_from_slice(&row[256..]);
             }
         } else {
-            read(table.weights(), &mut weights[..rows * 24 * weight_bytes])?;
+            let mut scale = prepared.scale.take().context("paired gather has no scale ticket")?;
             let scale_table = table.scales().context("paired engram has no scale table")?;
-            if encoding == EngramEncoding::Fp8 {
-                read(scale_table, &mut scales[..rows * 24 * scale_bytes])?;
+            let (weight_output, scale_output) = if encoding == EngramEncoding::Fp8 {
+                (&mut weights[..rows * 24 * weight_bytes], &mut scales[..rows * 24 * scale_bytes])
             } else {
-                read(scale_table, &mut weights[scale_base..scale_base + rows * 24 * scale_bytes])?;
+                let (weight, scale) = weights.split_at_mut(scale_base);
+                (&mut weight[..rows * 24 * weight_bytes], &mut scale[..rows * 24 * scale_bytes])
+            };
+            let (mut weight_done, mut scale_done) = (false, false);
+            while !weight_done || !scale_done {
+                if !weight_done { weight_done = prepared.weight.step(table.weights(), weight_output)?; }
+                if !scale_done { scale_done = scale.step(scale_table, scale_output)?; }
             }
         }
         let mut previous = None;
@@ -210,8 +240,8 @@ impl EngramBatchStaging {
             }
             previous = Some((address, slot));
         }
-        self.ready = Some((rows, layer_index, encoding, table.global_scale()));
-        self.view()
+        self.ready = Some((rows, layer, encoding, global_scale));
+        Ok(())
     }
     pub fn view(&self) -> Result<EngramGatherView<'_>> {
         let (rows, layer_index, encoding, global_scale) = self.ready.context("engram staging is not complete")?;
