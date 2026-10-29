@@ -230,7 +230,7 @@ def export_routed(extra, output):
     """Use the package's exact compiler/form policy without linking its DSOs."""
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
-        GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes, prefill_forms, fp8_moe_segment_scratch_bytes,
+        GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes, prefill_forms,
     )
     import package_fp8_moe_aot as package
     geometry = extra[extra.index("--geometry") + 1]
@@ -247,6 +247,8 @@ def export_routed(extra, output):
                 layouts += [f"tp{tp}-w{width}" for width in sorted(
                     set(package.exact_widths(base.intermediate, tp, 32)), reverse=True)]
     indirect = "--row-addresses" in extra
+    if indirect:
+        from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     records = []
     for layout in layouts:
         _, g = package.layout_geometry(base, layout)
@@ -257,7 +259,7 @@ def export_routed(extra, output):
             with exportable_compilation():
                 program = compile_fp8_moe_aot(g, route="stream" if indirect else "auto",
                     max_rows=package.SEGMENT_MAX_ROWS if indirect else rows, wire=indirect, prefill=form,
-                    row_addresses=indirect)
+                    **({"row_addresses": True} if indirect else {}))
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
