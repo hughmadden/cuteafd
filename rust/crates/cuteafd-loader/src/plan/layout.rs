@@ -1548,6 +1548,19 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
 
     }
 
+    if family == "deepseek_v41" {
+        let shape = crate::EngramStagingShape::new(usize::try_from(unit_rows)?,
+            usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?)?;
+        push(Category::Staging, "v41/engram-prefill", "pinned payload + pageable sort tuples",
+            shape.host_resident_bytes() as u64, Basis::Formula);
+        push(Category::Staging, "v41/engram-decode", "pinned payload + pageable sort tuples",
+            shape.decode_host_resident_bytes() as u64, Basis::Formula);
+        push(Category::Workspace, "v41/engram-prefill-worker", "preparer + two finishers",
+            shape.host_workspace_bytes() as u64, Basis::Formula);
+        push(Category::Workspace, "v41/engram-decode-worker", "preparer + two finishers",
+            shape.decode_host_workspace_bytes() as u64, Basis::Formula);
+    }
+
     if family == "qwen4" {
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
         if cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len()) {

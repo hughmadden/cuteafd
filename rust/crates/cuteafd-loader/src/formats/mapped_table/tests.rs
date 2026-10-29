@@ -1212,8 +1212,8 @@ fn split_gathers_prepare_second_before_first_finishes_and_bound_third() -> TestR
             finish_tx.send(*job).unwrap();
             if *job == 1 {
                 let (lock, ready) = &*blocked;
-                let mut released = lock.lock().unwrap();
-                while !*released { released = ready.wait(released).unwrap(); }
+                let released = lock.lock().unwrap();
+                let _ = ready.wait_timeout_while(released, Duration::from_secs(5), |done| !*done).unwrap();
             }
             *slot = *job;
             Ok(())
@@ -1234,5 +1234,92 @@ fn split_gathers_prepare_second_before_first_finishes_and_bound_third() -> TestR
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
     assert!(matches!(first.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
+    Ok(())
+}
+
+#[test]
+fn serial_and_split_preparer_panics_reject_queued_tickets_and_wake_waiters() -> TestResult {
+    for split in [false, true] {
+        let (started, entered) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        let run = move |_: &mut (), _: &usize| -> std::result::Result<(), ()> {
+            started.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            panic!("injected preparation panic");
+        };
+        let worker = if split { GatherWorker::split("split-panic", vec![(); 3], run, |_, _, ()| Ok(()))? }
+            else { GatherWorker::new("serial-panic", vec![(); 3], run)? };
+        let mut active = worker.try_submit(0, false)?.unwrap();
+        entered.recv_timeout(Duration::from_secs(5))?;
+        let mut normal = worker.try_submit(1, false)?.unwrap();
+        let mut priority = worker.try_submit_with(2, false, true)?.unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(priority.wait());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        release.send(())?;
+        receive.recv_timeout(Duration::from_secs(5))?;
+        assert!(matches!(await_gather(waiting), Err(GatherFailure::Worker(_))));
+        for ticket in [&mut active, &mut normal] {
+            assert!(matches!(ticket.wait_timeout(Duration::from_secs(5)), Err(GatherFailure::Worker(_))));
+        }
+        assert!(worker.try_submit(3, false).is_err());
+        assert!(worker.queue.0.lock().unwrap().closed);
+    }
+    Ok(())
+}
+
+#[test]
+fn split_finisher_panic_keeps_other_finisher_and_preparer_live() -> TestResult {
+    let worker = GatherWorker::split("split-finish-panic", vec![0usize; 3],
+        |_: &mut usize, _: &usize| Ok::<_, ()>(()),
+        |slot: &mut usize, job: &usize, ()| {
+            if *job == 0 { panic!("injected finisher panic"); }
+            *slot = *job;
+            Ok(())
+        })?;
+    let mut first = worker.try_submit(0, false)?.unwrap();
+    assert!(matches!(first.wait_timeout(Duration::from_secs(5)), Err(GatherFailure::Worker(_))));
+    for job in 1..=4 {
+        let mut ticket = worker.try_submit(job, false)?.expect("recycled staging");
+        let Ok(GatherPoll::Ready(lease)) = ticket.wait_timeout(Duration::from_secs(5)) else { panic!("surviving finisher stopped") };
+        assert_eq!(lease.slot(), Some(&job));
+    }
+    Ok(())
+}
+
+#[test]
+fn split_cancel_and_shutdown_recycle_prepared_and_queued_jobs() -> TestResult {
+    let (entered, started) = mpsc::channel();
+    let (release, resume) = mpsc::sync_channel(1);
+    let (dropped, drops) = mpsc::channel();
+    struct Prepared(mpsc::Sender<()>);
+    impl Drop for Prepared { fn drop(&mut self) { let _ = self.0.send(()); } }
+    let worker = GatherWorker::split("split-shutdown", vec![(); 4],
+        move |_: &mut (), job: &usize| {
+            if *job == 1 { entered.send(()).unwrap(); resume.recv_timeout(Duration::from_secs(5)).unwrap(); }
+            Ok::<_, ()>(Prepared(dropped.clone()))
+        }, |_, _, _: Prepared| Ok(()))?;
+    let mut first = worker.try_submit(1, false)?.unwrap();
+    started.recv_timeout(Duration::from_secs(5))?;
+    let mut queued = worker.try_submit(2, false)?.unwrap();
+    first.cancel();
+    assert!(matches!(first.poll(), Ok(GatherPoll::Cancelled)));
+    let slots = Arc::clone(&worker.slots);
+    let stopping = Arc::clone(&worker.shutdown);
+    let (done, joined) = mpsc::sync_channel(1);
+    let owner = std::thread::spawn(move || { drop(worker); done.send(()).unwrap(); });
+    // Observe shutdown deterministically without an unbounded gate. Once set,
+    // even the prepared job must drain/drop rather than reach its finisher.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !stopping.load(Ordering::Acquire) && Instant::now() < deadline { std::thread::yield_now(); }
+    assert!(stopping.load(Ordering::Acquire));
+    release.send(())?;
+    joined.recv_timeout(Duration::from_secs(5))?;
+    owner.join().unwrap();
+    drops.recv_timeout(Duration::from_secs(5))?;
+    assert!(matches!(queued.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Cancelled) | Err(GatherFailure::Worker(_))));
+    assert_eq!(slots.free.lock().unwrap().len(), 4);
     Ok(())
 }

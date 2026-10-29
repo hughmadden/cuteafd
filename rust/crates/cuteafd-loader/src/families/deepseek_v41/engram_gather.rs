@@ -55,6 +55,12 @@ impl EngramStagingShape {
     /// Exact persistent pool plus preparation and two bounded finish workspaces.
     /// Decode has its own pool/worker, so concurrent decode cannot starve prefill.
     pub fn host_bytes(self) -> usize { self.host_resident_bytes() + self.host_workspace_bytes() }
+    /// Preload runs before either staging pool or its lazy worker scratch is
+    /// allocated. Keep their complete working set and the shared read owner.
+    pub fn preload_budget(self, available: u64) -> u64 {
+        available.saturating_sub((self.host_bytes() + self.decode_host_bytes()
+            + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64)
+    }
     pub fn device_bytes(self) -> usize { self.units * self.rows * ENGRAM_DEVICE_ROW_BYTES }
     pub fn validate_slots(self, available: usize) -> std::result::Result<(), EngramStagingError> {
         if available != self.host_slots() { return Err(EngramStagingError::Slots {
@@ -241,6 +247,19 @@ mod lifecycle_tests {
 
     struct CopyLease { ready: Arc<AtomicBool>, drops: Rc<RefCell<Vec<usize>>>, id: usize }
     impl Drop for CopyLease { fn drop(&mut self) { self.drops.borrow_mut().push(self.id); } }
+
+    #[test]
+    fn preload_budget_reserves_every_staging_owner_and_lazy_workspace() -> Result<()> {
+        for (rows, units) in [(2752, 3), (4096, 2), (2048, 4)] {
+            let shape = EngramStagingShape::new(rows, units)?;
+            let future = (shape.host_bytes() + shape.decode_host_bytes()
+                + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
+            assert_eq!(shape.preload_budget(future - 1), 0);
+            assert_eq!(shape.preload_budget(future), 0);
+            assert_eq!(shape.preload_budget(future + 123), 123);
+        }
+        Ok(())
+    }
 
     #[test]
     fn engram_copy_pending_pool_reclaims_on_completion_with_bounded_polls() -> Result<()> {

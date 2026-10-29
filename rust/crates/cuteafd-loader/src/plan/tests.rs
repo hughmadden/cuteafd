@@ -3870,7 +3870,27 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
         assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves), (Some(rows), Some(waves)), "{}", render(&pinned));
         crate::EngramStagingShape::new(rows as usize, waves as usize).unwrap();
     }
-    crate::EngramStagingShape::new(2752, 3).unwrap();
+    let shape = crate::EngramStagingShape::new(2752, 3).unwrap();
+    let host = auto.host_ledger.as_ref().expect("V4.1 host owners");
+    for (group, bytes) in [
+        ("v41/engram-prefill", shape.host_resident_bytes()),
+        ("v41/engram-decode", shape.decode_host_resident_bytes()),
+        ("v41/engram-prefill-worker", shape.host_workspace_bytes()),
+        ("v41/engram-decode-worker", shape.decode_host_workspace_bytes()),
+    ] {
+        let item = host.items.iter().find(|item| item.group == group).expect(group);
+        assert_eq!(item.bytes, bytes as u64);
+    }
+    let future = (shape.host_bytes() + shape.decode_host_bytes()
+        + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
+    let tables = auto.mapped_placement.table_bytes;
+    for (budget, all) in [(future + tables - 1, false), (future + tables, true)] {
+        let options = PlanOptions { mapped_scale_preload_bytes: tables,
+            mapped_scale_host_budget_bytes: Some(budget), ..two(96, 0, 0) };
+        let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+        assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget));
+        assert_eq!(report.mapped_placement.tables_preloaded(), all);
+    }
 }
 
 #[test]

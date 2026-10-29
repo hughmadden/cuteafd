@@ -65,7 +65,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; combined startup census residuals fit this bound. Pure LoadedCode and ready parity are not qualified.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is reserved by shared V4.1 solver demands, not included in the ready residency claim.".into()];
-    mapped_table_note(report, &mut notes);
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }

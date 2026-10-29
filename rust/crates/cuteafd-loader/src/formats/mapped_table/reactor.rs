@@ -84,6 +84,7 @@ pub(super) struct ReadStream {
 }
 impl Reactor {
     pub(super) fn ready(&self) -> bool { self.shared.ready.load(Ordering::Acquire) }
+    pub(super) fn wake(&self) -> Result<()> { signal(&self.shared.wake) }
 
     pub(super) fn start(self: &Arc<Self>, reads: Vec<Read>, width: usize,
         priority: ReadPriority, window: usize) -> Result<ReadStream> {
@@ -107,7 +108,7 @@ impl Reactor {
 impl ReadStream {
     fn fill(&mut self) -> Result<()> {
         let shared = &self.owner.shared;
-        let decode = self.priority == ReadPriority::Decode;
+        let decode = self.priority.is_decode();
         while self.next < self.reads.len() && self.pending.len() < self.window {
             let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
             if decode { queue.decode_waiters += 1; }
@@ -157,7 +158,7 @@ impl ReadStream {
         let mut queue = self.owner.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
         queue.buffers.push(buffer);
         queue.borrowed -= 1;
-        if self.priority == ReadPriority::Prefill { queue.prefill_borrowed -= 1; }
+        if !self.priority.is_decode() { queue.prefill_borrowed -= 1; }
         self.owner.shared.available.notify_all();
     }
     pub(super) fn step(&mut self, output: &mut [u8]) -> Result<()> {
@@ -216,7 +217,12 @@ impl Engine {
     fn accept(&mut self, shared: &Shared) {
         let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
         while let Some(index) = self.jobs.iter().position(Option::is_none) {
-            let Some(request) = queue.decode.pop_front().or_else(|| queue.prefill.pop_front()) else { break; };
+            let take_first = |queue: &mut VecDeque<Request>, first| {
+                let at = queue.iter().position(|request| request.priority == first).unwrap_or(0);
+                queue.remove(at)
+            };
+            let Some(request) = take_first(&mut queue.decode, ReadPriority::DecodeFirst)
+                .or_else(|| take_first(&mut queue.prefill, ReadPriority::PrefillFirst)) else { break; };
             let left = request.buffer.reads.len();
             self.jobs[index] = Some(Job { request, next: 0, left, error: None, stats: Default::default() });
         }
@@ -245,22 +251,22 @@ impl Engine {
                 self.jobs[active.job].as_ref().is_some_and(|job| job.request.priority == priority))
                 .map(|active| active.job).or_else(|| self.jobs.iter().position(|job| job.as_ref().is_some_and(|job|
                     job.request.priority == priority && job.next < job.request.buffer.reads.len())));
-            let decode = candidate(ReadPriority::Decode);
-            let prefill = candidate(ReadPriority::Prefill);
+            let decode = candidate(ReadPriority::DecodeFirst).or_else(|| candidate(ReadPriority::Decode));
+            let prefill = candidate(ReadPriority::PrefillFirst).or_else(|| candidate(ReadPriority::Prefill));
             // Bound starvation under a continuous decode stream, without using
             // decode's reserved admission capacity for prefill.
             let prefill_allowed = self.outstanding < self.active.len() - reserve;
             let selected = if self.decode_streak >= 256 && prefill_allowed { prefill.or(decode) }
                 else { decode.or(if prefill_allowed { prefill } else { None }) };
-            let retry = self.retry.iter().position(|active|
-                self.jobs[active.job].as_ref().is_some_and(|job| {
-                    let priority = job.request.priority;
-                    (priority == ReadPriority::Decode || prefill_allowed) &&
-                        selected.is_none_or(|id| self.jobs[id].as_ref().unwrap().request.priority == priority)
-                }));
+            // Pick a class/sub-priority before considering retries, so an
+            // L14 short read cannot jump ahead of any ready L1 SQE. No join:
+            // L14 fills capacity whenever L1 is waiting for CQEs or refill.
+            let retry = selected.and_then(|id| self.retry.iter().position(|active|
+                self.jobs[active.job].as_ref().is_some_and(|job|
+                    job.request.priority == self.jobs[id].as_ref().unwrap().request.priority)));
             if let Some(at) = retry {
                 let active = self.retry.remove(at).expect("selected retry");
-                if self.jobs[active.job].as_ref().unwrap().request.priority == ReadPriority::Decode {
+                if self.jobs[active.job].as_ref().unwrap().request.priority.is_decode() {
                     self.decode_streak += 1;
                 } else { self.decode_streak = 0; }
                 self.enqueue(active)?;
@@ -268,7 +274,7 @@ impl Engine {
                 let job = self.jobs[id].as_mut().expect("selected job");
                 let row = job.next;
                 job.next += 1;
-                if job.request.priority == ReadPriority::Decode { self.decode_streak += 1; } else { self.decode_streak = 0; }
+                if job.request.priority.is_decode() { self.decode_streak += 1; } else { self.decode_streak = 0; }
                 self.enqueue(Active { job: id, row, done: 0, submitted: Instant::now() })?;
             } else { break; }
         }
@@ -437,6 +443,28 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_owner_wake_is_latched_for_demand_driven_recovery() -> Result<()> {
+        // Test the same eventfd wake used by GatherPool without depending on
+        // io_uring availability or interfering with the process-wide owner.
+        // SAFETY: eventfd takes no pointers and returns a new owned descriptor.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 { return Err(error("test eventfd", std::io::Error::last_os_error())); }
+        // SAFETY: this test owns the fresh descriptor exactly once.
+        let wake = unsafe { OwnedFd::from_raw_fd(fd) };
+        let owner = Reactor { shared: Arc::new(Shared { queue: Mutex::new(Queue::default()),
+            available: Condvar::new(), wake, ready: AtomicBool::new(false), failed: AtomicBool::new(false) }) };
+        assert!(!owner.ready());
+        owner.wake()?;
+        let mut poll = libc::pollfd { fd: owner.shared.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: poll borrows one initialized descriptor and never retains it.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 1);
+        clear_signal(&owner.shared.wake);
+        // SAFETY: the descriptor remains valid for this immediate readiness check.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 0);
+        Ok(())
+    }
+
+    #[test]
     fn two_prefill_windows_allow_decode_and_recycle_on_cancellation() -> Result<()> {
         let owner = global()?;
         if !owner.ready() { return Ok(()); }
@@ -452,6 +480,36 @@ mod tests {
         assert_eq!(output, [0]);
         assert!(4 < SLOTS - DECODE_SLOTS);
         drop((first, second, decode));
+        Ok(())
+    }
+
+    #[test]
+    fn first_layer_precedes_ready_later_reads_without_excluding_refill_gaps() -> Result<()> {
+        for (first, later) in [(ReadPriority::PrefillFirst, ReadPriority::Prefill),
+            (ReadPriority::DecodeFirst, ReadPriority::Decode)] {
+            let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
+            let mut engine = Engine::new(ring);
+            let file = Arc::new(File::open("/dev/zero").map_err(|source| error("test data", source))?);
+            let job = |priority, count| {
+                let (reply, receiver) = mpsc::sync_channel(1);
+                drop(receiver);
+                Job { request: Request { buffer: Buffer { bytes: vec![0; count],
+                    reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0 }).collect() },
+                    width: 1, priority, reply }, next: 0, left: count, error: None, stats: Default::default() }
+            };
+            // A later-layer retry is already queued. Ready first-layer reads
+            // still win; later reads fill immediately after the first two.
+            engine.jobs[0] = Some(job(later, engine.active.len() * 2));
+            engine.jobs[0].as_mut().unwrap().next = 1;
+            engine.retry.push_back(Active { job: 0, row: 0, done: 0, submitted: Instant::now() });
+            engine.jobs[1] = Some(job(first, 2));
+            engine.schedule()?;
+            assert_eq!(engine.active[0].unwrap().job, 1);
+            assert_eq!(engine.active[1].unwrap().job, 1);
+            assert_eq!(engine.jobs[1].as_ref().unwrap().next, 2);
+            assert!(engine.jobs[0].as_ref().unwrap().next > 1, "no L1 drain/join exclusion");
+            assert!(engine.retry.is_empty());
+        }
         Ok(())
     }
 

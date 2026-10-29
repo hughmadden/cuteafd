@@ -178,6 +178,7 @@ impl EngramBatchStaging {
         // One buffer per table: paired tables together occupy a two-buffer
         // window, and both start before waiting for either one's completion.
         let priority = gather.map_or(Default::default(), |gather| gather.priority());
+        let priority = if layer_index == 0 { priority.first() } else { priority };
         let (weight, scale, packed) = if table.is_strided() {
             let mut packed = vec![0; addresses.len() * 264];
             let packed_slots: Vec<_> = (0..addresses.len()).collect();

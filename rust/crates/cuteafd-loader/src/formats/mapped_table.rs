@@ -34,7 +34,13 @@ mod reactor;
 
 /// Explicit priority from the decode/prefill pipeline, never inferred from row count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReadPriority { Decode, #[default] Prefill }
+pub enum ReadPriority { DecodeFirst, Decode, PrefillFirst, #[default] Prefill }
+impl ReadPriority {
+    pub(crate) fn is_decode(self) -> bool { matches!(self, Self::DecodeFirst | Self::Decode) }
+    pub(crate) fn first(self) -> Self {
+        if self.is_decode() { Self::DecodeFirst } else { Self::PrefillFirst }
+    }
+}
 /// Conservative process-wide admission: 16 MiB miss buffers plus descriptors,
 /// SQ/CQ storage and owner scratch. Charged once per process, not per table.
 pub const TABLE_REACTOR_WORKSPACE_BYTES: usize = 18 << 20;
@@ -1632,6 +1638,14 @@ impl GatherPool {
         use rayon::prelude::*;
         let started = Instant::now();
         let row_bytes = table.row_bytes();
+        let routed = table.resident.is_some() || reactor::global().is_ok_and(|owner| {
+            if let Err(error) = owner.wake() { tracing::warn!(%error, "cannot wake table reactor recovery"); }
+            owner.ready()
+        });
+        if routed {
+            table.gather_slots(rows, slots, output)?;
+            return Ok(GatherReport { rows: rows.len(), elapsed: started.elapsed(), major_faults: 0 });
+        }
         if rows.len() != slots.len() { return Err(invalid("gather row/slot count mismatch")); }
         let mut unique = BTreeSet::new();
         for (&row, &slot) in rows.iter().zip(slots) {
@@ -1645,9 +1659,7 @@ impl GatherPool {
         let chunk = slots.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
-        if table.backend() != TableBackend::Mmap || reactor::global().is_ok_and(|owner| owner.ready()) {
-            table.gather_slots(rows, slots, output)?;
-        } else {
+        {
             table.record_residency(rows)?;
             self.pool.install(|| {
                 rows.par_chunks(chunk).zip(slots.par_chunks(chunk)).try_for_each(|(addresses, indices)| -> Result<()> {
@@ -1813,11 +1825,26 @@ struct GatherSlots<S> {
     admission: GatherAdmission,
     stopped: AtomicBool,
 }
-struct GatherWorkerExit<S>(Arc<GatherSlots<S>>);
-impl<S> Drop for GatherWorkerExit<S> {
+struct GatherWorkerExit<S: Send + 'static, J, E> {
+    slots: Arc<GatherSlots<S>>,
+    queue: GatherQueue<S, J, E>,
+}
+impl<S: Send + 'static, J, E> Drop for GatherWorkerExit<S, J, E> {
     fn drop(&mut self) {
-        self.0.stopped.store(true, Ordering::Release);
-        self.0.admission.notify();
+        self.slots.stopped.store(true, Ordering::Release);
+        let (lock, ready) = &*self.queue;
+        let rejected = {
+            let mut queues = lock.lock().unwrap_or_else(|p| p.into_inner());
+            queues.closed = true;
+            let mut rejected = std::mem::take(&mut queues.priority);
+            rejected.append(&mut queues.normal);
+            rejected
+        };
+        // Completion senders wake queued tickets on unwind; recycle leases
+        // outside the queue lock so admission callbacks cannot re-enter it.
+        drop(rejected);
+        ready.notify_all();
+        self.slots.admission.notify();
     }
 }
 
@@ -2044,6 +2071,7 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&shutdown);
         let worker_slots = Arc::clone(&slots);
+        let exit_queue = Arc::clone(&queue);
         let next = move || -> Option<WorkerJob<S, J, E>> {
             let (lock, ready) = &*jobs;
             let mut queues = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2056,7 +2084,7 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
         let worker = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                let _exit = GatherWorkerExit(worker_slots);
+                let _exit = GatherWorkerExit { slots: worker_slots, queue: exit_queue };
                 while let Some(mut job) = next() {
                     if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
                         let _ = job.completion.send(Ok(None));
@@ -2114,9 +2142,8 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
         let finish = Arc::new(finish);
         let mut finishers = Vec::new();
         for index in 0..2 {
-            let (receive, finish, slots, stopping) = (Arc::clone(&receive), Arc::clone(&finish), Arc::clone(&slots), Arc::clone(&shutdown));
+            let (receive, finish, stopping) = (Arc::clone(&receive), Arc::clone(&finish), Arc::clone(&shutdown));
             finishers.push(thread::Builder::new().name(format!("{name}-finish-{index}")).spawn(move || {
-                let _exit = GatherWorkerExit(slots);
                 loop {
                     let item = receive.lock().unwrap_or_else(|p| p.into_inner()).recv();
                     let Ok((mut job, prepared, _permit, started)) = item else { break; };
@@ -2141,8 +2168,9 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
             }).map_err(|source| MappedTableError::Io { context: format!("starting {name} finisher"), source })?);
         }
         let (jobs, worker_slots, stopping) = (Arc::clone(&queue), Arc::clone(&slots), Arc::clone(&shutdown));
+        let exit_queue = Arc::clone(&queue);
         let worker = thread::Builder::new().name(name.into()).spawn(move || {
-            let _exit = GatherWorkerExit(worker_slots);
+            let _exit = GatherWorkerExit { slots: worker_slots, queue: exit_queue };
             loop {
                 // Keep queued jobs visible to priority admission while both
                 // finishers own their permits; choose only after one returns.
