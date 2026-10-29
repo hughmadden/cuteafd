@@ -97,7 +97,7 @@ def jobs(scope):
                        for op in ("gate_up", "down")) + "," + ",".join(
                        f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
-                   ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
+                   ["--geometry", "kimik3", "--only", "router_scores,prefill_router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
     for geometry in ("mimo", "mimof"):

@@ -793,7 +793,7 @@ impl<'a> LocalLane<'a> {
 
     /// Route and quantize on this device; normal RouteStaging/SparkLane reads
     /// these admitted outputs. No CPU Vec<Routes> enters the operator hot path.
-    pub(crate) fn route(&mut self, layer: usize, rows: usize) -> Result<(cuteafd_ffi::KimiRoutes, CuteafdDeviceBuffer)> {
+    pub(crate) fn route(&mut self, layer: usize, rows: usize, prefill: bool) -> Result<(cuteafd_ffi::KimiRoutes, CuteafdDeviceBuffer)> {
         let weights = self.layer(layer)?;
         ensure!(self.programs.w8.cfg.dense.get(layer) == Some(&false), "Kimi dense layer has no routes");
         let input = self.plane("normalized", rows, 7168)?;
@@ -805,7 +805,7 @@ impl<'a> LocalLane<'a> {
         let router = weights.buffer("router.weight")?;
         let bias = weights.buffer("router.bias")?;
         self.lane.stream.device.run(|| {
-            self.programs.router.launch(rows, input, router, bias, logits, routes, self.lane.stream.raw)?;
+            self.programs.router.launch(rows, prefill, input, router, bias, logits, routes, self.lane.stream.raw)?;
             if weights.is_core("latent.down") {
                 let programs=self.programs.core.as_ref().context("K6 latent programs not resolved")?;
                 let scratch=self.lane.core.as_ref().context("K6 latent scratch not admitted")?;

@@ -352,7 +352,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
         let prefix = window.score_from - 1;
         for first in (0..prefix).step_by(capacity) {
             let chunk = &window.tokens[first..(first + capacity).min(prefix)];
-            engine.step_device(&mut [(&mut placement, chunk)], pool, 1, true)?;
+            engine.prefill_device(&mut [(&mut placement, chunk)], pool, 1, true)?;
         }
         let mut first = prefix;
         while first < end {

@@ -201,6 +201,7 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(g)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(g)),
+        ("prefill_router_scores", "prefill_router_scores", {}, lambda: ffn.compile_glm_prefill_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(g)),
     ]
     # The checkpoint's FP8 weights (E4M3 + FP32 128x128 scales; kv_b per head with per-row
@@ -275,6 +276,7 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_mimo_norm_aot(g)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_mimo_router_scores_aot(g)),
+        ("prefill_router_scores", "prefill_router_scores", {}, lambda: ffn.compile_mimo_prefill_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_mimo_expert_input_quant_aot(g)),
         ("head_fp8", "head_fp8", {}, lambda: attn.compile_mimo_head_fp8_aot(g)),
     ]
@@ -333,6 +335,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("head_fp8", "head_fp8", {}, lambda: glmf.compile_glmf_head_fp8_aot(g)),
         ("add", "add", {}, lambda: glmf.compile_glmf_add_aot(g)),
         ("router_scores", "router_scores", {}, lambda: glmf.compile_glmf_router_scores_aot(g)),
+        ("prefill_router_scores", "prefill_router_scores", {}, lambda: glmf.compile_glmf_prefill_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
         ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
         ("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
@@ -586,6 +589,8 @@ def kimi_route_programs():
     return [
         ("router_scores", "router_scores", {},
          lambda: glmf.compile_glmf_router_scores_aot(router)),
+        ("prefill_router_scores", "prefill_router_scores", {},
+         lambda: glmf.compile_glmf_prefill_router_scores_aot(router)),
         ("expert_input_quant", "expert_input_quant", {},
          lambda: glmf.compile_glmf_expert_input_quant_aot(latent)),
     ]
@@ -661,6 +666,7 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("hc_post", "hc_post", {}, lambda: qwen4.compile_qwen4_hc_post_aot(g)),
         ("head", "head", {}, lambda: qwen4.compile_qwen4_head_aot(g)),
         ("router_scores", "router_scores", {}, lambda: qwen4.compile_qwen4_router_scores_aot(g)),
+        ("prefill_router_scores", "prefill_router_scores", {}, lambda: qwen4.compile_qwen4_prefill_router_scores_aot(g)),
         ("shared", "shared", {}, lambda: qwen4.compile_qwen4_shared_aot(g)),
         ("add", "add", {}, lambda: qwen4.compile_qwen4_add_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: qwen4.compile_qwen4_expert_input_quant_aot(g)),

@@ -345,7 +345,14 @@ impl<'a> Engine<'a> {
         sequences: &mut [(&mut super::prefix::Placement, &[u32])],
         pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool)
         -> Result<crate::shared::token_io::DeviceLogits> {
-        self.step_device_mode(sequences, pool, logit_rows, graphed, false)
+        self.step_device_mode(sequences, pool, logit_rows, graphed, false, false)
+    }
+
+    pub(crate) fn prefill_device(&self,
+        sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool)
+        -> Result<crate::shared::token_io::DeviceLogits> {
+        self.step_device_mode(sequences, pool, logit_rows, graphed, false, true)
     }
 
     pub(crate) fn verify_device(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
@@ -353,11 +360,11 @@ impl<'a> Engine<'a> {
         -> Result<crate::shared::token_io::DeviceLogits> {
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi verify rows overflow")))?;
-        self.step_device_mode(sequences, pool, rows, graphed, true)
+        self.step_device_mode(sequences, pool, rows, graphed, true, false)
     }
 
     fn step_device_mode(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
-        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool)
+        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool, prefill: bool)
         -> Result<crate::shared::token_io::DeviceLogits> {
         self.require_live()?;
         ensure!(self.provisional.borrow().is_none(), "Kimi pending verify must be accepted or discarded before reuse");
@@ -382,7 +389,7 @@ impl<'a> Engine<'a> {
             }).collect::<Vec<_>>();
             // Unit calls stage all metadata banks before the pipeline; a single
             // pass stages its whole step (at most one unit) here.
-            let unit_call = !speculative && sequences.len() == 1 && rows > 64;
+            let unit_call = prefill && sequences.len() == 1 && rows > 64;
             if !unit_call { for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; } }
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
@@ -396,7 +403,7 @@ impl<'a> Engine<'a> {
             } else {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
                 self.execution.run(scope, &self.peer, &self.hops,
-                    &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
+                    &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative, prefill,
                     super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
             };
             for binding in &mut local[0] { binding.enable_replay(true); }
@@ -526,7 +533,7 @@ impl<'a> Engine<'a> {
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, experts, .. } = &mut *lanes;
             let outputs = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
+                &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false, true,
                 super::layers::Output::Residual, None, None)?;
             let stream = local[0][1].stream();
             stream.device.run(|| {
@@ -590,7 +597,7 @@ impl<'a> Engine<'a> {
                 ensure!(rows.iter().sum::<usize>() <= self.prefill.unit_rows,
                     "Kimi multi-sequence diagnostic step exceeds one prefill unit");
                 self.execution.run(scope, &self.peer, &self.hops,
-                    &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
+                    &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false, true,
                     super::layers::Output::Normalized, None, None)?
             };
             for (lane, normalized) in normalized.into_iter().enumerate() {
