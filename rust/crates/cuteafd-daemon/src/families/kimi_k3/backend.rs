@@ -501,6 +501,26 @@ mod tests {
         let backend = KimiBackend::new(engine)?;
         library.cuda_set_device(args.split_device)?;
         let mut pool = RefPagePool::new(engine.prefix_family()?.layout().pages, 64);
+        if std::env::var("CUTEAFD_KIMI_PACK_GATE_ROUTE64").as_deref() == Ok("1") {
+            // live_arm prefills private prefixes of 0/3/7 rows, leaving 64
+            // total packed rows; both arms therefore stay on the skinny route.
+            let prompts = [19, 24, 31].iter().enumerate().map(|(i, &len)|
+                (0..len).map(|j| source[(i * 97 + j) % source.len()]).collect::<Vec<_>>()).collect::<Vec<_>>();
+            engine.configure_packing(crate::shared::prefill_packing::PackingMode::Unrestricted)?;
+            let alone = live_arm(&backend, &mut pool, &prompts, false, false)?;
+            let packed = live_arm(&backend, &mut pool, &prompts, true, false)?;
+            for i in 0..prompts.len() {
+                println!("Kimi route64 discriminator member {i}: packed_rows=64 logits_bytes_equal={} target_bytes_equal={} draft_bytes_equal={}",
+                    alone[i].logits == packed[i].logits, alone[i].state == packed[i].state,
+                    alone[i].draft == packed[i].draft);
+            }
+            for i in 0..prompts.len() {
+                ensure!(alone[i].logits == packed[i].logits && alone[i].state == packed[i].state
+                    && alone[i].draft == packed[i].draft,
+                    "Kimi route64 singleton/packed bytes differ for member {i}");
+            }
+            return Ok(());
+        }
         let prompts = [29, 68, 134].iter().enumerate().map(|(i, &len)|
             (0..len).map(|j| source[(i * 97 + j) % source.len()]).collect::<Vec<_>>()).collect::<Vec<_>>();
         engine.configure_packing(crate::shared::prefill_packing::PackingMode::Exact)?;
