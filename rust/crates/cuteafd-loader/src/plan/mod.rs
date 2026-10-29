@@ -858,7 +858,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let meta = &tensor.meta;
         if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
         let (stem, suffix) = format::split_stem(&meta.name);
-        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv") { continue }
+        let suffix = if suffix.starts_with("strided_") { "strided" } else { suffix };
+        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv" | "strided") { continue }
         // Qwen splits one row space into shard_N tensors.
         let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
         if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {

@@ -1045,6 +1045,64 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn strided_engram_preload_plan_counts_two_logical_maps_and_all_part_bytes() {
+    let mut config = v41_config();
+    let mut parts = serde_json::Map::new();
+    let mut tensors = Vec::new();
+    for layer in [1, 14] {
+        let declarations: Vec<_> = [3, 5, 2].into_iter().enumerate().map(|(part, rows)| {
+            let name = format!("layers.{layer}.engram.embed.strided_{part:05}");
+            tensors.push((name.clone(), "U8", vec![rows, 264]));
+            json!({"tensor": name, "rows": rows})
+        }).collect();
+        parts.insert(layer.to_string(), json!(declarations));
+    }
+    config["engram_storage"] = json!({"layout":"fp8_row_interleaved_v1", "weight_bytes":256,
+        "scale_bytes":8, "tensor_suffix":"strided", "parts":parts});
+    let dir = snapshot(config, &tensors);
+    let bytes = 2 * 10 * 264;
+    for (cap, host, count) in [(0, bytes, 0), (bytes - 1, bytes, 0),
+        (bytes, bytes - 1, 0), (bytes, bytes, 2)] {
+        let report = plan(dir.path(), &PlanOptions { mapped_scale_preload_bytes: cap,
+            mapped_scale_host_budget_bytes: Some(host), ..Default::default() }).unwrap();
+        let p = &report.mapped_placement;
+        assert_eq!((p.mapped, p.preloaded, p.scale_bytes, p.table_bytes), (2 - count, count, 0, bytes));
+        assert_eq!(p.preloaded_bytes, if count == 2 { bytes } else { 0 });
+        assert_eq!(report.bytes_by_owner.get("host-preloaded").copied().unwrap_or(0), p.preloaded_bytes);
+        assert!(report.hints.iter().all(|h| !h.what.contains("strided engram")), "{:?}", report.hints);
+    }
+}
+
+#[test]
+fn strided_engram_planner_detects_headers_and_requires_matching_config() {
+    let mut config = v41_config();
+    config["engram_storage"] = serde_json::json!({"layout": "fp8_row_interleaved_v1",
+        "weight_bytes": 256, "scale_bytes": 8, "tensor_suffix": "strided", "parts": {
+            "1": [{"tensor":"layers.1.engram.embed.strided_00000", "rows":7},
+                  {"tensor":"layers.1.engram.embed.strided_00001", "rows":9}],
+            "14": [{"tensor":"layers.14.engram.embed.strided_00000", "rows":1}]}});
+    let dir = snapshot(config.clone(), &[t("layers.1.engram.embed.strided_00000", "U8", &[7, 264]),
+        t("layers.1.engram.embed.strided_00001", "U8", &[9, 264])]);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let mapped = component(&report, Component::MappedTable);
+    assert_eq!(mapped.bytes, 16 * 264);
+    assert!(mapped.formats.contains_key("fp8-strided264/ue8m0"));
+    assert_eq!(report.mapped_placement.mapped, 1);
+    assert_eq!(report.mapped_placement.scale_bytes, 0);
+    assert!(report.hints.iter().all(|h| !h.what.contains("strided engram")), "{:?}", report.hints);
+    // Matching total bytes cannot hide a changed part boundary.
+    let changed = snapshot(config.clone(), &[t("layers.1.engram.embed.strided_00000", "U8", &[8, 264]),
+        t("layers.1.engram.embed.strided_00001", "U8", &[8, 264])]);
+    let changed_report = plan(changed.path(), &PlanOptions::default()).unwrap();
+    assert!(changed_report.hints.iter().any(|h| h.what.contains("strided engram")));
+    for (cfg, shape) in [(v41_config(), vec![16, 264]), (config, vec![16, 263])] {
+        let dir = snapshot(cfg, &[t("layers.1.engram.embed.strided_00000", "U8", &shape)]);
+        let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+        assert!(report.hints.iter().any(|h| h.what.contains("strided engram")), "{:?}", report.hints);
+    }
+}
+
+#[test]
 fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     for nvfp4 in [false, true] {

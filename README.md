@@ -66,6 +66,12 @@ column, cards labelled "simulated 5090" ran on an RTX PRO 6000 capped at
 them; the others ran on a GeForce RTX 5090. Earlier releases and every other
 report: [benchmarks](benchmarks/README.md).
 
+V4.1 also supports [StridedPLE](https://huggingface.co/wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE),
+a byte-preserving Engram storage repack of the official 1017 checkpoint
+([minimum config](examples/configs/v41-flash-strided-min.config) ·
+[maximum config](examples/configs/v41-flash-strided-max.config)).
+The official checkpoint remains the default.
+
 <!-- results:begin -->
 <table>
 <tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>

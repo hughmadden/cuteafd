@@ -1,4 +1,4 @@
-//! Paired native engram weight and scale tables on the shared mapped-table
+//! Native paired or row-interleaved engram tables on the shared mapped-table
 //! infrastructure (`formats::mapped_table`): mapping, bounded background
 //! page-in and per-table stats.
 use crate::{AdviseRows, MappedTable, MappedTableError, RowFormat, TablePrefetchOutcome, TablePrefetchTicket,
@@ -15,7 +15,7 @@ impl EngramEncoding {
 
 pub struct EngramTable {
     weights: MappedTable,
-    scales: MappedTable,
+    scales: Option<MappedTable>,
     encoding: EngramEncoding,
     global_scale: f32,
 }
@@ -27,15 +27,21 @@ impl EngramTable {
         ensure!(weights.rows() == scales.rows() && weights.row_bytes() == 128 && scales.row_bytes() == 16,
             "NVFP4 engram requires paired 128-byte weight and 16-byte scale rows");
         ensure!(global_scale.is_finite() && global_scale > 0.0, "invalid NVFP4 engram global scale");
-        Ok(Self { weights, scales, encoding: EngramEncoding::Nvfp4, global_scale })
+        Ok(Self { weights, scales: Some(scales), encoding: EngramEncoding::Nvfp4, global_scale })
     }
     pub fn weights(&self) -> &MappedTable {
         &self.weights
     }
-    /// The weight and scale tables, for a preload before the pair is shared.
-    pub(crate) fn tables_mut(&mut self) -> [&mut MappedTable; 2] { [&mut self.weights, &mut self.scales] }
-    pub fn scales(&self) -> &MappedTable {
-        &self.scales
+    /// Row storage and optional separate scales, before the tables are shared.
+    pub(crate) fn tables_mut(&mut self) -> (&mut MappedTable, Option<&mut MappedTable>) {
+        (&mut self.weights, self.scales.as_mut())
+    }
+    pub fn scales(&self) -> Option<&MappedTable> { self.scales.as_ref() }
+    pub fn is_strided(&self) -> bool { self.scales.is_none() }
+    pub fn new_strided(rows: MappedTable) -> Result<Self> {
+        ensure!(rows.row_bytes() == 264 && rows.format().dtype == cuteafd_core::DType::U8,
+            "strided engram requires opaque U8 rows of 264 bytes");
+        Ok(Self { weights: rows, scales: None, encoding: EngramEncoding::Fp8, global_scale: 1.0 })
     }
     /// Gather stats are kept on the weight table (scales share its rows).
     pub fn stats(&self) -> crate::TableStatsSnapshot {
@@ -88,6 +94,30 @@ impl EngramTable {
             table.name_stats(format!("engram.{layer}.{suffix}"));
             Ok(table)
         };
+        let config_path = std::path::Path::new(&catalog.snapshot_path).join("config.json");
+        if config_path.exists() {
+            let config = crate::read_official_v41_config(Path::new(&catalog.snapshot_path))?;
+            if config.strided_engram() {
+                let prefix = format!("layers.{layer}.engram.embed.");
+                let declared = config.engram_parts(layer as usize);
+                let matching: Vec<_> = catalog.tensors.iter().filter(|t| t.name.starts_with(&prefix)).collect();
+                ensure!(matching.len() == declared.len(), "mixed or missing strided engram parts");
+                let parts = declared.iter().map(|part| {
+                    let tensor = matching.iter().find(|t| t.name == part.tensor)
+                        .with_context(|| format!("missing strided part {}", part.tensor))?;
+                    ensure!(tensor.dtype == DType::U8 && tensor.shape == [part.rows, 264]
+                        && tensor.byte_length == part.rows as u64 * 264, "invalid strided part {}", part.tensor);
+                    ensure!(!tensor.file.is_empty() && Path::new(&tensor.file).components()
+                        .all(|part| matches!(part, Component::Normal(_))), "invalid strided shard path");
+                    Ok(crate::TablePart { path: Path::new(&catalog.snapshot_path).join(&tensor.file),
+                        offset: tensor.byte_offset, rows: part.rows as u64 })
+                }).collect::<Result<Vec<_>>>()?;
+                // SAFETY: forwarded from this function's immutable checkpoint contract.
+                let table = unsafe { MappedTable::open(&parts, RowFormat::of(DType::U8, 264)?)? };
+                table.name_stats(format!("engram.{layer}.strided"));
+                return Self::new_strided(table);
+            }
+        }
         Self::new(
             map("weight", DType::F8E4M3, 256)?,
             map("scale", DType::F8E8M0, 8)?,
@@ -102,7 +132,7 @@ impl EngramTable {
             weights.row_bytes() == 256 && scales.row_bytes() == 8,
             "native engram rows require 256 FP8 bytes and eight UE8M0 scale bytes"
         );
-        Ok(Self { weights, scales, encoding: EngramEncoding::Fp8, global_scale: 1.0 })
+        Ok(Self { weights, scales: Some(scales), encoding: EngramEncoding::Fp8, global_scale: 1.0 })
     }
 }
 
@@ -123,8 +153,11 @@ impl AdviseRows for EngramTable {
     fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool)
         -> Result<Option<Vec<usize>>, MappedTableError> {
         let Some(weights) = self.weights.advise(rows, max_pages, cancelled)? else { return Ok(None) };
-        let Some(scales) = self.scales.advise(rows, max_pages, cancelled)? else { return Ok(None) };
-        Ok(Some(vec![weights[0], scales[0]]))
+        let scale_pages = if let Some(scales) = &self.scales {
+            let Some(pages) = scales.advise(rows, max_pages, cancelled)? else { return Ok(None) };
+            pages[0]
+        } else { 0 };
+        Ok(Some(vec![weights[0], scale_pages]))
     }
 }
 
@@ -247,7 +280,7 @@ mod tests {
             .weights()
             .gather_into(&[rows as u64 - 1], &mut weights)?;
         table
-            .scales()
+            .scales().unwrap()
             .gather_into(&[rows as u64 - 1], &mut scales)?;
         assert_eq!(weights, [0x38; 256]);
         assert_eq!(scales, [127; 8]);

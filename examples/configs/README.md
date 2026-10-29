@@ -33,6 +33,7 @@ Cards and quality findings are in the main README and each family doc.
 | Model · quant | Min | Max | Speculator | `POOL_TOKENS` |
 | --- | --- | --- | --- | --- |
 | [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 6 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| DeepSeek V4.1 Flash · StridedPLE (byte-identical FP8 Engram) | [1 RTX + 3 Spark](v41-flash-strided-min.config) | [2 RTX + 6 Spark](v41-flash-strided-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Flash · MXFP4](../../docs/models/deepseek_v4.md) | [1 RTX + 2 Spark](deepseek-v4-flash-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v4-flash-mxfp4-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Pro · EXL3 K2](../../docs/models/deepseek_v4.md) | [1 RTX + 4 Spark](deepseek-v4-pro-exl3-min.config) | [2 RTX + 6 Spark](deepseek-v4-pro-exl3-max.config) | `dspark` | `auto` |
 | [GLM 5.3 · EXL3 K4](../../docs/models/glm5.md) | [1 RTX + 4 Spark](glm53-exl3-min.config) | [2 RTX + 6 Spark](glm53-exl3-max.config) | `dflash2` `incoai/GLM-5.3-DFlash2` | `auto` |
@@ -196,3 +197,10 @@ reports them. Weight-only overflow is rejected before any service change. See
 The TP×EP overlays set `SPARK_DEVICE_BUDGET_BYTES=109119320064`, the tested
 fleet-wide floor (minimum of `MemTotal - 20 GiB` across the six hosts); the
 `tp4ep1` control carries no override and keeps the 100 GiB default fallback.
+
+StridedPLE packs each Engram row as 256 FP8 bytes followed by eight scale bytes.
+`MAPPED_SCALE_PRELOAD_GIB` preloads both complete interleaved tables, across all
+parts, when their full payload fits the cap and available host memory. Smaller
+caps leave them mapped: there is no separate scale-only preload. `ENGRAM_WARM`
+warms the complete mapped interleaved table. The original
+checkpoint and its main release card remain unchanged.

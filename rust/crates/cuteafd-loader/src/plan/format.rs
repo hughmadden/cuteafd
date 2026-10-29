@@ -155,6 +155,7 @@ impl QuantOperand {
     /// and its tiling. E4M3 and E5M2, FP32 and E8M0 scales, uniform and
     /// segmented grids all label differently.
     pub fn label(&self) -> String {
+        if self.companions.iter().any(|s| s == "strided") { return "fp8-strided264/ue8m0".into(); }
         let element = match self.encoding {
             Encoding::Bf16 => return "bf16".into(),
             Encoding::F16 => return "f16".into(),
@@ -303,7 +304,7 @@ const SUFFIXES: &[&str] = &[
 /// known suffix are their own stem.
 pub fn split_stem(name: &str) -> (&str, &str) {
     if let Some((stem, suffix)) = name.rsplit_once('.') {
-        if SUFFIXES.contains(&suffix) {
+        if SUFFIXES.contains(&suffix) || (suffix.strip_prefix("strided_").is_some_and(|part| part.len() == 5 && part.bytes().all(|b| b.is_ascii_digit())) && stem.ends_with(".engram.embed")) {
             return (stem, suffix);
         }
     }
@@ -359,6 +360,27 @@ fn block_edge(dim: usize, scales: usize) -> Option<usize> {
 pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
     let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
     let malformed = |tensor: &str, reason: String| Malformed { tensor: tensor.to_owned(), reason };
+    if members.keys().any(|suffix| suffix.starts_with("strided_")) {
+        let first = &members.values().next().expect("nonempty strided group").meta;
+        let mut rows = 0usize;
+        for (number, (suffix, tensor)) in members.iter().enumerate() {
+            let meta = &tensor.meta;
+            if suffix != &format!("strided_{number:05}") || meta.dtype != DType::U8
+                || meta.shape.len() != 2 || meta.shape[0] == 0 || meta.shape[1] != 264
+                || meta.byte_length != meta.shape[0] as u64 * 264 {
+                return Err(malformed(&meta.name, "strided engram requires contiguous U8 [part_rows, 264] parts".into()));
+            }
+            rows = rows.checked_add(meta.shape[0]).ok_or_else(|| malformed(&meta.name, "strided engram row overflow".into()))?;
+        }
+        let mut operand = QuantOperand::plain(Encoding::E4m3, first);
+        operand.logical = vec![rows, 256];
+        operand.stored = vec![rows, 264];
+        operand.scale = Some(BlockScale { tensor: "strided".into(), encoding: ScaleEncoding::Ue8m0,
+            direction: ScaleDirection::Multiply, rows: RowTiling::Uniform { rows: 1 },
+            cols: 32, grid: vec![rows, 8] });
+        operand.companions.push("strided".into());
+        return Ok(operand);
+    }
     if crate::formats::exl3_storage::EXL3_SUFFIXES.iter().any(|suffix| members.contains_key(*suffix)) {
         return detect_exl3(members);
     }

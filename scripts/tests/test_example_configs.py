@@ -46,6 +46,7 @@ NVFP4_GROUPS = {"config_groups": {"group_0": {"weights": {"num_bits": 4, "type":
 CHECKPOINTS = {
     "deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"},
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"model_type": "deepseek_v41"},
+    "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE": {"model_type": "deepseek_v41"},
     "nvidia/DeepSeek-V4.1-Flash-NVFP4": {"model_type": "deepseek_v41",
                                          "quantization_config": {"moe_quant_algo": "NVFP4"}},
     "deepseek-ai/DeepSeek-V4-Flash-0731": DSV4,
@@ -115,8 +116,9 @@ def _hub(tmp_path: Path) -> Path:
     for model, config in CHECKPOINTS.items():
         root = hf / "hub" / f"models--{model.replace('/', '--')}"
         (root / "refs").mkdir(parents=True)
-        (root / "refs" / "main").write_text("abc")
+        (root / "refs" / "main").write_text("a" * 40)
         (root / "snapshots" / "abc").mkdir(parents=True)
+        (root / "snapshots" / ("a" * 40)).symlink_to(root / "snapshots" / "abc")
         (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
     draft = hf / "hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots"
     (draft / "85ef153be924f17ce4bf62726954eeaa4a73e854").symlink_to(draft / "abc")
@@ -217,7 +219,7 @@ LOCAL_PLAN = {**SPARK_PLAN, "spark_ranks": 0, "encoder": {"kind": {"kind": "off"
 def test_one_starting_config_per_release_card() -> None:
     names = {p.name for p in starting_configs()}
     expected = {f"{model}-{profile}.config" for model in (
-        "deepseek-v41-mxfp4", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
+        "deepseek-v41-mxfp4", "v41-flash-strided", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
         "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
         "glm53-flash-tr3", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
@@ -442,8 +444,8 @@ def test_family_doc_and_readme_link_every_starting_config(path: Path) -> None:
     assert f"({path.name})" in (EXAMPLES / "README.md").read_text()
 
 
-V41 = [p for p in starting_configs() if p.name.startswith("deepseek-v41-")]
-FAMILY = [p for p in starting_configs() if not p.name.startswith("deepseek-v41-")]
+V41 = [p for p in starting_configs() if CHECKPOINTS[keys(p)["MODEL_ID"]]["model_type"] == "deepseek_v41"]
+FAMILY = [p for p in starting_configs() if p not in V41]
 
 
 @pytest.mark.parametrize("entry", [entry for filename in ("release-smoke-v3.json", "release-smoke-v4.json")
