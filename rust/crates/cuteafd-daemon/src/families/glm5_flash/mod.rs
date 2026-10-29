@@ -2091,7 +2091,7 @@ impl Opened {
                     };
                     (pushed, (embedding, model))
                 }
-                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library, embed,
+                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library, embed.clone(),
                     args.token_io.embed_placement, || {
                         crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
