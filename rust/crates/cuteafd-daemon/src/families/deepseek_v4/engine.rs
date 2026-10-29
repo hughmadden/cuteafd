@@ -31,10 +31,14 @@ mod context;
 mod dspark;
 mod tp2;
 mod prefill;
+mod packing;
+#[cfg(test)]
+mod packed_check;
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
 
+#[derive(Clone)]
 pub(crate) struct Dev<'a> {
     pub(crate) buffer: cuteafd_ffi::CuteafdDeviceBuffer,
     _owner: std::rc::Rc<DeviceAllocation<'a>>,
@@ -83,6 +87,8 @@ pub(crate) struct Engine<'a> {
     rope_compressed: Dev<'a>,
     /// Prefill and decode workspaces, reused across steps.
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
+    packed_row_cap: Cell<Option<usize>>,
+    packed_programs: crate::shared::prefill_packing::ProgramInventory,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     pub profile: RefCell<Profile>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
@@ -313,7 +319,7 @@ struct UnitSlot<'a> {
     payload: Option<Dev<'a>>,
     tables: StepBuffers<'a>,
     /// dSpark target taps of the lane's last TAP_ROWS rows, BF16
-    /// [TAP_ROWS, taps * dim] (empty without a drafter).
+    /// [admitted tap rows, taps * dim] (empty without a drafter).
     taps: Dev<'a>,
 }
 
@@ -355,6 +361,7 @@ struct Workspace<'a> {
 }
 
 /// Device copies of one step's tables.
+#[derive(Clone)]
 struct StepBuffers<'a> {
     /// Rows these buffers hold; tables are copied in per step.
     rows: usize,
@@ -403,6 +410,8 @@ impl<'a> Engine<'a> {
         -> Result<()> {
         let family = if split { self.split_family.context("no head-split programs")? } else { self.family };
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
+        let full_name = format!("{family}_{name}");
+        self.packed_programs.check(&full_name)?;
         let program = self.programs.program(&format!("{family}_{name}"), &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
         // SAFETY: every pointer names a live allocation of rank `rank`'s GPU sized for
@@ -588,6 +597,8 @@ impl<'a> Engine<'a> {
             attention_reduction,
             shape: parts.shape,
             prefill_workspace: RefCell::new(None),
+            packed_row_cap: Cell::new(None),
+            packed_programs: Default::default(),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
             graphs: RefCell::new(std::collections::HashMap::new()),
@@ -698,8 +709,10 @@ impl<'a> Engine<'a> {
                 comb: comb.rows(index, t * 16 * 4),
                 tokens: self.alloc(t * 4)?,
                 shared: shared.rows(index, t * h * 2),
-                tables: self.step_buffers(t, if shared_page_list { 1 } else { t })?,
-                taps: self.alloc(draft_bytes(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
+                tables: self.step_buffers(t, if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { t },
+                    if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { 1 })?,
+                taps: self.alloc(draft_bytes(cuteafd_loader::serving_capacity::deepseek_v4_tap_rows(t, shared_page_list)
+                    * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
             };
             self.reserve_slot_uploads(&slot, lead)?;
             Ok(slot)
@@ -741,28 +754,31 @@ impl<'a> Engine<'a> {
     }
 
     /// Persistent table buffers for up to `rows` rows.
-    fn step_buffers(&self, rows: usize, page_lists: usize) -> Result<StepBuffers<'a>> {
+    fn step_buffers(&self, rows: usize, page_lists: usize, members: usize) -> Result<StepBuffers<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/step");
         let ints = |count: usize| self.alloc(count * 4);
-        let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(rows + 2)).collect() };
+        // Each member's compressor headers and 16-byte pointer alignment are private.
+        let extra = if members > 1 { cuteafd_loader::serving_capacity::V4_PACKED_TABLE_EXTRA_ROWS } else { 0 };
+        let storage_rows = rows + extra;
+        let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(storage_rows + 2)).collect() };
         Ok(StepBuffers {
             rows,
-            positions: self.alloc(rows * 8)?,
-            main_slots: self.alloc(rows * 8)?,
-            swa_indices: ints(rows * metadata::WINDOW)?,
-            swa_lengths: ints(rows)?,
+            positions: self.alloc(storage_rows * 8)?,
+            main_slots: self.alloc(storage_rows * 8)?,
+            swa_indices: ints(storage_rows * metadata::WINDOW)?,
+            swa_lengths: ints(storage_rows)?,
             c4: metadata(4)?,
             c128: metadata(128)?,
             c4_page_table: {
                 // Pool-following tables are KV records, matching placement::solve.
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/records");
-                // Prefill units share one request list (stride zero); decode owns one per row.
-                ints(page_lists * self.shape.units)?
+                // Prefill retains a private, aligned page list per packed member.
+                ints(page_lists * (self.shape.units + if members > 1 { 3 } else { 0 }))?
             },
-            c4_visible: ints(rows)?,
-            c4_indexed_lengths: ints(rows)?,
-            c128_indices: ints(rows * self.c128_width)?,
-            c128_lengths: ints(rows)?,
+            c4_visible: ints(storage_rows)?,
+            c4_indexed_lengths: ints(storage_rows)?,
+            c128_indices: ints(storage_rows * self.c128_width)?,
+            c128_lengths: ints(storage_rows)?,
         })
     }
 
@@ -1898,7 +1914,7 @@ impl<'a> Engine<'a> {
     /// builds (row positions start at `first`) and posts the request once they
     /// complete. This thread does not wait for the GPU.
     fn wave_send(&self, layer: usize, t: usize, w: &Workspace<'_>, first: u64,
-        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        members: Vec<(usize, usize, usize, usize)>, transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
         let timer = Instant::now();
@@ -1909,6 +1925,12 @@ impl<'a> Engine<'a> {
                 Box::new(move |routes, wire| {
                     let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
                     for row in &mut request.rows { row.token_position += first; }
+                    for &(first_row, rows, start, state) in &members {
+                        for (offset, row) in request.rows[first_row..first_row + rows].iter_mut().enumerate() {
+                            row.source_request_id = state as u64 + 1;
+                            row.token_position = (start + offset) as u64;
+                        }
+                    }
                     Ok(request)
                 }))?
         };

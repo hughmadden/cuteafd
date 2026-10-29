@@ -2238,7 +2238,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let records = device.items.iter().find(|i| i.group == "records").unwrap();
             let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
-            assert_eq!(runtime[0].pool_unit_device_bytes, (2 + 64) * 4);
+            assert_eq!(runtime[0].pool_unit_device_bytes, (2 * crate::serving_capacity::V4_PACKED_MEMBERS as u64 + 64) * 4);
             assert_eq!(records.bytes, (cache.ranks[0].persistent_unit_bytes
                 + cache.ranks[0].pool_metadata_unit_bytes + runtime[0].pool_unit_device_bytes) * (32768 / 256));
             let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];

@@ -135,9 +135,9 @@ pub fn context_workspace(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64,
     let mut out = vec![("candidates", decode_rows * cfg.index_topk as u64 * 8),
         ("own-head partial", partial), ("peer-head partial", partial),
         ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
-        ("gather tables", prefill_lanes * 2 * half * 4), ("local selected lengths", decode_rows * 4),
+        ("gather tables", (prefill_lanes + crate::serving_capacity::V4_PACKED_MEMBERS as u64) * 2 * half * 4), ("local selected lengths", decode_rows * 4),
         ("empty window lengths", decode_rows * 4)];
-    out.extend((0..prefill_lanes).map(|_| ("commit blocks", commit)));
+    out.extend((0..prefill_lanes + crate::serving_capacity::V4_PACKED_MEMBERS as u64).map(|_| ("commit blocks", commit)));
     let scratch_units = context_scratch_units(decode_rows);
     for _ in cfg.compress_ratios.iter().filter(|&&ratio| ratio == 4) {
         out.push(("C4 scratch records", scratch_units * 37_440));
@@ -188,7 +188,8 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let hidden = inputs.cfg.dim as u64;
     let topk = inputs.cfg.n_activated_experts as u64;
-    let tables = inputs.prefill_waves + inputs.decode_rows;
+    let tables = inputs.prefill_waves.checked_mul(crate::serving_capacity::V4_PACKED_MEMBERS as u64)
+        .and_then(|n| n.checked_add(inputs.decode_rows)).ok_or(PlacementError::Overflow("V4 packed lane tables"))?;
     let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
     let mut overhead = Vec::new();
@@ -401,7 +402,7 @@ mod default_tests {
                 assert_eq!(buffers.partial_row_bytes, heads as u64 / 2 * 1028);
                 assert_eq!(buffers.candidate_row_bytes, topk as u64 * 8);
                 assert_eq!(buffers.workspace_bytes, workspace.iter().map(|&(_, n)| n.max(256)).sum::<u64>());
-                assert_eq!(workspace.iter().filter(|&&(name, _)| name == "commit blocks").count(), 2);
+                assert_eq!(workspace.iter().filter(|&&(name, _)| name == "commit blocks").count(), 2 + crate::serving_capacity::V4_PACKED_MEMBERS);
                 assert!(workspace.iter().filter(|&&(name, _)| name == "commit blocks")
                     .all(|&(_, n)| n == 4 * 3 * 9 * 8));
                 let scratch_bytes: u64 = workspace.iter().filter(|&&(name, _)| name.starts_with("C4 scratch"))

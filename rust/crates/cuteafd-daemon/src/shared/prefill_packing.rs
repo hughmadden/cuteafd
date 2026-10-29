@@ -142,6 +142,13 @@ impl Segment {
 /// Lay out already-queued chunks, never collecting or waiting for more work.
 /// Family-specific table/state capacities are checked in addition to this plan.
 pub(crate) fn plan(chunks: &[(usize, usize)], limits: &Limits) -> Result<Vec<Segment>> {
+    plan_with_tap_rows(chunks, limits, limits.taps.unwrap_or(0))
+}
+
+/// Separate a member's retained tail from the total admitted tap arena.
+/// Existing families use `plan`; windowed drafters can retain a bounded tail per member.
+pub(crate) fn plan_with_tap_rows(chunks: &[(usize, usize)], limits: &Limits, member_taps: usize)
+    -> Result<Vec<Segment>> {
     ensure!(!chunks.is_empty(), "a packed prefill needs a sequence");
     let (mut first, mut taps) = (0usize, 0usize);
     let mut out = Vec::with_capacity(chunks.len());
@@ -149,7 +156,7 @@ pub(crate) fn plan(chunks: &[(usize, usize)], limits: &Limits) -> Result<Vec<Seg
         ensure!(rows > 0 && rows <= limits.chunk_rows, "packed chunk exceeds its row capacity");
         let end = start.checked_add(rows).ok_or_else(|| anyhow::anyhow!("packed position overflow"))?;
         ensure!(end <= limits.max_context, "packed chunk exceeds its context");
-        let tap_rows = limits.taps.map_or(0, |cap| rows.min(cap));
+        let tap_rows = limits.taps.map_or(0, |_| rows.min(member_taps));
         out.push(Segment { first, rows, start, tap_offset: taps, tap_rows });
         first = first.checked_add(rows).ok_or_else(|| anyhow::anyhow!("packed row overflow"))?;
         taps = taps.checked_add(tap_rows).ok_or_else(|| anyhow::anyhow!("packed tap overflow"))?;
@@ -272,6 +279,22 @@ mod tests {
         assert!(plan(&[], &limits()).is_err());
         assert!(plan(&[(0, 200), (0, 57)], &Limits { taps: None, ..limits() }).is_err());
     }
+    #[test]
+    fn windowed_taps_have_private_tails_with_a_total_storage_limit() {
+        let limits = Limits { rows: 4096, chunk_rows: 4096, max_context: 8192, taps: Some(2048) };
+        let chunks = vec![(300, 200); 16];
+        let segments = plan_with_tap_rows(&chunks, &limits, 128).unwrap();
+        assert_eq!(segments.len(), 16);
+        for (i, segment) in segments.iter().enumerate() {
+            assert_eq!((segment.first, segment.rows, segment.tap_offset, segment.tap_rows),
+                (i * 200, 200, i * 128, 128));
+        }
+        assert!(plan_with_tap_rows(&vec![(0, 200); 17], &limits, 128).is_err());
+        assert!(plan_with_tap_rows(&chunks, &Limits { taps: Some(2047), ..limits }, 128).is_err());
+        assert_eq!(plan_with_tap_rows(&[(0, 200)], &Limits { taps: None, ..limits }, 128)
+            .unwrap()[0].tap_rows, 0);
+    }
+
     #[test]
     fn local_failure_does_not_stop_other_heads_but_device_failure_does() {
         let mut seen = Vec::new();

@@ -2,6 +2,7 @@
 pub(crate) mod engine;
 pub(crate) mod admission;
 mod draft_binding;
+mod packed_check;
 #[cfg(test)]
 mod placement_tests;
 pub(crate) mod local;
@@ -121,6 +122,11 @@ pub(crate) struct GoldenArgs {
     /// Published shared fidelity directory, or tokens.bin/layerNN.bin/logits.bin from golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Compare actual multi-member serving units with singleton logits and all KV/state bytes.
+    #[arg(long, conflicts_with_all = ["nll", "prefill", "draft", "verify_rows", "token_check", "resume_at"])]
+    pub packed_check: Option<usize>,
+    #[arg(long, value_enum)]
+    pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
     /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
     #[arg(long)]
     pub nll: bool,
@@ -199,6 +205,20 @@ mod prefill_shape_tests {
     struct Cli {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    #[test]
+    fn packed_check_cli_uses_explicit_arithmetic_mode_and_rejects_other_diagnostics() {
+        #[derive(Parser)]
+        struct Golden { #[command(flatten)] args: GoldenArgs }
+        let base = ["v4", "--snapshot", "/missing", "--native-lib", "/missing.so", "--golden", "/golden",
+            "--packed-check", "3", "--prefill-packing", "exact"];
+        let args = Golden::try_parse_from(base).unwrap().args;
+        assert_eq!(args.packed_check, Some(3));
+        assert_eq!(args.prefill_packing, Some(crate::shared::prefill_packing::PackingMode::Exact));
+        assert!(Golden::try_parse_from(base.into_iter().chain(["--nll"])).is_err());
+        let defaults = Golden::try_parse_from(&base[..base.len() - 2]).unwrap().args;
+        assert_eq!(defaults.prefill_packing.unwrap_or_default(), crate::shared::prefill_packing::PackingMode::Unrestricted);
     }
 
     #[test]
@@ -720,10 +740,15 @@ pub(crate) fn with_engine<T>(
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let shared = args.golden.join("manifest.json").try_exists()?;
-    if shared {
+    if args.packed_check.is_some() {
+        ensure!(shared && args.engine.full_prefill_logits && args.window.is_none()
+            && args.save_logits.is_none() && args.layers.is_none(),
+            "--packed-check requires a published V4 Flash set and --full-prefill-logits, without other diagnostics");
+    } else if shared {
         ensure!(args.nll && args.save_logits.is_some(), "shared V4 fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.draft && args.verify_rows.is_none()
-            && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none(),
+            && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none()
+            && args.packed_check.is_none(),
             "shared V4 fidelity cannot be combined with legacy golden diagnostics");
         let output = args.save_logits.as_deref().unwrap();
         ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
@@ -734,12 +759,30 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let started = Instant::now();
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    let windows = if shared { Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?) } else { None };
+    let windows = if shared && args.packed_check.is_none() {
+        Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?)
+    } else { None };
+    let packed_reference = if args.packed_check.is_some() {
+        ensure!(loaded.family == "dsv4f", "packed reference diagnostic supports V4 Flash only");
+        let (_, _, hash) = fidelity_publication(loaded.family)?;
+        ensure!(cuteafd_bench::fidelity_rows::sha256(&args.golden.join("manifest.json"))? == hash,
+            "packed reference manifest differs from immutable publication");
+        let manifest: serde_json::Value = cuteafd_loader::read_json_file(&args.golden.join("manifest.json"))?;
+        let reference = cuteafd_bench::fidelity_dataset::load(&args.golden, &manifest)?;
+        let mut windows = reference.windows;
+        windows.sort_by_key(|w| w.tokens.len());
+        Some(windows)
+    } else { None };
     with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime, _host_config| {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
             started.elapsed().as_secs_f64(), before.0, before.1);
-        let result = if let Some(windows) = &windows {
+        let mode = args.prefill_packing.unwrap_or_default();
+        engine.configure_packing(mode, transports)?;
+        let result = if let Some(members) = args.packed_check {
+            let windows = packed_reference.as_ref().context("packed reference")?;
+            packed_check::run(engine, transports, runtime, windows, members, mode)
+        } else if let Some(windows) = &windows {
             score_fidelity(&args, engine, transports, runtime, windows)
         } else { match args.token_check {
             Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
@@ -1169,19 +1212,42 @@ mod program_selection_tests {
 
     #[test]
     fn every_v4_dispatch_template_is_selected_and_required_at_startup() {
-        let sources = [include_str!("engine.rs"), include_str!("engine/dspark.rs"), include_str!("weights.rs")];
+        let sources = [include_str!("engine.rs"), include_str!("engine/dspark.rs"), include_str!("weights.rs"),
+            include_str!("engine/packing.rs"), include_str!("engine/context.rs"), include_str!("engine/tp2.rs")];
         for family in ["dsv4f", "dsv4p"] {
             let split_family = format!("{family}2");
             for split in [false, true] {
                 let selected = CoordinatorPrograms { family, split_family: split.then_some(split_family.as_str()) };
                 let required = selected.v4_required(4096, 64);
+                // These are exactly manifest_context's optional primitives and head ranges.
+                // Startup loads them through the same namespace selector as the base set.
+                let context_names = ["dsa_candidate_merge", "lse_combine2", "paged_staging_gather_c4",
+                    "paged_staging_gather_index", "scored_index_topk_decode_m64",
+                    "sparse_mla_partial_h0_s1_m64", "sparse_mla_partial_h32_s1_m64"]
+                    .map(|suffix| format!("{family}_{suffix}"));
+                let context_manifest = serde_json::json!({"programs": context_names.iter()
+                    .map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>()});
+                let manifest_context = cuteafd_loader::placement::families::deepseek_v4::manifest_context;
+                assert!(manifest_context(&context_manifest, family, 64, 64).is_some());
+                assert!(context_names.iter().all(|name| selected.contains(name)),
+                    "startup load_matching must load every context prerequisite");
+                let context_required = required.iter().chain(&context_names).cloned().collect::<Vec<_>>();
+                let gather = format!("{family}_paged_staging_gather_c4");
+                assert!(context_required.contains(&gather) && !required.contains(&gather));
+                let mut incomplete_context = context_manifest.clone();
+                incomplete_context["programs"].as_array_mut().unwrap()
+                    .retain(|program| program["name"].as_str() != Some(gather.as_str()));
+                assert!(manifest_context(&incomplete_context, family, 64, 64).is_none(),
+                    "context-enabled startup requires the C4 gather; base startup does not");
                 let mut checked = 0;
                 for source in sources {
-                    for line in source.lines().filter(|line| line.contains("self.run")) {
-                        // The only nonliteral route is run -> run_on forwarding `name`.
-                        let args = line.split("self.run").nth(1).unwrap();
+                    for line in source.lines().filter(|line| line.contains("self.run") || line.trim_start().starts_with("gather(\"")) {
+                        // Check the literal gather callers as well as ordinary dispatches.
+                        let args = line.split("self.run").nth(1).unwrap_or_else(|| line.trim_start().strip_prefix("gather").unwrap());
                         let Some(start) = args.find('"') else {
-                            assert!(args.trim() == "_on(0, false, name, pointers, scalars)",
+                            assert!(args.trim() == "_on(0, false, name, pointers, scalars)"
+                                || (line.trim_start().starts_with("let gather = |name: &str, pool: *mut c_void, staging: *mut c_void|")
+                                    && args.trim() == "_on(rank, false, name,"),
                                 "unrecognized nonliteral dispatch: {line}");
                             continue;
                         };
@@ -1192,7 +1258,7 @@ mod program_selection_tests {
                                 for ratio in ["4", "128"] {
                                     for program in ["prefill", "continuation"] {
                                         if template.contains("{}") {
-                                            assert!(line.contains("self.kernel_rows(cap)"),
+                                            assert!(line.contains("self.kernel_rows(cap)") || line.contains("self.prefill_kernel_rows"),
                                                 "unrecognized positional dispatch capacity: {line}");
                                         }
                                         let suffix = template.replace("{cap}", cap).replace("{}", cap).replace("{mode}", mode)
@@ -1200,7 +1266,10 @@ mod program_selection_tests {
                                             .replace("{program}", program);
                                         let name = format!("{family}_{suffix}");
                                         assert!(selected.contains(&name), "unselected dispatch {name}");
-                                        assert!(required.contains(&name), "startup misses dispatch {name}");
+                                        let startup_required = if line.trim_start().starts_with("gather(\"") {
+                                            &context_required
+                                        } else { &required };
+                                        assert!(startup_required.contains(&name), "startup misses dispatch {name}");
                                         if split && (args.starts_with("_on(1, true,") || args.starts_with("_on(rank, split,")
                                             || args.starts_with("_on(rank, weights.attention_split,")
                                             || args.starts_with("_on(0, weights.ffn_split,") || args.starts_with("_on(1, weights.ffn_split,")) {

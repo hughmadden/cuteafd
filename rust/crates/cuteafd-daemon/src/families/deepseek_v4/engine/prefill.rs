@@ -70,27 +70,28 @@ impl<'a> Engine<'a> {
         units: &[Unit], waves: usize) -> Result<(Vec<f32>, usize)> {
         let mut hooks = UnitHooks { engine: self, placement, tokens, tables, w, w1, transport, logit_rows, download,
             on_layer, logits: Vec::new(), landed: 0,
-            context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
+            packed: None, context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
         prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
         Ok((hooks.logits, hooks.landed))
     }
 }
 
-struct UnitHooks<'h, 'a, 't, 'l, 'c> {
-    engine: &'h Engine<'a>,
-    placement: &'h Placement,
-    tokens: &'h [u32],
-    tables: &'h [StepTables],
-    w: &'h Workspace<'a>,
-    w1: Option<&'h Workspace<'a>>,
-    transport: Option<&'t mut crate::shared::spark_waves::Waves<'l>>,
-    logit_rows: usize,
-    download: bool,
-    on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-    logits: Vec<f32>,
-    landed: usize,
-    context_plans: Vec<[context::ContextUnit; 2]>,
-    staging_owner: [Option<(usize, usize)>; 2],
+pub(super) struct UnitHooks<'h, 'a, 't, 'l, 'c> {
+    pub(super) engine: &'h Engine<'a>,
+    pub(super) placement: &'h Placement,
+    pub(super) tokens: &'h [u32],
+    pub(super) tables: &'h [StepTables],
+    pub(super) w: &'h Workspace<'a>,
+    pub(super) w1: Option<&'h Workspace<'a>>,
+    pub(super) transport: Option<&'t mut crate::shared::spark_waves::Waves<'l>>,
+    pub(super) logit_rows: usize,
+    pub(super) download: bool,
+    pub(super) on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+    pub(super) logits: Vec<f32>,
+    pub(super) landed: usize,
+    pub(super) context_plans: Vec<[context::ContextUnit; 2]>,
+    pub(super) staging_owner: [Option<(usize, usize)>; 2],
+    pub(super) packed: Option<&'h [super::packing::PackedMember<'a>]>,
 }
 
 /// Only an immediate same-layer predecessor leaves this parity's full history live.
@@ -117,7 +118,9 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
         if let Some(w1) = self.w1 {
             e.peer_post(layer, &w1.slots[unit.slot], unit.slot, w1, rows)?;
         }
-        if retains_draft_rows(&unit.rows, self.tokens.len()) {
+        if let Some(members) = self.packed {
+            for member in members { e.tap(self.w, &member.views[0], layer, member.segment.rows)?; }
+        } else if retains_draft_rows(&unit.rows, self.tokens.len()) {
             e.tap(self.w, &self.w.slots[unit.slot], layer, unit.rows.len())?;
         }
         if let Some(slot) = slot {
@@ -146,7 +149,8 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         let tokens = &self.tokens[unit.rows.clone()];
         e.route_check_unit(unit.slot, unit.index);
         e.embedding.check(tokens)?;
-        e.fill(&lane.tables, tables)?;
+        if let Some(members) = self.packed { e.stage_packed_tables(0, &lane.tables, members)?; }
+        else { e.fill(&lane.tables, tables)?; }
         e.upload(lane.tokens.buffer, bytes_of(tokens))?;
         if e.embedding.device_gather() {
             e.gather_streams(lane, tokens.len())?;
@@ -157,10 +161,11 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         if let Some(w1) = self.w1 {
             let peer = &w1.slots[unit.slot];
             e.on(1, || {
-                e.fill(&peer.tables, tables)?;
+                if let Some(members) = self.packed { e.stage_packed_tables(1, &peer.tables, members)?; }
+                else { e.fill(&peer.tables, tables)?; }
                 e.upload(peer.tokens.buffer, bytes_of(tokens))
             })?;
-            if e.context.is_some() {
+            if e.context.is_some() && self.packed.is_none() {
                 let contexts = [e.put_context_tables(0, &lane.tables, tables, unit.slot, true, &self.placement.units)?,
                     e.put_context_tables(1, &peer.tables, tables, unit.slot, true, &self.placement.units)?];
                 self.context_plans[unit.slot] = contexts;
@@ -176,6 +181,9 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
 
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let e = self.engine;
+        if let Some(members) = self.packed {
+            return e.packed_attention(layer, members, self.w, self.w1);
+        }
         let tables = &self.tables[unit.index];
         let rows = Scalar::I32(unit.rows.len() as i32);
         if let Some(ordinal) = e.context.as_ref().and_then(|split| split.ordinal(layer)) {
@@ -213,7 +221,10 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
         let e = self.engine;
         let transport = self.transport.as_mut().context("no prefill Spark link")?;
-        let wave = e.wave_send(layer, unit.rows.len(), self.w, (self.placement.len + unit.rows.start) as u64, transport)?;
+        let members = self.packed.map_or_else(Vec::new, |members| members.iter().map(|m|
+            (m.segment.first, m.segment.rows, m.segment.start,
+                m.tables.main_slots[0] as usize / (e.shape.ring_pages * metadata::SOURCE_PAGE_TOKENS))).collect());
+        let wave = e.wave_send(layer, unit.rows.len(), self.w, (self.placement.len + unit.rows.start) as u64, members, transport)?;
         e.shared_ffn(layer, self.w, &self.w.slots[unit.slot], Scalar::I32(unit.rows.len() as i32),
             e.prefill_rows, &e.weights.layers[layer])?;
         Ok(wave)
@@ -229,6 +240,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
         let e = self.engine;
         let rows = unit.rows.len();
+        if self.packed.is_some() { return Ok(()); }
         let wanted = unit.rows.end.saturating_sub((self.tokens.len() - self.logit_rows).max(unit.rows.start));
         if self.download {
             let mut done = 0;
@@ -251,7 +263,11 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
 
     fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
         let e = self.engine;
-        if retains_draft_rows(&unit.rows, self.tokens.len()) {
+        if let Some(members) = self.packed {
+            for member in members {
+                e.write_draft_kv(self.w, &member.views[0], member.segment.rows, e.prefill_rows)?;
+            }
+        } else if retains_draft_rows(&unit.rows, self.tokens.len()) {
             e.write_draft_kv(self.w, &self.w.slots[unit.slot], unit.rows.len(), e.prefill_rows)?;
         }
         if self.w1.is_some() {
