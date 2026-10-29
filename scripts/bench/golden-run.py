@@ -69,7 +69,8 @@ state, sampled power limit and draw). summary.md lists exit codes and the key lo
 (admission, logits digests, agreement/top-1, resume verdicts, test results, errors),
 the workers' readiness and errors, plus each --compare-logits A:B result: byte
 equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
-config.json, or --vocab). Both layouts a golden writes are compared: a flat
+config.json, or --vocab). Comparisons are report-only unless --require-identical,
+which exits 1 when any pair is not byte-identical. Both layouts a golden writes are compared: a flat
 `*logits*.bin` dump and the per-row safetensors directory (row-NNNNNNNN.safetensors
 plus manifest.jsonl) that Kimi and the shared probe write; for the row layout the
 table names the row carrying the largest KL.
@@ -1283,6 +1284,8 @@ def main(argv=None):
     parser.add_argument('--preflight-at-grant', action='store_true',
                         help='run --preflight only once the locks are granted (free-memory floors and the like)')
     parser.add_argument('--compare-logits', action='append', default=[], metavar='A:B')
+    parser.add_argument('--require-identical', action='store_true',
+                        help='exit 1 unless every --compare-logits pair is byte-identical (comparisons are otherwise report-only)')
     parser.add_argument('--vocab', type=int, help='logits row width (default: the checkpoint config.json vocab_size)')
     parser.add_argument('--overwrite', action='store_true', help='replace an earlier golden/ of this task')
     parser.add_argument('--dry-run', action='store_true', help='run the checks, print the commands, take no locks')
@@ -1385,6 +1388,9 @@ def main(argv=None):
     if code:
         return code
     if any(r['exit'] != 0 for r in records) or any(c.get('error') for c in comparisons):
+        return 1
+    if args.require_identical and not all(c.get('byte_identical') for c in comparisons):
+        print('golden-run: --require-identical: a --compare-logits pair is not byte-identical', file=sys.stderr)
         return 1
     return 0
 

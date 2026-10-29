@@ -369,6 +369,19 @@ def test_compare_logits_byte_identical_arms(env, monkeypatch):
     assert '| a | b | 1 | logits/logits.bin | True | 4 | 0.0000e+00 |' in summary
 
 
+def test_require_identical_fails_on_differing_logits(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    logits = env['tmp'] / 'logits.bin'
+    np.arange(32, dtype='<f4').tofile(logits)
+    monkeypatch.setattr(golden, 'compare_pairs',
+                        lambda *a: [{'a': 'a', 'b': 'b', 'repeat': 1, 'file': 'logits.bin', 'byte_identical': False, 'rows': 0}])
+    monkeypatch.setenv('STUB_LOGITS', str(logits))
+    argv = BASE + ['--arm', 'a=i1:s1', '--arm', 'b=i1:s1', '--compare-logits', 'a:b'] + GOLDEN + \
+        ['--save-logits', '{out}/logits']
+    assert golden.main(argv) == 0  # report-only by default
+    assert golden.main(argv[:len(BASE)] + ['--require-identical', '--overwrite'] + argv[len(BASE):]) == 1
+
+
 def test_compare_tool_on_synthetic_logits(tmp_path):
     rng = np.random.default_rng(0)
     a = rng.normal(size=(130, 50)).astype('<f4')
