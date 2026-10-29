@@ -183,7 +183,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     let dir = snapshot(false);
     let report = testing::plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("kimi_k3"));
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.unclassified.is_empty(), "{:?}", &report.unclassified[..report.unclassified.len().min(5)]);
     assert!(report.config_error.is_none(), "{:?}", report.config_error);
     let spec = report.spec.as_ref().unwrap();
@@ -192,7 +192,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     for component in [Component::Attention, Component::ResidualMix, Component::LatentProjection, Component::Router,
         Component::RoutedExpert, Component::SharedExpert, Component::DenseFfn] {
         let plan = report.components.iter().find(|c| c.component == component).unwrap_or_else(|| panic!("{component:?}"));
-        assert_eq!(plan.status, Status::Planned, "{component:?}");
+        assert_eq!(plan.status, Status::Ready, "{component:?}");
     }
     let experts = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
     assert_eq!(experts.formats.keys().collect::<Vec<_>>(), vec!["exl3-k2"]);
@@ -208,7 +208,10 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert!(!report.hints.iter().any(|h| h.what.contains("W9") || h.what.contains("Kimi K3 attention")));
     // The family's own Spark budget, shown in the report and its rendering.
     assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
+    // Serving status does not make the default single-GPU header plan fit.
     assert!(!report.executable());
+    assert!(report.hints.iter().any(|hint| hint.what.contains("requires TP2")
+        || hint.what.contains("targets two coordinator GPUs")));
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
@@ -367,7 +370,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
 
 #[test]
 #[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads real headers only in a manifest-free process"]
-fn mounted_release_plan_is_manifest_independent_and_wip_only() -> anyhow::Result<()> {
+fn mounted_release_plan_is_manifest_independent_and_serving() -> anyhow::Result<()> {
     let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot required")?;
     ensure!(std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").is_none(), "run with no installed manifest environment");
     let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
@@ -394,7 +397,7 @@ fn mounted_release_plan_is_manifest_independent_and_wip_only() -> anyhow::Result
     let report = testing::plan(std::path::Path::new(&snapshot), &options)?;
     assert_eq!(report.experts.as_ref().context("deployment expert package")?.package, PACKAGE);
     assert!(report.fits && report.placement_supported && report.wip_launchable(), "{:#?}", report.hints);
-    assert!(!report.executable(), "release readiness is not qualified by a header-only plan");
+    assert!(report.executable(), "{:#?}", report.hints);
     let deployment_options = crate::plan::deployment::DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
     let deployment = crate::plan::deployment::DeploymentSpec::from_report(&report, &deployment_options);
     assert!(deployment.is_ok(), "{deployment:?}");

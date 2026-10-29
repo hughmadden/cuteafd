@@ -21,7 +21,7 @@ pub(crate) const CONTEXT: usize = 0;
 pub(crate) const INPUT: usize = 1;
 pub(crate) const HIDDEN: usize = 2;
 pub(crate) const LOGITS: usize = 3;
-const SLOTS: usize = cuteafd_loader::placement::draft::BRIDGE_SLOTS as usize;
+use cuteafd_loader::placement::draft::BRIDGE_SLOT_SIZES;
 
 /// The bridge's sampled controls on each GPU: four zero-payload receive slots
 /// (256 B each), the control block and the abort word. The solver charges the
@@ -61,8 +61,8 @@ impl<'a> Prepared<'a> {
         let device = Device { library, id: target_peer.device };
         let stream = Stream::new(device)?;
         let target_ready = Event { device, raw: device.run(|| library.cuda_event_create_ordering())? };
-        let exchange = PeerExchange::new_abortable(library,
-            [target, RankDevice { device: target_peer.device, stream: stream.raw }], SLOTS, 0)?;
+        let exchange = PeerExchange::new_abortable_sized(library,
+            [target, RankDevice { device: target_peer.device, stream: stream.raw }], &BRIDGE_SLOT_SIZES)?;
         exchange.trace_identity(identity);
         Ok(Self { exchange, stream, target_peer, target_ready, head_rank })
     }

@@ -184,6 +184,17 @@ impl End<'_> {
 /// The flag of pushes into buffers outside the receive slots.
 pub(crate) const DIRECT: usize = usize::MAX;
 
+pub(crate) fn validate_slot_sizes(devices: [i32; 2], sizes: &[usize]) -> Result<()> {
+    ensure!(devices[0] != devices[1],
+        "head split requires two different GPUs, got devices {} and {}", devices[0], devices[1]);
+    ensure!(!sizes.is_empty(), "head split requires at least one receive slot");
+    for (slot, &bytes) in sizes.iter().enumerate() {
+        ensure!(bytes > 0 && bytes % 16 == 0,
+            "head split receive slot {slot} has invalid size {bytes} bytes; expected nonzero 16-byte rows");
+    }
+    Ok(())
+}
+
 /// Both ends of the exchange between ranks 0 and 1.
 pub(crate) struct PeerExchange<'a> {
     library: &'a NativeLibrary,
@@ -211,10 +222,7 @@ impl<'a> PeerExchange<'a> {
     fn new_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize]) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         let slots = sizes.len();
-        ensure!(
-            ranks[0].device != ranks[1].device && slots > 0 && sizes.iter().all(|bytes| *bytes > 0 && bytes % 16 == 0),
-            "a head split exchanges between two GPUs in 16-byte rows"
-        );
+        validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, || {
@@ -745,6 +753,17 @@ mod tests {
         assert!(panic.is_err());
         assert_eq!(library.cuda_get_device()?, 1);
         Ok(())
+    }
+
+    #[test]
+    fn invalid_slot_sizes_name_the_slot_and_extent() {
+        for bytes in [0, 17] {
+            let error = validate_slot_sizes([0, 1], &[256, bytes]).unwrap_err().to_string();
+            assert!(error.contains("slot 1") && error.contains(&format!("{bytes} bytes")), "{error}");
+        }
+        assert!(validate_slot_sizes([0, 0], &[256]).unwrap_err().to_string().contains("devices 0 and 0"));
+        assert!(validate_slot_sizes([0, 1], &[]).is_err());
+        assert!(validate_slot_sizes([0, 1], &[16, 256, 1024]).is_ok());
     }
 
     #[test]

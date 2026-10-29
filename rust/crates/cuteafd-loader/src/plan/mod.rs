@@ -1260,7 +1260,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         // without rows) plans exactly as given, ahead of every automatic rule.
         if layout.prefill_rows != 0 || layout.prefill_unit_rows.is_some()
             || layout.prefill_waves > 1 || layout.prefill_lanes > 0 {
-            if !report.executable() {
+            if !report.wip_launchable() {
                 let (rows, waves) = (report.prefill_unit_rows.unwrap_or(0), report.prefill_waves.unwrap_or(0));
                 report.hints.push(Hint {
                     what: format!("explicit prefill shape {waves} x {rows} rows refused by checkpoint or memory admission"),
@@ -1291,7 +1291,9 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             .collect();
         if let Some(best) = largest_fitting_prefill(&candidates, |reserve| {
             let report = at(reserve)?;
-            Ok(report.executable().then_some(report))
+            // Reserve admission must accept native WIP runtimes just like
+            // the Spark-count selector; release readiness is a separate gate.
+            Ok(report.wip_launchable().then_some(report))
         })? { return Ok(best); }
         let mut refused = at(RESERVE_ROWS)?;
         refused.hints.push(Hint {
