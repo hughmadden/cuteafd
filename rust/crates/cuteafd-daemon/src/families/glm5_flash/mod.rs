@@ -2060,11 +2060,11 @@ impl Opened {
             id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
         // Gather still runs on the entry GPU: peer access reads only the selected
         // token rows, not a second resident table. The drafter borrows it too.
-        let load_embedding = || embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
-            &self.library, embed.clone(), args.token_io.embed_placement, || Ok(())));
         // Admission is complete; overlap the drafter read with pushed expert/dense operands.
         let draft_read = args.draft.as_deref().map(dspark::DraftRead::start).transpose()?;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
+            let load_embedding = || embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
+                &self.library, embed.clone(), args.token_io.embed_placement, || Ok(())));
             let (pushed, loaded) = match coordinator_push.take() {
                 Some((push, sparks, devices, (model, operands, steps, dense))) => {
                     // The planned dense operands (and the TP2 halves) arrive in one

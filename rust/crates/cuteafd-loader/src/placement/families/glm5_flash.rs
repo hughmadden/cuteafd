@@ -1704,7 +1704,9 @@ mod tests {
             assert_eq!(planned.0.movables, [(MovableId::Drafter, 0)]);
             let selected = solve_attention_working_set_with_graphs(&input, Some(&alternate.resident),
                 2 << 20, false, 188, true).unwrap();
-            assert_eq!(selected.0, planned.0);
+            assert_eq!(placed_attention(input.attention, &selected.0).first_owner, expected);
+            assert!(attention_owner_score(input.onboard, &selected.0).unwrap()
+                >= attention_owner_score(input.onboard, &planned.0).unwrap());
             let mut measured_input = input.clone();
             for (capacity, baseline) in &mut measured_input.gpus {
                 let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
@@ -1819,7 +1821,12 @@ mod tests {
                 else { cache::GlmfIndexCache::Compact };
             let original = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
             let placed = solve_attention_working_set_with_graphs(&input, None, 2 << 20, false, 188, true).unwrap();
-            assert_eq!(original.0, placed.0);
+            let mut peer = input.clone();
+            peer.resident[1].embedding = peer.resident[0].embedding;
+            peer.resident[0].embedding = 0;
+            let candidate = solve_working_set_with_graphs(&peer, 2 << 20, false, 188, true).unwrap();
+            let expected = select_attention_working_set(input.onboard, Ok(original), Ok(candidate)).unwrap();
+            assert_eq!(expected.0, placed.0);
             assert_eq!(placed_attention(input.attention, &placed.0), input.attention);
             assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&input.resident),
                 2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));

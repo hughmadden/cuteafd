@@ -2767,13 +2767,18 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
-        let (placed, graphs, working) = glmf::solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        let (placed, graphs, working) = glmf::solve_attention_working_set_with_graphs(&input, None,
+            2 << 20, false, 188, true).unwrap();
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);
         let spark = !working.spark_layers.is_empty();
         assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, lanes) } else { (0, lanes) });
         let mut admitted = input.clone();
         admitted.graphs = graphs;
+        let home = glmf::embedding_home(&placed) as usize;
+        let embedding_bytes = admitted.resident.iter().map(|rank| rank.embedding).sum();
+        for rank in &mut admitted.resident { rank.embedding = 0; }
+        admitted.resident[home].embedding = embedding_bytes;
         let request = glmf::request_for_working_set(&admitted, &working).unwrap();
         assert_eq!(request.inventory.spark_ranks, working.spark_ranks);
         assert_eq!(request.hops.lanes, working.prefill_lanes);
