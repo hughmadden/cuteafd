@@ -411,6 +411,79 @@ fn release(family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_
     slots.extend(slot);
 }
 
+/// A queued chunk eligible for immediate shared admission.
+fn packed_chunk(p: &Prefill<'_>) -> Option<(usize, usize)> {
+    if p.job.events.is_closed() || p.done == p.tokens.len() || p.logits.is_some() { return None; }
+    Some((p.placement.len, p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()) - p.done))
+}
+
+fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, group: &mut [Prefill<'_>])
+    -> Vec<Result<Chunk>> {
+    let timer = Instant::now();
+    let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
+    let counts = group.iter().zip(&ends).map(|(p, end)| end - p.done).collect::<Vec<_>>();
+    cuteafd_transport::route_log::step(|| group.iter().zip(&counts).map(|(p, &n)| (p.id, n as u32)).collect());
+    let result = (|| -> Result<Vec<Result<()>>> {
+        let mut sequences = Vec::new();
+        let mut outputs = Vec::new();
+        for (p, &end) in group.iter_mut().zip(&ends) {
+            let Prefill { job, constraint, tokens, done, placement, first, logits, .. } = p;
+            sequences.push((placement, &tokens[*done..end]));
+            outputs.push((&*job, constraint, first, logits, tokens.len(), end));
+        }
+        let (segments, outcomes) = engine.prefill_packed(&mut sequences, &mut |i, logits| {
+            let (job, constraint, first, retained, len, end) = &mut outputs[i];
+            if job.events.is_closed() { return Ok(Err(anyhow::anyhow!("client went away"))); }
+            if end != len { return Ok(Ok(())); }
+            let mut batch = SelectBatch::default();
+            if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
+                return Ok(Err(error));
+            }
+            let selected = selector.select(&logits, &batch)?;
+            match take(constraint.as_mut(), &selected[0]) {
+                Ok(token) => **first = Some(token),
+                Err(error) => return Ok(Err(error)),
+            }
+            if cache.enabled() && !probe::cold(&job.probe) { **retained = Some(logits.row_host(engine.library, 0)?); }
+            if probe::wants_first(&job.probe) {
+                probe::device_rows(engine.library, &job.probe, &logits, 0, 1, *len)?;
+            }
+            Ok(Ok(()))
+        })?;
+        drop((sequences, outputs));
+        if let Some(drafter) = &engine.drafter {
+            for (p, s) in group.iter().zip(&segments) {
+                if let Some(slot) = p.slot {
+                    drafter.update(&(0..s.tap_rows).map(|r| ContextRow { tap_row: s.tap_offset + r, slot,
+                        position: s.start + s.rows - s.tap_rows + r }).collect::<Vec<_>>())?;
+                }
+            }
+        }
+        Ok(outcomes)
+    })();
+    let elapsed = timer.elapsed().as_secs_f64();
+    for (((p, &end), &count), share) in group.iter_mut().zip(&ends).zip(&counts)
+        .zip(crate::shared::prefill_packing::row_shares(&counts)) {
+        p.done = end;
+        p.cancelled = p.job.events.is_closed();
+        p.busy += elapsed * share;
+        p.ticket.prefill(count, p.chunks, p.plan.chunks.len(), timer);
+    }
+    let outcomes = crate::shared::prefill_packing::member_outcomes(group.len(), result);
+    group.iter_mut().zip(outcomes).map(|(p, outcome)| {
+        outcome?;
+        for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+            cache.capture_session(p.ticket.session());
+            if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement, After::default()) {
+                tracing::warn!("snapshot point {point} not retained: {error:#}");
+            }
+        }
+        p.chunks += 1;
+        Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+    }).collect()
+}
+
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>) {
@@ -619,57 +692,67 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         if prefills.due(!active.is_empty()) {
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|p| {
-                if p.done == p.tokens.len() {
-                    return Ok(Chunk::Done);
-                }
-                if p.job.events.is_closed() {
-                    p.cancelled = true;
-                    anyhow::bail!("client went away");
-                }
-                let timer = Instant::now();
-                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
-                let chunk = &p.tokens[p.done..end];
-                let start = p.placement.len;
-                cuteafd_transport::route_log::step(|| vec![(p.id, chunk.len() as u32)]);
-                let logits = engine.prefill_device(&mut p.placement, chunk,
-                    transport.as_deref_mut().map(|t| (t, runtime)), usize::from(end == p.tokens.len()))?;
-                if end == p.tokens.len() {
-                    // The first token, while this prompt's logits are the workspace's; the
-                    // prompt snapshot keeps that row (downloaded only when the cache retains).
-                    let logits = logits.context("prefill produced no logits")?;
-                    let mut batch = SelectBatch::default();
-                    batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
-                    let selected = selector.select(&logits, &batch)?;
-                    p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
-                    if cache.enabled() && !probe::cold(&p.job.probe) {
-                        p.logits = Some(logits.row_host(&opened.library, 0)?);
+            let limits = engine.packed_limits();
+            let finished = prefills.round_packed(limits.rows, DECODE_ROWS,
+                |p| packed_chunk(p).map(|(_, rows)| rows),
+                |group, next| crate::shared::prefill_packing::plan(&group.iter().chain([next])
+                    .filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok(),
+                |group| {
+                    if group.len() > 1 && group.iter().all(|p| packed_chunk(p).is_some()) {
+                        return prefill_group(engine, &family, &mut cache, &mut selector, group);
                     }
-                    if probe::wants_first(&p.job.probe) {
-                        probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
-                    }
-                }
-                // The chunk's tapped tail becomes drafter context before the next step.
-                if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
-                    let n = chunk.len().min(TAP_ROWS);
-                    let first = start + chunk.len() - n;
-                    drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
-                        .collect::<Vec<_>>())?;
-                }
-                p.done += chunk.len();
-                p.busy += timer.elapsed().as_secs_f64();
-                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
-                // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
-                    cache.capture_session(p.ticket.session());
-                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
-                        After::default()) {
-                        tracing::warn!("snapshot point {point} not retained: {error:#}");
-                    }
-                }
-                p.chunks += 1;
-                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
-            });
+                    group.iter_mut().map(|p| {
+                        if p.done == p.tokens.len() {
+                            return Ok(Chunk::Done);
+                        }
+                        if p.job.events.is_closed() {
+                            p.cancelled = true;
+                            anyhow::bail!("client went away");
+                        }
+                        let timer = Instant::now();
+                        let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
+                        let chunk = &p.tokens[p.done..end];
+                        let start = p.placement.len;
+                        cuteafd_transport::route_log::step(|| vec![(p.id, chunk.len() as u32)]);
+                        let logits = engine.prefill_device(&mut p.placement, chunk,
+                            transport.as_deref_mut().map(|t| (t, runtime)), usize::from(end == p.tokens.len()))?;
+                        if end == p.tokens.len() {
+                            // The first token, while this prompt's logits are the workspace's; the
+                            // prompt snapshot keeps that row (downloaded only when the cache retains).
+                            let logits = logits.context("prefill produced no logits")?;
+                            let mut batch = SelectBatch::default();
+                            batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+                            let selected = selector.select(&logits, &batch)?;
+                            p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+                            if cache.enabled() && !probe::cold(&p.job.probe) {
+                                p.logits = Some(logits.row_host(&opened.library, 0)?);
+                            }
+                            if probe::wants_first(&p.job.probe) {
+                                probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
+                            }
+                        }
+                        // The chunk's tapped tail becomes drafter context before the next step.
+                        if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
+                            let n = chunk.len().min(TAP_ROWS);
+                            let first = start + chunk.len() - n;
+                            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
+                                .collect::<Vec<_>>())?;
+                        }
+                        p.done += chunk.len();
+                        p.busy += timer.elapsed().as_secs_f64();
+                        p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
+                        // Intermediate snapshot points this chunk ends at (off unless configured).
+                        for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+                            cache.capture_session(p.ticket.session());
+                            if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
+                                After::default()) {
+                                tracing::warn!("snapshot point {point} not retained: {error:#}");
+                            }
+                        }
+                        p.chunks += 1;
+                        Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+                    }).collect()
+                });
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {

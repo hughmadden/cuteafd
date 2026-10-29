@@ -179,8 +179,14 @@ impl Bindings<'_, '_, '_, '_, '_> {
             })?;
         }
         if let Some(drafter) = &e.drafter {
-            let (first, rows, offset) = self.tap;
-            if rows > 0 { drafter.tap_at(index, self.work[0].h.buffer.ptr, first, rows, offset)?; }
+            if self.tables[0].segments.is_empty() {
+                let (first, rows, offset) = self.tap;
+                if rows > 0 { drafter.tap_at(index, self.work[0].h.buffer.ptr, first, rows, offset)?; }
+            } else {
+                for (s, _) in &self.tables[0].segments {
+                    drafter.tap_at(index, self.work[0].h.buffer.ptr, s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                }
+            }
         }
         Ok(())
     }
@@ -217,7 +223,7 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
             let rows = Scalar::I32(self.rows() as i32);
             if index == 0 { e.norm_full(rank, w, self.layer(rank, index).ptr("input_norm")?, 0, rows,
                 w.delta.buffer.ptr, w.delta.buffer.ptr)?; }
-            e.attention_on(rank, w, index, self.layer(rank, index), rows, self.cap(), &self.tables[rank])?;
+            e.attention_unit(rank, w, index, self.layer(rank, index), rows, self.cap(), self.tables, self.lane)?;
             e.norm_full(rank, w, self.layer(rank, index).ptr("post_norm")?, 1, rows,
                 w.delta.buffer.ptr, w.delta.buffer.ptr)
         })

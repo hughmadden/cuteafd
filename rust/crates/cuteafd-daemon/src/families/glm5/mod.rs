@@ -3,6 +3,7 @@
 use crate::shared::speculation::dflash;
 pub(crate) mod engine;
 pub(crate) mod prefix;
+mod packed_check;
 pub(crate) mod serve;
 pub(crate) mod landing;
 pub(crate) mod native_dense;
@@ -72,6 +73,9 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0,
         value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_waves: u8,
+    /// Pack queued short prompts; exact preserves loaded expert arithmetic routes.
+    #[arg(long, value_enum)]
+    pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
     /// Pool-first by default; local requests require an exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
     pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
@@ -359,6 +363,21 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn packed_prefill_mode_cli_and_golden_defaults() {
+        use crate::shared::prefill_packing::PackingMode;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native"];
+            argv.extend_from_slice(extra);
+            Parse::try_parse_from(argv).map(|p| p.engine.prefill_packing)
+        };
+        assert_eq!(PackingMode::resolve(parse(&[]).unwrap(), false), PackingMode::Unrestricted);
+        assert_eq!(PackingMode::resolve(parse(&[]).unwrap(), true), PackingMode::Exact);
+        assert_eq!(parse(&["--prefill-packing", "exact"]).unwrap(), Some(PackingMode::Exact));
+        assert_eq!(parse(&["--prefill-packing", "unrestricted"]).unwrap(), Some(PackingMode::Unrestricted));
+        assert!(parse(&["--prefill-packing", "off"]).is_err());
+    }
+
+    #[test]
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
@@ -578,6 +597,9 @@ pub(crate) struct GoldenArgs {
     /// copy's logits with the golden logits.
     #[arg(long)]
     pub sequences: Option<usize>,
+    /// Compare packed short prompts with standalone passes, including every live cache byte.
+    #[arg(long)]
+    pub packed_check: Option<usize>,
     /// Score every prefill row's logits against the golden (mean NLL, top-1,
     /// KL); the prefill runs without layer downloads (Spark lanes).
     #[arg(long)]
@@ -1224,6 +1246,7 @@ impl Opened {
         }
         *engine.prefill_link.borrow_mut() = prefill_link;
         engine.prefill_runtime = Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?);
+        engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             if engine.ranks() > 1 {
@@ -1668,6 +1691,8 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.prefill_packing = Some(crate::shared::prefill_packing::PackingMode::resolve(
+        args.engine.prefill_packing, args.packed_check.is_some()));
     // Reject invalid explicit geometry before checkpoint I/O.
     resolve_prefill(&mut args.engine)?;
     // Validate the scoring call before opening CUDA or loading any weights.
@@ -1682,6 +1707,11 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
+    if let Some(sequences) = args.packed_check {
+        let tokens = std::fs::read(args.golden.join("tokens.bin"))?.chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        return packed_check::check(engine, &tokens, sequences, transport, runtime);
+    }
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
     }
