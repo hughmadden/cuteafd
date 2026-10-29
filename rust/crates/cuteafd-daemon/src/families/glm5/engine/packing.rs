@@ -154,14 +154,13 @@ fn coordinator_inventory<'n>(names: impl IntoIterator<Item = &'n str>, split: bo
         (selected.contains(name)
             || cuteafd_loader::families::glm5::DensePrograms::Trellis.stage(name, split))
             && !name.ends_with("_m64") && !name.contains("_decode_")
-            && (!name.ends_with("_router_scores") || name.ends_with("_prefill_router_scores"))
     }).collect::<Vec<_>>();
     let mut inventory = Vec::new();
     for &name in &required {
         let suffix = name.strip_prefix("glm_").or_else(|| name.strip_prefix("glm2_"))
             .context("GLM packed catalogue namespace")?;
         let role = match suffix {
-            "norm" | "prefill_router_scores" | "expert_input_quant" => PackedRows,
+            "norm" | "router_scores" | "expert_input_quant" => PackedRows,
             "dsa_candidate_merge" | "lse_combine2" | "paged_staging_gather_kv"
                 | "paged_staging_gather_index" => SequenceLocal,
             _ => {
@@ -276,20 +275,20 @@ mod tests {
     #[test]
     fn exact_inventory_reviews_startup_programs_and_rejects_new_routes() -> Result<()> {
         use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
-        let names = ["glm_norm", "glm_prefill_router_scores", "glm_expert_input_quant",
+        let names = ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
             "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_producer_m4096",
             "glm_index_topk_prefill_m4096", "glm_stage_swiglu_i2048",
             "glm2_ffn_i1024_bf16_m4096", "glm2_stage_query_rope_context_m4096",
-            "glm_sparse_mla_decode_m64", "glm_router_scores"];
+            "glm_sparse_mla_decode_m64"];
         let inventory = coordinator_inventory(names, true)?;
-        for name in ["glm_norm", "glm_prefill_router_scores", "glm_expert_input_quant",
+        for name in ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
             "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_stage_swiglu_i2048",
             "glm2_ffn_i1024_bf16_m4096"] {
             assert!(inventory.contains(&(name.to_owned(), PackedRows)));
         }
         assert!(inventory.contains(&("glm_producer_m4096".into(), SequenceLocal)));
         assert!(inventory.contains(&("glm2_stage_query_rope_context_m4096".into(), SequenceLocal)));
-        assert!(!inventory.iter().any(|(n, _)| n.ends_with("_m64") || n == "glm_router_scores"));
+        assert!(!inventory.iter().any(|(n, _)| n.ends_with("_m64")));
         assert!(coordinator_inventory(["glm_new_projection_m4096"], false).is_err());
         assert!(coordinator_inventory(["glm_stage_new_transform_m4096"], false).is_err());
         let limits = Limits { rows: 64, chunk_rows: 4096, max_context: 4096, taps: None };
