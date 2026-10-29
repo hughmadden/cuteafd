@@ -408,6 +408,11 @@ impl FamilyModel for DeepSeekModel {
         &self.spec
     }
 
+    /// V4.1's Engram pipeline preloads both layers' tables.
+    fn mapped_table_preload(&self) -> bool {
+        self.id == "deepseek_v41"
+    }
+
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {

@@ -32,7 +32,8 @@ impl EngramTable {
     pub fn weights(&self) -> &MappedTable {
         &self.weights
     }
-    pub(crate) fn scales_mut(&mut self) -> &mut MappedTable { &mut self.scales }
+    /// The weight and scale tables, for a preload before the pair is shared.
+    pub(crate) fn tables_mut(&mut self) -> [&mut MappedTable; 2] { [&mut self.weights, &mut self.scales] }
     pub fn scales(&self) -> &MappedTable {
         &self.scales
     }

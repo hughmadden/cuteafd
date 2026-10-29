@@ -891,7 +891,8 @@ pub(crate) fn push_resident(devices: &mut [DeviceLayout], ranks: &[Vec<(String, 
 pub(crate) fn mapped_table_note(report: &PlanReport, notes: &mut Vec<String>) {
     let p = &report.mapped_placement;
     if p.mapped + p.preloaded > 0 {
-        notes.push(format!("{}; {} host-resident scale bytes charged against {} available bytes (cap {} bytes)",
+        let what = if p.tables_preloaded() { "table" } else { "scale" };
+        notes.push(format!("{}; {} host-resident {what} bytes charged against {} available bytes (cap {} bytes)",
             p.label(), p.preloaded_bytes, p.host_budget_bytes, p.cap_bytes));
     }
     let mapped: u64 = report.components.iter().filter(|c| c.component == Component::MappedTable).map(|c| c.bytes).sum::<u64>()
@@ -1563,7 +1564,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .try_fold(0u64, |n, c| n.checked_add(c.bytes)).context("host embedding overflow")?;
         push(Category::Embedding, "embedding", "checkpoint", bytes, Basis::Exact);
     }
-    push(Category::Tables, "mapped-scales/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
+    push(Category::Tables, "mapped-tables/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
         && report.vision != super::MediaMode::Off)
         || (family == "mimo_v2" && report.audio != super::MediaMode::Off);

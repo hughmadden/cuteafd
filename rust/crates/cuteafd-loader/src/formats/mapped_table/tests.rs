@@ -898,7 +898,7 @@ fn preloaded_rows_are_exact_without_random_io_or_page_accounting() -> TestResult
     let mut expected = [0; 12];
     table.gather_into(&[7, 2, 7], &mut expected)?;
     let before = table.stats.snapshot();
-    MappedTable::preload_all(&mut [&mut table])?;
+    MappedTable::preload_all(&mut [&mut table], 2)?;
     assert_eq!(table.backend(), TableBackend::Resident);
     let mut actual = [0; 12];
     table.gather_into(&[7, 2, 7], &mut actual)?;
@@ -980,6 +980,45 @@ fn warm_populates_the_page_cache_without_the_mapping() -> TestResult {
 }
 
 #[test]
+fn preload_releases_the_page_cache_behind_its_reads() -> TestResult {
+    // Disk-backed, as warm_populates_the_page_cache_without_the_mapping.
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    file.write_all(&(0..8 * page).map(|i| (i / page) as u8).collect::<Vec<_>>())?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test file is immutable while the table lives.
+    let mut table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    let rows: Vec<u64> = (0..8).collect();
+    assert_eq!(table.warm(2, &AtomicBool::new(false), |_| ())?.bytes, 8 * page as u64);
+    assert_eq!(table.residency(&rows, false)?, [true; 8]);
+    // Two pages per chunk on three readers: the host keeps one copy of each row.
+    MappedTable::preload_chunked(&mut [&mut table], 3, 2 * page)?;
+    assert_eq!(table.residency(&rows, false)?, [false; 8]);
+    for row in rows {
+        assert_eq!(table.row(row)?, &vec![row as u8; page][..]);
+    }
+    Ok(())
+}
+
+#[test]
+fn parallel_preload_matches_mapped_rows_across_parts_and_chunks() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: immutable test-owned files outlive both tables.
+    let mapped = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    // SAFETY: as above.
+    let mut table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    // 3-byte chunks of 4-byte rows on 4 readers: reads straddle rows and end at part ends.
+    MappedTable::preload_chunked(&mut [&mut table], 4, 3)?;
+    assert_eq!(table.backend(), TableBackend::Resident);
+    let rows: Vec<u64> = (0..8).rev().collect();
+    let (mut expected, mut actual) = (vec![0; 32], vec![0; 32]);
+    mapped.gather_into(&rows, &mut expected)?;
+    table.gather_into(&rows, &mut actual)?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
 fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: files remain immutable during all mapping access; the injected
@@ -987,7 +1026,7 @@ fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
     let mut first = unsafe { MappedTable::open(&parts[..1], u8_rows(4))? };
     let mut second = unsafe { MappedTable::open(&parts[1..], u8_rows(4))? };
     std::fs::OpenOptions::new().write(true).open(&parts[1].path)?.set_len(0)?;
-    assert!(MappedTable::preload_all(&mut [&mut first, &mut second]).is_err());
+    assert!(MappedTable::preload_all(&mut [&mut first, &mut second], 2).is_err());
     assert!(first.resident.is_none());
     assert!(second.resident.is_none());
     assert_ne!(first.backend(), TableBackend::Resident);

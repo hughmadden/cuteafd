@@ -954,6 +954,10 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 # ENGRAM_WARM (on|off; default off): after readiness, read both Engram tables once
 # into the page cache on a background thread (serve-native --engram-warm), for hosts
 # with RAM for the tables whose checkpoint store has slow random reads.
+# MAPPED_SCALE_PRELOAD_GIB (GiB; default 0) caps host memory for preloaded Engram
+# tables: a cap that holds every table, rows and scales (about 189 GiB for the official
+# checkpoint), loads them all before readiness, so no row is read from storage again;
+# a smaller cap that holds the scales (about 6 GiB) preloads those alone.
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac

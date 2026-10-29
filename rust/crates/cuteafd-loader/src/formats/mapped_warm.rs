@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn resident_tables_read_nothing_and_never_wait() -> TestResult {
         let (_file, mut table) = table(2)?;
-        MappedTable::preload_all(&mut [&mut table])?;
+        MappedTable::preload_all(&mut [&mut table], 2)?;
         let outcome = warm_when_ready("test", &[&table], 1, &AtomicBool::new(false),
             || panic!("resident tables need no readiness"), || panic!("nor host memory"), READY_POLL)?;
         assert_eq!(outcome, WarmOutcome::Resident);
