@@ -1710,7 +1710,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     if let Some(sequences) = args.packed_check {
         let tokens = std::fs::read(args.golden.join("tokens.bin"))?.chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-        return packed_check::check(engine, &tokens, sequences,
+        return packed_check::check(engine, &tokens, &args.golden, sequences,
             args.engine.prefill_packing.unwrap_or(crate::shared::prefill_packing::PackingMode::Exact), transport, runtime);
     }
     if let Some(dir) = &args.draft_oracle {

@@ -59,6 +59,19 @@ impl<'a> GlmEngine<'a> {
         }, on_logits)?;
         Ok((segments, outcomes))
     }
+
+    /// Golden-check consumer: score retained rows without widening serving's head storage.
+    pub(crate) fn packed_check_logits(&self, segment: Segment,
+        consume: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>) -> Result<()> {
+        let slots = self.prefill_slots.borrow();
+        let w = slots.first().context("packed-check prefill slot")?;
+        for first in (0..segment.rows).step_by(DECODE_ROWS) {
+            let rows = (segment.rows - first).min(DECODE_ROWS);
+            self.launch_head(w, segment.first + first + rows, rows)?;
+            consume(first, self.device_logits(w, rows, false))?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn sequence_tables(placement: &GlmPlacement, start: usize, rows: usize, topk: usize) -> Result<StepTables> {
