@@ -208,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn every_packed_launch_requires_an_explicit_role_and_guard_resets_on_error() {
         use ProgramRows::*;
         let inventory = ProgramInventory::default();
@@ -221,6 +222,15 @@ mod tests {
         }
         inventory.check("outside_packed_pass").unwrap();
         assert!(inventory.enter(|| vec![("router".into(), PackedRows), ("router".into(), SequenceLocal)]).is_err());
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_inventory_has_no_storage_or_launch_validation() {
+        assert_eq!(std::mem::size_of::<ProgramInventory>(), 0);
+        let inventory = ProgramInventory::default();
+        let _pass = inventory.enter(|| panic!("release must not build the inventory")).unwrap();
+        inventory.check("unclassified_release_launch").unwrap();
     }
 
     #[test]

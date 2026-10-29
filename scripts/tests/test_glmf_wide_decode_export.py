@@ -667,6 +667,11 @@ def _route_property(relative, owner):
     prop.decorator_list = []
     module = ast.Module(body=[prop], type_ignores=[])
     scope = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    scope[target.id] = node.value.value
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
     return scope["exact_row_cap"]
 
@@ -684,6 +689,48 @@ def test_coordinator_first_route_metadata_is_derived_from_projection_dispatch():
                                         activation_quant_row_threshold=8)) == 8
     assert switch(types.SimpleNamespace(prefill=None, bf16=types.SimpleNamespace(exact_row_cap=64), fp8=None)) == 64
     assert switch(types.SimpleNamespace(prefill=None, bf16=types.SimpleNamespace(exact_row_cap=64), fp8=object())) == 0
+
+
+def test_native_trellis_first_arithmetic_routes():
+    cap = _route_property("gemm/trellis_linear/_native.py", "NativeTrellisLinear")
+    for bits, e4m3, splits, bf16, expected in [
+        (4, True, 2, False, 16), (4, True, 6, False, 8),
+        (4, True, 6, True, 64), (6, False, 6, True, 129),
+        (6, True, 6, True, 64),
+    ]:
+        assert cap(types.SimpleNamespace(bits=bits, e4m3=e4m3, splits=splits,
+                                         input_bf16=bf16)) == expected
+
+
+@pytest.mark.parametrize("filename,functions", [
+    ("trellis_linear.py", {"compile_trellis_linear_aot"}),
+    ("scaled_linear.py", {"compile_scaled_linear_aot"}),
+    ("trellis_transform.py", {"compile_trellis_input_aot", "compile_trellis_output_aot"}),
+    ("trellis_unpack.py", {"compile_trellis_unpack_e4m3_aot"}),
+    ("native_dense.py", {"compile_swiglu_split_aot", "compile_f32_narrow_pack_aot",
+                         "compile_trellis_fp8_prefill_aot"}),
+    ("dense_mxfp8.py", {"compile_dense_mxfp8_quant_aot", "compile_dense_mxfp8_aot"}),
+    ("pointwise.py", {"compile_bf16_projection_aot"}),
+])
+def test_every_native_dense_export_publishes_cap_without_rekeying(filename, functions):
+    tree = ast.parse((ROOT / "third_party/sparkinfer/b12x/integration/cuteafd" / filename).read_text())
+    found = set()
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name not in functions:
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == "compile_program"]
+        assert calls
+        for call in calls:
+            geometry = next(kw.value for kw in call.keywords if kw.arg == "geometry")
+            if isinstance(geometry, ast.Dict):
+                assert "exact_row_cap" in [k.value for k in geometry.keys if isinstance(k, ast.Constant)]
+            else:
+                assert isinstance(geometry, ast.Call) and any(k.arg == "exact_row_cap" for k in geometry.keywords)
+            key = next(kw.value for kw in call.keywords if kw.arg == "key")
+            assert "exact_row_cap" not in ast.unparse(key)
+        found.add(fn.name)
+    assert found == functions
 
 
 @pytest.mark.parametrize("filename,programs", [

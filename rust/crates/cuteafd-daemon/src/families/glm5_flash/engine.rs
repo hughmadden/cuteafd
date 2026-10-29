@@ -5438,7 +5438,8 @@ mod prefill_lane_tests {
             // partitions, so a shape outside the table keeps master's (warps, 4) bitwise.
             // Fork #150 reads each GLM Flash projection's shipped warps from
             // `fp8_gemv_shipped_warps`; a tuning entry moves only the grid, never the warps.
-            ("integration/cuteafd/glmf.py", 0xbf4c_38b6_94dd_20e8_u64),
+            // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
+            ("integration/cuteafd/glmf.py", 0xc997a51c631cd643_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
@@ -5450,7 +5451,8 @@ mod prefill_lane_tests {
             // order with the same FP32 accumulation: bitwise-equal outputs at every row count.
             // Fork #150 keys the tables by the warps each cell was measured at and applies an
             // entry only when it matches the caller's warps, restoring callers #146 moved.
-            ("integration/cuteafd/_fp8_weights.py", 0x95f8_a0f4_d800_3c54),
+            // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
+            ("integration/cuteafd/_fp8_weights.py", 0x43a74e768ef10f78_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
@@ -5473,7 +5475,8 @@ mod prefill_lane_tests {
             // The V4.1-only activation subclass leaves the default epilogue as identity;
             // glmf/glmf2 SM188/170 exports remain byte-identical (88/88 objects and SASS).
             // Router-only row tiles do not change RoutedBf16Projection or its default kernels.
-            ("gemm/bf16_gemv/_skinny.py", 0xbf9e_4b35_5893_9fad),
+            // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0xf2bb7e72f51a9d1b_u64),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
