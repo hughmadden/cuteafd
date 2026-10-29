@@ -1,6 +1,22 @@
 use super::*;
 use crate::shared::memory::DeviceAllocation;
 
+/// Source rows and request-local positions of each member's retained CED tail.
+fn packed_tails(segments: &[crate::shared::prefill_packing::Segment])
+    -> Result<Vec<(std::ops::Range<usize>, std::ops::Range<u64>)>> {
+    ensure!(segments.len() > 1 && segments.len() <= 16, "packed suffix needs 2..=16 members");
+    let mut first = 0;
+    segments.iter().map(|segment| {
+        ensure!(segment.first == first && segment.rows > 0, "packed suffix segments differ");
+        let end_row = first.checked_add(segment.rows).context("packed suffix row overflow")?;
+        let end = segment.start.checked_add(segment.rows).context("packed suffix position overflow")?;
+        ensure!(end <= 1048576, "packed suffix exceeds context");
+        let count = segment.rows.min(128);
+        first = end_row;
+        Ok((end_row - count..end_row, (end - count) as u64..end as u64))
+    }).collect()
+}
+
 /// One admitted prompt's final encoder rows, retained across encoder chunk reuse.
 /// Allocate at admission; capture copies only the final window's intersecting rows.
 pub(crate) struct EncoderSuffix<'a> {
@@ -11,6 +27,7 @@ pub(crate) struct EncoderSuffix<'a> {
     end: u64,
     binding: QueryBinding,
     invalid: bool,
+    packed: Option<Vec<crate::shared::prefill_packing::Segment>>,
 }
 impl<'a> EncoderSuffix<'a> {
     pub fn device_bytes(prompt_end: u64) -> Result<usize> {
@@ -23,7 +40,18 @@ impl<'a> EncoderSuffix<'a> {
         let rows = (prompt_end - start) as usize;
         Ok(Self { residual: DeviceAllocation::new(library, rows * 40960)?,
             pre: DeviceAllocation::new(library, rows * 16)?, tokens: (start..prompt_end).collect(),
-            next: start, end: prompt_end, binding: QueryBinding::new(19)?, invalid: false })
+            next: start, end: prompt_end, binding: QueryBinding::new(19)?, invalid: false, packed: None })
+    }
+    /// Retain each member's CED tail in replay order, with no extra device rows.
+    pub(crate) fn packed(library: &'a NativeLibrary,
+        segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self> {
+        let tails = packed_tails(segments)?;
+        let tokens: Vec<_> = tails.into_iter().flat_map(|(_, positions)| positions).collect();
+        let rows = tokens.len();
+        Ok(Self { residual: DeviceAllocation::new(library, rows * 40960)?,
+            pre: DeviceAllocation::new(library, rows * 16)?, tokens,
+            next: 0, end: rows as u64, binding: QueryBinding::new(19)?, invalid: false,
+            packed: Some(segments.to_vec()) })
     }
     /// The producer is a completed encoder chunk from this admitted request.
     /// Incomplete/failed captures never expose an output; discard on request failure.
@@ -63,6 +91,34 @@ impl<'a> EncoderSuffix<'a> {
         mut copy: impl FnMut(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<()> {
         let valid = !std::mem::replace(&mut self.invalid, true);
         let rows = output.tokens.len();
+        if let Some(segments) = &self.packed {
+            ensure!(valid && self.next == 0 && output.layer == 19 && output.binding.layer() == 19
+                && segments.last().is_some_and(|s| s.end_row() == rows)
+                && output.residual.bytes == rows * 40960 && output.pre.bytes == rows * 16,
+                "packed encoder suffix producer differs");
+            let mut destination_row = 0;
+            for (source_rows, _) in packed_tails(segments)? {
+                let count = source_rows.len();
+                let source_row = source_rows.start;
+                ensure!(output.tokens[source_rows]
+                    == self.tokens[destination_row..destination_row + count],
+                    "packed encoder suffix positions differ");
+                for (source, destination, stride) in [(output.residual, self.residual.buffer, 40960),
+                    (output.pre, self.pre.buffer, 16)] {
+                    ensure!(source.device_id == destination.device_id, "packed encoder suffix device differs");
+                    let bytes = count * stride;
+                    // SAFETY: the validated segment and retained-tail extents bound both slices.
+                    let src = CuteafdDeviceBuffer { ptr: unsafe { source.ptr.cast::<u8>().add(source_row * stride).cast() }, bytes, ..source };
+                    // SAFETY: destination_row advances through the allocated concatenated tails.
+                    let dst = CuteafdDeviceBuffer { ptr: unsafe { destination.ptr.cast::<u8>().add(destination_row * stride).cast() }, bytes, ..destination };
+                    copy(dst, src, bytes)?;
+                }
+                destination_row += count;
+            }
+            self.next = self.end;
+            self.invalid = false;
+            return Ok(());
+        }
         ensure!(valid && output.layer == 19 && output.binding.layer() == 19
             && rows > 0 && output.tokens.windows(2).all(|p| p[0].checked_add(1) == Some(p[1]))
             && output.tokens[rows - 1] < self.end
@@ -95,6 +151,33 @@ impl<'a> EncoderSuffix<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packed_ced_tails_equal_singletons_and_keep_partner_rows_private() -> Result<()> {
+        use crate::shared::prefill_packing::{plan, Limits};
+        let lengths = [1, 29, 127, 128, 129, 257];
+        let segments = plan(&lengths.map(|rows| (0, rows)), &Limits {
+            rows: 4096, chunk_rows: 4096, max_context: 1048576, taps: None })?;
+        let tails = packed_tails(&segments)?;
+        let input: Vec<_> = lengths.iter().enumerate().flat_map(|(member, &rows)|
+            (0..rows).map(move |position| (member, position))).collect();
+        for (member, (source, positions)) in tails.iter().enumerate() {
+            let expected: Vec<_> = (lengths[member].saturating_sub(128)..lengths[member])
+                .map(|position| (member, position)).collect();
+            assert_eq!(&input[source.clone()], expected);
+            assert_eq!(positions.clone().collect::<Vec<_>>(), expected.iter().map(|r| r.1 as u64).collect::<Vec<_>>());
+        }
+        let mut changed = input.clone();
+        changed[..lengths[0]].fill((999, 999));
+        for (source, _) in &tails[1..] { assert_eq!(input[source.clone()], changed[source.clone()]); }
+        let mut invalid = segments.clone();
+        invalid[1].first -= 1;
+        assert!(packed_tails(&invalid).is_err());
+        invalid = segments.clone(); invalid[1].start = usize::MAX;
+        assert!(packed_tails(&invalid).is_err());
+        assert!(packed_tails(&segments[..1]).is_err());
+        Ok(())
+    }
+
     #[test]
     fn retained_encoder_suffix_crosses_chunk_boundaries() -> Result<()> {
         let Some(path) = std::env::var_os("CUTEAFD_ENCODER_SUFFIX_LIBRARY") else {

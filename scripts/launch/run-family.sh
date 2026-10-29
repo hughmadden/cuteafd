@@ -483,6 +483,7 @@ MODEL_REVISION
 MODEL_VARIANT
 POOL_TOKENS
 PREFILL_BATCH_TOKENS
+PREFILL_PACKING
 PREFILL_WAVES
 PREFIX_CACHE_ENTRIES
 PROBE_DUMP_ROOT
@@ -1093,6 +1094,10 @@ else
   [[ "$image_sparkinfer" == "$sparkinfer_commit" ]] || release_die "coordinator image uses another SparkInfer revision (run ./build.sh)"
 fi
 
+case "${PREFILL_PACKING:-}" in
+  ""|unrestricted|exact) ;;
+  *) release_die "PREFILL_PACKING must be unrestricted or exact" ;;
+esac
 # Select and admit the count before touching any serving container or Spark.
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 v41_decode_lanes="$(get DECODE_LANES)"
@@ -1451,6 +1456,7 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+[[ -z "${PREFILL_PACKING:-}" ]] || args+=(--prefill-packing "$PREFILL_PACKING")
 [[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
 [[ -z "${V41_PREFILL_WAVES:-}" ]] || args+=(--prefill-waves "$V41_PREFILL_WAVES")
 [[ -z "${V41_PREFILL_RESERVE_ROWS:-}" ]] || args+=(--prefill-reserve-rows "$V41_PREFILL_RESERVE_ROWS")

@@ -1973,7 +1973,7 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
                "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
-@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5", "qwen4", "qwen3_5", "deepseek_v4", "glm5"])
+@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5", "qwen4", "qwen3_5", "deepseek_v4", "glm5", "deepseek_v41"])
 @pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
 def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     config = {"glm5_flash": GLMF_CONFIG, "qwen3_5": DENSE_CONFIG,
@@ -1984,21 +1984,27 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
               "mimo_v2": {"model_type": "mimo_v2", "hidden_size": 6144,
                           "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
               "deepseek_v4": {"model_type": "deepseek_v4"},
+              "deepseek_v41": {"model_type": "deepseek_v41"},
               "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}}[family]
     keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n" + (f"PREFILL_PACKING={mode}\n" if mode else "")
+    model = "test/packed"
+    if family == "deepseek_v41":
+        model = "deepseek-ai/DeepSeek-V4.1-Flash"
+        keys += "MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n"
     if family == "step5":
         keys += "SPARK_COUNT=4\nRTX_GPUS=1\n" + "".join(
             f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(1, 4))
     if family == "qwen3_5":
         keys += "SPARK_COUNT=0\n"
-    result = _family_launch_result(tmp_path, config, "test/packed", keys,
+    result = _family_launch_result(tmp_path, config, model, keys,
         deployment_overrides={"executable": True} if family == "qwen3_5" else None,
         encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else
             {"placement_supported": True, "fits": True, "spark_ranks": 0} if family == "qwen3_5" else None)
     assert result.returncode == 0, result.stderr
     command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5",
-               "qwen4": "serve-qwen4", "qwen3_5": "serve-qwen35", "deepseek_v4": "serve-dsv4", "glm5": "serve-glm"}[family]
-    launch = next(shlex.split(line) for line in result.stderr.splitlines() if f"cuteafd {command}" in line)
+               "qwen4": "serve-qwen4", "qwen3_5": "serve-qwen35", "deepseek_v4": "serve-dsv4", "glm5": "serve-glm",
+               "deepseek_v41": "serve-native"}[family]
+    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd" in line and command in shlex.split(line))
     if mode is None:
         assert "--prefill-packing" not in launch
     else:

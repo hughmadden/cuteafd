@@ -245,6 +245,170 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     stats
 }
 
+type PackedAdmission = (admission::Prepared, u64, CacheLease, usize, ImageKeys,
+    Option<(usize, Option<RetainedScores>)>, (Instant, Instant));
+
+fn packing_limits(mode: crate::shared::prefill_packing::PackingMode, rows: usize,
+    max_context: usize, taps: Option<usize>) -> crate::shared::prefill_packing::Limits {
+    // Native V4.1 owners expose traffic groups, not arithmetic-route attestation.
+    // Until that ABI is attested, exact packs must fail closed to singletons.
+    crate::shared::prefill_packing::Limits {
+        rows: if mode == crate::shared::prefill_packing::PackingMode::Exact { 0 } else { rows },
+        chunk_rows: rows, max_context, taps,
+    }
+}
+
+/// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
+/// media and scoring retain their ordinary prefill transaction.
+fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
+    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
+    prefill: &mut super::prefill_target::PrefillSlots<'a, P>, admitted: &[PackedAdmission],
+    args: &crate::cli::NativeServeArgs, mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
+    prefixes: &mut PrefixCache<'a>,
+) -> Result<std::collections::BTreeMap<usize, Result<RetainedScores>>> {
+    use crate::shared::prefill_packing;
+    let mut out = std::collections::BTreeMap::new();
+    let limits = packing_limits(args.prefill_packing, args.prefill_batch_tokens as usize,
+        args.max_context_tokens as usize, draft.as_ref().map(|d| d.prefill_tap_capacity()));
+    let eligible: Vec<_> = admitted.iter().enumerate().filter_map(|(i, (prepared, _, lease, _, _, hit, _))| {
+        (hit.is_none() && prepared.images.is_empty() && !prepared.prompt.is_empty()
+            && prepared.prompt.len() <= limits.chunk_rows
+            && crate::shared::probe::scoring(&prepared.job.probe).is_none()
+            && !prepared.job.events.is_closed()
+            && requests.cache().committed_end(*lease).ok() == Some(0)).then_some(i)
+    }).collect();
+    let chunks: Vec<_> = eligible.iter().map(|&i| (0, admitted[i].0.prompt.len())).collect();
+    for range in prefill_packing::groups(eligible.len(), |range|
+        range.len() <= 16 && prefill_packing::plan(&chunks[range], &limits).is_ok()) {
+        if range.len() == 1 { continue; }
+        let indices = &eligible[range.clone()];
+        let segments = prefill_packing::plan(&chunks[range], &limits)?;
+        let members: Vec<_> = indices.iter().map(|&i| (admitted[i].2, admitted[i].0.prompt.as_slice())).collect();
+        let result = (|| -> Result<Vec<RetainedScores>> {
+            prefill_hold(&mut || prefixes.prefill_hold());
+            for (_, transport) in &mut prefill.slots { P::begin_request(transport)?; }
+            for &(lease, tokens) in &members { requests.begin_encoder(lease, tokens.len() as u64)?; }
+            let mut suffix = prefill.slot0().0.new_packed_suffix(lib, &segments)?;
+            let mut link = P::take_link(&mut prefill.slots[0].1)?;
+            // SAFETY: all member leases and slot/suffix storage remain exclusive until drained.
+            let encoded = runtime.block_on(unsafe { P::packed_encoder_unit(prefill.slots.iter_mut()
+                .map(|(pass, transport)| (pass, transport)).collect(), &mut link, requests, &members, &mut suffix) });
+            P::restore_link(&mut prefill.slots[0].1, link)?;
+            encoded?;
+            let work = members.iter().map(|&(lease, tokens)| {
+                let start = requests.begin_decoder_replay(lease)?;
+                Ok(crate::families::deepseek_v41::v41_backbone_cache::CacheWork { lease,
+                    tokens: (tokens.len() as u64 - start) as u32, kind: ExpertV2SourceKind::Prefill })
+            }).collect::<Result<Vec<_>>>()?;
+            let accepted: Vec<_> = work.iter().map(|w| w.tokens).collect();
+            let mut end = 0;
+            let selected: Vec<_> = accepted.iter().map(|&rows| { end += rows as usize; end - 1 }).collect();
+            let mut batch = requests.prepare_replay(&work)?;
+            let (pass, transport) = prefill.slot0();
+            let replay = (|| -> Result<Vec<RetainedScores>> {
+                // SAFETY: packed suffix is the exact concatenation of each lease's replay rows.
+                let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch,
+                    transport, &selected, Some(&suffix)) })?;
+                ensure!(bytes.len() == members.len() * scores::ROW_BYTES, "packed head extent differs");
+                let scores = bytes.chunks_exact(scores::ROW_BYTES).map(|row|
+                    RetainedScores::new(VOCAB, row.to_vec())).collect::<Result<Vec<_>>>()?;
+                runtime.block_on(pass.commit_packed_prefill(requests, &mut batch, draft.as_deref_mut(), &accepted))?;
+                Ok(scores)
+            })();
+            if replay.is_err() { pass.discard(&mut batch)?; }
+            replay
+        })();
+        match result {
+            Ok(scores) => {
+                let mut scores = scores.into_iter();
+                let completion = prefill_packing::finish_members(indices.len(), |_| scores.next()
+                    .context("missing packed member scores"), &mut |member, scores| {
+                        let i = indices[member];
+                        let result = if admitted[i].0.job.events.is_closed() { Err(anyhow::anyhow!("client disconnected")) }
+                            else { out.insert(i, Ok(scores)); Ok(()) };
+                        Ok(result)
+                    });
+                for (&i, result) in indices.iter().zip(prefill_packing::member_outcomes(indices.len(), completion)) {
+                    if let Err(error) = result { out.insert(i, Err(error)); }
+                }
+            }
+            Err(error) => {
+                for (&i, result) in indices.iter().zip(prefill_packing::member_outcomes(indices.len(), Err(error))) {
+                    out.insert(i, result.and_then(|_| Err(anyhow::anyhow!("missing packed result"))));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Hardware-only contract check using the serving packer and ordinary singleton prefill.
+#[cfg(test)]
+pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
+    lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
+    prefill: &mut super::prefill_target::PrefillSlots<'a,
+        crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>>,
+    args: &crate::cli::NativeServeArgs, prompts: &[&[u32]],
+    mut draft: Option<&mut DraftRuntime<'w, 'a,
+        crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain<'w, 'a>>>,
+) -> Result<()> {
+    type P<'w, 'a> = crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>;
+    let mut prefixes = PrefixCache::disabled();
+    let mut receivers = Vec::new();
+    let mut admitted = Vec::new();
+    for (slot, &tokens) in prompts.iter().enumerate() {
+        let id = 96000 + slot as u64;
+        let lease = requests.admit(slot, id)?;
+        if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
+        let (events, receive) = mpsc::unbounded_channel();
+        receivers.push(receive);
+        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+            prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
+            max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
+        let images = super::prefix::media_keys(tokens, &[])?;
+        let now = Instant::now();
+        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new() },
+            id, lease, slot, images, None, (now, now)));
+    }
+    let mut packed = prefill_packed_admissions::<P>(lib, runtime, requests, prefill,
+        &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
+    ensure!(packed.len() == prompts.len(), "hardware check did not actually pack every prompt");
+    for (_, id, lease, _, _, _, _) in &admitted {
+        requests.release_if_present(*lease)?;
+        if let Some(draft) = draft.as_deref_mut() { draft.release(*id)?; }
+    }
+    let mut agree = 0;
+    let mut kl_sum = 0.0;
+    let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Strict.bars();
+    for (member, (prepared, id, _, slot, _, _, _)) in admitted.into_iter().enumerate() {
+        let lease = requests.admit(slot, id)?;
+        if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
+        let alone = super::prefill(lib, runtime, requests, prefill, None, lease, &prepared.prompt,
+            super::PrefillShape::from_args(args), &prepared.job, draft.as_deref_mut(), &mut || Ok(()))?;
+        let packed = packed.remove(&member).context("missing packed hardware result")??;
+        let (a, b) = (alone.logits()?, packed.logits()?);
+        ensure!(a.iter().chain(&b).all(|x| x.is_finite()), "nonfinite packed comparison");
+        let log_probs = |values: &[f32]| {
+            let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let norm = values.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln() + max;
+            values.iter().map(|&v| v as f64 - norm).collect::<Vec<_>>()
+        };
+        let (a, b) = (log_probs(&a), log_probs(&b));
+        let kl = a.iter().zip(&b).map(|(&a, &b)| a.exp() * (a - b)).sum::<f64>();
+        let same = alone.select(None)? == packed.select(None)?;
+        eprintln!("V4.1 packed member={member} rows={} KL={kl:.8} top1={same}", prepared.prompt.len());
+        ensure!(kl <= kl_max, "packed member {member} KL {kl} exceeds strict {kl_max}");
+        kl_sum += kl;
+        agree += usize::from(same);
+        requests.release_if_present(lease)?;
+        if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
+    }
+    let top1 = agree as f64 / prompts.len() as f64;
+    eprintln!("V4.1 packed {} prompts: mean KL={:.8} top1={top1:.6}", prompts.len(), kl_sum / prompts.len() as f64);
+    ensure!(top1 >= top1_min, "packed top1 {top1} below strict {top1_min}");
+    Ok(())
+}
+
 /// Serve until the request channel closes, prefilling each prompt whole at admission.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
@@ -270,6 +434,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
+    crate::shared::prefill_packing::log_mode(args.prefill_packing,
+        if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact { 0 }
+        else { args.prefill_batch_tokens as usize });
     let result = (|| -> Result<()> {
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -300,15 +467,17 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // both lanes; mixed prefill/decode interleaving is a subsequent policy.
         let mut media_ready = media_ready.into_iter();
         let mut intake = receive.len().max(1);
+        let mut admitted = Vec::new();
+        let mut held_slots = std::collections::BTreeSet::new();
         loop {
-            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len();
+            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len();
             let backlog = !media.full() && !media.backlog.is_empty();
             let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.next() {
                 tracing::info!(request_id=leased.id, encoder_ms=leased.started.elapsed().as_secs_f64()*1000.0,
                     "native asynchronous vision preparation");
                 leased.into_admitted()
             } else {
-            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)) else { break };
+            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot) && !held_slots.contains(&slot)) else { break };
             let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
                 |prepared| prepared.job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Ready(prepared) => prepared,
@@ -444,6 +613,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     continue;
                 }
             };
+            // Prefix restore provenance belongs to this admission, not the last
+            // request restored while draining the queued packed members.
+            if let (Some(usage), Some(session)) = (&prepared.job.usage,
+                prefixes.restored_session().filter(|_| hit.is_some())) {
+                usage.session(session.to_owned(), "prefix");
+            }
             if resume < prepared.prompt.len() {
                 // Encode what the restored frontier still needs; the lease waits.
                 let leased = admission::Leased { prepared, id, lease, slot, image_keys, hit, restore, resume,
@@ -455,6 +630,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
             (prepared, id, lease, slot, image_keys, hit, restore)
             };
+            held_slots.insert(slot);
+            admitted.push((prepared, id, lease, slot, image_keys, hit, restore));
+        }
+        let mut packed_scores = prefill_packed_admissions::<P>(lib, runtime, requests, prefill_slots,
+            &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
+        for (member, (prepared, id, lease, slot, image_keys, hit, restore)) in admitted.into_iter().enumerate() {
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
@@ -472,9 +653,6 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
-                if let (Some(usage), Some(session)) = (&job.usage, prefixes.restored_session().filter(|_| cached > 0)) {
-                    usage.session(session.to_owned(), "prefix");
-                }
                 ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
                     for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
@@ -483,7 +661,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         &mut || prefixes.prefill_hold())?;
                 }
                 for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
-                let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
+                let scores = if let Some(result) = packed_scores.remove(&member) { result? }
+                else if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
                 else { prefill(lib, runtime, requests, &mut *prefill_slots, Some((&mut *first, &mut *first_transport)), lease, &prompt,
                     super::PrefillShape::from_args(args), &job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
                 requests.record_state(lease, &job.probe, "prompt")?;
@@ -2049,6 +2228,30 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+
+    #[test]
+    fn packed_prefill_caps_taps_and_unknown_exact_routes_without_rechunking() -> Result<()> {
+        use crate::shared::prefill_packing::{groups, plan, PackingMode};
+        let chunks = [(0, 29), (0, 40), (0, 129), (0, 7)];
+        let split = |mode, taps| {
+            let limits = packing_limits(mode, 256, 1048576, taps);
+            groups(chunks.len(), |range| plan(&chunks[range], &limits).is_ok())
+        };
+        assert_eq!(split(PackingMode::Unrestricted, None), [0..4]);
+        assert_eq!(split(PackingMode::Unrestricted, Some(128)), [0..2, 2..3, 3..4]);
+        assert_eq!(split(PackingMode::Exact, None), [0..1, 1..2, 2..3, 3..4]);
+        assert_eq!(split(PackingMode::Exact, Some(4096)), [0..1, 1..2, 2..3, 3..4]);
+        let (send, receive) = mpsc::unbounded_channel::<usize>();
+        drop(receive);
+        let mut completed = Vec::new();
+        let outcomes = crate::shared::prefill_packing::finish_members(3, Ok, &mut |member, row| {
+            completed.push(row);
+            Ok(if member == 1 && send.is_closed() { Err(anyhow::anyhow!("cancelled")) } else { Ok(()) })
+        })?;
+        assert_eq!(completed, [0, 1, 2]);
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+        Ok(())
+    }
 
     #[test]
     fn verifier_budget_preserves_anchors_and_admits_copy_tails() {

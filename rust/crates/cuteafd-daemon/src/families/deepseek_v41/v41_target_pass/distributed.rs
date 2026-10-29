@@ -1036,6 +1036,16 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
     fn distributed_target_prefill_decode_commit_smoke() -> Result<()> {
+        distributed_prefill_fixture(false)
+    }
+
+    #[test]
+    #[ignore = "requires native library, snapshot, two GPUs and live TP4 Sparks"]
+    fn packed_prefill_matches_singleton_logits() -> Result<()> {
+        distributed_prefill_fixture(true)
+    }
+
+    fn distributed_prefill_fixture(packed_check: bool) -> Result<()> {
         use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
@@ -1487,6 +1497,18 @@ mod tests {
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
             slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
         };
+        if packed_check {
+            use clap::Parser;
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-native", "--snapshot", &snapshot,
+                "--native-lib", &std::env::var("CUTEAFD_NATIVE_LIB")?, "--prefill-batch-tokens", "16",
+                "--prefill-waves", "2", "--prefill-packing", "unrestricted"])?;
+            let crate::cli::Commands::ServeNative(args) = cli.command else { unreachable!() };
+            let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
+                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
+            return crate::families::deepseek_v41::v41_native_serve::scheduler::exercise_packed_prefill(
+                &lib, &runtime, &mut requests, &mut prefill_slots, &args,
+                &[&prompt[..3], &prompt], Some(draft.get_mut()));
+        }
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;
             requests.begin_encoder(reference_lease, prompt.len() as u64)?;

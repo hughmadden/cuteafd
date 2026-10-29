@@ -383,6 +383,15 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type PrefillLink;
     fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink>;
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()>;
+    fn new_packed_suffix(&self, lib: &'a NativeLibrary,
+        segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix>;
+    /// # Safety
+    /// Member leases, passes and packed suffix remain exclusive until all waves drain.
+    async unsafe fn packed_encoder_unit(slots: Vec<(&mut Self, &mut Self::Transport)>,
+        prefill: &mut Self::PrefillLink, requests: &mut Requests<'a>,
+        members: &[(CacheLease, &[u32])], suffix: &mut Self::Suffix) -> Result<()>;
+    async fn commit_packed_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
+        batch: &mut RequestBatch, draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: &[u32]) -> Result<()>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
@@ -415,6 +424,16 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
         transport.restore_link(link)
     }
+    fn new_packed_suffix(&self, lib: &'a NativeLibrary,
+        segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix> {
+        EncoderSuffix::packed(lib, segments)
+    }
+    async unsafe fn packed_encoder_unit(slots: Vec<(&mut Self, &mut Self::Transport)>,
+        prefill: &mut Self::PrefillLink, requests: &mut Requests<'a>,
+        members: &[(CacheLease, &[u32])], suffix: &mut Self::Suffix) -> Result<()> {
+        // SAFETY: the caller retains all packed owners until the shared executor drains.
+        unsafe { Self::execute_packed_encoder_unit(slots, prefill, requests, members, suffix).await }
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -442,6 +461,11 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
         lib.copy_d2h(&mut bytes, logits.logits)?;
         Ok(bytes)
     }
+    async fn commit_packed_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
+        batch: &mut RequestBatch, draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: &[u32]) -> Result<()> {
+        if let Some(draft) = draft { draft.commit_batch(self, requests, batch, accepted) }
+        else { self.commit(requests, batch, accepted) }
+    }
     async fn commit_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()> {
         if let Some(draft) = draft { draft.commit(self, requests, batch, accepted) }
@@ -459,6 +483,16 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         let device = transport.device;
         ensure!(link.device.id == device.id, "prefill link device differs from slot 0's");
         device.run(|| transport.get_mut().restore_link(link.into_inner()))
+    }
+    fn new_packed_suffix(&self, lib: &'a NativeLibrary,
+        segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix> {
+        self.encoder_device()?.own(|| EncoderSuffix::packed(lib, segments))
+    }
+    async unsafe fn packed_encoder_unit(slots: Vec<(&mut Self, &mut Self::Transport)>,
+        prefill: &mut Self::PrefillLink, requests: &mut Requests<'a>,
+        members: &[(CacheLease, &[u32])], suffix: &mut Self::Suffix) -> Result<()> {
+        // SAFETY: the caller retains all packed owners until the shared executor drains.
+        unsafe { Self::execute_packed_encoder_unit(slots, prefill, requests, members, suffix).await }
     }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
@@ -483,6 +517,10 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     }
     async fn commit_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()> {
+        self.commit_packed_prefill(requests, batch, draft, &[accepted]).await
+    }
+    async fn commit_packed_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: &[u32]) -> Result<()> {
         struct Commit<'s, 'w, 'a, P: VerificationTarget<'a>, C: DraftChain<'a>> {
             pass: &'s mut P, requests: &'s mut Requests<'a>, batch: &'s mut RequestBatch,
             draft: Option<&'s mut DraftRuntime<'w, 'a, C>>, armed: bool,
@@ -499,9 +537,9 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         }
         let mut commit = Commit { pass: self, requests, batch, draft, armed: true };
         if let Some(draft) = &mut commit.draft {
-            draft.begin_queued_commit(0, commit.pass, commit.requests, commit.batch, &[accepted])?;
+            draft.begin_queued_commit(0, commit.pass, commit.requests, commit.batch, accepted)?;
         }
-        commit.pass.enqueue_cache_commit(commit.requests, commit.batch, &[accepted])?;
+        commit.pass.enqueue_cache_commit(commit.requests, commit.batch, accepted)?;
         loop {
             let target_ready = commit.pass.poll_cache_commit()?;
             let draft_ready = commit.draft.as_ref().map(|draft| draft.poll_queued_commit(0)).transpose()?.unwrap_or(true);
@@ -509,8 +547,8 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
             tokio::task::yield_now().await;
         }
         if let Some(draft) = &mut commit.draft {
-            draft.finish_queued_commit(0, commit.pass, commit.requests, commit.batch, &[accepted])?;
-        } else { commit.pass.commit(commit.requests, commit.batch, &[accepted])?; }
+            draft.finish_queued_commit(0, commit.pass, commit.requests, commit.batch, accepted)?;
+        } else { commit.pass.commit(commit.requests, commit.batch, accepted)?; }
         commit.armed = false;
         Ok(())
     }
