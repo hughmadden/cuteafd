@@ -1971,7 +1971,7 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
                "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
-@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5", "qwen4", "qwen3_5", "deepseek_v4"])
+@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5", "qwen4", "qwen3_5", "deepseek_v4", "glm5"])
 @pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
 def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     config = {"glm5_flash": GLMF_CONFIG, "qwen3_5": DENSE_CONFIG,
@@ -1981,7 +1981,8 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
                         "moe_layer_list": list(range(3, 91))}},
               "mimo_v2": {"model_type": "mimo_v2", "hidden_size": 6144,
                           "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
-              "deepseek_v4": {"model_type": "deepseek_v4"}}[family]
+              "deepseek_v4": {"model_type": "deepseek_v4"},
+              "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}}[family]
     keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n" + (f"PREFILL_PACKING={mode}\n" if mode else "")
     if family == "step5":
         keys += "SPARK_COUNT=4\nRTX_GPUS=1\n" + "".join(
@@ -1994,7 +1995,7 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
             {"placement_supported": True, "fits": True, "spark_ranks": 0} if family == "qwen3_5" else None)
     assert result.returncode == 0, result.stderr
     command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5",
-               "qwen4": "serve-qwen4", "qwen3_5": "serve-qwen35", "deepseek_v4": "serve-dsv4"}[family]
+               "qwen4": "serve-qwen4", "qwen3_5": "serve-qwen35", "deepseek_v4": "serve-dsv4", "glm5": "serve-glm"}[family]
     launch = next(shlex.split(line) for line in result.stderr.splitlines() if f"cuteafd {command}" in line)
     if mode is None:
         assert "--prefill-packing" not in launch

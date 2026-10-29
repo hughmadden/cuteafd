@@ -333,7 +333,7 @@ impl<'a> GlmEngine<'a> {
 fn rank_tables(tables: &StepTables, rank: usize, pages: usize) -> Result<StepTables> {
     let local_count = pages / 2;
     let scratch = (local_count * PAGE_ROWS) as i64;
-    let mut out = StepTables { decode: tables.decode, positions: tables.positions.clone(), slots: Vec::new(),
+    let mut out = StepTables { segments: tables.segments.clone(), decode: tables.decode, positions: tables.positions.clone(), slots: Vec::new(),
         page_table: Vec::new(), table_width: tables.table_width, table_stride: tables.table_stride,
         cache_lengths: tables.cache_lengths.clone(), lengths: tables.lengths.clone(),
         exchange_rows: tables.exchange_rows };
@@ -432,7 +432,7 @@ mod tests {
         let pages = 64; // 32 local pages per GPU, scratch at local 32
         let seq = ids(5, 3); // 300 rows: pages 0..4, tail of 44 rows on page 4 (GPU0)
         let width = 16;
-        let mut tables = StepTables { decode: true, positions: vec![299, 300], slots: Vec::new(),
+        let mut tables = StepTables { segments: Vec::new(), decode: true, positions: vec![299, 300], slots: Vec::new(),
             page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: vec![300, 301],
             lengths: vec![300, 301], exchange_rows: 2 };
         for &p in &tables.positions.clone() {
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn prefill_tables_are_the_staging_identity_and_commits_cover_owned_rows_once() {
         let seq = ids(9, 1);
-        let tables = StepTables { decode: false, positions: (100..550).collect(), slots: vec![0; 450],
+        let tables = StepTables { segments: Vec::new(), decode: false, positions: (100..550).collect(), slots: vec![0; 450],
             page_table: seq.iter().map(|&p| p as i32).collect(), table_width: 9, table_stride: 0,
             cache_lengths: vec![0; 450], lengths: vec![0; 450], exchange_rows: 450 };
         let r = rank_tables(&tables, 1, 64).unwrap();

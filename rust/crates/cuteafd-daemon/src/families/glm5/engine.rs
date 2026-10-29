@@ -36,6 +36,7 @@ use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, ExchangeDtype
 #[path = "engine/context.rs"]
 mod context;
 mod tp2;
+mod packing;
 mod layers;
 #[path = "engine/native_dense.rs"]
 pub(crate) mod native_dense;
@@ -99,6 +100,8 @@ impl Drop for GraphExec<'_> {
 /// Host tables of one step.
 #[derive(Clone)]
 struct StepTables {
+    /// Sequence-local attention tables; empty for an ordinary unit.
+    segments: Vec<(crate::shared::prefill_packing::Segment, StepTables)>,
     decode: bool,
     positions: Vec<i64>,
     slots: Vec<i64>,
@@ -221,6 +224,7 @@ impl<'a> Buf<'a> {
 /// logits rows, LM head, EXLR8 execution, native dense scratch, router
 /// staging) is the one every slot on the GPU shares (#762): all slots run on
 /// the GPU's one stream, and no hook reads that storage after it returns.
+#[derive(Clone)]
 struct Workspace<'a> {
     rows: usize,
     lane: usize,
@@ -406,6 +410,8 @@ pub(crate) struct GlmEngine<'a> {
     pub stream: *mut c_void,
     pub max_context: usize,
     pub prefill_rows: usize,
+    packed_row_cap: Cell<Option<usize>>,
+    packed_fallback_reason: RefCell<String>,
     pub pages: usize,
     kv: Vec<Dev<'a>>,
     index: Vec<Option<Dev<'a>>>,
@@ -548,7 +554,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
@@ -1032,18 +1038,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn prefill_tables(&self, placement: &GlmPlacement, start: usize, t: usize) -> Result<StepTables> {
-        let used = (start + t).div_ceil(PAGE_ROWS);
-        Ok(StepTables {
-            decode: false,
-            positions: (start..start + t).map(|p| p as i64).collect(),
-            slots: (start..start + t).map(|p| placement.slot(p)).collect::<Result<_>>()?,
-            page_table: placement.table(used).collect(),
-            table_width: used,
-            table_stride: 0,
-            cache_lengths: (start..start + t).map(|p| (p + 1) as i32).collect(),
-            lengths: (start..start + t).map(|p| (p + 1).min(self.cfg.index_topk) as i32).collect(),
-            exchange_rows: t,
-        })
+        packing::sequence_tables(placement, start, t, self.cfg.index_topk)
     }
 
     /// [`Self::prefill`] returning the logits of the chunk's last `logit_rows` rows.
@@ -1126,7 +1121,7 @@ impl<'a> GlmEngine<'a> {
             needed = needed.max((placement.len + count).div_ceil(PAGE_ROWS));
         }
         let width = self.table_width_bucket(needed);
-        let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
+        let mut tables = StepTables { segments: Vec::new(), decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
             table_width: width, table_stride: width, cache_lengths: Vec::new(), lengths: Vec::new(), exchange_rows: rows };
         for (placement, count) in sequences.iter() {
             let pages = placement.pages.len().min(width);
@@ -1192,7 +1187,7 @@ impl<'a> GlmEngine<'a> {
         self.graphs_warming.set(true);
         for shape in &shapes {
             let (width, bucket) = (shape.table_width, shape.rows);
-            let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
+            let mut tables = StepTables { segments: Vec::new(), decode: true, positions: Vec::new(), slots: Vec::new(),
                 page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
                 lengths: Vec::new(), exchange_rows: 1 };
             self.pad_rows(&mut tables, bucket);
@@ -1359,8 +1354,14 @@ impl<'a> GlmEngine<'a> {
             }
             if !layer.dense { self.finish_width_tap(w, index, tables.exchange_rows)?; }
             if let Some(drafter) = &self.drafter {
-                let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
-                drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
+                if tables.segments.is_empty() {
+                    let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
+                    drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
+                } else {
+                    for (s, _) in &tables.segments {
+                        drafter.tap_at(index, w.h.buffer.ptr, s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                    }
+                }
             }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
@@ -2182,7 +2183,7 @@ impl<'a> GlmEngine<'a> {
                     self.put_tables_ordered(1, w1, &ranked[1])?;
                 } else { self.on(1, || self.put_tables(w1, &ranked[1]))?; }
             }
-            if self.context.is_some() {
+            if self.context.is_some() && lanes[unit].segments.is_empty() {
                 let start = lanes[unit].positions.first().map_or(0, |&p| p as usize);
                 let mut units = self.context_units.borrow_mut();
                 for rank in 0..2 {
@@ -2264,6 +2265,12 @@ impl<'a> GlmEngine<'a> {
                     &[rows, Scalar::I32(1)])?;
             }
             if let Some(drafter) = &self.drafter {
+                if !lanes[unit].segments.is_empty() {
+                    for (s, _) in &lanes[unit].segments {
+                        drafter.tap_at(index, w.h.buffer.ptr, s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                    }
+                    return Ok(());
+                }
                 let first = starts[unit];
                 let from = first.max(window);
                 if from < first + counts[unit] {
@@ -2273,7 +2280,9 @@ impl<'a> GlmEngine<'a> {
             Ok(())
         };
         let unit_list: Vec<crate::shared::prefill_pipeline::Unit> = (0..lanes.len()).map(|unit| {
-            crate::shared::prefill_pipeline::Unit { index: unit, sequence: 0, segments: Vec::new(),
+            crate::shared::prefill_pipeline::Unit { index: unit, sequence: 0, segments: lanes[unit].segments.iter().enumerate().map(|(sequence, (s, _))|
+                    crate::shared::prefill_pipeline::UnitSegment { sequence, rows: s.first..s.end_row(),
+                        tokens: s.start..s.start + s.rows, prompt_end: false, snapshot: false, head: true }).collect(),
                 rows: starts[unit]..starts[unit] + counts[unit], layers: 0..layers.len(), slot: unit % waves, barrier: false }
         }).collect();
         let peers: Vec<Option<&Workspace<'_>>> = (0..waves).map(|slot| peer_workspaces.as_ref()
@@ -2356,6 +2365,29 @@ impl<'a> GlmEngine<'a> {
     fn attention_unit(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
         cap: &str, ranked: &[StepTables; 2], lane: usize) -> Result<()> {
         let tables = &ranked[rank];
+        if !tables.segments.is_empty() {
+            for (segment, original) in &tables.segments {
+                let local = self.segment_workspace(rank, w, segment.first, segment.rows)?;
+                let local_tables = if self.context.is_some() { self.rank_tables(original, rank)? } else { original.clone() };
+                // Row tables were uploaded once for the combined unit. Only the
+                // fixed, startup-reserved page-table address changes per segment;
+                // registering a sliced row address here could allocate pinned
+                // staging while a peer waits for this hook's publication.
+                self.on(rank, || unsafe {
+                    // SAFETY: the reserved table is rewritten on its reader's stream.
+                    self.library.copy_h2d_ordered(w.page_table.buffer, bytes_of(&local_tables.page_table), self.stream_of(rank))
+                })?;
+                let rows = Scalar::I32(segment.rows as i32);
+                if self.context.is_some() {
+                    let pages = placement_pages(original);
+                    let unit = self.context_prefill_tables(rank, lane, segment.start, segment.start, segment.rows, &pages)?;
+                    self.context_prefill_attention(rank, &local, index, layer, rows, cap, &local_tables, lane, unit)?;
+                } else {
+                    self.attention_on(rank, &local, index, layer, rows, cap, &local_tables)?;
+                }
+            }
+            return Ok(());
+        }
         if self.context.is_none() {
             return self.attention_on(rank, w, index, layer, rows, cap, tables);
         }
@@ -2375,6 +2407,31 @@ impl<'a> GlmEngine<'a> {
         self.context_prefill_attention(rank, w, index, layer, rows, cap, tables, lane, unit)
     }
 
+    /// Slice row arenas, retaining the stream-ordered program/head/table scratch.
+    fn segment_workspace<'w>(&self, rank: usize, w: &Workspace<'w>, first: usize, rows: usize) -> Result<Workspace<'w>> {
+        ensure!(first + rows <= w.rows, "packed rows exceed slot");
+        let split = self.weights.layers.first().is_some_and(|l| l.split);
+        let whole = self.weights.layers.iter().any(|l| l.attention_owner.is_some());
+        let widths = cuteafd_loader::placement::families::glm5::step_row_widths(&self.cfg, rank == 0,
+            split && !whole, self.tp2.is_some());
+        let mut out = w.clone();
+        let fields = [&mut out.h, &mut out.x, &mut out.query, &mut out.q_resid, &mut out.q_fp8,
+            &mut out.head_weights, &mut out.indices, &mut out.lengths, &mut out.attn, &mut out.delta,
+            &mut out.positions, &mut out.slots, &mut out.cache_lengths, &mut out.router_logits,
+            &mut out.route_ids, &mut out.route_weights, &mut out.wire, &mut out.shared, &mut out.ids];
+        for (field, (_, width)) in fields.into_iter().zip(widths) {
+            if width > 0 { *field = field.view(first * width as usize, rows * width as usize)?; }
+        }
+        if let Some(retained) = &mut out.core_rows {
+            for arena in retained {
+                let width = arena.buffer.bytes / w.rows;
+                *arena = arena.view(first * width, rows * width)?;
+            }
+        }
+        out.rows = rows;
+        Ok(out)
+    }
+
     /// Uploads a step's tables (one per prefill lane, or the decode step) to rank 0's and
     /// rank 1's workspaces, in order on each rank's stream behind the work still reading the
     /// previous tables (no host wait), and returns each lane's per-rank tables: identical
@@ -2389,7 +2446,7 @@ impl<'a> GlmEngine<'a> {
         for (lane, (&(w, w1, tables), pages)) in units.iter().zip(pages).enumerate() {
             let ranked = if self.context.is_some() {
                 let start = tables.positions.first().map_or(0, |&p| p as usize);
-                if !tables.decode {
+                if !tables.decode && tables.segments.is_empty() {
                     // Each unit records its full history; at its attention it gathers it
                     // only when its predecessor's rows are not already in the staging view
                     // ([`Self::context_unit_turn`]).
@@ -2851,7 +2908,7 @@ mod long_graph_tests {
         for real in 1..=64 {
             let width = 1_048_576 / PAGE_ROWS;
             let bucket = glm_decode_row_bucket(real, width).unwrap();
-            let mut tables = StepTables { decode: true, positions: vec![200_000; real],
+            let mut tables = StepTables { segments: Vec::new(), decode: true, positions: vec![200_000; real],
                 slots: vec![123 * PAGE_ROWS as i64; real], page_table: vec![123; real * width],
                 table_width: width, table_stride: width, cache_lengths: vec![200_001; real],
                 lengths: vec![2048; real], exchange_rows: real };

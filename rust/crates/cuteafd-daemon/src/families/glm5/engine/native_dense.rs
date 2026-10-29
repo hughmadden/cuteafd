@@ -54,6 +54,12 @@ impl<'a> NativePrograms<'a> {
         Ok(Self { linears, companions })
     }
 
+    /// Conservatively include every bound native route: attention-only entries
+    /// may tighten exact packing, but never allow an unreviewed FFN transition.
+    pub(super) fn packed_programs(&self) -> impl Iterator<Item = &str> {
+        self.linears.keys().chain(self.companions.keys()).map(String::as_str)
+    }
+
     fn linear(&self, name: &str) -> Result<&DenseLinear<'a>> {
         self.linears.get(name).with_context(|| format!("native dense program {name} is not in this build"))
     }

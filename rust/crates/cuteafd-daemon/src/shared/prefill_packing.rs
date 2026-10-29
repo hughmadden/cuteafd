@@ -170,9 +170,17 @@ pub(crate) fn plan_with_tap_rows(chunks: &[(usize, usize)], limits: &Limits, mem
 pub(crate) type MemberOutcome = Result<Result<()>>;
 
 /// Heads use one scratch buffer. Consume each head before generating the next.
-pub(crate) fn finish_members<L>(members: usize, mut head: impl FnMut(usize) -> Result<L>,
+pub(crate) fn finish_members<L>(members: usize, head: impl FnMut(usize) -> Result<L>,
     on_logits: &mut dyn FnMut(usize, L) -> MemberOutcome) -> Result<Vec<Result<()>>> {
-    (0..members).map(|i| on_logits(i, head(i)?)).collect()
+    finish_members_selected(members, |_| true, head, on_logits)
+}
+
+/// Intermediate chunks and cancelled members have no head consumer.
+/// Keep their outcome slots without launching an unused vocabulary projection.
+pub(crate) fn finish_members_selected<L>(members: usize, mut needs_head: impl FnMut(usize) -> bool,
+    mut head: impl FnMut(usize) -> Result<L>,
+    on_logits: &mut dyn FnMut(usize, L) -> MemberOutcome) -> Result<Vec<Result<()>>> {
+    (0..members).map(|i| if needs_head(i) { on_logits(i, head(i)?) } else { Ok(Ok(())) }).collect()
 }
 
 pub(crate) fn member_outcomes(members: usize, pass: Result<Vec<Result<()>>>) -> Vec<Result<()>> {
@@ -293,6 +301,20 @@ mod tests {
         assert!(plan_with_tap_rows(&chunks, &Limits { taps: Some(2047), ..limits }, 128).is_err());
         assert_eq!(plan_with_tap_rows(&[(0, 200)], &Limits { taps: None, ..limits }, 128)
             .unwrap()[0].tap_rows, 0);
+    }
+    #[test]
+    fn intermediate_and_cancelled_members_launch_no_head() -> Result<()> {
+        let mut heads = Vec::new();
+        let mut consumed = Vec::new();
+        let outcomes = finish_members_selected(4, |i| i == 1 || i == 3,
+            |i| { heads.push(i); Ok(i) }, &mut |i, row| {
+                consumed.push(row);
+                Ok(if i == 1 { Err(anyhow::anyhow!("grammar")) } else { Ok(()) })
+            })?;
+        assert_eq!(heads, [1, 3]);
+        assert_eq!(consumed, [1, 3]);
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok() && outcomes[3].is_ok());
+        Ok(())
     }
 
     #[test]
