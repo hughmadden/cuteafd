@@ -48,23 +48,30 @@ class GlmExl3PackageTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             tool.package_capacities('glmf', '4097')
         for capacity in (1, 80, 256, 1024, 2048, 2752, 4096, 5504, 8256):
-            wide = capacity in (1024, 2048, 2752)
-            merged = capacity > 2752
-            self.assertEqual(tool.route_block('kimik3', capacity, 'coordinator'), 64 if wide else 8)
+            self.assertEqual(tool.route_block('kimik3', capacity, 'coordinator'), 8)
             self.assertEqual(tool.route_block('kimik3', capacity, 'spark'), 8)
-            self.assertEqual(tool.token_major_rotation('kimik3', capacity, 'coordinator'), wide)
+            self.assertFalse(tool.token_major_rotation('kimik3', capacity, 'coordinator'))
             self.assertFalse(tool.token_major_rotation('kimik3', capacity, 'spark'))
-            for width in (512, 3072):
+            for width in (512, 3072, 1536):
                 self.assertIsNone(tool.decode_tile('kimik3', width, capacity))
-                self.assertEqual(tool.warp_specialized('kimik3', 'spark', width, capacity),
-                                 width == 512 and capacity >= 1024)
-                # Every row count above 2752 resolves to the warp-specialized
-                # prerotated 256-wide FC1 arm on both RTX splits.
-                self.assertEqual(tool.warp_specialized('kimik3', 'coordinator', width, capacity),
-                                 merged and width == 3072)
+                if width == 512:
+                    # Spark: width 512 is warp-specialized from m1024 up and
+                    # keeps its cooperative 8-row export below that.
+                    self.assertEqual(tool.warp_specialized('kimik3', 'spark', width, capacity),
+                                     capacity >= 1024)
+                    continue
+                # Every Kimi K3 coordinator prefill capacity, both RTX splits,
+                # takes the prerotated 256-wide FC1 arm (TJ 2026-10-29); the
+                # decode capacities m1/m80 keep the cooperative export whose
+                # geometry the decode reduction plan freezes.
+                if capacity <= 80:
+                    self.assertFalse(tool.warp_specialized('kimik3', 'coordinator', width, capacity))
+                    self.assertIsNone(tool.ws_tile('kimik3', 'coordinator', width, capacity))
+                    continue
+                self.assertTrue(tool.warp_specialized('kimik3', 'coordinator', width, capacity))
                 self.assertEqual(tool.ws_route_block('kimik3', 'coordinator', width, capacity), 64)
                 self.assertEqual(tool.ws_tile('kimik3', 'coordinator', width, capacity),
-                                 (64, 256, 64, 256) if merged and width == 3072 else None)
+                                 (64, 256, 64, 256))
 
     def test_profiles(self):
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role('coordinator', 'glm')}
