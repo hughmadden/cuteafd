@@ -22,17 +22,27 @@ const CHIP_PRIORITY: &[&[&str]] = &[
     &["*graph*"],
     &["host-cache-", "prefix-cache-"],
     &["*"],
-    &["api-key", "usage", "console-", "CUTEAFD_CONSOLE_", "CUTEAFD_FIDELITY_CACHE", "enable-bench"],
+    &["api-key", "usage", "console-", "CUTEAFD_CONSOLE_", "CUTEAFD_FIDELITY_CACHE", "enable-bench",
+        "CUTEAFD_HOST_", "CUTEAFD_THERMAL", "CUTEAFD_SPARK_ADMISSION_", "CUTEAFD_SPARK_INTAKE", "*timeout*"],
 ];
 
 fn chip_priority(setting: &Setting) -> usize {
     let name = setting.name.as_str();
+    let fallback = CHIP_PRIORITY.iter().position(|tier| tier.contains(&"*")).unwrap();
+    if name.starts_with("rtx-") || name.starts_with("route-") {
+        let value = setting.value.as_deref().unwrap_or("").trim();
+        let empty_ranges = value.split(',').all(|range| range.trim().split_once("..")
+            .is_some_and(|(start, end)| start.trim().parse::<usize>().ok()
+                .zip(end.trim().parse::<usize>().ok()).is_some_and(|(start, end)| start == end)));
+        if matches!(value, "" | "0" | "false" | "[]" | "{}") || empty_ranges { return fallback; }
+    }
     // Match the plumbing tier before the catch-all tier.
     CHIP_PRIORITY.iter().enumerate().filter(|(_, patterns)| !patterns.contains(&"*"))
         .find(|(_, patterns)| patterns.iter().any(|pattern| match *pattern {
             "*graph*" => name.contains("graph"),
+            "*timeout*" => name.to_ascii_lowercase().contains("timeout"),
             prefix => name.starts_with(prefix),
-        })).map_or_else(|| CHIP_PRIORITY.iter().position(|tier| tier.contains(&"*")).unwrap(), |(rank, _)| rank)
+        })).map_or(fallback, |(rank, _)| rank)
 }
 
 pub fn card_svg(report: &Report) -> String {
@@ -96,7 +106,7 @@ pub fn card_svg(report: &Report) -> String {
         }
     }
     // Three content bars.
-    let (bx, by, bw) = (pad, 424.0, WIDTH - 2.0 * pad);
+    let (bx, by, bw) = (pad, 416.0, WIDTH - 2.0 * pad);
     if let Some(b) = baseline {
         let max = b.card.decode.iter().map(|d| d.tok_s).fold(1.0f64, f64::max) * 1.08;
         for (i, d) in b.card.decode.iter().take(3).enumerate() {

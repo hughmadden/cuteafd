@@ -604,6 +604,7 @@ impl Opened {
                 admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(
                     self.experts.as_ref().context("Qwen Spark admission requires routed expert headers")?)?,
                     args.prefill_wave_rows(), args.resolved_prefill()?.waves, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+            cuteafd_bench::context::set_rtx_expert_layers(layers - working.spark_layers.len());
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -722,7 +723,6 @@ impl Opened {
         } else { args.pool_tokens };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
-        cuteafd_bench::context::set_rtx_expert_layers(0);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
         engine.prefill_shape = prefill_shape;

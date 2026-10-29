@@ -205,6 +205,11 @@ mod tests {
         assert!(card.contains("POWER-CAPPED"));
         assert!(card.contains("Fabric: retransmit rate unavailable"));
         assert!(card.contains(r#"x="56" y="516""#));
+        // Last bar ends at 496; health text starts no higher than 504 (12px font).
+        let last_bar_bottom = 416.0 + 2.0 * 30.0 + 4.0 + 16.0;
+        let health_top = 516.0 - 12.0;
+        assert!(health_top - last_bar_bottom >= 8.0);
+        assert!(card.contains(r#"x="146" y="480""#)); // Last bar's actual geometry.
         assert!(card.contains(r#"y="598""#)); // Second chip row starts here.
         assert!(!card.contains(r#"y="614""#)); // No health text among chips.
         assert!(card.contains("more in report"));
@@ -255,6 +260,17 @@ mod tests {
         // The full configuration retains even the options omitted from the strip.
         let full = render::report::panel_svg(&report, "configuration");
         assert!(full.contains("api-key-file"));
+        report.server.configuration.settings = ["CUTEAFD_HOST_ISA_SELECTED", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS",
+            "CUTEAFD_THERMAL", "request-timeout", "rtx-expert-ranges", "route-source", "max-output"]
+            .into_iter().map(|name| Setting { name: name.into(),
+                value: Some(if name == "rtx-expert-ranges" { "0..0,0..0" } else { "1" }.into()),
+                source: "resolved".into(), ..Default::default() }).collect();
+        let card = render::card::card_svg(&report);
+        let expected = ["route-source=1", "rtx-expert-ranges=0..0,0..0", "max-output=1",
+            "CUTEAFD_HOST_ISA_SELECTED=1", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=1", "CUTEAFD_THERMAL=1", "request-timeout=1"];
+        for pair in expected.windows(2) {
+            assert!(card.find(pair[0]).unwrap() < card.find(pair[1]).unwrap(), "{pair:?}");
+        }
     }
 
     #[test]
