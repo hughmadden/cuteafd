@@ -261,6 +261,13 @@ class PackageProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'descriptor contract mismatch'):
                 package.verify(output)
 
+    def test_v4pro_compact_recipe_does_not_inherit_retired_geometry(self):
+        for capacity in (256, 1024, 2048, 2752, 4096):
+            self.assertEqual(package.compact_ws_cell('dsv4p', 640, capacity),
+                             (32 if capacity == 256 else 64, 128))
+            self.assertEqual(package.compact_ws_tile('dsv4p', 'spark', 640, capacity),
+                             (64, 128, 64, 256))
+
     def test_compact_ws_qualifies_measured_glm_cells(self):
         capacities = (1, 16, 80, 256, 1024, 2752, 4096)
         self.assertEqual([package.compact_warp_specialized('glm', 'spark', 384, c)
@@ -273,26 +280,12 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('glm', 'spark', 768, c)
                           for c in capacities], [None] * 3 + [64] * 4)
-        for geometry in ('dsv4p', 'kimik3', 'glmf'):
-            for width in (384, 768):
-                if geometry == 'glmf' and width in (384, 768):
-                    continue  # measured by test_compact_ws_qualifies_qwen_cells
-                self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', width, c)
-                                     for c in capacities))
-        self.assertFalse(any(package.compact_warp_specialized('v41', 'spark', 768, c)
-                             for c in capacities))
-        self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 768, c)
-                             for c in capacities))
+        for geometry in package.GEOMETRIES:
+            for width in (256, 384, 512, 640, 768):
+                for capacity in capacities:
+                    self.assertEqual(package.compact_warp_specialized(geometry, 'spark', width, capacity),
+                                     capacity > 80)
         self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 384, 4096))
-        self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 768, 4096))
-        # Unmeasured capacities stay cooperative even above the smallest one.
-        for width in (384, 768):
-            self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, c)
-                                 for c in (512, 1536, 8192)))
-        # Unmeasured widths of the same geometry stay cooperative at every
-        # capacity; TP5 compact (640) and TP8 compact (256) were never measured.
-        self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, 4096)
-                             for width in (256, 512, 640)))
         # The 192-wide FC1 tile wins from m1024 up on both measured widths;
         # m256 keeps the N128 tile that names the cooperative geometry.
         for width in (384, 768):
@@ -311,25 +304,23 @@ class PackageProfileTests(unittest.TestCase):
                          package.TILE_384_COMPACT)
         self.assertIsNone(package.compact_ws_tile('glm', 'spark', 384, 80))
         self.assertIsNone(package.ws_tile('glm', 'spark', 384, 80, compact=True))
-        self.assertIsNone(package.ws_tile('glm', 'spark', 640, 4096, compact=True))
+        self.assertEqual(package.ws_tile('glm', 'spark', 640, 4096, compact=True), (64, 128, 64, 256))
         # Ordinary width-384 packs keep their 192-wide FC1 tile.
         self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096), package.TILE_384)
         # The measured cells are the K4/K5 tier family; another tier pair is a
         # different, unmeasured cell.
         self.assertTrue(package.compact_ws_export('glm', 'spark', 384, 4096, (4, 5)))
         self.assertTrue(package.compact_ws_export('glm', 'spark', 768, 4096, (4, 5)))
-        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (3, 4)))
-        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (3, 4)))
-        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (5, 6)))
-        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (5, 6)))
+        self.assertTrue(package.compact_ws_export('glm', 'spark', 384, 4096, (3, 4)))
+        self.assertTrue(package.compact_ws_export('glm', 'spark', 768, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (3, 4, 5)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (3, 4, 5)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 80, (4, 5)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 80, (4, 5)))
 
 
     def test_compact_ws_qualifies_qwen_cells(self):
         capacities = (1, 16, 80, 256, 1024, 2752, 4096)
-        # V4.1 K3/K4 TP4 compact width 640 (the only uneven V4.1 world): the
-        # 32-row block wins m256/m1024, the 64-row block m2752/m4096.
         # Qwen4 K4/K5 TP2 compact width 384: 32 rows at m256, 64 above.
         self.assertEqual([package.compact_warp_specialized('qwen4', 'spark', 384, c)
                           for c in capacities], [False] * 3 + [True] * 4)
@@ -340,17 +331,10 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('qwen4', 'spark', 256, c)
                           for c in capacities], [None] * 3 + [64] * 4)
-        # Other compact worlds of these geometries keep the cooperative kernel:
-        # V4.1 TP4's padded 512 pair split and Qwen TP1 width 640 are ordinary
-        # profiles, and the unmeasured widths stay off even under compaction.
-        self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 640, c)
-                             for c in capacities))
-        self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 384, c)
-                             for c in (512, 1536, 8192)))
+        for width in (256, 384, 640):
+            for capacity in (256, 512, 1536, 8192):
+                self.assertTrue(package.compact_warp_specialized('qwen4', 'spark', width, capacity))
         self.assertFalse(package.compact_warp_specialized('qwen4', 'coordinator', 384, 4096))
-        # V4.1 width 640 is not divisible by 192, but the 192-wide FC1 tile
-        # still wins at m256..m2752; m4096 keeps N128.
-        # Qwen4 width 256 cannot take a 192-wide FC1 tile at all.
         for capacity in (256, 1024, 2752, 4096):
             self.assertEqual(package.ws_tile('qwen4', 'spark', 256, capacity,
                                              compact=True),
@@ -362,12 +346,11 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities],
                          [None] * 3 + [package.TILE_384_COMPACT]
                          + [package.TILE_384_COMPACT_N192] * 3)
-        # Measured tier pairs only: V4.1 K3.25 is K3/K4, Qwen's shipped quant
-        # K4/K5; another pair of the same geometry stays cooperative.
+        # All two-tier pairs use the same width/capacity recipe.
         self.assertTrue(package.compact_ws_export('qwen4', 'spark', 384, 4096, (4, 5)))
         self.assertTrue(package.compact_ws_export('qwen4', 'spark', 256, 4096, (4, 5)))
-        self.assertFalse(package.compact_ws_export('qwen4', 'spark', 384, 4096, (3, 4)))
-        self.assertFalse(package.compact_ws_export('qwen4', 'spark', 256, 4096, (3, 4)))
+        self.assertTrue(package.compact_ws_export('qwen4', 'spark', 384, 4096, (3, 4)))
+        self.assertTrue(package.compact_ws_export('qwen4', 'spark', 256, 4096, (3, 4)))
         # GLM Flash K3/K4: TP6 compact width 384 and TP3 compact width 768
         # both take 32-row N128 blocks at m256 and 64-row N192 blocks above.
         for width in (384, 768):
@@ -380,10 +363,9 @@ class PackageProfileTests(unittest.TestCase):
                              [None] * 3 + [package.TILE_384_COMPACT]
                              + [package.TILE_384_COMPACT_N192] * 3)
             self.assertTrue(package.compact_ws_export('glmf', 'spark', width, 4096, (3, 4)))
-            self.assertFalse(package.compact_ws_export('glmf', 'spark', width, 4096, (4, 5)))
-        # TP5 compact width 512 was never measured.
-        self.assertFalse(any(package.compact_warp_specialized('glmf', 'spark', 512, c)
-                             for c in capacities))
+            self.assertTrue(package.compact_ws_export('glmf', 'spark', width, 4096, (4, 5)))
+        for capacity in capacities:
+            self.assertEqual(package.compact_warp_specialized('glmf', 'spark', 512, capacity), capacity > 80)
 
     def test_compact_glm_ws_prefill_export_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1036,9 +1018,9 @@ class PackageProfileTests(unittest.TestCase):
                          dict(route_block=64, dynamic=True))
         self.assertEqual(package.coordinator_ws_cell('glmf', 'coordinator', 2048, 2752),
                          dict(route_block=64))
-        self.assertEqual(package.coordinator_ws_cell('v41', 'coordinator', 1152, 256),
-                         package.COORDINATOR_WS_CELLS[('v41', 1152, 1024)])
-        self.assertIsNone(package.coordinator_ws_cell('v41', 'coordinator', 1152, 80))
+        self.assertEqual(package.coordinator_ws_cell('dsv4p', 'coordinator', 640, 256),
+                         package._WS_S14_M256)
+        self.assertIsNone(package.coordinator_ws_cell('dsv4p', 'coordinator', 640, 80))
 
     def test_glm_tp2_dynamic_ws_preserves_wire_and_losing_static_cells(self):
         for capacity in (1024, 4096):
@@ -1135,12 +1117,11 @@ class PackageProfileTests(unittest.TestCase):
                         self.assertIn('+tile' + '-'.join(map(str, tile)), str(call.args[0]))
             self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
 
-    def test_cooperative_routes_only_keep_v4pro_and_kimi_prefill(self):
+    def test_cooperative_routes_only_keep_v4pro_prefill(self):
         for geometry in package.GEOMETRIES:
             for capacity in (1, 16, 80, 256, 1024, 2048, 2752, 4096):
                 self.assertEqual(package.route_block(geometry, capacity, 'spark'), 8)
-                expected = (geometry == 'dsv4p' and capacity == 2048) or (
-                    geometry == 'kimik3' and capacity in (1024, 2048, 2752))
+                expected = geometry == 'dsv4p' and capacity == 2048
                 self.assertEqual(package.route_block(geometry, capacity, 'coordinator'), 64 if expected else 8)
                 self.assertEqual(package.token_major_rotation(geometry, capacity, 'coordinator'), expected)
                 self.assertFalse(package.token_major_rotation(geometry, capacity, 'spark'))

@@ -1033,7 +1033,7 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 options['hidden'] = hidden
                 block = route_block(geometry, capacity, args.role)
-                # WS supports two tiers. Three/four-tier prefill needs its own kernel.
+                # Coordinator Kimi retains its independently qualified K2/K3 recipe.
                 ws = compact_ws or (not compact and len(args.bits) == 2
                                     and warp_specialized(geometry, args.role, width, capacity)
                                     and (geometry != 'kimik3' or args.role != 'coordinator'
