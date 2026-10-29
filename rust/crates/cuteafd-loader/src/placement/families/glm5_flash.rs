@@ -535,7 +535,9 @@ pub fn solve_attention_working_set_with_graphs(i: &GlmfInputs<'_>,
     sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
     let original = solve_attention_owner_with_graphs(i, alternate_resident, target, automatic_context, sms, rtx_experts);
     if i.gpus.len() != 2 || i.resident.len() != 2 || i.resident[0].embedding == 0
-        || i.resident[1].embedding != 0 { return original; }
+        || i.resident[1].embedding != 0 || alternate_resident.is_some_and(|resident| resident.len() != 2) {
+        return original;
+    }
     // Price both homes with all weights, graphs, draft scratch and experts in
     // place. Pre-weight free memory alone misses asymmetric runtime costs.
     let mut alternate = i.clone();
@@ -1829,6 +1831,13 @@ mod tests {
             assert_eq!(expected.0, placed.0);
             assert_eq!(placed_attention(input.attention, &placed.0), input.attention);
             assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&input.resident),
+                2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));
+        }
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.attention.mode = AttentionPlacement::Layers;
+        for count in [0, 1, 3] {
+            let malformed = vec![input.resident[0].clone(); count];
+            assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&malformed),
                 2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));
         }
     }
