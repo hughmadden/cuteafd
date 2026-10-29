@@ -1846,7 +1846,7 @@ NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 def build_scopes(cards):
     env = family_scopes(cards, config)
-    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16')
+    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '16'), RUST_TEST_THREADS=os.environ.get('RUST_TEST_THREADS', '16'))
     return env
 
 
