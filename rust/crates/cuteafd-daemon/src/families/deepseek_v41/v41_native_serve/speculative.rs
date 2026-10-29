@@ -141,6 +141,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         });
         Ok(())
     }
+    pub(super) fn prefill_tap_capacity(&self) -> usize { self.mains[0].capacity() }
     pub fn max_verify_rows(&self) -> usize { self.draft_width + crate::shared::draft::copy::COPY_EXTENSION + 1 }
     pub fn attention_drafts(&self) -> usize { self.draft_limit.min(self.draft_width) }
     pub fn set_draft_limit(&mut self, limit: u8) -> Result<()> {

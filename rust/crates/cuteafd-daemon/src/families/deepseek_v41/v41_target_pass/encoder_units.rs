@@ -92,6 +92,12 @@ pub(super) fn unit_window(unit: &Unit, unit_rows: usize) -> Result<RowWindow> {
     Ok(RowWindow::rows(start..start + unit.rows.len()))
 }
 
+pub(super) fn member_rows(batch: &RequestBatch) -> Result<Vec<u32>> {
+    let cache = batch.cache()?;
+    let rows = cache.expert_rows();
+    Ok(cache.request_ids().iter().map(|id| rows.iter().filter(|r| r.request_id == *id).count() as u32).collect())
+}
+
 pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
     ensure!(!chunks.is_empty(), "empty encoder unit span");
     let mut start = 0;
@@ -118,6 +124,16 @@ pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
         .collect()
 }
 
+pub(super) fn packed_members(unit: &mut Unit, lengths: impl IntoIterator<Item = usize>) {
+    let mut first = 0;
+    unit.segments = lengths.into_iter().enumerate().map(|(sequence, rows)| {
+        let start = first;
+        first += rows;
+        crate::shared::prefill_pipeline::UnitSegment { sequence, rows: start..first,
+            tokens: 0..rows, prompt_end: true, snapshot: false, head: false }
+    }).collect();
+}
+
 pub(in crate::families::deepseek_v41) fn decoder_unit(index: usize, rows: std::ops::Range<usize>) -> Result<Unit> {
     ensure!(!rows.is_empty() && rows.len() <= 128, "decoder replay suffix capacity differs");
     Ok(Unit { index, sequence: 0, segments: Vec::new(), rows, layers: 20..40, slot: 0, barrier: true })
@@ -141,6 +157,7 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
     prefill: &'s mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>,
     requests: RefCell<&'r mut Requests<'a>>,
     lease: CacheLease,
+    packed: Option<&'s [(CacheLease, &'s [u32])]>,
     chunks: &'s [&'s [u32]],
     suffix: &'s mut EncoderSuffix<'a>,
     keep_running: &'s dyn Fn() -> bool,
@@ -205,19 +222,17 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         slot.pass.resources.upload.reset()?;
         slot.started = Instant::now();
         let chunk = self.chunks[unit.index];
-        slot.batch = Some(
-            self.requests
-                .borrow_mut()
-                .reserve_encoder(&[RequestTokens {
-                    lease: self.lease,
-                    tokens: chunk,
-                    image_mask: None,
-                    kind: ExpertV2SourceKind::Prefill,
-                }])?,
-        );
-        // Start the next unit's Engram I/O now (#815): see the 2-RTX hook.
-        let next: Vec<&[u32]> = self.chunks[unit.index + 1..].iter().chain(self.ahead).copied().collect();
-        self.requests.borrow_mut().prefetch_encoder(self.lease, &next)?;
+        let inputs: Vec<_> = match self.packed {
+            Some(members) => members.iter().map(|&(lease, tokens)| RequestTokens {
+                lease, tokens, image_mask: None, kind: ExpertV2SourceKind::Prefill }).collect(),
+            None => vec![RequestTokens { lease: self.lease, tokens: chunk,
+                image_mask: None, kind: ExpertV2SourceKind::Prefill }],
+        };
+        slot.batch = Some(self.requests.borrow_mut().reserve_encoder(&inputs)?);
+        if self.packed.is_none() {
+            let next: Vec<&[u32]> = self.chunks[unit.index + 1..].iter().chain(self.ahead).copied().collect();
+            self.requests.borrow_mut().prefetch_encoder(self.lease, &next)?;
+        }
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
             let positions = batch.cache()?.positions();
@@ -368,10 +383,11 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
     async fn commit_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
+        let accepted = member_rows(batch)?;
         slot.pass.commit(
             &mut self.requests.borrow_mut(),
             batch,
-            &[unit.rows.len() as u32],
+            &accepted,
         )?;
         slot.batch = None;
         crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(unit.rows.len());
@@ -512,10 +528,33 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?;
+        // SAFETY: forwards the caller's retained slot, request and suffix contract.
+        unsafe { Self::execute_encoder_units_inner(slots, prefill, requests, None,
+            lease, chunks, suffix, ahead, keep_running, before_unit).await }
+    }
+    /// One packed short-prompt unit on the same waves executor as long prompts.
+    /// # Safety
+    /// Every member owns its lease and the shared suffix through drained completion.
+    pub(crate) async unsafe fn execute_packed_encoder_unit(
+        slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>,
+        prefill: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>,
+        requests: &mut Requests<'a>, members: &[(CacheLease, &[u32])], suffix: &mut EncoderSuffix<'a>,
+    ) -> Result<()> {
+        let tokens: Vec<_> = members.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        // SAFETY: all member leases and the packed suffix stay live through the executor drain.
+        unsafe { Self::execute_encoder_units_inner(slots, prefill, requests, Some(members),
+            members[0].0, &[&tokens], suffix, &[], &|| true, &|| Ok(())).await }
+    }
+    async unsafe fn execute_encoder_units_inner(
+        slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, prefill: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, requests: &mut Requests<'a>,
+        packed: Option<&[(CacheLease, &[u32])]>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
+        before_unit: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if packed.is_none() { requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?; }
         let waves = slots.len();
         ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         let mut units = encoder_units(chunks)?;
+        if let Some(members) = packed { packed_members(&mut units[0], members.iter().map(|(_, tokens)| tokens.len())); }
         for unit in &mut units { unit.slot = unit.index % waves; }
         for layer in 0..20 {
             ensure!(slots.iter().all(|(_, transport)| transport.has_local_layer(layer) == slots[0].1.has_local_layer(layer)),
@@ -530,7 +569,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 Ok(UnitSlot { published: PublishedLayers::new(pass.library()?)?, pass, transport,
                     batch: None, prepared: None, started: Instant::now() })
             }).collect::<Result<Vec<_>>>()?,
-            requests: RefCell::new(requests), lease, chunks, suffix, ahead, keep_running, before_unit,
+            requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, keep_running, before_unit,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
         // Every unit's chained work completes before the decoder replay (or a
@@ -547,6 +586,39 @@ impl<'w, 'a> TargetPass<'w, 'a> {
 mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, Step};
+
+    #[test]
+    fn packed_encoder_one_wave_keeps_member_causality_and_engram_hashes() -> Result<()> {
+        let lengths = [29, 40, 1, 129];
+        let tokens = vec![0; lengths.iter().sum()];
+        let mut units = encoder_units(&[&tokens])?;
+        packed_members(&mut units[0], lengths);
+        assert_eq!(units[0].segments.iter().map(|s| s.tokens.clone()).collect::<Vec<_>>(),
+            [0..29, 0..40, 0..1, 0..129]);
+        for route in [FfnRoute::Spark, FfnRoute::Local] {
+            let schedule = prefill_schedule(&vec![route; 20], &units, 3)?;
+            assert_eq!(schedule.iter().filter(|s| matches!(s, Step::Attention { .. })).count(), 20);
+            assert_eq!(schedule.iter().filter(|s| matches!(s, Step::Commit { .. })).count(), 1);
+        }
+        let histories = lengths.map(|_| cuteafd_core::EngramHistory::new(2).unwrap());
+        let input: Vec<Vec<_>> = lengths.iter().enumerate().map(|(member, &rows)|
+            (0..rows).map(|row| Some((member * 977 + row * 19) as u32)).collect()).collect();
+        let packed = histories.iter().zip(&input).map(|(history, input)|
+            history.prepare(0, input, input.len())).collect::<std::result::Result<Vec<_>, _>>()?;
+        let flat: Vec<_> = packed.iter().flat_map(|batch| batch.hashes()).collect();
+        for (member, segment) in units[0].segments.iter().enumerate() {
+            let alone = cuteafd_core::EngramHistory::new(2)?.prepare(0, &input[member], lengths[member])?;
+            assert_eq!(&flat[segment.rows.clone()], alone.hashes().iter().collect::<Vec<_>>());
+            assert_eq!(histories[member].position(), 0);
+        }
+        let mut changed = input[0].clone(); changed.fill(Some(777));
+        let other = histories[0].prepare(0, &changed, changed.len())?;
+        assert_ne!(other.hashes(), packed[0].hashes());
+        for member in 1..lengths.len() {
+            assert_eq!(histories[member].prepare(0, &input[member], lengths[member])?.hashes(), packed[member].hashes());
+        }
+        Ok(())
+    }
 
     #[test]
     fn suffix_replay_waits_for_every_encoder_commit() -> Result<()> {

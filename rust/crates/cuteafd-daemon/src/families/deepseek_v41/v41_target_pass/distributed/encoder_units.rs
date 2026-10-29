@@ -128,6 +128,7 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
     prefill: &'s mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>,
     requests: RefCell<&'r mut Requests<'a>>,
     lease: CacheLease,
+    packed: Option<&'s [(CacheLease, &'s [u32])]>,
     chunks: &'s [&'s [u32]],
     suffix: &'s mut DeviceOwner<'a, EncoderSuffix<'a>>,
     keep_running: &'s dyn Fn() -> bool,
@@ -170,7 +171,7 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
                 }
             }
         }
-        if !self.complete && requests.cache().request_id(self.lease).is_ok() {
+        if !self.complete && self.packed.is_none() && requests.cache().request_id(self.lease).is_ok() {
             if let Err(error) = requests.release(self.lease) {
                 tracing::error!(%error, "revoking cancelled distributed encoder units");
             }
@@ -198,13 +199,17 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         slot.pass.resources.engram.reset_uploads()?;
         slot.started = Instant::now();
         let chunk = self.chunks[unit.index];
-        let batch = self.requests.borrow_mut().reserve_encoder(&[RequestTokens { lease: self.lease, tokens: chunk,
-            image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-        // Start the next unit's Engram I/O now (#815, prof13: it otherwise
-        // starts at that unit's reservation, one local layer before layer 1
-        // needs it, which left GPU0 idle ~14 ms per Engram layer).
-        let next: Vec<&[u32]> = self.chunks[unit.index + 1..].iter().chain(self.ahead).copied().collect();
-        self.requests.borrow_mut().prefetch_encoder(self.lease, &next)?;
+        let inputs: Vec<_> = match self.packed {
+            Some(members) => members.iter().map(|&(lease, tokens)| RequestTokens {
+                lease, tokens, image_mask: None, kind: ExpertV2SourceKind::Prefill }).collect(),
+            None => vec![RequestTokens { lease: self.lease, tokens: chunk,
+                image_mask: None, kind: ExpertV2SourceKind::Prefill }],
+        };
+        let batch = self.requests.borrow_mut().reserve_encoder(&inputs)?;
+        if self.packed.is_none() {
+            let next: Vec<&[u32]> = self.chunks[unit.index + 1..].iter().chain(self.ahead).copied().collect();
+            self.requests.borrow_mut().prefetch_encoder(self.lease, &next)?;
+        }
         // The slot is at rest (drained in `begin_unit`): select this unit's
         // rows in every shared plane (its transport's TP2 FFN included, C1),
         // then prepare layer 0's input. Its query runs in its attention hook
@@ -272,7 +277,7 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
     async fn commit_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
-        let rows = [unit.rows.len() as u32];
+        let rows = super::super::encoder_units::member_rows(batch)?;
         slot.pass.enqueue_cache_commit(&self.requests.borrow(), batch, &rows)?;
         while !slot.pass.poll_cache_commit()? { tokio::task::yield_now().await; }
         slot.pass.commit(&mut self.requests.borrow_mut(), batch, &rows)?;
@@ -385,13 +390,35 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         prefill: &mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>, requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]],
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
         before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?;
+        // SAFETY: forwards the caller's retained slot, request and suffix contract.
+        unsafe { Self::execute_encoder_units_inner(slots, prefill, requests, None,
+            lease, chunks, suffix, ahead, keep_running, before_unit).await }
+    }
+    /// One packed short-prompt unit on the shared waves executor.
+    /// # Safety
+    /// Every member owns its lease and the shared suffix through drained completion.
+    pub(crate) async unsafe fn execute_packed_encoder_unit(
+        slots: Vec<(&mut Self, &mut DeviceOwner<'a, NativeTp4Wave<'a>>)>,
+        prefill: &mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>,
+        requests: &mut Requests<'a>, members: &[(CacheLease, &[u32])], suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>,
+    ) -> Result<()> {
+        let tokens: Vec<_> = members.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        // SAFETY: member leases and the packed suffix stay live through the executor drain.
+        unsafe { Self::execute_encoder_units_inner(slots, prefill, requests, Some(members),
+            members[0].0, &[&tokens], suffix, &[], &|| true, &|| Ok(())).await }
+    }
+    async unsafe fn execute_encoder_units_inner(slots: Vec<(&mut Self, &mut DeviceOwner<'a, NativeTp4Wave<'a>>)>,
+        prefill: &mut DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>, requests: &mut Requests<'a>, packed: Option<&[(CacheLease, &[u32])]>, lease: CacheLease, chunks: &[&[u32]],
+        suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
+        before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        if packed.is_none() { requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?; }
         let waves = slots.len();
         ensure!((1..=4).contains(&waves), "V4.1 prefill runs 1..=4 units in flight");
         ensure!(slots.iter().all(|(pass, _)| pass.state == State::Idle), "distributed encoder lane still in use");
         ensure!(slots.iter().all(|(pass, _)| pass.resources.map == slots[0].0.resources.map),
             "distributed encoder lane placement differs");
         let mut units = super::super::encoder_units::encoder_units(chunks)?;
+        if let Some(members) = packed { super::super::encoder_units::packed_members(&mut units[0], members.iter().map(|(_, tokens)| tokens.len())); }
         for unit in &mut units { unit.slot = unit.index % waves; }
         for layer in 0..20 {
             ensure!(slots.iter().all(|(_, transport)| transport.has_local_layer(layer) == slots[0].1.has_local_layer(layer)),
@@ -409,7 +436,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     |layer| Ok(pass.resources.lanes[map.attention(layer)?].device.id))?;
                 Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published })
             }).collect::<Result<Vec<_>>>()?,
-            requests: RefCell::new(requests), lease, chunks, suffix, ahead, keep_running, before_unit, complete: false,
+            requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, keep_running, before_unit, complete: false,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
         // Every unit's chained work completes before the decoder replay reads it.

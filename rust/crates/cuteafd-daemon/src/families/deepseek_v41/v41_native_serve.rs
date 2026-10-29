@@ -487,6 +487,8 @@ fn worker(
     )).collect::<Result<Vec<_>>>()?;
     // The slots hold their components' storage; the set itself is no owner.
     drop(slot_storage);
+    let packed_suffix = admission::scoped(p, "encoder suffix", ||
+        slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
     // planner's charges, nothing retained beyond them.
     admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots)?;
@@ -513,7 +515,7 @@ fn worker(
         0 => NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?),
         _ => NativeTp4Wave::unlinked(&lib, capacity),
     }).collect::<Result<Vec<_>>>()?;
-    let mut prefill_slots = prefill_target::PrefillSlots { slots: slot_passes.drain(..).zip(slot_transports).collect() };
+    let mut prefill_slots = prefill_target::PrefillSlots { packed_suffix, slots: slot_passes.drain(..).zip(slot_transports).collect() };
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;

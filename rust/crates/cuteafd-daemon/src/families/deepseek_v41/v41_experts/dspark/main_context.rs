@@ -82,6 +82,7 @@ impl<'library> DsparkWeights<'library> {
     }
 }
 impl DsparkMainContext<'_, '_> {
+    pub(crate) fn capacity(&self) -> usize { self.capacity as usize }
     /// Extra storage beyond the main projection already in the wave plan;
     /// committed and private-draft KV use separate projection workspaces.
     pub fn additional_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {

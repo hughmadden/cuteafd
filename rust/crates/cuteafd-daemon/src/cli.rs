@@ -1148,6 +1148,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u32).range(80..=4096))]
     pub prefill_batch_tokens: u32,
 
+    /// Pack queued cold short prompts; exact requires attested arithmetic routes.
+    #[arg(long, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
+
     /// Prefill units in flight (the deployment's prefill_waves): one slot
     /// pass each on the shared storage set.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))]
