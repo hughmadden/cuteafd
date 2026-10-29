@@ -65,7 +65,7 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
     }
 }
 
-pub(crate) fn packed_check(engine: &RefCell<DenseEngine<'_>>, library: &NativeLibrary,
+pub(crate) fn packed_check<'a>(engine: &RefCell<DenseEngine<'a>>, library: &'a NativeLibrary,
     tokens: &[u32], members: usize) -> Result<()> {
     let prompts = crate::shared::qwen::packed_check::prompts(tokens, members)?;
     let mut backend = DenseBackend::new(engine, library);

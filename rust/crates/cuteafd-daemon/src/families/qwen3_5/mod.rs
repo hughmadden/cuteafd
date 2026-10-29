@@ -75,6 +75,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tracing::info!(hidden = cfg.hidden, layers = cfg.attention.len(), intermediate = cfg.intermediate,
         tensor_contracts = header.tensors.len(), "dense Qwen checkpoint headers validated for qualification");
     if args.check_headers { return Ok(()); }
+    if let Some(members) = args.packed_check {
+        ensure!((2..=8).contains(&members), "--packed-check needs 2..=8 members");
+    }
     ensure!((1..=4096).contains(&args.prefill_chunk), "prefill chunk must be 1..4096");
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;

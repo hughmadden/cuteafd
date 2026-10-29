@@ -21,6 +21,8 @@ pub(crate) fn check<P: Placement, D: DraftState>(library: &NativeLibrary, prompt
         -> Result<Vec<Result<()>>>,
     mut snapshot: impl FnMut(&P) -> Result<Vec<u8>>) -> Result<()> {
     let n = prompts.len();
+    ensure!(limits.chunk_rows > 0 && n >= 2 && prompts.last().is_some_and(|p| p.len() > 73),
+        "invalid packed-check shape");
     ensure!(packed.len() == n && alone.len() == n, "packed-check placement count differs");
     let mut pd: Vec<D> = (0..n).map(|_| D::default()).collect();
     let mut ad: Vec<D> = (0..n).map(|_| D::default()).collect();
@@ -55,15 +57,19 @@ pub(crate) fn check<P: Placement, D: DraftState>(library: &NativeLibrary, prompt
             })? { outcome?; }
         }
     }
+    let mut singleton_logits = Vec::with_capacity(n);
     for i in 0..n {
-        let head = single(&mut PrefillSeq { placement: &mut alone[i], tokens: &prompts[i][chunks[i].0..],
-            start: chunks[i].0, next: None, draft: &mut ad[i], neural })?;
-        let equal = logits[i].len() == head.len() && logits[i].iter().zip(&head).all(|(a, b)| a.to_bits() == b.to_bits());
+        singleton_logits.push(single(&mut PrefillSeq { placement: &mut alone[i], tokens: &prompts[i][chunks[i].0..],
+            start: chunks[i].0, next: None, draft: &mut ad[i], neural })?);
+    }
+    for i in 0..n {
+        let head = &singleton_logits[i];
+        let equal = logits[i].len() == head.len() && logits[i].iter().zip(head).all(|(a, b)| a.to_bits() == b.to_bits());
         let state = snapshot(&packed[i])? == snapshot(&alone[i])?;
-        let worst = logits[i].iter().zip(&head).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        let (kl, _) = crate::shared::golden_scores::scored_kl(&head, &logits[i], head.len())?;
+        let worst = logits[i].iter().zip(head).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let (kl, _) = crate::shared::golden_scores::scored_kl(head, &logits[i], head.len())?;
         let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
-        let top1 = top(&head) == top(&logits[i]);
+        let top1 = top(head) == top(&logits[i]);
         println!("packed check: member {i}, {} rows at {}: logits {equal}, state {state}, max |diff| {worst:.3e}, KL {kl:.6}, top1 {top1}", chunks[i].1, chunks[i].0);
         if exact { ensure!(equal && state, "packed member {i} differs from singleton"); }
         else { ensure!(kl <= 0.03 && top1, "unrestricted packed member {i} exceeds KL/top1 bar"); }
@@ -75,6 +81,21 @@ pub(crate) fn check<P: Placement, D: DraftState>(library: &NativeLibrary, prompt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_dense_shapes_pack_below_route_boundary_and_leave_large_members_alone() {
+        let p = prompts(&[1, 2, 3], 8).unwrap();
+        let chunks = p.iter().enumerate().map(|(i, p)| {
+            let start = if i == 7 { 73 } else { 0 };
+            (start, p.len() - start)
+        }).collect::<Vec<_>>();
+        let limits = Limits { rows: 64, chunk_rows: 4096, max_context: 4096, taps: None };
+        let groups = |rows| prefill_packing::groups(chunks.len(), |r|
+            prefill_packing::plan(&chunks[r], &Limits { rows, ..limits }).is_ok());
+        assert_eq!(groups(64), [0..3, 3..4, 4..5, 5..6, 6..7, 7..8]);
+        assert_eq!(groups(0), (0..8).map(|i| i..i + 1).collect::<Vec<_>>());
+        assert_eq!(groups(4096), [0..8]);
+    }
+
     #[test]
     fn packed_check_has_private_wrapping_prompts_and_resumed_tail() {
         let p = prompts(&[1, 2, 3], 8).unwrap();

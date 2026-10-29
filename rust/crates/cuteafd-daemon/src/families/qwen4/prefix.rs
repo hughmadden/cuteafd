@@ -384,6 +384,25 @@ pub(crate) fn packed_state(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement)
     let family = Qwen4Prefix::new(engine, |_| 0)?;
     let mut bytes = slot_state(engine, placement.slot)?;
     bytes.extend(paged_rows(&family, placement, placement.len)?);
+    if engine.weights.mtp.is_some() {
+        let frontier = placement.mtp_frontier.get();
+        bytes.extend(frontier.to_le_bytes());
+        bytes.push(u8::from(placement.mtp_snapshot_pending.get()));
+        if placement.mtp_snapshot_pending.get() {
+            let pending = engine.snapshot_regions(usize::try_from(placement.slot)?)
+                .last().copied().context("Qwen MTP pending snapshot region")?;
+            bytes.extend(download(engine, pending)?);
+        }
+        for (u, &unit) in placement.units.iter().enumerate().take(frontier.div_ceil(UNIT_ROWS)) {
+            let rows = (frontier - u * UNIT_ROWS).min(UNIT_ROWS);
+            let blocks = (frontier / BLOCK).saturating_sub(u * PAGE_ROWS).min(PAGE_ROWS);
+            let ranges = family.unit_ranges(unit)?;
+            let mtp = &ranges[ranges.len() - 3..];
+            bytes.extend_from_slice(&download(engine, mtp[0])?[..rows * engine.kv_record_bytes]);
+            bytes.extend_from_slice(&download(engine, mtp[1])?[..rows * KEY_BYTES]);
+            bytes.extend_from_slice(&download(engine, mtp[2])?[..blocks * BLOCK_KEY_BYTES]);
+        }
+    }
     Ok(bytes)
 }
 

@@ -905,10 +905,13 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 fn golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll;
     if let Some(members) = args.packed_check {
+        ensure!((2..=8).contains(&members), "--packed-check needs 2..=8 members");
         args.engine.slots = args.engine.slots.max(2 * members);
     }
     ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
-    let windows = if args.golden.join("manifest.json").try_exists()? {
+    let windows = if args.golden.join("manifest.json").try_exists()? && args.packed_check.is_some() {
+        Some(fidelity_windows(&args.golden, args.window.as_deref())?)
+    } else if args.golden.join("manifest.json").try_exists()? {
         ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.teacher_force && args.spec_keep.is_none()
             && args.mtp_oracle.is_none() && args.token_check.is_none() && args.spec_decode.is_none()
@@ -925,8 +928,13 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
         if let Some(members) = args.packed_check {
-            let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
-            let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            let tokens = if let Some(windows) = &windows {
+                windows.first().context("packed check needs a fidelity window")?.tokens.clone()
+            } else {
+                let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+                ensure!(!bytes.is_empty() && bytes.len() % 4 == 0, "invalid packed-check token payload");
+                bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>()
+            };
             return packed_check(engine, &tokens, members, args.engine.prefill_packing);
         }
         if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
@@ -955,9 +963,11 @@ fn packed_check(engine: &engine::Qwen4Engine<'_>, tokens: &[u32], members: usize
     let alone = admit()?;
     let limits = engine.packed_limits().context("packed Qwen requires one attention owner")?;
     crate::shared::qwen::packed_check::check::<_, speculate::MtpSeq>(engine.library, &prompts, packed, alone,
-        limits, false, mode == crate::shared::prefill_packing::PackingMode::Exact, |s| {
+        limits, engine.weights.mtp.is_some(), mode == crate::shared::prefill_packing::PackingMode::Exact, |s| {
             let head = engine.prefill_device(s.placement, s.tokens, None, None, 1)?.context("packed check needs full model head")?;
-            head.row_host(engine.library, 0)
+            let logits = head.row_host(engine.library, 0)?;
+            if s.neural { speculate::prefill_chunk(engine, s.placement, s.start, s.tokens, s.next, s.draft)?; }
+            Ok(logits)
         }, |sequences, callback| engine.prefill_packed(sequences, callback),
         |p| prefix::packed_state(engine, p))
 }
