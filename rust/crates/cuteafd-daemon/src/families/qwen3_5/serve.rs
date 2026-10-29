@@ -67,10 +67,14 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
 
 pub(crate) fn packed_check<'a>(engine: &RefCell<DenseEngine<'a>>, library: &'a NativeLibrary,
     tokens: &[u32], members: usize, mode: crate::shared::prefill_packing::PackingMode,
-    windows: Option<&[cuteafd_bench::reference::Window]>, precision: &cuteafd_bench::fidelity_precision::Precision) -> Result<()> {
+    windows: Option<&[cuteafd_bench::reference::Window]>, precision: &cuteafd_bench::fidelity_precision::Precision,
+    mtp: Option<Rc<super::engine::mtp::MtpCache<'a>>>) -> Result<()> {
     let prompts = crate::shared::qwen::packed_check::prompts(tokens, members)?;
     let mut backend = DenseBackend::new(engine, library);
     backend.packing = mode;
+    backend.mtp = mtp;
+    let neural = backend.mtp.is_some();
+    println!("dense packed check: native MTP {neural}");
     let limits = backend.checked_packed_limits()?.context("dense packed limits")?;
     let mut next_page = 0usize;
     let mut admit = |slot: usize, prompt: &[u32]| -> Result<Placement> {
@@ -79,29 +83,43 @@ pub(crate) fn packed_check<'a>(engine: &RefCell<DenseEngine<'a>>, library: &'a N
         next_page += pages;
         engine.borrow_mut().reset_slot(slot)?;
         engine.borrow_mut().bind_slot(slot, &units)?;
+        if let Some(mtp) = &backend.mtp {
+            mtp.reset_context(slot)?;
+            mtp.admit_pages(slot, prompt.len())?;
+        }
         Ok(Placement { units, slot, len: 0, state_len: 0 })
     };
     let packed = prompts.iter().enumerate().map(|(i, p)| admit(i, p)).collect::<Result<Vec<_>>>()?;
     let alone = prompts.iter().enumerate().map(|(i, p)| admit(i + members, p)).collect::<Result<Vec<_>>>()?;
     let pool = cuteafd_engine::prefix::RefPagePool::new(engine.borrow().pool_tokens / 64, 64);
-    crate::shared::qwen::packed_check::check::<_, DraftState>(library, &prompts, packed, alone, limits, false,
+    crate::shared::qwen::packed_check::check::<_, DraftState>(library, &prompts, packed, alone, limits, neural,
         mode == crate::shared::prefill_packing::PackingMode::Exact,
         |s| backend.prefill_device(s.placement, s.tokens, 1, &pool)?.context("dense check needs head")?.row_host(library, 0),
-        |s, callback| backend.prefill_packed(s, &pool, callback), |p| super::engine::prefix::packed_state(engine, p))?;
+        |s, callback| backend.prefill_packed(s, &pool, callback), |p| {
+            let mut bytes = super::engine::prefix::packed_state(engine, p)?;
+            if let Some(mtp) = &backend.mtp { bytes.extend(mtp.packed_state(p.slot, p.len)?); }
+            Ok(bytes)
+        })?;
     if mode == crate::shared::prefill_packing::PackingMode::Unrestricted {
         let windows = windows.context("dense packed check needs official windows")?;
         drop(admit);
         next_page = 0;
-        let placements = windows.iter().enumerate().map(|(slot, w)| {
+        let mut admit_reference = |slot: usize, w: &cuteafd_bench::reference::Window| {
             let pages = w.tokens.len().div_ceil(64);
             let units = (next_page..next_page + pages).map(u32::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
             next_page += pages;
             ensure!(next_page <= engine.borrow().pool_tokens / 64, "dense packed reference exhausts admitted pages");
             engine.borrow_mut().reset_slot(slot)?;
             engine.borrow_mut().bind_slot(slot, &units)?;
+            if let Some(mtp) = &backend.mtp {
+                mtp.reset_context(slot)?;
+                mtp.admit_pages(slot, w.tokens.len())?;
+            }
             Ok(Placement { units, slot, len: 0, state_len: 0 })
-        }).collect::<Result<Vec<_>>>()?;
-        crate::shared::qwen::packed_check::reference::<_, DraftState>(library, windows, placements, limits, false, precision,
+        };
+        let placements = windows.iter().enumerate().map(|(i, w)| admit_reference(i, w)).collect::<Result<Vec<_>>>()?;
+        let controls = windows.iter().enumerate().map(|(i, w)| admit_reference(i + members, w)).collect::<Result<Vec<_>>>()?;
+        crate::shared::qwen::packed_check::reference::<_, DraftState>(library, windows, placements, controls, limits, neural, precision,
             |s| backend.prefill_device(s.placement, s.tokens, 1, &pool)?.context("dense reference needs head")?.row_host(library, 0),
             |s, callback| backend.prefill_packed(s, &pool, callback))?;
     }

@@ -46,6 +46,16 @@ impl UploadShape {
         }
         Ok(())
     }
+    /// Split the same admitted payload over several calls without multiplying
+    /// its bytes. Each extra fragment needs a fence and at most 15 padding bytes.
+    pub fn fragment(&mut self, planes: usize, extra_calls: usize) -> Result<()> {
+        let ranges = planes.checked_mul(extra_calls).context("upload fragment count overflow")?;
+        self.ranges = self.ranges.checked_add(ranges).context("upload fragment fences overflow")?;
+        self.bytes = ranges.checked_mul(16).and_then(|n| self.bytes.checked_add(n))
+            .context("upload fragment padding overflow")?;
+        Ok(())
+    }
+
     /// One circular tail gap can strand fewer than one largest aligned plane.
     pub fn capacity_bytes(self) -> Result<usize> {
         self.bytes.checked_add(self.largest.saturating_sub(16)).context("upload wrap slack overflow")
@@ -205,6 +215,20 @@ mod tests {
         assert!(cursor.reserve(16)?.is_some());
         assert_eq!(METADATA_SM_COPY_BYTES, 4_194_304);
         assert!(shape.append(&[usize::MAX], 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fragmented_uploads_charge_fences_and_alignment_without_multiplying_payload() -> Result<()> {
+        let mut shape = UploadShape::default();
+        shape.append(&[257], 1)?;
+        shape.fragment(1, 256)?;
+        assert_eq!(shape.ranges, 257);
+        assert_eq!(shape.bytes, 272 + 256 * 16);
+        let mut cursor = UploadCursor::new(shape)?;
+        for _ in 0..257 { assert!(cursor.reserve(1)?.is_some()); }
+        assert!(cursor.reserve(1)?.is_none());
+        assert!(shape.fragment(usize::MAX, 2).is_err());
         Ok(())
     }
 

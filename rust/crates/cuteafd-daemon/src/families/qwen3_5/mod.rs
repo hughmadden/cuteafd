@@ -55,6 +55,9 @@ pub(crate) struct GoldenArgs {
     /// Compare native packed and singleton state/logits on 2..=8 members.
     #[arg(long)]
     pub packed_check: Option<usize>,
+    /// Include checkpoint-native MTP state for every packed qualification member.
+    #[arg(long, requires = "packed_check", conflicts_with_all = ["draft", "mtp_golden", "verify_check", "prefix_check"])]
+    pub packed_mtp: bool,
     #[arg(long, value_enum, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
@@ -96,8 +99,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         ensure!(format!("{:x}", Sha256::digest(&bytes)) == expected, "dense packed reference publication differs");
         let reference = fidelity_dataset::load(golden, &manifest)?;
         ensure!(reference.vocab == cfg.vocab, "dense packed reference vocabulary differs");
-        let window = reference.windows.iter().find(|w| w.id == args.window).context("dense packed reference window missing")?;
-        Some(vec![window.clone(); args.packed_check.unwrap()])
+        Some(crate::shared::qwen::packed_check::reference_windows(&reference.windows,
+            &args.window, args.packed_check.unwrap())?)
     } else { None };
     let (directory, positions) = if packed_windows.is_some() { (golden.to_owned(), None) } else {
         let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
@@ -133,8 +136,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let slots = usize::from(args.state_slots).max(args.packed_check.map_or(1, |n| 2 * n));
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
+    let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
+    let mtp_admission = args.packed_mtp.then(|| engine::mtp::Admission::new(&reader, cfg, &programs)).transpose()?;
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, None, slots, marks, args.kv_cache, false)?;
+        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes), slots, marks, args.kv_cache, false)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
@@ -145,7 +150,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             "unrestricted packed check needs the sealed official reference");
         let precision = cuteafd_bench::fidelity_precision::resolve("dense-packed-check", Some(&args.snapshot),
             &serde_json::json!([]), "Qwen/Qwen3.8-27B", None)?;
-        return serve::packed_check(&engine, &library, &tokens, members, args.prefill_packing, packed_windows.as_deref(), &precision);
+        let mtp = mtp_admission.map(|admission| engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)
+            .map(std::rc::Rc::new)).transpose()?;
+        return serve::packed_check(&engine, &library, &tokens, members, args.prefill_packing,
+            packed_windows.as_deref(), &precision, mtp);
     }
     if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
     let mut engine = engine.into_inner();
@@ -242,6 +250,18 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn packed_mtp_requires_a_packed_fixture_and_excludes_other_drafters() {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: super::GoldenArgs }
+        let base = ["test", "--snapshot", "model", "--packed-mtp"];
+        assert!(Cli::try_parse_from(base).is_err());
+        let parsed = Cli::try_parse_from(base.into_iter().chain(["--packed-check", "8", "--window", "c00"])).unwrap();
+        assert!(parsed.args.packed_mtp);
+        assert_eq!(parsed.args.window, "c00");
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--packed-check", "8", "--draft", "draft"])).is_err());
+    }
+
     #[test]
     fn mtp_oracle_is_explicit_and_excludes_other_draft_modes() {
         #[derive(clap::Parser)]

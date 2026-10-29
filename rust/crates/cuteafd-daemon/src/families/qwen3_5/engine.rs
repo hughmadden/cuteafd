@@ -403,17 +403,35 @@ impl<'a> DenseEngine<'a> {
             tables.push(rows::Rows { tokens: vec![], physical: vec![], groups: vec![],
                 slots: vec![i32::try_from(slot)?; s.rows], first: vec![0; s.rows], positions, kv, pages, stride: 0 });
         }
+        let mut all = rows::Rows { tokens: vec![], physical: vec![], groups: vec![], slots: vec![],
+            first: vec![], positions: vec![], kv: vec![], pages: vec![], stride: 0 };
+        let mut page_offsets = Vec::with_capacity(tables.len());
+        for table in &tables {
+            page_offsets.push(all.pages.len());
+            all.slots.extend_from_slice(&table.slots);
+            all.first.extend_from_slice(&table.first);
+            all.positions.extend_from_slice(&table.positions);
+            all.kv.extend_from_slice(&table.kv);
+            all.pages.extend_from_slice(&table.pages);
+        }
         let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
         self.verification.invalidate()?;
         self.healthy = false;
+        self.row_tables(&all)?;
         self.embedding.embed(&tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
         let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
             homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
         for (index, layer) in self.weights.layers.iter().enumerate() {
-            for (s, table) in segments.iter().zip(&tables) {
-                self.row_tables(table)?;
-                blocks.attention(index, layer,
-                    self.planes.segment(s.first, s.rows, self.cfg.hidden, self.cfg.heads * self.cfg.head_dim)?,
+            for ((s, table), &page_offset) in segments.iter().zip(&tables).zip(&page_offsets) {
+                let mut planes = self.planes.segment(s.first, s.rows, self.cfg.hidden, self.cfg.heads * self.cfg.head_dim)?;
+                let view = crate::shared::prefix::view;
+                planes.slots = view(self.planes.slots, s.first * 4, s.rows * 4)?;
+                planes.seq_first = view(self.planes.seq_first, s.first * 4, s.rows * 4)?;
+                planes.positions = view(self.planes.positions, s.first * 8, s.rows * 8)?;
+                planes.rope_positions = view(self.planes.rope_positions, s.first * 12, s.rows * 12)?;
+                planes.kv_slots = view(self.planes.kv_slots, s.first * 8, s.rows * 8)?;
+                planes.page_table = view(self.planes.page_table, page_offset * 4, table.pages.len() * 4)?;
+                blocks.attention(index, layer, planes,
                     self.kv[index].as_ref().map(|v| v.buffer), &Step { rows: s.rows,
                         capacity: if s.rows <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
                         table_stride: 0, splits: 1, speculative: false })?;

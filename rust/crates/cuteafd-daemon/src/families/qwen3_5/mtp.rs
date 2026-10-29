@@ -389,6 +389,32 @@ impl<'a> MtpCache<'a> {
 
 
 impl MtpCache<'_> {
+    /// Canonical live KV and pending hidden only, independent of physical page ids.
+    pub(crate) fn packed_state(&self, slot: usize, frontier: usize) -> Result<Vec<u8>> {
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        ensure!(mtp.pool.frontier(mtp.binding)?.1 == frontier && frontier > 0,
+            "dense packed MTP snapshot frontier differs");
+        // SAFETY: drain the owning stream before reading its canonical state.
+        unsafe { mtp.library.cuda_stream_synchronize(mtp.stream)?; }
+        let pages = mtp.pool.committed_page_table(mtp.binding)?;
+        let mut bytes = Vec::new();
+        // The final KV row is pending until the following target token exists.
+        for (i, &page) in pages.iter().enumerate().take((frontier - 1).div_ceil(64)) {
+            let rows = (frontier - 1 - i * 64).min(64);
+            let region = crate::shared::prefix::view(mtp.kv.buffer,
+                page as usize * 64 * mtp.layout.record_bytes, rows * mtp.layout.record_bytes)?;
+            let mut data = vec![0; region.bytes];
+            mtp.library.copy_d2h(&mut data, region)?;
+            bytes.extend(data);
+        }
+        let hidden = mtp.tail_hidden(frontier)?;
+        let mut data = vec![0; hidden.bytes];
+        mtp.library.copy_d2h(&mut data, hidden)?;
+        bytes.extend(data);
+        Ok(bytes)
+    }
+
     pub(crate) fn reset_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().reset_slot(slot) }
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().discard_slot(slot) }
     pub(crate) fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {

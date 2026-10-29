@@ -711,6 +711,8 @@ struct Workspace<'a> {
     kv_slots: Dev<'a>,
     slots: Dev<'a>,
     seq_first: Dev<'a>,
+    local_seq_first: Option<Dev<'a>>,
+    table_view: Cell<Option<(usize, usize, usize)>>,
     pool_slots: Dev<'a>,
     cache_lengths: Dev<'a>,
     page_table: Dev<'a>,
@@ -756,6 +758,22 @@ struct Workspace<'a> {
 }
 
 impl Workspace<'_> {
+    fn row_table(&self, buffer: &Dev<'_>, width: usize) -> *mut c_void {
+        buffer.buffer.ptr.wrapping_byte_add(self.table_view.get().map_or(0, |v| v.0) * width)
+    }
+
+    fn first_table(&self) -> *mut c_void {
+        if self.table_view.get().is_some() {
+            self.local_seq_first.as_ref().expect("prefill member first plane").buffer.ptr
+        } else { self.seq_first.buffer.ptr }
+    }
+
+    fn page_table(&self, pool: bool) -> *mut c_void {
+        let offset = self.table_view.get().map_or(0, |v| if pool { v.2 } else { v.1 });
+        let buffer = if pool { &self.pool_table } else { &self.page_table };
+        buffer.buffer.ptr.wrapping_byte_add(offset * 4)
+    }
+
     fn live(&self, buffer: &Dev<'_>, stride: usize) -> *mut c_void {
         self.live_buffer(buffer, stride).ptr
     }
@@ -2048,6 +2066,12 @@ impl<'a> Qwen4Engine<'a> {
             kv_slots: self.alloc(tables.kv_slots)?,
             slots: self.alloc(tables.slots)?,
             seq_first: self.alloc(tables.seq_first)?,
+            local_seq_first: if decode { None } else {
+                let zero = self.alloc(tables.seq_first)?;
+                self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
+                Some(zero)
+            },
+            table_view: Cell::new(None),
             pool_slots: self.alloc(tables.pool_slots)?,
             cache_lengths: self.alloc(tables.cache_lengths)?,
             page_table: self.alloc(tables.page_table)?,
@@ -2303,35 +2327,10 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn coordinator_packed_cap(&self, rows: usize) -> Result<usize> {
-        use crate::shared::prefill_packing::{coordinator_row_cap, validate_program_inventory, ProgramRows::*};
-        let mut inventory = vec![("qwen4_hc_pre".to_owned(), PackedRows),
-            ("qwen4_hc_post_pre".into(), PackedRows), ("qwen4_hc_post".into(), PackedRows),
-            ("qwen4_router_scores".into(), PackedRows), ("qwen4_shared".into(), PackedRows),
-            ("qwen4_add".into(), PackedRows), ("qwen4_head".into(), SequenceLocal)];
-        if matches!(self.weights.head, Qwen4Head::Fp8 { .. }) {
-            inventory.push(("qwen4_head_fp8".into(), SequenceLocal));
-        }
-        if let Some(ple) = &self.ple {
-            inventory.push((if ple.fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" }.into(), PackedRows));
-        }
-        if matches!(self.experts, Some(Experts::LocalExl3(_) | Experts::Spark { .. })) && !self.spark_bf16 {
-            inventory.push(("qwen4_expert_input_quant".into(), PackedRows));
-        }
-        for layer in &self.weights.layers {
-            let names = match layer.attention {
-                Qwen4Attention::Gdn => vec![Self::program(layer, "gdn", "m4096")],
-                Qwen4Attention::Full => vec![self.kv_program(layer, "m4096"),
-                    format!("qwen4_{}_m4096", self.kv_stem("sparse_gqa")),
-                    "qwen4_index_topk_m4096".into(), "qwen4_index_expand".into(),
-                    Self::program(layer, "attn_o", "m4096")],
-            };
-            for name in names {
-                if !inventory.iter().any(|(n, _)| n == &name) { inventory.push((name, SequenceLocal)); }
-            }
-        }
-        let refs = inventory.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
-        validate_program_inventory(inventory.iter().map(|(name, _)| name.as_str()), &refs)?;
-        coordinator_row_cap(self.programs, refs, rows)
+        let inventory = super::programs::packed_inventory(
+            self.programs.names().filter(|name| name.starts_with("qwen4_")))?;
+        let cap = crate::shared::prefill_packing::coordinator_row_cap(self.programs, inventory, rows)?;
+        Ok(super::programs::ple_packed_cap(cap, self.ple.is_some()))
     }
 
     pub(crate) fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
@@ -2375,12 +2374,24 @@ impl<'a> Qwen4Engine<'a> {
             w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false); w.terminal_valid.set(false);
             self.last_stream_offset.set(0);
             let mut all = StepTables::default();
+            let mut views = Vec::with_capacity(tables.len());
             for (s, t) in segments.iter().zip(&tables) {
+                views.push((s.first, all.page_table.len(), all.pool_table.len()));
                 all.positions.extend_from_slice(&t.positions);
+                all.rope_positions.extend_from_slice(&t.rope_positions);
+                all.block_rope_positions.extend_from_slice(&t.block_rope_positions);
+                all.kv_slots.extend_from_slice(&t.kv_slots);
                 all.slots.extend_from_slice(&t.slots);
                 all.seq_first.extend(std::iter::repeat_n(s.first as i32, s.rows));
+                all.pool_slots.extend_from_slice(&t.pool_slots);
+                all.cache_lengths.extend_from_slice(&t.cache_lengths);
+                all.page_table.extend_from_slice(&t.page_table);
+                all.pool_table.extend_from_slice(&t.pool_table);
                 all.ple_ids.extend_from_slice(&t.ple_ids);
             }
+            ensure!(all.page_table.len() <= self.pages && all.pool_table.len() <= self.pool_pages,
+                "packed member page tables exceed the admitted pool");
+            w.table_view.set(None);
             let all = Arc::new(all);
             self.stage_step_tables(w, &all)?;
             if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
@@ -2389,33 +2400,28 @@ impl<'a> Qwen4Engine<'a> {
                     as Arc<dyn crate::shared::mapped_table::RowSource>, false)?);
             }
             self.stage_embedding(w, &tokens, HC, &w.streams[0], false)?;
-            let rows = Scalar::I32(tokens.len() as i32);
-            let mut cur = 0;
-            if self.cfg.ple_layers.contains(&0) { self.finish_ple(w)?; }
-            self.enter(w, &mut cur, None, &self.weights.layers[0], 0, rows, false)?;
-            for (index, layer) in self.weights.layers.iter().enumerate() {
-                for (s, table) in segments.iter().zip(&tables) {
-                    w.row_offset.set(s.first); w.position.set(s.start);
-                    self.stage_step_tables(w, table)?;
-                    let n = Scalar::I32(s.rows as i32);
-                    match layer.attention {
-                        Qwen4Attention::Gdn => self.gdn(w, index, layer, n, "m4096", false)?,
-                        Qwen4Attention::Full => self.full(w, index, layer, n, "m4096", table)?,
-                    }
+            use crate::shared::prefill_pipeline::{run_prefill_units, Unit, UnitSegment};
+            let unit = Unit { index: 0, sequence: 0, rows: 0..tokens.len(),
+                layers: 0..self.weights.layers.len(), slot: 0, barrier: false,
+                segments: segments.iter().enumerate().map(|(i, s)| UnitSegment {
+                    sequence: i, rows: s.first..s.end_row(), tokens: s.start..s.start + s.rows,
+                    prompt_end: sequences[i].next.is_none(), snapshot: false, head: true,
+                }).collect() };
+            let run = |transport| -> Result<usize> {
+                let mut hooks = PackedHooks { engine: self, w, tables: &tables, segments: &segments,
+                    views: &views, transport, cur: 0, entered: false };
+                // One queued pack is one shared unit; cross-pack lookahead belongs to the scheduler.
+                run_prefill_units(&mut hooks, &[unit], 1)?;
+                Ok(hooks.cur)
+            };
+            let cur = match &self.experts {
+                Some(Experts::Spark { transport, .. }) => {
+                    let mut link = transport.borrow_mut();
+                    run(Some(link.exchange()?))?
                 }
-                w.row_offset.set(0);
-                self.stage_step_tables(w, &all)?;
-                self.post_pre(w, cur, layer, "mlp", rows)?;
-                cur ^= 1;
-                self.moe(w, index, layer, tokens.len(), rows, false)?;
-                if let Some(next) = self.weights.layers.get(index + 1) {
-                    if self.cfg.ple_layers.contains(&(index + 1)) {
-                        self.post(w, &mut cur, rows)?;
-                        self.finish_ple(w)?;
-                        self.enter(w, &mut cur, None, next, index + 1, rows, false)?;
-                    } else { self.enter(w, &mut cur, Some(()), next, index + 1, rows, false)?; }
-                } else { self.post(w, &mut cur, rows)?; }
-            }
+                _ => run(None)?,
+            };
+            w.table_view.set(None);
             self.last_streams.set((false, cur)); self.last_stream_offset.set(0);
             if let Some(terminal) = &w.terminal_streams {
                 // SAFETY: packed rows fit the existing terminal span and share its producer stream.
@@ -3515,8 +3521,8 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?)]);
         pointers.extend(Self::projection(layer, "w_out")?);
-        pointers.extend([("conv_state", conv), ("state", state), ("slots", w.slots.buffer.ptr),
-            ("seq_first", w.seq_first.buffer.ptr), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
+        pointers.extend([("conv_state", conv), ("state", state), ("slots", w.row_table(&w.slots, 4)),
+            ("seq_first", w.first_table()), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
         // Decode capacities record speculative replay inputs (spec) or advance the state.
         let decode = cap == "m64";
         if decode {
@@ -3548,22 +3554,22 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
-            ("positions", w.positions.buffer.ptr), ("rope_positions", w.rope_positions.buffer.ptr),
-            ("block_rope_positions", w.block_rope_positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
-            ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
+            ("positions", w.row_table(&w.positions, 8)), ("rope_positions", w.row_table(&w.rope_positions, 12)),
+            ("block_rope_positions", w.row_table(&w.block_rope_positions, 12)), ("kv_slots", w.row_table(&w.kv_slots, 8)),
+            ("pool_slots", w.row_table(&w.pool_slots, 8)), ("kv_cache", cache), ("token_keys", keys),
             ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&self.kv_program(layer, cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
-                ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
-                ("page_table", w.pool_table.buffer.ptr), ("output_indices", w.blocks.buffer.ptr),
+                ("positions", w.row_table(&w.positions, 8)), ("index_cache", blocks),
+                ("page_table", w.page_table(true)), ("output_indices", w.blocks.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)], &[rows, Scalar::I32(tables.pool_stride as i32)])?;
         }
-        self.run("qwen4_index_expand", &[("positions", w.positions.buffer.ptr), ("blocks", w.blocks.buffer.ptr),
+        self.run("qwen4_index_expand", &[("positions", w.row_table(&w.positions, 8)), ("blocks", w.blocks.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)], &[rows])?;
         self.run(&format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
-            ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
+            ("positions", w.row_table(&w.positions, 8)), ("page_table", w.page_table(false)),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32),
                 Scalar::I32(self.attention_plan.rows() as i32)])?;
@@ -3801,6 +3807,84 @@ impl<'a> Qwen4Engine<'a> {
     }
 }
 
+/// A queued pack uses the shared executor; its immutable metadata is uploaded once.
+struct PackedHooks<'e, 'w, 't, 'a, 'r, 'n> {
+    engine: &'e Qwen4Engine<'a>,
+    w: &'w Workspace<'a>,
+    tables: &'t [StepTables],
+    segments: &'t [crate::shared::prefill_packing::Segment],
+    views: &'t [(usize, usize, usize)],
+    transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
+    cur: usize,
+    entered: bool,
+}
+
+impl PackedHooks<'_, '_, '_, '_, '_, '_> {
+    fn aggregate(&self) {
+        self.w.row_offset.set(0);
+        self.w.table_view.set(None);
+        self.w.position.set(0);
+    }
+    fn finish(&mut self, layer: usize, rows: Scalar) -> Result<()> {
+        self.aggregate();
+        if let Some(next) = self.engine.weights.layers.get(layer + 1) {
+            let ple = self.engine.cfg.ple_layers.contains(&(layer + 1));
+            if ple {
+                self.engine.post(self.w, &mut self.cur, rows)?;
+                self.engine.finish_ple(self.w)?;
+            }
+            self.engine.enter(self.w, &mut self.cur, (!ple).then_some(()), next, layer + 1, rows, false)
+        } else { self.engine.post(self.w, &mut self.cur, rows) }
+    }
+}
+
+impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '_, '_, '_> {
+    type Ticket = crate::shared::spark_waves::WaveTicket;
+    fn route(&self, _: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        if self.transport.is_some() { crate::shared::prefill_pipeline::FfnRoute::Spark }
+        else { crate::shared::prefill_pipeline::FfnRoute::Local }
+    }
+    fn begin_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+    fn attention(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        if !self.entered {
+            if self.engine.cfg.ple_layers.contains(&0) { self.engine.finish_ple(self.w)?; }
+            self.engine.enter(self.w, &mut self.cur, None, &self.engine.weights.layers[0], 0, rows, false)?;
+            self.entered = true;
+        }
+        let layer = &self.engine.weights.layers[index];
+        for ((s, table), &view) in self.segments.iter().zip(self.tables).zip(self.views) {
+            self.w.row_offset.set(s.first); self.w.position.set(s.start); self.w.table_view.set(Some(view));
+            let n = Scalar::I32(s.rows as i32);
+            match layer.attention {
+                Qwen4Attention::Gdn => self.engine.gdn(self.w, index, layer, n, "m4096", false)?,
+                Qwen4Attention::Full => self.engine.full(self.w, index, layer, n, "m4096", table)?,
+            }
+        }
+        self.aggregate();
+        self.engine.post_pre(self.w, self.cur, layer, "mlp", rows)?;
+        self.cur ^= 1;
+        Ok(())
+    }
+    fn local_ffn(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        self.engine.moe(self.w, index, &self.engine.weights.layers[index], unit.rows.len(), rows, false)?;
+        self.finish(index, rows)
+    }
+    fn send_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        self.engine.moe_front(self.w, index, &self.engine.weights.layers[index], unit.rows.len(), rows)?;
+        self.engine.wave_send(self.w, index, unit.rows.len(), rows, false,
+            self.transport.as_mut().context("packed Spark exchange")?)
+    }
+    fn land_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
+        self.engine.wave_land(self.w, unit.rows.len(), ticket, self.transport.as_mut().context("packed Spark exchange")?)?;
+        self.finish(index, Scalar::I32(unit.rows.len() as i32))
+    }
+    fn end_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { self.aggregate(); Ok(()) }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+}
+
 /// Live rows survive hooks in slot planes; all tables and scratch are shared
 /// and rewritten on the execution stream before the hook that consumes them.
 struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
@@ -4035,6 +4119,7 @@ mod prefill_unit_tests {
                         tables.kv_slots, tables.slots, tables.seq_first, tables.pool_slots,
                         tables.cache_lengths, tables.page_table, tables.pool_table, tables.ple_ids, tables.ids]
                         .map(|bytes| bytes as u64));
+                    buffers.push(rows * 4); // Immutable sequence-local zero origins for packed attention.
                     if let Some(width) = mapped {
                         buffers.extend([rows * cfg.ple_rows() as u64 * 8, rows * cfg.ple_rows() as u64 * width]);
                     }

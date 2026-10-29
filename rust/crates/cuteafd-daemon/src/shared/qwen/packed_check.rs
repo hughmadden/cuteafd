@@ -13,6 +13,17 @@ pub(crate) fn prompts(tokens: &[u32], members: usize) -> Result<Vec<Vec<u32>>> {
     }).collect())
 }
 
+pub(crate) fn reference_windows(windows: &[cuteafd_bench::reference::Window], first: &str,
+    members: usize) -> Result<Vec<cuteafd_bench::reference::Window>> {
+    ensure!((2..=8).contains(&members) && windows.len() >= members, "packed reference needs distinct windows");
+    let start = windows.iter().position(|w| w.id == first)
+        .ok_or_else(|| anyhow::anyhow!("packed reference window {first} missing"))?;
+    let selected = (0..members).map(|i| windows[(start + i) % windows.len()].clone()).collect::<Vec<_>>();
+    ensure!(selected.iter().map(|w| &w.id).collect::<std::collections::BTreeSet<_>>().len() == members,
+        "packed reference repeats a window id");
+    Ok(selected)
+}
+
 fn singleton<P: Placement, D>(s: &mut PrefillSeq<'_, P, D>, chunk_rows: usize,
     single: &mut impl FnMut(&mut PrefillSeq<'_, P, D>) -> Result<Vec<f32>>) -> Result<Vec<f32>> {
     let mut logits = Vec::new();
@@ -52,7 +63,7 @@ pub(crate) fn check<P: Placement, D: DraftState>(library: &NativeLibrary, prompt
     let groups = prefill_packing::groups(n, |r| prefill_packing::plan(&chunks[r], &limits).is_ok());
     let packed_coverage = groups.iter().any(|r| r.len() > 1);
     ensure!(exact || packed_coverage, "unrestricted packed check exercised no packed group");
-    if !packed_coverage { println!("exact: singleton fallback (cap {}), no packed coverage", limits.rows); }
+    if !packed_coverage { println!("exact: singleton fallback, NOT a packing gate (cap {})", limits.rows); }
     let mut logits = vec![Vec::new(); n];
     for range in groups {
         let first = range.start;
@@ -90,10 +101,14 @@ pub(crate) fn check<P: Placement, D: DraftState>(library: &NativeLibrary, prompt
     Ok(())
 }
 
+fn non_inferior(delta_kl: f64, delta_top1: f64) -> bool {
+    delta_kl.is_finite() && delta_top1.is_finite() && delta_kl <= 0.005 + 1e-12 && delta_top1 >= -0.01 - 1e-12
+}
+
 /// Replay only original prefixes: synthetic partner-isolation prompts have no official oracle.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reference<P: Placement, D: DraftState>(library: &NativeLibrary,
-    windows: &[cuteafd_bench::reference::Window], mut placements: Vec<P>, limits: Limits,
+    windows: &[cuteafd_bench::reference::Window], mut placements: Vec<P>, mut controls: Vec<P>, limits: Limits,
     neural: bool, precision: &cuteafd_bench::fidelity_precision::Precision,
     mut single: impl FnMut(&mut PrefillSeq<'_, P, D>) -> Result<Vec<f32>>,
     mut pass: impl FnMut(&mut [PrefillSeq<'_, P, D>], &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome)
@@ -101,10 +116,11 @@ pub(crate) fn reference<P: Placement, D: DraftState>(library: &NativeLibrary,
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     const TAILS: [usize; 8] = [7, 9, 29, 40, 64, 65, 255, 1];
     let n = windows.len();
-    ensure!((2..=8).contains(&n) && placements.len() == n && limits.chunk_rows > 0,
+    ensure!((2..=8).contains(&n) && placements.len() == n && controls.len() == n && limits.chunk_rows > 0,
         "invalid official packed-check shape");
     precision.validate()?;
     let mut drafts: Vec<D> = (0..n).map(|_| D::default()).collect();
+    let mut control_drafts: Vec<D> = (0..n).map(|_| D::default()).collect();
     // Spaced official rows exercise >64 aggregate rows instead of scoring only
     // one-token updates (which would never cross common GEMV/MMA boundaries).
     let windows = windows.iter().map(|w| {
@@ -114,6 +130,9 @@ pub(crate) fn reference<P: Placement, D: DraftState>(library: &NativeLibrary,
         w
     }).collect::<Vec<_>>();
     let probes = windows.iter().map(|w| Probe::new(ProbeSpec {
+        want: w.want(), top_k: 1, ..Default::default()
+    })).collect::<Vec<_>>();
+    let control_probes = windows.iter().map(|w| Probe::new(ProbeSpec {
         want: w.want(), top_k: 1, ..Default::default()
     })).collect::<Vec<_>>();
     let mut packed_groups = 0;
@@ -126,11 +145,20 @@ pub(crate) fn reference<P: Placement, D: DraftState>(library: &NativeLibrary,
             ensure!(start < end && end < windows[i].tokens.len(), "invalid official score frontier");
             let tail = TAILS[i].min(limits.chunk_rows).min(end - start);
             let before = end - tail;
+            ensure!(controls[i].len() == start, "singleton control frontier differs");
             if before > start {
-                singleton(&mut PrefillSeq { placement: &mut placements[i], tokens: &windows[i].tokens[start..before],
-                    start, next: windows[i].tokens.get(before).copied(), draft: &mut drafts[i], neural },
-                    limits.chunk_rows, &mut single)?;
+                for (placement, draft) in [(&mut placements[i], &mut drafts[i]),
+                    (&mut controls[i], &mut control_drafts[i])] {
+                    singleton(&mut PrefillSeq { placement, tokens: &windows[i].tokens[start..before],
+                        start, next: windows[i].tokens.get(before).copied(), draft, neural },
+                        limits.chunk_rows, &mut single)?;
+                }
             }
+            let logits = singleton(&mut PrefillSeq { placement: &mut controls[i],
+                tokens: &windows[i].tokens[before..end], start: before,
+                next: windows[i].tokens.get(end).copied(), draft: &mut control_drafts[i], neural },
+                limits.chunk_rows, &mut single)?;
+            control_probes[i].row(end, &logits);
             active.push(i);
         }
         // Members have independent frontiers and KV pages, even when they share a reference window.
@@ -160,16 +188,34 @@ pub(crate) fn reference<P: Placement, D: DraftState>(library: &NativeLibrary,
         }
     }
     ensure!(packed_groups > 0, "official reference check exercised no packed group");
-    for (i, (window, probe)) in windows.iter().zip(&probes).enumerate() {
+    let mut candidate_records = Vec::new();
+    let mut control_records = Vec::new();
+    let mut failures = Vec::new();
+    for (i, ((window, probe), control)) in windows.iter().zip(&probes).zip(&control_probes).enumerate() {
         let record = probe.record();
+        let reference = control.record();
         let score = window.score(&record.rows);
-        println!("official packed member {i} ({}): {} rows, KL {:.6}, top1 {:.6}, tier {}",
-            window.id, score.positions, score.kl, score.top1, precision.tier.name());
-        ensure!(record.error.is_none() && score.positions > 0 && score.missing == 0 && score.non_finite == 0
-            && score.kl <= precision.tier_kl_max && score.top1 >= precision.tier_top1_min,
-            "official packed member {i} fails its fidelity tier");
+        let baseline = window.score(&reference.rows);
+        let valid = record.error.is_none() && reference.error.is_none() && score.positions > 0
+            && score.positions == baseline.positions && score.missing == 0 && baseline.missing == 0
+            && score.non_finite == 0 && baseline.non_finite == 0;
+        let pass = valid && non_inferior(score.kl - baseline.kl, score.top1 - baseline.top1);
+        println!("official packed member {i} ({}): {} rows, KL {:.6}/{:.6}, top1 {:.6}/{:.6}, delta KL {:.6}, delta top1 {:.6}, pass {pass}",
+            window.id, score.positions, score.kl, baseline.kl, score.top1, baseline.top1,
+            score.kl - baseline.kl, score.top1 - baseline.top1);
+        if !pass { failures.push(i); }
+        candidate_records.extend(score.records);
+        control_records.extend(baseline.records);
     }
-    println!("official packed check: {packed_groups} packed groups, every member passed");
+    let pooled = cuteafd_bench::reference::Fidelity::from_records(candidate_records);
+    let control = cuteafd_bench::reference::Fidelity::from_records(control_records);
+    let pooled_pass = pooled.positions > 0 && pooled.positions == control.positions
+        && non_inferior(pooled.kl - control.kl, pooled.top1 - control.top1);
+    println!("official packed pooled: {} rows, KL {:.6}/{:.6}, top1 {:.6}/{:.6}, delta KL {:.6}, delta top1 {:.6}, pass {pooled_pass}; card full panel requires tier {}",
+        pooled.positions, pooled.kl, control.kl, pooled.top1, control.top1,
+        pooled.kl - control.kl, pooled.top1 - control.top1, precision.tier.name());
+    ensure!(failures.is_empty() && pooled_pass, "official packed non-inferiority failed: members {failures:?}, pooled {pooled_pass}");
+    println!("official packed check: {packed_groups} packed groups, every member and pool non-inferior");
     Ok(())
 }
 
@@ -189,6 +235,33 @@ mod tests {
         assert_eq!(groups(64), [0..3, 3..4, 4..5, 5..6, 6..7, 7..8]);
         assert_eq!(groups(0), (0..8).map(|i| i..i + 1).collect::<Vec<_>>());
         assert_eq!(groups(4096), [0..8]);
+    }
+
+    #[test]
+    fn fixture_non_inferiority_has_no_absolute_tier_and_rejects_bad_deltas() {
+        assert!(non_inferior(0.005, -0.01));
+        assert!(non_inferior(0.0, 0.0)); // A weak singleton oracle is not a packing regression.
+        assert!(!non_inferior(0.005001, 0.0));
+        assert!(!non_inferior(0.0, -0.010001));
+        assert!(!non_inferior(f64::NAN, 0.0));
+        assert!(!non_inferior(0.0, f64::INFINITY));
+        let members = [(0.006, 0.0), (-0.006, 0.0)];
+        assert!(non_inferior(0.0, 0.0)); // A pooled pass cannot hide a bad member.
+        assert!(!members.iter().all(|&(kl, top1)| non_inferior(kl, top1)));
+    }
+
+    #[test]
+    fn original_reference_selection_accepts_nondefault_ids_and_keeps_members_distinct() {
+        let windows = ["a00", "c04", "e12"].into_iter().enumerate().map(|(i, id)|
+            cuteafd_bench::reference::Window { id: id.into(), block: "code".into(), bucket: "short".into(),
+                tokens: vec![i as u32, 9], roles: vec![], score_from: 1, top_k: 1,
+                positions: vec![], media: vec![] }).collect::<Vec<_>>();
+        let selected = reference_windows(&windows, "e12", 3).unwrap();
+        assert_eq!(selected.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["e12", "a00", "c04"]);
+        assert_eq!(selected.iter().map(|w| w.tokens[0]).collect::<Vec<_>>(), [2, 0, 1]);
+        assert!(reference_windows(&windows, "legacy", 2).is_err());
+        assert!(reference_windows(&windows, "a00", 4).is_err());
+        assert!(reference_windows(&[windows[0].clone(), windows[0].clone()], "a00", 2).is_err());
     }
 
     #[derive(Clone, Default)]

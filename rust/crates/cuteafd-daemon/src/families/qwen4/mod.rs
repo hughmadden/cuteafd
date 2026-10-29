@@ -910,7 +910,7 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     }
     ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
     let windows = if args.golden.join("manifest.json").try_exists()? && args.packed_check.is_some() {
-        Some(fidelity_windows(&args.golden, args.window.as_deref())?)
+        Some(fidelity_windows(&args.golden, None)?)
     } else if args.golden.join("manifest.json").try_exists()? {
         ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.teacher_force && args.spec_keep.is_none()
@@ -938,12 +938,14 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
             packed_check(engine, &tokens, members, args.engine.prefill_packing)?;
             if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted {
                 let windows = windows.as_ref().context("unrestricted packed check needs the sealed official reference")?;
-                let selected = (0..members).map(|i| windows[i % windows.len()].clone()).collect::<Vec<_>>();
+                let first = args.window.as_deref().unwrap_or(&windows.first().context("empty packed reference")?.id);
+                let selected = crate::shared::qwen::packed_check::reference_windows(windows, first, members)?;
                 let precision = cuteafd_bench::fidelity_precision::resolve("qwen-packed-check", Some(&args.engine.snapshot),
                     &serde_json::json!([]), "Qwen/Qwen3.8-Flash-Next", None)?;
                 let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
                 let placements = selected.iter().map(|w| allocator.admit(w.tokens.len())).collect::<Result<Vec<_>>>()?;
-                crate::shared::qwen::packed_check::reference::<_, speculate::MtpSeq>(engine.library, &selected, placements,
+                let controls = selected.iter().map(|w| allocator.admit(w.tokens.len())).collect::<Result<Vec<_>>>()?;
+                crate::shared::qwen::packed_check::reference::<_, speculate::MtpSeq>(engine.library, &selected, placements, controls,
                     engine.packed_limits().context("packed Qwen requires one attention owner")?, engine.weights.mtp.is_some(), &precision,
                     |s| {
                         let head = engine.prefill_device(s.placement, s.tokens, None, None, 1)?.context("reference check needs head")?;
