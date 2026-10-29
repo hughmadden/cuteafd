@@ -1,6 +1,44 @@
 //! Row and completion contracts shared by packed prefill families.
 use anyhow::{ensure, Result};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PackingMode {
+    /// Fill the admitted unit, accepting the same route switches as long prompts.
+    #[default]
+    Unrestricted,
+    /// Keep packs on the first loaded expert route; unknown routes run alone.
+    Exact,
+}
+
+impl PackingMode {
+    pub(crate) fn resolve(explicit: Option<Self>, packed_check: bool) -> Self {
+        explicit.unwrap_or(if packed_check { Self::Exact } else { Self::Unrestricted })
+    }
+}
+
+/// Greedy adjacent groups, retaining oversized requests as ordinary singletons.
+/// Splitting a request itself would change the alone reference's arithmetic.
+pub(crate) fn groups(members: usize, fits: impl Fn(std::ops::Range<usize>) -> bool)
+    -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut first = 0;
+    while first < members {
+        let mut end = first + 1;
+        while end < members && fits(first..end + 1) { end += 1; }
+        out.push(first..end);
+        first = end;
+    }
+    out
+}
+
+pub(crate) fn log_mode(mode: PackingMode, rows: usize) {
+    if mode == PackingMode::Exact {
+        if rows == 0 {
+            tracing::info!("exact packed prefill disabled: loaded expert route metadata cannot bound arithmetic transitions (including occupancy-dependent NVFP4 sparse/wide); requests run alone");
+        } else { tracing::info!(rows, "exact packed prefill uses the minimum loaded expert route cap"); }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub rows: usize,
@@ -75,6 +113,22 @@ pub(crate) fn row_shares(rows: &[usize]) -> Vec<f64> {
 mod tests {
     use super::*;
     fn limits() -> Limits { Limits { rows: 256, chunk_rows: 256, max_context: 4096, taps: Some(128) } }
+    #[test]
+    fn exact_groups_split_at_cap_without_rechunking_singletons() {
+        assert_eq!(PackingMode::default(), PackingMode::Unrestricted);
+        assert_eq!(PackingMode::resolve(None, false), PackingMode::Unrestricted);
+        assert_eq!(PackingMode::resolve(None, true), PackingMode::Exact);
+        assert_eq!(PackingMode::resolve(Some(PackingMode::Unrestricted), true), PackingMode::Unrestricted);
+        assert_eq!(PackingMode::resolve(Some(PackingMode::Exact), false), PackingMode::Exact);
+        let chunks = [(0, 300), (100, 340), (0, 1), (0, 700), (0, 29), (0, 40)];
+        let split = |cap| groups(chunks.len(), |range|
+            plan(&chunks[range], &Limits { rows: cap, chunk_rows: 4096, max_context: 4096, taps: None }).is_ok());
+        assert_eq!(split(640), vec![0..2, 2..3, 3..4, 4..6]);
+        assert_eq!(split(4096), vec![0..6]);
+        assert_eq!(split(0), (0..6).map(|i| i..i + 1).collect::<Vec<_>>());
+        assert!(groups(0, |_| true).is_empty());
+    }
+
     #[test]
     fn layout_has_private_rows_and_taps_without_extra_storage() {
         let p = plan(&[(200, 40), (0, 80), (3000, 8)], &limits()).unwrap();

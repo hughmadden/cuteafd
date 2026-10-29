@@ -805,6 +805,7 @@ pub(crate) struct MimoEngine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
+    packed_row_cap: Cell<Option<usize>>,
     tp2: Option<Tp2<'a>>,
     rtx_local: Option<Fp8Experts<'a>>,
     pub expert_input: ExpertInput,
@@ -920,7 +921,7 @@ impl<'a> MimoEngine<'a> {
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
             max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
+            prefill_kv_wide: RefCell::new(None), experts: None, packed_row_cap: Cell::new(None), tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             drafter: None, mtp: None, l2: None, embedding,
@@ -1635,8 +1636,48 @@ impl<'a> MimoEngine<'a> {
             if all_logits { tokens.len() } else { 1 }, false)))
     }
 
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::{log_mode, PackingMode};
+        if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
+        let mut cap = self.prefill_rows;
+        if let Some(local) = &self.rtx_local { cap = cap.min(local.packed_row_cap(true, cap)?); }
+        if let Some(tp2) = &self.tp2 {
+            for rank in &tp2.ranks { cap = cap.min(rank.borrow().packed_row_cap(cap)?); }
+        }
+        let remote_layers = self.weights.layers.iter().enumerate().any(|(i, layer)|
+            !layer.dense && !self.tp2_layer(i) && !self.rtx_local_layer(i));
+        if remote_layers {
+            match &self.experts {
+                Some(Experts::Local(local)) => cap = cap.min(local.packed_row_cap(!local.wire_input(), cap)?),
+                Some(Experts::Streamed { experts, .. }) => {
+                    let local = experts.borrow();
+                    cap = cap.min(local.packed_row_cap(!local.wire_input(), cap)?);
+                },
+                Some(Experts::Spark { prefill, .. }) => {
+                    let reports = prefill.borrow().installed_grouping()?;
+                    for (i, layer) in self.weights.layers.iter().enumerate() {
+                        if layer.dense || self.tp2_layer(i) || self.rtx_local_layer(i) { continue; }
+                        let mut found = false;
+                        for report in &reports {
+                            if report.layers().iter().any(|range| (range.first as usize..range.end as usize).contains(&i)) {
+                                cap = cap.min(report.packed_row_cap(self.expert_input.bf16(false)));
+                                found = true;
+                            }
+                        }
+                        if !found { cap = 0; }
+                    }
+                }
+                Some(Experts::Skip) => {},
+                None => cap = 0,
+            }
+        }
+        self.packed_row_cap.set(Some(cap));
+        log_mode(mode, cap);
+        Ok(())
+    }
+
     pub(crate) fn packed_limits(&self) -> crate::shared::prefill_packing::Limits {
-        crate::shared::prefill_packing::Limits { rows: self.prefill_rows, chunk_rows: self.prefill_rows,
+        crate::shared::prefill_packing::Limits { rows: self.packed_row_cap.get().unwrap_or(self.prefill_rows), chunk_rows: self.prefill_rows,
             max_context: self.max_context, taps: self.drafter.as_ref().map(|_| super::dflash::TAP_ROWS) }
     }
 

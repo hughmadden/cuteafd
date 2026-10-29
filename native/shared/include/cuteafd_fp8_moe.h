@@ -24,6 +24,11 @@ extern "C" {
 // [10 .. 10+n) capacities.
 int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
 int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
+// Static arithmetic interval for the launch-selected capacity/form (including
+// auto fallback). rows must be positive. IDs: 0 unknown, 1 decode, 2 prefill,
+// 3 stream. end_rows is inclusive. Unknown forbids exact multi-member packing.
+int32_t cuteafd_fp8moe_arithmetic_route(uint32_t capacity, uint32_t form, uint32_t rows,
+                                      uint32_t* route_id, uint32_t* end_rows);
 // Static installed traffic contract for capacity/form (same fallback as launch).
 // rows=0 queries the final segment. contract=1: exact_grouping; contract=2:
 // conservative_route_upper_bound (group_rows=1, one slice per routed occurrence).

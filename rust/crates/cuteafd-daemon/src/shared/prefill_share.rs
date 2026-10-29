@@ -622,6 +622,21 @@ mod tests {
     }
 
     #[test]
+    fn zero_packing_cap_runs_every_request_alone_without_changing_its_chunk() {
+        let mut queue = PrefillQueue::new(0.0);
+        for (id, left) in [29, 40, 100].into_iter().enumerate() { queue.push(Prompt { id, left }); }
+        let mut observed = Vec::new();
+        let finished = queue.round_packed(0, 8, |p| Some(p.left), |_, _| true, |group| {
+            assert_eq!(group.len(), 1);
+            observed.push((group[0].id, group[0].left));
+            vec![Ok(Chunk::Done)]
+        });
+        assert_eq!(observed, [(0, 29), (1, 40), (2, 100)]);
+        assert_eq!(finished.len(), 3);
+        assert!(finished.into_iter().all(|(_, result)| result.is_ok()));
+    }
+
+    #[test]
     fn packed_round_is_queued_only_bounded_and_never_skips_an_ineligible_member() {
         let mut queue = PrefillQueue::new(0.2).one_wave_rounds();
         let mut groups = Vec::new();

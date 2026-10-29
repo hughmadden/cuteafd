@@ -80,7 +80,7 @@ fn installed_variants(module: &Fp8MoeModule)
                 let (group, current) = module.weight_read_group_for_capacity(capacity, rows)?;
                 ensure!(current == contract, "FP8 expert traffic contract changes within a capacity");
                 Ok(group)
-            })
+            })?.with_arithmetic_routes(|rows| module.arithmetic_route_for_capacity(capacity, rows))
     }).collect()
 }
 
@@ -370,6 +370,14 @@ pub(crate) struct Fp8Weights<'a> {
 }
 
 impl<'a> Fp8Weights<'a> {
+    pub(crate) fn packed_row_cap(&self, bf16: bool, rows: usize) -> Result<usize> {
+        let module = if bf16 && self.wire_input() {
+            self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?
+        } else { &self.module };
+        Ok(installed_variants(module)?.iter().filter_map(|v| v.packed_row_cap()).min()
+            .unwrap_or(rows).min(rows))
+    }
+
     /// Loads resident weights and code; the execution owner allocates scratch.
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {

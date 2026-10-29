@@ -1969,6 +1969,27 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
                "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
+@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash"])
+@pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
+def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
+    config = GLMF_CONFIG if family == "glm5_flash" else {
+        "model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n" + (f"PREFILL_PACKING={mode}\n" if mode else "")
+    result = _family_launch_result(tmp_path, config, "test/packed", keys)
+    assert result.returncode == 0, result.stderr
+    command = "serve-glmf" if family == "glm5_flash" else "serve-mimo"
+    launch = next(shlex.split(line) for line in result.stderr.splitlines() if f"cuteafd {command}" in line)
+    if mode is None:
+        assert "--prefill-packing" not in launch
+    else:
+        assert launch[launch.index("--prefill-packing") + 1] == mode
+
+
+def test_packed_prefill_mode_rejects_unknown_value(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "PREFILL_PACKING=approximate\n")
+    assert result.returncode == 2 and "PREFILL_PACKING must be unrestricted or exact" in result.stderr
+
+
 def test_glmf_default_launch_passes_no_admission_option(tmp_path):
     """Packed admission prefill is opt-in; the default keeps one pass per prompt."""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "")

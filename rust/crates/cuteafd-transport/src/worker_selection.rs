@@ -227,6 +227,7 @@ pub struct InstalledExpertVariant {
     group_rows: usize,
     compact_live_rows: usize,
     segments: Vec<ExpertGroupingSegment>,
+    arithmetic_routes: Vec<ExpertArithmeticRoute>,
     contract: ExpertTrafficContract,
 }
 
@@ -245,7 +246,35 @@ impl ExpertTrafficContract {
 #[serde(deny_unknown_fields)]
 struct ExpertGroupingSegment { end_rows: usize, group_rows: usize }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertArithmeticRoute { end_rows: usize, route_id: u32 }
+
 impl InstalledExpertVariant {
+    /// Unknown route metadata forces singleton execution; traffic groups are unrelated.
+    pub fn packed_row_cap(&self) -> Option<usize> {
+        if self.arithmetic_routes.is_empty() { return Some(0); }
+        (self.arithmetic_routes.len() > 1).then(|| self.arithmetic_routes[0].end_rows)
+    }
+
+    pub fn with_arithmetic_routes(mut self,
+        mut query: impl FnMut(usize) -> Result<Option<(u32, usize)>>) -> Result<Self> {
+        self.arithmetic_routes.clear();
+        let mut rows = 1;
+        while rows <= self.capacity {
+            let Some((route_id, end_rows)) = query(rows)? else {
+                self.arithmetic_routes.clear();
+                return Ok(self);
+            };
+            ensure!((1..=3).contains(&route_id) && (rows..=self.capacity).contains(&end_rows),
+                "invalid installed arithmetic route interval");
+            self.arithmetic_routes.push(ExpertArithmeticRoute { route_id, end_rows });
+            rows = end_rows + 1;
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Read the loaded execution once at startup, never from a coordinator-side manifest.
     pub fn from_queries(capacity: usize, mut query: impl FnMut(usize) -> Result<usize>) -> Result<Self> {
         ensure!((1..=4096).contains(&capacity), "invalid installed expert variant capacity");
@@ -263,7 +292,7 @@ impl InstalledExpertVariant {
             }
         }
         let variant = Self { capacity, group_rows, compact_live_rows,
-            segments: Vec::new(), contract: ExpertTrafficContract::ExactGrouping };
+            segments: Vec::new(), arithmetic_routes: Vec::new(), contract: ExpertTrafficContract::ExactGrouping };
         variant.validate()?;
         Ok(variant)
     }
@@ -280,7 +309,7 @@ impl InstalledExpertVariant {
                 last.end_rows = rows;
             } else { segments.push(ExpertGroupingSegment { end_rows: rows, group_rows: group }); }
         }
-        let variant = Self { capacity, group_rows, compact_live_rows: 0, segments, contract };
+        let variant = Self { capacity, group_rows, compact_live_rows: 0, segments, arithmetic_routes: Vec::new(), contract };
         variant.validate()?;
         Ok(variant)
     }
@@ -292,6 +321,14 @@ impl InstalledExpertVariant {
             "invalid installed expert capacity/group/compact cutoff");
         ensure!(self.group_rows != 1 || self.compact_live_rows == 0,
             "group-one expert variant cannot have a separate compact prefix");
+        if !self.arithmetic_routes.is_empty() {
+            ensure!(self.arithmetic_routes.len() <= 16
+                && self.arithmetic_routes.iter().all(|s| (1..=3).contains(&s.route_id)
+                    && (1..=self.capacity).contains(&s.end_rows))
+                && self.arithmetic_routes.windows(2).all(|p| p[0].end_rows < p[1].end_rows)
+                && self.arithmetic_routes.last().is_some_and(|s| s.end_rows == self.capacity),
+                "invalid installed arithmetic routes");
+        }
         if !self.segments.is_empty() {
             ensure!(self.compact_live_rows == 0 && self.segments.len() <= 16
                 && self.segments.iter().all(|segment| segment.end_rows > 0
@@ -371,6 +408,14 @@ impl InstalledExpertGrouping {
     }
 
     pub fn layers(&self) -> &[LayerRange] { self.loaded.ranges() }
+
+    /// The input form actually used for prefill, not its decode sibling.
+    pub fn packed_row_cap(&self, bf16: bool) -> usize {
+        let variants = if bf16 { self.bf16_variants.as_ref().unwrap_or(&self.variants) }
+            else { &self.variants };
+        variants.iter().filter_map(InstalledExpertVariant::packed_row_cap)
+            .min().unwrap_or(self.capacity).min(self.capacity)
+    }
 
     pub fn traffic_contract(&self) -> ExpertTrafficContract {
         if self.variants.iter().chain(self.bf16_variants.iter().flatten())
@@ -1755,6 +1800,53 @@ mod tests {
             ExpertGroupingSelector::Exl3Nearest, variants[..2].to_vec()).is_err());
     }
 
+    fn arithmetic_variant(capacity: usize, cutoff: usize) -> InstalledExpertVariant {
+        // Identical traffic groups deliberately erase the arithmetic transition.
+        InstalledExpertVariant::from_piecewise_queries(capacity, ExpertTrafficContract::ExactGrouping,
+            |_| Ok(64)).unwrap().with_arithmetic_routes(|rows|
+                Ok(Some(if rows <= cutoff { (1, cutoff.min(capacity)) } else { (3, capacity) }))).unwrap()
+    }
+
+    #[test]
+    fn packed_caps_follow_arithmetic_not_traffic_groups() {
+        for cutoff in [640, 1000, 80, 256, 37] {
+            let variants = [1, 16, 80, 4096].into_iter().map(|capacity|
+                arithmetic_variant(capacity, cutoff)).collect();
+            let report = InstalledExpertGrouping::new(WorkerSelection::new(identity(), &[13]).unwrap(),
+                0, 4096, ExpertGroupingSelector::Fp8Nearest, variants).unwrap()
+                .with_bf16_variants(vec![arithmetic_variant(4096, 320)]).unwrap();
+            let restored: InstalledExpertGrouping = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+            assert_eq!(restored.packed_row_cap(false), cutoff);
+            assert_eq!(restored.packed_row_cap(true), 320);
+            assert_eq!(restored.group_rows(cutoff).unwrap(), 64);
+            assert_eq!(restored.group_rows(cutoff + 1).unwrap(), 64);
+        }
+        assert_eq!(arithmetic_variant(4096, 4096).packed_row_cap(), None);
+        assert_eq!([arithmetic_variant(4096, 1000), arithmetic_variant(4096, 640)]
+            .iter().filter_map(InstalledExpertVariant::packed_row_cap).min(), Some(640));
+        let unknown = InstalledExpertVariant::from_queries(4096, |_| Ok(64)).unwrap();
+        assert_eq!(unknown.packed_row_cap(), Some(0));
+        assert_eq!(arithmetic_variant(4096, 640).with_arithmetic_routes(|_| Ok(None)).unwrap()
+            .packed_row_cap(), Some(0));
+    }
+
+    #[test]
+    fn arithmetic_route_metadata_rejects_invalid_intervals_and_preserves_unknowns() {
+        let variant = || InstalledExpertVariant::from_queries(80, |_| Ok(64)).unwrap();
+        for interval in [(1, 0), (1, 81), (4, 80)] {
+            assert!(variant().with_arithmetic_routes(|_| Ok(Some(interval))).is_err());
+        }
+        let partial = variant().with_arithmetic_routes(|rows|
+            Ok(if rows <= 16 { Some((1, 16)) } else { None })).unwrap();
+        assert_eq!(partial.packed_row_cap(), Some(0));
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let report = InstalledExpertGrouping::new(loaded, 0, 80,
+            ExpertGroupingSelector::Fp8Nearest, vec![variant()]).unwrap();
+        let restored: InstalledExpertGrouping = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(restored.packed_row_cap(false), 0);
+        assert_eq!(restored.packed_row_cap(true), 0);
+    }
+
     #[test]
     fn fp8_loaded_capacities_and_input_forms_follow_piecewise_groups() {
         let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
@@ -1832,6 +1924,8 @@ mod tests {
         report.validate_for(&identity(), 0, 128, 13..14).unwrap();
         assert_eq!(report.group_rows(128).unwrap(), 1);
         assert_eq!(report.traffic_contract().label(), "conservative_route_upper_bound");
+        assert_eq!(report.packed_row_cap(false), 0);
+        assert_eq!(report.packed_row_cap(true), 0);
         assert!(InstalledExpertVariant::from_piecewise_queries(16,
             ExpertTrafficContract::ConservativeRouteUpperBound, |_| Ok(16)).is_err());
     }

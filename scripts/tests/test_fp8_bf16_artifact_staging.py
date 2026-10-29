@@ -1,6 +1,8 @@
 """Opt-in BF16 input packages must survive staging and retain their build identity."""
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
 import hashlib
 import importlib.util
 import json
@@ -263,8 +265,20 @@ static void mock_launch(void** args, int) {{
   *static_cast<int*>(args[13]) = optins.count({{kernel_library, device}}) ? 0 : 1;
 }}
 """)
+    # Execute the pinned selector's actual metadata method without importing CUDA.
+    route_source = REPO / "third_party/sparkinfer/b12x/integration/cuteafd/fp8_moe.py"
+    tree = ast.parse(route_source.read_text())
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Fp8Moe")
+    method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "arithmetic_routes")
+    env = {"_Route": type("Route", (), {}), "_StreamRoute": type("Stream", (), {})}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(route_source), "exec"), env)
+    decode = env["_Route"]()
+    decode.route = "decode"
+    routes = env["arithmetic_routes"](SimpleNamespace(route="auto", threshold=37,
+        decode=decode, prefill=env["_StreamRoute"]()), "nvfp4" if "nvfp4" in geometry else "mxfp4", 80)
     source = package_tool.bridge_source(
         [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
+          "arithmetic_routes": routes,
           "weight_read_grouping": ({"contract": "conservative_route_upper_bound",
               "segments": [{"end_rows": 80, "group_rows": 1}]} if "nvfp4" in geometry else
               {"contract": "exact_grouping", "segments": [
@@ -288,6 +302,16 @@ static void mock_launch(void** args, int) {{
             assert lib.cuteafd_fp8moe_weight_read_group(80, form, rows, ctypes.byref(group), ctypes.byref(contract)) == 0
             assert (group.value, contract.value) == ((1, 2) if "nvfp4" in geometry else (expected, 1))
     assert lib.cuteafd_fp8moe_weight_read_group(80, 0, 81, ctypes.byref(group), ctypes.byref(contract)) != 0
+    lib.cuteafd_fp8moe_arithmetic_route.argtypes = lib.cuteafd_fp8moe_weight_read_group.argtypes
+    route, end = ctypes.c_uint(), ctypes.c_uint()
+    for form in (0, 1, 2):  # absent forms must use launch's auto fallback
+        for rows in (1, 37, 38, 80):
+            assert lib.cuteafd_fp8moe_arithmetic_route(80, form, rows, ctypes.byref(route), ctypes.byref(end)) == 0
+            assert (route.value, end.value) == ((0, 80) if "nvfp4" in geometry else
+                (1, 37) if rows <= 37 else (3, 80))
+        # Rows 37 and 38 share a traffic group, but select different arithmetic.
+        for rows in (0, 81):
+            assert lib.cuteafd_fp8moe_arithmetic_route(80, form, rows, ctypes.byref(route), ctypes.byref(end)) != 0
     assert lib.mock_initialized() == 0  # The contract query must not initialize CUDA.
     contexts = []
     for rank in (0, 1):
