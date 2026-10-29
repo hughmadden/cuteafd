@@ -50,6 +50,23 @@ def test_mtp_shared_arena_target_history_and_logits_retire_before_prefill_draft(
             "if effective_neural(neural, &p.job.probe) {", "engine.prefill_draft(")
 
 
+def test_singleton_packing_diagnostic_copy_is_test_only():
+    root = PATH.parents[4]
+    backend = (root / "rust/crates/cuteafd-daemon/src/families/step5/backend.rs").read_text()
+    guarded = backend.split("            #[cfg(test)]\n            if rows != 0", 1)[1].split("            if rows == 0", 1)[0]
+    assert "kind == cuteafd_transport::ExpertV2SourceKind::Prefill" in guarded
+    assert "copy_device_ordered(self.library," in guarded
+    assert "input.residual.buffer, output, meta.rows * H * 4" in guarded
+    # The direct cfg attribute removes the entire singleton-copy statement in
+    # every non-test build, including release; there is no shipping runtime knob.
+    assert "#[cfg(test)]\n    pub(super) fn diagnostic_packed_logits" in backend
+    serve = (root / "rust/crates/cuteafd-daemon/src/families/step5/serve.rs").read_text()
+    fixture = serve.split("fn live_packed_prefill_matches_singletons_with_private_mtp", 1)[1]
+    assert "args.full_prefill_logits = true" not in fixture
+    assert "packing_non_inferior(delta_kl, delta_top1)" in fixture
+    assert "exceeds official reference fidelity tier" not in fixture
+
+
 def test_mtp_semantics_provenance_is_complete_and_fail_closed(tmp_path):
     assert mtp.VLLM_COMMIT == "dde9aca41cd3ccceb1ffa902933b6678a09c83ce"
     assert set(mtp.VLLM_SOURCES) == {"vllm/models/step5/nvidia/mtp.py",

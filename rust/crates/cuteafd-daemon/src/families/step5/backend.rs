@@ -353,6 +353,15 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                 }
             }
             let rows = logit_rows.unwrap_or(meta.rows);
+            #[cfg(test)]
+            if rows != 0 && kind == cuteafd_transport::ExpertV2SourceKind::Prefill {
+                // Singleton controls use the same retained rows and one-row head as packed diagnostics.
+                meta.stream.device.run(|| {
+                    // SAFETY: Step retains both admitted owners through stream drainage.
+                    unsafe { crate::shared::memory::device::copy_device_ordered(self.library,
+                        input.residual.buffer, output, meta.rows * H * 4, meta.stream.raw) }
+                })?;
+            }
             if rows == 0 {
                 // Heads/MTP reuse native scratch. Preserve every member's terminal
                 // residual in the independent input owner before the first head.

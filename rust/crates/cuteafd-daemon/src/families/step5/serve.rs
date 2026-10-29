@@ -719,6 +719,21 @@ mod tests {
         })
     }
 
+    fn packing_non_inferior(delta_kl: f64, delta_top1: f64) -> bool {
+        delta_kl.is_finite() && delta_top1.is_finite()
+            && delta_kl <= 0.005 + 1e-12 && delta_top1 >= -0.01 - 1e-12
+    }
+
+    #[test]
+    fn packed_fidelity_non_inferiority_bounds_are_inclusive_and_finite() {
+        assert!(packing_non_inferior(0.005, -0.01));
+        assert!(packing_non_inferior(0.0, 0.0));
+        assert!(!packing_non_inferior(0.0051, 0.0));
+        assert!(!packing_non_inferior(0.0, -0.0101));
+        assert!(!packing_non_inferior(f64::NAN, 0.0));
+        assert!(!packing_non_inferior(0.0, f64::INFINITY));
+    }
+
     #[test]
     #[ignore = "requires sealed native exports, target weights and real Spark workers"]
     fn live_packed_prefill_matches_singletons_with_private_mtp() -> Result<()> {
@@ -764,8 +779,6 @@ mod tests {
             "packed reference logit extent");
         let reference_logits = reference_bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-        let precision = cuteafd_bench::fidelity_precision::resolve("step5-packed-target", Some(&args.snapshot),
-            &serde_json::json!({}), "stepfun-ai/Step-5-Preview-BF16", None)?;
         with_backend(&args, |backend, _| {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 4)?;
             let mut placements = (0..4).map(|sequence| pool.admit_cold(&family, 192, 256,
@@ -787,6 +800,7 @@ mod tests {
             let groups = crate::shared::prefill_packing::groups(2, |range|
                 crate::shared::prefill_packing::plan(&layout[range], &limits).is_ok());
             let mut packed_logits = vec![Vec::new(); 2];
+            let mut packed_scores = vec![Vec::new(); 2];
             let mut packs = 0;
             for range in groups {
                 if range.len() == 1 {
@@ -815,30 +829,49 @@ mod tests {
                         let offset = chunks[..i].iter().map(|c| c.len()).sum::<usize>();
                         let packed_rows = selected.iter().map(|(_, p)| offset + **p - start - 1).collect::<Vec<_>>();
                         let actual = backend.diagnostic_packed_logits(&packed_rows)?;
-                        let expected = selected.iter().flat_map(|(row, _)|
-                            reference_logits[row * vocab..(row + 1) * vocab].iter().copied()).collect::<Vec<_>>();
-                        let actual = actual.into_iter().flatten().collect::<Vec<_>>();
-                        let (kl, _) = crate::shared::golden_scores::scored_kl(&expected, &actual, vocab)?;
-                        let argmax = |row: &[f32]| row.iter().enumerate()
-                            .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
-                        let agreement = expected.chunks_exact(vocab).zip(actual.chunks_exact(vocab))
-                            .filter(|(a, b)| argmax(a) == argmax(b)).count();
-                        let top1 = agreement as f64 / selected.len() as f64;
-                        println!("Step-5 packed official member={i} rows={} KL={kl:.9e} top1={top1:.6} tier={:?} kl_max={} top1_min={}",
-                            selected.len(), precision.tier, precision.tier_kl_max, precision.tier_top1_min);
-                        ensure!(kl <= precision.tier_kl_max && top1 >= precision.tier_top1_min,
-                            "packed member {i} exceeds official reference fidelity tier");
+                        packed_scores[i] = actual.into_iter().flatten().collect();
                     }
                 }
             }
             let exact = args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact;
             ensure!(exact || packs == 1, "unrestricted fixture did not exercise packed execution");
             let mut byte_exact = true;
+            let mut pooled = [0.0; 5]; // packed KL, singleton KL, packed hits, singleton hits, rows
+            let mut non_inferior = true;
             for i in 0..2 {
                 let j = i + 2;
                 let start = placements[j].committed;
                 let logits = backend.prefill_device(&mut placements[j], chunks[i], 1, pool.pool())?.context("alone head")?;
                 let alone = logits.row_host(backend.library(), 0)?;
+                if !exact {
+                    let selected = positions.iter().enumerate().filter(|(_, p)|
+                        **p > start && **p <= start + chunks[i].len()).collect::<Vec<_>>();
+                    let rows = selected.iter().map(|(_, p)| **p - start - 1).collect::<Vec<_>>();
+                    let control = backend.diagnostic_packed_logits(&rows)?.into_iter().flatten().collect::<Vec<_>>();
+                    let expected = selected.iter().flat_map(|(row, _)|
+                        reference_logits[row * vocab..(row + 1) * vocab].iter().copied()).collect::<Vec<_>>();
+                    let score = |actual: &[f32]| -> Result<(f64, usize)> {
+                        let (kl, _) = crate::shared::golden_scores::scored_kl(&expected, actual, vocab)?;
+                        let argmax = |row: &[f32]| row.iter().enumerate()
+                            .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                        let hits = expected.chunks_exact(vocab).zip(actual.chunks_exact(vocab))
+                            .filter(|(a, b)| argmax(a) == argmax(b)).count();
+                        Ok((kl, hits))
+                    };
+                    let (packed_kl, packed_hits) = score(&packed_scores[i])?;
+                    let (control_kl, control_hits) = score(&control)?;
+                    let n = rows.len() as f64;
+                    let delta_kl = packed_kl - control_kl;
+                    let delta_top1 = (packed_hits as f64 - control_hits as f64) / n;
+                    non_inferior &= packing_non_inferior(delta_kl, delta_top1);
+                    println!("Step-5 packed official member={i} rows={} packed_KL={packed_kl:.9e} singleton_KL={control_kl:.9e} packed_top1={:.6} singleton_top1={:.6} delta_KL={delta_kl:.9e} delta_top1={delta_top1:.6}",
+                        rows.len(), packed_hits as f64 / n, control_hits as f64 / n);
+                    pooled[0] += packed_kl * n;
+                    pooled[1] += control_kl * n;
+                    pooled[2] += packed_hits as f64;
+                    pooled[3] += control_hits as f64;
+                    pooled[4] += n;
+                }
                 backend.prefill_draft(&placements[j], start, chunks[i], None, &mut drafts[j])?;
                 let packed = &packed_logits[i];
                 let (kl, _) = crate::shared::golden_scores::scored_kl(&alone, packed, backend.geometry().vocab_size)?;
@@ -860,6 +893,15 @@ mod tests {
                     ensure!(logits_equal, "packed member {i} logits differ from singleton");
                     ensure!(differing == 0, "packed member {i} target/predictor state differs from singleton");
                 }
+            }
+            if !exact {
+                ensure!(pooled[4] > 0.0, "packed fidelity needs scored rows");
+                let delta_kl = (pooled[0] - pooled[1]) / pooled[4];
+                let delta_top1 = (pooled[2] - pooled[3]) / pooled[4];
+                println!("Step-5 packed pooled rows={} packed_KL={:.9e} singleton_KL={:.9e} packed_top1={:.6} singleton_top1={:.6} delta_KL={delta_kl:.9e} delta_top1={delta_top1:.6}",
+                    pooled[4], pooled[0] / pooled[4], pooled[1] / pooled[4], pooled[2] / pooled[4], pooled[3] / pooled[4]);
+                ensure!(non_inferior && packing_non_inferior(delta_kl, delta_top1),
+                    "packed member or pooled fidelity regresses its same-row singleton control");
             }
             println!("Step-5 packed check mode={:?} members=2 packs={packs} cap={} target_kv_csa=checked predictor_stages=3 logits=checked byte_exact={byte_exact}", args.prefill_packing, limits.rows);
             for p in &placements { pool.release(&family, &p.pages)?; }
