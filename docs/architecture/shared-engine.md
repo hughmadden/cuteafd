@@ -295,7 +295,11 @@ of one unit each. It never waits for more work to arrive.
   fork publishes it through `cuteafd_fp8moe_arithmetic_route`) so a packed
   row's arithmetic equals running it alone. Use `exact` for byte-exactness
   validation.
-- Families opt in (MiMo and GLM Flash today, `run-family.sh`).
+- It is on by default wherever a family implements it, and every family
+  should: the family's prefill hooks must run attention per segment. MiMo and
+  GLM Flash do today; the other families are #847 phases 2–5.
+- Not the same thing as Spark wave merging (below): packing joins short
+  prompts on the coordinator; wave merging joins full units on a Spark.
 
 ### Deployment contract: units and span
 
