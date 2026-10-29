@@ -60,6 +60,10 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::
         "packed-check must exercise a pack when packing is enabled");
     if fallback {
         println!("packed check: exact singleton fallback only, NOT a packing gate: {}", engine.packed_fallback_reason());
+    } else if exact && members >= 6 && limits.rows <= 64 {
+        ensure!(!groups.iter().any(|group| group.contains(&3) && group.contains(&4)),
+            "exact packed group crosses the adjacent 64/65-row owner boundary");
+        println!("packed check: exact cap {}, adjacent 64/65-row members split", limits.rows);
     }
     let prompts = lengths.iter().enumerate().map(|(i, &rows)| sequence(tokens, i, prefix(i) + rows)).collect::<Vec<_>>();
     let mut allocator = PageAllocator::new(engine);
