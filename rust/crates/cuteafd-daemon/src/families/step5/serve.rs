@@ -40,6 +40,9 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight: Spark waves outstanding on the one transport.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     prefill_waves: u8,
+    /// Pack queued short prompts, optionally preserving singleton arithmetic routes.
+    #[arg(long, value_enum, default_value = "unrestricted")]
+    prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -330,7 +333,8 @@ fn with_backend<T>(args: &ServeArgs,
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
-            args.prefill_rows as usize)?)?;
+            args.prefill_rows as usize)?)?
+        .configure_packing(args.prefill_packing)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,

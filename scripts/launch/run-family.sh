@@ -2058,7 +2058,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 prefill_packing="$(get PREFILL_PACKING)"
 if [[ -n "$prefill_packing" ]]; then
-  [[ "$family" == mimo_v2 || "$family" == glm5_flash ]] || { echo "PREFILL_PACKING applies to MiMo and GLM Flash" >&2; exit 2; }
+  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 ]] || { echo "PREFILL_PACKING applies to MiMo, GLM Flash and Step-5" >&2; exit 2; }
   case "$prefill_packing" in
     unrestricted|exact) family_args+=(--prefill-packing "$prefill_packing") ;;
     *) echo "PREFILL_PACKING must be unrestricted or exact" >&2; exit 2 ;;

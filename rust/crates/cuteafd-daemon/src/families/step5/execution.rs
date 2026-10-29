@@ -606,6 +606,18 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(self.main.caches.iter().all(|cache| !cache.borrow().poisoned.get()), "Step-5 poisoned cache");
         Ok(())
     }
+    pub(super) fn packed_row_cap(&self, rows: usize) -> Result<usize> {
+        let transport = self.main.transport.borrow();
+        let reports = transport.as_ref().context("Step-5 main transport missing")?.installed_grouping()?;
+        let inputs = (3..91).map(|layer| -> Result<_> {
+            let owner = owner_of(&self.main, layer)?.unwrap_or(0);
+            let Ffn::Routed(ffn) = &self.main.layer(owner, layer)?.ffn else {
+                anyhow::bail!("Step-5 routed layer missing from packing admission");
+            };
+            Ok((layer, ffn.wire_dtype() == ExpertV2Dtype::Bf16))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(packed_route_cap(rows, &reports, &inputs))
+    }
     pub(super) fn draft_geometry(&self, width: usize, rows: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let transport = self.main.transport.borrow();
@@ -814,6 +826,22 @@ impl<E: CopyEngine> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<
         // KV, rings and summaries were staged per unit; the step publishes once.
         Ok(())
     }
+}
+
+pub(super) fn packed_route_cap(rows: usize,
+    reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping], inputs: &[(usize, bool)]) -> usize {
+    let mut cap = rows;
+    for &(layer, bf16) in inputs {
+        let mut found = false;
+        for report in reports {
+            if report.layers().iter().any(|range| (range.first as usize..range.end as usize).contains(&layer)) {
+                cap = cap.min(report.packed_row_cap(bf16));
+                found = true;
+            }
+        }
+        if !found { return 0; }
+    }
+    cap
 }
 
 /// The attention owner of a whole-owned layer, or None for head split.
