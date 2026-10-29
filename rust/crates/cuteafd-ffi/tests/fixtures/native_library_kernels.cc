@@ -4,6 +4,9 @@
 
 #include "../../../../../native/shared/cuda/fp8_load_quant.h"
 
+// A synthetic device count keeps owner construction CPU-only.
+extern "C" int32_t cuteafd_sm_count() { return 1; }
+
 extern "C" int32_t cuteafd_fp8_load_quant(const void* jobs, int32_t count, void* stream) {
   (void)stream;
   if (count < 0) return 1;
@@ -26,10 +29,20 @@ extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64
   return 0;
 }
 
-extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int64_t n, void* stream) {
+extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int64_t n, int32_t sms, void* stream) {
   (void)stream;
+  if (n < 1 || sms < 1) return 1;
   for (int64_t i = 0; i < n; ++i)
     static_cast<uint16_t*>(dst)[i] = cuteafd_load_quant::narrow_f32(static_cast<const uint32_t*>(src)[i]);
+  return 0;
+}
+
+extern "C" int32_t cuteafd_bf16_f32_add_async(const uint16_t* rank0, const uint16_t* rank1,
+                                              float* dst, size_t n, int32_t sms, void* stream) {
+  (void)stream;
+  if (n < 1 || sms < 1) return 1;
+  for (size_t i = 0; i < n; ++i)
+    dst[i] = cuteafd_load_quant::partial_add_bf16_f32(rank0[i], rank1[i]);
   return 0;
 }
 

@@ -326,9 +326,11 @@ impl<'a> StepRows<'a> {
             head: shared.head.clone(), _head_workspace: shared.head_workspace.clone(),
             core_head: shared.core_head.clone(), core: shared.core.clone(),
             core_rows: self.core_rows.as_ref().map(|arenas| -> Result<_> {
-                let width = arenas[0].buffer.bytes / self.rows;
-                Ok([arenas[0].view(first * width, rows * width)?,
-                    arenas[1].view(first * width, rows * width)?, arenas[2].view(first * width, rows * width)?])
+                let view = |plane: usize| {
+                    let width = arenas[plane].buffer.bytes / self.rows;
+                    arenas[plane].view(first * width, rows * width)
+                };
+                Ok([view(0)?, view(1)?, view(2)?])
             }).transpose()? })
     }
 }
@@ -673,7 +675,7 @@ impl<'a> GlmEngine<'a> {
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let core_bytes = if layers.iter().chain(&self.weights.layers).any(|layer|
-            layer.core.values().any(|weight| weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)) { 4 } else { 0 };
+            layer.core.values().any(|weight| weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)) { 2 } else { 0 };
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * self.prefill_lanes.max(1),
             rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes))?;
@@ -918,8 +920,9 @@ impl<'a> GlmEngine<'a> {
                 .map(Buf::owned)).transpose()?,
             page_tables: (0..slots).map(|_| self.alloc(tables).map(Buf::owned)).collect::<Result<_>>()?,
             core_rows: if self.core_programs.get(rank).is_some_and(Option::is_some) {
-                let allocate = || self.alloc(rows * self.cfg.hidden * 4).map(Buf::owned);
-                Some([allocate()?, allocate()?, allocate()?])
+                // Attention/down retain BF16; their ordered sum remains F32.
+                let allocate = |element_bytes| self.alloc(rows * self.cfg.hidden * element_bytes).map(Buf::owned);
+                Some([allocate(2)?, allocate(2)?, allocate(4)?])
             } else { None } })
     }
 

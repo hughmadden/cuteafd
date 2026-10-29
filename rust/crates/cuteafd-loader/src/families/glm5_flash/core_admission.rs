@@ -46,7 +46,7 @@ impl CoreRankLayout {
         if let Some(stages) = &self.stages { for stage in stages {
             bytes = bytes.checked_add(stage.bytes()?).context("Flash K6 stage sum overflow")?;
         } }
-        let retained = self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(12))
+        let retained = self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
             .context("Flash K6 retained rows overflow")?;
         Ok(bytes.checked_add(retained).context("Flash K6 allocation total overflow")? as u64)
     }
@@ -63,7 +63,7 @@ pub fn owned_mla(cfg: &GlmNextConfig, layers: usize, ranks: usize, whole: bool) 
 pub fn receive_suffix_bytes(rows: usize, hidden: usize, waves: usize, output_shard: bool) -> Result<usize> {
     (if output_shard { 6usize } else { 4 }).checked_mul(waves)
         .and_then(|n| n.checked_mul(rows)).and_then(|n| n.checked_mul(hidden))
-        .and_then(|n| n.checked_mul(4)).context("Flash K6 receive overflow")
+        .and_then(|n| n.checked_mul(2)).context("Flash K6 receive overflow")
 }
 impl CoreCharges {
     #[allow(clippy::too_many_arguments)]
@@ -195,9 +195,9 @@ mod tests {
         let stage = CoreStageLayout::new(&cfg, 64, 2, false, 4096)?;
         let rank = CoreRankLayout { body: vec![], stages: Some([stage.clone(), stage.clone()]),
             decode: Some(p.clone()), prefill: Some(p.clone()), target_head: Some(p.clone()), draft_head: Some(p.clone()),
-            retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * 4096 * 4 };
+            retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * 4096 * 2 };
         assert_eq!(rank.bytes(4096)?, (4 * p.bytes()? + 2 * stage.bytes()? + rank.receive_suffix
-            + rank.retained_rows * 4096 * 12) as u64);
+            + rank.retained_rows * 4096 * 8) as u64);
         let mut overflow = rank; overflow.retained_rows = usize::MAX;
         assert!(overflow.bytes(4096).is_err());
         Ok(())

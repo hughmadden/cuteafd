@@ -90,6 +90,10 @@ __global__ void narrow_kernel(const uint32_t* src, uint16_t* dst, int64_t n) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
     dst[i] = lq::narrow_f32(src[i]);
 }
+__global__ void partial_add_kernel(const uint16_t* a, const uint16_t* b, float* dst, int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
+    dst[i] = lq::partial_add_bf16_f32(a[i], b[i]);
+}
 __global__ void absorb_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv, int64_t h0, int64_t heads,
                               int64_t nope, int64_t v, int64_t lat) {
   const int64_t nk = heads * lat * nope, nv = heads * v * lat;
@@ -122,11 +126,14 @@ __global__ void trellis_tiles_kernel(const uint4* src, uint4* dst, int64_t rows,
     dst[lq::trellis_tile(side, k0 + r, c, tiles, k16) * words + i % words] = src[i];
   }
 }
+unsigned grid_for(int64_t n, int sms) {
+  return unsigned(std::min<int64_t>((n + 255) / 256, int64_t(sms) * 8));
+}
 unsigned grid_for(int64_t n) {
   int device = 0, sms = 0;
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-  return unsigned(std::min<int64_t>((n + 255) / 256, int64_t(sms > 0 ? sms : 1) * 8));
+  return grid_for(n, sms > 0 ? sms : 1);
 }
 }  // namespace
 
@@ -139,10 +146,18 @@ extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64
 }
 
 // F32 -> BF16 (round to nearest even) of n values (see fp8_load_quant.h).
-extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int64_t n, void* stream) {
-  if (n < 1) return cudaErrorInvalidValue;
-  narrow_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int64_t n, int32_t sms, void* stream) {
+  if (n < 1 || n > INT64_MAX - 255 || sms < 1) return cudaErrorInvalidValue;
+  narrow_kernel<<<grid_for(n, sms), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint32_t*>(src), static_cast<uint16_t*>(dst), n);
+  return cudaGetLastError();
+}
+
+// Retained rank partials widen exactly before the ordered F32 sum; egress stays separate.
+extern "C" int32_t cuteafd_bf16_f32_add_async(const uint16_t* a, const uint16_t* b, float* dst,
+                                            size_t n, int32_t sms, void* stream) {
+  if (n < 1 || n > size_t(INT64_MAX - 255) || sms < 1) return cudaErrorInvalidValue;
+  partial_add_kernel<<<grid_for(int64_t(n), sms), 256, 0, static_cast<cudaStream_t>(stream)>>>(a, b, dst, int64_t(n));
   return cudaGetLastError();
 }
 

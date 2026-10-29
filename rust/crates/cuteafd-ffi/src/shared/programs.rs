@@ -691,11 +691,9 @@ impl NativeLibrary {
     /// `src` holds `n` F32 and `dst` room for `n` BF16, live through the stream.
     pub unsafe fn load_narrow_f32_bf16(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
         -> Result<()> {
-        type Narrow = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
-        let f = *unsafe { self.lib.get::<Narrow>(b"cuteafd_load_narrow_f32_bf16") }?;
-        let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
-        ensure!(status == 0, "F32 load narrowing failed with {status}");
-        Ok(())
+        let narrow = self.f32_bf16_narrow()?;
+        // SAFETY: caller provides the typed live storage on the current device.
+        unsafe { narrow.launch(src, dst, n, stream) }
     }
 
     /// `n` BF16 pairs `a[i]`, `b[i]` (device-visible) promoted to F32 and

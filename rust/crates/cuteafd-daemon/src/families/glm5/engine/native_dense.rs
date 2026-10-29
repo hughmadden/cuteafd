@@ -328,7 +328,7 @@ impl<'a> GlmEngine<'a> {
     fn core_received(&self, rank: usize, slot: usize, rows: usize) -> Result<Buffer> {
         let exchange = self.exchange()?;
         let offset = self.prefill_rows.max(DECODE_ROWS) * self.cfg.hidden * self.tp2_exchange.element_bytes();
-        let bytes = rows * self.cfg.hidden * 4;
+        let bytes = rows * self.cfg.hidden * 2;
         ensure!(offset + bytes <= exchange.slot_bytes(), "GLM K6 peer core exceeds admitted receive slot");
         let base = Buffer { ptr: exchange.recv(rank, slot)?, bytes: exchange.slot_bytes(),
             device_id: exchange.device(rank), flags: 0 };
@@ -341,7 +341,7 @@ impl<'a> GlmEngine<'a> {
         if Self::core_split(layer, key) {
             let core = &w.core_rows.as_ref().context("GLM K6 retained core rows")?[usize::from(key == "down")];
             self.exchange()?.push_to(rank, at, core.buffer.ptr,
-                self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 4)
+                self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 2)
         } else {
             self.exchange()?.push(rank, at, w.delta.buffer.ptr, rows * self.cfg.hidden * 2)
         }
@@ -354,7 +354,8 @@ impl<'a> GlmEngine<'a> {
         let retained = w.core_rows.as_ref().context("GLM K6 retained core rows")?;
         let local = retained[usize::from(key == "down")].buffer;
         let peer = self.core_received(rank, slot(index, key == "down", lane), rows)?;
-        // Rank-ordered F32 addition precedes the one complete H128/svh egress.
+        // Widen retained BF16 cores for rank-ordered F32 addition, then run
+        // the one complete H128/svh egress.
         let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
         self.on(rank, || programs.projection(weights)?.reduced(&programs.add, rows,
             first, second, retained[2].buffer, weights, output, self.stream_of(rank)))
@@ -395,8 +396,8 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    /// Input-side projections retain F32 cores before any following projection
-    /// reuses the serialized accumulator. Their caller owns the peer meet.
+    /// Input-side projections narrow F32 cores to retained BF16 before any
+    /// following projection reuses the accumulator. Their caller owns the meet.
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
         input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
         let weights = layer.core.get(key).with_context(|| format!("GLM K6 missing {key}"))?;
@@ -408,9 +409,8 @@ impl<'a> GlmEngine<'a> {
             if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
                 let core = projection.core(rows, input, weights, &scratch.projection, stream)?;
                 let retained = retained.context("GLM K6 split core has no retained row storage")?;
-                // SAFETY: both rank-local extents remain live; this copy precedes
-                // subsequent projections and publication on the same stream.
-                unsafe { self.library.copy_d2d_async(retained, core, rows * weights.shape[0] * 4, stream) }
+                crate::shared::dense_trellis::retain_partial(&programs.narrow, core, retained,
+                    rows * weights.shape[0], stream)
             } else { projection.local(rows, input, weights, &scratch.projection, output, stream) }
         })
     }

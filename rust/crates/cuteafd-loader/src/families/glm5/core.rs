@@ -43,8 +43,8 @@ pub fn expected(cfg: &GlmDsaConfig) -> BTreeMap<String, Vec<usize>> {
     shapes
 }
 
-/// Serialized BF16 stage operands beside the shared projection arena. F32
-/// partials live in each row slot, not here: they outlive the producer hook.
+/// Serialized BF16 stage operands beside the shared projection arena. Retained
+/// BF16 partials and their F32 sum live in row slots and outlive the producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreStageLayout { pub extents: BTreeMap<&'static str, usize> }
 impl CoreStageLayout {
@@ -163,7 +163,8 @@ impl CoreRankLayout {
             add(layout.bytes()?)?;
         }
         if let Some(stages) = &self.stages { for stage in stages { add(stage.bytes()?)?; } }
-        add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(3 * 4))
+        // Two BF16 retained partials and one F32 ordered reduction output.
+        add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(2 + 2 + 4))
             .context("GLM K6 retained plane extent overflow")?)?;
         Ok(bytes as u64)
     }
@@ -243,7 +244,7 @@ impl CoreCharges {
                 retained_rows: if body.is_empty() { 0 } else { 64usize.checked_add(span).context("GLM K6 row span")? },
                 receive_suffix: if ranks == 2 && split { 4usize.checked_mul(slots)
                     .and_then(|n| n.checked_mul(unit.max(64))).and_then(|n| n.checked_mul(cfg.hidden))
-                    .and_then(|n| n.checked_mul(4)).context("GLM K6 receive suffix overflow")? } else { 0 },
+                    .and_then(|n| n.checked_mul(2)).context("GLM K6 receive suffix overflow")? } else { 0 },
                 body, target_head, draft_head,
             });
         }
@@ -371,7 +372,7 @@ mod tests {
         let core = CoreInventory::from_checkpoint(&cfg, &checkpoint(&cfg))?;
         let manifest = package(&cfg, &core)?;
         for ranks in [1, 2] { for owners in if ranks == 1 { vec![None] } else { vec![None, Some([0, 1])] } {
-            for (unit, slots) in [(64, 1), (2048, 2), (2752, 3), (4096, 4)] {
+            for (unit, slots) in [(1, 1), (32, 2), (64, 1), (2048, 2), (2752, 3), (4096, 4)] {
                 for draft in [None, Some(128)] {
                     let charge = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, owners.as_ref().map(|o| o.as_slice()),
                         unit, slots, draft, &manifest)?;
@@ -394,8 +395,8 @@ mod tests {
                             expected += stage.extents.values().sum::<usize>();
                         }
                         assert_eq!(layout.retained_rows, 64 + crate::placement::families::glm5::prefill_span(unit as u64, slots as u64) as usize);
-                        expected += layout.retained_rows * cfg.hidden * 3 * 4;
-                        let suffix = if ranks == 2 { 4 * slots * unit.max(64) * cfg.hidden * 4 } else { 0 };
+                        expected += layout.retained_rows * cfg.hidden * (2 + 2 + 4);
+                        let suffix = if ranks == 2 { 4 * slots * unit.max(64) * cfg.hidden * 2 } else { 0 };
                         assert_eq!(layout.receive_suffix, suffix);
                         expected += suffix;
                         assert_eq!(layout.target_head.is_some(), rank == 0);

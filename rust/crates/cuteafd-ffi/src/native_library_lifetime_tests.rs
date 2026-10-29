@@ -38,6 +38,31 @@ fn symbols_resolve_once_and_optional_exports_stay_lazy() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn cached_k6_wire_owners_match_diagnostic_rounding() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let narrow = library.f32_bf16_narrow()?;
+    let add = library.bf16_f32_add()?;
+    let source = [f32::from_bits(0x3f808000), f32::from_bits(0x3f818000), f32::INFINITY, f32::NEG_INFINITY];
+    let mut rank0 = [0u16; 4];
+    let rank1 = [0xbf80u16, 0xbf80, 0x7f80, 0xff80];
+    let mut output = [0f32; 4];
+    let view = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: 0, flags: 0 };
+    // SAFETY: the fixture uses live, disjoint host arrays and a synthetic stream.
+    unsafe {
+        narrow.launch(source.as_ptr().cast(), rank0.as_mut_ptr().cast(), 4, std::ptr::null_mut())?;
+        add.launch(view(rank0.as_mut_ptr().cast(), 8), view(rank1.as_ptr().cast_mut().cast(), 8),
+            view(output.as_mut_ptr().cast(), 16), 4, std::ptr::null_mut())?;
+    }
+    assert_eq!(rank0, [0x3f80, 0x3f82, 0x7f80, 0xff80]);
+    assert_eq!(output.map(f32::to_bits), [0, 0x3c800000, 0x7f800000, 0xff800000]);
+    assert!(library.symbols.cuteafd_load_narrow_f32_bf16.get().unwrap().is_ok());
+    assert!(library.symbols.cuteafd_bf16_f32_add_async.get().unwrap().is_ok());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
