@@ -1988,6 +1988,7 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     if family == "qwen3_5":
         keys += "SPARK_COUNT=0\n"
     result = _family_launch_result(tmp_path, config, "test/packed", keys,
+        deployment_overrides={"executable": True} if family == "qwen3_5" else None,
         encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else
             {"placement_supported": True, "fits": True, "spark_ranks": 0} if family == "qwen3_5" else None)
     assert result.returncode == 0, result.stderr

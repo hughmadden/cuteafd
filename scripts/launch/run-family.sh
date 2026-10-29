@@ -167,6 +167,7 @@ GATEWAY
 EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
+PREFILL_PACKING
 SPECULATOR_DEPTH
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
@@ -377,9 +378,6 @@ DRAFT_SEQUENCES
 DRAFT_KV_CACHE
 SPECULATOR_FP8
 EOF
-      ;;
-    qwen3_5)
-      echo PREFILL_PACKING
       ;;
     qwen4)
       cat <<'EOF'
