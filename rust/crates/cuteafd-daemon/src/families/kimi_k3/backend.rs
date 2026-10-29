@@ -356,8 +356,86 @@ mod tests {
         Ok((kl / reference.len() as f64, matches as f64 / reference.len() as f64))
     }
 
+    fn live_golden_packed(backend: &KimiBackend<'_, '_>, pool: &mut RefPagePool) -> Result<()> {
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+        use cuteafd_bench::fidelity_dataset;
+        use cuteafd_engine::prefix::PrefixFamily;
+        use sha2::{Digest, Sha256};
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_KIMI_PACK_GATE_GOLDEN")?);
+        let bytes = std::fs::read(root.join("manifest.json"))?;
+        ensure!(format!("{:x}", Sha256::digest(&bytes)) == fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
+            "Kimi packing golden manifest differs from immutable publication");
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+        ensure!(manifest["config"] == fidelity_dataset::KIMI_K3_CONFIG && manifest["vocab"] == 163840,
+            "Kimi packing golden identity differs");
+        let reference = fidelity_dataset::load(&root, &manifest)?;
+        let windows = ["c00", "d00", "e00"].into_iter().map(|id| {
+            let mut window = reference.windows.iter().find(|w| w.id == id)
+                .with_context(|| format!("Kimi packing golden lacks {id}"))?.clone();
+            // Sixteen immutable positions per member: later packs have 3 x 32
+            // rows, crossing the 64-row router boundary without new reference data.
+            window.positions = window.positions.iter().step_by(32).take(16).cloned().collect();
+            ensure!(window.positions.len() == 16 && window.media.is_empty(), "Kimi packing golden coverage");
+            Ok(window)
+        }).collect::<Result<Vec<_>>>()?;
+        let family = backend.engine.prefix_family()?;
+        let mut placements = windows.iter().enumerate().map(|(slot, window)| {
+            let end = window.positions.last().context("Kimi packing golden empty")?.pos;
+            let mut placement = Placement { units: pool.alloc(end.div_ceil(64))?, slot, len: 0, state_len: 0 };
+            family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            family.admit_draft_pages(&mut placement, end).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Ok(placement)
+        }).collect::<Result<Vec<_>>>()?;
+        let mut states = (0..windows.len()).map(|_| DraftState::default()).collect::<Vec<_>>();
+        let probes = windows.iter().map(|window| {
+            let probe = Probe::new(ProbeSpec { score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
+                want: window.want(), ..Default::default() });
+            probe.admitted("kimi_k3", &window.tokens, 0);
+            probe
+        }).collect::<Vec<_>>();
+        for (i, first_rows) in [29, 65, 127].into_iter().enumerate() {
+            let end = windows[i].positions[0].pos.checked_sub(first_rows).context("Kimi golden prefix too short")?;
+            while placements[i].len < end {
+                let start = placements[i].len;
+                let next = (start + backend.engine.packed_limits()?.chunk_rows).min(end);
+                let chunk = &windows[i].tokens[start..next];
+                backend.prefill_device(&mut placements[i], chunk, 1, pool)?;
+                backend.prefill_draft(&placements[i], start, chunk, Some(windows[i].tokens[next]), &mut states[i])?;
+            }
+        }
+        for round in 0..16 {
+            let mut sequences = placements.iter_mut().zip(&mut states).enumerate().map(|(i, (placement, draft))| {
+                let end = windows[i].positions[round].pos;
+                let start = placement.len;
+                scheduler::PrefillSeq { placement, tokens: &windows[i].tokens[start..end], start,
+                    next: Some(windows[i].tokens[end]), draft, neural: true }
+            }).collect::<Vec<_>>();
+            ensure!(sequences.iter().map(|s| s.tokens.len()).sum::<usize>() > 64,
+                "Kimi golden pack must cross the total-row arithmetic boundary");
+            let outcomes = backend.prefill_packed(&mut sequences, pool, &mut |i, row| {
+                let logits = row.row_host(backend.library(), 0)?;
+                probes[i].row(windows[i].positions[round].pos, &logits);
+                Ok(Ok(()))
+            })?;
+            for outcome in outcomes { outcome?; }
+        }
+        let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Low.bars();
+        for (i, window) in windows.iter().enumerate() {
+            let score = window.score(&probes[i].record().rows);
+            println!("Kimi packed original golden member {i} {}: rows={} missing={} nonfinite={} KL={:.8} top1={:.4}",
+                window.id, score.positions, score.missing, score.non_finite, score.kl, score.top1);
+            ensure!(score.positions == window.positions.len() && score.missing == 0 && score.non_finite == 0
+                && score.kl <= kl_max && score.top1 >= top1_min,
+                "Kimi packed member {i} exceeds original-model fidelity tier");
+            family.drain().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            family.discard(&mut placements[i]).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            pool.release(&placements[i].units);
+        }
+        Ok(())
+    }
+
     #[test]
-    #[ignore = "requires two RTX GPUs, six live Spark workers, DFlash2 and CUTEAFD_KIMI_PACK_GATE_ARGS JSON serve-kimi argv plus CUTEAFD_KIMI_PACK_GATE_TOKENS JSON token IDs"]
+    #[ignore = "requires two RTX GPUs, six live Spark workers, DFlash2, CUTEAFD_KIMI_PACK_GATE_ARGS JSON serve-kimi argv, CUTEAFD_KIMI_PACK_GATE_TOKENS JSON token IDs and CUTEAFD_KIMI_PACK_GATE_GOLDEN immutable reference directory"]
     fn live_packed_prefill_matches_singletons_with_private_dflash() -> Result<()> {
         use anyhow::Context;
         use clap::Parser;
@@ -409,22 +487,19 @@ mod tests {
         let mut changed = prompts.clone();
         for (i, token) in changed[1].iter_mut().enumerate() { *token = source[(i + 11) % source.len()]; }
         let partner = live_arm(&backend, &mut pool, &changed, true, false)?;
-        let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Low.bars();
         for i in 0..prompts.len() {
             let (kl, top1) = live_logits_score(&alone[i].logits, &packed[i].logits)?;
-            println!("Kimi packed member {i}: KL={kl:.8} top1={top1:.4} target_bytes_equal={} draft_bytes_equal={}",
+            println!("Kimi packed-vs-singleton member {i} (informational): KL={kl:.8} top1={top1:.4} target_bytes_equal={} draft_bytes_equal={}",
                 alone[i].state == packed[i].state, alone[i].draft == packed[i].draft);
-            ensure!(kl <= kl_max && top1 >= top1_min, "Kimi packed member {i} exceeds fidelity tier");
             ensure!(packed[i].logits == cancelled[i].logits && packed[i].state == cancelled[i].state
                 && packed[i].draft == cancelled[i].draft, "Kimi cancellation changed member {i}");
             if i != 1 {
                 let (kl, top1) = live_logits_score(&packed[i].logits, &partner[i].logits)?;
-                println!("Kimi changed partner member {i}: KL={kl:.8} top1={top1:.4} target_bytes_equal={} draft_bytes_equal={}",
+                println!("Kimi changed partner member {i} (informational): KL={kl:.8} top1={top1:.4} target_bytes_equal={} draft_bytes_equal={}",
                     packed[i].state == partner[i].state, packed[i].draft == partner[i].draft);
-                ensure!(kl <= kl_max && top1 >= top1_min, "Kimi changed partner member {i} exceeds fidelity tier");
             }
         }
-        Ok(())
+        live_golden_packed(&backend, &mut pool)
     }
 
     #[test]
