@@ -9,6 +9,9 @@ use serde_json::Value;
 /// Maximum queued prompts sharing a V4 prefill unit and its private tap tails.
 pub const V4_PACKED_MEMBERS: usize = 16;
 
+/// Per-member compressor headers plus padding for 16-byte-aligned table views.
+pub const V4_PACKED_TABLE_EXTRA_ROWS: usize = 6 * V4_PACKED_MEMBERS;
+
 /// Decode retains one window; packed prefill admits one window per member.
 pub fn deepseek_v4_tap_rows(rows: usize, prefill: bool) -> usize {
     rows.min(128 * if prefill { V4_PACKED_MEMBERS } else { 1 })
@@ -87,7 +90,7 @@ pub struct V4WorkspaceRank {
     /// Everything except the pool-unit-sized C4 page tables.
     pub fixed_device_bytes: u64,
     pub prefill_waves: u64,
-    /// C4 page tables: one request list per prefill slot, one list per decode row.
+    /// C4 page tables: private packed member lists per prefill slot, one list per decode row.
     pub pool_unit_device_bytes: u64,
     /// Pinned router staging, reported outside GPU admission.
     pub pinned_host_bytes: u64,
@@ -110,8 +113,9 @@ impl V4WorkspaceRank {
                         product(
                             "V4 prefill lane table",
                             &[units, self.prefill_lane_table_unit_bytes],
-                        )?
-                        .max(256),
+                        )?.checked_add((V4_PACKED_MEMBERS * 3 * 4) as u64)
+                            .ok_or(CacheGeometryError::Overflow("V4 packed page padding"))?
+                        .max(256) - (V4_PACKED_MEMBERS * 3 * 4) as u64,
                     ],
                 )?,
                 product(
@@ -206,13 +210,14 @@ pub fn deepseek_v4_workspace_geometry(
             }, false)?;
             Ok(V4WorkspaceRank {
                 prefill_waves: waves,
-                fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
+                fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0,
+                    product("V4 packed page padding", &[waves, V4_PACKED_MEMBERS as u64, 3, 4])?])?,
                 pool_unit_device_bytes: sum(
                     "V4 prefill/decode table slope",
-                    &[product("V4 prefill table slope", &[waves, 4])?, decode.1],
+                    &[product("V4 prefill table slope", &[waves, V4_PACKED_MEMBERS as u64, 4])?, decode.1],
                 )?,
                 pinned_host_bytes: sum("V4 prefill/decode pinned staging", &[prefill.2, decode.2])?,
-                prefill_lane_table_unit_bytes: 4,
+                prefill_lane_table_unit_bytes: V4_PACKED_MEMBERS as u64 * 4,
                 decode_lane_table_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
             })
         })
@@ -235,8 +240,11 @@ fn step(
     let topk = cfg.n_activated_experts as u64;
     let lead = |bytes: u64| if rank == 0 { bytes } else { 256 };
     let draft = |bytes: u64| if rank == 0 && cfg.n_mtp_layers > 0 { bytes } else { 0 };
+    // Packed fields retain private headers and 16-byte-aligned member views.
+    let table_rows = rows.checked_add(if prefill { V4_PACKED_TABLE_EXTRA_ROWS as u64 } else { 0 })
+        .ok_or(CacheGeometryError::Overflow("V4 packed table rows"))?;
     // Eighteen metadata arrays (C4/C128 x9); four length/visible arrays.
-    let metadata_rows = rows
+    let metadata_rows = table_rows
         .checked_add(2)
         .ok_or(CacheGeometryError::Overflow("V4 metadata rows"))?;
     let lane_allocations = [
@@ -252,11 +260,11 @@ fn step(
             h,
             2,
         ])?),
-        mul(&[rows, 8])?,
-        mul(&[rows, 8])?,
-        mul(&[rows, 128, 4])?,
+        mul(&[table_rows, 8])?,
+        mul(&[table_rows, 8])?,
+        mul(&[table_rows, 128, 4])?,
         // c128_indices is a compiled context-sized table, not a pool table.
-        mul(&[rows, c128_width, 4])?,
+        mul(&[table_rows, c128_width, 4])?,
     ];
     let lane = sum("V4 lane allocations", &lane_allocations.map(|n| n.max(256)))?;
     let lane = sum(
@@ -264,7 +272,7 @@ fn step(
         &[
             lane,
             mul(&[18, mul(&[metadata_rows, 4])?.max(256)])?,
-            mul(&[4, mul(&[rows, 4])?.max(256)])?,
+            mul(&[4, mul(&[table_rows, 4])?.max(256)])?,
         ],
     )?;
     let fixed_allocations = [
@@ -392,11 +400,12 @@ mod tests {
             decode_shared_bytes: 490_734_592,
             decode_index_topk_bytes: 558_007_296,
         };
+        let packed_tables = 2 * (96 * (16 + 512 + 16 + 1024 * 4 + 18 * 4) + 15 * 1032 * 4 + 16 * 3 * 4);
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_677_619_184 - (2 * 4096 + 64) * 4096 * 4);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_330_410_480 - (2 * 4096 + 64) * 4096 * 4);
-        assert_eq!(flash[0].pool_unit_device_bytes, (2 + 64) * 4);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_677_619_184 - (2 * 4096 + 64) * 4096 * 4 + packed_tables);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_330_410_480 - (2 * 4096 + 64) * 4096 * 4 + packed_tables);
+        assert_eq!(flash[0].pool_unit_device_bytes, (2 * V4_PACKED_MEMBERS as u64 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
             4096,
@@ -411,8 +420,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_906_392_560 - (2 * 4096 + 64) * 7168 * 4);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_286_554_096 - (2 * 4096 + 64) * 7168 * 4);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_906_392_560 - (2 * 4096 + 64) * 7168 * 4 + packed_tables);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_286_554_096 - (2 * 4096 + 64) * 7168 * 4 + packed_tables);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes

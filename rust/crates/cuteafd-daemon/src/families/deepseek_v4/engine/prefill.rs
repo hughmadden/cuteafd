@@ -149,7 +149,8 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         let tokens = &self.tokens[unit.rows.clone()];
         e.route_check_unit(unit.slot, unit.index);
         e.embedding.check(tokens)?;
-        e.fill(&lane.tables, tables)?;
+        if let Some(members) = self.packed { e.stage_packed_tables(0, &lane.tables, members)?; }
+        else { e.fill(&lane.tables, tables)?; }
         e.upload(lane.tokens.buffer, bytes_of(tokens))?;
         if e.embedding.device_gather() {
             e.gather_streams(lane, tokens.len())?;
@@ -160,7 +161,8 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         if let Some(w1) = self.w1 {
             let peer = &w1.slots[unit.slot];
             e.on(1, || {
-                e.fill(&peer.tables, tables)?;
+                if let Some(members) = self.packed { e.stage_packed_tables(1, &peer.tables, members)?; }
+                else { e.fill(&peer.tables, tables)?; }
                 e.upload(peer.tokens.buffer, bytes_of(tokens))
             })?;
             if e.context.is_some() && self.packed.is_none() {
@@ -263,7 +265,6 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         let e = self.engine;
         if let Some(members) = self.packed {
             for member in members {
-                e.fill(&member.views[0].tables, &member.tables)?;
                 e.write_draft_kv(self.w, &member.views[0], member.segment.rows, e.prefill_rows)?;
             }
         } else if retains_draft_rows(&unit.rows, self.tokens.len()) {

@@ -13,14 +13,14 @@ pub(super) fn coordinator_inventory(family: &str, split: Option<&str>, rows: usi
     let required = ["mhc_pre", "producer", "compressor_prefill_c4", "compressor_continuation_c4",
         "compressor_prefill_c128", "compressor_continuation_c128", "index_producer", "index_topk_prefill",
         "sparse_mla_prefill_win", "sparse_mla_prefill_c4", "sparse_mla_prefill_c128", "wo",
-        "mhc_post_pre", "router_scores", "expert_input_quant", "shared_ffn", "mhc_post", "mhc_head"];
+        "mhc_post_pre", "prefill_router_scores", "expert_input_quant", "shared_ffn", "mhc_post", "mhc_head"];
     let classified = [("mhc_pre", SequenceLocal), ("producer", SequenceLocal),
         ("compressor_prefill_c4", SequenceLocal), ("compressor_continuation_c4", SequenceLocal),
         ("compressor_prefill_c128", SequenceLocal), ("compressor_continuation_c128", SequenceLocal),
         ("index_producer", SequenceLocal), ("index_topk_prefill", SequenceLocal),
         ("sparse_mla_prefill_win", SequenceLocal), ("sparse_mla_prefill_c4", SequenceLocal),
         ("sparse_mla_prefill_c128", SequenceLocal), ("wo", SequenceLocal),
-        ("mhc_post_pre", PackedRows), ("router_scores", PackedRows), ("expert_input_quant", PackedRows),
+        ("mhc_post_pre", PackedRows), ("prefill_router_scores", PackedRows), ("expert_input_quant", PackedRows),
         ("shared_ffn", PackedRows), ("mhc_post", PackedRows), ("mhc_head", SequenceLocal)];
     prefill_packing::validate_program_inventory(required, &classified)?;
     let sized = |name: &str| matches!(name, "producer" | "index_producer" | "index_topk_prefill" |
@@ -43,7 +43,8 @@ pub(super) fn coordinator_inventory(family: &str, split: Option<&str>, rows: usi
     // preparation do not execute in packed prefill; no row role is inferred for them.
     let required = cuteafd_core::coordinator_programs::CoordinatorPrograms { family, split_family: split }
         .v4_required(rows as u64, rows as u64).into_iter()
-        .filter(|name| !name.contains("_decode_") && !name.ends_with("_block_fp8_scale_prep"))
+        .filter(|name| !name.contains("_decode_") && !name.ends_with("_block_fp8_scale_prep")
+            && (!name.ends_with("_router_scores") || name.ends_with("_prefill_router_scores")))
         .chain(context.then(|| [format!("{family}_paged_staging_gather_c4"),
             format!("{family}_paged_staging_gather_index")]).into_iter().flatten())
         .collect::<Vec<_>>();
@@ -57,6 +58,49 @@ pub(super) struct PackedMember<'a> {
     pub tables: StepTables,
     pub units: Vec<u32>,
     pub views: Vec<UnitSlot<'a>>,
+    pub contexts: Vec<super::context::ContextUnit>,
+}
+
+pub(super) fn table_fields(t: &StepTables) -> Vec<&[u8]> {
+    let mut fields = vec![bytes_of(&t.positions), bytes_of(&t.main_slots),
+        bytes_of(&t.swa_indices), bytes_of(&t.swa_lengths)];
+    for entries in [&t.c4_tables, &t.c128_tables] {
+        fields.extend((0..9).map(|i| entries.get(i).map_or(&[][..], |(_, v)| bytes_of(v))));
+    }
+    fields.extend([bytes_of(&t.c4_page_table), bytes_of(&t.c4_visible),
+        bytes_of(&t.c4_indexed_lengths), bytes_of(&t.c128_indices), bytes_of(&t.c128_lengths)]);
+    // Initial compressor tables have seven arguments, continuations nine. Fixed
+    // field indices keep both shapes in the same admitted nine-plane arenas.
+    fields
+}
+
+fn table_devices<'b, 'a>(t: &'b StepBuffers<'a>) -> Vec<&'b Dev<'a>> {
+    [&t.positions, &t.main_slots, &t.swa_indices, &t.swa_lengths].into_iter()
+        .chain(&t.c4).chain(&t.c128).chain([&t.c4_page_table, &t.c4_visible,
+            &t.c4_indexed_lengths, &t.c128_indices, &t.c128_lengths]).collect()
+}
+
+impl<'a> StepBuffers<'a> {
+    fn packed_views(&self, tables: &[StepTables]) -> Result<Vec<Self>> {
+        let devices = table_devices(self);
+        let mut offsets = vec![0usize; devices.len()];
+        tables.iter().map(|t| {
+            let mut views = table_fields(t).into_iter().zip(&devices).enumerate().map(|(i, (bytes, dev))| {
+                let start = offsets[i].next_multiple_of(16);
+                let size = bytes.len().max(4);
+                ensure!(start + size <= dev.buffer.bytes, "packed table field {i} exceeds admitted arena");
+                offsets[i] = start + size;
+                let mut out = (*dev).clone();
+                out.buffer = super::context::view(dev, start, size)?;
+                Ok(out)
+            }).collect::<Result<Vec<_>>>()?.into_iter();
+            let mut next = || views.next().expect("all table fields present");
+            Ok(Self { rows: t.rows, positions: next(), main_slots: next(), swa_indices: next(), swa_lengths: next(),
+                c4: (0..9).map(|_| next()).collect(), c128: (0..9).map(|_| next()).collect(),
+                c4_page_table: next(), c4_visible: next(), c4_indexed_lengths: next(), c128_indices: next(),
+                c128_lengths: next() })
+        }).collect()
+    }
 }
 
 impl<'a> UnitSlot<'a> {
@@ -83,6 +127,22 @@ impl<'a> UnitSlot<'a> {
 }
 
 impl<'a> Engine<'a> {
+    pub(super) fn stage_packed_tables(&self, rank: usize, arena: &StepBuffers<'a>, members: &[PackedMember<'a>]) -> Result<()> {
+        let fields = members.iter().map(|m| table_fields(&m.tables)).collect::<Vec<_>>();
+        self.on(rank, || {
+            for (i, dev) in table_devices(arena).iter().enumerate() {
+                let mut bytes = Vec::new();
+                for member in &fields {
+                    bytes.resize(bytes.len().next_multiple_of(16), 0);
+                    bytes.extend_from_slice(member[i]);
+                    if member[i].is_empty() { bytes.extend_from_slice(&[0; 4]); }
+                }
+                self.upload(dev.buffer, &bytes)?;
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn configure_packing(&self, mode: PackingMode, links: &[SparkLink<'_>]) -> Result<()> {
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
         let inventory = coordinator_inventory(self.family, self.split_family, self.prefill_kernel_rows, self.context.is_some())?;
@@ -140,6 +200,9 @@ impl<'a> Engine<'a> {
         mut diagnostic: Option<&mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>>)
         -> Result<Vec<Result<()>>> {
         ensure!(prompt_ends.len() == sequences.len(), "packed prompt boundary count differs");
+        let _coverage_step = self.graph_coverage.step("prefill", sequences.len(), sequences.iter().map(|(_, t)| t.len()).sum());
+        let inventory = coordinator_inventory(self.family, self.split_family, self.prefill_kernel_rows, self.context.is_some())?;
+        let _inventory = self.packed_programs.enter(|| inventory)?;
         let segments = self.packed_plan(&sequences.iter().map(|(p, t)| (p.len, t.len())).collect::<Vec<_>>())?;
         let links = RefCell::new(links);
         crate::shared::experts::rtx::pair::submit(|| self.require_live(),
@@ -150,14 +213,33 @@ impl<'a> Engine<'a> {
                 let w = owned.as_ref().context("prefill workspace")?;
                 let peer_owned = self.peer.as_ref().map(|p| p.prefill_workspace.borrow());
                 let w1 = peer_owned.as_ref().and_then(|w| w.as_ref());
-                let members = sequences.iter().zip(&segments).map(|((p, tokens), &segment)| {
-                    let tables = metadata::prefill_step(p, &self.shape, p.len, tokens.len(), self.cfg.index_topk, self.c128_width)?;
-                    let views = std::iter::once(w).chain(w1).enumerate().map(|(rank, w)|
-                        w.slots[0].member(segment, self.cfg.dim,
-                            if rank == 0 && self.draft_ready() { self.cfg.dspark_target_layer_ids.len() } else { 0 }))
-                        .collect();
-                    Ok(PackedMember { segment, tables, units: p.units.clone(), views })
-                }).collect::<Result<Vec<_>>>()?;
+                let mut metadata = sequences.iter().map(|(p, tokens)| metadata::prefill_step(p, &self.shape,
+                    p.len, tokens.len(), self.cfg.index_topk, self.c128_width)).collect::<Result<Vec<_>>>()?;
+                if self.context.is_some() {
+                    for tables in &mut metadata {
+                        let shard = metadata::c4_context_prefill_tables(tables)?;
+                        tables.c4_tables = shard.c4_tables;
+                        tables.c4_page_table = shard.c4_page_table;
+                        tables.c4_visible = shard.c4_visible;
+                    }
+                }
+                let views = std::iter::once(w).chain(w1).map(|w| w.slots[0].tables.packed_views(&metadata))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut members = sequences.iter().zip(&segments).zip(metadata).enumerate().map(|(i, (((p, _), &segment), tables))| {
+                    let views = std::iter::once(w).chain(w1).enumerate().map(|(rank, w)| {
+                        let mut member = w.slots[0].member(segment, self.cfg.dim,
+                            if rank == 0 && self.draft_ready() { self.cfg.dspark_target_layer_ids.len() } else { 0 });
+                        member.tables = views[rank][i].clone();
+                        member
+                    }).collect();
+                    PackedMember { segment, tables, units: p.units.clone(), views, contexts: Vec::new() }
+                }).collect::<Vec<_>>();
+                if self.context.is_some() {
+                    for rank in 0..members[0].views.len() {
+                        let contexts = self.packed_context_tables(&members, rank)?;
+                        for (member, context) in members.iter_mut().zip(contexts) { member.contexts.push(context); }
+                    }
+                }
                 let tokens = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect::<Vec<_>>();
                 let mut units = prefill_pipeline::sequence_units(tokens.len(), self.prefill_rows, 1, self.cfg.n_layers)?;
                 units[0].segments = segments.iter().enumerate().map(|(sequence, s)| UnitSegment {
@@ -168,7 +250,11 @@ impl<'a> Engine<'a> {
                 if self.context.is_some() { *self.context_units.borrow_mut() = vec![Default::default(); self.prefill_waves]; }
                 self.prepare_route_checks(&[tokens.len()])?;
                 let mut links = links.borrow_mut();
-                let transport = links.get_mut(1).map(|link| link.exchange()).transpose()?;
+                let transport = links.get_mut(1).map(|link| {
+                    let exchange = link.exchange()?;
+                    ensure!(exchange.fits(self.wave_staging_bytes()?), "prefill link staging is narrower than a unit");
+                    Ok(exchange)
+                }).transpose()?;
                 let mut hooks = super::prefill::UnitHooks { engine: self, placement: sequences[0].0,
                     tokens: &tokens, tables: &tables, w, w1, transport, logit_rows: 0, download: false,
                     on_layer: None, logits: Vec::new(), landed: 0, packed: Some(&members),
@@ -187,26 +273,27 @@ impl<'a> Engine<'a> {
                             self.head_launch(&member.views[0].stream_a, first + count, count, 0, w)?;
                             callback(i, first, self.device_logits(w, count))?;
                         }
+                        return Ok(None);
                     }
+                    if !prompt_ends[i] { return Ok(None); }
                     let count = serving_head_rows(extent);
                     self.head_launch(&member.views[0].stream_a, extent, count, 0, w)?;
-                    Ok(self.device_logits(w, count))
-                }, on_logits)
+                    Ok(Some(self.device_logits(w, count)))
+                }, &mut |i, logits| match logits { Some(logits) => on_logits(i, logits), None => Ok(Ok(())) })
             })
     }
 
     pub(super) fn packed_attention(&self, layer: usize, members: &[PackedMember<'a>],
         w: &Workspace<'a>, w1: Option<&Workspace<'a>>) -> Result<()> {
         let total: usize = members.iter().map(|m| m.segment.rows).sum();
-        if layer == 0 && w1.is_some() { self.exchange()?.wait(1, slot(0, false, 0))?; }
+        if layer == 0 && w1.is_some() {
+            self.exchange()?.wait(1, slot(0, false, 0))?;
+            self.record_peer(1, "entry", slot(0, false, 0), false, 0, 0);
+        }
         for member in members {
             let rows = Scalar::I32(member.segment.rows as i32);
-            for (rank, view) in member.views.iter().enumerate() {
-                self.on(rank, || self.fill(&view.tables, &member.tables))?;
-                if self.context.is_some() {
-                    self.context_units.borrow_mut()[0][rank] = self.put_context_tables(rank, &view.tables,
-                        &member.tables, 0, true, &member.units)?;
-                }
+            for (rank, context) in member.contexts.iter().enumerate() {
+                self.context_units.borrow_mut()[0][rank] = context.clone();
             }
             self.attention_front(0, layer, &self.weights.layers[layer], &member.tables,
                 &member.views[0], w, rows, self.prefill_rows)?;
@@ -229,10 +316,14 @@ impl<'a> Engine<'a> {
             if w1.is_some() {
                 // Both sums must finish reading the peer receive planes before the next
                 // member can overwrite them (publication alone is not a consumption fence).
-                self.exchange()?.signal(0, DIRECT)?;
-                self.exchange()?.signal(1, DIRECT)?;
-                self.exchange()?.wait(0, DIRECT)?;
-                self.exchange()?.wait(1, DIRECT)?;
+                for rank in 0..2 {
+                    self.exchange()?.signal(rank, DIRECT)?;
+                    self.record_peer(rank, "packed-consume", DIRECT, true, layer, 0);
+                }
+                for rank in 0..2 {
+                    self.exchange()?.wait(rank, DIRECT)?;
+                    self.record_peer(rank, "packed-consume", DIRECT, false, layer, 0);
+                }
             }
         }
         let rows = Scalar::I32(total as i32);
@@ -251,7 +342,10 @@ impl<'a> Engine<'a> {
                     ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?),
                     ("out", lane.shared.buffer.ptr), ("scratch", work.scratch.buffer.ptr)], &[rows])?;
                 if self.tp2_layer(layer) { self.tp2_experts(1, layer, 0, work, total)?; }
-                else { self.exchange()?.push(1, slot(layer, true, 0), lane.shared.buffer.ptr, total * self.cfg.dim * 2)?; }
+                else {
+                    self.exchange()?.push(1, slot(layer, true, 0), lane.shared.buffer.ptr, total * self.cfg.dim * 2)?;
+                    self.record_peer(1, "ffn", slot(layer, true, 0), true, layer, 0);
+                }
             }
         }
         Ok(())

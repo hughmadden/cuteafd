@@ -96,6 +96,7 @@ def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("mhc_post", "mhc_post", {}, lambda: mhc.compile_dsv4_mhc_post_aot(g)),
         ("mhc_head", "mhc_head", {}, lambda: mhc.compile_dsv4_mhc_head_aot(g)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_dsv4_router_scores_aot(g)),
+        ("prefill_router_scores", "prefill_router_scores", {}, lambda: ffn.compile_dsv4_prefill_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {},
          lambda: ffn.compile_dsv4_expert_input_quant_aot(g)),
         # Load-time weight preparation (the rest of every weight is raw bytes).

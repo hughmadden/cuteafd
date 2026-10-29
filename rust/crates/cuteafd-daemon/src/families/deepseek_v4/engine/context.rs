@@ -88,6 +88,8 @@ pub(super) struct ContextUnit {
     pub shards: [usize; 2],
     /// Commit blocks per plane (payload, footer, keys, scales).
     pub commits: [usize; 4],
+    /// Packed members retain disjoint gather and commit lists throughout the unit.
+    pub packed_member: Option<usize>,
 }
 
 impl<'a> V4ContextSplit<'a> {
@@ -124,7 +126,8 @@ impl<'a> V4ContextSplit<'a> {
                 let mut next = || allocations.next().context("V4 context workspace list");
                 let (candidates, own, peer, topk_scratch, partial_scratch, gather, local_lengths, empty_window) =
                     (next()?, next()?, next()?, next()?, next()?, next()?, next()?, next()?);
-                let commit = (0..lanes).map(|_| next()).collect::<Result<Vec<_>>>()?;
+                let commit = (0..lanes as usize + cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS)
+                    .map(|_| next()).collect::<Result<Vec<_>>>()?;
                 ensure!(allocations.next().is_none(), "V4 context workspace list has unbound entries");
                 for zeroed in [&topk_scratch, &empty_window] {
                     engine.library.cuda_zero_bytes(zeroed.buffer, zeroed.buffer.bytes)?;
@@ -133,12 +136,14 @@ impl<'a> V4ContextSplit<'a> {
                 let view = staging_units * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES);
                 let staging = [engine.alloc(view)?, engine.alloc(view)?];
                 let half = staging_units.div_ceil(2);
+                engine.reserve_upload(gather.buffer)?;
                 for slot in 0..lanes as usize {
                     for owner in 0..2 {
                         engine.reserve_upload(super::context::view(&gather, (slot * 2 + owner) * half * 4, half * 4)?)?;
                     }
                     engine.reserve_upload(commit[slot].buffer)?;
                 }
+                for member in lanes as usize..commit.len() { engine.reserve_upload(commit[member].buffer)?; }
                 Ok(ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, local_lengths,
                     empty_window, commit, staging })
             })
@@ -165,7 +170,7 @@ impl<'a> V4ContextSplit<'a> {
 }
 
 /// A view of `bytes` at `offset` inside `dev`.
-fn view(dev: &Dev<'_>, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+pub(super) fn view(dev: &Dev<'_>, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(offset + bytes <= dev.buffer.bytes, "view of {bytes} B at {offset} past a {} B buffer", dev.buffer.bytes);
     Ok(CuteafdDeviceBuffer {
         // SAFETY: inside the allocation (checked above).
@@ -248,6 +253,34 @@ impl<'a> Engine<'a> {
         };
         self.on(rank, || self.fill_c4(m, &shard))?;
         Ok(unit)
+    }
+
+    pub(super) fn packed_context_tables(&self, members: &[super::packing::PackedMember<'a>], rank: usize)
+        -> Result<Vec<ContextUnit>> {
+        let split = self.context()?;
+        let own = &split.ranks[rank];
+        let half = split.staging_units.div_ceil(2);
+        let mut gather = vec![0u32; (self.prefill_waves + members.len()) * 2 * half];
+        let mut contexts = Vec::new();
+        for (i, member) in members.iter().enumerate() {
+            let mut unit = ContextUnit { packed_member: Some(i), ..Default::default() };
+            let history = member.tables.start.div_ceil(metadata::SOURCE_PAGE_TOKENS);
+            ensure!(history <= member.units.len() && history <= split.staging_units, "packed C4 history extent");
+            for owner in 0..2 {
+                let pages = local_pages(&member.units[..history], owner)?;
+                unit.shards[owner] = pages.len();
+                let first = ((self.prefill_waves + i) * 2 + owner) * half;
+                gather[first..first + pages.len()].copy_from_slice(&pages);
+            }
+            let first = member.tables.start / 4;
+            let groups = (member.tables.start + member.tables.rows) / 4 - first;
+            let commits = c4_context_commits(rank, first, groups, &member.units, split.commit_limit)?;
+            unit.commits.copy_from_slice(&commits.counts);
+            self.on(rank, || self.upload(own.commit[self.prefill_waves + i].buffer, bytes_of(&commits.table)))?;
+            contexts.push(unit);
+        }
+        self.on(rank, || self.upload(own.gather.buffer, bytes_of(&gather)))?;
+        Ok(contexts)
     }
 
     /// Uploads a rank's C4 shard over the lane's replicated C4 tables (after [`Self::fill`]).
@@ -374,7 +407,8 @@ impl<'a> Engine<'a> {
         let half = split.staging_units.div_ceil(2);
         for (owner, &count) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0) {
             let (pool, pool_keys) = self.c4_pools(owner, layer)?;
-            let table = view(&own.gather, (index * 2 + owner) * half * 4, count * 4)?.ptr;
+            let slot = unit.packed_member.map_or(index, |member| self.prefill_waves + member);
+            let table = view(&own.gather, (slot * 2 + owner) * half * 4, count * 4)?.ptr;
             // Whole pages (payload, footer, padding), staged at logical unit 2i + owner.
             let gather = |name: &str, pool: *mut c_void, staging: *mut c_void| self.run_on(rank, false, name,
                 &[("pool", pool), ("table", table), ("staging", staging)],
@@ -393,7 +427,8 @@ impl<'a> Engine<'a> {
             indexed_indices, indexed_lengths)?;
         self.attention_project(rank, weights, lane, w, rows, cap)?;
         // This GPU's completed groups, staging -> pool, per plane.
-        let commit = own.commit.get(index).context("commit lane")?;
+        let slot = unit.packed_member.map_or(index, |member| self.prefill_waves + member);
+        let commit = own.commit.get(slot).context("commit lane")?;
         let limit = split.commit_limit;
         let (pool, pool_keys) = self.c4_pools(rank, layer)?;
         for (plane, (&count, (source, destination))) in unit.commits.iter()
@@ -445,11 +480,12 @@ mod tests {
             let in_pools = (c4 * metadata::C4_SCRATCH_UNITS * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES)) as u64;
             assert_eq!(allocated + in_pools, charged, "{heads} heads");
             assert_eq!(context_buffers(&cfg, 1 << 20, 2752, 64, 3, context).workspace_bytes, charged);
-            // The listed order the engine binds: 8 shared buffers, then one commit list per lane.
+            // Shared buffers precede ordinary wave and private packed-member commit lists.
             let names: Vec<_> = list.iter().map(|(n, _)| *n).filter(|n| !n.starts_with("C4 scratch")).collect();
-            assert_eq!(names, ["candidates", "own-head partial", "peer-head partial", "scored top-k scratch",
-                "partial scratch", "gather tables", "local selected lengths", "empty window lengths",
-                "commit blocks", "commit blocks", "commit blocks"]);
+            let mut expected = vec!["candidates", "own-head partial", "peer-head partial", "scored top-k scratch",
+                "partial scratch", "gather tables", "local selected lengths", "empty window lengths"];
+            expected.extend(std::iter::repeat("commit blocks").take(3 + cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS));
+            assert_eq!(names, expected);
         }
         // One scratch page covers every decode row (a step's discarded groups write distinct rows).
         assert!(metadata::C4_SCRATCH_UNITS as u64

@@ -14,15 +14,21 @@ fn serving_keeps_one_terminal_head_row_without_diagnostic_callback() {
     let serving = source.split("pub(crate) fn prefill_packed_check").next().unwrap();
     assert!(serving.contains("self.prefill_packed_inner(sequences, links, prompt_ends, on_logits, None)"));
     assert!(!include_str!("../serve.rs").contains("prefill_packed_check"));
+    assert!(source.contains("if !prompt_ends[i] { return Ok(None); }"));
+    assert!(source.contains("return Ok(None);"));
+    let attention = source.split("pub(super) fn packed_attention").nth(1).unwrap();
+    assert!(!attention.contains(".fill("));
+    assert!(!attention.contains("put_context_tables"));
+    assert!(include_str!("../mod.rs").contains("args.prefill_packing.unwrap_or_default()"));
 }
 
 #[test]
 fn exact_inventory_caps_total_rows_and_preserves_large_singletons() -> Result<()> {
     use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
-    for split in [None, Some("dsv4f_tp2")] {
+    for split in [None, Some("dsv4f2")] {
         for context in [false, true] {
             let inventory = super::packing::coordinator_inventory("dsv4f", split, 256, context)?;
-            for suffix in ["router_scores", "expert_input_quant", "mhc_post_pre_m256", "shared_ffn_m256", "mhc_post"] {
+            for suffix in ["prefill_router_scores", "expert_input_quant", "mhc_post_pre_m256", "shared_ffn_m256", "mhc_post"] {
                 assert!(inventory.contains(&(format!("dsv4f_{suffix}"), PackedRows)));
             }
             assert!(inventory.contains(&("dsv4f_index_producer_m256".into(), SequenceLocal)));
@@ -151,6 +157,41 @@ fn cancellation_stays_member_local_and_exact_unknown_routes_run_alone() -> Resul
     for (cap, expected) in [(0, vec![0..1, 1..2, 2..3]), (69, vec![0..2, 2..3]), (128, vec![0..3])] {
         assert_eq!(prefill_packing::groups(chunks.len(), |r|
             prefill_packing::plan(&chunks[r], &Limits { rows: cap, ..limits() }).is_ok()), expected);
+    }
+    Ok(())
+}
+
+
+#[test]
+fn aligned_private_metadata_fits_admitted_arenas_for_sixteen_members() -> Result<()> {
+    use super::packing::table_fields;
+    use cuteafd_loader::serving_capacity::V4_PACKED_TABLE_EXTRA_ROWS;
+    for width in [1, 29, 31, 64, 127, 200, 256] {
+        let rows = 16 * width;
+        let storage = rows + V4_PACKED_TABLE_EXTRA_ROWS;
+        let units = 128;
+        let shape = PoolShape::new(16, rows, units);
+        let capacities = [storage * 8, storage * 8, storage * 128 * 4, storage * 4].into_iter()
+            .chain([4 * (storage + 2); 18])
+            .chain([16 * (units + 3) * 4, storage * 4, storage * 4, storage * 1024 * 4, storage * 4])
+            .collect::<Vec<_>>();
+        let mut planes = vec![Vec::new(); capacities.len()];
+        for member in 0..16 {
+            let start = if member % 2 == 0 { 0 } else { 301 };
+            let p = Placement::new(member, (0..units as u32).collect());
+            let tables = metadata::prefill_step(&p, &shape, start, width, 512, 1024)?;
+            let fields = table_fields(&tables);
+            assert_eq!(fields.len(), 27);
+            for (field, (bytes, capacity)) in fields.iter().zip(&capacities).enumerate() {
+                let plane = &mut planes[field];
+                let offset = plane.len().next_multiple_of(16);
+                plane.resize(offset, 0u8);
+                plane.extend_from_slice(bytes);
+                if bytes.is_empty() { plane.extend_from_slice(&[0; 4]); }
+                assert_eq!(&plane[offset..offset + bytes.len()], *bytes);
+                assert!(plane.len() <= *capacity, "width {width} member {member} field {field}");
+            }
+        }
     }
     Ok(())
 }

@@ -3,20 +3,25 @@ use super::{engine::Engine, pool::PoolAllocator, prefix, SparkLink};
 use crate::shared::prefill_packing::{self, PackingMode};
 use anyhow::{ensure, Result};
 use cuteafd_api::openai::probe::{Probe, ProbeSpec};
-use cuteafd_bench::{fidelity_precision::Precision, reference::Window};
+use cuteafd_bench::reference::{Fidelity, Window};
 
 struct Observed { logits: Vec<f32>, state: Vec<u8>, frontier: usize }
 
 fn widths(case: usize, member: usize) -> usize {
-    match case { 0 => [29, 40, 59][member % 3], 2 => [29, 31, 23][member % 3],
+    match case { 0 => [29, 31, 23][member % 3], 2 => [29, 31, 23][member % 3],
         _ => [200, 127, 64][member % 3] }
 }
 
 fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime,
-    prompts: &[Vec<u32>], case: usize, packed: bool) -> Result<(Vec<Observed>, usize)> {
+    prompts: &[Vec<u32>], starts: &[usize], case: usize, packed: bool) -> Result<(Vec<Observed>, usize)> {
     let mut allocator = PoolAllocator::for_engine(engine)?;
     let mut placements = prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>()?;
     for placement in &placements { prefix::packed_state(engine, placement, true)?; }
+    ensure!(starts.len() == prompts.len(), "diagnostic start count differs");
+    for ((p, tokens), &start) in placements.iter_mut().zip(prompts).zip(starts) {
+        ensure!(start < tokens.len(), "diagnostic start past prompt");
+        if start > 0 { engine.prefill(p, &tokens[..start], links, runtime, 0, None)?; }
+    }
     let mut logits = vec![Vec::new(); prompts.len()];
     let mut actual_packs = 0;
     while placements.iter().zip(prompts).any(|(p, t)| p.len < t.len()) {
@@ -83,58 +88,79 @@ fn pair_metrics(a: &[f32], b: &[f32], vocab: usize) -> (f64, f64) {
     (kl.max(0.0) / rows, same as f64 / rows)
 }
 
+fn reference_score(window: &Window, observed: &Observed, vocab: usize) -> Fidelity {
+    let probe = Probe::new(ProbeSpec { score_from: Some(window.score_from),
+        score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
+        want: window.want(), top_k: 32, ..Default::default() });
+    for (row, logits) in observed.logits.chunks_exact(vocab).enumerate() {
+        probe.row(window.score_from + row, logits);
+    }
+    window.score(&probe.record().rows)
+}
+
+fn noninferior(control: &Fidelity, packed: &Fidelity, label: &str) -> Result<()> {
+    let delta_kl = packed.kl - control.kl;
+    let delta_top1 = packed.top1 - control.top1;
+    println!("packed reference {label}: singleton KL {:.8}/top1 {:.6}, packed KL {:.8}/top1 {:.6}, delta KL {delta_kl:.8}/top1 {delta_top1:.6}, positions {}",
+        control.kl, control.top1, packed.kl, packed.top1, packed.positions);
+    ensure!(packed.positions > 0 && packed.positions == control.positions && packed.missing == 0
+        && control.missing == 0 && packed.non_finite == 0 && control.non_finite == 0
+        && delta_kl <= 0.005 + 1e-12 && delta_top1 >= -0.01 - 1e-12,
+        "{label} failed singleton non-inferiority");
+    Ok(())
+}
+
 pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime,
-    window: &Window, precision: &Precision, members: usize, mode: PackingMode) -> Result<()> {
+    windows: &[Window], members: usize, mode: PackingMode) -> Result<()> {
     ensure!((2..=16).contains(&members) && engine.shape.sequences >= members,
         "packed check needs 2 to 16 admitted sequence slots");
     ensure!(engine.full_prefill_logits && engine.prefill_rows >= 200,
         "packed check requires --full-prefill-logits and >=200 prefill rows");
-    ensure!(window.id == "legacy" && window.tokens.len() == 513 && window.positions.len() == 512,
-        "packed check requires the sealed original V4 Flash legacy window");
+    let selected = windows.iter().filter(|w| w.positions.len() == 512).take(members + 1).collect::<Vec<_>>();
+    ensure!(selected.len() == members + 1, "packed check needs distinct sealed windows and a replacement partner");
+    for (i, window) in selected.iter().enumerate() {
+        ensure!(window.score_from > 0 && window.tokens.len() > window.score_from
+            && window.positions.iter().enumerate().all(|(j, p)| p.pos == window.score_from + j)
+            && window.tokens.len() - window.score_from == 512,
+            "packed check window {} needs 512 contiguous scored positions", window.id);
+        ensure!(selected[..i].iter().all(|other| other.id != window.id && other.tokens != window.tokens),
+            "packed check windows must have distinct identities and token sequences");
+    }
     let vocab = engine.cfg.vocab_size;
-    let prompts = vec![window.tokens[..512].to_vec(); members];
     for case in 0..2 {
-        let (alone, _) = arm(engine, links, runtime, &prompts, case, false)?;
-        let (packed, packs) = arm(engine, links, runtime, &prompts, case, true)?;
-        if mode == PackingMode::Unrestricted { ensure!(packs > 0, "packed check exercised no multi-member unit"); }
-        for (i, (a, b)) in alone.iter().zip(&packed).enumerate() {
-            ensure!(a.frontier == 512 && b.frontier == 512 && b.logits.len() == 512 * vocab
-                && a.logits.len() == b.logits.len() && !b.state.is_empty()
-                && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid packed observation");
-            let logits_equal = equal(&a.logits, &b.logits);
-            let (kl, top1) = pair_metrics(&a.logits, &b.logits, vocab);
-            println!("packed case {case} member {i} width {} (<=64 {}): logits byte-identical {logits_equal}, state byte-identical {}, singleton KL {kl:.8}, top-1 {top1:.6} (informational)",
-                widths(case, i), widths(case, i) <= 64, a.state == b.state);
-            let probe = Probe::new(ProbeSpec { score_from: Some(window.score_from),
-                score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
-                want: window.want(), top_k: 32, ..Default::default() });
-            for (row, logits) in b.logits.chunks_exact(vocab).enumerate() { probe.row(row + 1, logits); }
-            let record = probe.record();
-            let score = window.score(&record.rows);
-            let (top1_min, kl_max) = precision.tier.bars();
-            println!("packed reference case {case} member {i}: rows {}, mean KL(top1024+tail) {:.8}, top-1 {:.6}, tier {} bars {kl_max}/{top1_min}",
-                score.positions, score.kl, score.top1, precision.tier.name());
-            ensure!(score.positions == 512 && score.missing == 0 && score.non_finite == 0
-                && score.kl <= kl_max && score.top1 + 1e-12 >= top1_min,
-                "packed member {i} failed stored-reference fidelity tier");
-            // #886: same-build singleton/singleton is not byte-stable on this
-            // layout. Both modes gate stored fidelity; cross-pass identity is diagnostic.
+        for replacement in [false, true] {
+            let mut references = selected[..members].to_vec();
+            if replacement { references[1] = selected[members]; }
+            let starts = references.iter().map(|w| w.score_from - 1).collect::<Vec<_>>();
+            let prompts = references.iter().map(|w| w.tokens[..w.tokens.len() - 1].to_vec()).collect::<Vec<_>>();
+            let (alone, _) = arm(engine, links, runtime, &prompts, &starts, case, false)?;
+            let (packed, packs) = arm(engine, links, runtime, &prompts, &starts, case, true)?;
+            if mode == PackingMode::Unrestricted { ensure!(packs > 0, "packed check exercised no multi-member unit"); }
+            let mut control_records = Vec::new();
+            let mut packed_records = Vec::new();
+            for (i, ((a, b), window)) in alone.iter().zip(&packed).zip(&references).enumerate() {
+                let rows = prompts[i].len() - starts[i];
+                ensure!(a.frontier == prompts[i].len() && b.frontier == a.frontier
+                    && b.logits.len() == rows * vocab && a.logits.len() == b.logits.len()
+                    && !b.state.is_empty() && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid packed observation");
+                let (kl, top1) = pair_metrics(&a.logits, &b.logits, vocab);
+                println!("packed case {case} replacement {replacement} member {i} window {}: singleton KL {kl:.8}, top1 {top1:.6}, logits byte-identical {}, state byte-identical {}",
+                    window.id, equal(&a.logits, &b.logits), a.state == b.state);
+                if mode == PackingMode::Exact {
+                    ensure!(equal(&a.logits, &b.logits) && a.state == b.state,
+                        "exact packed member {i} differs from singleton bytes");
+                }
+                let control = reference_score(window, a, vocab);
+                let score = reference_score(window, b, vocab);
+                ensure!(control.positions == 512 && score.positions == 512, "incomplete member score");
+                noninferior(&control, &score, &format!("case {case} replacement {replacement} member {i}"))?;
+                control_records.extend(control.records);
+                packed_records.extend(score.records);
+            }
+            noninferior(&Fidelity::from_records(control_records), &Fidelity::from_records(packed_records),
+                &format!("case {case} replacement {replacement} pooled"))?;
+            println!("packed check case {case} replacement {replacement}: {members} members, {packs} actual multi-member units, mode {mode:?}");
         }
-        // Report partner sensitivity; #886 prevents byte gating across separate passes.
-        for target in [0, members - 1] {
-            let partner_index = if target == 0 { 1 } else { 0 };
-            let mut changed = prompts.clone();
-            for token in &mut changed[partner_index] { *token = (*token + 1) % vocab as u32; }
-            ensure!(changed[partner_index] != prompts[partner_index], "partner mutation was vacuous");
-            let (partner, _) = arm(engine, links, runtime, &changed, case, true)?;
-            let (a, b) = (&packed[target], &partner[target]);
-            ensure!(a.frontier == b.frontier && a.logits.len() == b.logits.len()
-                && b.logits.iter().all(|v| v.is_finite()), "invalid partner observation");
-            let (kl, top1) = pair_metrics(&a.logits, &b.logits, vocab);
-            println!("packed partner case {case} target {target}: logits byte-identical {}, state byte-identical {}, KL {kl:.8}, top-1 {top1:.6} (informational; #886)",
-                equal(&a.logits, &b.logits), a.state == b.state);
-        }
-        println!("packed check case {case}: {members} members, {packs} actual multi-member units, mode {mode:?}");
     }
     Ok(())
 }
@@ -166,8 +192,8 @@ mod tests {
         let prompts = vec![window.tokens[..512].to_vec(); 3];
         super::super::with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, links, runtime, _| {
             engine.configure_packing(PackingMode::Unrestricted, links)?;
-            let (alone, _) = arm(engine, links, runtime, &prompts, 2, false)?;
-            let (packed, packs) = arm(engine, links, runtime, &prompts, 2, true)?;
+            let (alone, _) = arm(engine, links, runtime, &prompts, &[0; 3], 2, false)?;
+            let (packed, packs) = arm(engine, links, runtime, &prompts, &[0; 3], 2, true)?;
             ensure!(packs > 0, "skinny discriminator exercised no packs");
             for (i, (a, b)) in alone.iter().zip(&packed).enumerate() {
                 ensure!(a.frontier == 512 && b.frontier == 512
@@ -182,8 +208,22 @@ mod tests {
     }
 
     #[test]
+    fn noninferiority_checks_boundaries_missing_and_pooled_regressions() {
+        let score = |kl, top1| Fidelity { positions: 512, kl, top1, ..Default::default() };
+        let control = score(0.2, 0.8);
+        assert!(noninferior(&control, &score(0.205, 0.79), "boundary").is_ok());
+        assert!(noninferior(&control, &score(0.205001, 0.8), "kl").is_err());
+        assert!(noninferior(&control, &score(0.2, 0.789999), "top1").is_err());
+        for bad in [Fidelity { missing: 1, ..score(0.2, 0.8) },
+            Fidelity { non_finite: 1, ..score(0.2, 0.8) },
+            Fidelity { positions: 0, ..score(0.2, 0.8) }, score(f64::NAN, 0.8)] {
+            assert!(noninferior(&control, &bad, "invalid").is_err());
+        }
+    }
+
+    #[test]
     fn diagnostic_widths_cover_router_boundary_and_pair_metrics_are_informational() {
-        assert_eq!((widths(0, 0), widths(0, 1), widths(0, 2)), (29, 40, 59));
+        assert_eq!((widths(0, 0), widths(0, 1), widths(0, 2)), (29, 31, 23));
         assert_eq!((widths(1, 0), widths(1, 1), widths(1, 2)), (200, 127, 64));
         let (kl, top1) = pair_metrics(&[1.0, 0.0], &[0.0, 1.0], 2);
         assert!(kl > 0.0);

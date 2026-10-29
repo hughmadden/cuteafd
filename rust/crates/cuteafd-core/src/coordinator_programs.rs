@@ -242,7 +242,7 @@ impl CoordinatorPrograms<'_> {
     pub fn v4_required(self, prefill_rows: u64, decode_rows: u64) -> Vec<String> {
         let mut names = Vec::new();
         let mut add = |family: &str, suffix: String| names.push(format!("{family}_{suffix}"));
-        for suffix in ["mhc_pre", "mhc_post", "mhc_head", "router_scores", "expert_input_quant",
+        for suffix in ["mhc_pre", "mhc_post", "mhc_head", "router_scores", "prefill_router_scores", "expert_input_quant",
             "block_fp8_scale_prep"] {
             add(self.family, suffix.to_string());
         }
