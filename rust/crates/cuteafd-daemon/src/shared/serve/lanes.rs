@@ -78,7 +78,9 @@ impl LaneSet {
 async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
     let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
     std::future::poll_fn(move |context| {
-        let poll = future.as_mut().poll(context);
+        // Inner waits yield their pending polls to this pacer, which sleeps
+        // once per pending poll (they only spin while it polls).
+        let poll = { let _paced = cuteafd_transport::wait_policy::Paced::enter(); future.as_mut().poll(context) };
         if poll.is_pending() { backoff.pause() } else { backoff.reset() }
         poll
     }).await

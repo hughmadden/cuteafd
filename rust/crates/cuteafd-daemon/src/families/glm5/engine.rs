@@ -2273,7 +2273,7 @@ impl<'a> GlmEngine<'a> {
             Ok(())
         };
         let unit_list: Vec<crate::shared::prefill_pipeline::Unit> = (0..lanes.len()).map(|unit| {
-            crate::shared::prefill_pipeline::Unit { index: unit, sequence: 0,
+            crate::shared::prefill_pipeline::Unit { index: unit, sequence: 0, segments: Vec::new(),
                 rows: starts[unit]..starts[unit] + counts[unit], layers: 0..layers.len(), slot: unit % waves, barrier: false }
         }).collect();
         let peers: Vec<Option<&Workspace<'_>>> = (0..waves).map(|slot| peer_workspaces.as_ref()

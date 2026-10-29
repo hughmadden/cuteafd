@@ -11,7 +11,7 @@
 #   scripts/bench/ab-spark-intake.sh v41 4          # V4.1 Flash decode parity (C1, C16) via bench-ab.py
 #   scripts/bench/ab-spark-intake.sh summary        # per-arm medians of every results file
 #
-# build: clones BASE_REV (default: merge-base with origin/work/p0) and NEW_REV
+# build: clones BASE_REV (default: merge-base with origin/dev) and NEW_REV
 # (default: HEAD) into $OUT/src-{base,new}, compiles the coordinator release
 # artifacts of each in the development image exactly as build.sh does (p7's
 # family set), and layers them over OVERLAY_FROM (the p7 coordinator image) as
@@ -223,7 +223,7 @@ PY
 
 case "${1:-}" in
   build)
-    BASE_REV="${BASE_REV:-$(git -C "$repo" merge-base HEAD origin/work/p0)}"
+    BASE_REV="${BASE_REV:-$(git -C "$repo" merge-base HEAD origin/dev)}"
     NEW_REV="${NEW_REV:-$(git -C "$repo" rev-parse HEAD)}"
     build_arm base "$BASE_REV"
     build_arm new "$NEW_REV"

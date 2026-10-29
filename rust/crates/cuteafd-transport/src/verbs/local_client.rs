@@ -168,7 +168,7 @@ impl LocalTp4Client {
     }
 
     fn drain_retired(&mut self) -> Result<()> {
-        self.drain_retired_with_timeout(Duration::from_secs(3))
+        self.drain_retired_with_timeout(RING_RELEASE_TIMEOUT)
     }
 
     fn drain_retired_with_timeout(&mut self, timeout: Duration) -> Result<()> {
@@ -475,6 +475,21 @@ impl Drop for LocalTp4Client {
     }
 }
 
+/// How long a reconnect waits for each retired endpoint's ring release.
+///
+/// A worker notices our EOF within its 1 ms liveness poll, drains the
+/// executions holding that connection's units, releases its rings and closes.
+/// What it drains is bounded by its deferred admission (at most the ring
+/// depth of requests per connection, one layer of one unit each: tens of ms
+/// for a 2752-row prefill unit on a GB10), so a live worker releases in well
+/// under a second. A worker that has not released by then is wedged or gone:
+/// re-admitting would double-book its ring budget, so the reconnect fails and
+/// that transport stays refused (sticky), and the error reaches the request
+/// (the serving reset forwards it). A longer bound only delays that error
+/// while every lane waits on the reset. Retired streams are drained in turn,
+/// but every rank received its EOF at once, so the total is the slowest rank.
+const RING_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn wait_for_ring_release(stream: &mut TcpStream, timeout: Duration) -> Result<()> {
     stream.set_read_timeout(Some(timeout))?;
     let mut byte = [0u8; 1];
@@ -662,6 +677,39 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(format!("{first:#}"), format!("{second:#}"));
         assert_eq!(transport.retired.len(), 1);
+        Ok(())
+    }
+
+    /// The reconnect bound fits a live worker that releases only after
+    /// draining queued work (here ~10x a queued prefill unit-layer) and fails
+    /// a peer that never releases within the bound, not after it.
+    #[test]
+    fn ring_release_bound_waits_for_a_draining_worker_and_fails_a_wedged_one() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let peer = client.peer_addr()?;
+        client.shutdown(std::net::Shutdown::Write)?;
+        let worker = std::thread::spawn(move || -> Result<()> {
+            assert_eq!(std::io::Read::read(&mut server, &mut [0u8; 1])?, 0);
+            std::thread::sleep(Duration::from_millis(300));
+            drop(server);
+            Ok(())
+        });
+        let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default(), 0);
+        transport.retired.push((client, peer));
+        transport.drain_retired()?;
+        worker.join().unwrap()?;
+        // A peer that never releases: the reconnect fails at the bound.
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (_wedged, _) = listener.accept()?;
+        let peer = client.peer_addr()?;
+        transport.retired.push((client, peer));
+        let started = Instant::now();
+        let error = transport.drain_retired().unwrap_err();
+        let waited = started.elapsed();
+        assert!(waited >= RING_RELEASE_TIMEOUT && waited < RING_RELEASE_TIMEOUT + Duration::from_secs(1), "{waited:?}");
+        assert!(format!("{error:#}").contains("did not release its rings"), "{error:#}");
         Ok(())
     }
 

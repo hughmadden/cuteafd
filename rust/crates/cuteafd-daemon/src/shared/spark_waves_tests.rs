@@ -90,7 +90,7 @@ fn wait(world: &World, counter: Counter, target: u32) -> Result<()> {
 /// jobs) runs ahead of the "stream" thread, which executes the queued ops in
 /// order: exactly the run-ahead serving does.
 fn drive(world: &Arc<World>, slots: usize, layers: u32, timeout: Duration)
-    -> (Result<()>, Result<()>, Option<u32>) {
+    -> (Result<()>, Result<Stop>, Option<u32>) {
     #[derive(Debug)]
     enum Op { WaitLanded(u32), Staged(usize, u32), Consumed(usize, u32) }
     let (jobs, inbox) = mpsc::channel();
@@ -691,7 +691,8 @@ fn link_teardown_and_reset_take_the_transport_back_from_the_exchange() {
     let link = include_str!("spark_intake.rs");
     for name in ["pub(crate) fn terminal_quiesce(&mut self)", "pub(crate) fn reset_connections(&mut self)"] {
         let body = link.split(name).nth(1).unwrap().split("\n    }\n").next().unwrap();
-        assert!(body.contains("exchange.close::<SparkExperts>()?") && body.contains("self.transport = Some(transport);")
+        let stop = if name.contains("reset") { "exchange.cancel::<SparkExperts>()?" } else { "exchange.close::<SparkExperts>()?" };
+        assert!(body.contains(stop) && body.contains("self.transport = Some(transport);")
             && !body.contains("drop(exchange)"), "{name}: {body}");
     }
     // A reset re-opens the sessions before the exchange restarts: its device
@@ -735,6 +736,11 @@ struct Ring {
     posted: Arc<AtomicUsize>,
     _buffers: Vec<Vec<u8>>,
     fail_poll_after: Option<usize>,
+    /// Polls before a wave's replies start arriving (a slow wire).
+    hold_polls: usize,
+    /// Waves given up after a failure / for a deliberate reset.
+    abandoned: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
 }
 struct RingFrame { address: usize, bytes: usize, capacity: usize, free: Arc<Mutex<Vec<(usize, usize)>>> }
 impl ReplyFrame for RingFrame {
@@ -759,7 +765,8 @@ impl Ring {
             Arc::new(Mutex::new(slots))
         }).collect();
         Self { ranks, depth, rows, row_bytes, free, posted: Arc::new(AtomicUsize::new(0)), _buffers: buffers,
-            fail_poll_after: None }
+            fail_poll_after: None, hold_polls: 0, abandoned: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicUsize::new(0)) }
     }
 }
 
@@ -781,7 +788,7 @@ impl Transport for Ring {
         wave.passes += 1;
         if let Some(limit) = self.fail_poll_after { ensure!(wave.passes <= limit, "injected receive failure"); }
         for rank in 0..self.ranks {
-            if wave.sent & (1 << rank) != 0 || wave.passes <= rank { continue; }
+            if wave.sent & (1 << rank) != 0 || wave.passes <= rank + self.hold_polls { continue; }
             let (address, bytes) = self.free[rank].lock().unwrap().pop()
                 .with_context(|| format!("rank {rank}'s receive ring ran dry"))?;
             wave.sent |= 1 << rank;
@@ -791,7 +798,8 @@ impl Transport for Ring {
         Ok((wave.sent.count_ones() as usize == self.ranks).then_some(0))
     }
     fn timeout(&self) -> Duration { Duration::from_secs(5) }
-    fn abandon(&mut self) {}
+    fn abandon(&mut self) { self.abandoned.fetch_add(1, Ordering::SeqCst); }
+    fn cancel(&mut self) { self.cancelled.fetch_add(1, Ordering::SeqCst); }
     fn retained_reply_slots(&self) -> Vec<usize> { vec![self.depth; self.ranks] }
 }
 
@@ -1153,4 +1161,52 @@ fn a_slots_first_use_waits_for_nothing_beyond_the_initial_landing() {
         assert_eq!(super::staging_reuse(waves as u32 + 1, waves), 1);
         assert_eq!(super::staging_reuse(100, waves), 100 - waves as u32);
     }
+}
+
+/// #784 reset after a cancelled request: the link stops its exchange with
+/// waves still outstanding (their replies never consumed). The worker gives
+/// them up as a cancel, not a failure: the process stays healthy (a failure
+/// is terminal for every later request), the transport's waves are dropped
+/// without the failure record, and every queued wait is released so no
+/// stream waits on a wave that will never land. A real failure still records.
+#[test]
+fn a_reset_with_waves_outstanding_cancels_without_poisoning_health() {
+    let (ranks, rows, row_bytes) = (2usize, 4usize, 16usize);
+    let mut ring = Ring::new(ranks, 2, rows, row_bytes);
+    // Replies stay out long enough for the cancel to find both waves in flight.
+    ring.hold_polls = usize::MAX / 2;
+    let (cancelled, abandoned) = (ring.cancelled.clone(), ring.abandoned.clone());
+    let (mut backend, _control, _pulls) = ring_backend(ring, 2);
+    let words = backend.words;
+    let (jobs, inbox) = mpsc::channel();
+    jobs.send(Command::Wave(built_job(1, 0, rows, &[0, 0], vec![(0, 0)]))).unwrap();
+    jobs.send(Command::Wave(built_job(2, 1, rows, &[0, 0], vec![(1, 0)]))).unwrap();
+    jobs.send(Command::Cancel).unwrap();
+    let healthy_before = cuteafd_transport::health::failure_reason().is_none();
+    let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
+    assert_eq!(result.as_ref().ok(), Some(&Stop::Cancelled), "{result:?}");
+    assert_eq!(highest, Some(2));
+    drop(jobs);
+    finish_worker(&mut backend, &inbox, result, highest).expect("a cancel is not a failure");
+    assert_eq!((cancelled.load(Ordering::SeqCst), abandoned.load(Ordering::SeqCst)), (1, 0));
+    if healthy_before {
+        assert!(cuteafd_transport::health::failure_reason().is_none(), "a cancel marked the process unhealthy");
+    }
+    // Every wait over the given-up waves is released.
+    assert!(reached(words.load(Counter::Landed), 2));
+    for rank in 0..ranks { assert!(reached(words.load(Counter::Arrived(rank)), 2), "rank {rank}'s wait"); }
+
+    // Control: closing (not cancelling) with waves outstanding is a failure,
+    // abandons the waves and is reported.
+    let mut ring = Ring::new(ranks, 2, rows, row_bytes);
+    ring.hold_polls = usize::MAX / 2;
+    let (cancelled, abandoned) = (ring.cancelled.clone(), ring.abandoned.clone());
+    let (mut backend, _control, _pulls) = ring_backend(ring, 2);
+    let (jobs, inbox) = mpsc::channel();
+    jobs.send(Command::Wave(built_job(1, 0, rows, &[0, 0], vec![(0, 0)]))).unwrap();
+    drop(jobs);
+    let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
+    let error = finish_worker(&mut backend, &inbox, result, highest).unwrap_err();
+    assert!(format!("{error:#}").contains("waves outstanding"), "{error:#}");
+    assert_eq!((cancelled.load(Ordering::SeqCst), abandoned.load(Ordering::SeqCst)), (0, 1));
 }

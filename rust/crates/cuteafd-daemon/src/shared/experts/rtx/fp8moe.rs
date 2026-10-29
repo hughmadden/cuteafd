@@ -76,6 +76,10 @@ pub(crate) struct Fp8MoeTp2<'a> {
 }
 
 impl<'a> Fp8MoeTp2<'a> {
+    pub(crate) fn packed_row_cap(&self, rows: usize) -> Result<usize> {
+        self.experts.packed_row_cap(true, rows)
+    }
+
     /// Static package ABI only: no CUDA initialization or device allocation.
     /// The directory is the padded tp2 layout; exact_layout selects its sibling.
     pub(crate) fn plan(tensors: &Fp8ExpertTensors, directory: &Path, rank: usize,

@@ -2022,7 +2022,7 @@ def test_build_ref_is_pinned_once_across_build_and_launcher(entry, tmp_path, mon
     git('update-ref', ref, first)
     real_build_arms = cards.build_arms
     def build_arms_then_move(builds, *args):
-        git('update-ref', ref, moved)  # work/p0 advances while the build runs
+        git('update-ref', ref, moved)  # dev advances while the build runs
         real_build_arms(builds, *args)
     monkeypatch.setattr(cards, 'build_arms', build_arms_then_move)
     try:

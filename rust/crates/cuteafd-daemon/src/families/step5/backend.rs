@@ -274,7 +274,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             let next = *self.depth.as_ref().context("Step-5 prefill depth")?;
             let units = crate::shared::prefill_pipeline::prefill_units(first_row, next.unit_rows, next.waves, 64)?
                 .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index,
-                    sequence: 0, rows, layers: 0..92, slot: index % next.waves, barrier: false }).collect::<Vec<_>>();
+                    sequence: 0, segments: Vec::new(), rows, layers: 0..92, slot: index % next.waves, barrier: false }).collect::<Vec<_>>();
             self.execution.enqueue_units(&mut step, &input.residual, kind, &units, next.waves)?;
         } else {
             // Each return slot and hop lane holds one unit.

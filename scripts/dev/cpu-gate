@@ -6,7 +6,7 @@
 --jobs is the total worker budget: split evenly between Cargo and pytest when
 both run, otherwise given entirely to the requested suite. Default excludes
 15 measured full-plan/cache tests; --full restores them and is required for
-work/p0 merges and releases. This includes the installed-example deployment-to-
+dev merges and releases. This includes the installed-example deployment-to-
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
 inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
 The sweep discovers PROGRAMS.json in /opt/cuteafd/share, ~/.local/share/cuteafd,
@@ -630,7 +630,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--jobs', type=int, default=os.environ.get('CUTEAFD_TEST_JOBS', max(1, (os.cpu_count() or 2) // 2)),
                         help='total CPU worker budget (default: CUTEAFD_TEST_JOBS or half logical CPUs)')
-    parser.add_argument('--full', action='store_true', help='include measured full-plan/cache tests (required for work/p0 merges and releases)')
+    parser.add_argument('--full', action='store_true', help='include measured full-plan/cache tests (required for dev merges and releases)')
     parser.add_argument('--slow', action='store_true', help='also run explicit ignored CPU soaks (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')

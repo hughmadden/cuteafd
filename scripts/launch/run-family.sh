@@ -341,6 +341,7 @@ GLM5_FLASH_PREFIX_MARKS
 GLM5_FLASH_REPLAY_RECORDS
 GLM5_FLASH_DECODE_ROWS
 GLM5_FLASH_PREFILL_BATCH
+PREFILL_PACKING
 GLM5_FLASH_ROUTE_RING_CHECK
 GLM5_FLASH_REMOTE_DRAFTER
 EOF
@@ -358,6 +359,7 @@ HTTP_QUEUE_DEPTH
 HTTP_QUEUE_WAIT_MS
 MIMO_PREFIX_DRAFT
 MIMO_SNAPSHOT_WAIT
+PREFILL_PACKING
 MIMO_HOST_CACHE
 MIMO_PREFILL_CHUNK_S
 PREFILL_ROWS
@@ -2080,6 +2082,14 @@ if [[ "$family" == qwen3_5 ]]; then
   # Qwen templates can remove old thinking; retain the exact frontier before
   # the generation message, not an approximate reconstruction of that state.
   family_args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
+fi
+prefill_packing="$(get PREFILL_PACKING)"
+if [[ -n "$prefill_packing" ]]; then
+  [[ "$family" == mimo_v2 || "$family" == glm5_flash ]] || { echo "PREFILL_PACKING applies to MiMo and GLM Flash" >&2; exit 2; }
+  case "$prefill_packing" in
+    unrestricted|exact) family_args+=(--prefill-packing "$prefill_packing") ;;
+    *) echo "PREFILL_PACKING must be unrestricted or exact" >&2; exit 2 ;;
+  esac
 fi
 # EXPERT_INPUT is opt-in for MiMo's Spark exchange; unset preserves image defaults.
 expert_input="$(get EXPERT_INPUT)"

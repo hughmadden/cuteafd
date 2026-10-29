@@ -145,6 +145,8 @@ pub(crate) struct Unit {
     pub index: usize,
     /// Causal chain: units of one sequence attend in order at every layer.
     pub sequence: usize,
+    /// Explicit members of a packed unit; empty for the unchanged singleton path.
+    pub segments: Vec<UnitSegment>,
     /// Rows of the call's token stream.
     pub rows: std::ops::Range<usize>,
     /// Layers this unit runs (normally all; a partial replay may run a suffix).
@@ -153,6 +155,25 @@ pub(crate) struct Unit {
     pub slot: usize,
     /// Start only after every earlier unit committed.
     pub barrier: bool,
+}
+
+/// A request's contribution to a unit. `rows` are unit-local, `tokens` are
+/// request-local. Identities are stable for the lifetime of this submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnitSegment {
+    pub sequence: usize,
+    pub rows: std::ops::Range<usize>,
+    pub tokens: std::ops::Range<usize>,
+    pub prompt_end: bool,
+    pub snapshot: bool,
+    pub head: bool,
+}
+
+impl Unit {
+    fn sequences(&self) -> Vec<usize> {
+        if self.segments.is_empty() { vec![self.sequence] }
+        else { self.segments.iter().map(|s| s.sequence).collect() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,7 +317,7 @@ pub(crate) fn retained_logits_units(span: usize, unit_rows: usize, waves: usize,
 pub(crate) fn sequence_units(span: usize, unit_rows: usize, waves: usize, layers: usize)
     -> anyhow::Result<Vec<Unit>> {
     Ok(prefill_units(span, unit_rows, waves, 256)?.into_iter().enumerate().map(|(index, rows)| Unit {
-        index, sequence: 0, rows, layers: 0..layers, slot: index % waves, barrier: false }).collect())
+        index, sequence: 0, segments: Vec::new(), rows, layers: 0..layers, slot: index % waves, barrier: false }).collect())
 }
 
 /// The executor's exact order. Units enter free slots in order. Each turn
@@ -316,8 +337,27 @@ pub(crate) fn prefill_schedule(routes: &[FfnRoute], units: &[Unit], waves: usize
             && unit.layers.start < unit.layers.end && unit.layers.end <= routes.len(),
             "prefill unit {index} geometry differs from the call");
     }
-    let predecessor = (0..units.len()).map(|index| units[..index].iter().rev()
-        .find(|other| other.sequence == units[index].sequence).map(|other| other.index)).collect::<Vec<_>>();
+    let mut latest = std::collections::HashMap::new();
+    let mut predecessor = Vec::with_capacity(units.len());
+    for unit in units {
+        let mut first = 0;
+        let mut members = std::collections::HashSet::new();
+        for segment in &unit.segments {
+            anyhow::ensure!(segment.rows.start == first && !segment.rows.is_empty()
+                && segment.rows.len() == segment.tokens.len()
+                && members.insert(segment.sequence), "invalid packed member in unit {}", unit.index);
+            first = segment.rows.end;
+        }
+        anyhow::ensure!(unit.segments.is_empty() || first == unit.rows.len(),
+            "packed members do not cover unit {}", unit.index);
+        let mut previous = Vec::new();
+        for sequence in unit.sequences() {
+            if let Some(earlier) = latest.insert(sequence, unit.index) {
+                if !previous.contains(&earlier) { previous.push(earlier); }
+            }
+        }
+        predecessor.push(previous);
+    }
     // Next layer each unit attends: it has attended every layer below it.
     let mut attend = units.iter().map(|unit| unit.layers.start).collect::<Vec<_>>();
     let mut pending = vec![false; units.len()];
@@ -349,9 +389,8 @@ pub(crate) fn prefill_schedule(routes: &[FfnRoute], units: &[Unit], waves: usize
         while !pending[unit] && attend[unit] < units[unit].layers.end {
             let layer = attend[unit];
             // Unit k+1 attends layer L only after unit k attended L.
-            if let Some(earlier) = predecessor[unit].filter(|&earlier| earlier >= committed) {
-                if attend[earlier] <= layer.min(units[earlier].layers.end - 1) { break; }
-            }
+            if predecessor[unit].iter().copied().filter(|&earlier| earlier >= committed)
+                .any(|earlier| attend[earlier] <= layer.min(units[earlier].layers.end - 1)) { break; }
             steps.push(Step::Attention { layer, unit });
             attend[unit] += 1;
             progressed = true;
@@ -545,11 +584,13 @@ mod tests {
                     let expected = if layer == u.layers.start { None } else { Some(layer - 1) };
                     assert_eq!(residual[u.slot], Some((unit, expected)), "unit {unit} layer {layer} read stale rows");
                     assert_eq!(landed_or_local[unit].last().copied(), expected);
-                    // Same-sequence predecessor attended this layer first.
-                    if let Some(earlier) = units[..unit].iter().rev().find(|o| o.sequence == u.sequence) {
-                        if earlier.layers.contains(&layer) {
-                            assert!(attended[earlier.index].contains(&layer) || commits.contains(&earlier.index),
-                                "unit {unit} attended layer {layer} before unit {}", earlier.index);
+                    // Every participating sequence's predecessor must publish first.
+                    for sequence in u.sequences() {
+                        if let Some(earlier) = units[..unit].iter().rev().find(|o| o.sequences().contains(&sequence)) {
+                            if earlier.layers.contains(&layer) {
+                                assert!(attended[earlier.index].contains(&layer) || commits.contains(&earlier.index),
+                                    "unit {unit} attended layer {layer} before unit {}", earlier.index);
+                            }
                         }
                     }
                     attended[unit].push(layer);
@@ -590,6 +631,53 @@ mod tests {
         assert_eq!(commits, (0..units.len()).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn packed_fork_join_waits_for_every_member_and_rejects_bad_layouts() -> anyhow::Result<()> {
+        let routes = [FfnRoute::Local, FfnRoute::Local, FfnRoute::Spark, FfnRoute::Spark];
+        let mut units = sequence_units(5 * 64, 64, 3, routes.len())?;
+        let members = [vec![10], vec![20], vec![10, 20], vec![10], vec![20]];
+        for (u, ids) in units.iter_mut().zip(&members) {
+            let width = u.rows.len() / ids.len();
+            u.segments = ids.iter().enumerate().map(|(i, &sequence)| UnitSegment {
+                sequence, rows: i * width..(i + 1) * width, tokens: 0..width,
+                prompt_end: false, snapshot: false, head: false }).collect();
+        }
+        let steps = prefill_schedule(&routes, &units, 3)?;
+        check_schedule(&routes, &units, 3, &steps);
+        // A checker that only watched the first member would accept this corruption.
+        let mut broken = steps.clone();
+        let before = broken.iter().position(|s| *s == Step::Attention { layer: 0, unit: 1 }).unwrap();
+        let after = broken.iter().position(|s| *s == Step::Attention { layer: 0, unit: 2 }).unwrap();
+        broken.swap(before, after);
+        assert!(std::panic::catch_unwind(|| check_schedule(&routes, &units, 3, &broken)).is_err());
+        for bad in 0..4 {
+            let mut invalid = units.clone();
+            match bad {
+                0 => invalid[2].segments[1].sequence = 10,
+                1 => invalid[2].segments[1].rows.start -= 1,
+                2 => invalid[2].segments[1].rows.end += 1,
+                _ => invalid[2].segments[1].tokens.end += 1,
+            }
+            assert!(prefill_schedule(&routes, &invalid, 3).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_singleton_members_preserve_the_exact_schedule() -> anyhow::Result<()> {
+        for span in [1, 65, 2048, 4097] {
+            let units = sequence_units(span, 2048, 3, 4)?;
+            let mut explicit = units.clone();
+            for u in &mut explicit {
+                u.segments.push(UnitSegment { sequence: 0, rows: 0..u.rows.len(), tokens: u.rows.clone(),
+                    prompt_end: u.rows.end == span, snapshot: false, head: u.rows.end == span });
+            }
+            let routes = [FfnRoute::Local, FfnRoute::Local, FfnRoute::Spark, FfnRoute::Spark];
+            assert_eq!(prefill_schedule(&routes, &units, 3)?, prefill_schedule(&routes, &explicit, 3)?);
+        }
+        Ok(())
+    }
+
     fn random_units(seed: &mut u64, layers: usize, waves: usize) -> Vec<Unit> {
         let count = 1 + (lcg(seed) % 9) as usize;
         let mut sequence = 0;
@@ -597,7 +685,7 @@ mod tests {
             if index > 0 && lcg(seed) % 5 == 0 { sequence += 1; }
             let barrier = index > 0 && lcg(seed) % 9 == 0;
             let start = if barrier { (lcg(seed) as usize) % layers } else { 0 };
-            Unit { index, sequence, rows: index * 64..(index + 1) * 64, layers: start..layers,
+            Unit { index, sequence, segments: Vec::new(), rows: index * 64..(index + 1) * 64, layers: start..layers,
                 slot: index % waves, barrier }
         }).collect()
     }
