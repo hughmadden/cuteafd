@@ -66,11 +66,12 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
 }
 
 pub(crate) fn packed_check<'a>(engine: &RefCell<DenseEngine<'a>>, library: &'a NativeLibrary,
-    tokens: &[u32], members: usize) -> Result<()> {
+    tokens: &[u32], members: usize, mode: crate::shared::prefill_packing::PackingMode,
+    windows: Option<&[cuteafd_bench::reference::Window]>, precision: &cuteafd_bench::fidelity_precision::Precision) -> Result<()> {
     let prompts = crate::shared::qwen::packed_check::prompts(tokens, members)?;
     let mut backend = DenseBackend::new(engine, library);
-    backend.packing = crate::shared::prefill_packing::PackingMode::Exact;
-    let limits = backend.packed_limits().context("dense packed limits")?;
+    backend.packing = mode;
+    let limits = backend.checked_packed_limits()?.context("dense packed limits")?;
     let mut next_page = 0usize;
     let mut admit = |slot: usize, prompt: &[u32]| -> Result<Placement> {
         let pages = (prompt.len() + 1).div_ceil(64);
@@ -83,9 +84,28 @@ pub(crate) fn packed_check<'a>(engine: &RefCell<DenseEngine<'a>>, library: &'a N
     let packed = prompts.iter().enumerate().map(|(i, p)| admit(i, p)).collect::<Result<Vec<_>>>()?;
     let alone = prompts.iter().enumerate().map(|(i, p)| admit(i + members, p)).collect::<Result<Vec<_>>>()?;
     let pool = cuteafd_engine::prefix::RefPagePool::new(engine.borrow().pool_tokens / 64, 64);
-    crate::shared::qwen::packed_check::check::<_, DraftState>(library, &prompts, packed, alone, limits, false, true,
+    crate::shared::qwen::packed_check::check::<_, DraftState>(library, &prompts, packed, alone, limits, false,
+        mode == crate::shared::prefill_packing::PackingMode::Exact,
         |s| backend.prefill_device(s.placement, s.tokens, 1, &pool)?.context("dense check needs head")?.row_host(library, 0),
-        |s, callback| backend.prefill_packed(s, &pool, callback), |p| super::engine::prefix::packed_state(engine, p))
+        |s, callback| backend.prefill_packed(s, &pool, callback), |p| super::engine::prefix::packed_state(engine, p))?;
+    if mode == crate::shared::prefill_packing::PackingMode::Unrestricted {
+        let windows = windows.context("dense packed check needs official windows")?;
+        drop(admit);
+        next_page = 0;
+        let placements = windows.iter().enumerate().map(|(slot, w)| {
+            let pages = w.tokens.len().div_ceil(64);
+            let units = (next_page..next_page + pages).map(u32::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
+            next_page += pages;
+            ensure!(next_page <= engine.borrow().pool_tokens / 64, "dense packed reference exhausts admitted pages");
+            engine.borrow_mut().reset_slot(slot)?;
+            engine.borrow_mut().bind_slot(slot, &units)?;
+            Ok(Placement { units, slot, len: 0, state_len: 0 })
+        }).collect::<Result<Vec<_>>>()?;
+        crate::shared::qwen::packed_check::reference::<_, DraftState>(library, windows, placements, limits, false, precision,
+            |s| backend.prefill_device(s.placement, s.tokens, 1, &pool)?.context("dense reference needs head")?.row_host(library, 0),
+            |s, callback| backend.prefill_packed(s, &pool, callback))?;
+    }
+    Ok(())
 }
 
 impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
@@ -193,6 +213,11 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         placement.state_len = placement.len;
         Ok((logit_rows > 0).then_some(output))
     }
+    fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
+        if self.packing == crate::shared::prefill_packing::PackingMode::Exact {
+            Ok(Some(self.engine.borrow().coordinator_packed_cap()?))
+        } else { Ok(None) }
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         Some(crate::shared::prefill_packing::Limits {
             // The small and prefill FP8 FFNs have different projection arithmetic.
@@ -206,7 +231,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
         -> Result<Vec<Result<()>>> {
         ensure!(self.pending.borrow().is_none(), "dense packed prefill during pending verify");
-        let limits = self.packed_limits().context("dense packing limits")?;
+        let limits = self.checked_packed_limits()?.context("dense packing limits")?;
         let mut engine = self.engine.borrow_mut();
         for s in sequences.iter() {
             ensure!(engine.slot_position(s.placement.slot)? == s.start && s.placement.len == s.start,

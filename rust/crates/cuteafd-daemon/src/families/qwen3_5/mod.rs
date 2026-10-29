@@ -55,6 +55,8 @@ pub(crate) struct GoldenArgs {
     /// Compare native packed and singleton state/logits on 2..=8 members.
     #[arg(long)]
     pub packed_check: Option<usize>,
+    #[arg(long, value_enum, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
     #[arg(long)]
     pub draft: Option<PathBuf>,
@@ -81,18 +83,38 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!((1..=4096).contains(&args.prefill_chunk), "prefill chunk must be 1..4096");
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;
-    let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
-    let (directory, positions) = reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?;
-    let token_bytes = std::fs::read(directory.join("tokens.bin"))?;
+    let packed_windows = if args.packed_check.is_some() && golden.join("manifest.json").is_file() {
+        use cuteafd_bench::fidelity_dataset;
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(golden.join("manifest.json"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let expected = match (cfg.hidden, manifest["config"].as_str()) {
+            (5120, Some(fidelity_dataset::QWEN38_27B_CONFIG)) => fidelity_dataset::QWEN38_27B_MANIFEST_SHA256,
+            (4096, Some(fidelity_dataset::QWEN35_9B_CONFIG)) => fidelity_dataset::QWEN35_9B_MANIFEST_SHA256,
+            _ => anyhow::bail!("unsupported dense packed reference"),
+        };
+        ensure!(format!("{:x}", Sha256::digest(&bytes)) == expected, "dense packed reference publication differs");
+        let reference = fidelity_dataset::load(golden, &manifest)?;
+        ensure!(reference.vocab == cfg.vocab, "dense packed reference vocabulary differs");
+        let window = reference.windows.iter().find(|w| w.id == args.window).context("dense packed reference window missing")?;
+        Some(vec![window.clone(); args.packed_check.unwrap()])
+    } else { None };
+    let (directory, positions) = if packed_windows.is_some() { (golden.to_owned(), None) } else {
+        let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
+        reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?
+    };
+    let token_bytes = if let Some(windows) = &packed_windows {
+        windows[0].tokens.iter().flat_map(|t| t.to_le_bytes()).collect()
+    } else { std::fs::read(directory.join("tokens.bin"))? };
     ensure!(token_bytes.len() >= 8 && token_bytes.len() % 4 == 0, "invalid reference token payload");
     let tokens: Vec<_> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(tokens.iter().all(|&token| (token as usize) < cfg.vocab), "reference token outside vocabulary");
     let positions = positions.unwrap_or_else(|| (1..tokens.len()).collect());
     ensure!(!positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "invalid reference score positions");
-    let reference = std::fs::read(directory.join("logits.bin"))?;
+    let reference = if packed_windows.is_some() { Vec::new() } else { std::fs::read(directory.join("logits.bin"))? };
     let reference_rows = if golden.join("windows.json").is_file() { positions.len() } else { tokens.len() };
-    ensure!(reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
+    ensure!(packed_windows.is_some() || reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
     let reference: Vec<_> = reference.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(reference.iter().all(|v| v.is_finite()), "nonfinite reference logits");
     let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::open(&args.snapshot)?;
@@ -118,7 +140,13 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
     }
     let engine = std::cell::RefCell::new(engine);
-    if let Some(members) = args.packed_check { return serve::packed_check(&engine, &library, &tokens, members); }
+    if let Some(members) = args.packed_check {
+        ensure!(args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact || packed_windows.is_some(),
+            "unrestricted packed check needs the sealed official reference");
+        let precision = cuteafd_bench::fidelity_precision::resolve("dense-packed-check", Some(&args.snapshot),
+            &serde_json::json!([]), "Qwen/Qwen3.8-27B", None)?;
+        return serve::packed_check(&engine, &library, &tokens, members, args.prefill_packing, packed_windows.as_deref(), &precision);
+    }
     if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
     let mut engine = engine.into_inner();
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);

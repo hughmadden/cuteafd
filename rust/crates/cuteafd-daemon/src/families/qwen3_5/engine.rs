@@ -112,6 +112,22 @@ mod hook_borrow_tests {
 fn alloc_bytes(bytes: usize) -> usize { bytes.max(256) }
 
 impl<'a> DenseEngine<'a> {
+    pub(crate) fn coordinator_packed_cap(&self) -> Result<usize> {
+        use crate::shared::prefill_packing::{coordinator_row_cap, validate_program_inventory, ProgramRows::*};
+        // Attention (including its dense projections) runs inside the member loop;
+        // FFN projections, norm and add run on the aggregate row span.
+        let inventory = [("norm", 0, PackedRows), ("add", 0, PackedRows), ("gdn_commit", 0, SequenceLocal)]
+            .into_iter().chain([64, 4096].into_iter().flat_map(|rows|
+                [("gdn", rows, SequenceLocal), ("attn_producer", rows, SequenceLocal),
+                    ("full_gqa", rows, SequenceLocal), ("attn_o", rows, SequenceLocal), ("ffn", rows, PackedRows)]))
+            .map(|(op, rows, role)|
+                (cuteafd_loader::placement::families::qwen3_5::native_program_name(self.admitted.prefix,
+                    op, rows, self.admitted.kv_format, self.admitted.format.fp8()), role)).collect::<Vec<_>>();
+        let refs = inventory.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+        validate_program_inventory(self.admitted.required_names.iter().map(String::as_str), &refs)?;
+        coordinator_row_cap(self.programs, refs, 64)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,

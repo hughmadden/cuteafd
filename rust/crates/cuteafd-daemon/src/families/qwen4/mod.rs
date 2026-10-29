@@ -935,7 +935,24 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
                 ensure!(!bytes.is_empty() && bytes.len() % 4 == 0, "invalid packed-check token payload");
                 bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>()
             };
-            return packed_check(engine, &tokens, members, args.engine.prefill_packing);
+            packed_check(engine, &tokens, members, args.engine.prefill_packing)?;
+            if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted {
+                let windows = windows.as_ref().context("unrestricted packed check needs the sealed official reference")?;
+                let selected = (0..members).map(|i| windows[i % windows.len()].clone()).collect::<Vec<_>>();
+                let precision = cuteafd_bench::fidelity_precision::resolve("qwen-packed-check", Some(&args.engine.snapshot),
+                    &serde_json::json!([]), "Qwen/Qwen3.8-Flash-Next", None)?;
+                let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
+                let placements = selected.iter().map(|w| allocator.admit(w.tokens.len())).collect::<Result<Vec<_>>>()?;
+                crate::shared::qwen::packed_check::reference::<_, speculate::MtpSeq>(engine.library, &selected, placements,
+                    engine.packed_limits().context("packed Qwen requires one attention owner")?, engine.weights.mtp.is_some(), &precision,
+                    |s| {
+                        let head = engine.prefill_device(s.placement, s.tokens, None, None, 1)?.context("reference check needs head")?;
+                        let logits = head.row_host(engine.library, 0)?;
+                        if s.neural { speculate::prefill_chunk(engine, s.placement, s.start, s.tokens, s.next, s.draft)?; }
+                        Ok(logits)
+                    }, |s, callback| engine.prefill_packed(s, callback))?;
+            }
+            return Ok(());
         }
         if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
         if let Some(dir) = &args.mtp_oracle {

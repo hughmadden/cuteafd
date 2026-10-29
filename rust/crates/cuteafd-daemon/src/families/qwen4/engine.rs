@@ -2296,9 +2296,42 @@ impl<'a> Qwen4Engine<'a> {
             // Local EXL3 and the generic RTX trait do not publish arithmetic route metadata.
             _ => 0,
         };
+        let cap = cap.min(self.coordinator_packed_cap(rows)?);
         self.packed_row_cap.set(Some(cap));
         log_mode(mode, cap);
         Ok(())
+    }
+
+    fn coordinator_packed_cap(&self, rows: usize) -> Result<usize> {
+        use crate::shared::prefill_packing::{coordinator_row_cap, validate_program_inventory, ProgramRows::*};
+        let mut inventory = vec![("qwen4_hc_pre".to_owned(), PackedRows),
+            ("qwen4_hc_post_pre".into(), PackedRows), ("qwen4_hc_post".into(), PackedRows),
+            ("qwen4_router_scores".into(), PackedRows), ("qwen4_shared".into(), PackedRows),
+            ("qwen4_add".into(), PackedRows), ("qwen4_head".into(), SequenceLocal)];
+        if matches!(self.weights.head, Qwen4Head::Fp8 { .. }) {
+            inventory.push(("qwen4_head_fp8".into(), SequenceLocal));
+        }
+        if let Some(ple) = &self.ple {
+            inventory.push((if ple.fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" }.into(), PackedRows));
+        }
+        if matches!(self.experts, Some(Experts::LocalExl3(_) | Experts::Spark { .. })) && !self.spark_bf16 {
+            inventory.push(("qwen4_expert_input_quant".into(), PackedRows));
+        }
+        for layer in &self.weights.layers {
+            let names = match layer.attention {
+                Qwen4Attention::Gdn => vec![Self::program(layer, "gdn", "m4096")],
+                Qwen4Attention::Full => vec![self.kv_program(layer, "m4096"),
+                    format!("qwen4_{}_m4096", self.kv_stem("sparse_gqa")),
+                    "qwen4_index_topk_m4096".into(), "qwen4_index_expand".into(),
+                    Self::program(layer, "attn_o", "m4096")],
+            };
+            for name in names {
+                if !inventory.iter().any(|(n, _)| n == &name) { inventory.push((name, SequenceLocal)); }
+            }
+        }
+        let refs = inventory.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+        validate_program_inventory(inventory.iter().map(|(name, _)| name.as_str()), &refs)?;
+        coordinator_row_cap(self.programs, refs, rows)
     }
 
     pub(crate) fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
