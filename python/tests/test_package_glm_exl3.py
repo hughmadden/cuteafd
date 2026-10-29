@@ -57,7 +57,7 @@ class GlmExl3PackageTest(unittest.TestCase):
                     # Spark: width 512 is warp-specialized from m1024 up and
                     # keeps its cooperative 8-row export below that.
                     self.assertEqual(tool.warp_specialized('kimik3', 'spark', width, capacity),
-                                     capacity >= 1024)
+                                     capacity > 80)
                     continue
                 # Every Kimi K3 coordinator prefill capacity, both RTX splits,
                 # takes the prerotated 256-wide FC1 arm (TJ 2026-10-29); the
@@ -82,12 +82,12 @@ class GlmExl3PackageTest(unittest.TestCase):
 
     def test_route_policy(self):
         self.assertEqual([tool.route_block('glm', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
-                         [8, 8, 8, 8, 64, 64])
+                         [8, 8, 8, 8, 8, 8])
         self.assertEqual([tool.token_major_rotation('glm', c, 'coordinator') for c in (80, 256, 1024, 4096)],
-                         [False, False, True, True])
+                         [False, False, False, False])
         # Other geometries keep their policies.
-        self.assertEqual([tool.route_block('dsv4p', c, 'coordinator') for c in (256, 1024, 4096)], [8, 64, 64])
-        self.assertEqual([tool.route_block('dsv4p', c, 'spark') for c in (256, 1024, 4096)], [8, 16, 64])
+        self.assertEqual([tool.route_block('dsv4p', c, 'coordinator') for c in (256, 1024, 2048, 4096)], [8, 8, 64, 8])
+        self.assertEqual([tool.route_block('dsv4p', c, 'spark') for c in (256, 1024, 4096)], [8, 8, 8])
         self.assertNotIn('v41', tool.GEOMETRIES)
         self.assertNotIn('dsv4f', tool.GEOMETRIES)
 

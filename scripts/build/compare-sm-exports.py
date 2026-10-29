@@ -341,7 +341,7 @@ def _export_exl3(extra, output):
                 if hasattr(package, 'compact_ws_export') else
                 package.compact_warp_specialized(geometry, role, width, rows))
             # Baselines retain their measured-tier filter; current packages use
-            # every two-tier prefill cell except the separately owned Kimi RTX policy.
+            # every two-tier prefill cell except measured V4 Pro losses and Kimi RTX policy.
             ws_tiers = getattr(package, "WS_TIER_PAIRS", None)
             eligible = ((geometry, bits) in ws_tiers if ws_tiers is not None
                         else geometry != "kimik3" or bits == (2, 3))
@@ -367,7 +367,8 @@ def _export_exl3(extra, output):
                 policy_tile = package.ws_tile(geometry, role, width, rows, **compact_kw)
                 if policy_tile is not None:
                     options["tile"] = policy_tile
-            elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
+            elif (len(bits) == 2 and tile is None and hasattr(package, "fused_input_rotation")
+                  and package.fused_input_rotation(geometry, role, width, rows)):
                 options["fused_input_rotation"] = True
             elif len(bits) == 2 and package.token_major_rotation(
                     geometry, rows, *_policy_role_args(package.token_major_rotation, role)):

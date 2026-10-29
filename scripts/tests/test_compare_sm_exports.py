@@ -526,9 +526,8 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
         ("glm", [("m80", 80, 256, 8, 8), ("m256", 256, 256, 8, 64), ("m1024", 1024, 256, 8, 64)]),
         ("glmf", [("m80", 80, 288, 8, 8), ("m256", 256, 288, 8, 64),
                   ("m1024", 1024, 288, 8, 64)]),
-        ("dsv4p", [("m80", 80, 384, 6, 8), ("m256", 256, 384, 6, 8), ("m1024", 1024, 384, 6, 64)]),
-        # Kimi K3's coordinator exports are warp-specialized from m256 up, so
-        # the route gate covers its 64-row block there as well as at m1024.
+        ("dsv4p", [("m80", 80, 384, 6, 8), ("m256-b8", 256, 384, 6, 8),
+                   ("m256-b64", 256, 384, 6, 64), ("m1024", 1024, 384, 6, 64)]),
         ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 64), ("m1024", 1024, 896, 16, 64)]),
     ):
         recorded = []
@@ -583,7 +582,8 @@ def test_coordinator_ws_policy_preserves_decode_and_kimi_recipes():
         for _, width, *_ in package.profiles_for_role("coordinator", geometry):
             for capacity in capacities:
                 expected = ((geometry, width, capacity) in package.COORDINATOR_WS_CELLS
-                            if geometry == "kimik3" else capacity > 80)
+                            if geometry == "kimik3" else capacity > 80 and
+                            (geometry, width, capacity) not in package.COOPERATIVE_PREFILL_CELLS)
                 assert package.warp_specialized(geometry, "coordinator", width, capacity) == expected
 
 

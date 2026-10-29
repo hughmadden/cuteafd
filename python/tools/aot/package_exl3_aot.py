@@ -140,8 +140,6 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         # Absent means the original 8-row packed-route block.
         if variant.get('route_block', 8) != meta.get('route_block', 8):
             raise ValueError(f'EXL3 variant route block mismatch: {directory}')
-        if variant.get('fused_input_rotation', False) != meta.get('fused_input_rotation', False):
-            raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
         if variant.get('ws_dynamic_tiles', False) != meta.get('ws_dynamic_tiles', False):
@@ -285,101 +283,19 @@ def swiglu_limit(geometry: str) -> float | None:
 
 
 def route_block(geometry: str, capacity: int, role: str) -> int:
-    """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
-
-    Callers state the role: 'coordinator' packages the whole intermediate on one
-    RTX GPU, 'spark' the GB10 per-rank shard.
-    V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
-    (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
-    weight tile once per 8 rows, so wide prefill capacities use wider blocks
-    (GB10, TP4 width 768, random top-6 routes: m4096 53 -> 25 ms, m1024 15 -> 11 ms;
-    m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
-    fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
-    gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
-    Kimi K3 takes its 64-row blocks from the warp-specialized cells on the
-    coordinator and keeps 8 rows everywhere else.
-    """
-    # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
+    """Cooperative decode and the remaining V4 Pro/Kimi prefill recipes."""
     override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
     if str(capacity) in override:
         return int(override[str(capacity)])
-    if geometry == 'qwen4':
-        return qwen4_route_block(capacity)
-    if geometry in ('glm', 'glmf'):
-        return glm_route_block(capacity)
-    if geometry == 'kimik3':
-        return 8
-    if geometry != 'dsv4p' or capacity <= 256:
-        return 8
     if role == 'coordinator':
-        return 64
-    return 16 if capacity <= 1024 else 64
-
-
-def glm_route_block(capacity: int) -> int:
-    """GLM (256 experts, top-8): 8 * capacity routes, capacity / 32 rows per
-    expert on average. Measured on the coordinator rtx-tp1 package (RTX PRO
-    6000, width 2048, random top-8 routes, us): m80 8/16/32 = 2885/2905/2980;
-    m256 8/16/32/64 = 3265/3205/3260/3325; m1024 16/32/64 = 5650/4530/3910;
-    m4096 32/64 = 13820/11790 (64 with token-major rotation 11470). m256
-    keeps 8 rows (16 is 1.9% faster on the RTX, but its Spark TP3 width-640
-    kernel resolves a residency the native bridge does not take).
-    """
-    return 8 if capacity <= 256 else 64
-
-
-def qwen4_route_block(capacity: int) -> int:
-    """Qwen 3.8 Flash Next (512 experts, top-10): 10 * capacity routes, capacity / 51
-    rows per expert on average. Coordinator rtx-tp1 package (RTX PRO 6000, width
-    640, random top-10 routes, layer 23, median us): 8-row blocks m1024 2315,
-    m4096 11626; 64: m1024 1401, m4096 3489; 32: m256 1002 (8: 1023), m1024 1168,
-    m4096 3273 (min 3176 vs 3451). m256 with 16 fails the cooperative grid check.
-    """
-    return 8 if capacity <= 80 else 32
+        if geometry == 'dsv4p' and capacity == 2048:
+            return 64
+    return 8
 
 
 def token_major_rotation(geometry: str, capacity: int, role: str) -> bool:
-    """Whether a capacity rotates each token's input once for all of its routes.
-
-    Callers state the role, as for route_block: the answers differ per role.
-    Bit-identical to per-route rotation. It pays where the rotation phase is
-    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral on Spark.
-    """
-    if geometry in ('glm', 'glmf', 'qwen4'):
-        # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
-        return capacity > 256
-    if role == 'coordinator' and geometry == 'dsv4p':
-        # V4 Pro coordinator (RTX PRO 6000, K2/K3, m1024): 64-row blocks with
-        # token-major rotation improve rtx-tp2 w1536 4875.9 -> 4169.3 us (1.169x,
-        # vs _WS_S14 5220.0 us) and rtx-tp1 w3072 9396.5 -> 7891.6 us (1.191x,
-        # vs _WS_S14 10268.8 us). Spark keeps 16/False for cooperative m1024.
-        return capacity > 256
-    return geometry == 'dsv4p' and capacity > 1024
-
-
-def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Whether FC1 rotates staged token rows in shared memory (no per-route
-    rotated copies). Bit-identical; every FC1 N tile of a block rotates it
-    again, so it pays only while few 256-wide tiles share a projection half.
-    GB10, TP4 random routes, per layer (b12x ccf9e3cd): V4 Pro width 512
-    m4096 19.1 -> 16.5 ms, 768 22.7 -> 21.9, 1024 neutral, 1536 +10%;
-    GLM width 512 m1024 8.9 -> 7.3, m4096 22.6 -> 18.3, 768 -11%, 1024 -6%,
-    640 (128-wide tiles) +16%. V4 Pro m1024 (16-row blocks) is neutral.
-    GLM 5.3 Flash (b12x be78fa4c, m1024 / m2048 / m4096 ms): width 512
-    5.41 -> 4.49, 7.93 -> 6.60, 13.77 -> 11.22; 768 7.01 -> 6.60,
-    9.93 -> 8.92, 16.42 -> 15.71; 1024 8.47 -> 8.27, 11.74 -> 11.41,
-    19.36 -> 19.64, so width 1024 keeps its m4096 package on token-major.
-    The coordinator's full-width packages are not measured and stay off.
-    """
-    if role != 'spark' or width % 256:
-        return False
-    if geometry == 'dsv4p':
-        return width <= 768 and capacity > 1024
-    if geometry == 'glm':
-        return width <= 1024 and capacity > 256
-    if geometry == 'glmf':
-        return capacity > 256 and (width <= 768 or (width == 1024 and capacity <= 1024))
-    return False
+    """Token rotation only for surviving cooperative coordinator prefill."""
+    return role == 'coordinator' and geometry == 'dsv4p' and capacity == 2048
 
 
 # Warp-specialized tile with 128-wide FC1 N tiles and a 256-wide FC2: every
@@ -466,11 +382,17 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
 }
 
 
+# ABI8 RTX screen (#862), GPU0 at 450 W: TP1 m256 0.8335-0.8968x,
+# m2048 0.9494-0.9495x. Main retains only these cooperative prefill cells;
+# other noisy cells inherit the WS decision from their measured neighbours.
+COOPERATIVE_PREFILL_CELLS = {('dsv4p', 3072, 256), ('dsv4p', 3072, 2048)}
+
+
 def coordinator_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
     """Measured coordinator warp-specialized options for one export cell."""
     if role != 'coordinator':
         return None
-    if capacity <= 80:
+    if capacity <= 80 or (geometry, width, capacity) in COOPERATIVE_PREFILL_CELLS:
         return None
     measured = COORDINATOR_WS_CELLS.get((geometry, width, capacity))
     # Kimi RTX is owned by its separately measured kernel integration.
@@ -510,7 +432,9 @@ def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
 
 
 def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Two-tier prefill uses WS; decode keeps its cooperative reduction contract."""
+    """WS prefill except two measured V4 Pro losses; cooperative decode."""
+    if role == 'coordinator' and (geometry, width, capacity) in COOPERATIVE_PREFILL_CELLS:
+        return False
     if geometry == 'kimik3' and role == 'coordinator':
         return coordinator_ws_cell(geometry, role, width, capacity) is not None
     return role in ('coordinator', 'spark') and capacity > 80
@@ -1147,8 +1071,6 @@ def build(args: argparse.Namespace) -> None:
                         if compact_ws and policy_tile[1] == 192:
                             profile_dir = profile_dir.with_name(f'{profile_dir.name}-n192')
                             raw = profile_dir / f'm{capacity}'
-                elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
-                    options['fused_input_rotation'] = True
                 elif len(args.bits) == 2 and token_major_rotation(geometry, capacity, args.role):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
@@ -1203,8 +1125,6 @@ def build(args: argparse.Namespace) -> None:
                     variant['route_block'] = meta['route_block']
                 if meta.get('token_major_rotation'):
                     variant['token_major_rotation'] = True
-                if meta.get('fused_input_rotation'):
-                    variant['fused_input_rotation'] = True
                 if meta.get('warp_specialized'):
                     variant['warp_specialized'] = True
                 if meta.get('ws_dynamic_tiles'):
