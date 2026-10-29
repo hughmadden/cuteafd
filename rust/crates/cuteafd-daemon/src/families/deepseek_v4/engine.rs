@@ -326,7 +326,6 @@ struct UnitSlot<'a> {
 /// Step workspace sized for `rows` rows per lane; everything but the lanes is
 /// consumed within one (layer, lane) unit and shared.
 struct Workspace<'a> {
-    prefill: bool,
     slots: Vec<UnitSlot<'a>>,
     y: Dev<'a>,
     query: Dev<'a>,
@@ -719,7 +718,6 @@ impl<'a> Engine<'a> {
             Ok(slot)
         };
         Ok(Workspace {
-            prefill: shared_page_list,
             slots: (0..lanes).map(lane).collect::<Result<_>>()?,
             y: self.alloc(t * h * 2)?,
             query: self.alloc(t * heads * 512 * 2)?,
@@ -1615,7 +1613,7 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let Scalar::I32(t) = rows else { unreachable!() };
-        self.run_on(rank, false, if w.prefill { "prefill_router_scores" } else { "router_scores" }, &[
+        self.run_on(rank, false, "router_scores", &[
             ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
         ], &[rows])?;
         let (bias, tid2eid) = if weights.hash {

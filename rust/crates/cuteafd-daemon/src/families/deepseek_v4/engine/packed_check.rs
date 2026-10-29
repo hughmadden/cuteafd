@@ -28,7 +28,7 @@ fn exact_inventory_caps_total_rows_and_preserves_large_singletons() -> Result<()
     for split in [None, Some("dsv4f2")] {
         for context in [false, true] {
             let inventory = super::packing::coordinator_inventory("dsv4f", split, 256, context)?;
-            for suffix in ["prefill_router_scores", "expert_input_quant", "mhc_post_pre_m256", "shared_ffn_m256", "mhc_post"] {
+            for suffix in ["router_scores", "expert_input_quant", "mhc_post_pre_m256", "shared_ffn_m256", "mhc_post"] {
                 assert!(inventory.contains(&(format!("dsv4f_{suffix}"), PackedRows)));
             }
             assert!(inventory.contains(&("dsv4f_index_producer_m256".into(), SequenceLocal)));

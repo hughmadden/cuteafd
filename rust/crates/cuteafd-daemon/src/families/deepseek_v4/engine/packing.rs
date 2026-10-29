@@ -16,7 +16,7 @@ pub(super) fn coordinator_inventory(family: &str, split: Option<&str>, rows: usi
         ("index_producer", SequenceLocal), ("index_topk_prefill", SequenceLocal),
         ("sparse_mla_prefill_win", SequenceLocal), ("sparse_mla_prefill_c4", SequenceLocal),
         ("sparse_mla_prefill_c128", SequenceLocal), ("wo", SequenceLocal),
-        ("mhc_post_pre", PackedRows), ("prefill_router_scores", PackedRows), ("expert_input_quant", PackedRows),
+        ("mhc_post_pre", PackedRows), ("router_scores", PackedRows), ("expert_input_quant", PackedRows),
         ("shared_ffn", PackedRows), ("mhc_post", PackedRows), ("mhc_head", SequenceLocal)];
     let sized = |name: &str| matches!(name, "producer" | "index_producer" | "index_topk_prefill" |
         "sparse_mla_prefill_win" | "sparse_mla_prefill_c4" | "sparse_mla_prefill_c128" | "wo" |
@@ -38,8 +38,7 @@ pub(super) fn coordinator_inventory(family: &str, split: Option<&str>, rows: usi
     // preparation do not execute in packed prefill; no row role is inferred for them.
     let required = cuteafd_core::coordinator_programs::CoordinatorPrograms { family, split_family: split }
         .v4_required(rows as u64, rows as u64).into_iter()
-        .filter(|name| !name.contains("_decode_") && !name.ends_with("_block_fp8_scale_prep")
-            && (!name.ends_with("_router_scores") || name.ends_with("_prefill_router_scores")))
+        .filter(|name| !name.contains("_decode_") && !name.ends_with("_block_fp8_scale_prep"))
         .chain(context.then(|| [format!("{family}_paged_staging_gather_c4"),
             format!("{family}_paged_staging_gather_index")]).into_iter().flatten())
         .collect::<Vec<_>>();

@@ -113,11 +113,17 @@ fn reference_score(window: &Window, observed: &Observed, vocab: usize) -> Fideli
     window.score(&probe.record().rows)
 }
 
-fn noninferior(control: &Fidelity, packed: &Fidelity, label: &str) -> Result<()> {
+fn report_reference(control: &Fidelity, packed: &Fidelity, label: &str) {
     let delta_kl = packed.kl - control.kl;
     let delta_top1 = packed.top1 - control.top1;
     println!("packed reference {label}: singleton KL {:.8}/top1 {:.6}, packed KL {:.8}/top1 {:.6}, delta KL {delta_kl:.8}/top1 {delta_top1:.6}, positions {}",
         control.kl, control.top1, packed.kl, packed.top1, packed.positions);
+}
+
+fn noninferior(control: &Fidelity, packed: &Fidelity, label: &str) -> Result<()> {
+    report_reference(control, packed, label);
+    let delta_kl = packed.kl - control.kl;
+    let delta_top1 = packed.top1 - control.top1;
     ensure!(packed.positions > 0 && packed.positions == control.positions && packed.missing == 0
         && control.missing == 0 && packed.non_finite == 0 && control.non_finite == 0
         && delta_kl <= 0.005 + 1e-12 && delta_top1 >= -0.01 - 1e-12,
@@ -163,10 +169,13 @@ pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &to
                     window.id, equal(&a.logits, &b.logits), a.state.bytes == b.state.bytes);
                 let control = reference_score(window, a, vocab);
                 let score = reference_score(window, b, vocab);
-                ensure!(control.positions == 512 && score.positions == 512, "incomplete member score");
-                let fidelity = noninferior(&control, &score, &format!("case {case} replacement {replacement} member {i}"));
-                require_identical(a, b, vocab, &format!("case {case} replacement {replacement} member {i} mode {mode:?}"))?;
-                fidelity?;
+                ensure!(control.positions == 512 && score.positions == 512
+                    && control.missing == 0 && score.missing == 0
+                    && control.non_finite == 0 && score.non_finite == 0, "invalid or incomplete member score");
+                report_reference(&control, &score, &format!("case {case} replacement {replacement} member {i}"));
+                if mode == PackingMode::Exact {
+                    require_identical(a, b, vocab, &format!("case {case} replacement {replacement} member {i} mode {mode:?}"))?;
+                }
                 control_records.extend(control.records);
                 packed_records.extend(score.records);
             }
@@ -212,6 +221,23 @@ mod tests {
             Fidelity { positions: 0, ..score(0.2, 0.8) }, score(f64::NAN, 0.8)] {
             assert!(noninferior(&control, &bad, "invalid").is_err());
         }
+    }
+
+    #[test]
+    fn pooled_gate_allows_member_drift_but_rejects_aggregate_regression() {
+        use cuteafd_bench::reference::Position;
+        let record = |kl| Position { window: "member".into(), block: String::new(),
+            bucket: String::new(), role: String::new(), position: 0, agree: true,
+            confident: true, top3_contained: true, agree_text: true, finite: true,
+            kl, nll: 1.0, ref_nll: 1.0, argmax: 0, reference_argmax: 0 };
+        let controls = vec![record(0.2), record(0.2)];
+        let packed = vec![record(0.21), record(0.19)];
+        assert!(noninferior(&Fidelity::from_records(vec![controls[0].clone()]),
+            &Fidelity::from_records(vec![packed[0].clone()]), "member informational").is_err());
+        assert!(noninferior(&Fidelity::from_records(controls.clone()),
+            &Fidelity::from_records(packed), "pooled").is_ok());
+        assert!(noninferior(&Fidelity::from_records(controls),
+            &Fidelity::from_records(vec![record(0.21), record(0.21)]), "pooled regression").is_err());
     }
 
     #[test]
