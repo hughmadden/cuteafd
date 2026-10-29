@@ -707,13 +707,8 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
 /// (41,943,040 B for DFlash2).
 pub(crate) fn draft_capacity(max_sequences: usize, draft_sequences: usize, context_slots: Option<usize>)
     -> (Option<usize>, usize) {
-    match context_slots {
-        Some(slots) => (Some(slots), draft_sequences),
-        None => {
-            let slots = max_sequences.max(1);
-            (Some(slots), draft_sequences.min(slots))
-        }
-    }
+    cuteafd_loader::families::glm5::draft_representation::flash_serving_draft_limits(
+        max_sequences, draft_sequences, context_slots)
 }
 
 /// A drafter ring for a newly admitted sequence that drafts (`wanted`), counting the admissions

@@ -40,7 +40,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
+    for name in ("glmf", "glmf_split", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -57,6 +57,43 @@ def exporter(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("intermediates", [(12288, 2048), (6144, 1024)])
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 4096), (64, 64)])
+def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates, decode_rows, prefill_rows):
+    geometry = types.SimpleNamespace(dense_inter=intermediates[0], moe_inter=intermediates[1])
+    programs = exporter.glmf_stage_programs(geometry, decode_rows, prefill_rows)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
+    caps = decode_caps | {prefill_rows}
+    assert len(calls) == len(programs) == 6 * len(caps)
+    for rows in caps:
+        op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
+        assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
+        assert args == (geometry,)
+        assert params == kwargs == {"max_rows": rows, "decode": rows in decode_caps}
+        for stage in ("rank_norm", "absorb", "values"):
+            op, params, (module, compiler, args, kwargs) = calls[f"{stage}_m{rows}"]
+            assert op == "attention_stage"
+            assert (module, compiler, args) == ("glmf_split", "compile_glmf_stage_aot", (geometry,))
+            assert params == kwargs == {"stage": stage, "max_rows": rows}
+        for inter in intermediates:
+            op, params, (_, compiler, args, kwargs) = calls[f"swiglu_i{inter}_m{rows}"]
+            assert op == "swiglu_split"
+            assert compiler == "compile_glmf_stage_aot" and args == (geometry,)
+            assert params == kwargs == {"stage": "swiglu", "max_rows": rows, "inter": inter}
+
+
+def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
+    narrow = exporter.glmf_stage_programs(GEOMETRY, 64, 4096)
+    wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
+    describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
+    narrow, wide = describe(narrow), describe(wide)
+    assert len(narrow) == 12 and len(wide) == 18
+    assert {name: wide[name] for name in narrow} == narrow
+    assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
+    assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()
 
 
 @pytest.mark.parametrize("geometry,checkpoint,limit", [

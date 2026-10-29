@@ -231,6 +231,35 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
     Ok((add(owned, workspace)?, add(scratch, allocation(attention_scratch))?))
 }
 
+pub fn is_dspark(config: &serde_json::Value) -> bool {
+    config["speculators_model_type"] == "dspark" || config["architectures"].as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel"))
+}
+
+/// Serving owns one draft ring per scheduler slot unless explicitly overridden.
+pub fn flash_serving_draft_limits(max_sequences: usize, sequences: usize, slots: Option<usize>)
+    -> (Option<usize>, usize) {
+    match slots {
+        Some(slots) => (Some(slots), sequences),
+        None => { let slots = max_sequences.max(1); (Some(slots), sequences.min(slots)) }
+    }
+}
+
+/// Flash planning, admission and loading share one checkpoint-derived head row capacity.
+pub fn flash_draft_capacity(config: &serde_json::Value, context_slots: Option<usize>, sequences: usize)
+    -> Result<GlmDraftCapacity, GlmDraftStorageError> {
+    let slots = context_slots.unwrap_or(20.max(sequences));
+    let (block, batch) = if is_dspark(config) {
+        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)
+            .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark checkpoint"))?;
+        (cfg.block, sequences.min(slots).min(32))
+    } else {
+        let (_, block) = draft_geometry(config)?;
+        (usize::try_from(block).map_err(|_| GlmDraftStorageError::Overflow)?, sequences.min(slots))
+    };
+    GlmDraftCapacity::new(slots, batch, block)
+}
+
 pub fn draft_geometry(config: &serde_json::Value) -> Result<(GlmDraftGeometry, u64), GlmDraftStorageError> {
     let int = |value: &serde_json::Value, name: &str| value[name].as_u64()
         .ok_or(GlmDraftStorageError::Unsupported("missing draft geometry"));
@@ -253,7 +282,7 @@ pub fn draft_resident_bytes(config: &serde_json::Value, slots: usize, sequences:
 pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
     representation: GlmDraftRepresentation, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), GlmDraftStorageError> {
     if mode > 2 || sms == 0 || sms > 4096 { return Err(GlmDraftStorageError::Unsupported("invalid draft scratch mode or SM count")); }
-    if config["speculators_model_type"] == "dspark" {
+    if is_dspark(config) {
         return dspark_resident_bytes(config, slots, sequences.min(32), sms, representation, mode, kv_cache);
     }
     let (g, block) = draft_geometry(config)?;
@@ -355,6 +384,63 @@ mod tests {
             layers: if flash { 5 } else { 6 }, heads: if flash { 32 } else { 64 },
             kv_heads: 8, head_dim: 128, taps: if flash { 5 } else { 6 }, vocab: 154880,
             conv_group: 16, selector_rank: 256,
+        }
+    }
+
+    /// RedHatAI/GLM-5.3-Flash-speculator.dspark-preview, revision 1972f1f0.
+    fn flash_dspark() -> serde_json::Value {
+        serde_json::json!({"architectures":["DSparkDraftModel"],"speculators_model_type":"dspark",
+            "target_hidden_size":null,"aux_hidden_state_layer_ids":[20,28,32,36,40,44],"block_size":8,
+            "confidence_head_with_markov":true,"draft_vocab_size":154880,"enable_confidence_head":true,
+            "markov_head_type":"vanilla","markov_rank":256,"mask_token_id":154856,"sample_from_anchor":true,
+            "sliding_window_non_causal":false,"transformer_layer_config":{"attention_bias":false,"head_dim":64,
+                "hidden_act":"silu","hidden_size":4096,"intermediate_size":12288,
+                "layer_types":vec!["sliding_attention";5],"max_position_embeddings":1048576,"model_type":"qwen3",
+                "num_attention_heads":64,"num_hidden_layers":5,"num_key_value_heads":64,"rms_norm_eps":1e-5,
+                "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},"sliding_window":2048,
+                "use_sliding_window":true,"vocab_size":154880}})
+    }
+
+    #[test]
+    fn flash_head_capacity_uses_real_dspark_config_without_dflash_geometry() {
+        let config = flash_dspark();
+        assert!(config.get("dflash_config").is_none());
+        assert!(draft_geometry(&config).is_err());
+        for (slots, sequences, expected) in [(None,8,(20,8,64)), (None,16,(20,16,128)),
+            (Some(4),16,(4,4,32)), (None,64,(64,32,256))] {
+            let cap = flash_draft_capacity(&config,slots,sequences).unwrap();
+            assert_eq!((cap.context_slots,cap.max_batch_sequences,cap.block_rows),expected);
+            let (owned,scratch) = draft_resident_bytes(&config,cap.context_slots,cap.max_batch_sequences,
+                188,crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
+            assert!(owned > 0 && scratch > 0);
+        }
+        let mut specforge = config["transformer_layer_config"].clone();
+        for field in ["architectures","block_size","markov_rank","markov_head_type",
+            "enable_confidence_head","confidence_head_with_markov"] {
+            specforge[field] = config[field].clone();
+        }
+        specforge["dflash_config"] = serde_json::json!({"projector_type":"dspark",
+            "mask_token_id":154856,"target_layer_ids":[19,27,31,35,39,43]});
+        assert!(is_dspark(&specforge));
+        assert_eq!(flash_draft_capacity(&specforge,None,8).unwrap().block_rows,64);
+        assert!(draft_resident_bytes(&specforge,20,8,188,crate::families::qwen4::Qwen4KvCache::Bf16).is_ok());
+        assert!(flash_draft_capacity(&config,Some(0),8).is_err());
+        assert!(flash_draft_capacity(&config,None,0).is_err());
+    }
+
+    #[test]
+    fn flash_dflash_head_capacity_is_independent_of_target_concurrency() {
+        let config = serde_json::json!({"hidden_size":4096,"intermediate_size":12288,"num_hidden_layers":5,
+            "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"vocab_size":154880,
+            "dflash_config":{"target_layer_ids":[0,8,16,24,32],"conv_group_size":16,"selector_rank":256,"block_size":16}});
+        assert_eq!(flash_draft_capacity(&config,None,8).unwrap(),GlmDraftCapacity::new(20,8,16).unwrap());
+        assert_eq!(flash_draft_capacity(&config,None,16).unwrap(),GlmDraftCapacity::new(20,16,16).unwrap());
+        assert_eq!(flash_draft_capacity(&config,Some(4),16).unwrap(),GlmDraftCapacity::new(4,4,16).unwrap());
+        for (target,drafts,slots,expected) in [(16,8,None,(16,8,128)),(8,16,None,(8,8,128)),
+            (16,8,Some(4),(4,4,64)),(8,16,Some(20),(20,16,256))] {
+            let (slots,batch) = flash_serving_draft_limits(target,drafts,slots);
+            let cap = flash_draft_capacity(&config,slots,batch).unwrap();
+            assert_eq!((cap.context_slots,cap.max_batch_sequences,cap.block_rows),expected);
         }
     }
 

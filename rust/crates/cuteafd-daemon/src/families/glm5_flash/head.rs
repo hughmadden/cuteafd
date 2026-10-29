@@ -31,24 +31,27 @@ pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)
 }
 
 pub(crate) enum GlmfHead<'a> {
+    K6(crate::shared::dense_trellis::CoreWeights<'a>),
     Bf16(DeviceAllocation<'a>),
     Fp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
 }
 
 impl<'a> GlmfHead<'a> {
-    pub fn allocations(&self) -> Vec<&DeviceAllocation<'a>> {
+    pub fn allocations(&self) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         match self {
-            Self::Bf16(weight) => vec![weight],
-            Self::Fp8 { values, scales } => vec![values, scales],
+            Self::K6(weight) => vec![weight.payload.buffer, weight.suh.buffer, weight.svh.buffer],
+            Self::Bf16(weight) => vec![weight.buffer],
+            Self::Fp8 { values, scales } => vec![values.buffer, scales.buffer],
         }
     }
 
     pub fn bytes(&self) -> usize {
-        self.allocations().iter().map(|a| a.buffer.bytes).sum()
+        self.allocations().iter().map(|a| a.bytes).sum()
     }
 
     pub fn name(&self) -> &'static str {
         match self {
+            Self::K6(_) => "K6",
             Self::Bf16(_) => "BF16",
             Self::Fp8 { .. } => "FP8",
         }
@@ -58,7 +61,7 @@ impl<'a> GlmfHead<'a> {
     pub fn bf16(&self) -> Option<&DeviceAllocation<'a>> {
         match self {
             Self::Bf16(weight) => Some(weight),
-            Self::Fp8 { .. } => None,
+            Self::Fp8 { .. } | Self::K6(_) => None,
         }
     }
 

@@ -2,10 +2,11 @@
 """Shared native K6 core projections (trellis ABI v1).
 
 Dimensions are local [K,N] after TP2 placement, not the full checkpoint sizes.
-Whole/replicated MLA and latent operands retain their full dimensions. kv_a
-requires a stored N640 tensor and a caller-side N576 trim; unpadded N576 is
-not a supported native trellis geometry. Independently calibrated projections
-are never concatenated. One fixed arithmetic covers rows 1 through 4096.
+Whole/replicated MLA and latent operands retain their full dimensions. GLM
+and Kimi kv_a use stored N640 with a caller-side N576 trim; Flash is NoPE
+and uses native N512 without padding. Unpadded N576 is unsupported.
+Independently calibrated projections are never concatenated. One fixed
+arithmetic covers rows 1 through 4096.
 
 KDA q/k/v/g share one activation and run as one grouped launch per H128
 stage. Each projection retains its own payload, scales and rotation. Native
@@ -59,7 +60,30 @@ GLM_SHAPES = (
     ("glm_shared_down_tp2", 1024, 6144, 2),
     ("glm_lm_head", 6144, 154880, 1),
 )
-FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES}
+# GLM Flash is NoPE: kv_a is N512, not the padded N640 GLM/Kimi operand.
+# Gate/up and q/k/v remain independently calibrated projections.
+GLMF_SHAPES = (
+    ("glmf_kda_qkv", 4096, 8192, 1),
+    ("glmf_kda_qkv_tp2", 4096, 4096, 1),
+    ("glmf_kda_o", 8192, 4096, 1),
+    ("glmf_kda_o_tp2", 4096, 4096, 2),
+    ("glmf_q_a", 4096, 1536, 1),
+    ("glmf_kv_a", 4096, 512, 1),
+    ("glmf_q_b", 1536, 16384, 1),
+    ("glmf_q_b_tp2", 1536, 8192, 1),
+    ("glmf_o", 16384, 4096, 1),
+    ("glmf_o_tp2", 8192, 4096, 2),
+    ("glmf_dense_gate_up", 4096, 12288, 1),
+    ("glmf_dense_gate_up_tp2", 4096, 6144, 1),
+    ("glmf_dense_down", 12288, 4096, 1),
+    ("glmf_dense_down_tp2", 6144, 4096, 2),
+    ("glmf_shared_gate_up", 4096, 2048, 1),
+    ("glmf_shared_gate_up_tp2", 4096, 1024, 1),
+    ("glmf_shared_down", 2048, 4096, 1),
+    ("glmf_shared_down_tp2", 1024, 4096, 2),
+    ("glmf_lm_head", 4096, 154880, 1),
+)
+FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES}
 F32_OUTPUTS = (163840, 154880)
 
 

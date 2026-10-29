@@ -1450,10 +1450,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     precision::check_projection_inputs(&checkpoint, &cfg,
         args.layers.unwrap_or(cfg.layers))?;
     if let Some(snapshot) = &args.draft {
-        let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
-            .context("DFlash target has no lm_head.weight")?;
-        // The drafter borrows the target's one head: BF16, or the FP8 head made from it.
-        crate::shared::speculation::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        if core.get_weight("lm_head").is_none() {
+            let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
+                .context("DFlash target has no supported vocabulary head")?;
+            crate::shared::speculation::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
+        }
         if dspark::is_dspark(snapshot)? {
             dspark::check_checkpoint(snapshot, cfg.hidden, cfg.vocab_size, cfg.layers)?;
         } else {
@@ -1514,6 +1516,31 @@ fn resolve_attention(args: &EngineArgs, programs: &cuteafd_ffi::programs::Progra
 }
 
 impl Opened {
+    fn core_admission(&self, args: &EngineArgs, layers: usize, ranks: usize,
+        attention: engine::GlmfAttention) -> Result<Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>> {
+        use cuteafd_loader::families::glm5_flash::{core::CoreInventory, core_admission::CoreCharges, GlmNextAttention};
+        let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let core = CoreInventory::from_checkpoint(&self.cfg, &headers)?;
+        if core.projections.is_empty() { return Ok(None); }
+        ensure!(args.kda_state == engine::KdaState::F32, "native K6 requires F32 KDA state programs");
+        let owners = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers).then(|| {
+            let mut next = attention.first_owner as u8;
+            self.cfg.attention[..layers].iter().map(|kind| {
+                let owner = next;
+                if *kind == GlmNextAttention::Mla { next ^= 1; }
+                owner
+            }).collect::<Vec<_>>()
+        });
+        let draft_rows = args.draft.as_ref().map(|path| -> Result<usize> {
+            let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+            Ok(cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+                args.draft_context_slots, args.draft_sequences)?.block_rows)
+        }).transpose()?;
+        let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+        Ok(Some(CoreCharges::from_package(&self.cfg, &core, layers, ranks, owners.as_deref(),
+            args.prefill_rows, args.prefill_waves, args.decode_rows, draft_rows, args.kda_output_shard, &manifest)?))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
@@ -1522,21 +1549,28 @@ impl Opened {
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
-        use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_table_pages,
+        use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
             GlmfScratchOptions, GlmfStepShape};
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
         let split = devices.len() == 2;
+        let core_charge = self.core_admission(args, layers, devices.len(), attention)?;
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
-            programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS))?;
+            programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS)
+                || core_charge.as_ref().is_some_and(|c| c.programs.iter().any(|n| n == name)))?;
             Ok(())
         })?;
         let local_tp2_exl3 = split && args.peers.is_none() && !args.skip_experts
             && self.experts.as_ref().is_some_and(|c| c.exl3().is_some());
         let code_package = if local_tp2_exl3 { "exl3-tp2-local" } else { "*" };
+        let mut program_set = placement::ProgramSet::from_names(&["glmf", "glmf2"], programs.names());
+        if let Some(core) = &core_charge {
+            program_set.names.extend(core.programs.iter().cloned());
+            program_set.names.sort(); program_set.names.dedup();
+        }
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", code_package,
-                &placement::ProgramSet::from_names(&["glmf", "glmf2"], programs.names())))
+            crate::shared::inventory::pending_code(&self.library, device, rank, split,
+                if core_charge.is_some() { "glmf-k6" } else { "glmf" }, code_package, &program_set))
             .collect::<Result<Vec<_>>>()?;
         let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
@@ -1554,8 +1588,10 @@ impl Opened {
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
             kda_prefill_expanded: args.kda_prefill_expanded, index_compact: index == engine::IndexCache::Compact,
             kda_state: args.kda_state.into() };
-        let decode = glmf_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true)?;
-        let mut prefill = glmf_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false)?;
+        let native = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&self.cfg, &headers)?
+            .scratch_mask(&self.cfg, layers);
+        let decode = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true, native)?;
+        let mut prefill = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false, native)?;
         if args.replay_records == engine::ReplayRecords::Shared {
             prefill.programs = prefill.programs.max(cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes_rows(
                 &self.cfg, layers, devices.len(), args.decode_rows as u64)?);
@@ -1566,8 +1602,17 @@ impl Opened {
             output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
-        let workspace = workspaces(spark_ranks > 0, lanes);
-        let local_workspace = workspaces(false, lanes);
+        let mut workspace = workspaces(spark_ranks > 0, lanes);
+        let mut local_workspace = workspaces(false, lanes);
+        if let Some(core) = &core_charge {
+            for profile in [&mut workspace, &mut local_workspace] {
+                for (rank, bytes) in core.bytes(self.cfg.hidden)?.into_iter().enumerate() {
+                    profile.push(admission::GlmfBufferDemand::new(admission::GlmfComponent::Always, rank as u8,
+                        cuteafd_core::memory_layout::Category::Workspace, "native K6 core", bytes,
+                        cuteafd_core::memory_layout::Basis::Exact));
+                }
+            }
+        }
         let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
         experts.truncate(self.cfg.dense[..layers].iter().filter(|&&d| !d).count());
         if args.skip_experts { for cost in &mut experts { cost.whole = Default::default(); cost.half = Default::default(); } }
@@ -1592,8 +1637,9 @@ impl Opened {
         let draft_sms: Vec<_> = inventory.gpus.iter().map(|gpu| gpu.sms as u64).collect();
         let (drafter_bytes, drafter_scratch, drafter_bridge) = args.draft.as_ref().map(|path| -> Result<_> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-            let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
-            let batch = args.draft_sequences.min(slots);
+            let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+                args.draft_context_slots, args.draft_sequences)?;
+            let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
             let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
                 args.draft_linear.code() as u8, args.draft_kv_cache)?;
@@ -1609,7 +1655,7 @@ impl Opened {
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3,
+        let inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
@@ -1664,6 +1710,17 @@ impl Opened {
         let probe = |stage| crate::shared::inventory::startup_probe(&self.library, &probe_devices, stage);
         probe("contexts-before-peer")?;
         let mut resolved = args.clone();
+        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(
+            &self.cfg, &self.checkpoint)?;
+        if core.scratch_mask(&self.cfg, layers).kda {
+            // Native K6 reduces unrotated F32 cores, not FP8 KDA partials.
+            resolved.kda_fp8 = fp8::KdaFp8::Off;
+            resolved.kda_fp32_partials = false;
+            resolved.kda_output_shard = false;
+            resolved.kda_prefill_expanded = false;
+        }
+        if core.get_weight("lm_head").is_some() { resolved.fp8_head = false; }
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
             resolved.split_device = None;
@@ -2113,6 +2170,7 @@ impl Opened {
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
+        engine.bind_core(self.core_admission(args, layers, 1 + usize::from(split_device.is_some()), attention)?)?;
         engine.validate_attention_homes(&execution)?;
         if attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers {
             engine.bind_layer_execution(execution)?;
@@ -2161,6 +2219,7 @@ impl Opened {
         }
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
         engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
+        engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
             "GLM Flash immutable attention reduction plan");
@@ -2214,7 +2273,10 @@ impl Opened {
         let started = Instant::now();
         let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
             ::from_fp8_option(args.draft_fp8);
-        let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+            args.draft_context_slots, args.draft_sequences)?;
+        let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
         let drafter = if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
@@ -2224,10 +2286,10 @@ impl Opened {
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
             let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
-                slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
+                slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
-            dspark::Drafter::load(&self.library, snapshot, stream, slots, args.draft_sequences.min(slots),
+            dspark::Drafter::load(&self.library, snapshot, stream, slots, batch,
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                 args.draft_linear, args.draft_kv_cache, read)?
         };
