@@ -2662,3 +2662,20 @@ def test_arm_env_reaches_only_its_own_job():
     # Inherited private diagnostics never leak into an arm that did not ask for them.
     assert "if k.startswith('CUTEAFD_DIAG_')" in launch and "del job_env[key]" in launch
     assert "job_env.update(job.get('arm_env', {}))" in launch
+
+
+def test_cold_window_drops_page_cache_when_the_timed_sweep_opens(entry, tmp_path):
+    with pytest.raises(ValueError, match='--cold-window drops the page cache'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       cold_hosts=['raptor'])
+    job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'a', dict(instance='p', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+    assert job['entry']['window']['open']['argv'] == ['nest', 'drop-caches', '--host', 'raptor']
+    # With PROFILE=nsys the purge runs first, then the nsys sessions start.
+    job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'b', dict(instance='q', slot='s'), tmp_path,
+                         tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1, cold_hosts=['raptor'])
+    script = job['entry']['window']['open']['argv'][2]
+    assert script.index('nest drop-caches --host raptor') < script.index('start --session=')
+    with pytest.raises(ValueError, match='both use the measurement window'):
+        cards.generate({**entry, 'levels': [1]}, 'c', dict(instance='r', slot='s'), tmp_path, tmp_path / 'key',
+                       {}, set(), None, 1, exact_state=['/x', 'g'], cold_hosts=['raptor'])

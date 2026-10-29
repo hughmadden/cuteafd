@@ -276,7 +276,8 @@ def probe_selection(items, cards, arms):
     return probes, scoped
 
 
-def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None):
+def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None,
+             cold_hosts=None):
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'))
     entry['fabric'] = 'fabric' in probes
@@ -357,11 +358,21 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         if sessions:
             if not (entry.get('levels') or entry.get('prefill_lengths')):
                 raise ValueError(card + ': PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep; pass --levels or --prefill-lengths')
+            # A cold window drops the clean page cache first, so the profiled
+            # timed wave reads cold (warm-up already ran before the window).
+            purge = [cold_purge_argv(cold_hosts)] if cold_hosts else []
             entry['window'] = dict(
-                open=dict(argv=window_argv([s + ['start', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=120, required=True),
+                open=dict(argv=window_argv(purge + [s + ['start', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=300, required=True),
                 close=dict(argv=window_argv([s + ['stop', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
+    if cold_hosts and not entry.get('window'):
+        if not (entry.get('levels') or entry.get('prefill_lengths')):
+            raise ValueError(card + ': --cold-window drops the page cache before the timed sweep; pass --levels or --prefill-lengths')
+        if exact_state:
+            raise ValueError(card + ': --cold-window and --exact-state both use the measurement window')
+        entry['window'] = dict(open=dict(argv=cold_purge_argv(cold_hosts), timeout_s=300, required=True),
+                               close=dict(argv=['true'], timeout_s=10, required=True))
     if exact_state:
         # A family's exact prefix-state golden, run against the live server while
         # smoke holds the card's locks (CUTEAFD_SMOKE_URL); output in the job dir.
@@ -1028,6 +1039,12 @@ def spark_profile_ranks(values, hosts):
     if max(ranks) >= len(hosts):
         raise ValueError(f'PROFILE_SPARK_RANKS names rank {max(ranks)}; this card has ranks 0..{len(hosts) - 1}')
     return ranks
+
+
+def cold_purge_argv(hosts):
+    """SparkNest's clean page-cache drop on these hosts (its installed setuid
+    helper; other workloads on them lose cached pages too)."""
+    return ['nest', 'drop-caches', *[arg for host in hosts for arg in ('--host', host)]]
 
 
 def window_argv(commands):
@@ -2214,6 +2231,9 @@ def main():
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
                         'checked after warm-up and recorded in result.json')
+    parser.add_argument('--cold-window', metavar='HOSTS', help='drop the clean page cache on these comma-separated hosts '
+                        '(nest drop-caches) when the timed sweep opens, after warm-up; under the card\'s held locks, so only '
+                        'hosts the card owns; composes with PROFILE=nsys')
     parser.add_argument('--exact-state', metavar='ARGV', help='run this exact prefix-state golden (shell-split argv; gets '
                         '--resume-url URL --output JOB/exact-state) against the live server at the end of the sweep; needs --levels')
     parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
@@ -2435,7 +2455,7 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
