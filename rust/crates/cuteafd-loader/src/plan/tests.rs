@@ -1509,6 +1509,33 @@ fn glm5_coordinator_takes_bf16_and_per_tensor_fp8_where_decode_reads_fp8() {
 }
 
 #[test]
+fn routed_exl3_multitier_is_unsupported_and_names_tensors() {
+    for tiers in [3, 4] {
+        let mut config = glm5_flash_config(2);
+        let mut tensors = glm5_flash_tensors(&config);
+        tensors.retain(|(name, ..)| !name.contains(".mlp.experts."));
+        for expert in 0..288 {
+            let bits = 2 + expert % tiers;
+            for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096),
+                ("down_proj", 4096, 2048)] {
+                tensors.extend(exl3(&format!("model.language_model.layers.1.mlp.experts.{expert}.{proj}"), n, k, bits));
+            }
+        }
+        config["quantization_config"] = exl3_compact(2);
+        let dir = snapshot(config, &tensors);
+        let report = plan(dir.path(), &sparks(4)).unwrap();
+        assert!(!report.executable());
+        assert_eq!(component(&report, Component::RoutedExpert).status, Status::MissingKernel);
+        let output = render(&report);
+        assert!(output.contains(&format!("unsupported: EXL3 with {tiers} expert tiers (2 supported)")), "{output}");
+        for expert in 0..tiers {
+            assert!(output.contains(&format!("model.language_model.layers.1.mlp.experts.{expert}.down_proj")), "{output}");
+        }
+        assert!(crate::read_expert_catalog(dir.path()).is_err());
+    }
+}
+
+#[test]
 fn glm5_flash_mixed_exl3_tiers_share_one_package() {
     let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, ..Default::default() }), ..sparks(ranks) };
     let mut tensors = glm5_flash_tensors(&glm5_flash_config(2));

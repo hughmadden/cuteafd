@@ -289,7 +289,6 @@ python/tools/qualify_glmf_programs.py	python/tools/qualify/glm5_flash/qualify_gl
 python/tools/qualify_v41_attention_batch_aot.py	python/tools/qualify/deepseek_v41/qualify_v41_attention_batch_aot.py
 python/tools/qualify_v41_draft_expert_slices.py	python/tools/qualify/deepseek_v41/qualify_v41_draft_expert_slices.py
 python/tools/qualify_v41_exl3_aot.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_aot.py
-python/tools/qualify_v41_exl3_four_tier.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_four_tier.py
 python/tools/qualify_v41_exl3_geometry.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_geometry.py
 python/tools/qualify_v41_exl3_package.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_package.py
 python/tools/qualify_v41_exl3_paired.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_paired.py

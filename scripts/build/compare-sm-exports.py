@@ -166,8 +166,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry],
                     "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
-    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
-                           ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
+    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
@@ -303,8 +302,8 @@ def _policy_role_args(policy, role):
 def export_exl3(extra, output):
     """Follow production coordinator profiles and tuning, but allocate no CUDA buffers."""
     import torch
-    from b12x.moe._shared.kernels.w4a16 import mixed_trellis, mixed_trellis4
-    with cpu_trellis_luts((mixed_trellis, mixed_trellis4), torch.device("cpu")):
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis
+    with cpu_trellis_luts((mixed_trellis,), torch.device("cpu")):
         _export_exl3(extra, output)
 
 

@@ -77,6 +77,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError('duplicate EXL3 package variant')
         seen.add(directory)
         meta = json.loads((package / directory / 'v41_exl3.json').read_text())
+        if len(meta['bits']) != 2:
+            raise ValueError(f'EXL3 packages require two decoder tiers: {directory}')
         if meta.get('compute') != manifest['compute']:
             raise ValueError(f'EXL3 variant target differs from package target: {directory}')
         # Records without a hidden size predate other geometries: they are V4.1.
@@ -1277,6 +1279,8 @@ def package_capacities(geometry: str, requested: str) -> list[int]:
 
 
 def build(args: argparse.Namespace) -> None:
+    if len(args.bits) != 2:
+        raise ValueError('EXL3 packages require two decoder tiers')
     validate_destination(args.output)
     geometry = getattr(args, 'geometry', 'v41')
     hidden = GEOMETRIES[geometry][0]

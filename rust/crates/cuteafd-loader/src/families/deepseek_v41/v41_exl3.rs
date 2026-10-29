@@ -260,6 +260,10 @@ pub(crate) fn decoder_family(
         !bits.is_empty() && bits.iter().all(|b| (2..=5).contains(b)),
         "EXL3 decoder family must contain K2..K5 projections"
     );
+    ensure!(bits.len() <= 2,
+        "unsupported: EXL3 with {} expert tiers (2 supported); tensors: {}",
+        bits.len(), bits.iter().filter_map(|bit| projections.values().find(|p| p.bits == *bit))
+            .map(|p| format!("{} (K{})", p.name, p.bits)).collect::<Vec<_>>().join(", "));
     // Native mixed kernels retain an empty adjacent tier for uniform models.
     if bits.len() == 1 {
         let bit = *bits.first().unwrap();
