@@ -6199,8 +6199,23 @@ tensors, verified all MCG scalars/scales, calibrated evidence, asset bytes,
 47 diagnostic bundles and retirement barriers, with no findings. Evidence:
 `~/.cache/cuteafd/builds/glmf-core-k6/completed-export-audit.json`.
 
-The GPU container is stopped and the maxq lease released. The same durable
-supervisor is running authorized CPU-only upload and remote verification.
-Publication normalizes only the model-card license tag to the untouched
-source MIT license; every sealed numerical source hash remains unchanged.
-Do not report publication complete until its marker and successful exit exist.
+The GPU container is stopped and the maxq lease released. CPU-only publication
+completed at 2026-10-29 07:43:35 UTC, followed by supervisor exit zero.
+Public checkpoint: https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6
+revision `5d3fffe1df9c4a109bbbdafb60dc19df9fac019d`. All 107 published files
+pass independent remote checksums, including an anonymous weight-file check.
+The model-card license matches the untouched source MIT license; every sealed
+numerical source hash remains unchanged. Publication and exit markers are durable.
+
+Sparknest import completed with zero copied bytes: all 47 weight shards shared
+physical extents through a temporary reflink bridge, then hardlinked into the
+managed store. All 107 files were verified again through the mounted snapshot
+after removing the temporary bridge, standalone export and alternate local HF
+snapshot. `nest where` reports maxq ready. The default HF hub symlink and
+Sparknest-managed copy remain untouched. Audit:
+`~/.cache/cuteafd/builds/glmf-core-k6/sparknest-import-audit.json`.
+The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
+`models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-Core-K6/snapshots/5d3fffe1df9c4a109bbbdafb60dc19df9fac019d`.
+Do not replay publication against the deliberately retired standalone paths.
+Full-model generation/serving qualification and K6 engine shape support remain
+separate work; this task branch is pushed for review, not merged.
