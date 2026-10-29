@@ -66,6 +66,17 @@ pub(crate) struct DraftSeq<'p, P, D> {
     pub depth: usize,
 }
 
+/// One member of an already-queued packed prefill. The backend owns tap layout
+/// and advances both target and draft state before invoking its head callback.
+pub(crate) struct PrefillSeq<'p, P, D> {
+    pub placement: &'p mut P,
+    pub tokens: &'p [u32],
+    pub start: usize,
+    pub next: Option<u32>,
+    pub draft: &'p mut D,
+    pub neural: bool,
+}
+
 pub(crate) struct Verified<'p, P, D, H> {
     pub placement: &'p mut P,
     pub seq: &'p mut D,
@@ -127,6 +138,15 @@ pub(crate) trait Backend<'a> {
     fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> { None }
+    /// Consume each member's scratch head before generating the next one.
+    /// Outer errors invalidate shared work; inner errors belong to one member.
+    fn prefill_packed(&self, _sequences: &mut [PrefillSeq<'_, Self::Placement, Self::Draft>],
+        _pool: &cuteafd_engine::prefix::RefPagePool,
+        _on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        anyhow::bail!("backend does not implement packed prefill")
+    }
     fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
@@ -615,6 +635,82 @@ mod readiness_tests {
     }
 }
 
+fn packed_chunk<P: Placement, D>(p: &Prefill<'_, P, D>) -> Option<(usize, usize)> {
+    if p.job.events.is_closed() || p.done == p.tokens.len() || p.logits.is_some()
+        || !p.placement.spans().is_empty() || p.job.probe.as_ref().is_some_and(|probe|
+            probe.spec.cold_steps.get(p.chunks).is_some_and(|step| step.decode)) { return None; }
+    Some((p.placement.len(), p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()) - p.done))
+}
+
+fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>, B::Meta>, selector: &mut TokenSelector<'a>,
+    group: &mut [Prefill<'_, B::Placement, B::Draft>], neural: bool) -> Vec<Result<Chunk>> {
+    use crate::shared::prefill_packing::{member_outcomes, row_shares};
+    let timer = Instant::now();
+    let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
+    let counts = group.iter().zip(&ends).map(|(p, end)| end - p.done).collect::<Vec<_>>();
+    for (p, &end) in group.iter().zip(&ends) {
+        if end < p.tokens.len() {
+            let next = p.plan.chunks.get(p.chunks + 1).copied().unwrap_or(p.tokens.len());
+            engine.prefetch(&p.tokens[..end], &p.tokens[end..next]);
+        }
+    }
+    let caching = cache.enabled();
+    let (result, phases) = isolated_phases(engine.profile(), || {
+        let mut sequences = Vec::with_capacity(group.len());
+        let mut outputs = Vec::with_capacity(group.len());
+        for (p, &end) in group.iter_mut().zip(&ends) {
+            let Prefill { job, constraint, tokens, done, placement, seq, first, prompt_row, resume, .. } = p;
+            let start = placement.len();
+            sequences.push(PrefillSeq { placement, tokens: &tokens[*done..end], start,
+                next: tokens.get(end).copied(), draft: seq, neural: effective_neural(neural, &job.probe) });
+            outputs.push((&*job, constraint, first, prompt_row, tokens.len(), end, *resume));
+        }
+        engine.prefill_packed(&mut sequences, cache.pool(), &mut |i, logits| {
+            let (job, constraint, first, retained, len, end, resume) = &mut outputs[i];
+            // Even a departed member's state advanced; only its local completion fails.
+            if job.events.is_closed() { return Ok(Err(anyhow::anyhow!("client went away"))); }
+            if end != len { return Ok(Ok(())); }
+            anyhow::ensure!(logits.rows == 1, "packed prefill must produce one member head row");
+            if caching && !probe::cold(&job.probe) && resume < len {
+                **retained = Some(logits.row_host(engine.library(), 0)?);
+            }
+            if probe::wants_first(&job.probe) {
+                probe::device_rows(engine.library(), &job.probe, &logits, 0, 1, *len)?;
+            }
+            let mut batch = SelectBatch::default();
+            if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
+                return Ok(Err(error));
+            }
+            let selected = selector.select(&logits, &batch)?;
+            match take(constraint.as_mut(), &selected[0]) {
+                Ok(token) => { **first = Some(token); Ok(Ok(())) }
+                Err(error) => Ok(Err(error)),
+            }
+        })
+    });
+    let elapsed = timer.elapsed().as_secs_f64();
+    let outcomes = member_outcomes(group.len(), result);
+    group.iter_mut().zip(&ends).zip(&counts).zip(row_shares(&counts)).zip(outcomes)
+        .map(|((((p, &end), &count), share), outcome)| {
+            p.done = end;
+            p.cancelled = p.job.events.is_closed();
+            add_phases(&mut p.phases, phases.map(|seconds| seconds * share));
+            p.busy += elapsed * share;
+            p.ticket.prefill(count, p.chunks, p.plan.chunks.len(), timer);
+            outcome?;
+            for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+                cache.capture_session(p.ticket.session());
+                if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
+                    p.keys.spans(), &p.placement, After::default()) {
+                    tracing::warn!("snapshot point {point} not retained: {error:#}");
+                }
+            }
+            p.chunks += 1;
+            Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+        }).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
@@ -862,7 +958,16 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|p| {
+            let limits = engine.packed_limits();
+            let finished = prefills.round_packed(limits.map_or(0, |l| l.rows), max_sequences,
+                |p| packed_chunk(p).map(|(_, rows)| rows),
+                |group, next| limits.is_some_and(|limits| crate::shared::prefill_packing::plan(
+                    &group.iter().chain([next]).filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok()),
+                |group| {
+                    if group.len() > 1 {
+                        return prefill_group(engine, &family, &mut cache, &mut selector, group, neural);
+                    }
+                    group.iter_mut().map(|p| {
                 if p.done == p.tokens.len() {
                     return Ok(Chunk::Done);
                 }
@@ -928,7 +1033,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 }
                 p.chunks += 1;
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
-            });
+                    }).collect()
+                });
             for (mut p, prefilled) in finished {
                 let (placement, resume) = (p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
