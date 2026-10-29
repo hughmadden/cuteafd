@@ -667,6 +667,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires sealed native exports, target weights and real Spark workers"]
+    fn live_packed_prefill_matches_singletons_with_private_mtp() -> Result<()> {
+        use super::super::{mtp::DraftState, prefix::Placement};
+        use cuteafd_engine::prefix::PrefixFamily;
+        let mut args = live_mtp_args();
+        args.split_device = std::env::var("CUTEAFD_STEP5_SPLIT_DEVICE").ok().map(|s| s.parse()).transpose()?;
+        args.device = std::env::var("CUTEAFD_STEP5_DEVICE").unwrap_or_else(|_| "0".into()).parse()?;
+        args.prefill_rows = 256;
+        args.max_sequences = 4;
+        args.prefill_packing = <crate::shared::prefill_packing::PackingMode as clap::ValueEnum>::from_str(
+            &std::env::var("CUTEAFD_STEP5_PACKING").unwrap_or_else(|_| "exact".into()), false)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?;
+        args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
+        args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
+        args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
+        args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
+            .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
+        let bytes = std::fs::read(std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?)
+            .join("windows/original-page-leases/tokens.bin"))?;
+        ensure!(bytes.len() % 4 == 0, "packed exactness token byte extent");
+        let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        ensure!(tokens.len() >= 192, "packed exactness needs 192 real tokens");
+        with_backend(&args, |backend, _| {
+            let (family, mut pool) = backend.prefix_cache(&args.prefix, 4)?;
+            let mut placements = (0..4).map(|sequence| pool.admit_cold(&family, 192, 256,
+                |pages| Placement { pages, sequence, committed: 0 }).map(|a| a.placement)).collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut drafts = (0..4).map(|_| DraftState::default()).collect::<Vec<_>>();
+            let prompts = [&tokens[..128], &tokens[31..159]];
+            for (i, (p, draft)) in placements.iter_mut().zip(&mut drafts).enumerate() {
+                let prompt = prompts[i % 2];
+                backend.bind_request(p, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, prompt.len())?, prompt, 0)?;
+                if i % 2 == 1 {
+                    backend.prefill_device(p, &prompt[..65], 0, pool.pool())?;
+                    backend.prefill_draft(p, 0, &prompt[..65], prompt.get(65).copied(), draft)?;
+                }
+            }
+            let chunks = [&prompts[0][..29], &prompts[1][65..105]];
+            let limits = backend.packed_limits().context("Step-5 packing limits missing")?;
+            let layout = [(0, chunks[0].len()), (65, chunks[1].len())];
+            let groups = crate::shared::prefill_packing::groups(2, |range|
+                crate::shared::prefill_packing::plan(&layout[range], &limits).is_ok());
+            let mut packed_logits = vec![Vec::new(); 2];
+            let mut packs = 0;
+            for range in groups {
+                if range.len() == 1 {
+                    let i = range.start;
+                    let start = placements[i].committed;
+                    let logits = backend.prefill_device(&mut placements[i], chunks[i], 1, pool.pool())?.context("singleton head")?;
+                    packed_logits[i] = logits.row_host(backend.library(), 0)?;
+                    backend.prefill_draft(&placements[i], start, chunks[i], None, &mut drafts[i])?;
+                } else {
+                    packs += 1;
+                    let mut sequences = placements[..2].iter_mut().zip(&mut drafts[..2]).enumerate().map(|(i, (p, draft))|
+                        scheduler::PrefillSeq { start: p.committed, placement: p, tokens: chunks[i], next: None, draft, neural: true })
+                        .collect::<Vec<_>>();
+                    let outcomes = backend.prefill_packed(&mut sequences, pool.pool(), &mut |i, logits| {
+                        packed_logits[i] = logits.row_host(backend.library(), 0)?;
+                        Ok(Ok(()))
+                    })?;
+                    for outcome in outcomes { outcome?; }
+                }
+            }
+            for i in 0..2 {
+                let j = i + 2;
+                let start = placements[j].committed;
+                let logits = backend.prefill_device(&mut placements[j], chunks[i], 1, pool.pool())?.context("alone head")?;
+                let alone = logits.row_host(backend.library(), 0)?;
+                backend.prefill_draft(&placements[j], start, chunks[i], None, &mut drafts[j])?;
+                ensure!(packed_logits[i].iter().map(|v| v.to_bits()).eq(alone.iter().map(|v| v.to_bits())),
+                    "packed member {i} logits differ from singleton");
+                ensure!(backend.diagnostic_state(&placements[i])? == backend.diagnostic_state(&placements[j])?,
+                    "packed member {i} target/predictor state differs from singleton");
+            }
+            println!("Step-5 packed exactness members=2 packs={packs} cap={} target_kv_csa=true predictor_stages=3 logits=true byte_exact=true", limits.rows);
+            for p in &placements { pool.release(&family, &p.pages)?; }
+            family.drain().map_err(|e| anyhow::anyhow!("packed exactness drain: {e}"))?;
+            Ok(())
+        })
+    }
+
+    #[test]
     fn target_serving_defaults_and_invalid_owners() -> Result<()> {
         let mut args = args();
         args.validate()?;

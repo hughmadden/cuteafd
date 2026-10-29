@@ -207,38 +207,13 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         Ok(self)
     }
 
-    pub(super) fn packed_limits(&self) -> crate::shared::prefill_packing::Limits {
+    fn packing_limits(&self) -> crate::shared::prefill_packing::Limits {
         crate::shared::prefill_packing::Limits {
             rows: self.packed_row_cap.unwrap_or(self.prefill.0), chunk_rows: self.prefill.0,
             max_context: self.context,
             // Native MTP target history is request-owned, not a shared tap ring.
             taps: None,
         }
-    }
-
-    pub(super) fn prefill_packed(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
-        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
-        -> Result<Vec<Result<()>>> {
-        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
-            .map(|(p, tokens)| (p.committed, tokens.len())).collect::<Vec<_>>(), &self.packed_limits())?;
-        self.state.submit(|| {
-            let (step, _) = self.state.post_execution(self.execute_inner(sequences, pool,
-                cuteafd_transport::ExpertV2SourceKind::Prefill, Some(0))?)?;
-            let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
-                .collect::<Vec<_>>();
-            step.publish_wave(&mut accepted)?;
-            let rank = self.execution.ownership().execution().spec().head_gpu as usize;
-            let stages = self.execution.stages();
-            let stream = &stages[rank].stream;
-            let head = self.execution.head()?;
-            crate::shared::prefill_packing::finish_members(segments.len(), |i| {
-                let source = super::mtp::slice(self.inputs.residual.buffer,
-                    (segments[i].end_row() - 1) * H * 4, H * 4)?;
-                let logits = head.device_logits_on(source, 1, stream)?;
-                stream.drain()?;
-                Ok(logits)
-            }, on_logits)
-        })
     }
 
     /// The head was admitted at chunk width: all-row prefill scoring is served.
@@ -483,6 +458,44 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         if logit_rows == 0 { return Ok(None); }
         Ok(Some(logits))
     }
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        Some(self.packing_limits())
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, NoDraft>], pool: &RefPagePool,
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        ensure!(sequences.iter().all(|s| s.start == s.placement.committed),
+            "Step-5 packed member frontier differs from placement");
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &self.packing_limits())?;
+        self.state.submit(|| {
+            let mut target = sequences.iter_mut().map(|s| (&mut *s.placement, s.tokens)).collect::<Vec<_>>();
+            let (step, _) = self.state.post_execution(self.execute_inner(&target, pool,
+                cuteafd_transport::ExpertV2SourceKind::Prefill, Some(0))?)?;
+            let mut accepted = target.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
+                .collect::<Vec<_>>();
+            step.publish_wave(&mut accepted)?;
+            drop(accepted);
+            drop(target);
+            let rank = self.execution.ownership().execution().spec().head_gpu as usize;
+            let stages = self.execution.stages();
+            let stream = &stages[rank].stream;
+            let head = self.execution.head()?;
+            crate::shared::prefill_packing::finish_members(segments.len(), |i| {
+                let sequence = &mut sequences[i];
+                if sequence.neural {
+                    self.prefill_draft(sequence.placement, sequence.start, sequence.tokens,
+                        sequence.next, sequence.draft)?;
+                }
+                let source = super::mtp::slice(self.inputs.residual.buffer,
+                    (segments[i].end_row() - 1) * H * 4, H * 4)?;
+                let logits = head.device_logits_on(source, 1, stream)?;
+                stream.drain()?;
+                Ok(logits)
+            }, on_logits)
+        })
+    }
+
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.verify(|| self.execute(sequences, pool, verify_kind(speculative), None)).map(Some)
@@ -588,8 +601,9 @@ mod tests {
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping,
             InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         use crate::shared::prefill_packing::{groups, plan, Limits};
-        let identity = WorkerIdentity { checkpoint: "0".repeat(64), manifest: None,
-            geometry: [4096, 352, 8, 1536, 91], world: 4, topology: [4, 1], ownership_wire: false };
+        let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "manifest": null, "geometry": [4096, 352, 8, 1536, 91],
+            "world": 4, "topology": [4, 1], "ownership_wire": false }))?;
         let variant = |cut| InstalledExpertVariant::from_queries(256, |_| Ok(64))?
             .with_arithmetic_routes(|rows| Ok(Some(if rows <= cut { (1, cut) } else { (2, 256) })));
         let report = InstalledExpertGrouping::new(WorkerSelection::new(identity.clone(), &[3, 4])?,

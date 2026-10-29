@@ -1150,7 +1150,7 @@ pub(super) mod tests {
                 }
                 // CSA's carry belongs to this sequence, not the packed row offset.
                 assert_eq!(retained[i].base % 8, single[0].base % 8);
-                assert_eq!(retained[i].raw, chunks[..i].iter().map(|(base, rows)| base % 8 + rows).sum());
+                assert_eq!(retained[i].raw, chunks[..i].iter().map(|(base, rows)| base % 8 + rows).sum::<usize>());
                 let changed = vec![(3000, 1), chunks[i]];
                 let partner = plan(&changed, &limits)?;
                 assert_eq!((partner[1].start, partner[1].rows), (segment.start, segment.rows));
