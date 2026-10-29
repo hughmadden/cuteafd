@@ -6,6 +6,8 @@ use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    let auto_vision_retry = (report.spark_ranks == 0 && report.vision == super::super::MediaMode::Auto)
+        .then(|| (report.clone(), options.clone()));
     let prefill = match resolve_prefill(report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_waves: if report.spark_ranks == 0 { 1 }
@@ -271,6 +273,24 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             working.spark_ranks, working.prefill_lanes, working.spark_layers));
         Ok((placed, working))
     })();
+    if matches!(admitted.as_ref().err().and_then(|error| error.downcast_ref::<placement::PlacementError>()),
+        Some(placement::PlacementError::BelowFloor { .. }))
+        && report.encoder.as_ref().is_some_and(|encoder| matches!(encoder.kind,
+            crate::plan::encoder::EncoderKind::Rtx { .. })) {
+        if let Some((original, original_options)) = auto_vision_retry {
+            // Auto media is optional: preserve the text-serving floor when the
+            // precharged tower prevents admission. Explicit RTX requests stay strict.
+            *report = original;
+            *options = original_options;
+            report.vision = super::super::MediaMode::Off;
+            let mut result = layout(report, model, input, options);
+            report.vision = super::super::MediaMode::Auto;
+            let reason = "auto vision disabled to preserve the GLM Flash KV pool floor";
+            if let Some(encoder) = &mut report.encoder { encoder.reason = reason.into(); }
+            result.notes.push(reason.into());
+            return result;
+        }
+    }
     let mut selected = None;
     match admitted {
         Ok((placed, working)) => {

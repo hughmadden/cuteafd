@@ -4236,6 +4236,45 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
 /// open a Spark worker. The launcher attaches the encoder to an expert rank,
 /// so the planner refuses instead of inventing a vision-only worker.
 #[test]
+fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(2);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let mut tensors = glm5_flash_tensors(&cfg);
+    tensors.extend(super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)));
+    let dir = snapshot(cfg, &tensors);
+    let options = PlanOptions { vision: MediaMode::Off,
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 262144,
+            pool_tokens: Some(262144), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+        ..sparks(0) };
+    let reference = plan(dir.path(), &options).unwrap();
+    assert!(reference.fits, "{}", render(&reference));
+    let gpu = &reference.memory_layout.as_ref().unwrap().devices[0];
+    let required: u64 = gpu.items.iter().map(|item| item.bytes).sum();
+    let mut constrained = options.clone();
+    let layout = constrained.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![required + layout.headroom_bytes + (256 << 20)];
+    layout.pool_tokens = None;
+    let off = plan(dir.path(), &constrained).unwrap();
+    assert!(off.fits, "{}", render(&off));
+    let auto = plan(dir.path(), &PlanOptions { vision: MediaMode::Auto, ..constrained.clone() }).unwrap();
+    assert!(auto.fits && auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.vision, MediaMode::Auto);
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    assert!(auto.encoder.as_ref().unwrap().reason.contains("pool floor"));
+    assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
+    assert!(auto.memory_layout.as_ref().unwrap().devices.iter().flat_map(|device| &device.items)
+        .all(|item| !item.group.starts_with("vision ")));
+    let strict = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..constrained }).unwrap();
+    assert!(!strict.fits && !strict.placement_supported, "{}", render(&strict));
+    assert!(strict.hints.iter().any(|hint| hint.what.contains("floor")), "{:?}", strict.hints);
+}
+
+#[test]
 fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
     use super::encoder::EncoderKind;
     let mut cfg = glm5_flash_config(2);

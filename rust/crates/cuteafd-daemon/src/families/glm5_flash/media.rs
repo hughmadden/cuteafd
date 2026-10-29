@@ -11,6 +11,13 @@ pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Resu
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
+fn local_vision_gpu(mode: MediaMode, device: i32, split_device: Option<i32>) -> Result<i32> {
+    // Explicit CLI indices name CUDA devices; only defaults use logical ranks.
+    if let MediaMode::Rtx(Some(gpu)) = mode { return Ok(i32::try_from(gpu)?); }
+    let rank = cuteafd_loader::plan::encoder::rtx_encoder_gpu(mode, false, 1 + usize::from(split_device.is_some()));
+    Ok(if rank == 0 { device } else { split_device.context("vision peer GPU")? })
+}
+
 pub(super) struct RemoteVision {
     addresses: Vec<std::net::SocketAddr>,
     plan_hash: [u8; 32],
@@ -67,11 +74,11 @@ impl ReadyVision {
             return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes }), prefix));
         }
         let gpu = match mode {
-            MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
+            MediaMode::Rtx(_) => local_vision_gpu(mode, args.device, args.split_device)?,
             MediaMode::Auto => {
                 anyhow::ensure!(args.peers.is_none() || args.local_experts,
                     "auto vision with Spark experts requires planner-resolved --vision-peers");
-                args.device
+                local_vision_gpu(mode, args.device, args.split_device)?
             },
             MediaMode::Spark(_) => anyhow::bail!("Spark vision placement requires --vision-peers, --encoder-plan-hash and --encoder-revision"),
             MediaMode::Off => unreachable!(),
@@ -320,6 +327,19 @@ mod tests {
     use super::*;
     use cuteafd_core::TargetSamplingParams;
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
+
+    #[test]
+    fn local_encoder_defaults_match_planner_and_map_logical_ranks() {
+        for mode in [MediaMode::Auto, MediaMode::Rtx(None)] {
+            for (device, peer) in [(0, None), (3, None), (0, Some(1)), (1, Some(0)), (3, Some(5))] {
+                let rank = cuteafd_loader::plan::encoder::rtx_encoder_gpu(mode, false, 1 + usize::from(peer.is_some()));
+                assert_eq!(local_vision_gpu(mode, device, peer).unwrap(),
+                    if rank == 0 { device } else { peer.unwrap() });
+            }
+        }
+        assert_eq!(local_vision_gpu(MediaMode::Rtx(Some(0)), 1, Some(0)).unwrap(), 0);
+        assert_eq!(local_vision_gpu(MediaMode::Rtx(Some(3)), 0, None).unwrap(), 3);
+    }
 
     #[test]
     fn remote_options_require_complete_identity_and_valid_placement() {
