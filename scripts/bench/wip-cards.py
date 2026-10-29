@@ -1043,8 +1043,12 @@ def spark_profile_ranks(values, hosts):
 
 def cold_purge_argv(hosts):
     """SparkNest's clean page-cache drop on these hosts (its installed setuid
-    helper; other workloads on them lose cached pages too)."""
-    return ['nest', 'drop-caches', *[arg for host in hosts for arg in ('--host', host)]]
+    helper; other workloads on them lose cached pages too). The CLI is resolved
+    here, so a hook running under a systemd unit's minimal PATH still finds it."""
+    nest = shutil.which('nest')
+    if not nest:
+        raise ValueError('--cold-window needs the SparkNest `nest` CLI on PATH')
+    return [nest, 'drop-caches', *[arg for host in hosts for arg in ('--host', host)]]
 
 
 def window_argv(commands):
