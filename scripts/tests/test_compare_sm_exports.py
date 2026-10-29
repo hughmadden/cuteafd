@@ -140,8 +140,11 @@ def test_kimik3_package_and_route_registry_are_both_sm_gated(monkeypatch):
         ("exl3-kimik3-k23", "package_exl3_aot.py", ["--bits", "2,3"]),
         ("exl3-routes-kimik3", "export_b12x_exl3_routes_aot.py", []),
     ]:
+        # Kimi K3 merges up to three 2752-row wave units, so its gate covers
+        # the 5504/8256 extents the other EXL3 geometries never pack.
         assert [job for job in jobs if job[0] == name] == [
-            (name, exporter, ["--geometry", "kimik3", "--capacities", compare_sm.EXL3_CAPACITIES, *extra])]
+            (name, exporter, ["--geometry", "kimik3", "--capacities",
+                              compare_sm.EXL3_CAPACITIES_KIMIK3, *extra])]
     # Negative control: the old list silently omitted the route registry.
     monkeypatch.setattr(compare_sm, "EXL3_GEOMETRIES",
                         tuple(g for g in compare_sm.EXL3_GEOMETRIES if g != "kimik3"))
@@ -525,7 +528,9 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
         ("glmf", [("m80", 80, 288, 8, 8), ("m256", 256, 288, 8, 64),
                   ("m1024", 1024, 288, 8, 64)]),
         ("dsv4p", [("m80", 80, 384, 6, 8), ("m256", 256, 384, 6, 8), ("m1024", 1024, 384, 6, 64)]),
-        ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 8), ("m1024", 1024, 896, 16, 64)]),
+        # Kimi K3's coordinator exports are warp-specialized from m256 up, so
+        # the route gate covers its 64-row block there as well as at m1024.
+        ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 64), ("m1024", 1024, 896, 16, 64)]),
     ):
         recorded = []
         monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(

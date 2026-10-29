@@ -28,6 +28,9 @@ GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
 CAPACITIES = "1,16,80,256,1024,4096"
 # EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
 EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
+# Kimi K3 merges up to three 2752-row wave units, so its packed extents reach
+# 8256 rows and its warp-specialized cells cover every capacity above 2752.
+EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
@@ -151,11 +154,14 @@ def jobs(scope):
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits,
                         "--compact-companions"]))
+    exl3_capacity_args = {geometry: EXL3_CAPACITIES_KIMIK3 if geometry == "kimik3"
+                          else EXL3_CAPACITIES for geometry in EXL3_GEOMETRIES}
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", EXL3_CAPACITIES])
+                   ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry]])
                   for geometry in EXL3_GEOMETRIES)
     result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", "2,3"])
+                   ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry],
+                    "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
                            ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
@@ -165,7 +171,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
     result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
-                   ["--geometry", geometry, "--capacities", EXL3_CAPACITIES])
+                   ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry]])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
         ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "dense_trellis_k6,kimi_split"]),

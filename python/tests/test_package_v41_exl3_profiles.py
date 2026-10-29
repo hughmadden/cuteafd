@@ -1260,36 +1260,43 @@ class PackageProfileTests(unittest.TestCase):
                     self.assertNotIn('+ws-', str(call.args[0]))
 
     def test_kimi_coordinator_prefill_policy(self):
-        capacities = (1, 80, 256, 1024, 2048, 2752, 4096)
+        # Every Kimi K3 coordinator prefill row count on both RTX splits ships
+        # the warp-specialized prerotated arm (TJ 2026-10-29): it ties the
+        # cooperative 64-row token-major rotation at m1024-m2752 and wins
+        # 1.25-1.40x above 2752, where wave merging pads one <=2752-row unit to
+        # two or three merged units (4096, 5504, 8256). The two decode
+        # capacities (m1, m80) keep the cooperative export: the reduction plan
+        # freezes their tile and kernel class for every decode row.
+        capacities = (1, 80, 256, 1024, 2048, 2752, 4096, 5504, 8256)
+        prefill = capacities[2:]
         for width in (1536, 3072):
             self.assertEqual([package.warp_specialized('kimik3', 'coordinator', width, c)
-                              for c in capacities],
-                             [False, False, False, False, False, False, True])
+                              for c in capacities], [False, False] + [True] * len(prefill))
+            self.assertEqual([package.ws_tile('kimik3', 'coordinator', width, c)
+                              for c in prefill], [(64, 256, 64, 256)] * len(prefill))
+            self.assertIsNone(package.ws_tile('kimik3', 'coordinator', width, 80))
         self.assertEqual([package.route_block('kimik3', c, 'coordinator') for c in capacities],
-                         [8, 8, 8, 64, 64, 64, 8])
+                         [8] * len(capacities))
         self.assertEqual([package.route_block('kimik3', c, 'spark') for c in capacities],
                          [8] * len(capacities))
         self.assertEqual([package.token_major_rotation('kimik3', c, 'coordinator') for c in capacities],
-                         [False, False, False, True, True, True, False])
+                         [False] * len(capacities))
         self.assertEqual([package.token_major_rotation('kimik3', c, 'spark') for c in capacities],
                          [False] * len(capacities))
         for bits in ((2, 3), (3, 4)):
             with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
                 _, _, calls, _ = self.build_fixture(
                     Path(temporary), 'coordinator', bits, geometry='kimik3',
-                    capacities=(80, 256, 1024, 2048, 2752, 4096))
+                    capacities=(80, 256, 1024, 2048, 2752, 4096, 5504, 8256))
                 for call in calls:
-                    capacity = call.args[3]
-                    ws = bits == (2, 3) and capacity == 4096
+                    ws = bits == (2, 3) and call.args[3] >= 256
                     self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
                     self.assertEqual('+ws-m64-bf16-dynamic/' in str(call.args[0]), ws)
-                    self.assertEqual(call.kwargs.get('route_block', 8),
-                                     64 if capacity in (1024, 2048, 2752) or ws else 8)
-                    self.assertEqual(call.kwargs.get('token_major_rotation', False),
-                                     capacity in (1024, 2048, 2752))
+                    self.assertEqual(call.kwargs.get('route_block', 8), 64 if ws else 8)
+                    self.assertFalse(call.kwargs.get('token_major_rotation', False))
                     self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
                     if ws:
-                        self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
+                        self.assertEqual(call.kwargs['tile'], (64, 256, 64, 256))
 
     def test_decode_capacities_ship_the_canonical_tile(self):
         """A decode capacity the B12x planner widens is pinned to m1's tile (#309).

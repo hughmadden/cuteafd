@@ -42,6 +42,17 @@ def documented_tile_examples():
             for value in re.findall(r'[A-Za-z0-9._+-]+=(?:all|[0-9+]+):[0-9,]+', doc)]
 
 
+def default_tier_families():
+    """The EXL3 tier families a default configure packages, read from the cache default.
+
+    The count moves whenever the shipped decoder tiers do (K2/K3, K3/K4, then
+    K4/K5), so the request and stamp counts follow this instead of restating it.
+    """
+    value = re.search(r'CUTEAFD_V41_EXL3_BIT_FAMILIES "([^"]+)"',
+                      RULES.read_text()).group(1)
+    return [family.replace(',', '') for family in value.split(';')]
+
+
 def harness(architecture='121'):
     return f'''
 cmake_minimum_required(VERSION 3.24)
@@ -118,7 +129,8 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 requests = re.findall(r'--require-layout +(\S+)', rules)
-                self.assertEqual(requests, [layouts, layouts], 'one request per tier family')
+                self.assertEqual(requests, [layouts] * len(default_tier_families()),
+                                 'one request per tier family')
                 self.assertNotIn('--require-layout tp4-rank0 tp4-rank1', rules)
 
     def test_qwen_tp1_layout_is_required_and_stamped_on_sparks_only(self):
@@ -182,8 +194,8 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         result, rules = self.configure('-DCUTEAFD_V41_EXL3_TILES=tp3-width768=16+80:64,256,64,256')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('--tile tp3-width768=16+80:64,256,64,256', rules)
-        for family in ('k23', 'k34'):
-            stamp = f'v41_exl3_{family}_config.stamp'
+        for family in default_tier_families():
+            stamp = f'v41_exl3_k{family}_config.stamp'
             self.assertIn(stamp, rules, f'{family} export must depend on its config stamp')
 
     def test_reconfiguring_a_tile_rewrites_the_config_stamp(self):
@@ -197,8 +209,9 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             first = self.cmake(root, build, [])
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             before = stamps()
-            self.assertEqual(sorted(before), ['v41_exl3_k23_config.stamp',
-                                              'v41_exl3_k34_config.stamp'])
+            self.assertEqual(sorted(before),
+                             sorted(f'v41_exl3_k{family}_config.stamp'
+                                    for family in default_tier_families()))
             # Reconfiguring with the same values must not churn the stamp, or every
             # build would pay for a full re-export.
             self.assertEqual(self.cmake(root, build, []).returncode, 0)

@@ -295,12 +295,8 @@ def route_block(geometry: str, capacity: int, role: str) -> int:
     m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
-    Kimi K3 coordinator prefill (H3584, 896 experts, top-16) widens
-    m1024/m2048/m2752 from 8-row blocks to 64-row blocks with token-major rotation
-    (RTX PRO 6000, K2/K3:
-    rtx-tp2 w1536 m1024 9134.7 -> 5150.3 us, rtx-tp1 w3072 m1024 18805.4 ->
-    10596.1 us; m4096 takes its _WS_S14 cell); Spark keeps 8 rows for cooperative
-    capacities.
+    Kimi K3 takes its 64-row blocks from the warp-specialized cells on the
+    coordinator and keeps 8 rows everywhere else.
     """
     # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
     override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
@@ -311,7 +307,7 @@ def route_block(geometry: str, capacity: int, role: str) -> int:
     if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
     if geometry == 'kimik3':
-        return 64 if role == 'coordinator' and capacity in (1024, 2048, 2752) else 8
+        return 8
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
     if role == 'coordinator':
@@ -351,8 +347,6 @@ def token_major_rotation(geometry: str, capacity: int, role: str) -> bool:
     if geometry in ('glm', 'glmf', 'qwen4'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
-    if geometry == 'kimik3':
-        return role == 'coordinator' and capacity in (1024, 2048, 2752)
     if role == 'coordinator' and geometry == 'dsv4p':
         # V4 Pro coordinator (RTX PRO 6000, K2/K3, m1024): 64-row blocks with
         # token-major rotation improve rtx-tp2 w1536 4875.9 -> 4169.3 us (1.169x,
@@ -401,6 +395,9 @@ WS_TIER_PAIRS = {('glm', (4, 5)), ('glmf', (3, 4)), ('qwen4', (4, 5)),
 # dynamic tile claims, 32-row route blocks at m256 and 64 rows above it.
 _WS_S14_M256 = dict(route_block=32, dynamic=True, tile=TILE_RTX_MIXED)
 _WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
+# Prerotated 256-wide FC1 arm: the WS kernel hoists the token-major rotation
+# ahead of the block loop and keeps dynamic claims with 64-row route blocks.
+_WS_K3_PREROTATE = dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256))
 
 # Coordinator (RTX SM120) warp-specialized prefill cells, keyed by
 # (geometry, width, capacity): the measured options each cell carries, against
@@ -446,11 +443,38 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('v41', 1152, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
     ('v41', 2304, 4096): _WS_S14,
     ('v41', 1152, 4096): _WS_S14,
-    # Kimi K3 m1024/m2048/m2752 take cooperative 64-row token-major rotation;
-    # m2048/m2752 beat N128 dynamic by 1.23-1.30x, exhaustively exact (#762).
-    # m4096 keeps its separately qualified N128 dynamic arm.
-    ('kimik3', 3072, 4096): _WS_S14,
-    ('kimik3', 1536, 4096): _WS_S14,
+    # Kimi K3 ships the warp-specialized kernel on every coordinator prefill
+    # export (TJ 2026-10-29, kernel-tie rule): the prerotated 256-wide FC1 arm
+    # ties the cooperative 64-row token-major rotation at m1024-m2752 (geomean
+    # 1.005, inside round spread) and wins 1.25-1.40x above 2752, where wave
+    # merging hands one 4096/5504/8256-row packed extent to the kernel.
+    # Interleaved duel session, GPU0 pinned 450 W, 32 exact fixtures with
+    # every poisoned prefix and graph replay: rtx-tp1 1.297x m4096, rtx-tp2
+    # 1.392x; m5504 1.32/1.25x and m8256 1.32/1.26x. The arm hoists FC1's
+    # token-major rotation ahead of the block loop and keeps dynamic claims
+    # with 64-row route blocks.
+    #
+    # Every prefill capacity takes it, m256 included, so the kernel sees one
+    # recipe from a short prompt to a merged three-wave extent. The two decode
+    # capacities (m1, m80) stay cooperative: `Exl3ReductionPlan` freezes their
+    # manifest tile, route block and kernel class as the reduction geometry of
+    # every decode row, so moving them would hand C1 decode the prefill kernel
+    # with 256-wide FC1 tiles. The duel's floor is m1024, so that assignment is
+    # unmeasured, and no other family routes a decode capacity through WS.
+    ('kimik3', 3072, 256): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 256): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 1024): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 1024): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 2048): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 2048): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 2752): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 2752): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 4096): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 4096): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 5504): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 5504): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 8256): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 8256): _WS_K3_PREROTATE,
 }
 
 
@@ -501,7 +525,8 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     14.60; GLM 5.3 Flash TP4 512 m4096 11.03 -> 9.07, TP2 1024 m4096 19.32
     -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
     GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
-    keep the cooperative kernel.
+    keep the cooperative kernel; Kimi K3's coordinator cells are the measured
+    exception and take it at every capacity (`COORDINATOR_WS_CELLS`).
 
     SM120 RTX PRO 6000, 2026-10-24, H6144/E256/top8, K4 weights with
     K5 slots, FP32 sums, common wire-roundtripped input, three interleaved
@@ -1237,8 +1262,11 @@ def compile_variants(payloads, jobs):
 
 def package_capacities(geometry: str, requested: str) -> list[int]:
     capacities = sorted(set(int(v) for v in requested.split(',')))
-    if not capacities or any(v < 1 or v > 4096 for v in capacities):
-        raise ValueError('EXL3 capacities must be in 1..4096')
+    # Kimi K3 pads a <=2752-row prefill unit into merged waves of up to three
+    # units, so its packed extents reach 8256; every other family stops at 4096.
+    limit = 8256 if geometry == 'kimik3' else 4096
+    if not capacities or any(v < 1 or v > limit for v in capacities):
+        raise ValueError(f'EXL3 capacities must be in 1..{limit}')
     if geometry == 'kimik3':
         # m16 takes K128 tiles that drift against M1 decode; rows 2..16 run on
         # m80 (like GLM Flash). Every other capacity is allowed.

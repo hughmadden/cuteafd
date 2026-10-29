@@ -191,7 +191,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # swiglu_limit None is b12x's unclamped SwiGLU (GLM); DeepSeek clamps at 10.
     if swiglu_limit is not None and not swiglu_limit > 0:
         raise ValueError("SwiGLU limit must be positive or None (no clamp)")
-    if not 1 <= capacity <= 4096 or not 1 <= topk <= 16 or experts < topk or experts > 1024:
+    # 8256 rows is the widest compiled prefill extent: Kimi K3 merges three
+    # 2752-row wave units into one expert unit. Which extents a family ships is
+    # its packager policy (`package_exl3_aot.package_capacities`).
+    if not 1 <= capacity <= 8256 or not 1 <= topk <= 16 or experts < topk or experts > 1024:
         raise ValueError("invalid EXL3 capacity, top-k or expert count")
     # Whole H128 rotation blocks on both projection axes.
     if hidden < 128 or hidden % 128 or intermediate < 128 or intermediate % 128:
