@@ -1971,21 +1971,29 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
                "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
-@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5"])
+@pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "step5", "qwen4", "qwen3_5"])
 @pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
 def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
-    config = {"glm5_flash": GLMF_CONFIG, "mimo_v2": {
-        "model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
-        "step5": {"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
-            "moe_layer_list": list(range(3, 91))}}}[family]
+    config = {"glm5_flash": GLMF_CONFIG, "qwen3_5": DENSE_CONFIG,
+              "qwen4": {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+                        "layer_types": ["linear_attention", "full_attention"]}},
+              "step5": {"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
+                        "moe_layer_list": list(range(3, 91))}},
+              "mimo_v2": {"model_type": "mimo_v2", "hidden_size": 6144,
+                          "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}}[family]
     keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n" + (f"PREFILL_PACKING={mode}\n" if mode else "")
     if family == "step5":
         keys += "SPARK_COUNT=4\nRTX_GPUS=1\n" + "".join(
             f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(1, 4))
+    if family == "qwen3_5":
+        keys += "SPARK_COUNT=0\n"
     result = _family_launch_result(tmp_path, config, "test/packed", keys,
-        encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else None)
+        deployment_overrides={"executable": True} if family == "qwen3_5" else None,
+        encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else
+            {"placement_supported": True, "fits": True, "spark_ranks": 0} if family == "qwen3_5" else None)
     assert result.returncode == 0, result.stderr
-    command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5"}[family]
+    command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5",
+               "qwen4": "serve-qwen4", "qwen3_5": "serve-qwen35"}[family]
     launch = next(shlex.split(line) for line in result.stderr.splitlines() if f"cuteafd {command}" in line)
     if mode is None:
         assert "--prefill-packing" not in launch

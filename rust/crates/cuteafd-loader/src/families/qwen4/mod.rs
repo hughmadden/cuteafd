@@ -51,6 +51,9 @@ pub fn upload_shape(rows: usize, decode: bool, pages: usize, pools: usize, ple_r
         } else {
             shape.append(&planes, units.max(1))?;
             shape.append(&[rows.checked_mul(4).context("Qwen MTP upload rows overflow")?, tables.ids], units.max(1))?;
+            // Packed MTP members divide the admitted rows/page tables, but each
+            // independently queued call retains twelve immutable source ranges.
+            shape.fragment(12, rows.saturating_sub(1))?;
         }
     }
     Ok(shape)
@@ -64,6 +67,11 @@ pub fn mtp_upload_shape(rows: usize, pages: usize, pools: usize, calls: usize)
     shape.append(&[tables.positions, tables.rope_positions, tables.block_rope_positions,
         tables.kv_slots, tables.slots, tables.seq_first, tables.pool_slots,
         tables.cache_lengths, tables.page_table, tables.pool_table, tables.ids, tables.ids], calls)?;
+    // Every live unit may split into one MTP call per row. Page lists are
+    // disjoint within a unit, so only fence/alignment overhead multiplies.
+    let extra = rows.saturating_sub(1).checked_mul(calls)
+        .ok_or_else(|| anyhow::anyhow!("Qwen packed MTP call count overflow"))?;
+    shape.fragment(12, extra)?;
     Ok(shape)
 }
 
@@ -169,7 +177,37 @@ mod kv_record_tests {
         prefill_planes[9] = 4096 * 4;
         expected.append(&prefill_planes, 3)?;
         expected.append(&[4096 * 4, 4096 * 4], 3)?;
+        expected.fragment(12, (4096 - 1) * 3)?;
         assert_eq!(mtp_upload_shape(4096, 16384, 4096, 3)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_mtp_sources_cover_all_members_without_gpu_progress() -> anyhow::Result<()> {
+        use super::{mtp_upload_shape, upload_shape};
+        use crate::shared::token_table::UploadCursor;
+        let rows = 64;
+        let waves = 3;
+        let planes = |n: usize, pages: usize, pools: usize| [n * 8, n * 12, n * 12,
+            n * 8, n * 4, n * 4, n * 8, n * 4, pages * 4, pools * 4, n * 4, n * 4];
+        let mut cursor = UploadCursor::new(mtp_upload_shape(rows, rows, rows, waves)?)?;
+        for _ in 0..waves {
+            // One-row members have independent, disjoint page lists. None of
+            // their twelve source fences may be recycled before completion.
+            for _ in 0..rows {
+                for bytes in planes(1, 1, 1) { assert!(cursor.reserve(bytes)?.is_some()); }
+            }
+        }
+        assert!(cursor.reserve(16)?.is_none());
+        let mut local = UploadCursor::new(upload_shape(rows, false, rows, rows, 0, 48, 0, false, true, false)?)?;
+        for bytes in planes(rows, rows, rows).into_iter().take(10).chain([rows * 4]) {
+            assert!(local.reserve(bytes)?.is_some());
+        }
+        for _ in 0..rows {
+            for bytes in planes(1, 1, 1) { assert!(local.reserve(bytes)?.is_some()); }
+        }
+        assert!(local.reserve(16)?.is_none());
+        assert!(mtp_upload_shape(2, 1, 1, usize::MAX).is_err());
         Ok(())
     }
 

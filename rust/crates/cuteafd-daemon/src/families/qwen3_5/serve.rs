@@ -54,14 +54,76 @@ pub(crate) struct DenseBackend<'e, 'a> {
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<DenseMark<'a>>>,
     probe: RefCell<DenseProbe>,
+    packing: crate::shared::prefill_packing::PackingMode,
 }
 
 impl<'e, 'a> DenseBackend<'e, 'a> {
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
         Self { engine, library, drafter: None, mtp: None, selector: RefCell::new(None),
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
-            probe: RefCell::new(DenseProbe::default()) }
+            probe: RefCell::new(DenseProbe::default()), packing: Default::default() }
     }
+}
+
+pub(crate) fn packed_check<'a>(engine: &RefCell<DenseEngine<'a>>, library: &'a NativeLibrary,
+    tokens: &[u32], members: usize, mode: crate::shared::prefill_packing::PackingMode,
+    windows: Option<&[cuteafd_bench::reference::Window]>, precision: &cuteafd_bench::fidelity_precision::Precision,
+    mtp: Option<Rc<super::engine::mtp::MtpCache<'a>>>) -> Result<()> {
+    let prompts = crate::shared::qwen::packed_check::prompts(tokens, members)?;
+    let mut backend = DenseBackend::new(engine, library);
+    backend.packing = mode;
+    backend.mtp = mtp;
+    let neural = backend.mtp.is_some();
+    println!("dense packed check: native MTP {neural}");
+    let limits = backend.checked_packed_limits()?.context("dense packed limits")?;
+    let mut next_page = 0usize;
+    let mut admit = |slot: usize, prompt: &[u32]| -> Result<Placement> {
+        let pages = (prompt.len() + 1).div_ceil(64);
+        let units = (next_page..next_page + pages).map(u32::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
+        next_page += pages;
+        engine.borrow_mut().reset_slot(slot)?;
+        engine.borrow_mut().bind_slot(slot, &units)?;
+        if let Some(mtp) = &backend.mtp {
+            mtp.reset_context(slot)?;
+            mtp.admit_pages(slot, prompt.len())?;
+        }
+        Ok(Placement { units, slot, len: 0, state_len: 0 })
+    };
+    let packed = prompts.iter().enumerate().map(|(i, p)| admit(i, p)).collect::<Result<Vec<_>>>()?;
+    let alone = prompts.iter().enumerate().map(|(i, p)| admit(i + members, p)).collect::<Result<Vec<_>>>()?;
+    let pool = cuteafd_engine::prefix::RefPagePool::new(engine.borrow().pool_tokens / 64, 64);
+    crate::shared::qwen::packed_check::check::<_, DraftState>(library, &prompts, packed, alone, limits, neural,
+        mode == crate::shared::prefill_packing::PackingMode::Exact,
+        |s| backend.prefill_device(s.placement, s.tokens, 1, &pool)?.context("dense check needs head")?.row_host(library, 0),
+        |s, callback| backend.prefill_packed(s, &pool, callback), |p| {
+            let mut bytes = super::engine::prefix::packed_state(engine, p)?;
+            if let Some(mtp) = &backend.mtp { bytes.extend(mtp.packed_state(p.slot, p.len)?); }
+            Ok(bytes)
+        })?;
+    if mode == crate::shared::prefill_packing::PackingMode::Unrestricted {
+        let windows = windows.context("dense packed check needs official windows")?;
+        drop(admit);
+        next_page = 0;
+        let mut admit_reference = |slot: usize, w: &cuteafd_bench::reference::Window| {
+            let pages = w.tokens.len().div_ceil(64);
+            let units = (next_page..next_page + pages).map(u32::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
+            next_page += pages;
+            ensure!(next_page <= engine.borrow().pool_tokens / 64, "dense packed reference exhausts admitted pages");
+            engine.borrow_mut().reset_slot(slot)?;
+            engine.borrow_mut().bind_slot(slot, &units)?;
+            if let Some(mtp) = &backend.mtp {
+                mtp.reset_context(slot)?;
+                mtp.admit_pages(slot, w.tokens.len())?;
+            }
+            Ok(Placement { units, slot, len: 0, state_len: 0 })
+        };
+        let placements = windows.iter().enumerate().map(|(i, w)| admit_reference(i, w)).collect::<Result<Vec<_>>>()?;
+        let controls = windows.iter().enumerate().map(|(i, w)| admit_reference(i + members, w)).collect::<Result<Vec<_>>>()?;
+        crate::shared::qwen::packed_check::reference::<_, DraftState>(library, windows, placements, controls, limits, neural, precision,
+            |s| backend.prefill_device(s.placement, s.tokens, 1, &pool)?.context("dense reference needs head")?.row_host(library, 0),
+            |s, callback| backend.prefill_packed(s, &pool, callback))?;
+    }
+    Ok(())
 }
 
 impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
@@ -168,6 +230,59 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         placement.len += tokens.len();
         placement.state_len = placement.len;
         Ok((logit_rows > 0).then_some(output))
+    }
+    fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
+        if self.packing == crate::shared::prefill_packing::PackingMode::Exact {
+            Ok(Some(self.engine.borrow().coordinator_packed_cap()?))
+        } else { Ok(None) }
+    }
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        Some(crate::shared::prefill_packing::Limits {
+            // The small and prefill FP8 FFNs have different projection arithmetic.
+            rows: if self.packing == crate::shared::prefill_packing::PackingMode::Exact { 64 } else { cuteafd_loader::placement::families::qwen3_5::PREFILL_ROWS },
+            chunk_rows: self.geometry().prefill_rows, max_context: self.engine.borrow().cfg.max_context,
+            taps: self.drafter.as_ref().map(|_| TAP_ROWS),
+        })
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>],
+        _pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        ensure!(self.pending.borrow().is_none(), "dense packed prefill during pending verify");
+        let limits = self.checked_packed_limits()?.context("dense packing limits")?;
+        let mut engine = self.engine.borrow_mut();
+        for s in sequences.iter() {
+            ensure!(engine.slot_position(s.placement.slot)? == s.start && s.placement.len == s.start,
+                "dense packed placement/state frontier differs");
+            engine.bind_slot(s.placement.slot, &s.placement.units)?;
+        }
+        let inputs = sequences.iter().map(|s| (s.placement.slot, s.tokens)).collect::<Vec<_>>();
+        let last_layer = engine.cfg.attention.len() - 1;
+        let segments = engine.prefill_packed(&inputs, &limits, |layer, hidden, rows| {
+            if let Some(draft) = &self.drafter { draft.tap_streams_at(layer, hidden.ptr, 1, 0, rows, 0)?; }
+            if layer == last_layer {
+                if let Some(mtp) = &self.mtp { mtp.capture_hidden(hidden, rows)?; }
+            }
+            Ok(())
+        })?;
+        for (s, segment) in sequences.iter_mut().zip(&segments) {
+            s.placement.len = s.start + segment.rows;
+            s.placement.state_len = s.placement.len;
+        }
+        let outcomes = crate::shared::prefill_packing::finish_members(sequences.len(),
+            |i| engine.packed_head(segments[i].end_row() - 1), on_logits)?;
+        for (s, segment) in sequences.iter_mut().zip(&segments) {
+            if let Some(mtp) = &self.mtp {
+                mtp.update_captured_at(&mut engine, s.placement.slot, s.start, s.tokens, segment.first)?;
+            }
+            if let Some(draft) = &self.drafter {
+                let rows = (0..segment.tap_rows).map(|r| ContextRow { tap_row: segment.tap_offset + r,
+                    slot: s.placement.slot, position: s.start + segment.rows - segment.tap_rows + r }).collect::<Vec<_>>();
+                draft.update(&rows)?;
+            }
+            if s.neural { s.draft.anchor = s.next; }
+        }
+        Ok(outcomes)
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
@@ -399,6 +514,9 @@ pub(crate) struct ServeArgs {
     /// Admit a full prefill batch of vocabulary logits for quality scoring.
     #[arg(long)]
     pub full_prefill_logits: bool,
+    /// Bound packed rows to the singleton arithmetic route for exact validation.
+    #[arg(long, value_enum, default_value_t = crate::shared::prefill_packing::PackingMode::default())]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// External checkpoint-native BF16 block dSpark; the launcher resolves its default.
     #[arg(long)]
     pub draft: Option<std::path::PathBuf>,
@@ -469,6 +587,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), lanes,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
             let mut backend = DenseBackend::new(&engine, &library);
+            backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
                 let target = engine.borrow();
                 let config = block_dspark::DsparkConfig::read(snapshot)?;

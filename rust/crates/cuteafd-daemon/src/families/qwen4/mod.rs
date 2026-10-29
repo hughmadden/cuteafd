@@ -76,6 +76,9 @@ pub(crate) struct EngineArgs {
     /// Explicit per-unit rows for diagnostic cuts, including N=1.
     #[arg(long)]
     pub prefill_units: Option<usize>,
+    /// Arithmetic-route policy for already-queued short prompt packing.
+    #[arg(long, value_enum, default_value_t = crate::shared::prefill_packing::PackingMode::default())]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -156,6 +159,9 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/qwen4/golden.py, or a published shared fidelity set.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Compare real packed and singleton target state/logits on 2..=8 members.
+    #[arg(long)]
+    pub packed_check: Option<usize>,
     /// One window from the published shared fidelity quick subset (otherwise all eight).
     #[arg(long, requires_all = ["nll", "save_logits"])]
     pub window: Option<String>,
@@ -738,6 +744,7 @@ impl Opened {
             }
             engine.set_experts(experts);
         }
+        engine.configure_packing(args.prefill_packing)?;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
@@ -897,8 +904,15 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll;
+    if let Some(members) = args.packed_check {
+        ensure!((2..=8).contains(&members), "--packed-check needs 2..=8 members");
+        args.engine.slots = args.engine.slots.max(2 * members);
+    }
     ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
-    let windows = if args.golden.join("manifest.json").try_exists()? {
+    let windows = if args.golden.join("manifest.json").try_exists()? && args.packed_check.is_some() {
+        Some(fidelity_windows(&args.golden, None,
+            args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted)?)
+    } else if args.golden.join("manifest.json").try_exists()? {
         ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.teacher_force && args.spec_keep.is_none()
             && args.mtp_oracle.is_none() && args.token_check.is_none() && args.spec_decode.is_none()
@@ -907,13 +921,42 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
         let output = args.save_logits.as_deref().unwrap();
         ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
             "Qwen fidelity output needs an existing parent and a new directory");
-        Some(fidelity_windows(&args.golden, args.window.as_deref())?)
+        Some(fidelity_windows(&args.golden, args.window.as_deref(), false)?)
     } else {
         ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
         None
     };
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
+        if let Some(members) = args.packed_check {
+            let tokens = if let Some(windows) = &windows {
+                windows.first().context("packed check needs a fidelity window")?.tokens.clone()
+            } else {
+                let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+                ensure!(!bytes.is_empty() && bytes.len() % 4 == 0, "invalid packed-check token payload");
+                bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>()
+            };
+            packed_check(engine, &tokens, members, args.engine.prefill_packing)?;
+            if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted {
+                let windows = windows.as_ref().context("unrestricted packed check needs the sealed official reference")?;
+                let first = args.window.as_deref().unwrap_or(&windows.first().context("empty packed reference")?.id);
+                let selected = crate::shared::qwen::packed_check::reference_windows(windows, first, members, true)?;
+                let precision = cuteafd_bench::fidelity_precision::resolve("qwen-packed-check", Some(&args.engine.snapshot),
+                    &serde_json::json!([]), "Qwen/Qwen3.8-Flash-Next", None)?;
+                let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
+                let placements = selected.iter().map(|w| allocator.admit(w.tokens.len())).collect::<Result<Vec<_>>>()?;
+                let controls = selected.iter().map(|w| allocator.admit(w.tokens.len())).collect::<Result<Vec<_>>>()?;
+                crate::shared::qwen::packed_check::reference::<_, speculate::MtpSeq>(engine.library, &selected, placements, controls,
+                    engine.packed_limits().context("packed Qwen requires one attention owner")?, engine.weights.mtp.is_some(), &precision,
+                    |s| {
+                        let head = engine.prefill_device(s.placement, s.tokens, None, None, 1)?.context("reference check needs head")?;
+                        let logits = head.row_host(engine.library, 0)?;
+                        if s.neural { speculate::prefill_chunk(engine, s.placement, s.start, s.tokens, s.next, s.draft)?; }
+                        Ok(logits)
+                    }, |s, callback| engine.prefill_packed(s, callback))?;
+            }
+            return Ok(());
+        }
         if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
         if let Some(dir) = &args.mtp_oracle {
             return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
@@ -929,6 +972,24 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
         }
         golden_run(&args, &opened, engine)
     })
+}
+
+fn packed_check(engine: &engine::Qwen4Engine<'_>, tokens: &[u32], members: usize,
+    mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+    let prompts = crate::shared::qwen::packed_check::prompts(tokens, members)?;
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
+    let mut admit = || prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>();
+    let packed = admit()?;
+    let alone = admit()?;
+    let limits = engine.packed_limits().context("packed Qwen requires one attention owner")?;
+    crate::shared::qwen::packed_check::check::<_, speculate::MtpSeq>(engine.library, &prompts, packed, alone,
+        limits, engine.weights.mtp.is_some(), mode == crate::shared::prefill_packing::PackingMode::Exact, |s| {
+            let head = engine.prefill_device(s.placement, s.tokens, None, None, 1)?.context("packed check needs full model head")?;
+            let logits = head.row_host(engine.library, 0)?;
+            if s.neural { speculate::prefill_chunk(engine, s.placement, s.start, s.tokens, s.next, s.draft)?; }
+            Ok(logits)
+        }, |sequences, callback| engine.prefill_packed(sequences, callback),
+        |p| prefix::packed_state(engine, p))
 }
 
 /// `--resume-at P,..`: [`prefix::resume_check`] for every P and every --prefill-chunk.
@@ -965,7 +1026,7 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
     (agree, next_ok, golden_next, nll, scored)
 }
 
-fn fidelity_windows(root: &std::path::Path, selected: Option<&str>) -> Result<Vec<cuteafd_bench::reference::Window>> {
+fn fidelity_windows(root: &std::path::Path, selected: Option<&str>, packed: bool) -> Result<Vec<cuteafd_bench::reference::Window>> {
     use cuteafd_bench::fidelity_dataset;
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(root.join("manifest.json"))?;
@@ -975,7 +1036,9 @@ fn fidelity_windows(root: &std::path::Path, selected: Option<&str>) -> Result<Ve
     ensure!(manifest["config"] == fidelity_dataset::QWEN_CONFIG && manifest["vocab"] == 248320,
         "Qwen fidelity config/vocabulary differs");
     let reference = fidelity_dataset::load(root, &manifest)?;
-    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    // Packed qualification needs long genuine generations from the full panel;
+    // ordinary fidelity cards retain their immutable quick subset.
+    let mut windows = if packed { reference.windows.clone() } else { fidelity_dataset::quick_windows(&reference)? };
     if let Some(id) = selected {
         windows.retain(|window| window.id == id);
         ensure!(windows.len() == 1, "Qwen fidelity window must belong to the sealed quick subset");
@@ -1337,7 +1400,7 @@ mod golden_tests {
     fn shared_fidelity_rejects_an_unpublished_manifest() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
-        assert!(fidelity_windows(dir.path(), None).unwrap_err().to_string().contains("immutable publication"));
+        assert!(fidelity_windows(dir.path(), None, false).unwrap_err().to_string().contains("immutable publication"));
     }
 }
 

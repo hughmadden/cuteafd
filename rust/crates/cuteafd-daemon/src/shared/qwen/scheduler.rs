@@ -67,7 +67,8 @@ pub(crate) struct DraftSeq<'p, P, D> {
 }
 
 /// One member of an already-queued packed prefill. The backend owns tap layout
-/// and advances both target and draft state before invoking its head callback.
+/// and advances target, draft and taps before returning. Each scratch head must
+/// be consumed by its callback before another head reuses that storage.
 pub(crate) struct PrefillSeq<'p, P, D> {
     pub placement: &'p mut P,
     pub tokens: &'p [u32],
@@ -139,6 +140,14 @@ pub(crate) trait Backend<'a> {
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> { None }
+    fn coordinator_packed_cap(&self) -> Result<Option<usize>> { Ok(None) }
+    fn checked_packed_limits(&self) -> Result<Option<crate::shared::prefill_packing::Limits>> {
+        let mut limits = self.packed_limits();
+        if let (Some(limits), Some(cap)) = (&mut limits, self.coordinator_packed_cap()?) {
+            limits.rows = limits.rows.min(cap);
+        }
+        Ok(limits)
+    }
     /// Consume each member's scratch head before generating the next one.
     /// Outer errors invalidate shared work; inner errors belong to one member.
     fn prefill_packed(&self, _sequences: &mut [PrefillSeq<'_, Self::Placement, Self::Draft>],
@@ -958,7 +967,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
-            let limits = engine.packed_limits();
+            let limits = engine.checked_packed_limits()?;
             let finished = prefills.round_packed(limits.map_or(0, |l| l.rows), max_sequences,
                 |p| packed_chunk(p).map(|(_, rows)| rows),
                 |group, next| limits.is_some_and(|limits| crate::shared::prefill_packing::plan(

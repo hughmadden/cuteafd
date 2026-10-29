@@ -11,6 +11,7 @@ pub(crate) struct DensePrograms {
     pub(crate) format: DenseFormat,
     pub(crate) norm_dtype: DType,
     pub(crate) scratch_bytes: usize,
+    pub(crate) required_names: Vec<String>,
 }
 
 fn native(spec: &ProgramSpec) -> cuteafd_loader::placement::families::qwen3_5::NativeProgram {
@@ -44,10 +45,12 @@ impl DensePrograms {
             "dense Qwen exports require GDN128 and conv4");
         let mut scratch_bytes = 0;
         let mut norm = None;
+        let mut required_names = Vec::new();
         for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
             [64, 4096].into_iter().flat_map(|rows|
                 ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
             let name = cuteafd_loader::placement::families::qwen3_5::native_program_name(prefix, op, rows, kv_format, format.fp8());
+            required_names.push(name.clone());
             let spec = programs.spec(&name)?;
             cuteafd_loader::placement::families::qwen3_5::validate_projection_format(op, format.fp8(), &native(spec))?;
             validate(cfg, op, rows, kv_format, spec)?;
@@ -61,7 +64,7 @@ impl DensePrograms {
                 scratch_bytes = scratch_bytes.max(usize::try_from(bytes).context("dense Qwen scratch exceeds usize")?);
             }
         }
-        Ok(Self { prefix, kv_format, format, norm_dtype: norm.context("dense Qwen GDN norm ABI missing")?, scratch_bytes })
+        Ok(Self { prefix, kv_format, format, norm_dtype: norm.context("dense Qwen GDN norm ABI missing")?, scratch_bytes, required_names })
     }
 }
 

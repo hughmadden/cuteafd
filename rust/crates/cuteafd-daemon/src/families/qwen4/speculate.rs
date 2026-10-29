@@ -47,6 +47,29 @@ impl MtpSeq {
 /// canonical rows for every pair whose next token is known (`next`: the token
 /// after the chunk, if known), and the chunk's last row stashed otherwise.
 pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, start: usize, chunk: &[u32], next: Option<u32>, seq: &mut MtpSeq) -> Result<()> {
+    prefill_chunk_from(engine, placement, start, chunk, next, seq, 0, MtpSource::Target)
+}
+
+pub(crate) fn prefill_packed(engine: &Qwen4Engine<'_>, sequences: &mut [
+    crate::shared::qwen::scheduler::PrefillSeq<'_, Qwen4Placement, MtpSeq>],
+    segments: &[crate::shared::prefill_packing::Segment]) -> Result<()> {
+    let retained = engine.prefill_shape.is_some();
+    if !retained {
+        let stash = sequences.iter().zip(segments).filter(|(s, _)| s.neural)
+            .map(|(s, segment)| (s.placement.slot, segment.first, segment.rows, 0)).collect::<Vec<_>>();
+        if !stash.is_empty() { engine.mtp_stash(false, &stash)?; }
+    }
+    for (s, segment) in sequences.iter_mut().zip(segments) {
+        if !s.neural { continue; }
+        prefill_chunk_from(engine, s.placement, s.start, s.tokens, s.next, s.draft,
+            if retained { segment.first } else { 0 }, if retained { MtpSource::Target } else { MtpSource::Pending })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_chunk_from(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, start: usize, chunk: &[u32],
+    next: Option<u32>, seq: &mut MtpSeq, offset: usize, source: MtpSource) -> Result<()> {
     let n = chunk.len();
     ensure!(placement.mtp_frontier.get() == start, "MTP prefill requires contiguous canonical history");
     ensure!(n > 0 && seq.pending.is_empty(), "MTP prefill of an empty chunk or behind pending rows");
@@ -54,21 +77,30 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
     let (known, capacity) = prefill_rows(decode, n, next, engine.mtp_prefill_rows())?;
     if next.is_none() {
         // Stash first: the MTP step reuses the target streams' buffer.
-        engine.mtp_stash(decode, &[(placement.slot, n - 1, 1, 0)])?;
+        if !matches!(source, MtpSource::Pending) {
+            engine.mtp_stash(decode, &[(placement.slot, offset + n - 1, 1, 0)])?;
+        }
         seq.pending.push((start + n - 1, 0));
         seq.open = true;
         placement.mtp_snapshot_pending.set(true);
     }
     if known == 0 {
+        if matches!(source, MtpSource::Pending) && next.is_none() {
+            engine.mtp_keep_last_pending(placement.slot, offset + n - 1)?;
+        }
         return Ok(());
     }
     let tokens: Vec<u32> = (0..known).map(|i| chunk.get(i + 1).copied().or(next).unwrap_or_default()).collect();
     for first in (0..known).step_by(capacity) {
         let end = known.min(first + capacity);
-        let rows = (first..end).map(|i| MtpRow { position: start + i, token: tokens[i], source: i as i32 }).collect();
-        engine.mtp_step(decode, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens[first..end]),
+        let rows = (first..end).map(|i| MtpRow { position: start + i, token: tokens[i], source: (offset + i) as i32 }).collect();
+        engine.mtp_step(decode, &[MtpGroup { placement, rows }], source, &[], MtpTokens::Host(&tokens[first..end]),
             MtpOut::Download { logits: false })?;
         placement.mtp_frontier.set(start + end);
+    }
+    if matches!(source, MtpSource::Pending) && next.is_none() {
+        // Keep the open tail at the canonical stash row only after its partners were consumed.
+        engine.mtp_keep_last_pending(placement.slot, offset + n - 1)?;
     }
     Ok(())
 }

@@ -112,6 +112,22 @@ mod hook_borrow_tests {
 fn alloc_bytes(bytes: usize) -> usize { bytes.max(256) }
 
 impl<'a> DenseEngine<'a> {
+    pub(crate) fn coordinator_packed_cap(&self) -> Result<usize> {
+        use crate::shared::prefill_packing::{coordinator_row_cap, validate_program_inventory, ProgramRows::*};
+        // Attention (including its dense projections) runs inside the member loop;
+        // FFN projections, norm and add run on the aggregate row span.
+        let inventory = [("norm", 0, PackedRows), ("add", 0, PackedRows), ("gdn_commit", 0, SequenceLocal)]
+            .into_iter().chain([64, 4096].into_iter().flat_map(|rows|
+                [("gdn", rows, SequenceLocal), ("attn_producer", rows, SequenceLocal),
+                    ("full_gqa", rows, SequenceLocal), ("attn_o", rows, SequenceLocal), ("ffn", rows, PackedRows)]))
+            .map(|(op, rows, role)|
+                (cuteafd_loader::placement::families::qwen3_5::native_program_name(self.admitted.prefix,
+                    op, rows, self.admitted.kv_format, self.admitted.format.fp8()), role)).collect::<Vec<_>>();
+        let refs = inventory.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+        validate_program_inventory(self.admitted.required_names.iter().map(String::as_str), &refs)?;
+        coordinator_row_cap(self.programs, refs, 64)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
@@ -358,6 +374,86 @@ impl<'a> DenseEngine<'a> {
         self.position = self.slots[0].position;
         self.healthy = true;
         Ok(output)
+    }
+
+    /// Attention keeps each member's native row route and state; the dense FFN
+    /// sees the adjacent packed rows once. Tables reuse the admitted singleton scratch.
+    pub(crate) fn prefill_packed(&mut self, sequences: &[(usize, &[u32])],
+        limits: &crate::shared::prefill_packing::Limits,
+        mut hook: impl FnMut(usize, CuteafdDeviceBuffer, usize) -> Result<()>)
+        -> Result<Vec<crate::shared::prefill_packing::Segment>> {
+        ensure!(self.healthy && self.verification.pending.is_none(), "dense packed prefill requires committed healthy state");
+        let chunks = sequences.iter().map(|&(slot, tokens)| {
+            let state = self.slots.get(slot).context("dense packed slot outside admission")?;
+            self.embedding.check(tokens)?;
+            Ok((state.position, tokens.len()))
+        }).collect::<Result<Vec<_>>>()?;
+        let segments = crate::shared::prefill_packing::plan(&chunks, limits)?;
+        let mut tables = Vec::with_capacity(sequences.len());
+        for (i, (&(slot, _), s)) in sequences.iter().zip(&segments).enumerate() {
+            ensure!(!sequences[..i].iter().any(|&(other, _)| other == slot), "dense pack aliases a state slot");
+            let state = &self.slots[slot];
+            let end = s.start + s.rows;
+            ensure!(!state.pages.is_empty() && end.div_ceil(64) <= state.pages.len(), "dense pack exceeds bound pages");
+            let positions = (s.start..end).map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
+            let kv = (s.start..end).map(|p| i64::try_from(state.pages[p / 64] as usize * 64 + p % 64))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let pages = state.pages[..end.div_ceil(64)].iter().copied().map(i32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            tables.push(rows::Rows { tokens: vec![], physical: vec![], groups: vec![],
+                slots: vec![i32::try_from(slot)?; s.rows], first: vec![0; s.rows], positions, kv, pages, stride: 0 });
+        }
+        let mut all = rows::Rows { tokens: vec![], physical: vec![], groups: vec![], slots: vec![],
+            first: vec![], positions: vec![], kv: vec![], pages: vec![], stride: 0 };
+        let mut page_offsets = Vec::with_capacity(tables.len());
+        for table in &tables {
+            page_offsets.push(all.pages.len());
+            all.slots.extend_from_slice(&table.slots);
+            all.first.extend_from_slice(&table.first);
+            all.positions.extend_from_slice(&table.positions);
+            all.kv.extend_from_slice(&table.kv);
+            all.pages.extend_from_slice(&table.pages);
+        }
+        let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
+        self.verification.invalidate()?;
+        self.healthy = false;
+        self.row_tables(&all)?;
+        self.embedding.embed(&tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
+        let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
+            homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
+        for (index, layer) in self.weights.layers.iter().enumerate() {
+            for ((s, table), &page_offset) in segments.iter().zip(&tables).zip(&page_offsets) {
+                let mut planes = self.planes.segment(s.first, s.rows, self.cfg.hidden, self.cfg.heads * self.cfg.head_dim)?;
+                let view = crate::shared::prefix::view;
+                planes.slots = view(self.planes.slots, s.first * 4, s.rows * 4)?;
+                planes.seq_first = view(self.planes.seq_first, s.first * 4, s.rows * 4)?;
+                planes.positions = view(self.planes.positions, s.first * 8, s.rows * 8)?;
+                planes.rope_positions = view(self.planes.rope_positions, s.first * 12, s.rows * 12)?;
+                planes.kv_slots = view(self.planes.kv_slots, s.first * 8, s.rows * 8)?;
+                planes.page_table = view(self.planes.page_table, page_offset * 4, table.pages.len() * 4)?;
+                blocks.attention(index, layer, planes,
+                    self.kv[index].as_ref().map(|v| v.buffer), &Step { rows: s.rows,
+                        capacity: if s.rows <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
+                        table_stride: 0, splits: 1, speculative: false })?;
+            }
+            blocks.ffn(layer, self.planes, &Step { rows: tokens.len(),
+                capacity: if tokens.len() <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
+                table_stride: 0, splits: 1, speculative: false })?;
+            hook(index, self.planes.residual, tokens.len())?;
+        }
+        for (&(slot, _), s) in sequences.iter().zip(&segments) { self.slots[slot].position = s.start + s.rows; }
+        self.position = self.slots[0].position;
+        self.healthy = true;
+        Ok(segments)
+    }
+
+    pub(crate) fn packed_head(&self, row: usize) -> Result<DeviceLogits> {
+        let hidden = crate::shared::prefix::view(self.planes.residual, row * self.cfg.hidden * 2, self.cfg.hidden * 2)?;
+        let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
+        // SAFETY: selected terminal row and norm scratch stay live on the one target stream.
+        unsafe { norm.launch(&[hidden.ptr, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
+            &[Scalar::I32(1)], self.stream.raw)?; }
+        self.target_head(self.planes.norm, self.logits.buffer, 1)
     }
 
     fn row_tables(&self, rows: &rows::Rows) -> Result<()> {

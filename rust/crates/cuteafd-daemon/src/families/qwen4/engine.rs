@@ -711,6 +711,8 @@ struct Workspace<'a> {
     kv_slots: Dev<'a>,
     slots: Dev<'a>,
     seq_first: Dev<'a>,
+    local_seq_first: Option<Dev<'a>>,
+    table_view: Cell<Option<(usize, usize, usize)>>,
     pool_slots: Dev<'a>,
     cache_lengths: Dev<'a>,
     page_table: Dev<'a>,
@@ -756,6 +758,22 @@ struct Workspace<'a> {
 }
 
 impl Workspace<'_> {
+    fn row_table(&self, buffer: &Dev<'_>, width: usize) -> *mut c_void {
+        buffer.buffer.ptr.wrapping_byte_add(self.table_view.get().map_or(0, |v| v.0) * width)
+    }
+
+    fn first_table(&self) -> *mut c_void {
+        if self.table_view.get().is_some() {
+            self.local_seq_first.as_ref().expect("prefill member first plane").buffer.ptr
+        } else { self.seq_first.buffer.ptr }
+    }
+
+    fn page_table(&self, pool: bool) -> *mut c_void {
+        let offset = self.table_view.get().map_or(0, |v| if pool { v.2 } else { v.1 });
+        let buffer = if pool { &self.pool_table } else { &self.page_table };
+        buffer.buffer.ptr.wrapping_byte_add(offset * 4)
+    }
+
     fn live(&self, buffer: &Dev<'_>, stride: usize) -> *mut c_void {
         self.live_buffer(buffer, stride).ptr
     }
@@ -1103,6 +1121,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
     pub full_prefill_logits: bool,
+    packed_row_cap: Cell<Option<usize>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -1292,6 +1311,7 @@ impl<'a> Qwen4Engine<'a> {
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: false,
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
+            packed_row_cap: Cell::new(None),
             l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
@@ -2046,6 +2066,12 @@ impl<'a> Qwen4Engine<'a> {
             kv_slots: self.alloc(tables.kv_slots)?,
             slots: self.alloc(tables.slots)?,
             seq_first: self.alloc(tables.seq_first)?,
+            local_seq_first: if decode { None } else {
+                let zero = self.alloc(tables.seq_first)?;
+                self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
+                Some(zero)
+            },
+            table_view: Cell::new(None),
             pool_slots: self.alloc(tables.pool_slots)?,
             cache_lengths: self.alloc(tables.cache_lengths)?,
             page_table: self.alloc(tables.page_table)?,
@@ -2280,6 +2306,142 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(None);
         }
         Ok(Some(self.device_logits(w, logit_rows, false)))
+    }
+
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::{PackingMode, log_mode};
+        if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
+        let rows = self.prefill_shape.map_or(self.prefill_rows, |s| s.unit_rows as usize);
+        let cap = match &self.experts {
+            Some(Experts::Local(local)) => local.experts.borrow().packed_row_cap(true, rows)?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?.iter()
+                .map(|report| report.packed_row_cap(self.spark_bf16)).min().unwrap_or(0).min(rows),
+            Some(Experts::SharedOnly) => rows,
+            // Local EXL3 and the generic RTX trait do not publish arithmetic route metadata.
+            _ => 0,
+        };
+        let cap = cap.min(self.coordinator_packed_cap(rows)?);
+        self.packed_row_cap.set(Some(cap));
+        log_mode(mode, cap);
+        Ok(())
+    }
+
+    fn coordinator_packed_cap(&self, rows: usize) -> Result<usize> {
+        let inventory = super::programs::packed_inventory(
+            self.programs.names().filter(|name| name.starts_with("qwen4_")))?;
+        let cap = crate::shared::prefill_packing::coordinator_row_cap(self.programs, inventory, rows)?;
+        Ok(super::programs::ple_packed_cap(cap, self.ple.is_some()))
+    }
+
+    pub(crate) fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        if self.gdn_banks.len() != 1 || self.hops.is_some() { return None; }
+        let rows = self.prefill_shape.map_or(self.prefill_rows, |s| s.unit_rows as usize);
+        Some(crate::shared::prefill_packing::Limits {
+            rows: self.packed_row_cap.get().unwrap_or(rows),
+            chunk_rows: if self.weights.mtp.is_some() && self.prefill_shape.is_none() {
+                MTP_PENDING_ROWS.min(rows)
+            } else { rows },
+            max_context: self.max_context, taps: None,
+        })
+    }
+
+    pub(crate) fn prefill_packed(&self, sequences: &mut [crate::shared::qwen::scheduler::PrefillSeq<'_,
+        Qwen4Placement, super::speculate::MtpSeq>],
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+            ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(), "packed Qwen requires one attention owner");
+            let limits = self.packed_limits().context("Qwen packing limits")?;
+            let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+                .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &limits)?;
+            let mut tables: Vec<StepTables> = Vec::with_capacity(sequences.len());
+            for (i, s) in sequences.iter_mut().enumerate() {
+                ensure!(s.start == s.placement.len && !tables.iter().any(|t| t.slots.first() == Some(&s.placement.slot)),
+                    "Qwen packed frontier or state-slot alias");
+                if s.start == 0 { self.start(s.placement)?; }
+                let mut table = StepTables { page_table: s.placement.pages.clone(), pool_table: s.placement.pool_pages.clone(),
+                    page_width: s.placement.pages.len(), ..Default::default() };
+                self.rows(s.placement, s.tokens, 0, &mut table)?;
+                ensure!(table.positions.len() == segments[i].rows, "Qwen packed rows differ");
+                tables.push(table);
+            }
+            let tokens = sequences.iter().flat_map(|s| s.tokens.iter().copied()).collect::<Vec<_>>();
+            if self.prefill_shape.is_some() { self.prepare_prefill_units()?; }
+            if self.workspace.borrow().is_none() { *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, false, 1)?); }
+            let workspace = self.workspace.borrow();
+            let w = workspace.as_ref().context("Qwen packed workspace")?;
+            ensure!(tokens.len() <= w.rows, "Qwen pack exceeds admitted unit");
+            w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false); w.terminal_valid.set(false);
+            self.last_stream_offset.set(0);
+            let mut all = StepTables::default();
+            let mut views = Vec::with_capacity(tables.len());
+            for (s, t) in segments.iter().zip(&tables) {
+                views.push((s.first, all.page_table.len(), all.pool_table.len()));
+                all.positions.extend_from_slice(&t.positions);
+                all.rope_positions.extend_from_slice(&t.rope_positions);
+                all.block_rope_positions.extend_from_slice(&t.block_rope_positions);
+                all.kv_slots.extend_from_slice(&t.kv_slots);
+                all.slots.extend_from_slice(&t.slots);
+                all.seq_first.extend(std::iter::repeat_n(s.first as i32, s.rows));
+                all.pool_slots.extend_from_slice(&t.pool_slots);
+                all.cache_lengths.extend_from_slice(&t.cache_lengths);
+                all.page_table.extend_from_slice(&t.page_table);
+                all.pool_table.extend_from_slice(&t.pool_table);
+                all.ple_ids.extend_from_slice(&t.ple_ids);
+            }
+            ensure!(all.page_table.len() <= self.pages && all.pool_table.len() <= self.pool_pages,
+                "packed member page tables exceed the admitted pool");
+            w.table_view.set(None);
+            let all = Arc::new(all);
+            self.stage_step_tables(w, &all)?;
+            if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
+                drop(self.ple_pending.borrow_mut().take());
+                *self.ple_pending.borrow_mut() = Some(mapped.begin(Arc::clone(&all)
+                    as Arc<dyn crate::shared::mapped_table::RowSource>, false)?);
+            }
+            self.stage_embedding(w, &tokens, HC, &w.streams[0], false)?;
+            use crate::shared::prefill_pipeline::{run_prefill_units, Unit, UnitSegment};
+            let unit = Unit { index: 0, sequence: 0, rows: 0..tokens.len(),
+                layers: 0..self.weights.layers.len(), slot: 0, barrier: false,
+                segments: segments.iter().enumerate().map(|(i, s)| UnitSegment {
+                    sequence: i, rows: s.first..s.end_row(), tokens: s.start..s.start + s.rows,
+                    prompt_end: sequences[i].next.is_none(), snapshot: false, head: true,
+                }).collect() };
+            let run = |transport| -> Result<usize> {
+                let mut hooks = PackedHooks { engine: self, w, tables: &tables, segments: &segments,
+                    views: &views, transport, cur: 0, entered: false };
+                // One queued pack is one shared unit; cross-pack lookahead belongs to the scheduler.
+                run_prefill_units(&mut hooks, &[unit], 1)?;
+                Ok(hooks.cur)
+            };
+            let cur = match &self.experts {
+                Some(Experts::Spark { transport, .. }) => {
+                    let mut link = transport.borrow_mut();
+                    run(Some(link.exchange()?))?
+                }
+                _ => run(None)?,
+            };
+            w.table_view.set(None);
+            self.last_streams.set((false, cur)); self.last_stream_offset.set(0);
+            if let Some(terminal) = &w.terminal_streams {
+                // SAFETY: packed rows fit the existing terminal span and share its producer stream.
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, terminal.buffer,
+                    w.streams[cur].buffer, tokens.len() * HC * self.cfg.hidden * 2, self.execution_stream())?; }
+                w.terminal_valid.set(true);
+            }
+            for s in sequences.iter_mut() { s.placement.len += s.tokens.len(); s.placement.state_len = s.placement.len; }
+            let result = crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
+                let s = &segments[i];
+                w.row_offset.set(s.first); w.position.set(s.start);
+                self.head(w, &w.streams[cur], s.rows, Scalar::I32(s.rows as i32), 1)?;
+                Ok(self.device_logits(w, 1, false))
+            }, on_logits);
+            w.row_offset.set(0);
+            let outcomes = result?;
+            drop(workspace);
+            super::speculate::prefill_packed(self, sequences, &segments)?;
+            Ok(outcomes)
+        })
     }
 
     pub(crate) fn mtp_prefill_rows(&self) -> usize {
@@ -3359,8 +3521,8 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?)]);
         pointers.extend(Self::projection(layer, "w_out")?);
-        pointers.extend([("conv_state", conv), ("state", state), ("slots", w.slots.buffer.ptr),
-            ("seq_first", w.seq_first.buffer.ptr), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
+        pointers.extend([("conv_state", conv), ("state", state), ("slots", w.row_table(&w.slots, 4)),
+            ("seq_first", w.first_table()), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
         // Decode capacities record speculative replay inputs (spec) or advance the state.
         let decode = cap == "m64";
         if decode {
@@ -3392,22 +3554,22 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
-            ("positions", w.positions.buffer.ptr), ("rope_positions", w.rope_positions.buffer.ptr),
-            ("block_rope_positions", w.block_rope_positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
-            ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
+            ("positions", w.row_table(&w.positions, 8)), ("rope_positions", w.row_table(&w.rope_positions, 12)),
+            ("block_rope_positions", w.row_table(&w.block_rope_positions, 12)), ("kv_slots", w.row_table(&w.kv_slots, 8)),
+            ("pool_slots", w.row_table(&w.pool_slots, 8)), ("kv_cache", cache), ("token_keys", keys),
             ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&self.kv_program(layer, cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
-                ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
-                ("page_table", w.pool_table.buffer.ptr), ("output_indices", w.blocks.buffer.ptr),
+                ("positions", w.row_table(&w.positions, 8)), ("index_cache", blocks),
+                ("page_table", w.page_table(true)), ("output_indices", w.blocks.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)], &[rows, Scalar::I32(tables.pool_stride as i32)])?;
         }
-        self.run("qwen4_index_expand", &[("positions", w.positions.buffer.ptr), ("blocks", w.blocks.buffer.ptr),
+        self.run("qwen4_index_expand", &[("positions", w.row_table(&w.positions, 8)), ("blocks", w.blocks.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)], &[rows])?;
         self.run(&format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
-            ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
+            ("positions", w.row_table(&w.positions, 8)), ("page_table", w.page_table(false)),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32),
                 Scalar::I32(self.attention_plan.rows() as i32)])?;
@@ -3645,6 +3807,84 @@ impl<'a> Qwen4Engine<'a> {
     }
 }
 
+/// A queued pack uses the shared executor; its immutable metadata is uploaded once.
+struct PackedHooks<'e, 'w, 't, 'a, 'r, 'n> {
+    engine: &'e Qwen4Engine<'a>,
+    w: &'w Workspace<'a>,
+    tables: &'t [StepTables],
+    segments: &'t [crate::shared::prefill_packing::Segment],
+    views: &'t [(usize, usize, usize)],
+    transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
+    cur: usize,
+    entered: bool,
+}
+
+impl PackedHooks<'_, '_, '_, '_, '_, '_> {
+    fn aggregate(&self) {
+        self.w.row_offset.set(0);
+        self.w.table_view.set(None);
+        self.w.position.set(0);
+    }
+    fn finish(&mut self, layer: usize, rows: Scalar) -> Result<()> {
+        self.aggregate();
+        if let Some(next) = self.engine.weights.layers.get(layer + 1) {
+            let ple = self.engine.cfg.ple_layers.contains(&(layer + 1));
+            if ple {
+                self.engine.post(self.w, &mut self.cur, rows)?;
+                self.engine.finish_ple(self.w)?;
+            }
+            self.engine.enter(self.w, &mut self.cur, (!ple).then_some(()), next, layer + 1, rows, false)
+        } else { self.engine.post(self.w, &mut self.cur, rows) }
+    }
+}
+
+impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '_, '_, '_> {
+    type Ticket = crate::shared::spark_waves::WaveTicket;
+    fn route(&self, _: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        if self.transport.is_some() { crate::shared::prefill_pipeline::FfnRoute::Spark }
+        else { crate::shared::prefill_pipeline::FfnRoute::Local }
+    }
+    fn begin_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+    fn attention(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        if !self.entered {
+            if self.engine.cfg.ple_layers.contains(&0) { self.engine.finish_ple(self.w)?; }
+            self.engine.enter(self.w, &mut self.cur, None, &self.engine.weights.layers[0], 0, rows, false)?;
+            self.entered = true;
+        }
+        let layer = &self.engine.weights.layers[index];
+        for ((s, table), &view) in self.segments.iter().zip(self.tables).zip(self.views) {
+            self.w.row_offset.set(s.first); self.w.position.set(s.start); self.w.table_view.set(Some(view));
+            let n = Scalar::I32(s.rows as i32);
+            match layer.attention {
+                Qwen4Attention::Gdn => self.engine.gdn(self.w, index, layer, n, "m4096", false)?,
+                Qwen4Attention::Full => self.engine.full(self.w, index, layer, n, "m4096", table)?,
+            }
+        }
+        self.aggregate();
+        self.engine.post_pre(self.w, self.cur, layer, "mlp", rows)?;
+        self.cur ^= 1;
+        Ok(())
+    }
+    fn local_ffn(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        self.engine.moe(self.w, index, &self.engine.weights.layers[index], unit.rows.len(), rows, false)?;
+        self.finish(index, rows)
+    }
+    fn send_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        self.engine.moe_front(self.w, index, &self.engine.weights.layers[index], unit.rows.len(), rows)?;
+        self.engine.wave_send(self.w, index, unit.rows.len(), rows, false,
+            self.transport.as_mut().context("packed Spark exchange")?)
+    }
+    fn land_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
+        self.engine.wave_land(self.w, unit.rows.len(), ticket, self.transport.as_mut().context("packed Spark exchange")?)?;
+        self.finish(index, Scalar::I32(unit.rows.len() as i32))
+    }
+    fn end_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { self.aggregate(); Ok(()) }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+}
+
 /// Live rows survive hooks in slot planes; all tables and scratch are shared
 /// and rewritten on the execution stream before the hook that consumes them.
 struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
@@ -3879,6 +4119,7 @@ mod prefill_unit_tests {
                         tables.kv_slots, tables.slots, tables.seq_first, tables.pool_slots,
                         tables.cache_lengths, tables.page_table, tables.pool_table, tables.ple_ids, tables.ids]
                         .map(|bytes| bytes as u64));
+                    buffers.push(rows * 4); // Immutable sequence-local zero origins for packed attention.
                     if let Some(width) = mapped {
                         buffers.extend([rows * cfg.ple_rows() as u64 * 8, rows * cfg.ple_rows() as u64 * width]);
                     }
@@ -3986,6 +4227,117 @@ mod prefill_unit_tests {
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen engine retirement");
+    }
+}
+
+#[cfg(test)]
+mod packed_route_fixture {
+    use super::*;
+    use super::super::{speculate, prefix};
+    use crate::shared::qwen::scheduler::PrefillSeq;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        engine: super::super::EngineArgs,
+    }
+
+    fn regions(engine: &Qwen4Engine<'_>, slot: i32) -> Result<Vec<Vec<u8>>> {
+        engine.slot_regions(slot as usize).into_iter().map(|buffer| {
+            // SAFETY: the engine retains the region and its owning execution stream.
+            unsafe { engine.library.cuda_stream_synchronize(engine.state_stream(buffer.device_id)?)?; }
+            let mut bytes = vec![0; buffer.bytes];
+            engine.library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes)
+        }).collect()
+    }
+
+    #[test]
+    #[ignore = "requires sealed Qwen native artifact, official reference and GPU"]
+    fn packed_native_genuine_rows() -> Result<()> {
+        #[derive(Parser)]
+        struct Cli { #[command(flatten)] args: super::super::GoldenArgs }
+        let snapshot = std::env::var("CUTEAFD_FIXTURE_MODEL")?;
+        let golden = std::env::var("CUTEAFD_FIXTURE_REFERENCE")?;
+        let args = Cli::try_parse_from(["fixture", "--snapshot", &snapshot, "--golden", &golden,
+            "--local-experts", "--mtp", "3", "--pool-tokens", "65536", "--slots", "16",
+            "--packed-check", "8", "--prefill-packing", "unrestricted"])?;
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+            .block_on(super::super::run_golden(args.args))
+    }
+
+    #[test]
+    #[ignore = "requires sealed Qwen native artifact, checkpoint, reference and GPU"]
+    fn packed_totals_at_most_64_discriminator() -> Result<()> {
+        let snapshot = std::env::var("CUTEAFD_FIXTURE_MODEL")?;
+        let golden = std::env::var("CUTEAFD_FIXTURE_REFERENCE")?;
+        let args = Args::try_parse_from(["fixture", "--snapshot", &snapshot,
+            "--local-experts", "--mtp", "3", "--pool-tokens", "65536",
+            "--slots", "16", "--prefill-packing", "unrestricted"])?;
+        let windows = super::super::fidelity_windows(std::path::Path::new(&golden), None, false)?;
+        let opened = super::super::open(&args.engine)?;
+        opened.with_engine(&args.engine, |engine| {
+            let mut names = Vec::new();
+            for (layer, home) in engine.state_map.layers.iter().enumerate() {
+                if home.gdn_ordinal.is_some() {
+                    names.push(format!("rank{} layer{layer} GDN.conv", home.owner));
+                    names.push(format!("rank{} layer{layer} GDN.recurrent", home.owner));
+                }
+            }
+            if engine.ple_state.is_some() {
+                names.push(format!("rank0 layer{} PLE.conv", engine.cfg.ple_layers[0]));
+            }
+            let mut every_equal = true;
+            let shapes: &[&[usize]] = if std::env::var_os("CUTEAFD_FIXTURE_REVERSE").is_some() {
+                &[&[29, 9, 7], &[40, 24]]
+            } else { &[&[7, 9], &[7, 17], &[7, 9, 29], &[24, 40]] };
+            for &lengths in shapes {
+                let total: usize = lengths.iter().sum();
+                let mut allocator = Allocator::new(engine.pages, engine.slots, &engine.cfg);
+                let mut packed = lengths.iter().map(|&n| allocator.admit(n + 1)).collect::<Result<Vec<_>>>()?;
+                let mut alone = lengths.iter().map(|&n| allocator.admit(n + 1)).collect::<Result<Vec<_>>>()?;
+                let tokens = lengths.iter().enumerate().map(|(i, &n)| {
+                    let source = &windows[i].tokens;
+                    (0..n).map(|j| source[(i * 97 + j) % source.len()]).collect::<Vec<_>>()
+                }).collect::<Vec<_>>();
+                let mut drafts = vec![speculate::MtpSeq::default(); lengths.len()];
+                let mut logits = vec![Vec::new(); lengths.len()];
+                let mut sequences = packed.iter_mut().zip(&tokens).zip(&mut drafts).map(|((placement, tokens), draft)| {
+                    PrefillSeq { placement, tokens, start: 0, next: None, draft, neural: true }
+                }).collect::<Vec<_>>();
+                for result in engine.prefill_packed(&mut sequences, &mut |i, head| {
+                    logits[i] = head.row_host(engine.library, 0)?;
+                    Ok(Ok(()))
+                })? { result?; }
+                drop(sequences);
+                for i in 0..lengths.len() {
+                    let head = engine.prefill_device(&mut alone[i], &tokens[i], None, None, 1)?
+                        .context("singleton full-model head")?.row_host(engine.library, 0)?;
+                    let mut draft = speculate::MtpSeq::default();
+                    speculate::prefill_chunk(engine, &alone[i], 0, &tokens[i], None, &mut draft)?;
+                    let equal = logits[i].iter().map(|x| x.to_bits()).eq(head.iter().map(|x| x.to_bits()));
+                    let state = prefix::packed_state(engine, &packed[i])? == prefix::packed_state(engine, &alone[i])?;
+                    let a = regions(engine, packed[i].slot)?;
+                    let b = regions(engine, alone[i].slot)?;
+                    ensure!(a.len() == names.len() && b.len() == names.len(), "state labels drifted");
+                    let first = a.iter().zip(&b).enumerate().find(|(_, (a, b))| a != b);
+                    let ple = names.iter().position(|n| n.contains("PLE.conv"))
+                        .map(|p| a[p] == b[p]);
+                    if let Some((plane, (a, b))) = first {
+                        let byte = a.iter().zip(b).position(|(a, b)| a != b).unwrap();
+                        println!("discriminator total{total} member{i}: first differing tensor {} byte{byte}", names[plane]);
+                    } else if !state {
+                        println!("discriminator total{total} member{i}: target slot planes equal; first differing canonical plane is paged KV/index or MTP stash/history");
+                    }
+                    let (kl, _) = crate::shared::golden_scores::scored_kl(&head, &logits[i], head.len())?;
+                    println!("discriminator total{total} member{i} rows{}: logits_bytes={equal} canonical_state_bytes={state} PLE.conv_equal={ple:?} KL={kl:.9}", lengths[i]);
+                    every_equal &= equal && state;
+                }
+            }
+            println!("discriminator all totals <=64 byte-identical: {every_equal}");
+            Ok(())
+        })
     }
 }
 

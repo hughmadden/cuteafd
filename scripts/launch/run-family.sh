@@ -167,6 +167,7 @@ GATEWAY
 EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
+PREFILL_PACKING
 SPECULATOR_DEPTH
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
@@ -380,6 +381,7 @@ EOF
       ;;
     qwen4)
       cat <<'EOF'
+PREFILL_PACKING
 KV_CACHE
 QWEN_FP8_DECODE
 QWEN_FP8_HEAD
@@ -2056,7 +2058,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 prefill_packing="$(get PREFILL_PACKING)"
 if [[ -n "$prefill_packing" ]]; then
-  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 ]] || { echo "PREFILL_PACKING applies to MiMo, GLM Flash and Step-5" >&2; exit 2; }
+  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
   case "$prefill_packing" in
     unrestricted|exact) family_args+=(--prefill-packing "$prefill_packing") ;;
     *) echo "PREFILL_PACKING must be unrestricted or exact" >&2; exit 2 ;;

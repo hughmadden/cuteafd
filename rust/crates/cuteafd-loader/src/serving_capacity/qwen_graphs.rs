@@ -258,6 +258,8 @@ pub fn qwen_workspace_bytes(cfg: &crate::families::qwen4::Qwen4Config, t: u64, d
         a(t * blocks * 4), a(t * 2112 * 4), a(t * 4), a(scratch), a(topk_scratch),
         a(logit_rows * cfg.vocab_size as u64 * 4), a(t * cfg.experts as u64 * 4), a(t * topk * 4), a(t * topk * 4),
         a(t * (h + h / 32)), a(t * 4), a(logit_rows * 8), a(t * 4), a(logit_rows * 8), 4 << 20].iter().sum::<u64>();
+    // Packed attention uses a zero-origin member view; PLE retains global origins.
+    if !decode { total += a(t * 4); }
     if let Some(row_bytes) = mapped_ple_row_bytes {
         total += a(t * ple_rows * 8) + a(t * ple_rows * row_bytes);
     }

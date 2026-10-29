@@ -52,6 +52,14 @@ pub(crate) struct GoldenArgs {
     /// Check exact recurrent prefix restore and copied GQA full/partial pages before scoring.
     #[arg(long)]
     pub prefix_check: bool,
+    /// Compare native packed and singleton state/logits on 2..=8 members.
+    #[arg(long)]
+    pub packed_check: Option<usize>,
+    /// Include checkpoint-native MTP state for every packed qualification member.
+    #[arg(long, requires = "packed_check", conflicts_with_all = ["draft", "mtp_golden", "verify_check", "prefix_check"])]
+    pub packed_mtp: bool,
+    #[arg(long, value_enum, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
     #[arg(long)]
     pub draft: Option<PathBuf>,
@@ -72,21 +80,45 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tracing::info!(hidden = cfg.hidden, layers = cfg.attention.len(), intermediate = cfg.intermediate,
         tensor_contracts = header.tensors.len(), "dense Qwen checkpoint headers validated for qualification");
     if args.check_headers { return Ok(()); }
+    if let Some(members) = args.packed_check {
+        ensure!((2..=8).contains(&members), "--packed-check needs 2..=8 members");
+    }
     ensure!((1..=4096).contains(&args.prefill_chunk), "prefill chunk must be 1..4096");
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;
-    let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
-    let (directory, positions) = reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?;
-    let token_bytes = std::fs::read(directory.join("tokens.bin"))?;
+    let packed_windows = if args.packed_check.is_some() && golden.join("manifest.json").is_file() {
+        use cuteafd_bench::fidelity_dataset;
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(golden.join("manifest.json"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let expected = match (cfg.hidden, manifest["config"].as_str()) {
+            (5120, Some(fidelity_dataset::QWEN38_27B_CONFIG)) => fidelity_dataset::QWEN38_27B_MANIFEST_SHA256,
+            (4096, Some(fidelity_dataset::QWEN35_9B_CONFIG)) => fidelity_dataset::QWEN35_9B_MANIFEST_SHA256,
+            _ => anyhow::bail!("unsupported dense packed reference"),
+        };
+        ensure!(format!("{:x}", Sha256::digest(&bytes)) == expected, "dense packed reference publication differs");
+        let reference = fidelity_dataset::load(golden, &manifest)?;
+        ensure!(reference.vocab == cfg.vocab, "dense packed reference vocabulary differs");
+        Some(crate::shared::qwen::packed_check::reference_windows(&reference.windows,
+            &args.window, args.packed_check.unwrap(),
+            args.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted)?)
+    } else { None };
+    let (directory, positions) = if packed_windows.is_some() { (golden.to_owned(), None) } else {
+        let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
+        reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?
+    };
+    let token_bytes = if let Some(windows) = &packed_windows {
+        windows[0].tokens.iter().flat_map(|t| t.to_le_bytes()).collect()
+    } else { std::fs::read(directory.join("tokens.bin"))? };
     ensure!(token_bytes.len() >= 8 && token_bytes.len() % 4 == 0, "invalid reference token payload");
     let tokens: Vec<_> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(tokens.iter().all(|&token| (token as usize) < cfg.vocab), "reference token outside vocabulary");
     let positions = positions.unwrap_or_else(|| (1..tokens.len()).collect());
     ensure!(!positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "invalid reference score positions");
-    let reference = std::fs::read(directory.join("logits.bin"))?;
+    let reference = if packed_windows.is_some() { Vec::new() } else { std::fs::read(directory.join("logits.bin"))? };
     let reference_rows = if golden.join("windows.json").is_file() { positions.len() } else { tokens.len() };
-    ensure!(reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
+    ensure!(packed_windows.is_some() || reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
     let reference: Vec<_> = reference.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(reference.iter().all(|v| v.is_finite()), "nonfinite reference logits");
     let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::open(&args.snapshot)?;
@@ -102,16 +134,28 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
     }
     ensure!(args.draft.is_none(), "--draft requires --spec-decode for dense qualification");
-    let slots = usize::from(args.state_slots);
+    let slots = usize::from(args.state_slots).max(args.packed_check.map_or(1, |n| 2 * n));
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
+    let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
+    let mtp_admission = args.packed_mtp.then(|| engine::mtp::Admission::new(&reader, cfg, &programs)).transpose()?;
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, None, slots, marks, args.kv_cache, false)?;
+        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes), slots, marks, args.kv_cache, false)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
     }
     let engine = std::cell::RefCell::new(engine);
+    if let Some(members) = args.packed_check {
+        ensure!(args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact || packed_windows.is_some(),
+            "unrestricted packed check needs the sealed official reference");
+        let precision = cuteafd_bench::fidelity_precision::resolve("dense-packed-check", Some(&args.snapshot),
+            &serde_json::json!([]), "Qwen/Qwen3.8-27B", None)?;
+        let mtp = mtp_admission.map(|admission| engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)
+            .map(std::rc::Rc::new)).transpose()?;
+        return serve::packed_check(&engine, &library, &tokens, members, args.prefill_packing,
+            packed_windows.as_deref(), &precision, mtp);
+    }
     if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
     let mut engine = engine.into_inner();
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
@@ -207,6 +251,32 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    #[ignore = "requires sealed dense Qwen artifact, official reference and GPU"]
+    fn packed_native_mtp_raw_rows() -> anyhow::Result<()> {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: super::GoldenArgs }
+        let model = std::env::var("CUTEAFD_FIXTURE_MODEL")?;
+        let reference = std::env::var("CUTEAFD_FIXTURE_REFERENCE")?;
+        let parsed = Cli::try_parse_from(["fixture", "--snapshot", &model, "--golden", &reference,
+            "--packed-check", "8", "--window", "a00", "--packed-mtp", "--pool-tokens", "262144",
+            "--prefill-packing", "unrestricted"])?;
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(super::run_golden(parsed.args))
+    }
+
+    #[test]
+    fn packed_mtp_requires_a_packed_fixture_and_excludes_other_drafters() {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: super::GoldenArgs }
+        let base = ["test", "--snapshot", "model", "--packed-mtp"];
+        assert!(Cli::try_parse_from(base).is_err());
+        let parsed = Cli::try_parse_from(base.into_iter().chain(["--packed-check", "8", "--window", "c00"])).unwrap();
+        assert!(parsed.args.packed_mtp);
+        assert_eq!(parsed.args.window, "c00");
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--packed-check", "8", "--draft", "draft"])).is_err());
+    }
+
     #[test]
     fn mtp_oracle_is_explicit_and_excludes_other_draft_modes() {
         #[derive(clap::Parser)]

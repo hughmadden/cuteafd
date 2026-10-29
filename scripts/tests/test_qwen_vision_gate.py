@@ -219,6 +219,26 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     assert "begin_staging(" not in engine and "reserve_h2d_ordered(" not in engine
 
 
+def test_packed_qwen_metadata_is_uploaded_once_and_only_viewed_inside_layers():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families"
+    moe = (root / "qwen4/engine.rs").read_text()
+    packed = moe[moe.index("    pub(crate) fn prefill_packed("):moe.index("    pub(crate) fn mtp_prefill_rows(")]
+    assert packed.count("self.stage_step_tables(w, &all)?;") == 1
+    assert "run_prefill_units(&mut hooks, &[unit], 1)?" in packed
+    hooks = moe[moe.index("struct PackedHooks"):moe.index("struct UnitHooks")]
+    assert "stage_step_tables" not in hooks
+    assert "self.w.table_view.set(Some(view))" in hooks
+    assert "self.w.table_view.set(None)" in hooks
+    assert "local_seq_first" in moe and "seq_first\", w.first_table()" in moe
+    dense = (root / "qwen3_5/engine.rs").read_text()
+    packed = dense[dense.index("    pub(crate) fn prefill_packed("):dense.index("    pub(crate) fn packed_head(")]
+    assert packed.count("self.row_tables(&all)?;") == 1
+    layers = packed[packed.index("for (index, layer)"):]
+    assert "row_tables(" not in layers
+    for field in ["slots", "seq_first", "positions", "rope_positions", "kv_slots", "page_table"]:
+        assert f"planes.{field} = view(" in layers
+
+
 def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
     root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
     engine = (root / "engine.rs").read_text()

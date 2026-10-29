@@ -12,6 +12,30 @@ pub(super) fn validate_all(cfg: &Qwen4Config, programs: &Programs<'_>, context: 
     Ok(())
 }
 
+pub(super) fn packed_inventory<'a>(required: impl IntoIterator<Item = &'a str>)
+    -> Result<Vec<(&'a str, crate::shared::prefill_packing::ProgramRows)>> {
+    use crate::shared::prefill_packing::{validate_program_inventory, ProgramRows::*};
+    let required = required.into_iter().collect::<Vec<_>>();
+    let inventory = required.iter().map(|&name| {
+        let op = name.strip_prefix("qwen4_").ok_or_else(|| anyhow::anyhow!("Qwen program prefix"))?;
+        let role = match op {
+            "hc_pre" | "hc_post_pre" | "hc_post" | "router_scores" | "shared" | "add"
+                | "ple_bf16" | "ple_fp8" | "expert_input_quant" => PackedRows,
+            "head" | "head_fp8" | "mtp_feedback" | "gdn_commit" | "ple_commit" | "index_expand" => SequenceLocal,
+            _ if ["gdn_", "attn_producer_", "sparse_gqa_", "index_topk_", "attn_o_"]
+                .iter().any(|stem| op.starts_with(stem)) => SequenceLocal,
+            _ => bail!("Qwen program {name} lacks an explicit packed row role"),
+        };
+        Ok((name, role))
+    }).collect::<Result<Vec<_>>>()?;
+    validate_program_inventory(required, &inventory)?;
+    Ok(inventory)
+}
+
+pub(super) fn ple_packed_cap(cap: usize, ple: bool) -> usize {
+    if ple { cap.min(24) } else { cap }
+}
+
 fn expected(cfg: &Qwen4Config, name: &str) -> Result<Value> {
     let op = name.strip_prefix("qwen4_").unwrap_or(name);
     let (stem, rows) = match op.rsplit_once("_m") {
@@ -98,6 +122,22 @@ fn validate(cfg: &Qwen4Config, context: usize, spec: &ProgramSpec) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_inventory_uses_startup_names_and_fails_closed_on_new_programs() -> Result<()> {
+        use crate::shared::prefill_packing::ProgramRows::*;
+        let names = ["qwen4_shared", "qwen4_ple_fp8", "qwen4_gdn_w8_m64", "qwen4_mtp_feedback",
+            "qwen4_gdn_commit", "qwen4_ple_commit"];
+        let roles = packed_inventory(names)?;
+        assert_eq!(roles.iter().map(|(_, role)| *role).collect::<Vec<_>>(),
+            [PackedRows, PackedRows, SequenceLocal, SequenceLocal, SequenceLocal, SequenceLocal]);
+        assert!(packed_inventory(names.into_iter().chain(["qwen4_new_projection"])).is_err());
+        assert!(packed_inventory(["qwen4_shared", "qwen4_shared"]).is_err());
+        assert_eq!(ple_packed_cap(64, true), 24);
+        assert_eq!(ple_packed_cap(16, true), 16);
+        assert_eq!(ple_packed_cap(64, false), 64);
+        Ok(())
+    }
 
     #[test]
     fn pinned_exporter_attention_geometry_is_accepted_independently() -> Result<()> {

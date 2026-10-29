@@ -99,6 +99,26 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
     }
 }
 
+pub(crate) fn packed_state(engine: &RefCell<DenseEngine<'_>>, placement: &Placement) -> Result<Vec<u8>> {
+    let target = engine.borrow();
+    target.stream.drain()?;
+    let mut regions = DensePrefix::state(&target, placement.slot);
+    let record = target.kv_format.record_bytes(target.cfg.kv_heads, target.cfg.head_dim);
+    for (i, &page) in placement.units.iter().enumerate().take(placement.len.div_ceil(64)) {
+        let rows = (placement.len - i * 64).min(64);
+        for pool in target.kv.iter().flatten() {
+            regions.push(view(pool.buffer, page as usize * 64 * record, rows * record)?);
+        }
+    }
+    let mut bytes = Vec::new();
+    for region in regions {
+        let mut data = vec![0; region.bytes];
+        target.stream.device.library.copy_d2h(&mut data, region)?;
+        bytes.extend(data);
+    }
+    Ok(bytes)
+}
+
 /// Qualification through the real prefix adapter, including a partial-page
 /// copy-on-write tail and a restored frontier on different physical KV pages.
 pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result<()> {

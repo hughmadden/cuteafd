@@ -254,7 +254,9 @@ impl InstalledExpertVariant {
     /// Unknown route metadata forces singleton execution; traffic groups are unrelated.
     pub fn packed_row_cap(&self) -> Option<usize> {
         if self.arithmetic_routes.is_empty() { return Some(0); }
-        (self.arithmetic_routes.len() > 1).then(|| self.arithmetic_routes[0].end_rows)
+        // A single route ends at this compiled program's capacity too. Packing
+        // beyond it can select another program, even when its route id agrees.
+        Some(self.arithmetic_routes[0].end_rows.min(self.capacity))
     }
 
     pub fn with_arithmetic_routes(mut self,
@@ -1817,12 +1819,15 @@ mod tests {
                 0, 4096, ExpertGroupingSelector::Fp8Nearest, variants).unwrap()
                 .with_bf16_variants(vec![arithmetic_variant(4096, 320)]).unwrap();
             let restored: InstalledExpertGrouping = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
-            assert_eq!(restored.packed_row_cap(false), cutoff);
+            assert_eq!(restored.packed_row_cap(false), 1.min(cutoff));
             assert_eq!(restored.packed_row_cap(true), 320);
             assert_eq!(restored.group_rows(cutoff).unwrap(), 64);
             assert_eq!(restored.group_rows(cutoff + 1).unwrap(), 64);
         }
-        assert_eq!(arithmetic_variant(4096, 4096).packed_row_cap(), None);
+        assert_eq!(arithmetic_variant(4096, 4096).packed_row_cap(), Some(4096));
+        let compiled = [arithmetic_variant(64, 64), arithmetic_variant(256, 256)];
+        assert_eq!(compiled.iter().filter_map(InstalledExpertVariant::packed_row_cap).min(), Some(64),
+            "one arithmetic route must not erase a compiled-program boundary");
         assert_eq!([arithmetic_variant(4096, 1000), arithmetic_variant(4096, 640)]
             .iter().filter_map(InstalledExpertVariant::packed_row_cap).min(), Some(640));
         let unknown = InstalledExpertVariant::from_queries(4096, |_| Ok(64)).unwrap();

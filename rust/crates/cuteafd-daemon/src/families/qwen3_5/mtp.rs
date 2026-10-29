@@ -352,6 +352,25 @@ impl<'a> MtpCache<'a> {
         Ok(())
     }
 
+    /// Packed target rows share one capture; never compact a member over its partner.
+    pub(crate) fn update_captured_at(&self, engine: &mut DenseEngine<'a>, slot: usize, start: usize,
+        tokens: &[u32], offset: usize) -> Result<()> {
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        ensure!(mtp.pool.frontier(mtp.binding)?.1 == start, "dense packed MTP frontier differs");
+        for first in (0..tokens.len()).step_by(HEAD_ROWS) {
+            let end = (first + HEAD_ROWS).min(tokens.len());
+            let hidden = crate::shared::prefix::view(mtp.hidden.buffer, (offset + first) * mtp.layout.hidden_bytes,
+                (end - first) * mtp.layout.hidden_bytes)?;
+            mtp.norm(engine, hidden, engine.weights.norm.buffer, hidden, end - first)?;
+            if start + first > 0 { mtp.resolve_pending_device(engine, tokens[first], start + first)?; }
+            if end - first > 1 { mtp.step_device(engine, hidden, &tokens[first + 1..end], start + first)?; }
+            let tail = crate::shared::prefix::view(hidden, (end - first - 1) * mtp.layout.hidden_bytes, mtp.layout.hidden_bytes)?;
+            mtp.pending(tail, start + end)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn draft_chain(&self, engine: &mut DenseEngine<'a>, slot: usize, anchor: u32,
         frontier: usize, depth: usize,
         select: impl FnMut(crate::shared::token_io::DeviceLogits, usize) -> Result<u32>) -> Result<Vec<u32>> {
@@ -370,6 +389,32 @@ impl<'a> MtpCache<'a> {
 
 
 impl MtpCache<'_> {
+    /// Canonical live KV and pending hidden only, independent of physical page ids.
+    pub(crate) fn packed_state(&self, slot: usize, frontier: usize) -> Result<Vec<u8>> {
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        ensure!(mtp.pool.frontier(mtp.binding)?.1 == frontier && frontier > 0,
+            "dense packed MTP snapshot frontier differs");
+        // SAFETY: drain the owning stream before reading its canonical state.
+        unsafe { mtp.library.cuda_stream_synchronize(mtp.stream)?; }
+        let pages = mtp.pool.committed_page_table(mtp.binding)?;
+        let mut bytes = Vec::new();
+        // The final KV row is pending until the following target token exists.
+        for (i, &page) in pages.iter().enumerate().take((frontier - 1).div_ceil(64)) {
+            let rows = (frontier - 1 - i * 64).min(64);
+            let region = crate::shared::prefix::view(mtp.kv.buffer,
+                page as usize * 64 * mtp.layout.record_bytes, rows * mtp.layout.record_bytes)?;
+            let mut data = vec![0; region.bytes];
+            mtp.library.copy_d2h(&mut data, region)?;
+            bytes.extend(data);
+        }
+        let hidden = mtp.tail_hidden(frontier)?;
+        let mut data = vec![0; hidden.bytes];
+        mtp.library.copy_d2h(&mut data, hidden)?;
+        bytes.extend(data);
+        Ok(bytes)
+    }
+
     pub(crate) fn reset_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().reset_slot(slot) }
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().discard_slot(slot) }
     pub(crate) fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {
