@@ -236,6 +236,15 @@ pub fn is_dspark(config: &serde_json::Value) -> bool {
         .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel"))
 }
 
+/// Serving owns one draft ring per scheduler slot unless explicitly overridden.
+pub fn flash_serving_draft_limits(max_sequences: usize, sequences: usize, slots: Option<usize>)
+    -> (Option<usize>, usize) {
+    match slots {
+        Some(slots) => (Some(slots), sequences),
+        None => { let slots = max_sequences.max(1); (Some(slots), sequences.min(slots)) }
+    }
+}
+
 /// Flash planning, admission and loading share one checkpoint-derived head row capacity.
 pub fn flash_draft_capacity(config: &serde_json::Value, context_slots: Option<usize>, sequences: usize)
     -> Result<GlmDraftCapacity, GlmDraftStorageError> {
@@ -427,6 +436,12 @@ mod tests {
         assert_eq!(flash_draft_capacity(&config,None,8).unwrap(),GlmDraftCapacity::new(20,8,16).unwrap());
         assert_eq!(flash_draft_capacity(&config,None,16).unwrap(),GlmDraftCapacity::new(20,16,16).unwrap());
         assert_eq!(flash_draft_capacity(&config,Some(4),16).unwrap(),GlmDraftCapacity::new(4,4,16).unwrap());
+        for (target,drafts,slots,expected) in [(16,8,None,(16,8,128)),(8,16,None,(8,8,128)),
+            (16,8,Some(4),(4,4,64)),(8,16,Some(20),(20,16,256))] {
+            let (slots,batch) = flash_serving_draft_limits(target,drafts,slots);
+            let cap = flash_draft_capacity(&config,slots,batch).unwrap();
+            assert_eq!((cap.context_slots,cap.max_batch_sequences,cap.block_rows),expected);
+        }
     }
 
     #[test]
