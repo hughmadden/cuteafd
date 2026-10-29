@@ -1017,6 +1017,7 @@ impl Opened {
         }
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
+        cuteafd_bench::context::set_rtx_expert_layers(preflight.placement.onboard_layers);
         resolved.prefill_rows = preflight.prefill_rows;
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
         let args = &resolved;

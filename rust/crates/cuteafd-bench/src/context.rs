@@ -85,6 +85,11 @@ pub fn set_resolved(name: &str, value: &str) {
     }
 }
 
+/// Publish the accepted expert placement, including zero onboarded layers.
+pub fn set_rtx_expert_layers(layers: usize) {
+    set_resolved("rtx-expert-layers", &layers.to_string());
+}
+
 pub fn set_thinking_off(supported: bool) {
     if let Ok(mut slot) = state().context.lock() { slot.supports_thinking_off = Some(supported); }
 }
@@ -189,9 +194,9 @@ pub fn env_settings() -> Vec<Setting> {
 
 /// Option names that describe the deployment rather than a tuning choice:
 /// never shown as chips (they are in the hardware and configuration panels).
-pub const DEPLOYMENT: [&str; 12] = ["snapshot", "native-lib", "native_lib", "peers", "listen", "model-id",
-    "model_id", "hf-home", "hf_home", "device", "split-device",
-    "split_device"];
+pub const DEPLOYMENT: [&str; 16] = ["snapshot", "native-lib", "native_lib", "peers", "listen", "model-id",
+    "model_id", "hf-home", "hf_home", "device", "api-key-file", "usage-dir", "console-secret-file", "enable-bench",
+    "CUTEAFD_CONSOLE_LINK_COMMAND", "CUTEAFD_FIDELITY_CACHE"];
 
 #[cfg(test)]
 mod tests {

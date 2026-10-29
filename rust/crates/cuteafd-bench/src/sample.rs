@@ -98,6 +98,7 @@ pub fn report(failed: bool) -> Report {
 #[cfg(test)]
 mod tests {
     use crate::render;
+    use crate::report::Setting;
 
     #[test]
     fn obsolete_single_point_reports_are_refused_and_migrated_history_keeps_c8() {
@@ -196,13 +197,81 @@ mod tests {
             report.server.configuration.settings.push(Setting { name: format!("long-option-{i}"), value: Some("x".repeat(80)),
                 source: "cli".into(), ..Default::default() });
         }
+        // Health evidence must not steal the second chip row.
+        report.fabric.push(crate::fabric::Phase { timed: true, ports: vec![crate::fabric::Port {
+            health: Some(Default::default()), ..Default::default()
+        }], ..Default::default() });
         let card = render::card::card_svg(&report);
         assert!(card.contains("POWER-CAPPED"));
+        assert!(card.contains("Fabric: retransmit rate unavailable"));
+        assert!(card.contains(r#"x="56" y="516""#));
+        // Last bar ends at 496; health text starts no higher than 504 (12px font).
+        let last_bar_bottom = 416.0 + 2.0 * 30.0 + 4.0 + 16.0;
+        let health_top = 516.0 - 12.0;
+        assert!(health_top - last_bar_bottom >= 8.0);
+        assert!(card.contains(r#"x="146" y="480""#)); // Last bar's actual geometry.
+        assert!(card.contains(r#"y="598""#)); // Second chip row starts here.
+        assert!(!card.contains(r#"y="614""#)); // No health text among chips.
         assert!(card.contains("more in report"));
         assert!(card.contains(r#"y="629""#)); // Badge begins after both chip rows (ending at 618).
         assert!(!card.contains(r#"y="624""#)); // No third chip row.
         assert!(!card.contains(r#"y="638""#));
         assert!(card.contains(r#"x="56" y="647""#));
+    }
+
+    #[test]
+    fn resolved_onboard_count_enriches_capacity_only_for_spark_cards() {
+        let mut report = super::report(false);
+        let original = report.capacity_line();
+        let mut setting = Setting { name: "rtx-expert-layers".into(), value: Some("auto".into()),
+            source: "cli".into(), ..Default::default() };
+        report.server.configuration.settings.push(setting.clone());
+        assert_eq!(report.capacity_line(), original);
+        assert!(!render::card::card_svg(&report).contains("rtx-expert-layers="));
+        for count in [0, 11] {
+            setting.source = "resolved".into();
+            setting.value = Some(count.to_string());
+            *report.server.configuration.settings.last_mut().unwrap() = setting.clone();
+            assert!(report.capacity_line().contains(&format!("{count} RTX expert layers")));
+            let card = render::card::card_svg(&report);
+            assert!(card.contains(&format!("{count} RTX expert layers")));
+            assert!(!card.contains("rtx-expert-layers="));
+        }
+        report.baseline = None;
+        assert_eq!(report.capacity_line(), "11 RTX expert layers · 16 req max");
+        report.server.hardware.sparks.clear();
+        assert_eq!(report.capacity_line(), "16 req max");
+    }
+
+    #[test]
+    fn card_chips_prioritize_performance_and_keep_order_within_tiers() {
+        let mut report = super::report(false);
+        report.server.configuration.settings = ["api-key-file", "max-output", "host-cache-bytes",
+            "v4-graph-captures", "route-source", "attention-placement", "pool-tokens",
+            "prefill-waves", "prefill-rows", "draft-fp8", "draft"]
+            .into_iter().map(|name| Setting { name: name.into(), value: Some("1".into()),
+                source: "resolved".into(), ..Default::default() }).collect();
+        let card = render::card::card_svg(&report);
+        let expected = ["draft-fp8=1", "draft=1", "prefill-waves=1", "prefill-rows=1", "pool-tokens=1",
+            "attention-placement=1", "route-source=1", "v4-graph-captures=1", "host-cache-bytes=1", "max-output=1"];
+        for pair in expected.windows(2) {
+            assert!(card.find(pair[0]).unwrap() < card.find(pair[1]).unwrap(), "{pair:?}");
+        }
+        // The full configuration retains even the options omitted from the strip.
+        let full = render::report::panel_svg(&report, "configuration");
+        assert!(full.contains("api-key-file"));
+        assert!(!card.contains("api-key-file"));
+        report.server.configuration.settings = ["CUTEAFD_HOST_ISA_SELECTED", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS",
+            "CUTEAFD_THERMAL", "request-timeout", "rtx-expert-ranges", "route-source", "max-output"]
+            .into_iter().map(|name| Setting { name: name.into(),
+                value: Some(if name == "rtx-expert-ranges" { "0..0,0..0" } else { "1" }.into()),
+                source: "resolved".into(), ..Default::default() }).collect();
+        let card = render::card::card_svg(&report);
+        let expected = ["route-source=1", "rtx-expert-ranges=0..0,0..0", "max-output=1",
+            "CUTEAFD_HOST_ISA_SELECTED=1", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=1", "CUTEAFD_THERMAL=1", "request-timeout=1"];
+        for pair in expected.windows(2) {
+            assert!(card.find(pair[0]).unwrap() < card.find(pair[1]).unwrap(), "{pair:?}");
+        }
     }
 
     #[test]

@@ -82,6 +82,7 @@ impl Opened {
             spark_ranks: 0, onboard: args.onboard.unwrap_or(Onboard::Auto), startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
         })?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
+        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
             "Qwen dual shared solver admission before allocation");
         let owners = placement.layers.iter().map(|layer| match layer.mode {

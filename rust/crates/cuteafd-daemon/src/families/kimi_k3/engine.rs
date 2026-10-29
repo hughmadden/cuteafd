@@ -122,6 +122,7 @@ impl<'a> Engine<'a> {
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() == 6,
             "Kimi startup needs process latent geometry and six real expert ranks");
         let plan = admission.execution_plan()?;
+        cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
         hops.validate_binding(&plan, &peer)?;
         check_exchange_streams(&peer, &exchange_streams)?;
         let devices = programs.each_ref().map(|programs| programs.device);

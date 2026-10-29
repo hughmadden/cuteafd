@@ -1082,6 +1082,7 @@ impl Opened {
         let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
+        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
         let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;

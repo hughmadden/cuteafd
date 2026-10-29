@@ -550,7 +550,7 @@ pub(crate) fn with_engine<T>(
             "DeepSeek V4 measured admission disagrees with frozen pre-load placement");
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
             local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
-        cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
+        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         cuteafd_bench::context::set_resolved("rtx-expert-ranges", &placement.expert_ranges.iter()
             .map(|r| format!("{}..{}", r.first, r.first + r.layers)).collect::<Vec<_>>().join(","));
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());

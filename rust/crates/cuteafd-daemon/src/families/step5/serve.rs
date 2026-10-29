@@ -247,6 +247,7 @@ fn with_backend<T>(args: &ServeArgs,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
+    cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     // Uploads convert on the host and copy synchronously. No transient device
     // conversion arena exists: each loading phase is bounded by retained owners.
     inputs.startup = admission.placement.items.iter().enumerate().map(|(rank, items)| {
