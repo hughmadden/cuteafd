@@ -738,7 +738,11 @@ pub(crate) fn with_engine<T>(
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let shared = args.golden.join("manifest.json").try_exists()?;
-    if shared {
+    if args.packed_check.is_some() {
+        ensure!(shared && args.engine.full_prefill_logits && args.window.is_none()
+            && args.save_logits.is_none() && args.layers.is_none(),
+            "--packed-check requires a published V4 Flash set and --full-prefill-logits, without other diagnostics");
+    } else if shared {
         ensure!(args.nll && args.save_logits.is_some(), "shared V4 fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.draft && args.verify_rows.is_none()
             && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none()
@@ -753,7 +757,23 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let started = Instant::now();
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    let windows = if shared { Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?) } else { None };
+    let windows = if shared && args.packed_check.is_none() {
+        Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?)
+    } else { None };
+    let packed_reference = if args.packed_check.is_some() {
+        ensure!(loaded.family == "dsv4f", "packed reference diagnostic supports V4 Flash only");
+        let (_, _, hash) = fidelity_publication(loaded.family)?;
+        ensure!(cuteafd_bench::fidelity_rows::sha256(&args.golden.join("manifest.json"))? == hash,
+            "packed reference manifest differs from immutable publication");
+        let manifest: serde_json::Value = cuteafd_loader::read_json_file(&args.golden.join("manifest.json"))?;
+        let reference = cuteafd_bench::fidelity_dataset::load(&args.golden, &manifest)?;
+        let window = reference.windows.into_iter().find(|w| w.id == "legacy")
+            .context("sealed legacy packed reference missing")?;
+        let model = "deepseek-ai/DeepSeek-V4-Flash-0731";
+        let precision = cuteafd_bench::fidelity_precision::resolve(model, Some(&args.engine.snapshot),
+            &serde_json::json!({}), model, None)?;
+        Some((window, precision))
+    } else { None };
     with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime, _host_config| {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
@@ -761,10 +781,8 @@ fn golden(args: GoldenArgs) -> Result<()> {
         let mode = crate::shared::prefill_packing::PackingMode::resolve(args.prefill_packing, args.packed_check.is_some());
         engine.configure_packing(mode, transports)?;
         let result = if let Some(members) = args.packed_check {
-            let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
-            ensure!(bytes.len() % 4 == 0, "golden tokens contain a partial token");
-            let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-            packed_check::run(engine, transports, runtime, &tokens, members, mode)
+            let (window, precision) = packed_reference.as_ref().context("packed reference")?;
+            packed_check::run(engine, transports, runtime, window, precision, members, mode)
         } else if let Some(windows) = &windows {
             score_fidelity(&args, engine, transports, runtime, windows)
         } else { match args.token_check {

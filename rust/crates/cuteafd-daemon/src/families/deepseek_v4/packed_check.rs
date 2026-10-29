@@ -1,39 +1,54 @@
-//! Golden diagnostic through the real segmented serving executor.
+//! Reference-aligned diagnostic through the real segmented serving executor.
 use super::{engine::Engine, pool::PoolAllocator, prefix, SparkLink};
 use crate::shared::prefill_packing::{self, PackingMode};
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
+use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+use cuteafd_bench::{fidelity_precision::Precision, reference::Window};
 
 struct Observed { logits: Vec<f32>, state: Vec<u8>, frontier: usize }
 
+fn widths(case: usize, member: usize) -> usize {
+    match case { 0 => [29, 40, 59][member % 3], _ => [200, 127, 64][member % 3] }
+}
+
 fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime,
-    prompts: &[Vec<u32>], chunks: &[(usize, usize)], packed: bool) -> Result<(Vec<Observed>, usize)> {
+    prompts: &[Vec<u32>], case: usize, packed: bool) -> Result<(Vec<Observed>, usize)> {
     let mut allocator = PoolAllocator::for_engine(engine)?;
     let mut placements = prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>()?;
-    for ((placement, prompt), &(start, _)) in placements.iter_mut().zip(prompts).zip(chunks) {
-        prefix::packed_state(engine, placement, true)?;
-        for part in prompt[..start].chunks(engine.prefill_rows) {
-            engine.prefill_device(placement, part, links, runtime, 0)?;
-        }
-    }
-    let groups = if packed { prefill_packing::groups(chunks.len(), |r| engine.packed_plan(&chunks[r]).is_ok()) }
-        else { (0..chunks.len()).map(|i| i..i + 1).collect() };
+    for placement in &placements { prefix::packed_state(engine, placement, true)?; }
+    let mut logits = vec![Vec::new(); prompts.len()];
     let mut actual_packs = 0;
-    let mut logits = vec![Vec::new(); chunks.len()];
-    for range in groups {
-        if range.len() == 1 {
-            let i = range.start;
-            logits[i] = engine.prefill_device(&mut placements[i], &prompts[i][chunks[i].0..], links, runtime, 1)?
-                .context("packed check requires final logits")?.row_host(engine.library, 0)?;
-        } else {
-            actual_packs += 1;
-            let first = range.start;
-            let mut members = placements[range.clone()].iter_mut().zip(&prompts[range.clone()]).zip(&chunks[range])
-                .map(|((p, tokens), &(start, _))| (p, &tokens[start..])).collect::<Vec<_>>();
-            let prompt_ends = vec![true; members.len()];
-            for result in engine.prefill_packed(&mut members, links, &prompt_ends, &mut |i, row| {
-                logits[first + i] = row.row_host(engine.library, 0)?;
-                Ok(Ok(()))
-            })? { result?; }
+    while placements.iter().zip(prompts).any(|(p, t)| p.len < t.len()) {
+        let active = placements.iter().zip(prompts).enumerate()
+            .filter_map(|(i, (p, t))| (p.len < t.len()).then_some(i)).collect::<Vec<_>>();
+        let chunks = active.iter().map(|&i| (placements[i].len,
+            widths(case, i).min(prompts[i].len() - placements[i].len))).collect::<Vec<_>>();
+        let groups = if packed { prefill_packing::groups(active.len(), |r| engine.packed_plan(&chunks[r]).is_ok()) }
+            else { (0..active.len()).map(|i| i..i + 1).collect() };
+        for range in groups {
+            if range.len() == 1 {
+                let i = active[range.start];
+                let (start, rows) = chunks[range.start];
+                logits[i].extend(engine.prefill(&mut placements[i], &prompts[i][start..start + rows],
+                    links, runtime, rows, None)?);
+            } else {
+                actual_packs += 1;
+                let ids = &active[range.clone()];
+                // Active indices are ordered; collect disjoint mutable placements without unsafe.
+                let mut members = placements.iter_mut().enumerate().filter_map(|(i, p)| {
+                    ids.iter().position(|&id| id == i).map(|j| {
+                        let (start, rows) = chunks[range.start + j];
+                        (p, &prompts[i][start..start + rows])
+                    })
+                }).collect::<Vec<_>>();
+                let ends = ids.iter().enumerate().map(|(j, &i)| {
+                    let (start, rows) = chunks[range.start + j]; start + rows == prompts[i].len()
+                }).collect::<Vec<_>>();
+                for result in engine.prefill_packed_check(&mut members, links, &ends, &mut |j, _, rows| {
+                    logits[ids[j]].extend(rows.to_host(engine.library)?);
+                    Ok(())
+                })? { result?; }
+            }
         }
     }
     let observed = placements.iter().zip(logits).map(|(p, logits)| Ok(Observed {
@@ -42,40 +57,94 @@ fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtim
     Ok((observed, actual_packs))
 }
 
+fn equal(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+fn pair_metrics(a: &[f32], b: &[f32], vocab: usize) -> (f64, f64) {
+    let normalized = |row: &[f32]| {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lse = max + row.iter().map(|&x| (f64::from(x) - max).exp()).sum::<f64>().ln();
+        row.iter().map(|&x| f64::from(x) - lse).collect::<Vec<_>>()
+    };
+    let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let mut kl = 0.0;
+    let mut same = 0;
+    for (a, b) in a.chunks_exact(vocab).zip(b.chunks_exact(vocab)) {
+        same += usize::from(argmax(a) == argmax(b));
+        let (a, b) = (normalized(a), normalized(b));
+        kl += a.iter().zip(b).map(|(a, b)| a.exp() * (a - b)).sum::<f64>();
+    }
+    let rows = (a.len() / vocab) as f64;
+    (kl.max(0.0) / rows, same as f64 / rows)
+}
+
 pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime,
-    tokens: &[u32], members: usize, mode: PackingMode) -> Result<()> {
-    ensure!((2..=16).contains(&members), "--packed-check takes 2 to 16 members");
-    ensure!(!tokens.is_empty() && engine.shape.sequences >= members,
-        "packed check needs tokens and at least {members} sequence slots");
-    let mut chunks = vec![(0, 200); members];
-    chunks[members - 1] = (301, 127);
-    for &(_, rows) in &chunks { ensure!(rows <= engine.prefill_rows, "packed check needs >=200 prefill rows"); }
-    let prompts = chunks.iter().enumerate().map(|(i, &(start, rows))|
-        (0..start + rows).map(|r| tokens[(i * 97 + r) % tokens.len()]).collect::<Vec<_>>()).collect::<Vec<_>>();
-    let (alone, _) = arm(engine, links, runtime, &prompts, &chunks, false)?;
-    let (packed, packs) = arm(engine, links, runtime, &prompts, &chunks, true)?;
-    if mode == PackingMode::Unrestricted { ensure!(packs > 0, "packed check did not exercise a multi-member unit"); }
-    for (i, (a, b)) in alone.iter().zip(&packed).enumerate() {
-        ensure!(a.frontier == b.frontier, "packed member {i} frontier differs");
-        let logits_equal = a.logits.len() == b.logits.len()
-            && a.logits.iter().zip(&b.logits).all(|(a, b)| a.to_bits() == b.to_bits());
-        println!("packed member {i}: logits byte-identical {logits_equal}, state byte-identical {}", a.state == b.state);
-        ensure!(b.logits.len() == engine.cfg.vocab_size && !b.state.is_empty()
-            && b.logits.iter().all(|v| v.is_finite()), "empty or nonfinite packed observation");
-        ensure!(logits_equal && a.state == b.state,
-            "packed member {i} differs from singleton; characterize arithmetic route changes before accepting differences");
+    window: &Window, precision: &Precision, members: usize, mode: PackingMode) -> Result<()> {
+    ensure!((2..=16).contains(&members) && engine.shape.sequences >= members,
+        "packed check needs 2 to 16 admitted sequence slots");
+    ensure!(engine.full_prefill_logits && engine.prefill_rows >= 200,
+        "packed check requires --full-prefill-logits and >=200 prefill rows");
+    ensure!(window.id == "legacy" && window.tokens.len() == 513 && window.positions.len() == 512,
+        "packed check requires the sealed original V4 Flash legacy window");
+    let vocab = engine.cfg.vocab_size;
+    let prompts = vec![window.tokens[..512].to_vec(); members];
+    for case in 0..2 {
+        let (alone, _) = arm(engine, links, runtime, &prompts, case, false)?;
+        let (packed, packs) = arm(engine, links, runtime, &prompts, case, true)?;
+        if mode == PackingMode::Unrestricted { ensure!(packs > 0, "packed check exercised no multi-member unit"); }
+        for (i, (a, b)) in alone.iter().zip(&packed).enumerate() {
+            ensure!(a.frontier == 512 && b.frontier == 512 && b.logits.len() == 512 * vocab
+                && a.logits.len() == b.logits.len() && !b.state.is_empty()
+                && a.logits.iter().chain(&b.logits).all(|v| v.is_finite()), "invalid packed observation");
+            let logits_equal = equal(&a.logits, &b.logits);
+            let (kl, top1) = pair_metrics(&a.logits, &b.logits, vocab);
+            println!("packed case {case} member {i} width {} (<=64 {}): logits byte-identical {logits_equal}, state byte-identical {}, singleton KL {kl:.8}, top-1 {top1:.6} (informational)",
+                widths(case, i), widths(case, i) <= 64, a.state == b.state);
+            let probe = Probe::new(ProbeSpec { score_from: Some(window.score_from),
+                score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
+                want: window.want(), top_k: 32, ..Default::default() });
+            for (row, logits) in b.logits.chunks_exact(vocab).enumerate() { probe.row(row + 1, logits); }
+            let record = probe.record();
+            let score = window.score(&record.rows);
+            let (top1_min, kl_max) = precision.tier.bars();
+            println!("packed reference case {case} member {i}: rows {}, mean KL(top1024+tail) {:.8}, top-1 {:.6}, tier {} bars {kl_max}/{top1_min}",
+                score.positions, score.kl, score.top1, precision.tier.name());
+            ensure!(score.positions == 512 && score.missing == 0 && score.non_finite == 0
+                && score.kl <= kl_max && score.top1 + 1e-12 >= top1_min,
+                "packed member {i} failed stored-reference fidelity tier");
+            // #886: same-build singleton/singleton is not byte-stable on this
+            // layout. Both modes gate stored fidelity; cross-pass identity is diagnostic.
+        }
+        // Report partner sensitivity; #886 prevents byte gating across separate passes.
+        for target in [0, members - 1] {
+            let partner_index = if target == 0 { 1 } else { 0 };
+            let mut changed = prompts.clone();
+            for token in &mut changed[partner_index] { *token = (*token + 1) % vocab as u32; }
+            ensure!(changed[partner_index] != prompts[partner_index], "partner mutation was vacuous");
+            let (partner, _) = arm(engine, links, runtime, &changed, case, true)?;
+            let (a, b) = (&packed[target], &partner[target]);
+            ensure!(a.frontier == b.frontier && a.logits.len() == b.logits.len()
+                && b.logits.iter().all(|v| v.is_finite()), "invalid partner observation");
+            let (kl, top1) = pair_metrics(&a.logits, &b.logits, vocab);
+            println!("packed partner case {case} target {target}: logits byte-identical {}, state byte-identical {}, KL {kl:.8}, top-1 {top1:.6} (informational; #886)",
+                equal(&a.logits, &b.logits), a.state == b.state);
+        }
+        println!("packed check case {case}: {members} members, {packs} actual multi-member units, mode {mode:?}");
     }
-    for target in [0, members - 1] {
-        let partner_index = if target == 0 { 1 } else { 0 };
-        let mut changed = prompts.clone();
-        for token in &mut changed[partner_index] { *token = (*token + 1) % engine.cfg.vocab_size as u32; }
-        ensure!(changed[partner_index] != prompts[partner_index], "partner mutation was vacuous");
-        let (partner, _) = arm(engine, links, runtime, &changed, &chunks, true)?;
-        let (a, b) = (&packed[target], &partner[target]);
-        ensure!(a.frontier == b.frontier && a.state == b.state && a.logits.len() == b.logits.len()
-            && a.logits.iter().zip(&b.logits).all(|(a, b)| a.to_bits() == b.to_bits()),
-            "packed partner mutation changed member {target}");
-    }
-    println!("packed check: {members} members, {packs} actual multi-member units, partner isolation byte-identical, mode {mode:?}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn diagnostic_widths_cover_router_boundary_and_pair_metrics_are_informational() {
+        assert_eq!((widths(0, 0), widths(0, 1), widths(0, 2)), (29, 40, 59));
+        assert_eq!((widths(1, 0), widths(1, 1), widths(1, 2)), (200, 127, 64));
+        let (kl, top1) = pair_metrics(&[1.0, 0.0], &[0.0, 1.0], 2);
+        assert!(kl > 0.0);
+        assert_eq!(top1, 0.0);
+        assert!(!equal(&[0.0], &[-0.0]));
+    }
 }

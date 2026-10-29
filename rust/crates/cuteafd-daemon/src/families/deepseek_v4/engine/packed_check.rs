@@ -6,6 +6,41 @@ use crate::shared::prefill_pipeline::{self, FfnRoute, PrefillHooks, Unit};
 fn limits() -> Limits { Limits { rows: 256, chunk_rows: 256, max_context: 4096, taps: Some(TAP_ROWS) } }
 
 #[test]
+fn serving_keeps_one_terminal_head_row_without_diagnostic_callback() {
+    for rows in [1, 29, 64, 127, 200, 2752] {
+        assert_eq!(super::packing::serving_head_rows(rows), 1);
+    }
+    let source = include_str!("packing.rs");
+    let serving = source.split("pub(crate) fn prefill_packed_check").next().unwrap();
+    assert!(serving.contains("self.prefill_packed_inner(sequences, links, prompt_ends, on_logits, None)"));
+    assert!(!include_str!("../serve.rs").contains("prefill_packed_check"));
+}
+
+#[test]
+fn exact_inventory_caps_total_rows_and_preserves_large_singletons() -> Result<()> {
+    use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    for split in [None, Some("dsv4f_tp2")] {
+        for context in [false, true] {
+            let inventory = super::packing::coordinator_inventory("dsv4f", split, 256, context)?;
+            for suffix in ["router_scores", "expert_input_quant", "mhc_post_pre_m256", "shared_ffn_m256", "mhc_post"] {
+                assert!(inventory.contains(&(format!("dsv4f_{suffix}"), PackedRows)));
+            }
+            assert!(inventory.contains(&("dsv4f_index_producer_m256".into(), SequenceLocal)));
+            assert_eq!(inventory.iter().filter(|(_, role)| *role == PackedRows).count(), 5 + usize::from(split.is_some()));
+        }
+    }
+    // Simulate a loaded router's attested first route ending at 64 rows. The
+    // 200-row partner must stay whole and cannot pull a short member past it.
+    let chunks = [(0, 29), (0, 200), (301, 40), (127, 24)];
+    let limits = Limits { rows: 64, taps: None, ..limits() };
+    let groups = prefill_packing::groups(chunks.len(), |r| prefill_packing::plan(&chunks[r], &limits).is_ok());
+    assert_eq!(groups, vec![0..1, 1..2, 2..4]);
+    assert_eq!(chunks[1].1, 200);
+    assert!(prefill_packing::plan(&chunks[..2], &Limits { rows: 256, ..limits }).is_ok());
+    Ok(())
+}
+
+#[test]
 fn packed_members_keep_singleton_tables_and_disjoint_state() -> Result<()> {
     let shape = PoolShape::new(3, 256, 48);
     let chunks = [(0, 29), (301, 40), (127, 59)];
