@@ -25,7 +25,7 @@ enhanced build.
 
 | Who | Does | Doesn't |
 |---|---|---|
-| **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `work/p0`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
+| **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `dev`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
 | **Codex Sol 6.1** | The workhorse: kernels, ports, measurements, A/B campaigns, release builds and smoke matrices, investigations | Merging, tagging, pushing images, changing defaults without passing gates |
 | **Astra 6** (`high`) | Kernel duels and targeted judgment calls, always tightly scoped (expensive): new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Open-ended tasks, simple kernels, investigation, probes, harnesses, integration, gates (Sol does these) |
 | **DeepSeek 4.1 Flash** | Fast mechanical work and kernel duels: renames, refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts, duel rounds against Sol or Gemini | Judgment calls, numerics outside a duel's bitwise gate |
@@ -111,10 +111,10 @@ build and cleanup contract. Two commands cover most briefs; paste them:
 # A/B two commits on cards: builds both arms, preflights on the CPU, queues fairly,
 # interleaves, and writes summary.md (before -> after per card and metric, first real error).
 python3 scripts/bench/wip-cards.py --kit gate --interleave --repeats 1 --cards qwen38-exl3-min \
-  --arm base=<task>-b:<slot> --arm cand=<task>-c:<slot> --build base=origin/work/p0 --build cand=HEAD \
+  --arm base=<task>-b:<slot> --arm cand=<task>-c:<slot> --build base=origin/dev --build cand=HEAD \
   --panels baseline --levels 1,16 --post-load-c1 --trace --binary <cuteafd built from HEAD> --task <task>
 # CPU gate: cargo + script suite, verdict from parsed summaries, optional new-failure diff against a base.
-scripts/dev/cpu-gate --task <task> [--cargo] [--scripts] [--skip-live-planners] [--base origin/work/p0]
+scripts/dev/cpu-gate --task <task> [--cargo] [--scripts] [--skip-live-planners] [--base origin/dev]
 ```
 
 Same build, two configurations: `--arm-wip` both arms to one sealed WIP
@@ -157,7 +157,7 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
 The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 
-1. **Branch and base:** `work/<task>` off `origin/work/p0`, in a worktree
+1. **Branch and base:** `work/<task>` off `origin/dev`, in a worktree
    under `~/Developer/cute-worktrees/<name>`, outside the repo. New CuteAFD
    and SparkInfer worktrees both go in this folder, not directly in
    `~/Developer`; use distinct names such as `cuteafd-<task>` and
@@ -185,7 +185,7 @@ checkout (SparkInfer branches use that fork's base, not CuteAFD's):
 
 ```sh
 mkdir -p ~/Developer/cute-worktrees
-git -C ~/Developer/cuteafd worktree add ~/Developer/cute-worktrees/cuteafd-<task> -b work/<task> origin/work/p0
+git -C ~/Developer/cuteafd worktree add ~/Developer/cute-worktrees/cuteafd-<task> -b work/<task> origin/dev
 git -C ~/Developer/sparkinfer-glmrt worktree add ~/Developer/cute-worktrees/sparkinfer-<task> -b work/<task> origin/master
 ```
 
@@ -335,7 +335,7 @@ patterns:
 
 The same gates and rules apply as for every agent: no tooling extensions, no
 sudo, no power changes, the fair queue for hardware, public-text hygiene. An
-external agent never merges, and never pushes to work/p0 or the fork's master.
+external agent never merges, and never pushes to dev or the fork's master.
 Compact the scorecard log into its summary table every ~10 entries, and
 update this section's table as the picture firms up.
 
@@ -450,15 +450,15 @@ These apply to every agent and are also in `AGENTS.md`.
 ## Reviewing and merging
 
 1. Read the report, then check the branch: `git merge-base --is-ancestor
-   origin/work/p0 origin/<branch>` and `git diff --stat origin/work/p0...origin/<branch>`.
+   origin/dev origin/<branch>` and `git diff --stat origin/dev...origin/<branch>`.
 2. Merge in a temporary worktree. On conflicts, keep both sides' intent; if
    an agent wrote the branch and the conflict is substantial, send it back to
-   that agent to merge `origin/work/p0` and re-verify.
+   that agent to merge `origin/dev` and re-verify.
 3. Check launcher keys: every key `run-family.sh` reads must be in
    `release_known_key` (`scripts/lib/release-common.sh`).
 4. Tests: `cargo test --workspace`, and compare failing script-test ids
-   against `origin/work/p0` (add none).
-5. Push to `work/p0` (fast-forward when possible).
+   against `origin/dev` (add none).
+5. Push to `dev` (fast-forward when possible).
 6. Override a conservative call when the measurements justify it, and record
    the reason in the commit (e.g. the V4.1 FP8 vocabulary head default).
 

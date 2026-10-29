@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-BASE = 'origin/work/p0'
+BASE = 'origin/dev'
 
 
 def git(root, *args, check=True):
