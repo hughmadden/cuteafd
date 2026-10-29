@@ -100,6 +100,9 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    for geometry in ("mimo", "mimof"):
+        result.append((f"routed-{geometry}-row-addresses", "package_fp8_moe_aot.py",
+                       ["--geometry", geometry, "--capacities", "2752", "--layouts", "tp2", "--row-addresses"]))
     result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
@@ -249,21 +252,27 @@ def export_routed(extra, output):
             if base.weights == "mxfp4" and tp == 6:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(
                     set(package.exact_widths(base.intermediate, tp, 32)), reverse=True)]
+    indirect = "--row-addresses" in extra
+    if indirect:
+        from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     records = []
     for layout in layouts:
         _, g = package.layout_geometry(base, layout)
         forms = [(rows, "auto") for rows in capacities]
-        forms += [(rows, form) for rows in capacities for form in prefill_forms(g, rows, False)]
+        forms += [(rows, form) for rows in capacities for form in prefill_forms(g, rows, indirect)]
         for rows, form in forms:
             stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
             with exportable_compilation():
-                program = compile_fp8_moe_aot(g, route="auto", max_rows=rows, wire=False, prefill=form)
+                program = compile_fp8_moe_aot(g, route="stream" if indirect else "auto",
+                    max_rows=package.SEGMENT_MAX_ROWS if indirect else rows, wire=indirect, prefill=form,
+                    **({"row_addresses": True} if indirect else {}))
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
                 raise ValueError(f"{stem}: unexpected routed expert ABI")
             records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
-                            "scratch_bytes": fp8_moe_scratch_bytes(g, "auto", rows, False, form)})
+                            "scratch_bytes": (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
+                                              if indirect else fp8_moe_scratch_bytes(g, "auto", rows, False, form))})
             print(f"exported {stem}", flush=True)
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 

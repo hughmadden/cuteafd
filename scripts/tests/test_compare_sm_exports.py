@@ -748,3 +748,56 @@ def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_p
     context_file.write_text(json.dumps(context))
     with pytest.raises(ValueError, match="toolchain"):
         compare_sm.compare(left, right, source_comparison=True)
+
+
+def test_indirect_fp8_and_mxfp4_streams_are_in_the_sm_gate():
+    cases = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    for geometry in ("mimo", "mimof"):
+        exporter, args = cases[f"routed-{geometry}-row-addresses"]
+        assert exporter == "package_fp8_moe_aot.py"
+        assert "--row-addresses" in args
+        assert args[args.index("--capacities") + 1] == "2752"
+    ordinary = cases["routed-mimo"][1]
+    assert "--row-addresses" not in ordinary
+
+
+@pytest.mark.parametrize("indirect", [False, True])
+def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
+    from contextlib import nullcontext
+
+    geometry = SimpleNamespace()
+    calls = []
+    program = SimpleNamespace(export_to_c=lambda *args: None)
+
+    # This signature matches a baseline fork without the segmented API.
+    def ordinary_compile(g, *, route, max_rows, wire, prefill):
+        calls.append((g, route, max_rows, wire, prefill))
+        return program
+
+    def segment_compile(g, *, route, max_rows, wire, prefill, row_addresses):
+        assert row_addresses is True
+        return ordinary_compile(g, route=route, max_rows=max_rows, wire=wire, prefill=prefill)
+
+    module = SimpleNamespace(
+        GEOMETRIES={"mimo": geometry},
+        compile_fp8_moe_aot=segment_compile if indirect else ordinary_compile,
+        fp8_moe_scratch_bytes=lambda *args: 64,
+        prefill_forms=lambda *args: [],
+    )
+    if indirect:
+        module.fp8_moe_segment_scratch_bytes = lambda *args: 128
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
+        exportable_compilation=nullcontext,
+        validate_exported_header=lambda *args: {"argument_count": 13},
+    ))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
+    monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
+        layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+    ))
+    args = ["--geometry", "mimo", "--capacities", "2752"]
+    compare_sm.export_routed(args + (["--row-addresses"] if indirect else []), tmp_path)
+    assert calls == [(geometry, "stream" if indirect else "auto", 16384 if indirect else 2752,
+                      indirect, "auto")]
+    records = json.loads((tmp_path / "routed.json").read_text())["programs"]
+    assert len(records) == 1
+    assert records[0]["scratch_bytes"] == (128 if indirect else 64)

@@ -19,6 +19,7 @@ static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
 static int queued_experts;
 static int queue_expert(void **ptrs, int rows, void *stream);
+static int queue_segment_expert(void **ptrs, int rows, void *stream);
 void fixture_configure_queued_experts(void) { queued_experts = 1; }
 
 void fixture_configure_immediate_copies(void) { immediate_copies = 1; }
@@ -110,6 +111,8 @@ int cuteafd_v41_markov_destroy(void *head) { free(head); return 0; }
  * buffers but never launch expert math. Each loaded module caches these words. */
 static uint32_t fp8_words[16];
 static uint64_t fp8_scratch[6];
+static int fp8_segments;
+void fixture_configure_fp8_segments(void) { fp8_segments = 1; }
 void fixture_configure_fp8(const uint32_t *words, const uint64_t *scratch) {
     memcpy(fp8_words, words, sizeof(fp8_words));
     memcpy(fp8_scratch, scratch, sizeof(fp8_scratch));
@@ -129,6 +132,28 @@ int cuteafd_fp8moe_launch(void *ctx, uint32_t capacity, void **ptrs, int rows, v
     (void)ctx; (void)capacity;
     if (queued_experts) return queue_expert(ptrs, rows, stream);
     return 1; /* Ordinary lifetime tests never launch expert math. */
+}
+int cuteafd_fp8moe_segment_info(uint32_t form, uint32_t *maximum, uint32_t *minimum, uint32_t *act) {
+    if (form > 2) return 1;
+    *maximum = fp8_segments ? 16384 : 0;
+    *minimum = fp8_segments ? 769 : 0;
+    *act = fp8_segments ? 2 * fp8_words[2] : 0; return 0;
+}
+int cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t *bytes) {
+    if (!fp8_segments || !rows || rows > 16384) return 1;
+    uint64_t pairs = (uint64_t)rows * fp8_words[4], bound = 16384ull * fp8_words[4];
+    uint64_t experts = fp8_words[3];
+    uint64_t tiles = (pairs + 127) / 128 + (pairs < experts ? pairs : experts);
+    uint64_t max_tiles = (bound + 127) / 128 + (bound < experts ? bound : experts);
+    uint64_t regions[] = {4 * (4 + 3 * experts + max_tiles), 4 * pairs, 4 * pairs,
+        tiles * 128 * 2 * fp8_words[2], pairs * fp8_words[1] * 2};
+    *bytes = 0;
+    for (size_t i = 0; i < 5; ++i) *bytes += (regions[i] + 1023) / 1024 * 1024;
+    return 0;
+}
+int cuteafd_fp8moe_launch_segments(void *ctx, void **ptrs, int rows, void *stream) {
+    (void)ctx;
+    return queued_experts && fp8_segments ? queue_segment_expert(ptrs, rows, stream) : 1;
 }
 void cuteafd_fp8moe_destroy(void *ctx) { free(ctx); }
 
@@ -250,6 +275,12 @@ static int queue_expert(void **ptrs, int rows, void *stream) {
     memcpy(op.ptrs, ptrs, sizeof(op.ptrs));
     return enqueue(op);
 }
+static int queue_segment_expert(void **ptrs, int rows, void *stream) {
+    struct queued_op op = { .kind = 2, .stream = stream, .rows = (size_t)rows,
+        .hidden = fp8_words[1], .topk = fp8_words[4] };
+    memcpy(op.ptrs, ptrs, sizeof(op.ptrs));
+    return enqueue(op);
+}
 static void advance_queue(size_t until) {
     while (queued_done < until) {
         struct queued_op *op = &queued_ops[queued_done++];
@@ -264,13 +295,17 @@ static void advance_queue(size_t until) {
             const uint8_t *input = op->ptrs[0];
             size_t stride = op->hidden + op->hidden / 32;
             for (size_t row = 0; row < op->rows; ++row) {
-                uint16_t value = input[row * stride];
+                const uint8_t *row_input = op->kind == 2
+                    ? (const uint8_t *)(uintptr_t)((const uint64_t *)input)[row] : input + row * stride;
+                uint16_t *row_out = op->kind == 2
+                    ? (uint16_t *)(uintptr_t)((const uint64_t *)out)[row] : out + row * op->hidden;
+                uint16_t value = row_input[0];
                 for (size_t route = 0; route < op->topk; ++route) {
                     size_t at = row * op->topk + route;
                     value += (uint16_t)((ids[at] + 1) * (int)gates[at]);
                 }
                 for (size_t col = 0; col < op->hidden; ++col)
-                    out[row * op->hidden + col] = value;
+                    row_out[col] = value;
             }
         }
     }

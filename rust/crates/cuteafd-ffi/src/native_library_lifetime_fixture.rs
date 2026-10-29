@@ -121,6 +121,15 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn configure_fp8_segments(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this CPU-only fixture export toggles its static segment metadata.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_configure_fp8_segments")?;
+            configure();
+        }
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<NativeLibrary> {
         // SAFETY: this test just compiled the fixture with the native ABI.
         let library = unsafe { NativeLibrary::load(&self.module)? };

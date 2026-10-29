@@ -2,6 +2,12 @@
 //! Spark expert service. One process serves one model, so the geometry is a
 //! process-wide value fixed at startup; it defaults to DeepSeek V4.1 so every
 //! V4.1 path (and its tests) behaves exactly as before.
+/// Request metadata is followed by zero padding so mapped payloads support
+/// native 16-byte vector loads, independent of row and route counts.
+pub fn expert_request_payload_offset(header: usize, row_bytes: usize, route_bytes: usize) -> Option<usize> {
+    header.checked_add(row_bytes)?.checked_add(route_bytes)?.checked_add(15).map(|n| n & !15)
+}
+
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
@@ -280,7 +286,9 @@ impl ExpertGeometry {
     pub fn compact_wire_bytes(&self, capacity: u32, bf16: bool) -> Option<(usize, usize)> {
         let rows = capacity as usize;
         let hidden = self.hidden as usize;
-        let request = rows.checked_mul(40 + self.topk as usize * 12 + if bf16 { hidden * 2 } else { hidden + hidden / 32 })?.checked_add(96)?;
+        let prefix = expert_request_payload_offset(96, rows.checked_mul(40)?,
+            rows.checked_mul(self.topk as usize)?.checked_mul(12)?)?;
+        let request = prefix.checked_add(rows.checked_mul(if bf16 { hidden * 2 } else { hidden + hidden / 32 })?)?;
         let response = rows.checked_mul(4 + hidden * 2)?.checked_add(96)?;
         Some((request, response))
     }
@@ -441,6 +449,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn odd_request_capacity_charges_padding_before_ring_alignment() {
+        for geometry in [ExpertGeometry::MIMO_V2_FLASH, ExpertGeometry::DEEPSEEK_V41,
+            ExpertGeometry::GLM5, ExpertGeometry::KIMI_K3] {
+            for rows in [1u32, 3, 2487, 2752] {
+                for bf16 in [false, true] {
+                    let n = rows as usize;
+                    let raw_prefix = 96 + n * (40 + geometry.topk as usize * 12);
+                    let padding = (16 - raw_prefix % 16) % 16;
+                    let (request, response) = geometry.compact_wire_bytes(rows, bf16).unwrap();
+                    let stride = if bf16 { geometry.hidden as usize * 2 }
+                        else { geometry.hidden as usize * 33 / 32 };
+                    assert_eq!(request, raw_prefix + padding + n * stride);
+                    // Alignment=1 exposes the exact padding charge, not just page rounding.
+                    assert_eq!(geometry.compact_ring_bytes(rows, 64 << 20, 3, 1, 1, 2, bf16),
+                        Some((request + response) * 3 * 2));
+                    let page = |bytes: usize| (bytes + 4095) / 4096 * 4096;
+                    assert_eq!(geometry.compact_ring_bytes(rows, 64 << 20, 3, 1, 4096, 2, bf16),
+                        Some((page(request) + page(response)) * 3 * 2));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn endpoint_ring_depth_resolves_default_and_rejects_invalid_depths() {
         let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None };
         let geometry = ExpertGeometry::DEEPSEEK_V41;
@@ -547,7 +579,7 @@ mod tests {
         assert_eq!(kimi.slice(6), Some(512));
         // Latent rows: BF16 ingress is sized from 3584, not the 7168 residual.
         assert_eq!(kimi.row_bytes(), 7168);
-        assert_eq!(kimi.compact_wire_bytes(1, true), Some((40 + 16 * 12 + 3584 * 2 + 96, 4 + 3584 * 2 + 96)));
+        assert_eq!(kimi.compact_wire_bytes(1, true), Some((336 + 3584 * 2, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
     }
 }

@@ -1,5 +1,5 @@
 //! Native GPU resources and inference QPs share one owning thread.
-mod local;
+pub(super) mod local;
 mod backend;
 mod census;
 mod modules;
@@ -177,7 +177,7 @@ fn load_weights<'a>(
     );
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
-    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows| {
+    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, _| {
         let budget = ExpertWeights::plan_execution(config.selection(0)?, library,
             compiled, live, nvfp4)?;
         let device = budget.total()?;
@@ -402,13 +402,13 @@ fn spark_runtime_headroom() -> Result<usize> {
 /// Query installed packages at each owner's live/export extent. The tuple is
 /// device scratch, stream-ordered device I/O and pinned staging per queued unit.
 fn spark_execution_workspace(config: &NativeExpertServiceConfig,
-    mut plan: impl FnMut(u32, u32, u32) -> Result<(usize, usize, usize)>)
+    mut plan: impl FnMut(u32, u32, u32, cuteafd_core::OwnerExtent) -> Result<(usize, usize, usize)>)
     -> Result<cuteafd_core::expert_geometry::SparkWorkspaceBytes> {
     let executions = &config.model_admission.as_ref()
         .context("Spark workspace requires typed execution admission")?.executions;
     executions.validate()?;
     executions.workspace_bytes(|extent| {
-        let (scratch, io, pinned) = plan(extent.capacity, extent.compiled, extent.staging_rows)?;
+        let (scratch, io, pinned) = plan(extent.capacity, extent.compiled, extent.staging_rows, extent)?;
         Ok::<_, anyhow::Error>(cuteafd_core::OwnerBytes { scratch: u64::try_from(scratch)?,
             io: u64::try_from(io)?, pinned_staging: u64::try_from(pinned)? })
     })?.context("Spark execution workspace overflow")
@@ -979,7 +979,7 @@ mod tests {
         model.executions = cuteafd_core::SparkExecutions::admit(&[64, 80], 4096, 2752, 3,
             &[1, 80, 4096])?;
         let mut queried = Vec::new();
-        let workspace = spark_execution_workspace(&config, |live, compiled, staging_rows| {
+        let workspace = spark_execution_workspace(&config, |live, compiled, staging_rows, _| {
             queried.push((live, compiled, staging_rows));
             Ok((compiled as usize * 10, live as usize * 2, staging_rows as usize * 8))
         })?;
@@ -1088,7 +1088,7 @@ mod tests {
                 assert_eq!(budget.exchange, actual);
                 assert_eq!(budget.row_indices, indices.capacity() * std::mem::size_of::<u32>());
                 let mut extents = Vec::new();
-                spark_execution_workspace(&config, |live, compiled, staging| {
+                spark_execution_workspace(&config, |live, compiled, staging, _| {
                     extents.push((live, compiled, staging));
                     Ok((compiled as usize, live as usize, staging as usize))
                 })?;

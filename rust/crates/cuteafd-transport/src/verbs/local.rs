@@ -787,6 +787,29 @@ impl LocalVerbsExpertConnection {
     /// [`Self::finish_deferred`]; their request and response slots stay held.
     pub fn deferred(&self) -> usize { self.deferred.len() }
 
+    /// Preflight for extra/staged intake only. With exclusive connection access,
+    /// a free response slot cannot become occupied before `begin_deferred`.
+    /// Unlike its ordinary reservation path, this never waits for a SEND CQE.
+    pub fn try_deferred_capacity(&mut self, limit: usize) -> Result<bool> {
+        let held = self.deferred.len();
+        if !deferred_admits(held, limit, self.request_ring.depth, self.response_ring.depth) {
+            tracing::debug!(target: "cuteafd::spark_coalesce", held, limit,
+                request_depth = self.request_ring.depth, response_depth = self.response_ring.depth,
+                reason = "deferred_or_ring_full", "Spark intake capacity unavailable");
+            return Ok(false);
+        }
+        let available = self.response_sends.try_slot(self.response_ring.depth, held, |posted| {
+            let stats = self.endpoint.try_poll(u32::try_from(posted)?, 0)?;
+            anyhow::ensure!(stats.recv_completions == 0, "reply send poll consumed a request");
+            Ok(stats.send_completions as usize)
+        })?;
+        if !available {
+            tracing::debug!(target: "cuteafd::spark_coalesce", held,
+                reason = "send_ring_full", "Spark intake capacity unavailable");
+        }
+        Ok(available)
+    }
+
     /// Receive at most one request and hand it to `launch`, which may leave GPU
     /// work queued on the mapped request and response slots. The request slot
     /// is not reposted and no response is sent until [`Self::finish_deferred`]

@@ -32,7 +32,8 @@ pub struct PrefillExecution {
     /// landing and reply staging are sized here, and prefill requests are
     /// bounded here.
     pub unit_rows: u32,
-    /// Retained in-flight I/O units (k); this does not multiply scratch or streams.
+    /// Retained in-flight I/O units (k); one stream/scratch owner. Eligible
+    /// segmented recipes size that arena at the admitted sum, not k arenas.
     pub buffered_units: u8,
 }
 
@@ -51,7 +52,7 @@ pub struct SparkExecutions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionOwner { Decode(usize), Prefill }
 
-/// One owner's extents for workspace accounting: scratch at `compiled`,
+/// One owner's extents for workspace accounting: singleton scratch at `compiled`,
 /// stream-ordered device I/O at `capacity`, and pinned route staging of
 /// `staging_rows` retained for each of `buffered_units` queued units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,47 @@ pub struct OwnerExtent {
     pub compiled: u32,
     pub staging_rows: u32,
     pub buffered_units: u8,
+}
+
+/// Segmented code can address four full wire units; allocations use only the
+/// admitted row sum, independently of this compile-time metadata bound.
+pub const SEGMENT_MAX_ROWS: u32 = 4 * 4096;
+
+impl OwnerExtent {
+    pub fn segment_rows(self) -> Option<u32> {
+        match self.owner {
+            ExecutionOwner::Prefill if self.buffered_units > 1 =>
+                self.staging_rows.checked_mul(u32::from(self.buffered_units))
+                    .filter(|&rows| rows <= SEGMENT_MAX_ROWS),
+            _ => None,
+        }
+    }
+}
+
+/// Device inputs for a segmented owner. BF16 fallback readers retain a separate
+/// plane: an asynchronous wire copy must never overwrite their pending reads.
+pub fn segment_input_bytes(capacity: u32, rows: u32, hidden: u32, bf16_sibling: bool) -> Option<u64> {
+    let wire = u64::from(rows).checked_mul(u64::from(hidden) + u64::from(hidden) / 32)?;
+    if bf16_sibling { wire.checked_add(u64::from(capacity) * u64::from(hidden) * 2) }
+    else { Some(wire.max(u64::from(capacity) * (u64::from(hidden) + u64::from(hidden) / 32))) }
+}
+
+/// Exact streamed intermediate arena with the compiled tile-table offset.
+/// `act_row_bytes` is installed recipe metadata (BF16 or MXFP8 down input).
+/// This does not include row descriptors, wire frames or singleton scratch.
+pub fn segment_scratch_bytes(hidden: u32, experts: u32, topk: u32, act_row_bytes: u32,
+    rows: u32, maximum: u32) -> Option<u64> {
+    if hidden == 0 || experts == 0 || topk == 0 || act_row_bytes == 0
+        || rows == 0 || rows > maximum || maximum > SEGMENT_MAX_ROWS { return None; }
+    let align = |n: u64| n.checked_add(1023).map(|n| n / 1024 * 1024);
+    let tiles = |p: u64| p.div_ceil(128) + u64::from(experts).min(p);
+    let pairs = u64::from(rows) * u64::from(topk);
+    let bound = u64::from(maximum) * u64::from(topk);
+    let meta = align((4 + 3 * u64::from(experts) + tiles(bound)).checked_mul(4)?)?;
+    let routes = align(pairs.checked_mul(4)?)?.checked_mul(2)?;
+    let act = align(tiles(pairs).checked_mul(128)?.checked_mul(u64::from(act_row_bytes))?)?;
+    let output = align(pairs.checked_mul(u64::from(hidden))?.checked_mul(2)?)?;
+    meta.checked_add(routes)?.checked_add(act)?.checked_add(output)
 }
 
 /// Bytes one owner holds at its extents, from the planner's census or the
@@ -194,6 +236,19 @@ mod tests {
     const LADDER: [u32; 8] = crate::EXL3_CAPACITIES;
 
     #[test]
+    fn segmented_allocation_uses_live_sum_and_keeps_decode_unchanged() {
+        let plan = SparkExecutions::admit(&[64], 4096, 2752, 3, &LADDER).unwrap();
+        let owners = plan.owners().collect::<Vec<_>>();
+        assert_eq!(owners[0].segment_rows(), None);
+        assert_eq!(owners[1].segment_rows(), Some(8256));
+        let size = |rows| segment_scratch_bytes(4096, 256, 8, 768, rows, SEGMENT_MAX_ROWS).unwrap();
+        assert!(size(8256) < size(SEGMENT_MAX_ROWS));
+        assert_eq!(size(8256), 617_493_504);
+        assert!(segment_scratch_bytes(4096, 256, 8, 768, 16385, SEGMENT_MAX_ROWS).is_none());
+        assert!(segment_scratch_bytes(4096, 256, 8, 768, 0, SEGMENT_MAX_ROWS).is_none());
+    }
+
+    #[test]
     fn admission_takes_covering_exports_from_the_package_ladder() {
         let plan = SparkExecutions::admit(&[64, 80], 4096, 2752, 3, &LADDER).unwrap();
         assert_eq!(plan.decode, [DecodeExecution { capacity: 64, compiled_capacity: 80 },
@@ -266,5 +321,22 @@ mod tests {
         assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::Capacity { owner: "prefill", .. })));
         invalid = plan; invalid.decode.clear();
         assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::DecodeLanes { .. })));
+    }
+}
+
+#[cfg(test)]
+mod segment_input_tests {
+    use super::*;
+    #[test]
+    fn input_planes_charge_admitted_wire_rows_and_keep_bf16_readers_disjoint() {
+        for (capacity, unit, count) in [(4096, 2752, 3), (4096, 769, 3), (1024, 1024, 2)] {
+            let rows = unit * count;
+            let wire = u64::from(rows) * 4224;
+            assert_eq!(segment_input_bytes(capacity, rows, 4096, false),
+                Some(wire.max(u64::from(capacity) * 4224)));
+            let sibling = u64::from(capacity) * 8192;
+            assert_eq!(segment_input_bytes(capacity, rows, 4096, true), Some(sibling + wire));
+            assert!(sibling + wire > sibling.max(wire), "aliasing the BF16 plane would undercharge");
+        }
     }
 }

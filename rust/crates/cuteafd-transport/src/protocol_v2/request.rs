@@ -1,3 +1,4 @@
+use cuteafd_core::expert_geometry::expert_request_payload_offset;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 
@@ -378,6 +379,7 @@ impl ExpertProtocolV2Request {
         for route in &self.routes {
             encode_route_entry(out, route);
         }
+        out.resize(prefix_bytes, 0);
         Ok(())
     }
 
@@ -449,14 +451,19 @@ impl ExpertProtocolV2Request {
 
         let rows_start = header_len;
         let routes_start = rows_start + row_descriptor_bytes_usize;
-        let payload_start = routes_start + route_bytes_usize;
-        let frame_end = payload_start + hidden_payload_bytes_usize;
+        let routes_end = routes_start + route_bytes_usize;
+        let payload_start = expert_request_payload_offset(header_len, row_descriptor_bytes_usize, route_bytes_usize)
+            .context("request metadata extent overflow")?;
+        let frame_end = payload_start.checked_add(hidden_payload_bytes_usize)
+            .context("request frame extent overflow")?;
         if frame_end != bytes.len() {
             bail!(
                 "ExpertProtocolV2 request length mismatch: sections end at {frame_end}, frame has {}",
                 bytes.len()
             );
         }
+        anyhow::ensure!(bytes[routes_end..payload_start].iter().all(|&byte| byte == 0),
+            "request alignment padding must be zero");
 
         let rows = (0..rows_len)
             .map(|idx| {
@@ -509,10 +516,10 @@ impl ExpertProtocolV2Request {
     pub fn wire_stats(&self) -> ExpertProtocolV2WireStats {
         ExpertProtocolV2WireStats {
             logical_payload_bytes: self.hidden_payload.len(),
-            wire_bytes: self.header_len()
-                + self.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
-                + self.routes.len() * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN
-                + self.hidden_payload.len(),
+            wire_bytes: expert_request_payload_offset(self.header_len(),
+                self.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
+                self.routes.len() * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN)
+                .expect("validated request metadata") + self.hidden_payload.len(),
         }
     }
 

@@ -132,6 +132,8 @@ impl Fp8MoeInfo {
 }
 
 type Launch = unsafe extern "C" fn(*mut c_void, u32, *const *mut c_void, i32, *mut c_void) -> i32;
+type LaunchSegments = unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32, *mut c_void) -> i32;
+type SegmentInfo = unsafe extern "C" fn(u32, *mut u32, *mut u32, *mut u32) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
 type SetOptions = unsafe extern "C" fn(*mut c_void, u32) -> i32;
@@ -200,6 +202,8 @@ pub struct Fp8MoeModule {
     info: Fp8MoeInfo,
     scratch: Vec<usize>,
     launch: Launch,
+    launch_segments: LaunchSegments,
+    segments: Vec<Fp8MoeSegment>,
     destroy: Destroy,
     set_options: Option<SetOptions>,
     weight_read_group: Option<WeightReadGroup>,
@@ -214,6 +218,25 @@ pub struct Fp8MoeModule {
 pub struct Fp8MoeMetadata {
     pub info: Fp8MoeInfo,
     scratch: Vec<usize>,
+    pub segments: Vec<Fp8MoeSegment>,
+}
+
+/// One installed wide-stream arithmetic recipe. Only constituent units at
+/// least `minimum_rows` may join; grouping cannot promote a decode tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fp8MoeSegment {
+    pub form: Fp8MoePrefill,
+    pub maximum_rows: u32,
+    pub minimum_rows: u32,
+    pub act_row_bytes: u32,
+}
+
+fn segment_scratch(info: &Fp8MoeInfo, segments: &[Fp8MoeSegment], rows: u32) -> Result<usize> {
+    segments.iter().map(|segment| {
+        cuteafd_core::spark_executions::segment_scratch_bytes(info.hidden.try_into()?, info.experts.try_into()?,
+            info.topk.try_into()?, segment.act_row_bytes, rows, segment.maximum_rows)
+            .context("invalid segmented scratch extent").and_then(|bytes| Ok(usize::try_from(bytes)?))
+    }).collect::<Result<Vec<_>>>()?.into_iter().max().context("package has no segmented stream")
 }
 
 /// Exact scratch retained by one execution slot, from the package's static ABI.
@@ -271,14 +294,43 @@ impl Fp8MoeMetadata {
         // SAFETY: the query fills at most sixteen live words.
         ensure!(unsafe { query(words.as_mut_ptr(), 16) } == 0,
             "FP8 expert package info query failed");
-        Self::from_words_and_scratch(words, |capacity| {
+        let mut metadata = Self::from_words_and_scratch(words, |capacity| {
             let mut bytes = 0u64;
             // SAFETY: capacity came from the validated package info and
             // the scratch query writes exactly one live u64.
             ensure!(unsafe { scratch_bytes(capacity as u32, &mut bytes) } == 0,
                 "FP8 expert scratch query failed");
             Ok(bytes)
-        })
+        })?;
+        // SAFETY: static queries from the trusted library write only supplied scalars.
+        let (segment_info, segment_bytes) = unsafe {
+            (*library.get::<SegmentInfo>(b"cuteafd_fp8moe_segment_info")?,
+             *library.get::<Scratch>(b"cuteafd_fp8moe_segment_scratch_bytes")?)
+        };
+        for form in [Fp8MoePrefill::Auto, Fp8MoePrefill::W8a16, Fp8MoePrefill::W8a8] {
+            let (mut maximum, mut minimum, mut act_row_bytes) = (0, 0, 0);
+            // SAFETY: the query writes three live u32 values and performs no GPU work.
+            ensure!(unsafe { segment_info(form.option(), &mut maximum, &mut minimum, &mut act_row_bytes) } == 0,
+                "FP8 segment info query failed");
+            if maximum == 0 { continue; }
+            ensure!(metadata.info.wire_input && matches!(metadata.info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4)
+                && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
+                && minimum > 0 && minimum <= 4096 && act_row_bytes > 0,
+                "invalid segmented stream metadata");
+            metadata.segments.push(Fp8MoeSegment { form, maximum_rows: maximum, minimum_rows: minimum, act_row_bytes });
+        }
+        if !metadata.segments.is_empty() {
+            ensure!(metadata.segments.len() == 3, "segmented package must describe every arithmetic form");
+            for rows in [1u32, 4096, 8256, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS] {
+                let mut bytes = 0u64;
+                // SAFETY: the static query writes one live u64; no allocation or CUDA work.
+                ensure!(unsafe { segment_bytes(rows, &mut bytes) } == 0,
+                    "FP8 segmented scratch query failed");
+                ensure!(u64::try_from(metadata.segment_scratch_bytes(rows)?)? == bytes,
+                    "FP8 installed segmented scratch disagrees with shared geometry");
+            }
+        }
+        Ok(metadata)
     }
 
     fn from_words_and_scratch(words: [u32; 16], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
@@ -288,7 +340,11 @@ impl Fp8MoeMetadata {
         let scratch = info.capacities.iter().map(|&capacity| {
             usize::try_from(query(capacity)?).context("FP8 expert scratch does not fit this process")
         }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { info, scratch })
+        Ok(Self { info, scratch, segments: Vec::new() })
+    }
+
+    pub fn segment_scratch_bytes(&self, rows: u32) -> Result<usize> {
+        segment_scratch(&self.info, &self.segments, rows)
     }
 
     /// Static `(compiled capacity, scratch bytes)` records for planner/runtime admission.
@@ -319,17 +375,18 @@ impl Fp8MoeModule {
         let metadata = Fp8MoeMetadata::from_library(&library)?;
         let create = *library.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_fp8moe_create")?;
         let launch = *library.get::<Launch>(b"cuteafd_fp8moe_launch")?;
+        let launch_segments = *library.get::<LaunchSegments>(b"cuteafd_fp8moe_launch_segments")?;
         let destroy = *library.get::<Destroy>(b"cuteafd_fp8moe_destroy")?;
         // Packages built before the W8A16 fallback forms have no options.
         let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
         let weight_read_group = library.get::<WeightReadGroup>(b"cuteafd_fp8moe_weight_read_group").ok().map(|f| *f);
         let arithmetic_route = library.get::<ArithmeticRoute>(b"cuteafd_fp8moe_arithmetic_route").ok().map(|f| *f);
-        let Fp8MoeMetadata { info, scratch } = metadata;
+        let Fp8MoeMetadata { info, scratch, segments } = metadata;
         let mut context = std::ptr::null_mut();
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
         let context = NonNull::new(context).context("FP8 expert package returned a null context")?;
-        Ok(Self { _library: library, context, info, scratch, launch, destroy, set_options,
+        Ok(Self { _library: library, context, info, scratch, launch, launch_segments, segments, destroy, set_options,
             weight_read_group, arithmetic_route, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
     }
 
@@ -403,6 +460,33 @@ impl Fp8MoeModule {
         let index = self.info.capacities.iter().position(|&c| c == capacity)
             .with_context(|| format!("FP8 expert package has no capacity {capacity}"))?;
         Ok(self.scratch[index])
+    }
+
+    pub fn segment_minimum_rows(&self) -> Option<u32> {
+        self.segments.iter().map(|segment| segment.minimum_rows).min()
+    }
+
+    pub fn segment_recipe(&self) -> Option<Fp8MoeSegment> {
+        self.segments.iter().find(|segment| segment.form == self.prefill).copied()
+    }
+
+    pub fn segment_scratch_bytes(&self, rows: u32) -> Result<usize> {
+        segment_scratch(&self.info, &self.segments, rows)
+    }
+
+    /// # Safety
+    /// Input/output are device-readable row-address tables, retained with all
+    /// addressed rows and other operands until this stream completes. Tables
+    /// must be populated before launch and scratch sized at the admitted sum.
+    pub unsafe fn launch_segments(&self, pointers: &[*mut c_void; FP8_MOE_POINTERS], rows: usize,
+        stream: *mut c_void) -> Result<()> {
+        let recipe = self.segment_recipe().context("package has no selected segmented recipe")?;
+        ensure!(rows > 0 && rows <= recipe.maximum_rows as usize, "segmented rows exceed code extent");
+        // SAFETY: caller guarantees ordered, live operands; context belongs to this library.
+        let status = unsafe { (self.launch_segments)(self.context.as_ptr(), pointers.as_ptr(),
+            i32::try_from(rows)?, stream) };
+        ensure!(status == 0, "FP8 segmented launch failed ({status})");
+        Ok(())
     }
 
     /// Runs the smallest program holding `rows`.

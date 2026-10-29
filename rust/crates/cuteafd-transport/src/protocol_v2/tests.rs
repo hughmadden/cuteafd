@@ -1607,9 +1607,9 @@ fn expert_hosts() -> Vec<String> {
 }
 
 fn request_payload_offset(request: &ExpertProtocolV2Request) -> usize {
-    request.header_len()
-        + request.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
-        + request.routes.len() * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN
+    cuteafd_core::expert_geometry::expert_request_payload_offset(request.header_len(),
+        request.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
+        request.routes.len() * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN).unwrap()
 }
 
 fn request_payload_ptr<'a>(encoded: &'a [u8], request: &ExpertProtocolV2Request) -> *const u8 {
@@ -1732,5 +1732,60 @@ fn checksummed_frames_never_carry_a_unit_pace() -> Result<()> {
     forged[68..72].copy_from_slice(&flags.to_le_bytes());
     assert!(ExpertProtocolV2Response::decode(&forged).is_err());
     assert!(ExpertProtocolV2ResponseView::parse(&forged).is_err());
+    Ok(())
+}
+
+#[test]
+fn mapped_request_padding_aligns_odd_rows_and_sparse_routes() -> Result<()> {
+    use cuteafd_core::expert_geometry::expert_request_payload_offset;
+    for (rows, topk) in [(1usize, 0usize), (1, 1), (2, 1), (3, 3), (2752, 8), (2688, 8), (2487, 8), (2557, 8)] {
+        for debug in [false, true] {
+            let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor {
+                row_id: row as u64, source_kind: ExpertV2SourceKind::Prefill,
+                source_request_id: 1, token_position: row as u64,
+                route_offset: (row * topk) as u32, route_count: topk as u32 }).collect();
+            let routes = (0..rows).flat_map(|row| (0..topk).map(move |slot| ExpertProtocolV2RouteEntry {
+                row_index: row as u32, expert_id: slot as u32, gate_weight: 1.0 / topk as f32 })).collect();
+            let mut request = ExpertProtocolV2Request::new(1, 1, 1, 4096,
+                ExpertV2Dtype::Fp8E4m3Ue8m0K32, descriptors, routes, vec![0x5a; rows * 4224])?;
+            if debug { request = request.with_debug_checksum(); }
+            let wire = request.encode()?;
+            let raw = request.header_len() + rows * 40 + rows * topk * 12;
+            let offset = expert_request_payload_offset(request.header_len(), rows * 40, rows * topk * 12).unwrap();
+            assert_eq!(offset % 16, 0);
+            assert!(offset - raw < 16);
+            if rows == 2487 { assert_eq!(raw % 16, 8, "old layout reproduces the failing tail"); }
+            assert!(wire[raw..offset].iter().all(|&byte| byte == 0));
+            let view = ExpertProtocolV2RequestView::parse(&wire)?;
+            assert_eq!(view.hidden_payload().as_ptr() as usize - wire.as_ptr() as usize, offset);
+            assert_eq!(view.route_bytes().len(), rows * topk * 12);
+            assert_eq!(view.hidden_payload(), request.hidden_payload.as_ref());
+            assert_eq!(ExpertProtocolV2Request::decode(&wire)?, request);
+            assert_eq!(view.wire_stats(), request.wire_stats());
+            assert_eq!(wire.len(), offset + rows * 4224);
+            let mut forwarded = ExpertProtocolV2FrameBuffer::default();
+            let forwarded = forwarded.encode_regular_forwarded_request(&view, ExpertV2Dtype::Bf16)?;
+            let forwarded_view = ExpertProtocolV2RequestView::parse(forwarded)?;
+            assert_eq!(forwarded_view.hidden_payload(), request.hidden_payload.as_ref());
+            assert_eq!(forwarded_view.hidden_payload().as_ptr() as usize - forwarded.as_ptr() as usize, offset);
+            if topk == 8 {
+                assert_eq!(cuteafd_core::ExpertGeometry::MIMO_V2_FLASH.compact_wire_bytes(rows as u32, false).unwrap().0
+                    + if debug { 32 } else { 0 }, wire.len());
+            }
+            let mut split = ExpertProtocolV2FrameBuffer::default();
+            let mut gathered = split.encode_request_prefix(&request)?.to_vec();
+            gathered.extend_from_slice(&request.hidden_payload);
+            assert_eq!(gathered, wire);
+            if raw != offset {
+                let mut corrupt = wire.clone(); corrupt[raw] = 1;
+                assert!(ExpertProtocolV2RequestView::parse(&corrupt).is_err());
+                assert!(ExpertProtocolV2Request::decode(&corrupt).is_err());
+            }
+            let mut old = wire; old[8..10].copy_from_slice(&4u16.to_le_bytes());
+            assert!(ExpertProtocolV2RequestView::parse(&old).unwrap_err().to_string().contains("version 4"));
+            assert!(ExpertProtocolV2Request::decode(&old).unwrap_err().to_string().contains("version 4"));
+        }
+    }
+    assert!(expert_request_payload_offset(usize::MAX, 40, 12).is_none());
     Ok(())
 }

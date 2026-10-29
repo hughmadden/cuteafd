@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{So
 pub mod push;
 
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 
 fn check_version(actual: u64, expected: u32) -> Result<()> {
     ensure!(actual == u64::from(expected),
@@ -1059,16 +1059,17 @@ mod tests {
             let error = check_version(actual, expected).unwrap_err().to_string();
             assert!(error.contains(&format!("version {actual}; expected {expected}")));
         }
-        for message in ["worker_selection_start", "worker_selection_ready"] {
+        for (message, version) in ["worker_selection_start", "worker_selection_ready"]
+            .into_iter().flat_map(|message| [1, VERSION - 1].map(|version| (message, version))) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let mut client = TcpStream::connect(listener.local_addr()?)?;
             let (server, _) = listener.accept()?;
             server.set_read_timeout(Some(Duration::from_secs(3)))?;
             // Deliberately undecodable identity: version must win over schema errors.
             write(&mut client, &serde_json::json!({"message":message,
-                "selection":{"version":1,"identity":{"legacy":true}}}))?;
+                "selection":{"version":version,"identity":{"legacy":true}}}))?;
             let error = read::<serde_json::Value>(&server).unwrap_err().to_string();
-            assert!(error.contains("version 1; expected 6"), "{error}");
+            assert!(error.contains(&format!("version {version}; expected {VERSION}")), "{error}");
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let mut client = TcpStream::connect(listener.local_addr()?)?;
@@ -1076,9 +1077,9 @@ mod tests {
         write(&mut client, &serde_json::json!({"message":"worker_selection_start",
             "selection":{"version":1}}))?;
         let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
-        assert!(error.to_string().contains("version 1; expected 6"));
+        assert!(error.to_string().contains("version 1; expected 7"));
         let rejection = read::<serde_json::Value>(&client).unwrap_err();
-        assert!(rejection.to_string().contains("version 1; expected 6"));
+        assert!(rejection.to_string().contains("version 1; expected 7"));
         let envelope = serde_json::to_value(admission_selection())?;
         assert!(envelope["identity"].get("manifest").is_none());
         assert_eq!(envelope["version"], VERSION);

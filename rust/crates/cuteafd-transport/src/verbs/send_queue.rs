@@ -25,6 +25,16 @@ impl SendQueue {
     }
     /// SENDs posted and not yet completed (one send-queue entry each).
     pub fn in_flight(&self) -> usize { self.frames.len() }
+    /// Reserve no storage and never wait: reap at most once if posted SENDs
+    /// plus deferred replies currently fill the response ring.
+    pub fn try_slot(&mut self, depth: usize, held: usize,
+        reap: impl FnOnce(usize) -> Result<usize>) -> Result<bool> {
+        if self.in_flight() + held < depth { return Ok(true); }
+        if self.in_flight() == 0 { return Ok(false); }
+        let completed = reap(self.in_flight())?;
+        self.completed(completed)?;
+        Ok(self.in_flight() + held < depth)
+    }
     /// Whether some uncompleted SEND still reads registered egress `slot`.
     pub fn reads_egress(&self, slot: usize) -> bool { self.frames.contains(&Some(slot)) }
 }
@@ -164,6 +174,25 @@ impl VerbsHostProtocolV2PersistentClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_reply_ring_tries_once_without_waiting_or_consuming_receives() -> Result<()> {
+        let mut queue = SendQueue::default();
+        for _ in 0..3 { queue.posted(None); }
+        let mut polls = 0;
+        assert!(!queue.try_slot(4, 1, |posted| {
+            assert_eq!(posted, 3);
+            polls += 1;
+            Ok(0)
+        })?);
+        assert_eq!(polls, 1, "a full ring must return rather than retry");
+        assert_eq!(queue.in_flight(), 3);
+        assert!(queue.try_slot(4, 1, |_| Ok(1))?);
+        assert!(queue.try_slot(4, 1, |_| panic!("free slot must not poll"))?);
+        assert!(!SendQueue::default().try_slot(4, 4, |_| panic!("no SENDs to poll"))?);
+        assert!(queue.try_slot(2, 0, |_| Ok(3)).is_err(), "invalid CQ counts fail closed");
+        Ok(())
+    }
 
     /// A full-capacity BF16 wave's landed payload is exactly its plane: the
     /// ring bound's row-index prefix does not count against the slice (the

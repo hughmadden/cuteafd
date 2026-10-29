@@ -86,7 +86,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
     let info = library.cuda_device_info(library.cuda_get_device()?)?;
     let capability = (info.compute_capability_major, info.compute_capability_minor);
-    let owners = spark_execution_workspace(config, |capacity, _, staging_rows| {
+    let owners = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
         Ok((execution_bytes(programs, capacity as usize, unit_limit, capability,
             config.exlr8_prefill_activations)?, 0,
             staging_rows as usize * catalog.routed_experts().geometry()?.topk as usize * 8))

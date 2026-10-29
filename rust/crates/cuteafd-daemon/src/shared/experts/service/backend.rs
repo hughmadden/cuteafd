@@ -183,6 +183,7 @@ impl<'a> Weights<'a> {
         library: &'a NativeLibrary,
         config: &NativeExpertServiceConfig,
         compiled: u32,
+        extent: cuteafd_core::OwnerExtent,
         remaining: usize,
         modules: &mut super::modules::WarmModules<'a>,
     ) -> Result<Execution<'_, 'a>> {
@@ -213,10 +214,11 @@ impl<'a> Weights<'a> {
             }
             Self::Fp8(experts) => {
                 let capacity = config.capacity as usize;
-                let scratch_bytes = experts.iter().map(|group| group.slot_scratch_bytes(capacity))
+                let scratch_bytes = experts.iter().map(|group| group.owner_scratch_bytes(extent))
                     .collect::<Result<Vec<_>>>()?.into_iter().max().context("FP8 owner has no packages")?;
                 let workspace = experts.iter().try_fold(scratch_bytes, |total, group|
-                    total.checked_add(Fp8Worker::io_bytes(group.module.info(), group.bf16_module.is_some(), capacity)?)
+                    total.checked_add(Fp8Worker::io_bytes(group.module.info(), group.bf16_module.is_some(), capacity)?
+                        + Fp8Worker::segment_io_bytes(&group.module, extent, group.bf16_module.is_some())?)
                         .context("expert group workspace overflow"))?;
                 ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
                 let scratch = Rc::new(crate::shared::memory::DeviceAllocation::named(library,
@@ -225,7 +227,8 @@ impl<'a> Weights<'a> {
                 let mut bindings = Vec::new();
                 for (group, experts) in experts.iter().enumerate() {
                     bindings.extend(experts.layers.iter().enumerate().map(|(index, layer)| (layer.layer, group, index)));
-                    let mut worker = Fp8Worker::with_scratch(library, experts.clone(), config.capacity, Some(scratch.clone()))?;
+                    let mut worker = Fp8Worker::with_extent(library, experts.clone(), config.capacity, Some(scratch.clone()), Some(extent))?;
+                    worker.prepare_segments(extent)?;
                     if let Some(first) = workers.first() { worker.share_owner(first); }
                     workers.push(worker);
                 }
@@ -274,7 +277,7 @@ pub(super) struct Fp8Groups<'a> {
     bindings: Vec<(usize, usize)>,
     selected: usize,
     read_bytes: usize,
-    pending_groups: std::collections::VecDeque<usize>,
+    pending_groups: std::collections::VecDeque<(usize, usize)>,
 }
 impl Drop for Fp8Groups<'_> {
     fn drop(&mut self) {
@@ -350,6 +353,29 @@ pub(super) enum Execution<'w, 'a> {
     Exlr8(super::exlr8::Worker<'w, 'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
+    pub(super) fn flush_staged(&mut self) -> Result<()> {
+        if let Self::Fp8(groups) = self {
+            for worker in &mut groups.workers { worker.flush_staged()?; }
+        }
+        Ok(())
+    }
+    pub(super) fn has_staged(&self) -> bool {
+        matches!(self, Self::Fp8(groups) if groups.workers.iter().any(|worker| worker.has_staged()))
+    }
+    pub(super) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
+        if let Self::Fp8(groups) = self {
+            for (index, worker) in groups.workers.iter_mut().enumerate() {
+                if worker.cancel_staged(input_address)? {
+                    let position = groups.pending_groups.iter().position(|&(group, address)| group == index && address == input_address)
+                        .context("staged group has no owner FIFO entry")?;
+                    groups.pending_groups.remove(position);
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize) -> Result<Option<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
         match self {
@@ -381,7 +407,7 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exl3(execution) => execution.complete(),
             Self::Full(execution) => execution.complete(),
             Self::Fp8(groups) => {
-                let Some(group) = groups.pending_groups.front().copied() else { return Ok(None) };
+                let Some((group, _)) = groups.pending_groups.front().copied() else { return Ok(None) };
                 let pace = groups.workers[group].complete()?;
                 groups.pending_groups.pop_front();
                 Ok(pace)
@@ -411,7 +437,7 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Full(execution) => execution.unit_ready(),
             Self::Exl3(execution) => execution.unit_ready(),
             Self::Fp8(groups) => groups.pending_groups.front().map_or(Ok(true),
-                |&group| groups.workers[group].unit_ready()),
+                |&(group, _)| groups.workers[group].unit_ready()),
             Self::Exlr8(execution) => execution.unit_ready(),
         }
     }
@@ -440,9 +466,14 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Full(execution) => unsafe { execution.execute_mapped_payload(request, executor_id, exchange, mapped) },
             Self::Exl3(execution) => unsafe { execution.execute_mapped_payload(request, executor_id, exchange, mapped) },
             Self::Fp8(groups) => {
+                // A different package cannot overtake a staged predecessor on
+                // this shared stream; errors here retain execution-fatal status.
+                for (index, worker) in groups.workers.iter_mut().enumerate() {
+                    if index != groups.selected { worker.flush_staged()?; }
+                }
                 // SAFETY: the transport retains every mapped source and destination until its unit fence.
                 let response = unsafe { groups.workers[groups.selected].execute_mapped_payload(request, executor_id, exchange, mapped)? };
-                if response.is_some() { groups.pending_groups.push_back(groups.selected); }
+                if response.is_some() { groups.pending_groups.push_back((groups.selected, mapped.hidden_payload.ptr as usize)); }
                 Ok(response)
             }
         }
@@ -608,15 +639,19 @@ pub(super) fn load_fp8<'a>(
         totals.add(resident, 1, group.scratch)?;
         budgets.push(resident);
     }
-    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows| {
+    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, extent| {
         let (mut scratch, mut io) = (0, 0usize);
         for group in &groups {
             let (group_scratch, group_io) = group.modules.as_ref()
-                .context("native group modules already consumed")?.workspace_bytes(capacity as usize)?;
+                .context("native group modules already consumed")?.owner_workspace_bytes(extent)?;
             scratch = scratch.max(group_scratch);
             io = io.checked_add(group_io).context("native owner I/O overflow")?;
         }
-        let pinned = staging_rows as usize * cuteafd_core::expert_geometry().topk as usize * 8 * groups.len();
+        let pinned = groups.iter().try_fold(0usize, |bytes, group| -> Result<usize> {
+            let module = group.modules.as_ref().context("native group modules already consumed")?;
+            Ok(bytes + staging_rows as usize * cuteafd_core::expert_geometry().topk as usize * 8
+                + module.segment_pinned_bytes(extent)?)
+        })?;
         Ok((scratch, io, pinned))
     })?;
     let workspace = usize::try_from(workspace.total().context("native owner workspace overflow")?)?;
@@ -664,7 +699,7 @@ pub(super) fn load_exl3<'a>(
         config.exl3_schedule)?;
     config.validate_exl3_residency(catalog, &exl3_directory)?;
 
-    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows| {
+    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
         let device = Exl3Worker::plan(&exl3_directory, capacity, config.exl3_schedule)
             .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
