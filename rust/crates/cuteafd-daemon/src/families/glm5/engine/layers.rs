@@ -242,10 +242,10 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let layer = &e.weights.layers[index];
         let rows = Scalar::I32(self.rows() as i32);
         if !layer.dense && e.tp2_layer(index) {
-            e.moe_front(w, layer, self.rows(), !self.tables[0].decode)?;
+            e.moe_front(w, layer, self.rows())?;
             e.ring_local_routes(index, w, self.rows())?;
             e.shared_on(0, index, w, layer, rows, self.cap())?;
-            e.moe_front_on(1, w1, self.layer(1, index), self.rows(), !self.tables[0].decode)?;
+            e.moe_front_on(1, w1, self.layer(1, index), self.rows())?;
             e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
             let pair = e.tp2.as_ref().context("TP2")?;
             e.tp2_rank(pair, 0, index, self.lane, w, self.rows())?;
@@ -268,7 +268,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             self.segment(0, index, GlmOwnedPhase::FfnFront, || e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows))?;
             return Ok(Ticket::Complete);
         }
-        self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows(), !self.tables[0].decode))?;
+        self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows()))?;
         let real = self.tables[0].exchange_rows;
         if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
         let decode = self.tables[0].decode;

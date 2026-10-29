@@ -193,7 +193,7 @@ impl<'a> GlmEngine<'a> {
                 } else {
                     &self.peer()?.layers[pair.layers[0]]
                 };
-                self.moe_front_on(rank, w, layer, w.rows, self.prefill_rows >= DECODE_ROWS)?;
+                self.moe_front_on(rank, w, layer, w.rows)?;
                 let cap = if self.prefill_rows >= DECODE_ROWS {
                     "m4096"
                 } else {
@@ -245,7 +245,7 @@ impl<'a> GlmEngine<'a> {
     ) -> Result<()> {
         let pair = self.tp2.as_ref().context("TP2 experts")?;
         self.shared_on(0, layer, w, &self.weights.layers[layer], Scalar::I32(rows as i32), cap)?;
-        self.moe_front_on(1, w1, &self.peer()?.layers[layer], rows, cap == "m4096")?;
+        self.moe_front_on(1, w1, &self.peer()?.layers[layer], rows)?;
         self.ring_local_routes(layer, w, rows)?;
         self.tp2_rank(pair, 0, layer, lane, w, rows)?;
         self.tp2_rank(pair, 1, layer, lane, w1, rows)?;

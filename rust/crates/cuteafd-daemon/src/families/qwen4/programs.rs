@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 
 pub(super) fn validate_all(cfg: &Qwen4Config, programs: &Programs<'_>, context: usize) -> Result<()> {
     cfg.check_programs()?;
-    programs.require_prefill_router("qwen4_prefill_router_scores")?;
     for name in programs.names().filter(|name| name.starts_with("qwen4_")) {
         validate(cfg, context, programs.spec(name)?)?;
     }
@@ -32,8 +31,6 @@ fn expected(cfg: &Qwen4Config, name: &str) -> Result<Value> {
             "streams":cfg.hc_count,"lowrank":cfg.hc_lowrank,"eps":cfg.rms_norm_eps}),
         "head_fp8" => json!({"hidden":cfg.hidden,"vocab":cfg.vocab_size,"max_rows":64}),
         "mtp_feedback" => json!({"hidden":cfg.hidden,"streams":cfg.hc_count,"eps":cfg.rms_norm_eps}),
-        "prefill_router_scores" => json!({"hidden":cfg.hidden,"experts":cfg.experts,"top_k":cfg.topk,
-            "route":"mma_prefill","exact_row_cap":i32::MAX}),
         "router_scores" => json!({"hidden":cfg.hidden,"experts":cfg.experts,"top_k":cfg.topk}),
         "shared" => json!({"hidden":cfg.hidden,"inter":cfg.shared_intermediate,"rows":2 * cfg.shared_intermediate + 16}),
         "add" => json!({"hidden":cfg.hidden}),
@@ -124,7 +121,7 @@ mod tests {
     #[test]
     fn qwen_geometry_rejects_stale_fields_and_missing_context() -> Result<()> {
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
-        for op in ["hc_pre", "hc_post_pre", "hc_post", "head", "head_fp8", "mtp_feedback", "router_scores", "prefill_router_scores",
+        for op in ["hc_pre", "hc_post_pre", "hc_post", "head", "head_fp8", "mtp_feedback", "router_scores",
             "shared", "add", "expert_input_quant", "ple_bf16", "ple_fp8", "ple_commit", "gdn_commit",
             "index_expand", "gdn_m64", "gdn_m4096", "gdn_w8_m64", "gdn_w8_m4096", "gdn_fp8_m64",
             "attn_producer_m64", "attn_producer_kv_fp8_m4096", "attn_producer_w8_kv_fp8_m64",

@@ -520,7 +520,6 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
     calls = {stem: (op, params, thunk) for stem, op, params, thunk in programs}
     assert len(calls) == len(programs)
     for stem, geometry in (("router_scores", {"hidden": 7168, "routed_experts": 896, "top_k": 16}),
-                           ("prefill_router_scores", {"hidden": 7168, "routed_experts": 896, "top_k": 16}),
                            ("expert_input_quant", {"hidden": 3584})):
         op, params, thunk = calls[stem]
         module, function, args, kwargs = thunk()
@@ -638,8 +637,7 @@ def test_glm_official_catalog_stays_fused(exporter):
     geometry = types.SimpleNamespace(moe_inter=2048, dense_inter=12288)
     entries = exporter.glm_programs(geometry, 64, 4096, 1048576)
     names = {name for name, _, _, _ in entries}
-    assert len(names) == len(entries) == 28
-    assert {"router_scores", "prefill_router_scores"} <= names
+    assert len(names) == len(entries) == 27
     for rows in (64, 4096):
         for stem in ("producer", "index_producer", "o"):
             assert f"{stem}_m{rows}" in names
@@ -773,18 +771,18 @@ def _rust_methods(source, names):
 @pytest.mark.parametrize("family,methods,launches,inventory_names", [
     ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on"},
      {"mimo_norm", "mimo_{k}_producer{kv}_{cap}", "mimo_{k}_attention{}_{mode}_{cap}",
-      "mimo_o_w8_{cap}", "mimo_o_{cap}", "mimo_ffn_{cap}", "mimo_prefill_router_scores", "mimo_expert_input_quant"},
+      "mimo_o_w8_{cap}", "mimo_o_{cap}", "mimo_ffn_{cap}", "mimo_router_scores", "mimo_expert_input_quant"},
      {"mimo_norm", "mimo_{k}_producer{kv}_m4096", "mimo_{k}_attention{kv}_prefill_m4096",
-      "mimo_o{}_m4096", "mimo_ffn_m4096", "mimo_prefill_router_scores", "mimo_expert_input_quant"}),
+      "mimo_o{}_m4096", "mimo_ffn_m4096", "mimo_router_scores", "mimo_expert_input_quant"}),
     ("glm5_flash", {"pre_at", "post_pre_at", "mhc_post_at", "kda_on", "kda_w8", "ffn_on",
                    "mla_producer_into", "index_producer_part", "mla_output", "mla_over", "moe_front", "moe_experts"},
      {"mhc_pre", "mhc_post_pre_{cap}", "mhc_post", "kda_w8{dtype}{expanded}_{cap}",
       "ffn_i{inter}_{cap}", "mla_producer_{cap}", "index_producer_{cap}", "index_producer_c_{cap}",
       "o_{cap}", "index_topk_{mode}_{cap}", "index_expand", "sparse_mla_{mode}_{cap}",
-      "prefill_router_scores", "expert_input_quant", "add"},
+      "router_scores", "expert_input_quant", "add"},
      {"mhc_pre", "mhc_post", "mhc_post_pre_m4096", "head", "kda_w8{}_m4096", "mla_producer_m4096",
       "o_m4096", "index_producer{}_m4096", "index_topk_prefill_m4096", "index_expand",
-      "sparse_mla_prefill_m4096", "ffn_i{inter}_m4096", "prefill_router_scores", "add", "expert_input_quant"}),
+      "sparse_mla_prefill_m4096", "ffn_i{inter}_m4096", "router_scores", "add", "expert_input_quant"}),
 ])
 def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, methods, launches, inventory_names):
     source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/engine.rs").read_text()
@@ -818,30 +816,3 @@ def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, me
         assert 'add("head".into(), PackedRows)' in inventory
         units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
         assert 'e.run("head"' in units
-
-
-@pytest.mark.parametrize("filename,prefix", [
-    ("glm_ffn.py", "glm"), ("glmf.py", "glmf"),
-    ("mimo_ffn.py", "mimo"), ("qwen4.py", "qwen4"),
-])
-def test_prefill_router_exports_fixed_mma_without_decode_replacement(filename, prefix):
-    tree = ast.parse((ROOT / "third_party/sparkinfer/b12x/integration/cuteafd" / filename).read_text())
-    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
-    assert f"compile_{prefix}_router_scores_aot" in functions
-    function = functions[f"compile_{prefix}_prefill_router_scores_aot"]
-    call = next(node for node in ast.walk(function) if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name) and node.func.id == "compile_program")
-    geometry = next(keyword.value for keyword in call.keywords if keyword.arg == "geometry")
-    fields = {key.value: value for key, value in zip(geometry.keys, geometry.values)}
-    assert ast.literal_eval(fields["route"]) == "mma_prefill"
-    assert eval(compile(ast.Expression(fields["exact_row_cap"]), "<cap>", "eval"), {"__builtins__": {}}) == 2**31 - 1
-    source = ast.unparse(function)
-    if prefix == "mimo":
-        classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
-        for name in ("_PrefillRouterHiLo", "_PrefillRouterBf16"):
-            assert "_V41RouterScores" in ast.unparse(classes[name])
-        hilo = ast.unparse(classes["_PrefillRouterHiLo"])
-        assert "RouterHiLoAdd" in hilo and "2 * self.e" in hilo
-    else:
-        assert "_V41RouterScores" in source
-        assert "RoutedBf16Projection" not in source

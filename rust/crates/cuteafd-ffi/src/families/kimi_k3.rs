@@ -721,26 +721,23 @@ pub struct KimiRoutes { pub ids: Buffer, pub weights: Buffer }
 /// Native BF16 router projection followed by E896/K16 sigmoid selection.
 /// The checkpoint correction bias selects experts, but does not weight their outputs.
 pub struct KimiRouter<'a> {
-    scores: Program<'a>, prefill_scores: Program<'a>, library: &'a crate::NativeLibrary, rows: usize,
+    scores: Program<'a>, library: &'a crate::NativeLibrary, rows: usize,
 }
 impl<'a> KimiRouter<'a> {
     pub fn load(programs: &'a Programs<'a>) -> W8Result<Self> {
         let scores = programs.program("kimik3_router_scores", &["x", "w", "logits"])?;
         validate_router_manifest(scores.spec())?;
-        let prefill_scores = programs.program("kimik3_prefill_router_scores", &["x", "w", "logits"])?;
-        validate_router_manifest(prefill_scores.spec())?;
-        programs.require_prefill_router("kimik3_prefill_router_scores")?;
-        let rows = scores.spec().capacity_rows.min(prefill_scores.spec().capacity_rows) as usize;
-        Ok(Self { scores, prefill_scores, library: programs.library(), rows })
+        let rows = scores.spec().capacity_rows as usize;
+        Ok(Self { scores, library: programs.library(), rows })
     }
 
-    pub fn launch(&self, rows: usize, prefill: bool, input: Buffer, weight: Buffer, bias: Buffer,
+    pub fn launch(&self, rows: usize, input: Buffer, weight: Buffer, bias: Buffer,
         logits: Buffer, routes: KimiRoutes, stream: *mut c_void) -> W8Result<()> {
         validate_router_buffers(rows, self.rows, input, weight, bias, logits, routes)?;
         // SAFETY: dense operands and disjoint device outputs are checked before
         // either launch; the caller retains every buffer through completion/replay.
         unsafe {
-            (if prefill { &self.prefill_scores } else { &self.scores }).launch(&[input.ptr, weight.ptr, logits.ptr], &[Scalar::I32(rows as i32)], stream)?;
+            self.scores.launch(&[input.ptr, weight.ptr, logits.ptr], &[Scalar::I32(rows as i32)], stream)?;
             self.library.router_select(logits.ptr, bias.ptr, std::ptr::null(), std::ptr::null(),
                 routes.ids.ptr, routes.weights.ptr, rows, 896, 16, 1.0, true, stream)?;
         }

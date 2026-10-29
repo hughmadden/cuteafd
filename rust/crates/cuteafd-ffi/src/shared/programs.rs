@@ -287,12 +287,6 @@ impl<'a> Programs<'a> {
         Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
     }
 
-    /// Required separately from decode so stale packages cannot silently fall back.
-    pub fn require_prefill_router(&self, name: &str) -> Result<()> {
-        let spec = self.spec(name).with_context(|| format!("required prefill router export {name}"))?;
-        validate_prefill_router(spec)
-    }
-
     pub fn capacities(&self) -> ProgramCapacities {
         self.capacities
     }
@@ -1010,32 +1004,5 @@ impl Drop for VocabularyHead<'_> {
         if let Ok(destroy) = unsafe { self.library.lib.get::<Destroy>(b"cuteafd_v41_markov_destroy") } {
             unsafe { destroy(self.handle) };
         }
-    }
-}
-
-/// A prefill router must advertise the fixed MMA reduction and no row-route cap.
-pub(crate) fn validate_prefill_router(spec: &ProgramSpec) -> Result<()> {
-    ensure!(spec.geometry["route"] == "mma_prefill"
-        && spec.geometry["exact_row_cap"].as_u64() == Some(i32::MAX as u64),
-        "{}: prefill router requires route=mma_prefill and exact_row_cap={}", spec.name, i32::MAX);
-    Ok(())
-}
-
-#[cfg(test)]
-mod prefill_router_tests {
-    use super::*;
-
-    #[test]
-    fn prefill_router_rejects_missing_or_decode_metadata() {
-        let mut spec = ProgramSpec { name: "family_prefill_router_scores".into(), pointers: vec![],
-            scalar_kinds: vec![], scratch: Default::default(), capacity_rows: 4096,
-            geometry: serde_json::json!({}) };
-        assert!(validate_prefill_router(&spec).is_err());
-        spec.geometry = serde_json::json!({"route":"mma_prefill","exact_row_cap":64});
-        assert!(validate_prefill_router(&spec).is_err());
-        spec.geometry["exact_row_cap"] = serde_json::json!(i32::MAX);
-        validate_prefill_router(&spec).unwrap();
-        spec.geometry["route"] = serde_json::json!("skinny");
-        assert!(validate_prefill_router(&spec).is_err());
     }
 }

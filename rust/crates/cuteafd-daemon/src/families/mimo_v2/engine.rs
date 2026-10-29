@@ -595,10 +595,10 @@ impl UnitHooks<'_, '_> {
         if let Some(members) = self.packed {
             for member in members {
                 let s = member.segment;
-                e.moe_front_on(rank, &member.views[rank], weight, s.rows, bf16, true)?;
+                e.moe_front_on(rank, &member.views[rank], weight, s.rows, bf16)?;
             }
             Ok(())
-        } else { e.moe_front_on(rank, w, weight, rows, bf16, true) }
+        } else { e.moe_front_on(rank, w, weight, rows, bf16) }
     }
 
     fn after_ffn(&self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
@@ -894,7 +894,6 @@ impl<'a> MimoEngine<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let prefill_span_rows = prefill_span_rows(prefill_span, prefill_rows)?;
         let family = cfg.program_family()?;
-        programs.require_prefill_router(&format!("{family}_prefill_router_scores"))?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
         let share = cfg.head_split(ranks)?;
@@ -1659,7 +1658,7 @@ impl<'a> MimoEngine<'a> {
                 add(format!("mimo_o{}_m4096", if layer.has("w_o_fp8") { "_w8" } else { "" }), layer.split, SequenceLocal);
                 if layer.dense { add("mimo_ffn_m4096".into(), layer.split, PackedRows); }
                 else {
-                    add("mimo_prefill_router_scores".into(), false, SequenceLocal);
+                    add("mimo_router_scores".into(), false, SequenceLocal);
                     if !self.expert_bf16_input(false) { add("mimo_expert_input_quant".into(), false, SequenceLocal); }
                 }
             }
@@ -2223,7 +2222,7 @@ impl<'a> MimoEngine<'a> {
             Ok(())
         } else {
             let local = self.tp2_layer(index) || self.rtx_local_layer(index);
-            self.moe_front(w, layer, t, local || bf16_input, false)
+            self.moe_front(w, layer, t, local || bf16_input)
         }
     }
 
@@ -2269,7 +2268,7 @@ impl<'a> MimoEngine<'a> {
                 self.dense_ffn(1, w1, share, rows, "m64", true)?;
                 self.push(1, slot(index, true, tables.decode), w1.delta.buffer.ptr, bytes)?;
             } else if self.tp2_layer(index) {
-                self.moe_front_on(1, w1, share, t, true, false)?;
+                self.moe_front_on(1, w1, share, t, true)?;
             }
             Ok(())
         })
@@ -2431,7 +2430,7 @@ impl<'a> MimoEngine<'a> {
             self.push(1, ffn, w1.delta.buffer.ptr, bytes)?;
             self.wait(1, ffn)?;
         } else if self.tp2_layer(index) {
-            self.moe_front_on(1, w1, share, tables.positions.len(), true, false)?;
+            self.moe_front_on(1, w1, share, tables.positions.len(), true)?;
             self.tp2_experts(1, index, 0, w1, tables.positions.len())?;
             self.tp2_post(1, index, 0, w1, tables.positions.len())?;
         } else if next.is_some() {
@@ -2463,7 +2462,7 @@ impl<'a> MimoEngine<'a> {
             self.dense_ffn(1, w, layer, rows, "m4096", false)?;
             self.push(1, unit_slot(index, true, lane), w.delta.buffer.ptr, bytes)?;
         } else if self.tp2_layer(index) {
-            self.moe_front_on(1, w, layer, tables.positions.len(), true, true)?;
+            self.moe_front_on(1, w, layer, tables.positions.len(), true)?;
             self.tp2_experts(1, index, lane, w, tables.positions.len())?;
         }
         Ok(())
@@ -2925,12 +2924,12 @@ impl<'a> MimoEngine<'a> {
         forward: Option<usize>) -> Result<()> {
         let bytes = t * self.cfg.hidden * 2;
         if self.tp2_layer(index) {
-            self.moe_front(w, layer, t, true, !decode)?;
+            self.moe_front(w, layer, t, true)?;
             self.probe_ring(w, index, t)?;
             return self.tp2_experts(0, index, 0, w, t);
         }
         if self.rtx_local_layer(index) {
-            self.moe_front(w, layer, t, true, !decode)?;
+            self.moe_front(w, layer, t, true)?;
             self.moe_run(w, index, t, decode)?;
             return match forward { Some(slot) => self.push(0, slot, w.delta.buffer.ptr, bytes), None => Ok(()) };
         }
@@ -2944,14 +2943,14 @@ impl<'a> MimoEngine<'a> {
 
     /// Router scores, the top-k selection and (unless the ranks take BF16
     /// rows) the FP8 wire rows, all on the stream.
-    fn moe_front(&self, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool, prefill: bool) -> Result<()> {
-        self.moe_front_on(0, w, layer, t, bf16_input, prefill)
+    fn moe_front(&self, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool) -> Result<()> {
+        self.moe_front_on(0, w, layer, t, bf16_input)
     }
 
-    fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool, prefill: bool) -> Result<()> {
+    fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
-        self.run_on(rank, false, if prefill { "mimo_prefill_router_scores" } else { "mimo_router_scores" }, &[("x", w.x.buffer.ptr), layer.router_operand()?,
+        self.run_on(rank, false, "mimo_router_scores", &[("x", w.x.buffer.ptr), layer.router_operand()?,
             ("logits", w.router_logits.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
         self.on(rank, || unsafe {
@@ -2984,7 +2983,7 @@ impl<'a> MimoEngine<'a> {
             "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
              (run --layers 1 for the dense layer alone)"))?;
         let bf16_input = self.expert_bf16_input(decode);
-        self.moe_front(w, layer, t, bf16_input, !decode)?;
+        self.moe_front(w, layer, t, bf16_input)?;
         match experts {
             Experts::Spark { decode: decode_link, prefill } => {
                 let transport = if decode { decode_link } else { prefill };

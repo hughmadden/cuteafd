@@ -281,8 +281,7 @@ pub fn workspace_scratch(
     let family = cfg.program_family()?;
     let split_family = cfg.head_split(ranks)?.program_family()?;
     let lead = rank == 0;
-    let router = if decode { "router_scores" } else { "prefill_router_scores" };
-    let mut scratch = query(&format!("{family}_{router}"))?;
+    let mut scratch = query(&format!("{family}_router_scores"))?;
     let families: &[&str] = match (ranks, lead) {
         (1, _) => &[family],
         (_, true) => &[family, split_family],

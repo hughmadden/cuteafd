@@ -538,7 +538,6 @@ impl<'a> GlmEngine<'a> {
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         embedding: TokenEmbedding<'a>, depth: crate::shared::prefill_depth::PrefillDepth,
         context_mode: Option<GlmContext>) -> Result<Self> {
-        programs.require_prefill_router("glm_prefill_router_scores")?;
         let prefill_lanes = depth.waves;
         ensure!((1..=4).contains(&prefill_lanes), "GLM prefill lanes must match admitted inventory");
         ensure!(depth.unit_rows == prefill_rows, "GLM prefill depth runs {}-row units, the engine {prefill_rows}",
@@ -1324,10 +1323,10 @@ impl<'a> GlmEngine<'a> {
                     self.publish_projection(0, index, 0, w, layer, "down", t)?;
                 }
             } else if self.tp2_layer(index) {
-                self.moe_front(w, layer, t, !tables.decode)?;
+                self.moe_front(w, layer, t)?;
                 self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, t, cap)?;
             } else if let Some(skip) = &self.skip {
-                self.moe_front(w, layer, t, !tables.decode)?;
+                self.moe_front(w, layer, t)?;
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
                 self.reduce(skip.pointers(), w, ranks, t)?;
             } else {
@@ -1644,7 +1643,7 @@ impl<'a> GlmEngine<'a> {
                     }
                     Ok(())
                 } else {
-                    self.moe_front(w, layer, t, false)
+                    self.moe_front(w, layer, t)
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
@@ -1861,7 +1860,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut SparkLink<'_>) -> Result<()> {
-        self.moe_front(w, layer, t, !decode)?;
+        self.moe_front(w, layer, t)?;
         let waves = transport.exchange()?;
         let slot = self.moe_exchange(w, index, layer, t, cap, decode, waves)?;
         self.reduce(waves.planes(slot), w, waves.ranks(), t)?;
@@ -1869,14 +1868,14 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
-    fn moe_front(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize, prefill: bool) -> Result<()> {
-        self.moe_front_on(0, w, layer, t, prefill)
+    fn moe_front(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
+        self.moe_front_on(0, w, layer, t)
     }
 
-    fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize, prefill: bool) -> Result<()> {
+    fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
-        self.run_on(rank, if prefill { "glm_prefill_router_scores" } else { "glm_router_scores" }, &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
+        self.run_on(rank, "glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
         self.on(rank, || unsafe {
@@ -2234,7 +2233,7 @@ impl<'a> GlmEngine<'a> {
                 }
                 Ok(())
             } else {
-                self.moe_front(w, layer, counts[unit], true)
+                self.moe_front(w, layer, counts[unit])
             }
         };
         // h += ffn (routed partials reduced first); x = the next input norm.

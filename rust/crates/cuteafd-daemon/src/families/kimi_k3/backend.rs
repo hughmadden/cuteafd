@@ -114,7 +114,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.engine.prefill_device(&mut [(placement, tokens)], pool, logit_rows.max(1), true)
+        self.engine.step_device(&mut [(placement, tokens)], pool, logit_rows.max(1), true)
             .map(|logits| (logit_rows > 0).then_some(logits))
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,

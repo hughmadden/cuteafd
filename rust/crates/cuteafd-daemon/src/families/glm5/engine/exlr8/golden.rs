@@ -323,7 +323,7 @@ fn native_layer3_same_quant() -> Result<()> {
                     let name = if rows > 64 { "exlr8_a16_grouped" } else { "exlr8_a16_serving" };
                     ensure!(pair.group_rows(rows)? == cuteafd_ffi::exlr8::group_rows(engine.programs.spec(name)?)?,
                         "native TP2 serving grouping differs from the export ABI");
-                    engine.moe_front(w, &engine.weights.layers[3], rows, true)?;
+                    engine.moe_front(w, &engine.weights.layers[3], rows)?;
                     engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
                     engine.tp2_pair(3, 0, w, w1, rows, "m4096")?;
                     engine.exchange()?.wait(0, slot(3, true, 0))?;

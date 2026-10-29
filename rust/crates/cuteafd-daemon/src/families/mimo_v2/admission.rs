@@ -1229,8 +1229,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bytes, 2048);
-        assert!(peer.iter().any(|n| n == "mimop_prefill_router_scores"));
-        assert!(peer.iter().all(|n| n == "mimop_prefill_router_scores"
+        assert!(peer.iter().any(|n| n == "mimop_router_scores"));
+        assert!(peer.iter().all(|n| n == "mimop_router_scores"
             || (n.starts_with("mimop2_") && n.ends_with("m4096"))));
     }
 

@@ -322,7 +322,7 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert 'ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked")' in host_experts
     assert "clear_tail(0..t)?" in host_experts
     assert "real_row_moe(real_rows, t, |real_rows|" in host_experts
-    assert "self.moe_front(w, index, &layers[index], real_rows, expert_rows, false)?" in host_experts
+    assert "self.moe_front(w, index, &layers[index], real_rows, expert_rows)?" in host_experts
     assert "self.moe_experts(w, index, real_rows, expert_rows, true)" in host_experts
     assert "}, clear_tail)?" in host_experts
     assert "self.moe_experts(w, index, t, rows, true)?" in host_experts

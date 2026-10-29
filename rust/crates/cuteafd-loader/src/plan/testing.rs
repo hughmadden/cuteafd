@@ -941,7 +941,6 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
     let mut programs = Vec::new();
     for (name, geometry) in [
         ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
-        ("kimik3_prefill_router_scores", json!({"hidden":7168,"experts":896,"top_k":16,"route":"mma_prefill","exact_row_cap":i32::MAX})),
         ("kimik3_expert_input_quant", json!({"hidden":3584})),
         ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
         ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),

@@ -2980,7 +2980,7 @@ impl<'a> Qwen4Engine<'a> {
                         Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                     }
                     self.post_pre(w, c, layer, "mlp", rows)?;
-                    if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows, false) }
+                    if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
                 })?;
                 if index == 0 || boundary { cur[owner] ^= 1; }
                 let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
@@ -2991,7 +2991,7 @@ impl<'a> Qwen4Engine<'a> {
                 if self.warming_graphs.get() { ensure!(real_rows == 0, "Qwen startup real expert rows"); clear_tail(0..t)?; }
                 else if self.startup_graphs {
                     real_row_moe(real_rows, t, |real| {
-                        self.moe_front(w, index, layer, real, expert_rows, false)?;
+                        self.moe_front(w, index, layer, real, expert_rows)?;
                         self.moe_experts(w, index, real, expert_rows, true)
                     }, clear_tail)?;
                 } else { self.moe_experts(w, index, t, rows, true)?; }
@@ -3158,7 +3158,7 @@ impl<'a> Qwen4Engine<'a> {
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
-                if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows, false) }
+                if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
             })?;
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
@@ -3175,7 +3175,7 @@ impl<'a> Qwen4Engine<'a> {
                         clear_tail(0..t)?;
                     } else {
                         real_row_moe(real_rows, t, |real_rows| {
-                            self.moe_front(w, index, &layers[index], real_rows, expert_rows, false)?;
+                            self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
                             self.moe_experts(w, index, real_rows, expert_rows, true)
                         }, clear_tail)?;
                     }
@@ -3420,18 +3420,18 @@ impl<'a> Qwen4Engine<'a> {
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Scalar, decode: bool)
         -> Result<()> {
-        self.moe_front(w, index, layer, t, rows, !decode)?;
+        self.moe_front(w, index, layer, t, rows)?;
         self.moe_experts(w, index, t, rows, decode)
     }
 
     /// Router logits, the softmax top-10, the shared expert (into `shared`)
     /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync.
-    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Scalar, prefill: bool)
+    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Scalar)
         -> Result<()> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} needs routed experts: pass --local-experts, Spark --peers or --shared-only"))?;
-        self.run(if prefill { "qwen4_prefill_router_scores" } else { "qwen4_router_scores" }, &[("x", w.live(&w.x, self.cfg.hidden * 2)), ("w", layer.ptr("gate")?),
+        self.run("qwen4_router_scores", &[("x", w.live(&w.x, self.cfg.hidden * 2)), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
         // SAFETY: logits and route outputs are live buffers of `t` rows.
         unsafe {
@@ -3747,7 +3747,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
     fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
         self.select(unit)?;
         let rows = Scalar::I32(unit.rows.len() as i32);
-        self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows, true)?;
+        self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
         let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
         self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport)
     }

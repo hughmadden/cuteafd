@@ -1707,7 +1707,6 @@ impl<'a> GlmfEngine<'a> {
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
-        programs.require_prefill_router("glmf_prefill_router_scores")?;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
@@ -2099,7 +2098,7 @@ impl<'a> GlmfEngine<'a> {
                     self.stream_of(rank))?; }
                 let layer = tp2.layers[0];
                 let weights = if rank == 0 { &self.weights.layers[layer] } else { &self.peer()?.layers[layer] };
-                self.router_on(rank, w, weights, rows, &[Span { first: 0, rows }], false)?;
+                self.router_on(rank, w, weights, rows, &[Span { first: 0, rows }])?;
                 let cap = if self.prefill_rows >= self.decode_rows { PREFILL_CAP } else { decode_cap(rows) };
                 self.ffn_on(rank, w, weights, self.cfg.moe_intermediate, cap,
                     w.shared.buffer.ptr, Scalar::I32(rows as i32))?;
@@ -2540,7 +2539,7 @@ impl<'a> GlmfEngine<'a> {
         self.ffn_on(1, w1, &peer.layers[layer], self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, scalar)?;
         // Both ranks see the identical FFN-site collapse. The peer router is
         // outside padded attention graphs, so only genuine rows enter routes.
-        self.router_on(1, w1, &peer.layers[layer], rows, &[Span { first: 0, rows }], cap == PREFILL_CAP)?;
+        self.router_on(1, w1, &peer.layers[layer], rows, &[Span { first: 0, rows }])?;
         self.tp2_rank(0, layer, lane, w, rows, w.delta.buffer.ptr)?;
         self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;
         Ok(())
@@ -2551,9 +2550,9 @@ impl<'a> GlmfEngine<'a> {
         self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.delta.buffer.ptr, rows * self.cfg.hidden * 2)
     }
 
-    fn router_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: usize, spans: &[Span], prefill: bool) -> Result<()> {
+    fn router_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: usize, spans: &[Span]) -> Result<()> {
         for span in spans {
-            self.run_on(rank, false, if prefill { "prefill_router_scores" } else { "router_scores" }, &[("x", row_at(&w.x, span.first, self.cfg.hidden * 2)),
+            self.run_on(rank, false, "router_scores", &[("x", row_at(&w.x, span.first, self.cfg.hidden * 2)),
                 ("w", layer.ptr("gate")?), ("logits", row_at(&w.router_logits, span.first, self.cfg.experts * 4))],
                 &[span.rows()])?;
         }
@@ -3452,7 +3451,7 @@ impl<'a> GlmfEngine<'a> {
             let inter = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
             if !layer.has("nvfp4_w1") { add(format!("ffn_i{inter}_m4096"), PackedRows); }
             if !layer.dense {
-                add("prefill_router_scores".into(), SequenceLocal);
+                add("router_scores".into(), SequenceLocal);
                 add("add".into(), PackedRows);
                 if !self.spark_bf16 { add("expert_input_quant".into(), PackedRows); }
             }
@@ -4884,9 +4883,9 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
-    /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync. Router scores
-    /// use fixed MMA for prefill and the existing decode route otherwise, over
-    /// each of `spans`; the rest run over every row.
+    /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync. The router scores, a skinny
+    /// GEMV up to 160 rows, run over each of `spans` (each packed sequence's rows, or the whole
+    /// step); the rest over every row.
     #[allow(clippy::too_many_arguments)]
     fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
         spans: &[Span]) -> Result<()> {
@@ -4895,7 +4894,7 @@ impl<'a> GlmfEngine<'a> {
         ensure!(experts.is_some() || self.tp2_layer(index), "layer {index} has no expert home");
         for span in spans {
             let rows = if spans.len() == 1 && span.rows == t { rows } else { span.rows() };
-            self.run(if cap == PREFILL_CAP { "prefill_router_scores" } else { "router_scores" }, &[("x", row_at(&w.x, span.first, h * 2)), ("w", layer.ptr("gate")?),
+            self.run("router_scores", &[("x", row_at(&w.x, span.first, h * 2)), ("w", layer.ptr("gate")?),
                 ("logits", row_at(&w.router_logits, span.first, self.cfg.experts * 4))], &[rows])?;
         }
         self.timed("router_select", || {
@@ -5440,8 +5439,7 @@ mod prefill_lane_tests {
             // Fork #150 reads each GLM Flash projection's shipped warps from
             // `fp8_gemv_shipped_warps`; a tuning entry moves only the grid, never the warps.
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
-            // Additive prefill-only F32 MMA router; every decode projection remains unchanged.
-            ("integration/cuteafd/glmf.py", 0x9384fb38251982be_u64),
+            ("integration/cuteafd/glmf.py", 0xc997a51c631cd643_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.

@@ -85,14 +85,14 @@ impl<'a> Execution<'a> {
     pub(crate) fn run<'e>(&'e self, scope: &'e SubmissionScope<'_>,
         peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
         locals: &'e mut [[LocalLane<'a>; 2]], routed: &'e mut [RoutedLane<'a>],
-        experts: &'e mut [[Option<Exl3Tp2<'a>>; 2]], rows: &[usize], speculative: bool, prefill: bool, output: Output, draft: Option<&'e super::draft::NativeDraft<'a>>, probe: Option<&'e DraftProbe<'a>>) -> Result<Vec<CuteafdDeviceBuffer>> {
+        experts: &'e mut [[Option<Exl3Tp2<'a>>; 2]], rows: &[usize], speculative: bool, output: Output, draft: Option<&'e super::draft::NativeDraft<'a>>, probe: Option<&'e DraftProbe<'a>>) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!(!rows.is_empty() && rows.len() == locals.len() && rows.len() == routed.len() && rows.len() == experts.len(),
             "Kimi shared pipeline needs matching local, Spark and row lanes");
         let protocol = self.protocol(peer, hops)?;
         let mut bindings = locals.iter_mut().zip(routed).zip(experts).zip(rows).enumerate().map(
             |(lane, (((local, routed), experts), &rows))| Bindings::new(local, routed, experts, self, peer, hops, scope, lane, rows, speculative)
         ).collect::<Result<Vec<_>>>()?;
-        for binding in &mut bindings { binding.draft = draft; binding.probe = probe; binding.prefill = prefill; }
+        for binding in &mut bindings { binding.draft = draft; binding.probe = probe; }
         crate::shared::peer_split::attention::layer_pipeline_with(scope, &self.plan, &protocol,
             crate::shared::peer_split::attention::LaneOrder::OrderedChunks, rows, &mut bindings)?;
         bindings.iter_mut().map(|binding| binding.output(output)).collect()
@@ -118,7 +118,6 @@ impl<'a> Execution<'a> {
             units[0].rows.len(), false)?;
         binding.draft = draft;
         binding.defer_publication = true;
-        binding.prefill = true;
         let mut hooks = UnitHooks { binding, protocol: &protocol,
             state: units.iter().map(|_| UnitState::default()).collect(), consumed:
                 vec![vec![0; self.plan.hops().len()]; units.len()] };
@@ -357,7 +356,6 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     lane: usize,
     rows: usize,
     speculative: bool,
-    prefill: bool,
     owners: Vec<(Vec<u8>, Vec<u8>)>,
     completed: usize,
     pending: Option<FfnTicket>,
@@ -416,7 +414,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         for rank in 0..2 { peer.recv(rank, lane)?; }
         ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, prefill: false, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false })
+        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false })
     }
 
     fn with_probe(&self, work: impl FnOnce(&mut crate::shared::draft::probe::RoundProbe<'a>) -> Result<()>) -> Result<()> {
@@ -619,7 +617,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
             None
         } else {
-            let (canonical, wire) = self.local[owner].route(layer, self.rows, self.prefill)?;
+            let (canonical, wire) = self.local[owner].route(layer, self.rows)?;
             if rtx || owner == 0 {
                 self.transfer_planes(owner, &[("route ids", canonical.ids.bytes),
                     ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)])?;
@@ -673,7 +671,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 None
             } else {
                 let kind = if self.speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify }
-                    else if self.prefill { cuteafd_transport::ExpertV2SourceKind::Prefill }
+                    else if self.rows > 64 { cuteafd_transport::ExpertV2SourceKind::Prefill }
                     else { cuteafd_transport::ExpertV2SourceKind::Decode };
                 let routes = cuteafd_ffi::KimiRoutes {
                     ids: self.local[1].buffer("route ids")?, weights: self.local[1].buffer("route weights")? };

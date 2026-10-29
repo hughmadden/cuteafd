@@ -88,16 +88,13 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
         Some("coordinator") => {
             ensure!(programs["sparkinfer_revision"] == revision, "Kimi K3 program/package revision mismatch");
             let inventory = programs["programs"].as_array().unwrap();
-            for name in ["kimik3_router_scores", "kimik3_prefill_router_scores", "kimik3_expert_input_quant", "kimik3_latent_down",
+            for name in ["kimik3_router_scores", "kimik3_expert_input_quant", "kimik3_latent_down",
                 "kimik3_latent_up", "kimik3_rmsnorm_h3584"] {
                 let entries = inventory.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
                 ensure!(entries.len() == 1 && entries[0]["object_sha256"].as_str().is_some_and(|s| s.len() == 64),
                     "Kimi K3 program inventory requires one sealed {name}");
                 let geometry = &entries[0]["geometry"];
                 match name {
-                    "kimik3_prefill_router_scores" => ensure!(geometry["hidden"] == 7168 && geometry["experts"] == 896
-                        && geometry["top_k"] == 16 && geometry["route"] == "mma_prefill"
-                        && geometry["exact_row_cap"] == i32::MAX, "Kimi prefill router geometry mismatch"),
                     "kimik3_router_scores" => ensure!(geometry["hidden"] == 7168 && geometry["experts"] == 896
                         && geometry["top_k"] == 16, "Kimi router geometry mismatch"),
                     "kimik3_latent_down" => ensure!(geometry["width"] == 7168 && geometry["outputs"] == 3584,
