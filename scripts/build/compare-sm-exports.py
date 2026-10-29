@@ -340,11 +340,13 @@ def _export_exl3(extra, output):
                 package.compact_ws_export(geometry, role, width, rows, bits)
                 if hasattr(package, 'compact_ws_export') else
                 package.compact_warp_specialized(geometry, role, width, rows))
-            # A baseline package that predates the measured-tier set only has the
-            # two shipped coordinator pairs; keep its exports loadable.
-            ws_tiers = getattr(package, "WS_TIER_PAIRS", (("glm", (4, 5)), ("glmf", (3, 4))))
+            # Baselines retain their measured-tier filter; current packages use
+            # every two-tier prefill cell except the separately owned Kimi RTX policy.
+            ws_tiers = getattr(package, "WS_TIER_PAIRS", None)
+            eligible = ((geometry, bits) in ws_tiers if ws_tiers is not None
+                        else geometry != "kimik3" or bits == (2, 3))
             ws = compact_ws or (len(bits) == 2 and tile is None
-                                and (role != "coordinator" or (geometry, bits) in ws_tiers)
+                                and (role != "coordinator" or eligible)
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
                 block = (package.compact_ws_route_block(geometry, role, width, rows)
