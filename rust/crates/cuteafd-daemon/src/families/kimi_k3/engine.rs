@@ -217,7 +217,8 @@ impl<'a> Engine<'a> {
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
-        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts, prefill)?;
+        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts,
+            prefill, coordinator_packing_cap)?;
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
@@ -230,7 +231,7 @@ impl<'a> Engine<'a> {
         local: Vec<[LocalLane<'a>; 2]>, routed: Vec<RoutedLane<'a>>,
         io: Vec<[TokenIo<'a>; 2]>,
         experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
-        prefill: PrefillUnits) -> Result<Self> {
+        prefill: PrefillUnits, coordinator_packing_cap: usize) -> Result<Self> {
         // The units in flight fit the lane.
         ensure!(prefill.waves > 0 && local.iter().all(|pair| pair[0].rows() >= prefill.unit_rows * prefill.waves
             || prefill.waves == 1), "Kimi lane rows hold fewer than the admitted prefill units in flight");
