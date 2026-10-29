@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn flash_head_capacity_uses_real_dspark_config_without_dflash_geometry() {
-        let mut config = flash_dspark();
+        let config = flash_dspark();
         assert!(config.get("dflash_config").is_none());
         assert!(draft_geometry(&config).is_err());
         for (slots, sequences, expected) in [(None,8,(20,8,64)), (None,16,(20,16,128)),
@@ -405,10 +405,16 @@ mod tests {
                 188,crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             assert!(owned > 0 && scratch > 0);
         }
-        config.as_object_mut().unwrap().remove("speculators_model_type");
-        assert!(is_dspark(&config));
-        assert_eq!(flash_draft_capacity(&config,None,8).unwrap().block_rows,64);
-        assert!(draft_resident_bytes(&config,20,8,188,crate::families::qwen4::Qwen4KvCache::Bf16).is_ok());
+        let mut specforge = config["transformer_layer_config"].clone();
+        for field in ["architectures","block_size","markov_rank","markov_head_type",
+            "enable_confidence_head","confidence_head_with_markov"] {
+            specforge[field] = config[field].clone();
+        }
+        specforge["dflash_config"] = serde_json::json!({"projector_type":"dspark",
+            "mask_token_id":154856,"target_layer_ids":[19,27,31,35,39,43]});
+        assert!(is_dspark(&specforge));
+        assert_eq!(flash_draft_capacity(&specforge,None,8).unwrap().block_rows,64);
+        assert!(draft_resident_bytes(&specforge,20,8,188,crate::families::qwen4::Qwen4KvCache::Bf16).is_ok());
         assert!(flash_draft_capacity(&config,Some(0),8).is_err());
         assert!(flash_draft_capacity(&config,None,0).is_err());
     }
