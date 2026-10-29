@@ -43,7 +43,7 @@ impl EngramStagingShape {
         self.decode_slots() * EngramBatchStaging::storage_bytes(self.decode_rows()).expect("validated shape")
     }
     pub fn decode_host_workspace_bytes(self) -> usize {
-        EngramBatchStaging::worker_bytes(self.decode_rows()).expect("validated shape")
+        3 * EngramBatchStaging::worker_bytes(self.decode_rows()).expect("validated shape")
     }
     pub fn decode_host_bytes(self) -> usize { self.decode_host_resident_bytes() + self.decode_host_workspace_bytes() }
     pub fn prefetch_units(self) -> usize { self.units }
@@ -51,8 +51,8 @@ impl EngramStagingShape {
     pub fn host_resident_bytes(self) -> usize {
         self.host_slots() * EngramBatchStaging::storage_bytes(self.rows).expect("validated shape")
     }
-    pub fn host_workspace_bytes(self) -> usize { EngramBatchStaging::worker_bytes(self.rows).expect("validated shape") }
-    /// Exact persistent pool plus a documented upper bound for its one worker.
+    pub fn host_workspace_bytes(self) -> usize { 3 * EngramBatchStaging::worker_bytes(self.rows).expect("validated shape") }
+    /// Exact persistent pool plus preparation and two bounded finish workspaces.
     /// Decode has its own pool/worker, so concurrent decode cannot starve prefill.
     pub fn host_bytes(self) -> usize { self.host_resident_bytes() + self.host_workspace_bytes() }
     pub fn device_bytes(self) -> usize { self.units * self.rows * ENGRAM_DEVICE_ROW_BYTES }
@@ -168,14 +168,19 @@ impl EngramGatherer {
     fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>, decode: bool) -> Result<Self> {
         let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?
             .with_priority(if decode { crate::formats::mapped_table::ReadPriority::Decode } else { crate::formats::mapped_table::ReadPriority::Prefill });
-        let worker = TablePipeline::new("engram-gather", staging, move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
-            let started = Instant::now();
-            let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();
-            let view = staging.gather_on(&job.table, &batches, job.layer, Some(&gather))?;
-            let bytes = view.weights.len() + view.scales.len();
-            job.table.weights().stats().record_gather(view.rows * 24, bytes, started.elapsed(), [0; 3]);
-            Ok(())
-        }, EngramBatchStaging::copy_ready)
+        let worker = TablePipeline::split("engram-gather", staging,
+            move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
+                let started = Instant::now();
+                let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();
+                Ok((staging.prepare(&job.table, &batches, job.layer, Some(&gather))?, started))
+            },
+            |staging: &mut EngramBatchStaging, job: &EngramGatherJob, (prepared, started)| {
+                staging.finish(&job.table, prepared)?;
+                let view = staging.view()?;
+                let bytes = view.weights.len() + view.scales.len();
+                job.table.weights().stats().record_gather(view.rows * 24, bytes, started.elapsed(), [0; 3]);
+                Ok(())
+            }, EngramBatchStaging::copy_ready)
         .context("starting engram gather worker")?;
         Ok(Self { worker, capacity })
     }
@@ -293,8 +298,8 @@ mod lifecycle_tests {
             let n = shape.host_slots();
             assert_eq!(n, 4 * k);
             assert_eq!(shape.host_resident_bytes(), n * EngramBatchStaging::storage_bytes(rows)?);
-            assert_eq!(shape.host_bytes(), shape.host_resident_bytes() + rows * 24 * 1024 + (1 << 20));
-            assert_eq!(shape.decode_host_bytes(), 4 * EngramBatchStaging::storage_bytes(256)? + 256 * 24 * 1024 + (1 << 20));
+            assert_eq!(shape.host_bytes(), shape.host_resident_bytes() + 3 * (rows * 24 * 1024 + (1 << 20)));
+            assert_eq!(shape.decode_host_bytes(), 4 * EngramBatchStaging::storage_bytes(256)? + 3 * (256 * 24 * 1024 + (1 << 20)));
             assert_eq!(shape.device_bytes(), k * rows * ENGRAM_DEVICE_ROW_BYTES);
             assert_eq!(shape.validate_slots(n - 1), Err(EngramStagingError::Slots { required: n, available: n - 1 }));
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -870,34 +870,96 @@ fn spawned_gathers_complete_into_caller_storage() -> TestResult {
 #[ignore = "CPU residency overhead measurement, run in release mode on NVMe"]
 fn residency_overhead_measurement() -> TestResult {
     use std::hint::black_box;
-    let width = 256;
-    let rows = 1usize << 26;
-    let file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
-    // Sparse 16 GiB address space: random decode rows rarely share pages.
-    file.as_file().set_len((rows * width) as u64)?;
-    file.as_file().sync_all()?;
-    // SAFETY: immutable fixture survives every gather and mapping.
-    let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(), offset: 0, rows: rows as u64 }], u8_rows(width))? };
-    for count in [24, 384, 1536, 3072] {
-        let ids: Vec<_> = (0..count).map(|i| (i as u64 * 7919) % rows as u64).collect();
-        let mut output = vec![0; count * width];
-        table.gather_into(&ids, &mut output)?;
-        let repeats = 500;
-        let copying = Instant::now();
-        for _ in 0..repeats {
-            for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
-                slot.copy_from_slice(table.parts[0].row(row)?);
-            }
-            black_box(&output);
-        }
-        let copying = copying.elapsed();
-        let accounting = Instant::now();
-        for _ in 0..repeats { table.record_residency(black_box(&ids))?; }
-        let accounting = accounting.elapsed();
-        eprintln!("rows={count} repeats={repeats} copy_us={:.3} mincore_accounting_us={:.3}",
-            copying.as_secs_f64() * 1e6 / repeats as f64,
-            accounting.as_secs_f64() * 1e6 / repeats as f64);
+    let number = |name: &str, default: usize| -> std::result::Result<usize, Box<dyn std::error::Error>> {
+        Ok(std::env::var(name).ok().map(|value| value.parse()).transpose()?.unwrap_or(default))
+    };
+    let width = number("MAPPED_BENCH_WIDTH", 256)?;
+    let count = number("MAPPED_BENCH_ROWS", 121_465)?;
+    let repeats = number("MAPPED_BENCH_REPEATS", 10)?;
+    let offset = number("MAPPED_BENCH_OFFSET", 0)?;
+    assert!([256, 264].contains(&width) && count > 0 && repeats > 0);
+    let fixture = if std::env::var_os("MAPPED_BENCH_PATH").is_none() {
+        let file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+        file.as_file().set_len((1u64 << 26) * width as u64)?;
+        file.as_file().sync_all()?;
+        Some(file)
+    } else { None };
+    let path = std::env::var_os("MAPPED_BENCH_PATH").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fixture.as_ref().unwrap().path().into());
+    let length = std::fs::metadata(&path)?.len();
+    let rows = number("MAPPED_BENCH_TABLE_ROWS", ((length - offset as u64) / width as u64) as usize)?;
+    assert!(rows >= count && (rows as u64 * width as u64) <= length - offset as u64);
+    // SAFETY: the fixture or immutable checkpoint remains live throughout every gather.
+    let table = unsafe { MappedTable::open(&[TablePart { path: path.clone(), offset: offset as u64,
+        rows: rows as u64 }], u8_rows(width))? };
+    let ids: Vec<_> = (0..count).map(|i| (i as u64 * 7919) % rows as u64).collect();
+    let slots: Vec<_> = (0..count).collect();
+    let mut output = vec![0; count * width];
+    // Populate only the selected pages, not a whole hundred-GB table.
+    for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
+        slot.copy_from_slice(table.parts[0].row(row)?);
     }
+    table.gather_slots(&ids, &slots, &mut output)?;
+    let before = table.stats().snapshot();
+    let full = Instant::now();
+    for _ in 0..repeats { table.gather_slots(black_box(&ids), &slots, black_box(&mut output))?; }
+    let full = full.elapsed();
+    let delta = table.stats().snapshot().since(&before);
+    assert_eq!(delta.page_misses, 0, "warm benchmark must not measure table I/O");
+    assert_eq!(delta.late_major_faults, 0, "resident pages faulted during copies");
+    assert_eq!(delta.page_hits, (count * repeats) as u64);
+    if std::env::var_os("MAPPED_BENCH_WRAPPER").is_some() {
+        let gather = crate::shared::token_table::RowGather::new("mapped-bench", 16)?;
+        gather.gather_slots(&table, &ids, &slots, &mut output)?;
+        let before = table.stats().snapshot();
+        let wrapped = Instant::now();
+        for _ in 0..repeats {
+            gather.gather_slots(&table, black_box(&ids), &slots, black_box(&mut output))?;
+        }
+        let wrapped = wrapped.elapsed();
+        let wrapped_delta = table.stats().snapshot().since(&before);
+        assert_eq!(wrapped_delta.page_misses, 0, "wrapper benchmark must not measure table I/O");
+        assert_eq!(wrapped_delta.late_major_faults, 0);
+        assert_eq!(wrapped_delta.page_hits, (count * repeats) as u64);
+        eprintln!("mapped_wrapper backend={:?} rows={count} width={width} repeats={repeats} parallel={} direct_us={:.3} wrapped_us={:.3} residency_us={:.3} hits={} misses={} late_faults={}",
+            table.backend(), crate::shared::token_table::RowGather::parallel(count * width),
+            full.as_secs_f64() * 1e6 / repeats as f64, wrapped.as_secs_f64() * 1e6 / repeats as f64,
+            wrapped_delta.residency_ns as f64 / repeats as f64 / 1e3,
+            wrapped_delta.page_hits, wrapped_delta.page_misses, wrapped_delta.late_major_faults);
+    }
+    let copying = Instant::now();
+    for _ in 0..repeats {
+        for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
+            slot.copy_from_slice(table.parts[0].row(row)?);
+        }
+        black_box(&output);
+    }
+    let copying = copying.elapsed();
+    let accounting = Instant::now();
+    for _ in 0..repeats { table.record_residency(black_box(&ids))?; }
+    let accounting = accounting.elapsed();
+    // Isolate the residency page collection/sort/dedup from mincore and lookup.
+    let sorting = Instant::now();
+    for _ in 0..repeats {
+        let mut pages = Vec::with_capacity(count * 2);
+        for &row in &ids { pages.extend(table.parts[0].pages(row)?); }
+        pages.sort_unstable();
+        pages.dedup();
+        black_box(pages);
+    }
+    let sorting = sorting.elapsed();
+    let validation = Instant::now();
+    for _ in 0..repeats {
+        let mut unique = BTreeSet::new();
+        for &slot in &slots { black_box(unique.insert(slot)); }
+        black_box(unique);
+    }
+    let validation = validation.elapsed();
+    let us = |elapsed: Duration| elapsed.as_secs_f64() * 1e6 / repeats as f64;
+    eprintln!("mapped_bench path={} rows={count} table_rows={rows} width={width} repeats={repeats} full_us={:.3} residency_us={:.3} accounting_us={:.3} sort_dedup_us={:.3} validation_tree_us={:.3} copy_us={:.3} hits={} misses={} late_faults={}",
+        path.display(), us(full), delta.residency_ns as f64 / repeats as f64 / 1e3,
+        us(accounting), us(sorting), us(validation), us(copying), delta.page_hits,
+        delta.page_misses, delta.late_major_faults);
     Ok(())
 }
 
@@ -1096,5 +1158,81 @@ fn fully_preloaded_tables_never_start_the_process_reactor() -> TestResult {
     assert!(!table_reactor_started(), "private gathers do not need a reactor");
     assert_eq!(table_reactor_workspace_bytes(0), 0);
     assert_eq!(table_reactor_workspace_bytes(8), 18 << 20);
+    Ok(())
+}
+
+#[test]
+fn split_gathers_keep_priority_selection_after_finisher_admission() -> TestResult {
+    let (prepared_tx, prepared_rx) = mpsc::channel();
+    let (finishing_tx, finishing_rx) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = Arc::clone(&gate);
+    let worker = GatherWorker::split("split-priority", vec![0usize; 4],
+        move |_: &mut usize, job: &usize| { prepared_tx.send(*job).unwrap(); Ok::<_, ()>(()) },
+        move |_: &mut usize, job: &usize, ()| {
+            if *job <= 2 {
+                finishing_tx.send(*job).unwrap();
+                let released = blocked.0.lock().unwrap();
+                // Bound the gate even if an assertion unwinds before release.
+                let _ = blocked.1.wait_timeout_while(released, Duration::from_secs(5), |done| !*done).unwrap();
+            }
+            Ok(())
+        })?;
+    let mut tickets = Vec::new();
+    for job in 1..=2 {
+        tickets.push(worker.try_submit(job, false)?.unwrap());
+        assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, job);
+        assert_eq!(finishing_rx.recv_timeout(Duration::from_secs(5))?, job);
+    }
+    tickets.push(worker.try_submit(3, false)?.unwrap());
+    assert!(prepared_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    // No finisher permit exists: normal work must remain in the shared queue,
+    // rather than being hidden in the preparation owner's local variable.
+    assert_eq!(worker.queue.0.lock().unwrap().normal.len(), 1);
+    tickets.push(worker.try_submit_with(4, false, true)?.unwrap());
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 4);
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 3);
+    for ticket in &mut tickets {
+        assert!(matches!(ticket.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
+    }
+    Ok(())
+}
+
+#[test]
+fn split_gathers_prepare_second_before_first_finishes_and_bound_third() -> TestResult {
+    let (prepared_tx, prepared_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = Arc::clone(&gate);
+    let worker = GatherWorker::split("split-test", vec![0usize; 4],
+        move |_: &mut usize, job: &usize| { prepared_tx.send(*job).unwrap(); Ok::<_, ()>(()) },
+        move |slot: &mut usize, job: &usize, ()| {
+            finish_tx.send(*job).unwrap();
+            if *job == 1 {
+                let (lock, ready) = &*blocked;
+                let mut released = lock.lock().unwrap();
+                while !*released { released = ready.wait(released).unwrap(); }
+            }
+            *slot = *job;
+            Ok(())
+        })?;
+    let mut first = worker.try_submit(1, false)?.unwrap();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 1);
+    assert_eq!(finish_rx.recv_timeout(Duration::from_secs(5))?, 1);
+    let mut second = worker.try_submit(2, false)?.unwrap();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 2);
+    assert_eq!(finish_rx.recv_timeout(Duration::from_secs(5))?, 2);
+    let GatherPoll::Ready(second) = second.wait_timeout(Duration::from_secs(5)).unwrap() else { panic!("second cancelled") };
+    assert_eq!(second.slot(), Some(&2));
+    assert!(matches!(first.poll(), Ok(GatherPoll::Pending)));
+    let mut third = worker.try_submit(3, false)?.unwrap();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 3);
+    assert_eq!(finish_rx.recv_timeout(Duration::from_secs(5))?, 3);
+    assert!(matches!(third.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    assert!(matches!(first.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
     Ok(())
 }

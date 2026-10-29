@@ -802,24 +802,56 @@ impl MappedTable {
         self.gather_slots_priority(rows, slots, output, ReadPriority::Prefill)
     }
     pub fn gather_slots_priority(&self, rows: &[u64], slots: &[usize], output: &mut [u8], priority: ReadPriority) -> Result<()> {
+        let pending = self.prepare_gather(rows, slots, output, priority, 2)?;
+        pending.finish(self, output)
+    }
+
+    /// Copy hits now and submit only misses. The returned ticket owns its I/O
+    /// buffers/files, not the destination, so another table can start first.
+    pub(crate) fn prepare_gather(&self, rows: &[u64], slots: &[usize], output: &mut [u8],
+        priority: ReadPriority, window: usize) -> Result<PreparedTableGather> {
         if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
         let width = self.row_bytes();
         let mut unique = BTreeSet::new();
-        let reads: Vec<_> = rows.iter().zip(slots).map(|(&row, &slot)| {
+        let locations = rows.iter().zip(slots).map(|(&row, &slot)| {
             let (part, local) = self.locate(row)?;
             if slot.checked_add(1).and_then(|n| n.checked_mul(width)).is_none_or(|n| n > output.len())
                 || !unique.insert(slot) { return Err(invalid("invalid or overlapping gather slots")); }
-            Ok(uring::Read { part: &self.parts[part], row: local, slot })
-        }).collect::<Result<_>>()?;
+            Ok((part, local, slot))
+        }).collect::<Result<Vec<_>>>()?;
+        let mut prepared = PreparedTableGather { misses: Vec::new(), stream: None,
+            stats: Default::default(), output_len: output.len(), width };
         if self.resident.is_some() {
             for (&row, &slot) in rows.iter().zip(slots) {
                 output[slot * width..(slot + 1) * width].copy_from_slice(self.row(row)?);
             }
-            return Ok(());
+            return Ok(prepared);
         }
-        let stats = self.uring_reads(rows, &reads, output, false, priority)?;
-        self.stats.record_reads(stats, false);
-        Ok(())
+        let hits = self.residency(rows, false)?;
+        let before = thread_faults();
+        for ((part, row, slot), hit) in locations.into_iter().zip(hits) {
+            if hit {
+                output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
+                prepared.stats.hits += 1;
+                prepared.stats.hit_bytes += width as u64;
+            } else {
+                prepared.misses.push((part, row, slot));
+                prepared.stats.misses += 1;
+                prepared.stats.miss_bytes += width as u64;
+                prepared.stats.device_bytes_estimate += self.parts[part].pages(row)?.count() as u64 * self.parts[part].page_bytes as u64;
+            }
+        }
+        prepared.stats.resident_copy_rows = prepared.stats.hits;
+        prepared.stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
+        if !prepared.misses.is_empty() {
+            let reads = prepared.misses.iter().map(|&(part, row, slot)| reactor::Read {
+                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot }).collect();
+            match uring::start(reads, width, priority, window) {
+                Ok(stream) => prepared.stream = Some(stream),
+                Err(error) => self.uring_fallback(&error),
+            }
+        }
+        Ok(prepared)
     }
 
     /// mincore snapshots every requested page before copying any rows. Pages
@@ -1690,6 +1722,49 @@ impl GatherPool {
     }
 }
 
+/// Split-phase gather with no borrowed destination or mapping pointer. The
+/// table owner supplies the same immutable table and destination at completion.
+pub(crate) struct PreparedTableGather {
+    misses: Vec<(usize, u64, usize)>, stream: Option<reactor::ReadStream>,
+    stats: uring::ReadStats, output_len: usize, width: usize,
+}
+impl PreparedTableGather {
+    pub(crate) fn step(&mut self, table: &MappedTable, output: &mut [u8]) -> Result<bool> {
+        if output.len() != self.output_len || table.row_bytes() != self.width {
+            return Err(invalid("prepared gather destination changed"));
+        }
+        if let Some(stream) = &mut self.stream {
+            if let Err(error) = stream.step(output) {
+                // Drop drains submitted reads before mmap fallback or storage reuse.
+                drop(self.stream.take());
+                table.uring_fallback(&error);
+            } else if !stream.finished() { return Ok(false); }
+            else {
+                let stats = stream.stats();
+                self.stats.miss_ns = stats.miss_ns;
+                self.stats.miss_max_ns = stats.miss_max_ns;
+                self.stats.miss_histogram = stats.miss_histogram;
+                table.stats.record_reads(self.stats, false);
+                self.misses.clear();
+                self.stream = None;
+                self.stats = Default::default();
+                return Ok(true);
+            }
+        }
+        for &(part, row, slot) in &self.misses {
+            output[slot * self.width..(slot + 1) * self.width].copy_from_slice(table.parts[part].row(row)?);
+        }
+        table.stats.record_reads(self.stats, false);
+        self.misses.clear();
+        self.stats = Default::default();
+        Ok(true)
+    }
+    pub(crate) fn finish(mut self, table: &MappedTable, output: &mut [u8]) -> Result<()> {
+        while !self.step(table, output)? {}
+        Ok(())
+    }
+}
+
 /// Recorded only when the job was submitted with timing (trace enabled).
 #[derive(Debug, Clone, Copy)]
 pub struct GatherTiming {
@@ -1924,6 +1999,24 @@ struct GatherQueues<S: Send + 'static, J, E> {
 }
 type GatherQueue<S, J, E> = Arc<(Mutex<GatherQueues<S, J, E>>, std::sync::Condvar)>;
 
+struct GatherPermit(Arc<(Mutex<usize>, std::sync::Condvar)>);
+impl GatherPermit {
+    fn acquire(state: Arc<(Mutex<usize>, std::sync::Condvar)>) -> Self {
+        let (lock, available) = &*state;
+        let mut free = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *free == 0 { free = available.wait(free).unwrap_or_else(|p| p.into_inner()); }
+        *free -= 1;
+        drop(free);
+        Self(state)
+    }
+}
+impl Drop for GatherPermit {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.0.1.notify_one();
+    }
+}
+
 /// Bounded background gathers into a fixed pool of reusable staging slots:
 /// the pool bounds queued, in-flight and completed-but-unconsumed storage, and
 /// submission never waits (None is backpressure). Priority submissions run
@@ -1931,6 +2024,7 @@ type GatherQueue<S, J, E> = Arc<(Mutex<GatherQueues<S, J, E>>, std::sync::Condva
 pub struct GatherWorker<S: Send + 'static, J: Send + 'static, E: Send + 'static> {
     queue: GatherQueue<S, J, E>,
     worker: Option<JoinHandle<()>>,
+    finishers: Vec<JoinHandle<()>>,
     slots: Arc<GatherSlots<S>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -1999,7 +2093,85 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
                 }
             })
             .map_err(|source| MappedTableError::Io { context: format!("starting {name}"), source })?;
-        Ok(Self { queue, worker: Some(worker), slots, shutdown })
+        Ok(Self { queue, worker: Some(worker), finishers: Vec::new(), slots, shutdown })
+    }
+
+    /// One ordered preparation owner and two persistent completion workers.
+    /// The permit is held from preparation through completion, so at most two
+    /// jobs may own miss windows, independent of queued staging capacity.
+    pub(crate) fn split<P: Send + 'static>(name: &str, staging: Vec<S>,
+        mut prepare: impl FnMut(&mut S, &J) -> std::result::Result<P, E> + Send + 'static,
+        finish: impl Fn(&mut S, &J, P) -> std::result::Result<(), E> + Send + Sync + 'static) -> Result<Self> {
+        if staging.is_empty() { return Err(invalid("a gather worker needs at least one staging slot")); }
+        let slots = Arc::new(GatherSlots { free: Mutex::new(staging), admission: GatherAdmission::default(),
+            stopped: AtomicBool::new(false) });
+        let queue: GatherQueue<S, J, E> = Arc::new((Mutex::new(GatherQueues {
+            priority: Default::default(), normal: Default::default(), closed: false }), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let permits = Arc::new((Mutex::new(2usize), std::sync::Condvar::new()));
+        let (send, receive) = mpsc::sync_channel::<(WorkerJob<S, J, E>, P, GatherPermit, Option<Instant>)>(2);
+        let receive = Arc::new(Mutex::new(receive));
+        let finish = Arc::new(finish);
+        let mut finishers = Vec::new();
+        for index in 0..2 {
+            let (receive, finish, slots, stopping) = (Arc::clone(&receive), Arc::clone(&finish), Arc::clone(&slots), Arc::clone(&shutdown));
+            finishers.push(thread::Builder::new().name(format!("{name}-finish-{index}")).spawn(move || {
+                let _exit = GatherWorkerExit(slots);
+                loop {
+                    let item = receive.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                    let Ok((mut job, prepared, _permit, started)) = item else { break; };
+                    let before = job.submitted.and_then(|_| thread_faults());
+                    let result = if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
+                        drop(prepared);
+                        let _ = job.completion.send(Ok(None));
+                        continue;
+                    } else { finish(job.lease.slot.as_mut().expect("admitted staging"), &job.lease.job, prepared) };
+                    if let (Some(submitted), Some(started)) = (job.submitted, started) {
+                        let completed = Instant::now();
+                        let faults = thread_faults_since(before);
+                        job.lease.timing = Some(GatherTiming { queued: started.duration_since(submitted),
+                            gather: completed.duration_since(started), completed,
+                            minor_faults: faults[0], major_faults: faults[1], input_blocks: faults[2] });
+                    }
+                    let result = if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
+                        Ok(None)
+                    } else { result.map(|()| Some(job.lease)) };
+                    let _ = job.completion.send(result);
+                }
+            }).map_err(|source| MappedTableError::Io { context: format!("starting {name} finisher"), source })?);
+        }
+        let (jobs, worker_slots, stopping) = (Arc::clone(&queue), Arc::clone(&slots), Arc::clone(&shutdown));
+        let worker = thread::Builder::new().name(name.into()).spawn(move || {
+            let _exit = GatherWorkerExit(worker_slots);
+            loop {
+                // Keep queued jobs visible to priority admission while both
+                // finishers own their permits; choose only after one returns.
+                let permit = GatherPermit::acquire(Arc::clone(&permits));
+                let mut job = {
+                    let (lock, ready) = &*jobs;
+                    let mut queues = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(job) = queues.priority.pop_front().or_else(|| queues.normal.pop_front()) { break job; }
+                        if queues.closed { return; }
+                        queues = ready.wait(queues).unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+                if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
+                    let _ = job.completion.send(Ok(None));
+                    continue;
+                }
+                let started = job.submitted.map(|_| Instant::now());
+                // Fault counters are per-thread; finishers measure their own
+                // work rather than subtracting the preparation owner's values.
+                match prepare(job.lease.slot.as_mut().expect("admitted staging"), &job.lease.job) {
+                    Ok(prepared) => {
+                        if send.send((job, prepared, permit, started)).is_err() { return; }
+                    },
+                    Err(error) => { let _ = job.completion.send(Err(error)); },
+                }
+            }
+        }).map_err(|source| MappedTableError::Io { context: format!("starting {name} preparation"), source })?;
+        Ok(Self { queue, worker: Some(worker), finishers, slots, shutdown })
     }
 
     /// Submit early, when row ids become available. None is bounded
@@ -2099,6 +2271,9 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> Drop for GatherWor
             if worker.join().is_err() {
                 tracing::error!("gather worker panicked during shutdown");
             }
+        }
+        for worker in self.finishers.drain(..) {
+            if worker.join().is_err() { tracing::error!("gather finisher panicked during shutdown"); }
         }
     }
 }

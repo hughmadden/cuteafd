@@ -169,7 +169,7 @@ impl EngramPipeline {
             "mapped scale preload admission");
         for table in &tables {
             table.weights().prepare_reads();
-            table.scales().prepare_reads();
+            if let Some(scales) = table.scales() { scales.prepare_reads(); }
         }
         let tables = tables.map(Arc::new);
         Ok(Self {

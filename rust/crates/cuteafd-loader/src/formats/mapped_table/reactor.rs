@@ -11,7 +11,7 @@ pub(super) const BUFFER_BYTES: usize = 1 << 20;
 const WAKE: u64 = u64::MAX;
 
 #[derive(Clone)]
-pub(super) struct Read { pub file: Arc<File>, pub offset: u64 }
+pub(super) struct Read { pub file: Arc<File>, pub offset: u64, pub slot: usize }
 #[derive(Default)]
 struct Buffer { bytes: Vec<u8>, reads: Vec<Read> }
 struct Reply { buffer: Buffer, result: Result<uring::ReadStats> }
@@ -75,86 +75,118 @@ pub(super) fn global() -> Result<Arc<Reactor>> {
     *global = Some(Arc::clone(&reactor));
     Ok(reactor)
 }
+/// Owns every submitted buffer until its CQEs have drained. A split gather
+/// never lends its caller's destination to the reactor.
+pub(super) struct ReadStream {
+    owner: Arc<Reactor>, reads: Vec<Read>, next: usize, width: usize,
+    priority: ReadPriority, window: usize, pending: VecDeque<mpsc::Receiver<Reply>>,
+    stats: uring::ReadStats,
+}
 impl Reactor {
     pub(super) fn ready(&self) -> bool { self.shared.ready.load(Ordering::Acquire) }
 
-    pub(super) fn read(&self, reads: &[uring::Read<'_>], output: &mut [u8], width: usize,
+    pub(super) fn start(self: &Arc<Self>, reads: Vec<Read>, width: usize,
+        priority: ReadPriority, window: usize) -> Result<ReadStream> {
+        if width == 0 || width > BUFFER_BYTES || !(1..=2).contains(&window) {
+            return Err(invalid("table reactor row/window exceeds buffer budget"));
+        }
+        let mut stream = ReadStream { owner: Arc::clone(self), reads, next: 0, width,
+            priority, window, pending: VecDeque::new(), stats: Default::default() };
+        stream.fill()?;
+        Ok(stream)
+    }
+    pub(super) fn read(self: &Arc<Self>, reads: &[uring::Read<'_>], output: &mut [u8], width: usize,
         priority: ReadPriority) -> Result<uring::ReadStats> {
-        if width == 0 || width > BUFFER_BYTES { return Err(invalid("table reactor row exceeds buffer budget")); }
-        let decode = priority == ReadPriority::Decode;
-        let mut stats = uring::ReadStats::default();
-        let mut failure = None;
-        // Stream arbitrarily large gathers with a two-buffer window. Returning
-        // one buffer never drains the entire submission pipeline.
-        let mut chunks = reads.chunks(uring::MAX_BATCH.min(BUFFER_BYTES / width)).peekable();
-        let mut pending = VecDeque::new();
-        while chunks.peek().is_some() || !pending.is_empty() {
-          'fill: while chunks.peek().is_some() && pending.len() < 2 {
-            let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let reads = reads.iter().map(|read| Read { file: Arc::clone(&read.part.file),
+            offset: read.part.file_offset + read.row * width as u64, slot: read.slot }).collect();
+        let mut stream = self.start(reads, width, priority, 2)?;
+        while !stream.finished() { stream.step(output)?; }
+        Ok(stream.stats)
+    }
+}
+impl ReadStream {
+    fn fill(&mut self) -> Result<()> {
+        let shared = &self.owner.shared;
+        let decode = self.priority == ReadPriority::Decode;
+        while self.next < self.reads.len() && self.pending.len() < self.window {
+            let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
             if decode { queue.decode_waiters += 1; }
             while queue.borrowed == SLOTS || (!decode &&
                 (queue.prefill_borrowed == SLOTS - DECODE_SLOTS || queue.decode_waiters > 0)) {
-                if !pending.is_empty() {
+                if !self.pending.is_empty() {
                     if decode { queue.decode_waiters -= 1; }
-                    break 'fill;
+                    return Ok(());
                 }
-                if self.shared.failed.load(Ordering::Acquire) {
+                if shared.failed.load(Ordering::Acquire) {
                     if decode { queue.decode_waiters -= 1; }
                     return Err(invalid("table read reactor owner exited"));
                 }
-                queue = self.shared.available.wait(queue).unwrap_or_else(|p| p.into_inner());
+                queue = shared.available.wait(queue).unwrap_or_else(|p| p.into_inner());
             }
             if decode { queue.decode_waiters -= 1; } else { queue.prefill_borrowed += 1; }
             queue.borrowed += 1;
             let mut buffer = queue.buffers.pop().unwrap_or_default();
             drop(queue);
-            let chunk = chunks.next().expect("pending chunk");
+            let end = (self.next + uring::MAX_BATCH.min(BUFFER_BYTES / self.width)).min(self.reads.len());
             if buffer.bytes.is_empty() { buffer.bytes.resize(BUFFER_BYTES, 0); }
             buffer.reads.clear();
-            buffer.reads.extend(chunk.iter().map(|read| Read { file: Arc::clone(&read.part.file),
-                offset: read.part.file_offset + read.row * width as u64 }));
+            buffer.reads.extend_from_slice(&self.reads[self.next..end]);
+            self.next = end;
             let (send, receive) = mpsc::sync_channel(1);
-            let request = Request { buffer, width, priority, reply: send };
+            let request = Request { buffer, width: self.width, priority: self.priority, reply: send };
             {
-                let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-                if self.shared.failed.load(Ordering::Acquire) {
+                let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+                if shared.failed.load(Ordering::Acquire) {
                     let _ = request.reply.send(Reply { buffer: request.buffer,
                         result: Err(invalid("table read reactor owner exited")) });
                 } else if decode { queue.decode.push_back(request); } else { queue.prefill.push_back(request); }
             }
-            // A nonblocking eventfd is latched even when the owner is between
-            // inspecting queues and arming PollAdd. No polling or lost wakeup.
-            if let Err(error) = signal(&self.shared.wake) {
+            self.pending.push_back(receive);
+            // Latched eventfd closes the inspect/arm race without polling.
+            if let Err(error) = signal(&shared.wake) {
                 tracing::error!(%error, "cannot wake table reactor; refusing an unbounded wait");
                 std::process::abort();
             }
-            pending.push_back((chunk, receive));
-          }
-            let (chunk, receive) = pending.pop_front().expect("submitted read batch");
-            let reply = receive.recv().map_err(|_| invalid("table read reactor exited"))?;
-            let result = reply.result;
-            if result.is_ok() {
-                for (read, bytes) in chunk.iter().zip(reply.buffer.bytes.chunks_exact(width)) {
-                    output[read.slot * width..(read.slot + 1) * width].copy_from_slice(bytes);
-                }
-            }
-            let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-            let mut buffer = reply.buffer;
-            buffer.reads.clear();
-            queue.buffers.push(buffer);
-            queue.borrowed -= 1;
-            if !decode { queue.prefill_borrowed -= 1; }
-            self.shared.available.notify_all();
-            drop(queue);
-            let batch = match result {
-                Ok(batch) => batch,
-                Err(error) => { failure.get_or_insert(error); chunks.by_ref().for_each(drop); continue; }
-            };
-            stats.miss_ns += batch.miss_ns;
-            stats.miss_max_ns = stats.miss_max_ns.max(batch.miss_max_ns);
-            for (total, value) in stats.miss_histogram.iter_mut().zip(batch.miss_histogram) { *total += value; }
         }
-        failure.map_or(Ok(stats), Err)
+        Ok(())
+    }
+    pub(super) fn finished(&self) -> bool { self.next == self.reads.len() && self.pending.is_empty() }
+    pub(super) fn stats(&self) -> uring::ReadStats { self.stats }
+    fn release(&self, mut buffer: Buffer) {
+        buffer.reads.clear();
+        let mut queue = self.owner.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        queue.buffers.push(buffer);
+        queue.borrowed -= 1;
+        if self.priority == ReadPriority::Prefill { queue.prefill_borrowed -= 1; }
+        self.owner.shared.available.notify_all();
+    }
+    pub(super) fn step(&mut self, output: &mut [u8]) -> Result<()> {
+        self.fill()?;
+        let Some(receive) = self.pending.pop_front() else { return Ok(()); };
+        let reply = receive.recv().map_err(|_| invalid("table read reactor exited"))?;
+        if reply.result.is_ok() {
+            for (read, bytes) in reply.buffer.reads.iter().zip(reply.buffer.bytes.chunks_exact(self.width)) {
+                output[read.slot * self.width..(read.slot + 1) * self.width].copy_from_slice(bytes);
+            }
+        }
+        self.release(reply.buffer);
+        let batch = reply.result?;
+        self.stats.miss_ns += batch.miss_ns;
+        self.stats.miss_max_ns = self.stats.miss_max_ns.max(batch.miss_max_ns);
+        for (total, value) in self.stats.miss_histogram.iter_mut().zip(batch.miss_histogram) { *total += value; }
+        self.fill()
+    }
+}
+impl Drop for ReadStream {
+    fn drop(&mut self) {
+        // Cancellation and errors drain already owned reads, never refill. No
+        // channel receiver or buffer credit is abandoned while the kernel runs.
+        while let Some(receive) = self.pending.pop_front() {
+            match receive.recv() {
+                Ok(reply) => self.release(reply.buffer),
+                Err(_) => std::process::abort(),
+            }
+        }
     }
 }
 
@@ -405,6 +437,25 @@ mod tests {
     }
 
     #[test]
+    fn two_prefill_windows_allow_decode_and_recycle_on_cancellation() -> Result<()> {
+        let owner = global()?;
+        if !owner.ready() { return Ok(()); }
+        let file = Arc::new(File::open("/dev/zero").map_err(|source| error("test zero", source))?);
+        let reads = || (0..8192).map(|slot| Read { file: Arc::clone(&file), offset: 0, slot }).collect();
+        let first = owner.start(reads(), 1, ReadPriority::Prefill, 2)?;
+        let second = owner.start(reads(), 1, ReadPriority::Prefill, 2)?;
+        // Hold both finishers' completed-but-unreaped windows. Decode must
+        // acquire and complete without either prefill caller making progress.
+        let mut decode = owner.start(vec![Read { file, offset: 0, slot: 0 }], 1, ReadPriority::Decode, 2)?;
+        let mut output = [255];
+        while !decode.finished() { decode.step(&mut output)?; }
+        assert_eq!(output, [0]);
+        assert!(4 < SLOTS - DECODE_SLOTS);
+        drop((first, second, decode));
+        Ok(())
+    }
+
+    #[test]
     fn scheduling_reserves_decode_capacity_and_completes_abandoned_replies() -> Result<()> {
         // This isolated engine uses no global owner and is dropped after draining.
         let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
@@ -413,7 +464,7 @@ mod tests {
         let request = |priority, count| {
             let (reply, receiver) = mpsc::sync_channel(1);
             drop(receiver); // caller cancellation must never free in-flight storage
-            let buffer = Buffer { bytes: vec![0; count], reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0 }).collect() };
+            let buffer = Buffer { bytes: vec![0; count], reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0 }).collect() };
             Job { request: Request { buffer, width: 1, priority, reply }, next: 0, left: count, error: None, stats: Default::default() }
         };
         let limit = engine.active.len();
@@ -444,7 +495,7 @@ mod tests {
         supervise(&shared, || panic!("injected owner panic"));
         assert!(reply.recv_timeout(Duration::from_secs(1)).unwrap().result.is_err());
         assert!(!shared.ready.load(Ordering::Acquire));
-        let owner = Reactor { shared };
+        let owner = Arc::new(Reactor { shared });
         let file = tempfile::NamedTempFile::new().map_err(|source| error("test file", source))?;
         file.as_file().set_len(1).map_err(|source| error("test file size", source))?;
         // SAFETY: immutable file remains live until the rejected request returns.
@@ -463,7 +514,7 @@ mod tests {
         let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
         let (send, _reply) = mpsc::sync_channel(1);
         engine.jobs[0] = Some(Job { request: Request { buffer: Buffer { bytes: vec![0; 2],
-            reads: vec![Read { file, offset: 0 }] }, width: 2, priority: ReadPriority::Decode, reply: send },
+            reads: vec![Read { file, offset: 0, slot: 0 }] }, width: 2, priority: ReadPriority::Decode, reply: send },
             next: 1, left: 1, error: None, stats: Default::default() });
         let first = Instant::now() - Duration::from_millis(20);
         engine.retry.push_back(Active { job: 0, row: 0, done: 1, submitted: first });
@@ -489,7 +540,7 @@ mod tests {
         let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
         let request = |priority, rows| {
             let (reply, receiver) = mpsc::sync_channel(1);
-            let buffer = Buffer { bytes: vec![0; rows], reads: (0..rows).map(|_| Read { file: Arc::clone(&file), offset: 0 }).collect() };
+            let buffer = Buffer { bytes: vec![0; rows], reads: (0..rows).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0 }).collect() };
             (Request { buffer, width: 1, priority, reply }, receiver)
         };
         let (prefill, _prefill_reply) = request(ReadPriority::Prefill, engine.active.len() * 2);

@@ -10,6 +10,7 @@ pub const PARALLEL_GATHER_BYTES: usize = 1 << 20;
 pub struct RowGather { pool: GatherPool, priority: crate::formats::mapped_table::ReadPriority }
 impl RowGather {
     pub fn new(name: &str, threads: usize) -> Result<Self> { Ok(Self { pool: GatherPool::new(name, threads)?, priority: Default::default() }) }
+    pub(crate) fn priority(&self) -> crate::formats::mapped_table::ReadPriority { self.priority }
     pub fn with_priority(mut self, priority: crate::formats::mapped_table::ReadPriority) -> Self { self.priority = priority; self }
     pub fn parallel(bytes: usize) -> bool { bytes >= PARALLEL_GATHER_BYTES }
     pub fn gather(&self, table: &MappedTable, rows: &[u64], output: &mut [u8]) -> Result<()> {
@@ -151,6 +152,14 @@ impl<S: Send + 'static, J: Send + 'static> TablePipeline<S, J> {
         copy_ready: fn(&mut S) -> Result<bool>) -> Result<Self> {
         let capacity = slots.len();
         Ok(Self { worker: GatherWorker::new(name, slots, gather)?, copies: Mutex::new(CopyPool::new(capacity)), copy_ready })
+    }
+    pub(crate) fn split<P: Send + 'static>(name: &str, slots: Vec<S>,
+        prepare: impl FnMut(&mut S, &J) -> Result<P> + Send + 'static,
+        finish: impl Fn(&mut S, &J, P) -> Result<()> + Send + Sync + 'static,
+        copy_ready: fn(&mut S) -> Result<bool>) -> Result<Self> {
+        let capacity = slots.len();
+        Ok(Self { worker: GatherWorker::split(name, slots, prepare, finish)?,
+            copies: Mutex::new(CopyPool::new(capacity)), copy_ready })
     }
     pub fn reclaim_copies(&self) -> Result<()> {
         self.copies.lock().unwrap_or_else(|p| p.into_inner()).reclaim(|lease|

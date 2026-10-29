@@ -108,6 +108,12 @@ pub(super) fn probe(_part: &MappedRows) -> Result<bool> {
     Ok(false)
 }
 
+pub(super) fn start(reads: Vec<reactor::Read>, width: usize, priority: ReadPriority,
+    window: usize) -> Result<reactor::ReadStream> {
+    setup_error()?;
+    reactor::global()?.start(reads, width, priority, window)
+}
+
 pub(super) fn gather(reads: &[Read<'_>], output: &mut [u8], width: usize,
     resident: &[Option<bool>]) -> Result<ReadStats> {
     gather_priority(reads, output, width, resident, ReadPriority::Prefill)
