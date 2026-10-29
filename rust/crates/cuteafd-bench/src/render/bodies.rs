@@ -323,11 +323,12 @@ impl<'a> View<'a> {
         }
         y += row(doc, t, 0.0, y, w, "Speculator", &c.speculator_label());
         y += row(doc, t, 0.0, y, w, "Thinking", c.thinking_label());
-        y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity().line());
+        y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity_line());
         if let Some(layout) = &c.layout {
             y += row(doc, t, 0.0, y, w, "Layout", layout);
         }
-        let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str()))
+        let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
+            && s.name != "rtx-expert-layers")
             .map(|s| s.chip()).collect();
         doc.text(0.0, y + 14.0, Font::new(10.0, t.muted).spacing(1.2), "OPTIONS");
         if options.is_empty() {
@@ -395,7 +396,7 @@ impl<'a> View<'a> {
                 &format!("{warn}{}", rate(d.tok_s)));
         }
         let extra = by;
-        doc.text(0.0, 102.0 + extra, Font::new(11.0, t.ink2), &fit(&self.report.capacity().line(), 11.0, w));
+        doc.text(0.0, 102.0 + extra, Font::new(11.0, t.ink2), &fit(&self.report.capacity_line(), 11.0, w));
         // Quick quality.
         let mut y = 116.0 + extra;
         doc.line(0.0, y, w, y, t.line, 1.0);

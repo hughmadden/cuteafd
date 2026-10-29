@@ -722,6 +722,7 @@ impl Opened {
         } else { args.pool_tokens };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
+        cuteafd_bench::context::set_rtx_expert_layers(0);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
         engine.prefill_shape = prefill_shape;

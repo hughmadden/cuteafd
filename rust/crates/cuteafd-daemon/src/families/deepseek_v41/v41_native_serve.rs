@@ -579,6 +579,7 @@ fn worker(
         projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
         "shared V4.1 cache and expert admission");
     let local_layers = pool.placement.onboard_layers;
+    cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
     let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity,
         topology)?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;

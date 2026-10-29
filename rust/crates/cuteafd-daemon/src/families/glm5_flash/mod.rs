@@ -1647,7 +1647,7 @@ impl Opened {
             "attention_first_owner": attention.first_owner,
             "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
         }), "GLM Flash startup plan");
-        cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
+        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         Ok((placement, graphs, working))
     }
 

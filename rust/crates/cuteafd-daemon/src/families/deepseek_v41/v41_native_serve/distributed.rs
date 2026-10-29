@@ -413,6 +413,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     second.bind_execution_plan(&pool.placement)?;
     for slot in &mut slot_passes { slot.bind_execution_plan(&pool.placement)?; }
     let expert_layers=pool.placement.onboard_layers;
+    cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
     let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
     let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub(ffn_arenas as u64) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,

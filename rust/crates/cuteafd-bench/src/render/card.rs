@@ -5,10 +5,35 @@ use super::bodies::{self, chips, content_color, LOGO, LOGO_ASPECT};
 use super::svg::{fit, text_width, Anchor, Doc, Font};
 use super::{grouped, rate, seconds, Theme};
 use crate::context::DEPLOYMENT;
-use crate::report::Report;
+use crate::report::{Report, Setting};
 
 pub const WIDTH: f64 = 1200.0;
 pub const HEIGHT: f64 = 675.0;
+
+// Approximate performance impact, highest first. Stable sorting preserves
+// configuration order within each tier; measured power-cap evidence is prepended.
+const CHIP_PRIORITY: &[&[&str]] = &[
+    &["POWER-CAPPED"],
+    &["draft", "dspark", "speculat", "mtp", "CUTEAFD_DRAFT_"],
+    &["prefill-", "CUTEAFD_PREFILL_"],
+    &["max-sequences", "concurrency", "pool-tokens"],
+    &["attention-", "kv-", "split-device", "split_device"],
+    &["rtx-", "route-"],
+    &["*graph*"],
+    &["host-cache-", "prefix-cache-"],
+    &["*"],
+    &["api-key", "usage", "console-", "CUTEAFD_CONSOLE_", "CUTEAFD_FIDELITY_CACHE", "enable-bench"],
+];
+
+fn chip_priority(setting: &Setting) -> usize {
+    let name = setting.name.as_str();
+    // Match the plumbing tier before the catch-all tier.
+    CHIP_PRIORITY.iter().enumerate().filter(|(_, patterns)| !patterns.contains(&"*"))
+        .find(|(_, patterns)| patterns.iter().any(|pattern| match *pattern {
+            "*graph*" => name.contains("graph"),
+            prefix => name.starts_with(prefix),
+        })).map_or_else(|| CHIP_PRIORITY.iter().position(|tier| tier.contains(&"*")).unwrap(), |(rank, _)| rank)
+}
 
 pub fn card_svg(report: &Report) -> String {
     let t = Theme::for_report(report.quality_failed());
@@ -88,6 +113,9 @@ pub fn card_svg(report: &Report) -> String {
     }
     // Hardware, options, build and badge.
     let hw = &r.server.hardware;
+    if let Some(health) = crate::fabric::health_header(&r.fabric) {
+        doc.text(pad, 516.0, Font::new(12.0, t.ink2), &fit(&health, 12.0, WIDTH - 2.0 * pad));
+    }
     let hardware = r.server.hardware_line();
     let fabric = crate::fabric::header(&r.fabric);
     let rail_width = fabric.as_ref().map_or(0.0, |line| line.chars().count() as f64 * 8.5 + 24.0);
@@ -95,23 +123,24 @@ pub fn card_svg(report: &Report) -> String {
     if let Some(fabric) = fabric {
         doc.text(WIDTH - pad, 538.0, Font::new(13.0, t.ink2).anchor(Anchor::End), &fabric);
     }
-    doc.text(pad, 560.0, Font::new(13.0, t.ink2), &fit(&r.capacity().line(), 13.0, WIDTH - 2.0 * pad));
+    doc.text(pad, 560.0, Font::new(13.0, t.ink2), &fit(&r.capacity_line(), 13.0, WIDTH - 2.0 * pad));
     // Publication evidence belongs in the full report, not the fixed-height option strip.
-    let mut options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
+    let mut settings: Vec<_> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
         && !s.name.starts_with("provenance.") && !s.name.starts_with("qualification.")
         && !(s.name == "pool-tokens" && matches!(s.value.as_deref(), Some("0" | "auto")))
-        && s.name != "supersedes-checkpoint")
-        .map(|s| s.chip()).collect();
+        && !matches!(s.name.as_str(), "supersedes-checkpoint" | "rtx-expert-layers"))
+        .collect();
+    settings.sort_by_key(|s| chip_priority(s));
+    let mut options: Vec<String> = settings.into_iter().map(Setting::chip).collect();
     if let Some(power) = hw.power.as_ref().filter(|power| power.capped()) {
         // Report the longest per-GPU evidence, not a sum of GPU-seconds.
         let capped = power.gpus.iter().map(|gpu| gpu.cap_seconds).fold(0.0, f64::max);
         options.insert(0, format!("POWER-CAPPED {}", seconds(capped)));
     }
-    let health = crate::fabric::health_header(&r.fabric);
-    // Reserve the second option row for health evidence when available.
+    // Both option rows remain available regardless of fabric health evidence.
     let omitted = |items: &[String]| {
         let mut probe = Doc::new(WIDTH, HEIGHT);
-        chips(&mut probe, &t, pad, 572.0, WIDTH - 2.0 * pad, items, t.series[2]) > if health.is_some() { 22.0 } else { 46.0 }
+        chips(&mut probe, &t, pad, 572.0, WIDTH - 2.0 * pad, items, t.series[2]) > 46.0
     };
     let total = options.len();
     while omitted(&options) {
@@ -129,9 +158,6 @@ pub fn card_svg(report: &Report) -> String {
         }
     }
     chips(&mut doc, &t, pad, 572.0, WIDTH - 2.0 * pad, &options, t.series[2]);
-    if let Some(health) = health {
-        doc.text(pad, 614.0, Font::new(12.0, t.ink2), &fit(&health, 12.0, WIDTH - 2.0 * pad));
-    }
     let b = &r.server.build;
     let mut build = format!("build {}", b.label());
     if let Some(remote) = &b.remote {

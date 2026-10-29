@@ -681,6 +681,23 @@ impl Capacity {
 }
 
 impl Report {
+    /// Resolved onboard count belongs beside capacity, not among tuning chips.
+    /// Old reports and GPU-only cards do not imply a zero onboard count.
+    pub fn capacity_line(&self) -> String {
+        let capacity = self.capacity();
+        let line = capacity.line();
+        let onboard = (!self.server.hardware.sparks.is_empty()).then(|| {
+            self.server.configuration.settings.iter()
+                .find(|s| s.name == "rtx-expert-layers" && s.source == "resolved")
+                .and_then(|s| s.value.as_ref()?.parse::<usize>().ok())
+        }).flatten();
+        let Some(count) = onboard else { return line };
+        let mut parts: Vec<_> = line.split(" · ").filter(|part| !part.is_empty()).map(str::to_owned).collect();
+        // Keep placement visible even if a verbose KV format needs truncating.
+        parts.insert(usize::from(capacity.kv_tokens.is_some()), format!("{count} RTX expert layers"));
+        parts.join(" · ")
+    }
+
     /// The capacity of the baseline, else what the options say.
     pub fn capacity(&self) -> Capacity {
         self.baseline.as_ref().and_then(|b| b.card.capacity.clone())
