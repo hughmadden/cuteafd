@@ -188,7 +188,7 @@ fn every_ring_bounds_its_io_wq_workers() -> TestResult {
         eprintln!("SKIP io-wq bounds: kernel/seccomp disallows io_uring");
         return Ok(());
     }
-    assert_eq!(uring::ring_worker_bounds()?, [uring::IOWQ_MAX_WORKERS; 2]);
+    assert_eq!(uring::ring_worker_bounds()?, [32; 2]);
     Ok(())
 }
 

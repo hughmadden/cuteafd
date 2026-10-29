@@ -7,14 +7,13 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub(super) const MAX_BATCH: usize = 4096;
-/// io-wq workers per ring, bounded and unbound. A miss that NOWAIT cannot
-/// serve runs on an io-wq worker, and the kernel default allows up to
-/// min(entries, 4 x CPUs) of them for each submitting thread. Cold Engram
-/// rows read through FUSE once grew one coordinator to its container slice's
-/// 16,384-task limit, and unrelated thread spawns then failed with EAGAIN.
-/// Eight per ring still keeps hundreds of misses in flight across the
-/// gather pools.
-pub(super) const IOWQ_MAX_WORKERS: u32 = 8;
+/// io-wq workers per ring, bounded and unbound. Each cold FUSE read blocks a
+/// worker, but the connection's max_background (128 on raptor) and store
+/// daemon (~250 threads) bound useful depth. More workers consume the
+/// container's pids budget, not useful depth: cold reads once exhausted its
+/// 16,384-task limit. Thirty-two per ring leaves ample in-flight reads across
+/// gather pools. Deep O_DIRECT/native store I/O is separate from these reads.
+pub(super) const IOWQ_MAX_WORKERS: u32 = 32;
 thread_local! { static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) }; }
 #[cfg(test)]
 thread_local! { static SETUP_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
