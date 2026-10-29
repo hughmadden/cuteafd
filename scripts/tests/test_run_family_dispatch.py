@@ -1980,7 +1980,8 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     if family == "step5":
         keys += "SPARK_COUNT=4\nRTX_GPUS=1\n" + "".join(
             f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(1, 4))
-    result = _family_launch_result(tmp_path, config, "test/packed", keys)
+    result = _family_launch_result(tmp_path, config, "test/packed", keys,
+        encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else None)
     assert result.returncode == 0, result.stderr
     command = {"glm5_flash": "serve-glmf", "mimo_v2": "serve-mimo", "step5": "serve-step5"}[family]
     launch = next(shlex.split(line) for line in result.stderr.splitlines() if f"cuteafd {command}" in line)
