@@ -196,6 +196,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         let output_ref=zero(device,rows*h*2)?;
         let output=zero(device,rows*h*2)?;
         let retained=zero(device,rows*h*2)?;
+        let narrow=device.run(||device.library.f32_bf16_narrow())?;
         let replay=zero(device,KimiKda::replay_bytes())?;let replay_ref=zero(device,replay.buffer.bytes)?;
         let scratch=zero(device,split.scratch_bytes())?;let scratch_ref=zero(device,fused.scratch_bytes())?;
         let slots=zero(device,rows*4)?;let first=zero(device,rows*4)?;
@@ -211,7 +212,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
                 normalized:normalized_ref.buffer,output:output_ref.buffer,replay:Some(replay_ref.buffer),scratch:scratch_ref.buffer},stream.raw)?;
             let partial=out_projection.core(rows,normalized.buffer,stream.raw)?;
             out_projection.program.program.output(rows,partial,out_projection.weights.svh.buffer,output.buffer,stream.raw)?;
-            crate::shared::dense_trellis::retain_partial(device.library,partial,retained.buffer,rows*h,stream.raw)?;
+            crate::shared::dense_trellis::retain_partial(&narrow,partial,retained.buffer,rows*h,stream.raw)?;
             Ok(partial)
         });
         stream.drain_or_abort("K6 full KDA case");let partial=result?;
@@ -395,11 +396,12 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
         let activated=zero(device,rows*3072*2)?;let activated_ref=zero(device,rows*3072*2)?;
         let output=zero(device,rows*7168*2)?;let reference=zero(device,rows*7168*2)?;
         let retained=zero(device,rows*7168*2)?;
+        let narrow=device.run(||device.library.f32_bf16_narrow())?;
         let result=device.run(|| {
             let partial=super::core_runtime::ffn_projected(gate.projected(),up.projected(),down.projected(),&situ,&copy,rows,
                 input.buffer,gate_out.buffer,up_out.buffer,gate_up.buffer,activated.buffer,stream.raw)?;
             down.program.program.output(rows,partial,down.weights.svh.buffer,output.buffer,stream.raw)?;
-            crate::shared::dense_trellis::retain_partial(device.library,partial,retained.buffer,rows*7168,stream.raw)?;
+            crate::shared::dense_trellis::retain_partial(&narrow,partial,retained.buffer,rows*7168,stream.raw)?;
             fused.launch(KimiFfnBatch{rows,input:input.buffer,gate_up_weight:gate_weight.buffer,down_weight:down_weight.buffer,
                 gate_up:gate_up_ref.buffer,activated:activated_ref.buffer,output:reference.buffer},stream.raw)?;
             Ok(partial)

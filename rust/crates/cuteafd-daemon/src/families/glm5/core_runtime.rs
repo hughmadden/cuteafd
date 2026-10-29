@@ -230,7 +230,7 @@ mod tests {
         assert!(reduce.contains(".reduced(&programs.add"));
         let producer = source.split("fn core_linear(").nth(1).unwrap()
             .split("pub(super) fn core_producer").next().unwrap();
-        assert!(producer.contains("dense_trellis::retain_partial(self.library, core, retained,"));
+        assert!(producer.contains("dense_trellis::retain_partial(&programs.narrow, core, retained,"));
         assert!(producer.contains("rows * weights.shape[0], stream)"));
         assert!(!producer.contains("copy_d2d_async"));
     }
