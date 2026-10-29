@@ -755,7 +755,7 @@ def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, me
     assert actual == launches
     inventory = _rust_methods(source, {"packed_program_inventory"})["packed_program_inventory"]
     names = set(re.findall(r'"([a-z][a-z0-9_{}]*)"', inventory))
-    assert inventory_names <= names
+    assert names - {"w_o_fp8", "w_in_fp8", "nvfp4_w1", "glmf_{name}"} == inventory_names
     assert "PackedRows" in inventory and "SequenceLocal" in inventory
     assert "self.packed_programs.check(" in source
     assert "self.packed_programs.enter(|| self.packed_program_inventory())?" in source
