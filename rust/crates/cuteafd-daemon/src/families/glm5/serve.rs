@@ -432,7 +432,9 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
             sequences.push((placement, &tokens[*done..end]));
             outputs.push((&*job, constraint, first, logits, tokens.len(), end));
         }
-        let (segments, outcomes) = engine.prefill_packed(&mut sequences, &mut |i, logits| {
+        let heads = outputs.iter().map(|(job, _, _, _, len, end)| (*job, end == len)).collect::<Vec<_>>();
+        let (segments, outcomes) = engine.prefill_packed_selected(&mut sequences,
+            &mut |i| heads[i].1 && !heads[i].0.events.is_closed(), &mut |i, logits| {
             let (job, constraint, first, retained, len, end) = &mut outputs[i];
             if job.events.is_closed() { return Ok(Err(anyhow::anyhow!("client went away"))); }
             if end != len { return Ok(Ok(())); }

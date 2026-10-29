@@ -38,6 +38,13 @@ impl<'a> GlmEngine<'a> {
     pub(crate) fn prefill_packed(&self, sequences: &mut [(&mut GlmPlacement, &[u32])],
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome)
         -> Result<(Vec<Segment>, Vec<Result<()>>)> {
+        self.prefill_packed_selected(sequences, &mut |_| true, on_logits)
+    }
+
+    pub(crate) fn prefill_packed_selected(&self, sequences: &mut [(&mut GlmPlacement, &[u32])],
+        needs_head: &mut dyn FnMut(usize) -> bool,
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome)
+        -> Result<(Vec<Segment>, Vec<Result<()>>)> {
         let chunks = sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>();
         let segments = prefill_packing::plan(&chunks, &self.packed_limits())?;
         let tables = packed_tables(sequences, &segments, self.cfg.index_topk)?;
@@ -46,6 +53,8 @@ impl<'a> GlmEngine<'a> {
             let mut link = self.prefill_link.borrow_mut();
             let link = link.as_mut().context("packed prefill link")?;
             let runtime = self.prefill_runtime.as_ref().context("packed prefill runtime")?;
+            // One retained unit keeps segment heads/taps in slot 0. Multi-wave
+            // slicing needs explicit per-segment slot remapping (#847 follow-up).
             self.step_lanes(&[tables], &[&tokens], self.depth, 0, link, runtime)?;
         } else {
             self.step(&tables, &tokens, 0, None, None)?;
@@ -53,7 +62,7 @@ impl<'a> GlmEngine<'a> {
         for (placement, tokens) in sequences.iter_mut() { placement.len += tokens.len(); }
         let slots = self.slot_workspaces(1)?;
         let w = &slots[0];
-        let outcomes = prefill_packing::finish_members(sequences.len(), |i| {
+        let outcomes = prefill_packing::finish_members_selected(sequences.len(), needs_head, |i| {
             self.launch_head(w, segments[i].end_row(), 1)?;
             Ok(self.device_logits(w, 1, false))
         }, on_logits)?;
@@ -133,6 +142,17 @@ mod tests {
         assert_ne!(tables.segments[1].1.slots, changed.segments[1].1.slots);
         assert_eq!(segments.iter().map(|s| (s.tap_offset, s.tap_rows)).collect::<Vec<_>>(), [(0, 12), (12, 9)]);
         Ok(())
+    }
+
+    #[test]
+    fn packed_pass_retains_one_unit_for_segment_heads_and_taps() {
+        let source = include_str!("packing.rs");
+        let pass = source.split("pub(crate) fn prefill_packed_selected(").nth(1).unwrap()
+            .split("pub(crate) fn packed_check_logits(").next().unwrap();
+        assert!(pass.contains("self.step_lanes(&[tables], &[&tokens], self.depth, 0, link, runtime)?"));
+        assert!(pass.contains("self.slot_workspaces(1)?"));
+        assert!(!pass.contains("retained_logits_units("));
+        assert!(!pass.contains(".chunks("));
     }
 
     #[test]

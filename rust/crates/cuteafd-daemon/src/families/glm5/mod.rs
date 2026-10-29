@@ -370,8 +370,12 @@ mod draft_cli_tests {
             argv.extend_from_slice(extra);
             Parse::try_parse_from(argv).map(|p| p.engine.prefill_packing)
         };
-        assert_eq!(PackingMode::resolve(parse(&[]).unwrap(), false), PackingMode::Unrestricted);
-        assert_eq!(PackingMode::resolve(parse(&[]).unwrap(), true), PackingMode::Exact);
+        assert_eq!(parse(&[]).unwrap().unwrap_or_default(), PackingMode::Unrestricted);
+        let source = include_str!("mod.rs");
+        let golden = source.split(concat!("fn ", "golden(mut args:")).nth(1).unwrap()
+            .split(concat!("fn ", "golden_run(")).next().unwrap();
+        assert!(golden.contains("args.engine.prefill_packing.unwrap_or_default()"));
+        assert!(!golden.contains("PackingMode::resolve"));
         assert_eq!(parse(&["--prefill-packing", "exact"]).unwrap(), Some(PackingMode::Exact));
         assert_eq!(parse(&["--prefill-packing", "unrestricted"]).unwrap(), Some(PackingMode::Unrestricted));
         assert!(parse(&["--prefill-packing", "off"]).is_err());
@@ -1691,8 +1695,7 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
-    args.engine.prefill_packing = Some(crate::shared::prefill_packing::PackingMode::resolve(
-        args.engine.prefill_packing, args.packed_check.is_some()));
+    args.engine.prefill_packing = Some(args.engine.prefill_packing.unwrap_or_default());
     // Reject invalid explicit geometry before checkpoint I/O.
     resolve_prefill(&mut args.engine)?;
     // Validate the scoring call before opening CUDA or loading any weights.
@@ -1711,7 +1714,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         let tokens = std::fs::read(args.golden.join("tokens.bin"))?.chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
         return packed_check::check(engine, &tokens, &args.golden, sequences,
-            args.engine.prefill_packing.unwrap_or(crate::shared::prefill_packing::PackingMode::Exact), transport, runtime);
+            args.engine.prefill_packing.unwrap_or_default(), transport, runtime);
     }
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);

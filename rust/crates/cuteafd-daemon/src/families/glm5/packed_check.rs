@@ -55,8 +55,10 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::
     }
     let groups = prefill_packing::groups(members, |range| prefill_packing::plan(&chunks[range], &limits).is_ok());
     let exact = mode == prefill_packing::PackingMode::Exact;
-    ensure!(exact || groups.iter().any(|group| group.len() > 1),
-        "unrestricted packed-check must exercise a pack");
+    let fallback = exact && limits.rows == 0;
+    ensure!(fallback || groups.iter().any(|group| group.len() > 1),
+        "packed-check must exercise a pack when packing is enabled");
+    if fallback { println!("packed check: explicit exact mode has unknown routes; singleton fallback only, NOT a packing gate"); }
     let prompts = lengths.iter().enumerate().map(|(i, &rows)| sequence(tokens, i, prefix(i) + rows)).collect::<Vec<_>>();
     let mut allocator = PageAllocator::new(engine);
     let mut packed = prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>()?;
@@ -101,6 +103,11 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::
         println!("packed check: sequence {i}: {} rows at {}: logits {}, live cache {}, KL {kl:.8}, top-1 {same_top1}",
             lengths[i], prefix(i), if same_logits { "identical" } else { "DIFFER" },
             if same_state { "identical" } else { "DIFFER" });
+        // On the vendor-dense EXL3 gate, >64-row members stay on the wide
+        // router route. Their live pages also cover post-attention context commits.
+        if !exact && lengths[i] > 64 && engine.weights.layers.iter().all(|l| !l.is_native() && l.core.is_empty()) {
+            ensure!(same_logits && same_state, "wide-route member {i} changed logits or committed live pages");
+        }
         equal &= same_logits && same_state;
     }
     for placement in packed.into_iter().chain(alone) { allocator.release(placement); }
