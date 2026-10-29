@@ -730,18 +730,37 @@ mod tests {
                     for outcome in outcomes { outcome?; }
                 }
             }
+            let exact = args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact;
+            ensure!(exact || packs == 1, "unrestricted fixture did not exercise packed execution");
+            let mut byte_exact = true;
             for i in 0..2 {
                 let j = i + 2;
                 let start = placements[j].committed;
                 let logits = backend.prefill_device(&mut placements[j], chunks[i], 1, pool.pool())?.context("alone head")?;
                 let alone = logits.row_host(backend.library(), 0)?;
                 backend.prefill_draft(&placements[j], start, chunks[i], None, &mut drafts[j])?;
-                ensure!(packed_logits[i].iter().map(|v| v.to_bits()).eq(alone.iter().map(|v| v.to_bits())),
-                    "packed member {i} logits differ from singleton");
-                ensure!(backend.diagnostic_state(&placements[i])? == backend.diagnostic_state(&placements[j])?,
-                    "packed member {i} target/predictor state differs from singleton");
+                let packed = &packed_logits[i];
+                let (kl, _) = crate::shared::golden_scores::scored_kl(&alone, packed, backend.geometry().vocab_size)?;
+                let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                let top1 = argmax(packed) == argmax(&alone);
+                let logits_equal = packed.iter().map(|v| v.to_bits()).eq(alone.iter().map(|v| v.to_bits()));
+                let state = backend.diagnostic_state(&placements[i])?;
+                let reference = backend.diagnostic_state(&placements[j])?;
+                ensure!(state.len() == reference.len() && state.iter().zip(&reference).all(|(a, b)| a.len() == b.len()),
+                    "packed member {i} target/predictor state shape differs from singleton");
+                let differing = state.iter().flatten().zip(reference.iter().flatten()).filter(|(a, b)| a != b).count();
+                let bytes = state.iter().map(Vec::len).sum::<usize>();
+                let frontier = placements[i].committed == placements[j].committed
+                    && placements[i].committed == layout[i].0 + chunks[i].len();
+                ensure!(frontier, "packed member {i} frontier differs from singleton");
+                println!("Step-5 packed member={i} KL(alone||packed)={kl:.9e} top1_agreement={}/1 logits_byte_exact={logits_equal} state_differing_bytes={differing}/{bytes} frontier={frontier}", usize::from(top1));
+                byte_exact &= logits_equal && differing == 0;
+                if exact {
+                    ensure!(logits_equal, "packed member {i} logits differ from singleton");
+                    ensure!(differing == 0, "packed member {i} target/predictor state differs from singleton");
+                }
             }
-            println!("Step-5 packed exactness members=2 packs={packs} cap={} target_kv_csa=true predictor_stages=3 logits=true byte_exact=true", limits.rows);
+            println!("Step-5 packed check mode={:?} members=2 packs={packs} cap={} target_kv_csa=checked predictor_stages=3 logits=checked byte_exact={byte_exact}", args.prefill_packing, limits.rows);
             for p in &placements { pool.release(&family, &p.pages)?; }
             family.drain().map_err(|e| anyhow::anyhow!("packed exactness drain: {e}"))?;
             Ok(())
