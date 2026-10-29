@@ -102,6 +102,11 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
                 cuteafd_core::spark_executions::SEGMENT_MAX_ROWS).context("segment scratch overflow")?;
             scratch = scratch.max(bytes);
             io += u64::from(rows) * (16 + u64::from(geometry.topk) * 8);
+            let sibling = format == ExpertFormat::Fp8Block128 && matches!(family, "mimo_v2" | "step5");
+            let old_input = u64::from(extent.capacity) * if sibling { u64::from(geometry.hidden) * 2 }
+                else { u64::from(geometry.hidden) * 33 / 32 };
+            io += cuteafd_core::spark_executions::segment_input_bytes(extent.capacity, rows,
+                geometry.hidden, sibling).context("segmented input extent overflow")? - old_input;
             address_staging += u64::from(extent.staging_rows) * 16;
         }
     }
@@ -276,7 +281,12 @@ mod tests {
                 let exact = cuteafd_core::spark_executions::segment_scratch_bytes(
                     geometry.hidden, geometry.experts, geometry.topk, width * 2, 8256, 16384).unwrap();
                 assert_eq!(three.scratch, one.scratch.max(exact));
-                assert_eq!(three.io - one.io, 8256 * (16 + 8 * u64::from(geometry.topk)));
+                let sibling = format == ExpertFormat::Fp8Block128;
+                let old_input = u64::from(singleton.capacity) * if sibling { u64::from(geometry.hidden) * 2 }
+                    else { u64::from(geometry.hidden) * 33 / 32 };
+                let input_delta = cuteafd_core::spark_executions::segment_input_bytes(singleton.capacity,
+                    8256, geometry.hidden, sibling).unwrap() - old_input;
+                assert_eq!(three.io - one.io, 8256 * (16 + 8 * u64::from(geometry.topk)) + input_delta);
                 assert_eq!(three.pinned_staging - one.pinned_staging, 2752 * 16);
                 // Negative control: the compiled bound is not the allocation.
                 let overcharged = cuteafd_core::spark_executions::segment_scratch_bytes(

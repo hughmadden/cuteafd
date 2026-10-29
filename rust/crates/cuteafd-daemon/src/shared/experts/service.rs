@@ -1,5 +1,5 @@
 //! Native GPU resources and inference QPs share one owning thread.
-mod local;
+pub(super) mod local;
 mod backend;
 mod census;
 mod modules;

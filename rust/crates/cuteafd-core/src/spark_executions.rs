@@ -79,6 +79,14 @@ impl OwnerExtent {
     }
 }
 
+/// Device inputs for a segmented owner. BF16 fallback readers retain a separate
+/// plane: an asynchronous wire copy must never overwrite their pending reads.
+pub fn segment_input_bytes(capacity: u32, rows: u32, hidden: u32, bf16_sibling: bool) -> Option<u64> {
+    let wire = u64::from(rows).checked_mul(u64::from(hidden) + u64::from(hidden) / 32)?;
+    if bf16_sibling { wire.checked_add(u64::from(capacity) * u64::from(hidden) * 2) }
+    else { Some(wire.max(u64::from(capacity) * (u64::from(hidden) + u64::from(hidden) / 32))) }
+}
+
 /// Exact streamed intermediate arena with the compiled tile-table offset.
 /// `act_row_bytes` is installed recipe metadata (BF16 or MXFP8 down input).
 /// This does not include row descriptors, wire frames or singleton scratch.
@@ -313,5 +321,22 @@ mod tests {
         assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::Capacity { owner: "prefill", .. })));
         invalid = plan; invalid.decode.clear();
         assert!(matches!(invalid.validate(), Err(ExecutionAdmissionError::DecodeLanes { .. })));
+    }
+}
+
+#[cfg(test)]
+mod segment_input_tests {
+    use super::*;
+    #[test]
+    fn input_planes_charge_admitted_wire_rows_and_keep_bf16_readers_disjoint() {
+        for (capacity, unit, count) in [(4096, 2752, 3), (4096, 769, 3), (1024, 1024, 2)] {
+            let rows = unit * count;
+            let wire = u64::from(rows) * 4224;
+            assert_eq!(segment_input_bytes(capacity, rows, 4096, false),
+                Some(wire.max(u64::from(capacity) * 4224)));
+            let sibling = u64::from(capacity) * 8192;
+            assert_eq!(segment_input_bytes(capacity, rows, 4096, true), Some(sibling + wire));
+            assert!(sibling + wire > sibling.max(wire), "aliasing the BF16 plane would undercharge");
+        }
     }
 }

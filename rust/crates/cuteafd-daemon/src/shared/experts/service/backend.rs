@@ -218,7 +218,7 @@ impl<'a> Weights<'a> {
                     .collect::<Result<Vec<_>>>()?.into_iter().max().context("FP8 owner has no packages")?;
                 let workspace = experts.iter().try_fold(scratch_bytes, |total, group|
                     total.checked_add(Fp8Worker::io_bytes(group.module.info(), group.bf16_module.is_some(), capacity)?
-                        + Fp8Worker::segment_io_bytes(&group.module, extent)?)
+                        + Fp8Worker::segment_io_bytes(&group.module, extent, group.bf16_module.is_some())?)
                         .context("expert group workspace overflow"))?;
                 ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
                 let scratch = Rc::new(crate::shared::memory::DeviceAllocation::named(library,
@@ -227,7 +227,7 @@ impl<'a> Weights<'a> {
                 let mut bindings = Vec::new();
                 for (group, experts) in experts.iter().enumerate() {
                     bindings.extend(experts.layers.iter().enumerate().map(|(index, layer)| (layer.layer, group, index)));
-                    let mut worker = Fp8Worker::with_scratch(library, experts.clone(), config.capacity, Some(scratch.clone()))?;
+                    let mut worker = Fp8Worker::with_extent(library, experts.clone(), config.capacity, Some(scratch.clone()), Some(extent))?;
                     worker.prepare_segments(extent)?;
                     if let Some(first) = workers.first() { worker.share_owner(first); }
                     workers.push(worker);

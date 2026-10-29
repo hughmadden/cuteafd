@@ -632,11 +632,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let wait_index = waiting.then(|| idle_cursor % connections.len());
         let mut index = 0;
         let mut intake = 0usize;
+        let mut intake_stats = IntakeStats::default();
         let mut received_this_sweep = false;
         while index < connections.len() {
             let mut execution_failed = false;
             let mut executed = false;
             let mut intake_blocked = false;
+            let mut received = false;
             let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)
                 && wait_index == Some(index)).then_some(idle_wait);
             let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
@@ -662,6 +664,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     if !intake_has_capacity(intake, executions.iter().any(Execution::has_staged),
                         || connections[index].try_deferred_capacity(deferred_limit))? {
                         intake_blocked = true;
+                        intake_stats.send_ring_full += 1;
+                        tracing::debug!(target: "cuteafd::spark_coalesce", peer = index, intake,
+                            send_ring_full = intake_stats.send_ring_full, reason = "send_or_ring_full",
+                            "Spark intake preflight refused");
                         return Ok(finished);
                     }
                     let mut launch_failed = false;
@@ -679,6 +685,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     });
                     match launched {
                         Ok(Some((owner, true))) => {
+                            received = true;
+                            intake_stats.received += 1;
                             holding[index].push_back(queues.record_request(owner, input_address)?);
                             let queued = queues.pending[owner].len();
                             // Count overlap only while the oldest GPU fence is
@@ -696,6 +704,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         // The host-only path drains its owner before using blocking
                         // uploads. Earlier replies still leave in connection order.
                         Ok(Some((owner, false))) => (|| -> Result<bool> {
+                            received = true;
+                            intake_stats.received += 1;
                             executions[owner].flush_staged()?;
                             executions[owner].synchronize()?;
                             queues.complete_ready(owner, &mut executions[owner])?;
@@ -718,7 +728,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             })?;
                             Ok(true)
                         })(),
-                        Ok(None) => Ok(finished),
+                        Ok(None) => {
+                            if executions.iter().any(Execution::has_staged) { intake_stats.empty_second_receive += 1; }
+                            Ok(finished)
+                        },
                         Err(error) => { execution_failed = launch_failed; Err(error) }
                     }
                 })
@@ -747,7 +760,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     // A full reply ring cannot delay the staged wave behind a
                     // SEND wait. Launch it now, then resume the ordinary sweep.
                     if intake_blocked { break; }
-                    received_this_sweep |= processed;
+                    received_this_sweep |= received;
                     index += 1;
                     // Finish the original connection sweep before any extra
                     // polling: a decode on another peer is never postponed.
@@ -768,7 +781,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         }
                         return Err(error).context("native GPU execution failed");
                     }
-                    // Staged frames have launched nothing: remove them before
+                    // Staged frames have only queued copies: retire them before
                     // draining any launched members or releasing their peer rings.
                     let mut retained = std::collections::VecDeque::new();
                     for unit in holding[index].drain(..) {
@@ -791,6 +804,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     intake = 0;
                 }
             }
+        }
+        if executions.iter().any(Execution::has_staged) {
+            tracing::debug!(target: "cuteafd::spark_coalesce", received = intake_stats.received,
+                send_ring_full = intake_stats.send_ring_full, empty_second_receive = intake_stats.empty_second_receive,
+                sweeps = intake + 1, "Spark intake flush decision");
         }
         for execution in &mut executions {
             if let Err(error) = execution.flush_staged() {
@@ -815,13 +833,16 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     result
 }
 
+#[derive(Default)]
+struct IntakeStats { received: u64, send_ring_full: u64, empty_second_receive: u64 }
+
 fn intake_has_capacity(sweep: usize, staged: bool, check: impl FnOnce() -> Result<bool>) -> Result<bool> {
     if sweep == 0 && !staged { return Ok(true); }
     check()
 }
 
 /// Extra intake follows a full ordinary sweep and never waits for an arrival.
-fn continue_intake(received: bool, staged: bool, sweep: usize, bound: usize) -> bool {
+pub(crate) fn continue_intake(received: bool, staged: bool, sweep: usize, bound: usize) -> bool {
     received && staged && sweep + 1 < bound
 }
 

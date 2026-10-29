@@ -15,6 +15,7 @@ use std::rc::Rc;
 pub(crate) struct Fp8Worker<'a> {
     // Drain the stream before dropping the experts or the inputs.
     stream: Rc<LoadStream<'a>>,
+    copy_stream: Option<Rc<LoadStream<'a>>>,
     experts: Fp8Experts<'a, Rc<Fp8Weights<'a>>>,
     library: &'a NativeLibrary,
     inputs: [DeviceAllocation<'a>; 3],
@@ -33,14 +34,26 @@ pub(crate) struct Fp8Worker<'a> {
     timing_units: std::collections::VecDeque<bool>,
 }
 
+impl Drop for Fp8Worker<'_> {
+    fn drop(&mut self) {
+        // Shared stream owners may outlive this group's allocations.
+        crate::shared::decode_graph::fatal_drain(self.synchronize(), "FP8 worker inputs");
+    }
+}
+
 struct StagedUnit {
     slot: usize,
     layer: usize,
     identity: (u64, u32, u32, u64),
+    source_address: usize,
     input: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer,
 }
 struct Segments<'a> {
+    copied: Vec<crate::shared::memory::device::Event<'a>>,
+    input_offset: usize,
+    staged_units: u64,
+    flushes: u64,
     rows: usize,
     unit_rows: usize,
     descriptors: Vec<crate::shared::memory::HostAllocation<'a>>,
@@ -61,8 +74,13 @@ fn validate_worker_layers(layers: &[usize]) -> Result<()> {
 impl<'a> Fp8Worker<'a> {
     pub(crate) fn capacity(&self) -> usize { self.capacity }
     pub(crate) fn segment_io_bytes(module: &cuteafd_ffi::fp8_moe::Fp8MoeModule,
-        extent: cuteafd_core::OwnerExtent) -> Result<usize> {
-        Ok(super::segment_rows(module, extent).map_or(0, |rows| rows as usize * (16 + module.info().topk * 8)))
+        extent: cuteafd_core::OwnerExtent, bf16_sibling: bool) -> Result<usize> {
+        let Some(rows) = super::segment_rows(module, extent) else { return Ok(0) };
+        let info = module.info();
+        let input = cuteafd_core::spark_executions::segment_input_bytes(extent.capacity, rows,
+            info.hidden as u32, bf16_sibling).context("segmented input bytes overflow")? as usize;
+        let old = extent.capacity as usize * if bf16_sibling { info.hidden * 2 } else { info.wire_row_bytes() };
+        Ok(rows as usize * (16 + info.topk * 8) + input - old)
     }
     pub(crate) fn prepare_segments(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
         let Some(rows) = super::segment_rows(&self.experts.module, extent) else { return Ok(()) };
@@ -71,8 +89,13 @@ impl<'a> Fp8Worker<'a> {
         let descriptors = (0..extent.buffered_units).map(|_| crate::shared::memory::HostAllocation::named(
             self.library, extent.staging_rows as usize * 16, "experts/workspace/row_addresses"))
             .collect::<Result<Vec<_>>>()?;
+        self.copy_stream = Some(Rc::new(LoadStream { library: self.library, raw: self.library.cuda_stream_create()? }));
+        let device = crate::shared::memory::device::Device { library: self.library, id: self.library.cuda_get_device()? };
         self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
-        self.segments = Some(Segments { rows, unit_rows: extent.staging_rows as usize, descriptors,
+        self.segments = Some(Segments {
+            copied: (0..extent.buffered_units).map(|_| crate::shared::memory::device::Event::new(device)).collect::<Result<_>>()?,
+            input_offset: if self.experts.bf16_module.is_some() { self.capacity * self.experts.module.info().hidden * 2 } else { 0 },
+            staged_units: 0, flushes: 0, rows, unit_rows: extent.staging_rows as usize, descriptors,
             device: [DeviceAllocation::new(self.library, rows * 8)?, DeviceAllocation::new(self.library, rows * topk * 4)?,
                 DeviceAllocation::new(self.library, rows * topk * 4)?, DeviceAllocation::new(self.library, rows * 8)?],
             staged: Vec::with_capacity(extent.buffered_units as usize) });
@@ -85,7 +108,11 @@ impl<'a> Fp8Worker<'a> {
 
     pub(crate) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
         let Some(segments) = &mut self.segments else { return Ok(false) };
-        let Some(index) = segments.staged.iter().position(|unit| unit.input.ptr as usize == input_address) else { return Ok(false) };
+        let Some(index) = segments.staged.iter().position(|unit| unit.source_address == input_address) else { return Ok(false) };
+        let unit = &segments.staged[index];
+        // SAFETY: cancellation must retire the already-issued copy before the
+        // caller can release the mapped frame or reuse this device slot.
+        unsafe { self.library.cuda_event_synchronize(segments.copied[unit.slot].raw)?; }
         let unit = segments.staged.remove(index);
         self.pending.cancel_reserved(unit.slot)?;
         Ok(true)
@@ -96,6 +123,9 @@ impl<'a> Fp8Worker<'a> {
         if segments.staged.is_empty() { return Ok(()) }
         let rows: usize = segments.staged.iter().map(|unit| unit.identity.2 as usize).sum();
         ensure!(rows <= segments.rows, "staged group exceeds admitted rows");
+        segments.flushes += 1;
+        tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = segments.staged_units,
+            flushes = segments.flushes, segments = segments.staged.len(), rows, "Spark staged flush");
         let topk = self.experts.module.info().topk;
         let layer = segments.staged[0].layer;
         let mut first = 0;
@@ -105,7 +135,7 @@ impl<'a> Fp8Worker<'a> {
             // SAFETY: all per-unit staging and mapped rows remain retained until
             // the fences below. Device tables are overwritten only in stream order.
             unsafe {
-                self.pending.arrive_reserved(unit.slot, self.stream.raw)?;
+                self.library.cuda_stream_wait_event(self.stream.raw, segments.copied[unit.slot].raw)?;
                 self.route_staging.upload(unit.slot, 0, count * topk,
                     device_part(segments.device[1].buffer, first * topk * 4, count * topk * 4)?,
                     device_part(segments.device[2].buffer, first * topk * 4, count * topk * 4)?, self.stream.raw)?;
@@ -146,11 +176,21 @@ impl<'a> Fp8Worker<'a> {
         output: CuteafdDeviceBuffer, executor_id: u64) -> Result<bool> {
         let rows = request.rows() as usize;
         let compatible = self.segments.as_ref().is_some_and(|segments| rows <= segments.unit_rows)
-            && self.experts.module.segment_recipe().is_some_and(|recipe| rows >= recipe.minimum_rows as usize)
             && request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32).is_ok();
-        if !compatible { return Ok(false) }
+        if !compatible {
+            tracing::debug!(target: "cuteafd::spark_coalesce", rows, reason = "incompatible_input_or_capacity", "Spark staging bypass");
+            return Ok(false)
+        }
+        let singleton = self.experts.module.segment_recipe().is_some_and(|recipe| rows < recipe.minimum_rows as usize);
+        if singleton {
+            tracing::debug!(target: "cuteafd::spark_coalesce", rows, reason = "singleton_recipe", "Spark staged boundary");
+            self.flush_staged()?;
+        }
         if self.segments.as_ref().is_some_and(|segments| segments.staged.first()
-            .is_some_and(|unit| unit.layer != self.layer)) { self.flush_staged()?; }
+            .is_some_and(|unit| unit.layer != self.layer)) {
+            tracing::debug!(target: "cuteafd::spark_coalesce", reason = "different_layer", "Spark staged boundary");
+            self.flush_staged()?;
+        }
         ensure!(executor_id == self.executor_id && request.layer() as usize == self.experts.layers[self.layer].layer,
             "staged expert identity mismatch");
         let segments = self.segments.as_mut().unwrap();
@@ -162,8 +202,11 @@ impl<'a> Fp8Worker<'a> {
             "segmented mapped rows require 16-byte aligned input/output payloads and input stride");
         ensure!(input.bytes >= rows * stride && output.bytes >= rows * self.experts.module.info().hidden * 2,
             "staged mapped row extent is too small");
+        let source_address = input.ptr as usize;
+        let resident = device_part(self.inputs[0].buffer,
+            segments.input_offset + slot * segments.unit_rows * stride, rows * stride)?;
         for row in 0..rows {
-            let input_address = (input.ptr as usize).checked_add(row * stride).context("input row address overflow")?;
+            let input_address = (resident.ptr as usize).checked_add(row * stride).context("input row address overflow")?;
             let output_address = (output.ptr as usize).checked_add(row * self.experts.module.info().hidden * 2)
                 .context("output row address overflow")?;
             bytes[row * 8..row * 8 + 8].copy_from_slice(&(input_address as u64).to_le_bytes());
@@ -171,8 +214,20 @@ impl<'a> Fp8Worker<'a> {
             bytes[at..at + 8].copy_from_slice(&(output_address as u64).to_le_bytes());
         }
         ensure!(self.pending.reserve()? == slot, "staged slot reservation changed");
-        segments.staged.push(StagedUnit { slot, layer: self.layer,
-            identity: (request.request_id(), request.layer(), request.rows(), executor_id), input, output });
+        segments.staged.push(StagedUnit { slot, layer: self.layer, source_address,
+            identity: (request.request_id(), request.layer(), request.rows(), executor_id), input: resident, output });
+        let copy = self.copy_stream.as_ref().unwrap().raw;
+        // SAFETY: the reserved unit retains its mapped source, device slice and
+        // event. Copy is host-triggered now, with no wait on future compute.
+        unsafe {
+            self.pending.arrive_reserved(slot, copy)?;
+            self.library.copy_d2d_async(resident, input, rows * stride, copy)?;
+            self.library.cuda_event_record(segments.copied[slot].raw, copy)?;
+        }
+        segments.staged_units += 1;
+        tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = segments.staged_units,
+            staged = segments.staged.len(), rows, slot, "Spark unit copied and staged");
+        if singleton { self.flush_staged()?; }
         Ok(true)
     }
 
@@ -195,6 +250,11 @@ impl<'a> Fp8Worker<'a> {
 
     pub(crate) fn with_scratch(library: &'a NativeLibrary, experts: Rc<Fp8Weights<'a>>, capacity: u32,
         scratch: Option<Rc<DeviceAllocation<'a>>>) -> Result<Self> {
+        Self::with_extent(library, experts, capacity, scratch, None)
+    }
+
+    pub(crate) fn with_extent(library: &'a NativeLibrary, experts: Rc<Fp8Weights<'a>>, capacity: u32,
+        scratch: Option<Rc<DeviceAllocation<'a>>>, extent: Option<cuteafd_core::OwnerExtent>) -> Result<Self> {
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk, capacity) = (geometry.hidden as usize, geometry.topk as usize, capacity as usize);
         validate_worker_layers(&experts.layers.iter().map(|layer| layer.layer).collect::<Vec<_>>())?;
@@ -206,9 +266,14 @@ impl<'a> Fp8Worker<'a> {
             Some(scratch) => Fp8Experts::from_scratch(experts, capacity, scratch)?,
             None => Fp8Experts::from_shared(library, experts, capacity)?,
         };
+        let input_bytes = match extent.and_then(|e| super::segment_rows(&experts.module, e)) {
+            Some(rows) => cuteafd_core::spark_executions::segment_input_bytes(capacity as u32, rows,
+                hidden as u32, experts.bf16_module.is_some()).context("segmented input extent overflow")? as usize,
+            None => capacity * if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
+                else { hidden + hidden / 32 },
+        };
         let inputs = [
-            DeviceAllocation::new(library, capacity * if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
-                else { hidden + hidden / 32 })?,
+            DeviceAllocation::new(library, input_bytes)?,
             DeviceAllocation::new(library, capacity * topk * 4)?,
             DeviceAllocation::new(library, capacity * topk * 4)?,
         ];
@@ -218,6 +283,7 @@ impl<'a> Fp8Worker<'a> {
             .map(|timing| Rc::new(std::cell::RefCell::new(timing)));
         Ok(Self {
             stream: Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }),
+            copy_stream: None,
             experts,
             library,
             inputs,
@@ -244,6 +310,7 @@ impl<'a> Fp8Worker<'a> {
     /// follow the slot, not skip compute from a different weight group.
     pub(crate) fn share_owner(&mut self, other: &Self) {
         self.stream = other.stream.clone();
+        if self.copy_stream.is_some() && other.copy_stream.is_some() { self.copy_stream = other.copy_stream.clone(); }
         self.timing = other.timing.clone();
         self.clock = other.clock.clone();
     }
@@ -274,7 +341,10 @@ impl<'a> Fp8Worker<'a> {
 
     pub(crate) fn synchronize(&self) -> Result<()> {
         // SAFETY: this owner retains its stream and every queued buffer.
-        unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
+        unsafe {
+            if let Some(copy) = &self.copy_stream { self.library.cuda_stream_synchronize(copy.raw)?; }
+            self.library.cuda_stream_synchronize(self.stream.raw)?;
+        }
         Ok(())
     }
 
@@ -302,6 +372,8 @@ impl<'a> Fp8Worker<'a> {
             }
         }
         self.flush_staged()?;
+        // Host-only fallback can alias the wire arena; retire prior consumers.
+        if self.segments.is_some() && (hidden_view.is_none() || self.experts.bf16_module.is_none()) { self.synchronize()?; }
         let rows = request.rows() as usize;
         ensure!(rows > 0 && rows <= self.capacity, "FP8 request exceeds capacity");
         // FP8 K32 wire rows, or BF16 rows when the BF16-input package is loaded.
@@ -511,16 +583,34 @@ mod tests {
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn three_queued_prefill_units_preserve_distinct_routes_inputs_and_replies() -> Result<()> {
-        queued_prefill_units(false)
+        queued_prefill_units(false, false)
     }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn grouped_prefill_orders_descriptors_before_launch_and_cancels_without_launching() -> Result<()> {
-        queued_prefill_units(true)
+        queued_prefill_units(true, false)
     }
 
-    fn queued_prefill_units(segmented: bool) -> Result<()> {
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn two_received_units_copy_before_one_flush_and_ignore_retired_source_bytes() -> Result<()> {
+        queued_prefill_units(true, true)
+    }
+
+    #[test]
+    fn staged_input_copy_is_host_triggered_and_compute_waits_on_recorded_event() {
+        let source = include_str!("worker.rs");
+        let stage = source.split("    fn stage(").nth(1).unwrap().split("    /// Exact retained").next().unwrap();
+        assert!(stage.find("copy_d2d_async(resident").unwrap() < stage.find("cuda_event_record(segments.copied").unwrap());
+        assert!(!stage.contains("cuda_stream_wait_event"));
+        let flush = source.split("    pub(crate) fn flush_staged(").nth(1).unwrap().split("    fn stage(").next().unwrap();
+        assert!(flush.find("cuda_stream_wait_event").unwrap() < flush.find("self.experts.run(").unwrap());
+        assert!(flush.contains("unit.input.ptr"));
+        assert!(stage.contains("(resident.ptr as usize)"));
+    }
+
+    fn queued_prefill_units(segmented: bool, received_pair: bool) -> Result<()> {
         use crate::shared::memory::HostAllocation;
         use cuteafd_ffi::{fp8_moe::Fp8MoeModule, native_library_lifetime_fixture::Fixture};
         use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RequestView,
@@ -551,7 +641,7 @@ mod tests {
         let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
             capacity: 4096, compiled: 4096, staging_rows: 769, buffered_units: 3 };
         let scratch = Rc::new(DeviceAllocation::new(&library, weights.owner_scratch_bytes(extent)?)?);
-        let mut worker = Fp8Worker::with_scratch(&library, weights, 4096, Some(scratch))?;
+        let mut worker = Fp8Worker::with_extent(&library, weights, 4096, Some(scratch), segmented.then_some(extent))?;
         if segmented { worker.prepare_segments(extent)?; }
         worker.defer(3, if segmented { 769 } else { 4096 }, cuteafd_core::ExecutionOwner::Prefill)?;
         let mut exchange = HostExpertExchange::new(4096)?;
@@ -591,14 +681,52 @@ mod tests {
             frames.push(frame);
             replies.push(reply);
         }
+        if received_pair {
+            use crate::shared::experts::service::local::continue_intake;
+            // Drive the production nonblocking sweep policy with two already
+            // received frames, then an empty receive (never a timer or wait).
+            for unit in 0..2 {
+                let view = ExpertProtocolV2RequestView::parse(frames[unit].bytes())?;
+                let request = BackboneRequest::parse(frames[unit].bytes(), 4096)?;
+                let alias = library.cuda_host_buffer_device_alias(frames[unit].buffer)?;
+                let mapped = ProtocolV2RequestDevicePayload {
+                    hidden_payload: CuteafdDeviceBuffer { ptr: view.hidden_payload().as_ptr().cast_mut().cast(),
+                        bytes: view.hidden_payload().len(), ..alias }, execution_lane: 0,
+                    response_slot: Some(library.cuda_host_buffer_device_alias(replies[unit].buffer)?) };
+                worker.bind_layer(0)?;
+                // SAFETY: frames/replies remain owned until both completion fences retire.
+                unsafe { worker.execute_mapped_payload(&request, worker.executor_id, &mut exchange, mapped)?; }
+                let staged = &worker.segments.as_ref().unwrap().staged[unit];
+                assert_ne!(staged.input.ptr, mapped.hidden_payload.ptr, "FC1 must not gather mapped host rows");
+                assert!(continue_intake(true, worker.has_staged(), unit, 3));
+            }
+            assert!(!continue_intake(false, worker.has_staged(), 2, 3));
+            assert_eq!(worker.segments.as_ref().unwrap().staged.len(), 2);
+            assert_eq!(worker.segments.as_ref().unwrap().flushes, 0);
+            fixture.advance_queued_experts(&library, 2)?; // both input copies, no FC1
+            // Negative control: direct mapped gather would now produce different bytes.
+            for frame in &mut frames[..2] { frame.bytes_mut().fill(0xff); }
+            worker.flush_staged()?;
+            assert_eq!(worker.segments.as_ref().unwrap().flushes, 1);
+            fixture.advance_queued_experts(&library, 8)?; // packed routes + addresses
+            assert!(!worker.unit_ready()?);
+            fixture.advance_queued_experts(&library, 1)?; // one indirect FC1/down/combine fixture
+            for unit in 0..2 {
+                assert!(worker.unit_ready()?);
+                worker.complete()?;
+                assert_eq!(&replies[unit].bytes()[prefix..prefix + expected[unit].len()], expected[unit]);
+            }
+            assert!(worker.pending.is_empty());
+            return Ok(());
+        }
         for unit in 0..4 {
             if unit == 3 && segmented {
                 // Cancel one retained peer before any launch. The other two
                 // descriptors survive, and the freed slot holds the fourth peer.
-                let cancelled = worker.segments.as_ref().unwrap().staged[1].input.ptr as usize;
+                let cancelled = worker.segments.as_ref().unwrap().staged[1].source_address;
                 assert!(worker.cancel_staged(cancelled)?);
                 assert!(!worker.cancel_staged(cancelled)?);
-                assert!(worker.stream_idle()? && !worker.unit_ready()?);
+                assert!(!worker.unit_ready()?);
             }
             if unit == 3 && !segmented {
                 fixture.advance_queued_experts(&library, 1)?;
@@ -629,19 +757,24 @@ mod tests {
             }
         }
         if segmented {
-            assert!(worker.has_staged() && worker.stream_idle()?);
+            assert!(worker.has_staged());
             assert_eq!(worker.pending.len(), 0);
             assert!(worker.pending.next_slot().is_err());
             let segments = worker.segments.as_ref().unwrap();
             assert_eq!(segments.rows, 3 * 769);
+            assert_eq!(worker.inputs[0].buffer.bytes, cuteafd_core::spark_executions::segment_input_bytes(
+                4096, 3 * 769, geometry.hidden, false).unwrap() as usize);
+            for unit in &segments.staged {
+                assert_ne!(unit.input.ptr as usize, unit.source_address);
+            }
             assert_eq!(segments.device.iter().map(|a| a.buffer.bytes).sum::<usize>(),
                 3 * 769 * (16 + 8 * topk));
             assert_eq!(segments.descriptors.iter().map(|a| a.buffer.bytes).sum::<usize>(), 3 * 769 * 16);
             worker.flush_staged()?;
             assert!(!worker.unit_ready()? && worker.pending.next_slot().is_err());
-            // Four ordered uploads per member: route IDs/weights and row input/output
-            // addresses. All twelve complete before the one indirect expert launch.
-            fixture.advance_queued_experts(&library, 12)?;
+            // Two uncancelled copies remain after cancellation retired copies0/1,
+            // followed by four route/address uploads per member before FC1.
+            fixture.advance_queued_experts(&library, 14)?;
             assert!(!worker.unit_ready()?);
             for reply in &replies { assert!(reply.bytes().iter().all(|&b| b == 0xa5)); }
             fixture.advance_queued_experts(&library, 1)?;
@@ -655,7 +788,7 @@ mod tests {
             assert!(replies[1].bytes().iter().all(|&b| b == 0xa5), "cancelled peer must not launch");
             assert!(worker.stream_idle()? && worker.pending.is_empty());
             // Reuse the cancelled peer as a lone unit. It launches the ordinary
-            // recipe, with only two route uploads and no descriptor copies.
+            // recipe, with one input copy/two route uploads and no descriptors.
             let view = ExpertProtocolV2RequestView::parse(frames[1].bytes())?;
             let request = BackboneRequest::parse(frames[1].bytes(), 4096)?;
             let alias = library.cuda_host_buffer_device_alias(frames[1].buffer)?;
@@ -666,7 +799,7 @@ mod tests {
             // SAFETY: the source and reply remain retained through the completion below.
             unsafe { worker.execute_mapped_payload(&request, worker.executor_id, &mut exchange, mapped)?; }
             worker.flush_staged()?;
-            fixture.advance_queued_experts(&library, 2)?;
+            fixture.advance_queued_experts(&library, 3)?;
             assert!(!worker.unit_ready()?);
             assert!(replies[1].bytes().iter().all(|&b| b == 0xa5));
             fixture.advance_queued_experts(&library, 1)?;

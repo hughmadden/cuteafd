@@ -343,7 +343,7 @@ impl Fp8Modules {
         let (mut scratch, mut io) = self.workspace_bytes(extent.capacity as usize)?;
         if let Some(rows) = segment_rows(&self.module, extent) {
             scratch = scratch.max(self.module.segment_scratch_bytes(rows)?);
-            io += worker::Fp8Worker::segment_io_bytes(&self.module, extent)?;
+            io += worker::Fp8Worker::segment_io_bytes(&self.module, extent, self.bf16.is_some())?;
         }
         Ok((scratch, io))
     }
