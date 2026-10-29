@@ -68,6 +68,9 @@ CUTEAFD_LQ_FN double dadd(double a, double b) {
 }
 
 CUTEAFD_LQ_FN float bf16(uint16_t v) { return bits_f32(uint32_t(v) << 16); }
+CUTEAFD_LQ_FN float partial_add_bf16_f32(uint16_t rank0, uint16_t rank1) {
+  return fadd(bf16(rank0), bf16(rank1));
+}
 CUTEAFD_LQ_FN float fabs32(float x) { return bits_f32(f32_bits(x) & 0x7FFFFFFFu); }
 // Rust f32::max: the non-NaN operand when one is NaN.
 CUTEAFD_LQ_FN float fmax32(float a, float b) {

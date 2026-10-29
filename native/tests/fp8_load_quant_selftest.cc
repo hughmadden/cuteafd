@@ -22,6 +22,21 @@ static T take(const std::vector<uint8_t>& bytes, size_t& at) {
 }
 
 int main(int argc, char** argv) {
+  // The wire rounds each partial, not their sum; ties use the shared RNE rule.
+  if (lq::narrow_f32(0x3f808000u) != 0x3f80 || lq::narrow_f32(0x3f818000u) != 0x3f82
+      || lq::f32_bits(lq::partial_add_bf16_f32(lq::narrow_f32(0x3f808000u), 0xbf80)) != 0) {
+    std::fprintf(stderr, "retained BF16 partial RNE/cancellation mismatch\n");
+    return 1;
+  }
+  for (uint32_t bits = 0; bits < 65536; ++bits) {
+    // Finite/subnormal/zero/infinity widening must be exact; NaN payloads are
+    // governed by CUDA's existing addition, not a new narrowing of the sum.
+    if ((bits & 0x7f80u) == 0x7f80u) continue;
+    const auto a = uint16_t(bits), b = uint16_t((bits * 37u + 17u) & 0xffffu);
+    if ((b & 0x7f80u) == 0x7f80u) continue;
+    const float diagnostic = lq::fadd(lq::bits_f32(lq::widen_bf16(a)), lq::bits_f32(lq::widen_bf16(b)));
+    if (lq::f32_bits(lq::partial_add_bf16_f32(a, b)) != lq::f32_bits(diagnostic)) return 1;
+  }
   const char* path = argc > 1 ? argv[1] : CUTEAFD_LOAD_QUANT_FIXTURE;
   std::ifstream file(path, std::ios::binary);
   std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());

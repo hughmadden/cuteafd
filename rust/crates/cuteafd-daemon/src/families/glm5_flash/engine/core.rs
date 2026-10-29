@@ -1,8 +1,8 @@
 //! Native projections share the neutral K6 owners; only Flash stage wiring lives here.
 use super::*;
-use crate::shared::{dense_trellis::{CoreHead, CoreWeights, Projection, ProjectionLayout, ProjectionScratch, codebook},
+use crate::shared::{dense_trellis::{CoreHead, CoreWeights, Projection, ProjectionLayout, ProjectionScratch, codebook, retain_partial},
     memory::device::{Allocation, Device}};
-use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, F32Add};
+use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf16F32Add};
 use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names};
 use std::collections::BTreeMap;
 
@@ -25,7 +25,7 @@ fn rank_order<T>(rank: usize, local: T, peer: T) -> (T, T) {
     if rank == 0 { (local, peer) } else { (peer, local) }
 }
 fn retained_bytes(rows: usize, hidden: usize) -> Result<usize> {
-    rows.checked_mul(hidden).and_then(|n| n.checked_mul(4)).context("Flash K6 retained extent overflow")
+    rows.checked_mul(hidden).and_then(|n| n.checked_mul(2)).context("Flash K6 retained extent overflow")
 }
 
 struct Scratch<'a> { projection: ProjectionScratch<'a>, stages: BTreeMap<&'static str, Allocation<'a>> }
@@ -35,7 +35,7 @@ impl Scratch<'_> {
 pub(super) struct Rank<'a> {
     projections: BTreeMap<Key, Projection<'a>>,
     scratch: [Option<Rc<Scratch<'a>>>; 2],
-    add: F32Add<'a>,
+    add: Bf16F32Add<'a>,
 }
 pub(super) struct Slot<'a> {
     scratch: Rc<Scratch<'a>>,
@@ -82,15 +82,15 @@ impl<'a> Rank<'a> {
                 .map(|(&n, &b)| Ok((n, Allocation::new(device, b)?))).collect::<Result<_>>()?;
             Ok(Some(Rc::new(Scratch { projection, stages })))
         };
-        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.f32_add()? })
+        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.bf16_f32_add()? })
     }
     fn slot(&self, engine: &GlmfEngine<'a>, rank: usize, rows: usize, decode: bool, lane: usize) -> Result<Option<Slot<'a>>> {
         let Some(scratch) = &self.scratch[usize::from(!decode)] else { return Ok(None); };
         let device = Device { library: engine.library, id: if rank == 0 { engine.device } else { engine.peer()?.device } };
         ensure!(rows == scratch.projection.rows, "Flash K6 retained slot capacity differs from scratch");
         let bytes = retained_bytes(rows, engine.cfg.hidden)?;
-        let allocate = || Allocation::new(device, bytes);
-        Ok(Some(Slot { scratch: scratch.clone(), retained: [allocate()?, allocate()?, allocate()?], lane }))
+        let allocate = |width| Allocation::new(device, bytes * width);
+        Ok(Some(Slot { scratch: scratch.clone(), retained: [allocate(1)?, allocate(1)?, allocate(2)?], lane }))
     }
 }
 
@@ -119,7 +119,7 @@ impl<'a> GlmfEngine<'a> {
                 let rows = self.prefill_rows.max(self.decode_rows);
                 let expected_suffix = if admitted.ranks.iter().flat_map(|r| &r.body)
                     .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) {
-                    rows * self.cfg.hidden * 4
+                    rows * self.cfg.hidden * 2
                 } else { 0 };
                 ensure!(suffix == expected_suffix, "Flash K6 exchange slot suffix differs from admission");
                 let allocated = if suffix == 0 { 0 } else {
@@ -157,7 +157,7 @@ impl<'a> GlmfEngine<'a> {
     fn core_received(&self, rank: usize, slot: usize, rows: usize) -> Result<Buffer> {
         let exchange = self.exchange()?;
         let prefix = self.prefill_rows.max(self.decode_rows) * self.cfg.hidden * self.partial_bytes();
-        let bytes = rows * self.cfg.hidden * 4;
+        let bytes = rows * self.cfg.hidden * 2;
         ensure!(prefix + bytes <= exchange.slot_bytes(), "Flash K6 receive suffix not admitted");
         Ok(Self::core_buffer(exchange.recv(rank, slot)?.wrapping_byte_add(prefix), bytes, exchange.device(rank)))
     }
@@ -173,9 +173,8 @@ impl<'a> GlmfEngine<'a> {
                 let bytes = retained_bytes(rows, self.cfg.hidden)?;
                 ensure!(bytes <= slot.retained[plane].buffer.bytes, "Flash K6 retained rows exceed slot");
                 let result = projection.core(rows, input, weights, &slot.scratch.projection, self.stream_of(rank))?;
-                // SAFETY: retain this producer's F32 core before another projection reuses the accumulator.
-                unsafe { self.library.copy_d2d_async(slot.retained[plane].buffer, result,
-                    bytes, self.stream_of(rank)) }
+                retain_partial(self.library, result, slot.retained[plane].buffer,
+                    rows * self.cfg.hidden, self.stream_of(rank))
             } else { projection.local(rows, input, weights, &slot.scratch.projection, output, self.stream_of(rank)) }
         })
     }
@@ -191,7 +190,7 @@ impl<'a> GlmfEngine<'a> {
         let slot = w.core.as_ref().context("Flash K6 retained slot")?;
         self.record_exchange(rank, "main", at, true);
         self.exchange()?.push_to(rank, at, slot.retained[plane].buffer.ptr,
-            self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 4)
+            self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 2)
     }
     fn core_reduce(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, name: &str,
         at: usize, rows: usize, plane: usize, output: Buffer) -> Result<()> {
@@ -310,16 +309,16 @@ mod tests {
         };
         let first = (0..128).map(|n| ((n * 37 % 257) as f32 - 128.0) / 29.0).collect::<Vec<_>>();
         let second = (0..128).map(|n| ((n * 61 % 251) as f32 - 125.0) / 31.0).collect::<Vec<_>>();
-        let reference = transform(first.iter().zip(&second).map(|(a,b)| a + b).collect());
+        let reference = transform(first.iter().zip(&second).map(|(a,b)| narrow(*a) + narrow(*b)).collect());
         for rank in 0..2 {
             let (a,b) = if rank == 0 { (&first,&second) } else { (&second,&first) };
             let (a,b) = rank_order(rank,a,b);
             assert!(std::ptr::eq(a,&first) && std::ptr::eq(b,&second));
-            assert_eq!(transform(a.iter().zip(b).map(|(a,b)| a + b).collect()), reference);
+            assert_eq!(transform(a.iter().zip(b).map(|(a,b)| narrow(*a) + narrow(*b)).collect()), reference);
         }
         let lossy = transform(first).iter().zip(transform(second)).map(|(a,b)| narrow(a+b)).collect::<Vec<_>>();
         assert_ne!(lossy, reference, "fixture must detect premature BF16 egress");
-        assert_eq!(retained_bytes(4096,4096)?, 4096*4096*4);
+        assert_eq!(retained_bytes(4096,4096)?, 4096*4096*2);
         assert!(retained_bytes(usize::MAX,4096).is_err());
         Ok(())
     }
@@ -328,9 +327,9 @@ mod tests {
     fn native_slots_retain_both_producers_and_one_shared_contribution() {
         let source = include_str!("core.rs");
         let allocate = source.split("fn slot(&self").nth(1).unwrap().split("impl<'a> GlmfEngine").next().unwrap();
-        assert!(allocate.contains("retained: [allocate()?, allocate()?, allocate()?]"));
+        assert!(allocate.contains("retained: [allocate(1)?, allocate(1)?, allocate(2)?]"));
         let linear = source.split("fn core_linear(").nth(1).unwrap().split("fn core_stage(").next().unwrap();
-        assert!(linear.find("projection.core(").unwrap() < linear.find("copy_d2d_async").unwrap());
+        assert!(linear.find("projection.core(").unwrap() < linear.find("retain_partial(").unwrap());
         assert!(linear.contains("slot.retained[plane].buffer"));
         let reduce = source.split("fn core_reduce(").nth(1).unwrap().split("fn core_attention_meet(").next().unwrap();
         assert!(reduce.contains("rank_order(rank, local, peer)") && reduce.contains("slot.retained[2].buffer"));

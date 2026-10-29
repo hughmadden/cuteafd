@@ -386,7 +386,7 @@ mod tests {
         for output_shard in [false,true] {
             let charges = CoreCharges::from_package(&cfg,&core,cfg.layers,2,None,4096,3,64,None,output_shard,&manifest)?;
             let expected = receive_suffix_bytes(4096,cfg.hidden,3,output_shard)?;
-            assert_eq!(expected,if output_shard { 6 } else { 4 } * 3 * 4096 * cfg.hidden * 4);
+            assert_eq!(expected,if output_shard { 6 } else { 4 } * 3 * 4096 * cfg.hidden * 2);
             assert!(charges.ranks.iter().all(|r| r.receive_suffix == expected));
         }
         assert!(receive_suffix_bytes(usize::MAX,4096,3,true).is_err());

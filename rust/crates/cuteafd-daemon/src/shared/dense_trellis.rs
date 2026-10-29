@@ -5,7 +5,7 @@ use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_loader::{LoadedTensor, placement::Demand, formats::{
     dense_trellis::{LoadedDenseTrellis, TrellisSide}, exl3_storage::exl3_module,
     trellis_core::ProjectionScratchLayout}};
-use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, programs::Programs, F32Add,
+use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, programs::Programs, Bf16F32Add, NativeLibrary,
     dense_trellis::{DenseTrellisBuffers, DenseTrellisDispatch, DenseTrellisPolicy,
         TrellisDType, GroupedWorkspace, GROUPS}};
 use std::{collections::BTreeMap, ffi::c_void};
@@ -155,6 +155,48 @@ impl ProjectionScratch<'_> {
             accumulator:get("accumulator")}
     }
 }
+/// Replace the producer's retained copy with one exact RNE narrowing launch.
+/// Callers serialize the source accumulator and retain destination through drain.
+pub(crate) fn retain_partial(library: &NativeLibrary, source: Buffer, destination: Buffer,
+    count: usize, stream: *mut c_void) -> Result<()> {
+    validate_retained_partial(source, destination, count)?;
+    // SAFETY: checked distinct typed extents and device; the serialized lane
+    // orders the producer and retains both owners until this stream drains.
+    unsafe { library.load_narrow_f32_bf16(source.ptr, destination.ptr, count, stream) }
+}
+fn validate_retained_partial(source: Buffer, destination: Buffer, count: usize) -> Result<()> {
+    let input = count.checked_mul(4).filter(|&n| n > 0).context("K6 partial F32 extent overflow")?;
+    let output = count.checked_mul(2).context("K6 partial BF16 extent overflow")?;
+    ensure!(count <= (i64::MAX - 255) as usize, "K6 partial native extent overflow");
+    ensure!(source.device_id >= 0 && destination.device_id == source.device_id,
+        "K6 retained partial device mismatch");
+    for (buffer, bytes, alignment) in [(source, input, 4), (destination, output, 2)] {
+        ensure!(buffer.flags == 0 && !buffer.ptr.is_null() && buffer.ptr as usize % alignment == 0
+            && buffer.bytes >= bytes && (buffer.ptr as usize).checked_add(bytes).is_some(),
+            "K6 retained partial extent/alignment");
+    }
+    let src = source.ptr as usize;
+    let dst = destination.ptr as usize;
+    ensure!(src + input <= dst || dst + output <= src, "K6 retained partial aliases accumulator");
+    Ok(())
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    #[test]
+    fn narrowing_requires_distinct_full_typed_storage() {
+        let source = Buffer { ptr: 0x1000usize as *mut c_void, bytes: 64, device_id: 0, flags: 0 };
+        let destination = Buffer { ptr: 0x2000usize as *mut c_void, bytes: 32, ..source };
+        validate_retained_partial(source, destination, 16).unwrap();
+        for count in [0, 17, usize::MAX] { assert!(validate_retained_partial(source, destination, count).is_err()); }
+        for bad in [Buffer { bytes: 31, ..destination }, Buffer { device_id: 1, ..destination },
+            Buffer { ptr: 0x103eusize as *mut c_void, ..destination }, Buffer { flags: 1, ..destination }] {
+            assert!(validate_retained_partial(source, bad, 16).is_err());
+        }
+    }
+}
+
 pub(crate) struct Projection<'a> {pub program:DenseTrellisDispatch<'a>}
 impl<'a> Projection<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,shape:&str,book:&str,rows:usize,output:TrellisDType)->Result<Self> {
@@ -184,7 +226,7 @@ impl<'a> Projection<'a> {
         let core=self.core(rows,input,weights,scratch,stream)?;
         self.program.output(rows,core,weights.svh.buffer,output,stream)?;Ok(())
     }
-    pub(crate) fn reduced(&self,add:&F32Add<'_>,rows:usize,local:Buffer,published_peer:Buffer,reduced:Buffer,
+    pub(crate) fn reduced(&self,add:&Bf16F32Add<'_>,rows:usize,local:Buffer,published_peer:Buffer,reduced:Buffer,
         weights:&CoreWeights<'_>,output:Buffer,stream:*mut c_void)->Result<()> {
         self.program.reduce_output(add,rows,local,published_peer,reduced,weights.svh.buffer,output,stream)?;Ok(())
     }

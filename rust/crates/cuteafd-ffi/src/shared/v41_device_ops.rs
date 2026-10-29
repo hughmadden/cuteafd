@@ -48,6 +48,50 @@ impl F32Add<'_> {
         Ok(())
     }
 }
+type Bf16F32AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut f32, usize, *mut c_void) -> i32;
+/// Exact BF16 widening and rank-ordered F32 addition before a single K6 egress.
+pub struct Bf16F32Add<'a> { _library: &'a NativeLibrary, launch: Bf16F32AddFn }
+impl NativeLibrary {
+    pub fn bf16_f32_add(&self) -> Result<Bf16F32Add<'_>> {
+        // SAFETY: the symbol accepts two BF16 inputs and a distinct F32 output.
+        Ok(Bf16F32Add { _library: self,
+            launch: unsafe { *self.lib.get(b"cuteafd_bf16_f32_add_async")? } })
+    }
+}
+impl Bf16F32Add<'_> {
+    /// # Safety
+    /// Producers precede this operation on the current device stream. The
+    /// caller retains all allocations until completion, including graph replay.
+    pub unsafe fn launch(&self, a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
+        validate_bf16_f32_add_buffers(a, b, output, count)?;
+        // SAFETY: validated typed extents and disjoint output; caller owns ordering.
+        let status = unsafe { (self.launch)(a.ptr.cast(), b.ptr.cast(), output.ptr.cast(), count, stream) };
+        ensure!(status == 0, "shared BF16/F32 addition failed with CUDA status {status}");
+        Ok(())
+    }
+}
+fn validate_bf16_f32_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+    let input_bytes = count.checked_mul(2).filter(|&n| n > 0).context("invalid BF16/F32 addition extent")?;
+    let output_bytes = count.checked_mul(4).context("BF16/F32 addition output overflow")?;
+    ensure!(count <= (i64::MAX - 255) as usize, "BF16/F32 addition exceeds native extent");
+    ensure!(output.device_id >= 0 && a.device_id == output.device_id && b.device_id == output.device_id,
+        "BF16/F32 addition device mismatch");
+    for (buffer, bytes, alignment) in [(a, input_bytes, 2), (b, input_bytes, 2), (output, output_bytes, 4)] {
+        ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % alignment == 0 && buffer.bytes >= bytes
+            && buffer.flags == 0 && (buffer.ptr as usize).checked_add(bytes).is_some(),
+            "invalid BF16/F32 addition buffer");
+    }
+    let out = output.ptr as usize;
+    for source in [a, b] {
+        let start = source.ptr as usize;
+        ensure!(out + output_bytes <= start || start + input_bytes <= out,
+            "BF16/F32 addition output overlaps input");
+    }
+    Ok(())
+}
+
 fn validate_f32_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
     let bytes=count.checked_mul(4).filter(|&n|n>0).ok_or_else(||anyhow::anyhow!("invalid F32 addition extent"))?;
@@ -125,6 +169,27 @@ mod add_tests {
         assert!(validate_f32_add_buffers(a,b,a,7168).is_err());
         assert!(validate_f32_add_buffers(a,b,out,usize::MAX).is_err());
         assert!(validate_f32_add_buffers(a,CuteafdDeviceBuffer{device_id:1,..b},out,7168).is_err());
+    }
+
+    #[test]
+    fn retained_bf16_inputs_require_full_f32_output_and_disjoint_ranges() {
+        let [a, b, out] = buffers(16);
+        let out = CuteafdDeviceBuffer { bytes: 64, ..out };
+        validate_bf16_f32_add_buffers(a, b, out, 16).unwrap();
+        validate_bf16_f32_add_buffers(a, a, out, 16).unwrap();
+        for count in [0, 17, usize::MAX] {
+            assert!(validate_bf16_f32_add_buffers(a, b, out, count).is_err());
+        }
+        assert!(validate_bf16_f32_add_buffers(a, b, CuteafdDeviceBuffer { bytes: 63, ..out }, 16).is_err());
+        // Output starts before an input but its wider F32 range still overlaps it.
+        let overlap = CuteafdDeviceBuffer { ptr: (a.ptr as usize - 32) as *mut c_void, ..out };
+        assert!(validate_bf16_f32_add_buffers(a, b, overlap, 16).is_err());
+        for bad in [CuteafdDeviceBuffer { flags: 1, ..a },
+            CuteafdDeviceBuffer { device_id: 1, ..a },
+            CuteafdDeviceBuffer { ptr: 1usize as *mut c_void, ..a },
+            CuteafdDeviceBuffer { ptr: (usize::MAX - 1) as *mut c_void, ..a }] {
+            assert!(validate_bf16_f32_add_buffers(bad, b, out, 16).is_err());
+        }
     }
 
     #[test]
