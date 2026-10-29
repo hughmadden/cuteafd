@@ -464,6 +464,37 @@ impl<'a> LocalLane<'a> {
         Ok(())
     }
 
+    /// Attention alone selects member row views. Residual mixing and FFNs retain
+    /// the packed shape; recurrent slots and MLA page tables never cross members.
+    pub(crate) fn packed_attention(&self, sequences: &[SequenceRows<'_>],
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<AttentionRows>> {
+        ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
+            "Kimi packed page pool differs from admitted MLA bank");
+        AttentionRows::packed(sequences, self.lane.layout.unit, self.kda.slots(), self.max_context(), pool)
+    }
+
+    pub(crate) fn attention_packed(&mut self, layer: usize, members: &[AttentionRows]) -> Result<()> {
+        let window = self.lane.window.clone();
+        let shape = self.attention;
+        let bank = self.lane.metadata_bank;
+        let result = (|| {
+            let mut first = 0;
+            for metadata in members {
+                self.select_subwave(Some(first..first + metadata.rows))?;
+                self.lane.metadata_bank = 0;
+                self.lane.upload_attention(metadata)?;
+                self.attention = Some(AttentionShape { rows: metadata.rows, sequences: 1 });
+                self.attention(layer, metadata.rows, false)?;
+                first += metadata.rows;
+            }
+            Ok(())
+        })();
+        self.lane.window = window;
+        self.lane.metadata_bank = bank;
+        self.attention = shape;
+        result
+    }
+
     /// Stage immutable metadata in a disjoint admitted bank for every unit.
     /// Repeated layers only select views; they never upload or fence the host.
     pub(crate) fn stage_attention_units(&mut self, units: &[crate::shared::prefill_pipeline::Unit],
@@ -877,7 +908,7 @@ struct AttentionShape {
 /// Host metadata is rebuilt outside capture, then copied into fixed lane buffers.
 /// For <=64 rows, MLA treats each query as one request with its own visible
 /// length, so the native request scalar depends only on rows, not partitions.
-struct AttentionRows {
+pub(crate) struct AttentionRows {
     rows: usize,
     sequences: usize,
     width: usize,
@@ -890,6 +921,29 @@ struct AttentionRows {
 }
 
 impl AttentionRows {
+    fn packed(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<Self>> {
+        ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi packed member count");
+        let mut used = std::collections::BTreeSet::new();
+        let mut pages = BTreeMap::<u32, bool>::new();
+        let mut total = 0usize;
+        let mut members = Vec::with_capacity(sequences.len());
+        for sequence in sequences {
+            ensure!(used.insert(sequence.slot), "Kimi packed recurrent slot repeats");
+            total = total.checked_add(sequence.rows).context("Kimi packed rows overflow")?;
+            ensure!(total <= capacity, "Kimi packed rows exceed admitted unit");
+            let metadata = Self::new(std::slice::from_ref(sequence), capacity, slots, max_context, pool)?;
+            for (index, &page) in sequence.pages[..(sequence.start + sequence.rows).div_ceil(64)].iter().enumerate() {
+                let writable = index >= sequence.start / 64;
+                if let Some(previous) = pages.insert(page, writable) {
+                    ensure!(!previous && !writable, "Kimi packed members alias a writable page");
+                }
+            }
+            members.push(metadata);
+        }
+        Ok(members)
+    }
+
     fn new(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
         ensure!((1..=4096).contains(&capacity) && (1..=64).contains(&slots)
@@ -1276,6 +1330,30 @@ mod tests {
                 assert_ne!(shared, expected[0].lengths);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_attention_metadata_matches_singletons_and_rejects_member_aliases() -> Result<()> {
+        let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(32, 64, 1);
+        let pages = [pool.alloc(3)?, pool.alloc(3)?, pool.alloc(1)?];
+        let mut sequences = [SequenceRows { slot: 2, start: 63, rows: 65, pages: &pages[0] },
+            SequenceRows { slot: 0, start: 3, rows: 127, pages: &pages[1] },
+            SequenceRows { slot: 1, start: 0, rows: 3, pages: &pages[2] }];
+        let members = AttentionRows::packed(&sequences, 256, 4, 256, &pool)?;
+        for (member, sequence) in members.iter().zip(&sequences) {
+            let alone = AttentionRows::new(std::slice::from_ref(sequence), 256, 4, 256, &pool)?;
+            assert_eq!(member.uploads(), alone.uploads());
+            assert!(i32_metadata(&member.kda_first).iter().all(|&first| first == 0));
+            assert!(i32_metadata(&member.kda_slots).iter().all(|&slot| slot == sequence.slot as i32));
+        }
+        sequences[2].slot = 2;
+        assert!(AttentionRows::packed(&sequences, 256, 4, 256, &pool).is_err());
+        sequences[2].slot = 1;
+        sequences[2].pages = &pages[0];
+        assert!(AttentionRows::packed(&sequences, 256, 4, 256, &pool).is_err());
+        sequences[2].pages = &pages[2];
+        assert!(AttentionRows::packed(&sequences, 194, 4, 256, &pool).is_err());
         Ok(())
     }
 

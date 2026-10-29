@@ -31,6 +31,7 @@ pub(crate) struct Engine<'a> {
     exchange_streams: [Rc<Stream<'a>>; 2],
     /// Prefill units: the unit and the waves in flight.
     prefill: PrefillUnits,
+    packed_row_cap: Cell<Option<usize>>,
     /// The same shape as the shared prefill depth.
     depth: crate::shared::prefill_depth::PrefillDepth,
 }
@@ -39,6 +40,10 @@ pub(crate) struct Engine<'a> {
 /// equal units of at most `unit_rows` (`prefill_units`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrefillUnits { pub unit_rows: usize, pub waves: usize }
+
+fn packed_row_cap(mode: crate::shared::prefill_packing::PackingMode) -> Option<usize> {
+    (mode == crate::shared::prefill_packing::PackingMode::Exact).then_some(0)
+}
 
 impl Drop for Engine<'_> {
     fn drop(&mut self) {
@@ -74,6 +79,19 @@ fn check_expert_owners(layers: &[cuteafd_loader::placement::LayerAssignment], ow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_packing_runs_unknown_exl3_and_k6_arithmetic_routes_alone() {
+        use crate::shared::prefill_packing::{self, PackingMode, Limits};
+        let chunks = [(0, 17), (4, 31), (0, 65)];
+        let groups = |mode| {
+            let limits = Limits { rows: packed_row_cap(mode).unwrap_or(2752), chunk_rows: 2752,
+                max_context: 1024, taps: Some(2048) };
+            prefill_packing::groups(chunks.len(), |range| prefill_packing::plan(&chunks[range], &limits).is_ok())
+        };
+        assert_eq!(groups(PackingMode::Exact), [0..1, 1..2, 2..3]);
+        assert_eq!(groups(PackingMode::Unrestricted), [0..3]);
+    }
 
     #[test]
     fn whole_expert_bindings_require_exact_sparse_owner_sets() -> Result<()> {
@@ -213,7 +231,7 @@ impl<'a> Engine<'a> {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         Ok(Self { depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, exchange_streams, prefill })
+            hops, peer, exchange_streams, prefill, packed_row_cap: Cell::new(None) })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -245,6 +263,63 @@ impl<'a> Engine<'a> {
             // A call is the slots' units.
             slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
             full_prefill_logits: false })
+    }
+
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::log_mode;
+        // EXL3 capacity selection and K6 projection dispatch do not yet publish
+        // arithmetic-route bounds. Unknown routes must run alone.
+        let cap = packed_row_cap(mode);
+        self.packed_row_cap.set(cap);
+        log_mode(mode, cap.unwrap_or(self.prefill.unit_rows));
+        Ok(())
+    }
+
+    pub(crate) fn packed_limits(&self) -> Result<crate::shared::prefill_packing::Limits> {
+        Ok(crate::shared::prefill_packing::Limits {
+            rows: self.packed_row_cap.get().unwrap_or(self.prefill.unit_rows),
+            chunk_rows: self.prefill.unit_rows, max_context: self.geometry()?.max_context,
+            taps: self.draft.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),
+        })
+    }
+
+    /// One queued unit; state remains member-local and shared head scratch is
+    /// consumed before projecting the next member. Callback failures are local.
+    pub(crate) fn prefill_packed(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        self.require_live()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi packed prefill cannot overwrite pending verify");
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>(), &self.packed_limits()?)?;
+        let family = self.prefix_family()?;
+        for (placement, tokens) in sequences.iter() { family.check_append(placement, tokens.len())?; }
+        if let Some(draft) = &self.draft { draft.prepare_target()?; }
+        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            let mut lanes = self.lanes.try_borrow_mut()?;
+            let metadata = sequences.iter().map(|(p, tokens)| SequenceRows {
+                slot: p.slot, start: p.len, rows: tokens.len(), pages: &p.units,
+            }).collect::<Vec<_>>();
+            let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
+            lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
+            let Lanes { local, routed, io, experts } = &mut *lanes;
+            let normalized = self.execution.run_packed(scope, &self.peer, &self.hops,
+                &mut local[0], &mut routed[0], &mut experts[0], &metadata, pool, self.draft.as_deref())?;
+            drop(metadata);
+            for (placement, tokens) in sequences.iter_mut() {
+                family.commit(placement, placement.len, tokens.len())?;
+            }
+            crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
+                let row = segments[i].end_row() - 1;
+                let input = crate::shared::prefix::view(normalized, row * 7168 * 2, 7168 * 2)?;
+                let logits = io[0][1].project(input, 1, &local[0][1])?;
+                Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: 1,
+                    vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
+                    stream: local[0][1].stream().raw, greedy: None })
+            }, on_logits)
+        })
     }
 
     pub(crate) fn arm_draft_probe(&self) -> Result<()> {

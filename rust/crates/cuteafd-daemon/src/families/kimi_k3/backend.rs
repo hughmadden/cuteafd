@@ -117,6 +117,38 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         self.engine.step_device(&mut [(placement, tokens)], pool, logit_rows.max(1), true)
             .map(|logits| (logit_rows > 0).then_some(logits))
     }
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        self.engine.packed_limits().ok()
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>],
+        pool: &RefPagePool, on_logits: &mut dyn FnMut(usize, DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &self.engine.packed_limits()?)?;
+        let mut target = Vec::with_capacity(sequences.len());
+        let mut drafts = Vec::with_capacity(sequences.len());
+        for sequence in sequences {
+            ensure!(sequence.placement.len == sequence.start, "Kimi packed member frontier differs");
+            let slot = sequence.placement.slot;
+            drafts.push((slot, sequence.next, sequence.neural, &mut *sequence.draft));
+            target.push((&mut *sequence.placement, sequence.tokens));
+        }
+        self.engine.prefill_packed(&mut target, pool, &mut |i, logits| {
+            let (slot, next, neural, state) = &mut drafts[i];
+            if *neural {
+                let draft = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter not admitted"))?;
+                let segment = segments[i];
+                let rows = (0..segment.tap_rows).map(|offset| crate::shared::speculation::dflash::ContextRow {
+                    tap_row: segment.tap_offset + offset, slot: *slot, position: segment.start + offset,
+                }).collect::<Vec<_>>();
+                draft.update(&rows)?;
+                state.ready = true;
+                state.valid_from = self.origins.borrow()[*slot];
+                state.anchor = *next;
+            }
+            on_logits(i, logits)
+        })
+    }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         if speculative { return self.engine.verify_device(sequences, pool, true).map(Some); }
@@ -235,6 +267,163 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
 mod tests {
     use super::*;
     use crate::shared::qwen::scheduler::DraftState as _;
+    use anyhow::Context;
+
+    struct LiveMember {
+        logits: Vec<Vec<f32>>,
+        state: String,
+        draft: crate::shared::speculation::dflash::MlaReadback,
+    }
+
+    fn live_arm(backend: &KimiBackend<'_, '_>, pool: &mut RefPagePool, prompts: &[Vec<u32>],
+        packed: bool, cancelled: bool) -> Result<Vec<LiveMember>> {
+        use cuteafd_engine::prefix::PrefixFamily;
+        let family = backend.engine.prefix_family()?;
+        let starts = [0, 3, 7];
+        let mut placements = prompts.iter().enumerate().map(|(slot, prompt)| {
+            let mut placement = Placement { units: pool.alloc((prompt.len() + 1).div_ceil(64))?,
+                slot, len: 0, state_len: 0 };
+            family.bind(&mut placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            family.admit_draft_pages(&mut placement, prompt.len() + 1)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(placement)
+        }).collect::<Result<Vec<_>>>()?;
+        let mut states = (0..prompts.len()).map(|_| DraftState::default()).collect::<Vec<_>>();
+        for i in 0..prompts.len() {
+            if starts[i] > 0 {
+                backend.prefill_device(&mut placements[i], &prompts[i][..starts[i]], 1, pool)?;
+                backend.prefill_draft(&placements[i], 0, &prompts[i][..starts[i]], Some(prompts[i][starts[i]]), &mut states[i])?;
+            }
+        }
+        let mut logits = vec![Vec::new(); prompts.len()];
+        if packed {
+            let mut members = placements.iter_mut().zip(&mut states).enumerate().map(|(i, (placement, draft))|
+                scheduler::PrefillSeq { placement, tokens: &prompts[i][starts[i]..], start: starts[i],
+                    next: Some(42), draft, neural: true }).collect::<Vec<_>>();
+            let outcomes = backend.prefill_packed(&mut members, pool, &mut |i, row| {
+                logits[i].push(row.row_host(backend.library(), 0)?);
+                Ok(if cancelled && i == 1 { Err(anyhow::anyhow!("test client cancelled")) } else { Ok(()) })
+            })?;
+            for (i, result) in outcomes.into_iter().enumerate() {
+                ensure!(result.is_err() == (cancelled && i == 1), "Kimi packed cancellation escaped member {i}");
+            }
+        } else {
+            for i in 0..prompts.len() {
+                let chunk = &prompts[i][starts[i]..];
+                let row = backend.prefill_device(&mut placements[i], chunk, 1, pool)?.context("Kimi native head")?;
+                logits[i].push(row.row_host(backend.library(), 0)?);
+                backend.prefill_draft(&placements[i], starts[i], chunk, Some(42), &mut states[i])?;
+            }
+        }
+        // Identical teacher-forced continuation exposes corrupted recurrent/KV history.
+        for i in 0..prompts.len() {
+            let start = placements[i].len;
+            let row = backend.prefill_device(&mut placements[i], &[42], 1, pool)?.context("Kimi continuation head")?;
+            logits[i].push(row.row_host(backend.library(), 0)?);
+            backend.prefill_draft(&placements[i], start, &[42], Some(43), &mut states[i])?;
+        }
+        let draft = backend.engine.native_draft().context("native packing gate requires DFlash2")?;
+        draft.drain()?;
+        let mut output = Vec::new();
+        for (i, placement) in placements.iter_mut().enumerate() {
+            ensure!(states[i].ready && states[i].anchor == Some(43)
+                && draft.frontier(i)? == (0, placement.len), "Kimi packed draft member frontier {i}");
+            output.push(LiveMember { logits: std::mem::take(&mut logits[i]),
+                state: family.live_digest(placement)?, draft: draft.readback(i, 0)? });
+            family.discard(placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            pool.release(&placement.units);
+        }
+        Ok(output)
+    }
+
+    fn live_logits_score(reference: &[Vec<f32>], actual: &[Vec<f32>]) -> Result<(f64, f64)> {
+        ensure!(!reference.is_empty() && reference.len() == actual.len(), "Kimi packed score rows");
+        let (mut kl, mut matches) = (0.0, 0usize);
+        for (reference, actual) in reference.iter().zip(actual) {
+            ensure!(!reference.is_empty() && reference.len() == actual.len()
+                && reference.iter().chain(actual).all(|v| v.is_finite()), "Kimi packed logits invalid");
+            let log_probs = |row: &[f32]| {
+                let peak = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let norm = row.iter().map(|v| (f64::from(*v) - peak).exp()).sum::<f64>().ln() + peak;
+                row.iter().map(|v| f64::from(*v) - norm).collect::<Vec<_>>()
+            };
+            let p = log_probs(reference);
+            let q = log_probs(actual);
+            kl += p.iter().zip(q).map(|(p, q)| p.exp() * (p - q)).sum::<f64>();
+            let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            matches += usize::from(top(reference) == top(actual));
+        }
+        Ok((kl / reference.len() as f64, matches as f64 / reference.len() as f64))
+    }
+
+    #[test]
+    #[ignore = "requires two RTX GPUs, six live Spark workers, DFlash2 and CUTEAFD_KIMI_PACK_GATE_ARGS JSON serve-kimi argv plus CUTEAFD_KIMI_PACK_GATE_TOKENS JSON token IDs"]
+    fn live_packed_prefill_matches_singletons_with_private_dflash() -> Result<()> {
+        use anyhow::Context;
+        use clap::Parser;
+        use cuteafd_engine::prefix::PrefixFamily;
+        use std::sync::Arc;
+        let argv: Vec<String> = serde_json::from_str(&std::env::var("CUTEAFD_KIMI_PACK_GATE_ARGS")?)?;
+        let crate::cli::Commands::ServeKimi(args) = crate::cli::Cli::try_parse_from(argv)?.command else {
+            anyhow::bail!("packing gate needs serve-kimi arguments");
+        };
+        ensure!(args.peers.len() == 6 && args.max_sequences >= 3, "Kimi native packing gate needs six peers and three slots");
+        let source: Vec<u32> = serde_json::from_str(&std::env::var("CUTEAFD_KIMI_PACK_GATE_TOKENS")?)?;
+        ensure!(!source.is_empty(), "Kimi packing gate token panel empty");
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("native packing gate requires isolated process"))?;
+        super::super::startup::preflight(&args.manifest, &args.native_lib)?;
+        // SAFETY: explicit installed native library; every borrower drops before it.
+        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
+        let programs = library.programs()?.with_manifest(&args.manifest)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
+        let prefill = args.prefill()?;
+        let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
+            super::super::startup::Options { cache_format: args.kv_cache, devices: [args.device, args.split_device],
+                native_lib: &args.native_lib, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
+                spark_budget_gib: args.spark_budget_gib, rows: usize::try_from(prefill.span_rows)?,
+                waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
+                slots: usize::from(args.max_sequences), marks: 1,
+                max_context: args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT),
+                pool_tokens: args.pool_tokens, graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
+                hosted_layers: None, draft: Some(super::super::draft::Options {
+                    snapshot: args.draft.clone().context("native packing gate requires --draft")?,
+                    fp8: args.draft_fp8, cache_format: args.kv_cache }), verify_rows: 0 })?;
+        let engine = &loaded.engine;
+        let backend = KimiBackend::new(engine)?;
+        library.cuda_set_device(args.split_device)?;
+        let mut pool = RefPagePool::new(engine.prefix_family()?.layout().pages, 64);
+        let prompts = [29, 68, 134].iter().enumerate().map(|(i, &len)|
+            (0..len).map(|j| source[(i * 97 + j) % source.len()]).collect::<Vec<_>>()).collect::<Vec<_>>();
+        engine.configure_packing(crate::shared::prefill_packing::PackingMode::Exact)?;
+        let alone = live_arm(&backend, &mut pool, &prompts, false, false)?;
+        let exact = live_arm(&backend, &mut pool, &prompts, false, false)?;
+        for i in 0..prompts.len() {
+            ensure!(alone[i].logits == exact[i].logits && alone[i].state == exact[i].state
+                && alone[i].draft == exact[i].draft, "Kimi exact singleton golden differs for member {i}");
+        }
+        engine.configure_packing(crate::shared::prefill_packing::PackingMode::Unrestricted)?;
+        let packed = live_arm(&backend, &mut pool, &prompts, true, false)?;
+        let cancelled = live_arm(&backend, &mut pool, &prompts, true, true)?;
+        let mut changed = prompts.clone();
+        for (i, token) in changed[1].iter_mut().enumerate() { *token = source[(i + 11) % source.len()]; }
+        let partner = live_arm(&backend, &mut pool, &changed, true, false)?;
+        let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Low.bars();
+        for i in 0..prompts.len() {
+            let (kl, top1) = live_logits_score(&alone[i].logits, &packed[i].logits)?;
+            println!("Kimi packed member {i}: KL={kl:.8} top1={top1:.4} target_bytes_equal={} draft_bytes_equal={}",
+                alone[i].state == packed[i].state, alone[i].draft == packed[i].draft);
+            ensure!(kl <= kl_max && top1 >= top1_min, "Kimi packed member {i} exceeds fidelity tier");
+            ensure!(packed[i].logits == cancelled[i].logits && packed[i].state == cancelled[i].state
+                && packed[i].draft == cancelled[i].draft, "Kimi cancellation changed member {i}");
+            if i != 1 {
+                ensure!(packed[i].logits == partner[i].logits && packed[i].state == partner[i].state
+                    && packed[i].draft == partner[i].draft, "Kimi partner changed member {i}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn kimi_verify_cycle_observes_simple_wall_time_and_shared_routes() -> Result<()> {

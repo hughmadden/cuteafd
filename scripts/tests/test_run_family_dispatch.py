@@ -1991,6 +1991,25 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
         assert launch[launch.index("--prefill-packing") + 1] == mode
 
 
+@pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
+def test_kimi_packed_prefill_mode_forwarding(tmp_path, mode):
+    config = {"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
+        "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    keys = "SPARK_COUNT=6\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    keys += "".join(f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(1, 6))
+    if mode:
+        keys += f"PREFILL_PACKING={mode}\n"
+    result = _family_launch_result(tmp_path, config, "test/Kimi-K3", keys,
+        extra_args=("--wip", "packed-kimi"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30})
+    assert result.returncode == 0, result.stderr
+    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    if mode is None:
+        assert "--prefill-packing" not in launch
+    else:
+        assert launch[launch.index("--prefill-packing") + 1] == mode
+
+
 def test_packed_prefill_mode_rejects_unknown_value(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "PREFILL_PACKING=approximate\n")
     assert result.returncode == 2 and "PREFILL_PACKING must be unrestricted or exact" in result.stderr

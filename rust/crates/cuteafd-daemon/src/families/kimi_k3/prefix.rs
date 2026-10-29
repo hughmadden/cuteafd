@@ -152,6 +152,27 @@ impl<'a> KimiPrefix<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn live_digest(&self, placement: &Placement) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        self.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut digest = Sha256::new();
+        for rank in 0..2 {
+            let device = self.0.kda[rank].stream.device;
+            let mut buffers = self.state_buffers(rank, placement.slot)?;
+            for (index, &page) in placement.units.iter().enumerate() {
+                let rows = placement.len.saturating_sub(index * MLA_PAGE_ROWS).min(MLA_PAGE_ROWS);
+                if rows > 0 { buffers.extend(self.page_buffers(rank, page, rows)?); }
+            }
+            for buffer in buffers {
+                let mut bytes = vec![0; buffer.bytes];
+                device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+                digest.update(bytes);
+            }
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
     fn state_buffers(&self, rank: usize, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         self.0.cfg.attention.iter().enumerate().filter(|(_, kind)| **kind == KimiAttention::Kda)
             .map(|(layer, _)| self.0.kda[rank].slot(layer, slot)).collect::<Result<Vec<_>>>()
