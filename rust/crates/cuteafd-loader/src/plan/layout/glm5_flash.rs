@@ -144,11 +144,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             });
             let path = path.ok_or_else(|| anyhow::anyhow!("DFlash2 config missing: provide --glmf-drafter-snapshot or disable the drafter"))?;
             let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
-            let slots = options.draft_context_slots.unwrap_or(sequences.max(8)) as usize;
-            let batch = options.draft_sequences.max(sequences).min(slots as u64) as usize;
-            let (_, block) = crate::families::glm5::draft_representation::draft_geometry(&config)?;
-            draft_rows = Some(batch.checked_mul(usize::try_from(block)?)
-                .ok_or_else(|| anyhow::anyhow!("Flash native draft head row overflow"))?);
+            let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config,
+                options.draft_context_slots.map(usize::try_from).transpose()?, usize::try_from(options.draft_sequences)?)?;
+            let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
+            draft_rows = Some(capacity.block_rows);
             let (bytes, scratch) = glmf::drafter_inventory(&config, slots, batch,
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
@@ -166,7 +165,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             });
             Some(crate::families::glm5_flash::core_admission::CoreCharges::from_package(&cfg, &core,
                 cfg.layers, ranks, owners.as_deref(), rows as usize, lanes as usize,
-                decode_rows as usize, draft_rows,
+                decode_rows as usize, draft_rows, ranks == 2 && representation.output_shard,
                 manifest.ok_or_else(|| anyhow::anyhow!("Flash K6 requires PROGRAMS.json with native exports"))?)?)
         } else { None };
         if let Some(charge) = &core_charge {

@@ -54,15 +54,27 @@ impl CoreRankLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreCharges { pub ranks: Vec<CoreRankLayout>, pub programs: Vec<String> }
+
+/// Whole MLA stages exist only when an admitted layer actually contains MLA.
+pub fn owned_mla(cfg: &GlmNextConfig, layers: usize, ranks: usize, whole: bool) -> bool {
+    ranks == 2 && whole && cfg.attention[..layers].contains(&super::GlmNextAttention::Mla)
+}
+
+pub fn receive_suffix_bytes(rows: usize, hidden: usize, waves: usize, output_shard: bool) -> Result<usize> {
+    (if output_shard { 6usize } else { 4 }).checked_mul(waves)
+        .and_then(|n| n.checked_mul(rows)).and_then(|n| n.checked_mul(hidden))
+        .and_then(|n| n.checked_mul(4)).context("Flash K6 receive overflow")
+}
 impl CoreCharges {
     #[allow(clippy::too_many_arguments)]
     pub fn from_package(cfg: &GlmNextConfig, core: &CoreInventory, layers: usize, ranks: usize,
         owners: Option<&[u8]>, unit: usize, slots: usize, decode_rows: usize,
-        draft_rows: Option<usize>, manifest: &serde_json::Value) -> Result<Self> {
+        draft_rows: Option<usize>, output_shard: bool, manifest: &serde_json::Value) -> Result<Self> {
         ensure!(layers > 0 && layers <= cfg.layers && matches!(ranks, 1 | 2)
             && (1..=4096).contains(&unit) && (1..=4).contains(&slots)
             && matches!(decode_rows, 64 | 128) && (ranks == 1 || decode_rows == 64)
             && owners.is_none_or(|o| ranks == 2 && o.len() == layers), "Flash K6 admission geometry");
+        let owned = owned_mla(cfg, layers, ranks, owners.is_some());
         let mut bodies = vec![Vec::new(); ranks];
         for layer in 0..layers {
             let owner = owners.and_then(|o| (cfg.attention[layer] == super::GlmNextAttention::Mla).then_some(o[layer]));
@@ -88,14 +100,14 @@ impl CoreCharges {
         };
         let scratch = |decode: bool| -> Result<usize> {
             let mut bytes = 0;
-            for name in route_stage_names(cfg, ranks, owners.is_some(), decode, decode_rows) {
+            for name in route_stage_names(cfg, ranks, owned, decode, decode_rows) {
                 bytes = bytes.max(lookup(&name)?);
             }
             Ok(bytes)
         };
         if bodies.iter().any(|b| !b.is_empty()) {
             for decode in [true, false] {
-                for name in route_stage_names(cfg, ranks, owners.is_some(), decode, decode_rows) {
+                for name in route_stage_names(cfg, ranks, owned, decode, decode_rows) {
                     lookup(&name)?; programs.insert(name);
                 }
             }
@@ -112,14 +124,13 @@ impl CoreCharges {
         let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input);
         let retained_rows = decode_rows.checked_add(unit.checked_mul(slots).context("Flash K6 live rows overflow")?)
             .context("Flash K6 live rows overflow")?;
-        let receive = 4usize.checked_mul(slots).and_then(|n| n.checked_mul(unit.max(decode_rows)))
-            .and_then(|n| n.checked_mul(cfg.hidden)).and_then(|n| n.checked_mul(4)).context("Flash K6 receive overflow")?;
+        let receive = receive_suffix_bytes(unit.max(decode_rows), cfg.hidden, slots, output_shard)?;
         let mut layouts = Vec::new();
         for (rank, body) in bodies.into_iter().enumerate() {
             layouts.push(CoreRankLayout {
                 stages: if body.is_empty() { None } else { Some([
-                    CoreStageLayout::new(cfg, decode_rows, ranks, owners.is_some(), scratch(true)?)?,
-                    CoreStageLayout::new(cfg, unit, ranks, owners.is_some(), scratch(false)?)?]) },
+                    CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(true)?)?,
+                    CoreStageLayout::new(cfg, unit, ranks, owned, scratch(false)?)?]) },
                 decode: projection(&body, decode_rows)?, prefill: projection(&body, unit)?,
                 target_head: if rank == 0 { head_scratch(decode_rows.max(unit))? } else { None },
                 draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },

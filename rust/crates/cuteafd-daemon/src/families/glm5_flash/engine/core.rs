@@ -67,8 +67,10 @@ impl<'a> Rank<'a> {
             }
             ensure!(actual.as_ref() == Some(expected), "Flash K6 loaded/admitted projection scratch mismatch");
             let projection = ProjectionLayout { rows: expected.rows, extents: expected.extents.clone() }.allocate(device)?;
-            let owned = engine.weights.layers.iter().chain(engine.peer.iter().flat_map(|p| p.layers.iter()))
+            let whole = engine.weights.layers.iter().chain(engine.peer.iter().flat_map(|p| p.layers.iter()))
                 .any(|l| l.attention == GlmNextAttention::Mla && !l.attention_share.split());
+            let owned = cuteafd_loader::families::glm5_flash::core_admission::owned_mla(
+                &engine.cfg, layers.len(), engine.ranks(), whole);
             let mut stage_bytes = 0;
             for name in route_stage_names(&engine.cfg, engine.ranks(), owned, index == 0, engine.decode_rows) {
                 stage_bytes = stage_bytes.max(engine.programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0) as usize);
@@ -114,7 +116,16 @@ impl<'a> GlmfEngine<'a> {
             if self.ranks() == 2 {
                 let prefix = self.prefill_rows.max(self.decode_rows) * self.cfg.hidden * self.partial_bytes();
                 let suffix = self.exchange()?.slot_bytes().checked_sub(prefix).context("Flash K6 exchange prefix")?;
-                let allocated = suffix * (if self.kda_output_shard { 6 } else { 4 }) * self.prefill_waves;
+                let rows = self.prefill_rows.max(self.decode_rows);
+                let expected_suffix = if admitted.ranks.iter().flat_map(|r| &r.body)
+                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) {
+                    rows * self.cfg.hidden * 4
+                } else { 0 };
+                ensure!(suffix == expected_suffix, "Flash K6 exchange slot suffix differs from admission");
+                let allocated = if suffix == 0 { 0 } else {
+                    cuteafd_loader::families::glm5_flash::core_admission::receive_suffix_bytes(
+                        rows, self.cfg.hidden, self.prefill_waves, self.kda_output_shard)?
+                };
                 ensure!(layout.receive_suffix == allocated, "Flash K6 receive suffix differs from admission");
             } else { ensure!(layout.receive_suffix == 0, "single-rank Flash K6 has no receive suffix"); }
             self.core.push(Some(self.on(rank, || Rank::new(self, rank, layout, layers))?));

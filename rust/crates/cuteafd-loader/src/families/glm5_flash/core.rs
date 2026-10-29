@@ -367,6 +367,33 @@ mod tests {
     }
 
     #[test]
+    fn owned_short_prefix_and_mixed_kda_suffix_match_runtime_contract() -> Result<()> {
+        use super::super::core_admission::{CoreCharges, CoreStageLayout, owned_mla, receive_suffix_bytes};
+        let (cfg, checkpoint) = fixture();
+        let mut core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let manifest = executable_package(&cfg, &core)?;
+        for layers in 1..=4 {
+            let owners = vec![0; layers];
+            let charges = CoreCharges::from_package(&cfg,&core,layers,2,Some(&owners),4096,3,64,None,false,&manifest)?;
+            let owned = owned_mla(&cfg,layers,2,true);
+            assert_eq!(owned,layers == 4);
+            let expected = CoreStageLayout::new(&cfg,64,2,owned,4096)?;
+            for rank in charges.ranks { assert_eq!(rank.stages.unwrap()[0],expected); }
+        }
+        core.projections.retain(|name,_| !(0..cfg.layers).any(|layer|
+            cfg.attention[layer] == GlmNextAttention::Kda && name.starts_with(&format!("{PREFIX}{layer}.self_attn."))));
+        assert!(!core.scratch_mask(&cfg,cfg.layers).kda);
+        for output_shard in [false,true] {
+            let charges = CoreCharges::from_package(&cfg,&core,cfg.layers,2,None,4096,3,64,None,output_shard,&manifest)?;
+            let expected = receive_suffix_bytes(4096,cfg.hidden,3,output_shard)?;
+            assert_eq!(expected,if output_shard { 6 } else { 4 } * 3 * 4096 * cfg.hidden * 4);
+            assert!(charges.ranks.iter().all(|r| r.receive_suffix == expected));
+        }
+        assert!(receive_suffix_bytes(usize::MAX,4096,3,true).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn published_finalizer_manifest_and_native_residency() -> Result<()> {
         let (cfg, checkpoint) = complete_fixture();
         assert_eq!(checkpoint.tensors.len(), 151198);

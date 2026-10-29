@@ -1533,13 +1533,12 @@ impl Opened {
         });
         let draft_rows = args.draft.as_ref().map(|path| -> Result<usize> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-            let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
-            args.draft_sequences.min(args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)))
-                .checked_mul(usize::try_from(block)?).context("Flash native draft head row overflow")
+            Ok(cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+                args.draft_context_slots, args.draft_sequences)?.block_rows)
         }).transpose()?;
         let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
         Ok(Some(CoreCharges::from_package(&self.cfg, &core, layers, ranks, owners.as_deref(),
-            args.prefill_rows, args.prefill_waves, args.decode_rows, draft_rows, &manifest)?))
+            args.prefill_rows, args.prefill_waves, args.decode_rows, draft_rows, args.kda_output_shard, &manifest)?))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1638,8 +1637,9 @@ impl Opened {
         let draft_sms: Vec<_> = inventory.gpus.iter().map(|gpu| gpu.sms as u64).collect();
         let (drafter_bytes, drafter_scratch, drafter_bridge) = args.draft.as_ref().map(|path| -> Result<_> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-            let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
-            let batch = args.draft_sequences.min(slots);
+            let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+                args.draft_context_slots, args.draft_sequences)?;
+            let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
             let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
                 args.draft_linear.code() as u8, args.draft_kv_cache)?;
@@ -2273,7 +2273,10 @@ impl Opened {
         let started = Instant::now();
         let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
             ::from_fp8_option(args.draft_fp8);
-        let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+            args.draft_context_slots, args.draft_sequences)?;
+        let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
         let drafter = if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
@@ -2283,10 +2286,10 @@ impl Opened {
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
             let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
-                slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
+                slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
-            dspark::Drafter::load(&self.library, snapshot, stream, slots, args.draft_sequences.min(slots),
+            dspark::Drafter::load(&self.library, snapshot, stream, slots, batch,
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                 args.draft_linear, args.draft_kv_cache, read)?
         };
