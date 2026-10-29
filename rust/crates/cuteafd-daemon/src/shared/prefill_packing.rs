@@ -49,6 +49,52 @@ pub(crate) fn validate_program_inventory<'a>(required: impl IntoIterator<Item = 
     Ok(())
 }
 
+/// A scoped packed pass checks every coordinator launch against its owner's
+/// explicit inventory, including sequence-local helpers. Future programs have
+/// no default role and fail before launch until the inventory is updated.
+#[derive(Default)]
+pub(crate) struct ProgramInventory {
+    #[cfg(debug_assertions)]
+    active: std::cell::RefCell<Option<std::collections::HashMap<String, ProgramRows>>>,
+}
+
+impl ProgramInventory {
+    pub(crate) fn enter(&self, entries: impl FnOnce() -> Vec<(String, ProgramRows)>) -> Result<ProgramInventoryGuard<'_>> {
+        #[cfg(debug_assertions)] {
+            let entries = entries();
+            let borrowed: Vec<_> = entries.iter().map(|(name, role)| (name.as_str(), *role)).collect();
+            validate_program_inventory(entries.iter().map(|(name, _)| name.as_str()), &borrowed)?;
+            let mut active = self.active.borrow_mut();
+            ensure!(active.is_none(), "nested packed program inventory");
+            *active = Some(entries.into_iter().collect());
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = entries;
+        Ok(ProgramInventoryGuard(self))
+    }
+
+    #[inline(always)]
+    pub(crate) fn check(&self, name: &str) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if let Some(active) = self.active.borrow().as_ref() {
+            ensure!(active.contains_key(name), "unclassified packed-path program {name}");
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = name;
+        Ok(())
+    }
+}
+
+pub(crate) struct ProgramInventoryGuard<'a>(&'a ProgramInventory);
+impl Drop for ProgramInventoryGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        { *self.0.active.borrow_mut() = None; }
+        #[cfg(not(debug_assertions))]
+        let _ = self.0;
+    }
+}
+
 /// Greedy adjacent groups, retaining oversized requests as ordinary singletons.
 /// Splitting a request itself would change the alone reference's arithmetic.
 pub(crate) fn groups(members: usize, fits: impl Fn(std::ops::Range<usize>) -> bool)
@@ -159,6 +205,22 @@ mod tests {
         assert!(validate_program_inventory(["router", "attention", "new_projection"], &inventory).is_err());
         assert!(validate_program_inventory(["router"], &inventory).is_err());
         assert!(validate_program_inventory(["router"], &[("router", PackedRows), ("router", SequenceLocal)]).is_err());
+    }
+
+    #[test]
+    fn every_packed_launch_requires_an_explicit_role_and_guard_resets_on_error() {
+        use ProgramRows::*;
+        let inventory = ProgramInventory::default();
+        inventory.check("outside_packed_pass").unwrap();
+        {
+            let _pass = inventory.enter(|| vec![("router".into(), PackedRows), ("attention".into(), SequenceLocal)]).unwrap();
+            inventory.check("router").unwrap();
+            inventory.check("attention").unwrap();
+            assert!(inventory.check("new_projection").is_err());
+            assert!(inventory.enter(|| vec![]).is_err());
+        }
+        inventory.check("outside_packed_pass").unwrap();
+        assert!(inventory.enter(|| vec![("router".into(), PackedRows), ("router".into(), SequenceLocal)]).is_err());
     }
 
     #[test]

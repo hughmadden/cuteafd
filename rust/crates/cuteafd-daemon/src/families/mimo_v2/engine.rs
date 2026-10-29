@@ -806,6 +806,7 @@ pub(crate) struct MimoEngine<'a> {
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
     packed_row_cap: Cell<Option<usize>>,
+    packed_programs: crate::shared::prefill_packing::ProgramInventory,
     tp2: Option<Tp2<'a>>,
     rtx_local: Option<Fp8Experts<'a>>,
     pub expert_input: ExpertInput,
@@ -921,7 +922,7 @@ impl<'a> MimoEngine<'a> {
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
             max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            prefill_kv_wide: RefCell::new(None), experts: None, packed_row_cap: Cell::new(None), tp2: None, rtx_local: None,
+            prefill_kv_wide: RefCell::new(None), experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             drafter: None, mtp: None, l2: None, embedding,
@@ -1343,6 +1344,7 @@ impl<'a> MimoEngine<'a> {
     fn run_on(&self, rank: usize, split: bool, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar])
         -> Result<()> {
         let name = &self.program_name(name, split);
+        self.packed_programs.check(name)?;
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: self.family, split_family: self.split_family,
         };
@@ -1636,10 +1638,40 @@ impl<'a> MimoEngine<'a> {
             if all_logits { tokens.len() } else { 1 }, false)))
     }
 
+    fn packed_program_inventory(&self) -> Vec<(String, crate::shared::prefill_packing::ProgramRows)> {
+        use crate::shared::prefill_packing::ProgramRows::*;
+        let mut inventory = Vec::new();
+        for (rank, layers) in std::iter::once(&self.weights.layers)
+            .chain(self.peer.as_ref().map(|p| &p.layers)).enumerate() {
+            let split = rank != 0;
+            let mut add = |name: String, role| {
+                let item = (self.program_name(&name, split), role);
+                if !inventory.contains(&item) { inventory.push(item); }
+            };
+            add("mimo_norm".into(), PackedRows);
+            for layer in layers {
+                // The fused producer and output projection run within packed_attention's member loop.
+                let k = kind(layer.attention);
+                let kv = self.kv_cache.of(layer.attention).program_tag();
+                add(format!("mimo_{k}_producer{kv}_m4096"), SequenceLocal);
+                add(format!("mimo_{k}_attention{kv}_prefill_m4096"), SequenceLocal);
+                add(format!("mimo_o{}_m4096", if layer.has("w_o_fp8") { "_w8" } else { "" }), SequenceLocal);
+                if layer.dense { add("mimo_ffn_m4096".into(), PackedRows); }
+                else {
+                    add("mimo_router_scores".into(), SequenceLocal);
+                    if !self.expert_bf16_input(false) { add("mimo_expert_input_quant".into(), SequenceLocal); }
+                }
+            }
+        }
+        inventory
+    }
+
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
         use crate::shared::prefill_packing::{log_mode, PackingMode};
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
-        let mut cap = self.prefill_rows;
+        let inventory = self.packed_program_inventory();
+        let mut cap = crate::shared::prefill_packing::coordinator_row_cap(self.programs,
+            inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows)?;
         if let Some(local) = &self.rtx_local { cap = cap.min(local.packed_row_cap(true, cap)?); }
         if let Some(tp2) = &self.tp2 {
             for rank in &tp2.ranks { cap = cap.min(rank.borrow().packed_row_cap(cap)?); }
@@ -1688,6 +1720,7 @@ impl<'a> MimoEngine<'a> {
         -> Result<(Vec<crate::shared::prefill_packing::Segment>, Vec<Result<()>>)> {
         use crate::shared::prefill_pipeline::{Unit, UnitSegment, run_prefill_units};
         ensure!(self.weights.layers.len() == self.cfg.layers, "packed prefill requires every layer");
+        let _program_inventory = self.packed_programs.enter(|| self.packed_program_inventory())?;
         let segments = crate::shared::prefill_packing::plan(&sequences.iter()
             .map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>(), &self.packed_limits())?;
         self.submit(|| {

@@ -656,3 +656,55 @@ def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
         params = dict(width=width, outputs=outputs)
         assert calls[f"latent_{direction}"] == ("bf16_projection", params,
             ("pointwise", "compile_bf16_projection_aot", (), params))
+
+
+def _route_property(relative, owner):
+    """Exercise exported arithmetic metadata without importing CUDA/CuTe."""
+    source = ROOT / "third_party/sparkinfer/b12x" / relative
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == owner)
+    prop = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "exact_row_cap")
+    prop.decorator_list = []
+    module = ast.Module(body=[prop], type_ignores=[])
+    scope = {}
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
+    return scope["exact_row_cap"]
+
+
+def test_coordinator_first_route_metadata_is_derived_from_projection_dispatch():
+    bf16 = _route_property("gemm/bf16_gemv/_skinny.py", "RoutedBf16Projection")
+    assert bf16(types.SimpleNamespace(max_skinny_rows=64)) == 64
+    assert bf16(types.SimpleNamespace(max_skinny_rows=160)) == 160
+    assert bf16(types.SimpleNamespace(max_skinny_rows=0)) == 2**31 - 1
+    fp8 = _route_property("integration/cuteafd/_fp8_weights.py", "Fp8Projection")
+    assert fp8(types.SimpleNamespace(prefill=True)) == 2**31 - 1
+    assert fp8(types.SimpleNamespace(prefill=False)) == 0  # runtime fp8_rows is unbounded metadata
+    switch = _route_property("integration/cuteafd/glmf.py", "_Fp8Switch")
+    assert switch(types.SimpleNamespace(prefill=object(), bf16=types.SimpleNamespace(exact_row_cap=64),
+                                        activation_quant_row_threshold=8)) == 8
+    assert switch(types.SimpleNamespace(prefill=None, bf16=types.SimpleNamespace(exact_row_cap=64), fp8=None)) == 64
+    assert switch(types.SimpleNamespace(prefill=None, bf16=types.SimpleNamespace(exact_row_cap=64), fp8=object())) == 0
+
+
+@pytest.mark.parametrize("filename,programs", [
+    ("mimo_ffn.py", {"compile_mimo_norm_aot", "compile_mimo_ffn_aot", "compile_mimo_router_scores_aot"}),
+    ("glmf.py", {"compile_glmf_mla_producer_aot", "compile_glmf_ffn_aot", "compile_glmf_o_aot",
+                  "compile_glmf_router_scores_aot", "compile_glmf_add_aot"}),
+    ("glm_ffn.py", {"compile_glm_router_scores_aot", "_compile_glm_ffn_w8"}),
+    ("dsv4_ffn.py", {"compile_dsv4_router_scores_aot", "compile_dsv4_shared_ffn_aot"}),
+])
+def test_coordinator_composites_publish_first_route_caps(filename, programs):
+    source = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd" / filename
+    tree = ast.parse(source.read_text())
+    found = set()
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef) or function.name not in programs:
+            continue
+        for call in ast.walk(function):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != "compile_program":
+                continue
+            geometry = next(kw.value for kw in call.keywords if kw.arg == "geometry")
+            assert isinstance(geometry, ast.Dict)
+            assert "exact_row_cap" in [key.value for key in geometry.keys if isinstance(key, ast.Constant)], function.name
+        found.add(function.name)
+    assert found == programs

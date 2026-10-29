@@ -1403,6 +1403,7 @@ pub(crate) struct GlmfEngine<'a> {
     prefill_slots: RefCell<Vec<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
     packed_row_cap: Cell<Option<usize>>,
+    packed_programs: crate::shared::prefill_packing::ProgramInventory,
     dense_nvfp4: Option<DenseNvfp4<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     /// Host seconds per phase: GPU work until each expert exchange (waiting
@@ -1772,7 +1773,7 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
-            experts: None, packed_row_cap: Cell::new(None), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -3038,6 +3039,7 @@ impl<'a> GlmfEngine<'a> {
     fn run_on(&self, rank: usize, split: bool, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar])
         -> Result<()> {
         let name = format!("{}_{name}", if split { "glmf2" } else { "glmf" });
+        self.packed_programs.check(&name)?;
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(&name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
@@ -3416,10 +3418,56 @@ impl<'a> GlmfEngine<'a> {
         Ok(logits)
     }
 
+    fn packed_program_inventory(&self) -> Vec<(String, crate::shared::prefill_packing::ProgramRows)> {
+        use crate::shared::prefill_packing::ProgramRows::*;
+        let mut inventory = Vec::new();
+        let mut add = |name: String, role| {
+            let item = (format!("glmf_{name}"), role);
+            if !inventory.contains(&item) { inventory.push(item); }
+        };
+        for name in ["mhc_pre", "mhc_post", "mhc_post_pre_m4096", "head"] {
+            add(name.into(), SequenceLocal);
+        }
+        for layer in &self.weights.layers {
+            match layer.attention {
+                GlmNextAttention::Kda => {
+                    let name = if layer.has("w_in_fp8") {
+                        if self.kda_state == KdaState::F32 {
+                            format!("kda_w8{}_m4096", if self.kda_prefill_expanded { "_expanded" } else { "" })
+                        } else { self.kda_state.w8_program(PREFILL_CAP) }
+                    } else { self.kda_state.program(PREFILL_CAP) };
+                    add(name, SequenceLocal);
+                }
+                GlmNextAttention::Mla => {
+                    add("mla_producer_m4096".into(), PackedRows);
+                    add("o_m4096".into(), PackedRows);
+                    add(format!("index_producer{}_m4096", if self.index_cache == IndexCache::Compact { "_c" } else { "" }), SequenceLocal);
+                    for name in ["index_topk_prefill_m4096", "index_expand", "sparse_mla_prefill_m4096"] {
+                        add(name.into(), SequenceLocal);
+                    }
+                }
+            }
+            let inter = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
+            if !layer.has("nvfp4_w1") { add(format!("ffn_i{inter}_m4096"), PackedRows); }
+            if !layer.dense {
+                add("router_scores".into(), SequenceLocal);
+                add("add".into(), PackedRows);
+                if !self.spark_bf16 { add("expert_input_quant".into(), PackedRows); }
+            }
+        }
+        inventory
+    }
+
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
         use crate::shared::prefill_packing::{log_mode, PackingMode};
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
-        let mut cap = self.prefill_rows;
+        let inventory = self.packed_program_inventory();
+        let mut cap = if self.packs_prefill() {
+            crate::shared::prefill_packing::coordinator_row_cap(self.programs,
+                inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows)?
+        } else { 0 };
+        // NVFP4 dense modules have occupancy-dependent expert dispatch, outside Programs.
+        if self.dense_nvfp4.is_some() { cap = 0; }
         // This family's packed executor is single-GPU only.
         if !self.packs_prefill() { cap = 0; }
         else {
@@ -3483,6 +3531,7 @@ impl<'a> GlmfEngine<'a> {
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> PackedOutcome)
         -> Result<(Vec<packing::Segment>, Vec<Result<()>>)> {
         ensure!(self.packs_prefill(), "a packed prefill runs on one GPU with every layer");
+        let _program_inventory = self.packed_programs.enter(|| self.packed_program_inventory())?;
         let chunks: Vec<(usize, usize)> = sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect();
         let segments = packing::plan(&chunks, &self.packed_limits())?;
         let mut tables = StepTables::default();
