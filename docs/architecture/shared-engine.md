@@ -9,8 +9,9 @@ port a family (MiniMax Flash is next) or change shared code. Why the engine is
 built this way: [PLAN "One engine, shared structure"](../../PLAN.md#one-engine-shared-structure-tj-2026-10-25).
 Working rules: [AGENTS.md](../../AGENTS.md).
 
-Pointers are `file:line` at work/p0 `6bb2d5e61`. Lines drift, so each one also
-names a symbol you can grep for. Short prefixes used below:
+Pointers are `file:line` at dev `5cd3295a1` (2026-10-29). `dev` is the
+integration branch; `main` moves only at tagged releases. Lines drift, so each
+one also names a symbol you can grep for. Short prefixes used below:
 
 | Prefix | Path |
 |---|---|
@@ -278,6 +279,24 @@ The guard is the kernel row-curve rule in
 cliff, add a descriptor preference such as `initial_unit_rows` that avoids the
 bad unit.
 
+### Packing short prompts into one unit
+
+[daemon/shared/prefill_packing.rs](../../rust/crates/cuteafd-daemon/src/shared/prefill_packing.rs)
+(#847, #855, #858). When several short prompts are already queued, the
+coordinator lays them out as adjacent segments of one unit (`plan`) instead
+of one unit each. It never waits for more work to arrive.
+
+- Attention runs per segment; rowwise and expert work run once on the packed
+  rows. Each member's result and failure stay its own (`member_outcomes`).
+- A drafter's tap buffer caps a pack (`Limits::taps`, the drafter's window:
+  1024 rows for MiMo DFlash, 2048 for the shared DFlash2 ring).
+- `PREFILL_PACKING=unrestricted` (default) packs across arithmetic route
+  boundaries; `exact` caps a pack at the loaded kernels' route boundary (the
+  fork publishes it through `cuteafd_fp8moe_arithmetic_route`) so a packed
+  row's arithmetic equals running it alone. Use `exact` for byte-exactness
+  validation.
+- Families opt in (MiMo and GLM Flash today, `run-family.sh`).
+
 ### Deployment contract: units and span
 
 `cuteafd plan --deployment` publishes:
@@ -295,8 +314,7 @@ comes from `family_prefill_mode`:
 | Mode | Families | Serve flags |
 |---|---|---|
 | `units` | step5, kimi_k3, qwen4, deepseek_v4, deepseek_v41 | `--prefill-rows` (V4.1 `--prefill-batch-tokens`), `--prefill-waves` (V4.1 also `--prefill-reserve-rows`) |
-| `units-span` | glm5, glm5_flash | the above plus `--prefill-span-rows`: unit × waves |
-| `legacy` | mimo_v2 | not on the shared executor (#671) |
+| `units-span` | glm5, glm5_flash, mimo_v2 | the above plus `--prefill-span-rows`: unit × waves |
 
 A new family opts in here once its serve CLI accepts the shape. Each slot's
 storage is a view at `slot * unit` inside per-field arenas spanning the
@@ -389,6 +407,22 @@ does the following:
   GB10 that cost 1062 µs per 2752 × top-8 unit, against 7 µs packed
   (`f2f05dfa0`).
 
+**Wave merging on the Spark (FP8/MXFP4, #844).** Units that arrive for the
+same layer while the GPU is busy run as one expert launch:
+
+- Each received unit is copied from the RDMA ring into per-slot device memory
+  on a copy stream; compute waits on the copy's event. GB10 has no GPUDirect
+  RDMA, and reading the mapped ring in place made FC1 4.9× slower.
+- Staged units flush when the compute stream is idle, the layer changes,
+  intake is blocked, or two units are staged: a merged wave is at most
+  2 × unit rows ([fp8/worker.rs](../../rust/crates/cuteafd-daemon/src/shared/experts/fp8/worker.rs) `stage`,
+  [service/local.rs](../../rust/crates/cuteafd-daemon/src/shared/experts/service/local.rs) `flush_after_sweep`).
+- Row-address kernels gather FC1 rows and store combine rows per member
+  address, so merged output is byte-identical to singleton launches.
+- MiMo Flash 8K prefill 1.11×, MiMo Pro 1.04×, with expert launches 93 → 65
+  per request on a Spark rank. A new FP8/MXFP4 family gets this from the
+  shared worker with no family code.
+
 **Ingress dtype.** Each endpoint has a typed `SparkIngress`
 ([core/expert_geometry.rs:57](../../rust/crates/cuteafd-core/src/expert_geometry.rs#L57)):
 `Fp8K32`, `Bf16`, `Bf16Decode { rows }` (BF16 decode rows and FP8 K32
@@ -454,11 +488,11 @@ These are the gates; the tiers and bars are in
 [AGENTS.md "Engineering rules"](../../AGENTS.md#engineering-rules).
 
 1. **CPU gate.** Run `scripts/dev/cpu-gate --task NAME` while iterating, and
-   `--full` before the merge into work/p0.
+   `--full` before the merge into dev.
    - `--full` adds the installed deployment sweep,
      `installed_example_deployments_publish_executable_prefill_shapes`
      ([daemon/tests/budget_cli.rs:220](../../rust/crates/cuteafd-daemon/tests/budget_cli.rs#L220)).
-     It plans every `examples/configs/*.config` (40 today) and runs it through
+     It plans every `examples/configs/*.config` (42 today) and runs it through
      `release_prefill_shape`.
    - Add your family's min and max configs there. Link them from the family
      doc and from `examples/configs/README.md`;
@@ -477,7 +511,7 @@ These are the gates; the tiers and bars are in
    ([cuteafd-bench/src/panels/lossless.rs](../../rust/crates/cuteafd-bench/src/panels/lossless.rs))
    must pass 10/10: identical ids and row hashes with drafts on and off, with
    no tie tolerance.
-5. **One wip-cards pair.** One launch per arm, candidate against work/p0,
+5. **One wip-cards pair.** One launch per arm, candidate against dev,
    through `scripts/bench/wip-cards.py` ([docs/wip-cards.md](../wip-cards.md)).
    An exchange or prefill-scheduling change also runs the two landing-mode
    cards: `v41-flash-sim5090` (pinned) and the TP3 5090 shape (dma-buf):
@@ -519,7 +553,8 @@ These are the gates; the tiers and bars are in
    and group before allocation, and don't run a private pool or onboard policy.
 4. Write the coordinator programs and expert packages. Use the AOT exports at
    the exact capacities (1/16/80/256/1024/2048/2752/4096 for EXL3), and the
-   checkpoint's native numerics and ingress.
+   checkpoint's native numerics and ingress (FP8/MXFP4 checkpoints use the
+   shared FP8 worker; EXL3 is two-tier only, warp-specialized for prefill).
 5. Prefill: implement `PrefillHooks` and call `run_prefill_units`. Each unit
    owns its slot slices. Opt the family into `family_prefill_mode` in
    `run-family.sh`.
