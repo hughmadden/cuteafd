@@ -197,10 +197,11 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
 
 
 
-    pub(super) fn configure_packing(mut self, mode: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
+    pub(super) fn configure_packing(mut self, mode: crate::shared::prefill_packing::PackingMode,
+        coordinator_cap: usize) -> Result<Self> {
         use crate::shared::prefill_packing::{log_mode, PackingMode};
         if mode == PackingMode::Exact {
-            let cap = self.execution.packed_row_cap(self.prefill.0)?;
+            let cap = self.execution.packed_row_cap(self.prefill.0)?.min(coordinator_cap);
             self.packed_row_cap = Some(cap);
             log_mode(mode, cap);
         }

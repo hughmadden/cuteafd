@@ -130,6 +130,57 @@ pub(crate) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, 
     ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, spark_rings(max_frame_bytes)?, clients, executions)
 }
 
+// Startup loads the whole selected namespace, not just the current layer route.
+// Shared SWA/CSA projections are packed even when CSA finishes per member.
+const PACKED_PROGRAM_ROLES: &[(&str, crate::shared::prefill_packing::ProgramRows)] = {
+    use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    &[
+        ("hidden_norm", PackedRows),
+        ("attn_q", PackedRows), ("attn_kv", PackedRows), ("attn_gate", PackedRows),
+        ("attn_out", PackedRows), ("attn_out_partial", PackedRows),
+        ("head_gate", PackedRows),
+        ("swa_q_norm_rope", PackedRows), ("swa_k_norm_rope", PackedRows),
+        ("csa_q_norm_rope", PackedRows), ("csa_k_norm_rope", PackedRows),
+        ("index_q", PackedRows), ("index_kz", PackedRows),
+        ("index_q_norm", PackedRows), ("index_k_norm", PackedRows),
+        ("index_weight", PackedRows),
+        ("dense_gate_up", PackedRows), ("dense_down", PackedRows),
+        ("post_silu_w13824_c7", PackedRows), ("post_silu_w13824_c10", PackedRows),
+        ("router", PackedRows), ("route_weights", PackedRows),
+        ("shared_gate_up", PackedRows), ("shared_down", PackedRows),
+        ("post_silu_w1536_c7", PackedRows), ("post_silu_w1536_c10", PackedRows),
+        ("residual_bf16", PackedRows), ("residual_f32", PackedRows),
+        ("expert_input_quant", PackedRows), ("pack_fp8_kv_plane", PackedRows),
+        ("sliding_positions", SequenceLocal), ("sliding_commit", SequenceLocal),
+        ("swa_attention", SequenceLocal), ("swa_attention_fp8", SequenceLocal),
+        ("csa_attention", SequenceLocal), ("csa_attention_fp8", SequenceLocal),
+        ("region_compress", SequenceLocal), ("region_scores", SequenceLocal),
+        ("region_selection", SequenceLocal), ("region_commit", SequenceLocal),
+        // Predictor/head calls retain their member-local row count. RoPE runs at load.
+        ("final_norm", SequenceLocal), ("mtp_eh", SequenceLocal),
+        ("rope_s192_llama3", SequenceLocal), ("rope_s192_plain", SequenceLocal),
+        ("rope_s32_llama3", SequenceLocal), ("rope_s32_plain", SequenceLocal),
+        ("rope_s64_llama3", SequenceLocal), ("rope_s64_plain", SequenceLocal),
+    ]
+};
+
+fn packed_program_inventory(split: bool) -> Vec<(String, crate::shared::prefill_packing::ProgramRows)> {
+    std::iter::once("step5").chain(split.then_some("step52")).flat_map(|namespace|
+        PACKED_PROGRAM_ROLES.iter().map(move |&(suffix, role)| (format!("{namespace}_{suffix}"), role)))
+        .collect()
+}
+
+fn coordinator_packing_cap(programs: &cuteafd_ffi::programs::Programs<'_>, split: bool,
+    mode: crate::shared::prefill_packing::PackingMode, rows: usize) -> Result<usize> {
+    use crate::shared::prefill_packing::{coordinator_row_cap, validate_program_inventory, PackingMode};
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+        family: "step5", split_family: split.then_some("step52") };
+    let owned = packed_program_inventory(split);
+    let inventory = owned.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+    validate_program_inventory(programs.names().filter(|name| selected.contains(name)), &inventory)?;
+    if mode == PackingMode::Exact { coordinator_row_cap(programs, inventory, rows) } else { Ok(rows) }
+}
+
 fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
     cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(0),
         crate::shared::qwen::Encoder::Off, 16)
@@ -164,6 +215,8 @@ fn with_backend<T>(args: &ServeArgs,
     let ids = std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>();
     let devices = ids.iter().map(|&id| Device { library: &library, id }).collect::<Vec<_>>();
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    let coordinator_cap = coordinator_packing_cap(&programs, args.split_device.is_some(),
+        args.prefill_packing, args.prefill_rows as usize)?;
     let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
         family: "step5", split_family: args.split_device.map(|_| "step52") };
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
@@ -334,7 +387,7 @@ fn with_backend<T>(args: &ServeArgs,
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
             args.prefill_rows as usize)?)?
-        .configure_packing(args.prefill_packing)?;
+        .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
@@ -813,6 +866,48 @@ mod tests {
             family.drain().map_err(|e| anyhow::anyhow!("packed exactness drain: {e}"))?;
             Ok(())
         })
+    }
+
+    #[test]
+    fn packed_startup_catalogue_has_explicit_roles_and_rejects_new_programs() -> Result<()> {
+        use crate::shared::prefill_packing::{validate_program_inventory, ProgramRows::*};
+        for split in [false, true] {
+            let owned = packed_program_inventory(split);
+            let inventory = owned.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+            assert_eq!(inventory.len(), if split { 96 } else { 48 });
+            validate_program_inventory(inventory.iter().map(|(name, _)| *name), &inventory)?;
+            let mut required = inventory.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+            required.push("step5_new_projection");
+            assert!(validate_program_inventory(required, &inventory).is_err());
+            assert!(validate_program_inventory(inventory.iter().skip(1).map(|(name, _)| *name), &inventory).is_err());
+            for prefix in std::iter::once("step5").chain(split.then_some("step52")) {
+                let role = |suffix| inventory.iter().find(|(name, _)| *name == format!("{prefix}_{suffix}"))
+                    .map(|(_, role)| *role).unwrap();
+                for suffix in ["router", "attn_q", "index_weight", "pack_fp8_kv_plane", "shared_gate_up"] {
+                    assert_eq!(role(suffix), PackedRows);
+                }
+                for suffix in ["swa_attention", "csa_attention_fp8", "region_compress", "mtp_eh", "final_norm"] {
+                    assert_eq!(role(suffix), SequenceLocal);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_exact_coordinator_cap_keeps_large_partner_singleton() -> Result<()> {
+        use crate::shared::prefill_packing::{groups, plan, Limits};
+        let chunks = [(0, 32), (65, 80), (0, 16), (511, 48)];
+        let expert_cap = 256usize;
+        let limits = Limits { rows: expert_cap.min(64), chunk_rows: 256, max_context: 4096, taps: None };
+        assert_eq!(groups(chunks.len(), |range| plan(&chunks[range], &limits).is_ok()),
+            [0..1, 1..2, 2..4]);
+        assert!(plan(&chunks[..2], &Limits { rows: expert_cap, ..limits }).is_ok());
+        assert_eq!(chunks[1].1, 80, "the large member retains its singleton arithmetic");
+        let unknown = Limits { rows: 0, ..limits };
+        assert_eq!(groups(chunks.len(), |range| plan(&chunks[range], &unknown).is_ok()),
+            [0..1, 1..2, 2..3, 3..4]);
+        Ok(())
     }
 
     #[test]
