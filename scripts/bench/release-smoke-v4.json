@@ -1104,6 +1104,7 @@
       ],
       "set": {
         "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+        "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
         "RTX_GPUS": "1",
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "3",
@@ -1140,6 +1141,7 @@
       ],
       "set": {
         "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+        "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
         "RTX_GPUS": "2",
         "COORDINATOR_GPU": "0",
         "ADDR": "0.0.0.0:8891",

@@ -198,11 +198,12 @@ def test_strided_examples_only_change_checkpoint_and_share_release_matrix():
         assert strided.pop("MODEL_ID") == repack.TARGET
         paired.pop("MODEL_ID")
         paired.pop("MODEL_REVISION")
-        # MODEL_REVISION is pinned after the verified upload.
-        strided.pop("MODEL_REVISION", None)
+        revision = strided.pop("MODEL_REVISION")
+        assert revision == "51b3391435c83db9c38e87e114abf7bcfe7fc9c3"
         assert paired == strided
         original = entries[f"v41-flash-{size}"]
         candidate = entries[f"v41-flash-strided-{size}"]
         assert original["gpus"] == candidate["gpus"]
         assert original["sparks"] == candidate["sparks"]
         assert candidate["set"]["MODEL_ID"] == repack.TARGET
+        assert candidate["set"]["MODEL_REVISION"] == revision
