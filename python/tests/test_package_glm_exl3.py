@@ -35,14 +35,21 @@ class GlmExl3PackageTest(unittest.TestCase):
     def test_kimi_capacity_set(self):
         # Kimi drops only m16 (K128 tiles drift against M1 decode; rows 2..16
         # take m80); the prefill wave units 2048/2752 package like any other.
-        requested = '1,16,80,256,1024,2048,2752,4096'
-        self.assertEqual(tool.package_capacities('kimik3', requested), [1, 80, 256, 1024, 2048, 2752, 4096])
-        self.assertEqual(tool.package_capacities('glmf', requested), [1, 16, 80, 256, 1024, 2048, 2752, 4096])
-        for invalid in ('16', '0', '4097'):
+        # Wave merging pads one <=2752-row unit to two or three merged units,
+        # so the packed extents reach 8256.
+        requested = '1,16,80,256,1024,2048,2752,4096,5504,8256'
+        self.assertEqual(tool.package_capacities('kimik3', requested),
+                         [1, 80, 256, 1024, 2048, 2752, 4096, 5504, 8256])
+        self.assertEqual(tool.package_capacities('glmf', '1,16,80,256,1024,2048,2752,4096'),
+                         [1, 16, 80, 256, 1024, 2048, 2752, 4096])
+        for invalid in ('16', '0', '8257'):
             with self.assertRaises(ValueError):
                 tool.package_capacities('kimik3', invalid)
-        for capacity in (1, 80, 256, 1024, 2048, 2752, 4096):
+        with self.assertRaises(ValueError):
+            tool.package_capacities('glmf', '4097')
+        for capacity in (1, 80, 256, 1024, 2048, 2752, 4096, 5504, 8256):
             wide = capacity in (1024, 2048, 2752)
+            merged = capacity > 2752
             self.assertEqual(tool.route_block('kimik3', capacity, 'coordinator'), 64 if wide else 8)
             self.assertEqual(tool.route_block('kimik3', capacity, 'spark'), 8)
             self.assertEqual(tool.token_major_rotation('kimik3', capacity, 'coordinator'), wide)
@@ -51,6 +58,13 @@ class GlmExl3PackageTest(unittest.TestCase):
                 self.assertIsNone(tool.decode_tile('kimik3', width, capacity))
                 self.assertEqual(tool.warp_specialized('kimik3', 'spark', width, capacity),
                                  width == 512 and capacity >= 1024)
+                # Every row count above 2752 resolves to the warp-specialized
+                # prerotated 256-wide FC1 arm on both RTX splits.
+                self.assertEqual(tool.warp_specialized('kimik3', 'coordinator', width, capacity),
+                                 merged and width == 3072)
+                self.assertEqual(tool.ws_route_block('kimik3', 'coordinator', width, capacity), 64)
+                self.assertEqual(tool.ws_tile('kimik3', 'coordinator', width, capacity),
+                                 (64, 256, 64, 256) if merged and width == 3072 else None)
 
     def test_profiles(self):
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role('coordinator', 'glm')}

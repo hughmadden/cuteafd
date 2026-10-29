@@ -140,8 +140,11 @@ def test_kimik3_package_and_route_registry_are_both_sm_gated(monkeypatch):
         ("exl3-kimik3-k23", "package_exl3_aot.py", ["--bits", "2,3"]),
         ("exl3-routes-kimik3", "export_b12x_exl3_routes_aot.py", []),
     ]:
+        # Kimi K3 merges up to three 2752-row wave units, so its gate covers
+        # the 5504/8256 extents the other EXL3 geometries never pack.
         assert [job for job in jobs if job[0] == name] == [
-            (name, exporter, ["--geometry", "kimik3", "--capacities", compare_sm.EXL3_CAPACITIES, *extra])]
+            (name, exporter, ["--geometry", "kimik3", "--capacities",
+                              compare_sm.EXL3_CAPACITIES_KIMIK3, *extra])]
     # Negative control: the old list silently omitted the route registry.
     monkeypatch.setattr(compare_sm, "EXL3_GEOMETRIES",
                         tuple(g for g in compare_sm.EXL3_GEOMETRIES if g != "kimik3"))

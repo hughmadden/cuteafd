@@ -401,6 +401,9 @@ WS_TIER_PAIRS = {('glm', (4, 5)), ('glmf', (3, 4)), ('qwen4', (4, 5)),
 # dynamic tile claims, 32-row route blocks at m256 and 64 rows above it.
 _WS_S14_M256 = dict(route_block=32, dynamic=True, tile=TILE_RTX_MIXED)
 _WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
+# Prerotated 256-wide FC1 arm: the WS kernel hoists the token-major rotation
+# ahead of the block loop and keeps dynamic claims with 64-row route blocks.
+_WS_K3_PREROTATE = dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256))
 
 # Coordinator (RTX SM120) warp-specialized prefill cells, keyed by
 # (geometry, width, capacity): the measured options each cell carries, against
@@ -448,9 +451,21 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('v41', 1152, 4096): _WS_S14,
     # Kimi K3 m1024/m2048/m2752 take cooperative 64-row token-major rotation;
     # m2048/m2752 beat N128 dynamic by 1.23-1.30x, exhaustively exact (#762).
-    # m4096 keeps its separately qualified N128 dynamic arm.
-    ('kimik3', 3072, 4096): _WS_S14,
-    ('kimik3', 1536, 4096): _WS_S14,
+    # Every row count above 2752 ships the warp-specialized kernel: one prefill
+    # unit is <=2752 rows and wave merging merges two or three of them, so a
+    # route resolves to the 4096, 5504 or 8256 packed extent. That arm hoists
+    # FC1's token-major rotation ahead of the block loop and takes 256-wide FC1
+    # tiles (interleaved duel session, GPU0 pinned 450 W, 32 exact fixtures
+    # with every poisoned prefix and graph replay): rtx-tp1 1.289x, rtx-tp2
+    # 1.424x against the N128 dynamic arm at m4096. m5504 and m8256 resolve to
+    # the same exported cell; the duel's merged-wave baseline is byte-exact at
+    # both, and the pinned wave-merging session times them.
+    ('kimik3', 3072, 4096): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 4096): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 5504): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 5504): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 8256): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 8256): _WS_K3_PREROTATE,
 }
 
 
@@ -1237,8 +1252,11 @@ def compile_variants(payloads, jobs):
 
 def package_capacities(geometry: str, requested: str) -> list[int]:
     capacities = sorted(set(int(v) for v in requested.split(',')))
-    if not capacities or any(v < 1 or v > 4096 for v in capacities):
-        raise ValueError('EXL3 capacities must be in 1..4096')
+    # Kimi K3 pads a <=2752-row prefill unit into merged waves of up to three
+    # units, so its packed extents reach 8256; every other family stops at 4096.
+    limit = 8256 if geometry == 'kimik3' else 4096
+    if not capacities or any(v < 1 or v > limit for v in capacities):
+        raise ValueError(f'EXL3 capacities must be in 1..{limit}')
     if geometry == 'kimik3':
         # m16 takes K128 tiles that drift against M1 decode; rows 2..16 run on
         # m80 (like GLM Flash). Every other capacity is allowed.
