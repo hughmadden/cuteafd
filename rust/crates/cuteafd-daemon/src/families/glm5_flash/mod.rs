@@ -2055,7 +2055,7 @@ impl Opened {
             })
         };
         let embed = self.embed_source()?;
-        let embedding_rank = admission::embedding_home(&placement) as usize;
+        let embedding_rank = cuteafd_loader::placement::families::glm5_flash::embedding_home(&placement) as usize;
         let embedding_device = crate::shared::memory::device::Device { library: &self.library,
             id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
         // Gather still runs on the entry GPU: peer access reads only the selected
