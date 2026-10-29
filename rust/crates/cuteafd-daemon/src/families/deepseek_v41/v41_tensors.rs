@@ -133,17 +133,20 @@ impl<'a> NativeRtxTensors<'a> {
 }
 
 /// One vocabulary weight shared by the backbone and dSpark. Each execution
-/// owns its handle and workspace; `all` retains only the packed FP8 weight.
+/// owns its handle and workspace; `all` retains only the packed FP8 weight,
+/// `packed` only the exact 12-bit copy.
 pub(crate) struct VocabularyHead<'library> {
     shard: VocabularyShard<'library>,
 }
 
-/// E4M3 vocabulary heads (`CUTEAFD_V41_FP8_HEAD`): `draft` projects only the
-/// dSpark draft head through an FP8 copy (outputs unchanged, acceptance may
-/// move), `all` (default) both heads from one FP8 copy; `off` keeps BF16. Copies use per-row x
-/// 128-K FP32 scales (`fp8_linear`, the better of amax and power-of-two per
-/// block) and the W8A16 tensor-core GEMV. `all` releases BF16 after packing;
-/// `draft` retains BF16 for target projections.
+/// Vocabulary heads (`CUTEAFD_V41_FP8_HEAD`): `draft` projects only the dSpark
+/// draft head through an E4M3 copy (outputs unchanged, acceptance may move),
+/// `all` (default) both heads from one E4M3 copy; `off` keeps BF16. E4M3 copies
+/// use per-row x 128-K FP32 scales (`fp8_linear`, the better of amax and
+/// power-of-two per block) and the W8A16 tensor-core GEMV. `packed` keeps one
+/// exact 12-bit copy of the BF16 head (`packed_head`): target logits read it
+/// exactly, the dSpark drafter its coarse plane. `all` and `packed` release BF16
+/// after packing; `draft` retains BF16 for target projections.
 pub(crate) use cuteafd_loader::placement::families::deepseek_v41::resident::Fp8Head;
 pub(crate) fn fp8_head() -> Fp8Head {
     static MODE: std::sync::OnceLock<Fp8Head> = std::sync::OnceLock::new();
@@ -152,6 +155,32 @@ pub(crate) fn fp8_head() -> Fp8Head {
         tracing::info!(?mode, "V4.1 vocabulary heads");
         mode
     })
+}
+
+/// The resident copy of the vocabulary a projection can read instead of BF16.
+#[derive(Clone, Copy)]
+pub(crate) enum HeadCopy<'h, 'a> {
+    /// E4M3 with FP32 scales per row and 128-wide K block (`draft`, `all`).
+    Fp8(&'h crate::shared::fp8_linear::Fp8Weight<'a>),
+    /// The exact 12-bit head (`packed`).
+    Packed(&'h crate::shared::packed_head::PackedHead<'a>),
+}
+
+impl HeadCopy<'_, '_> {
+    /// Vocabulary rows and width.
+    fn shape(self) -> (usize, usize) {
+        match self {
+            HeadCopy::Fp8(weight) => (weight.n, weight.k),
+            HeadCopy::Packed(head) => (head.n, head.k),
+        }
+    }
+}
+
+/// GEMV scratch of a head copy at one projection site.
+pub(crate) struct HeadScratch<'a> {
+    allocation: DeviceAllocation<'a>,
+    /// The dSpark drafter's site: a packed head is read through its coarse plane.
+    coarse: bool,
 }
 
 /// Packs a resident BF16 head, draining before releasing the source. Failed
@@ -176,50 +205,112 @@ fn pack_fp8<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: 
     Ok((source, packed))
 }
 
-/// A vocabulary projection through the FP8 copy when the caller holds scratch
-/// for it (see [`fp8_head`]), else the BF16 head.
+/// Packs a resident BF16 head into the exact 12-bit copy, which verifies itself
+/// bit for bit, then releases the BF16 source. A failed drain quarantines the
+/// destination, the source and the native module until process teardown.
+fn pack_packed<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
+    -> Result<crate::shared::packed_head::PackedHead<'a>> {
+    ensure!(weight.buffer.bytes == rows * 10240, "packed head geometry differs from BF16");
+    let stream = library.cuda_stream_create()?;
+    let packed = crate::shared::packed_head::PackedHead::pack(library, weight.buffer.ptr, rows, 5120, stream);
+    if packed.is_err() && library.is_quarantined_after_failed_drain() {
+        // The pack could not prove its reads of the source retired.
+        std::mem::forget(weight);
+        return packed;
+    }
+    // SAFETY: the pack drained the stream, which has no other users.
+    unsafe { library.cuda_stream_destroy(stream)?; }
+    drop(weight);
+    packed
+}
+
+/// A vocabulary projection through the head copy when the caller holds scratch
+/// for it (see [`fp8_head`]), else the BF16 head. A packed copy is read exactly,
+/// or through its coarse plane at the drafter's site.
 ///
 /// # Safety
 /// As [`cuteafd_ffi::V41VocabularyProjection::launch`]; `scratch` was sized by
 /// [`fp8_scratch`] for at least `rows` rows of this head.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: &cuteafd_ffi::V41VocabularyProjection<'_>,
-    bf16: Option<CuteafdDeviceBuffer>, fp8: Option<(&crate::shared::fp8_linear::Fp8Weight<'_>, &DeviceAllocation<'_>)>,
+    bf16: Option<CuteafdDeviceBuffer>, copy: Option<(HeadCopy<'_, '_>, &HeadScratch<'_>)>,
     input: CuteafdDeviceBuffer, logits: CuteafdDeviceBuffer, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
-    match fp8 {
-        Some((weight, scratch)) => {
-            ensure!(input.bytes >= rows * 10240 && logits.bytes >= rows * weight.n * 4
-                && input.device_id == logits.device_id, "FP8 vocabulary projection buffers differ");
-            unsafe { weight.apply(library, input.ptr, logits.ptr, true, rows, 0, weight.n, scratch, stream) }
-        }
-        None => unsafe { projection.launch(input, bf16.context("BF16 vocabulary is not resident; FP8 scratch required")?, logits, rows, stream) },
+    let Some((copy, scratch)) = copy else {
+        return unsafe { projection.launch(input, bf16.context("BF16 vocabulary is not resident; head copy scratch required")?,
+            logits, rows, stream) };
+    };
+    ensure!(input.bytes >= rows * 10240 && logits.bytes >= rows * copy.shape().0 * 4
+        && input.device_id == logits.device_id, "vocabulary head copy projection buffers differ");
+    match copy {
+        HeadCopy::Fp8(weight) => unsafe {
+            weight.apply(library, input.ptr, logits.ptr, true, rows, 0, weight.n, &scratch.allocation, stream)
+        },
+        HeadCopy::Packed(head) => unsafe {
+            head.apply(library, input.ptr, logits.ptr, true, rows, scratch.coarse, &scratch.allocation, stream)
+        },
     }
 }
 
 /// [`project_vocabulary`] for target logits: the BF16 head takes the shared target-head route
-/// ([`crate::shared::target_head`], tensor cores by default); the FP8 copy is unchanged.
+/// ([`crate::shared::target_head`], tensor cores by default); head copies are unchanged.
 ///
 /// # Safety
 /// As [`project_vocabulary`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn project_target_vocabulary(library: &NativeLibrary,
     projection: &cuteafd_ffi::V41VocabularyProjection<'_>, bf16: Option<CuteafdDeviceBuffer>,
-    fp8: Option<(&crate::shared::fp8_linear::Fp8Weight<'_>, &DeviceAllocation<'_>)>, input: CuteafdDeviceBuffer,
+    copy: Option<(HeadCopy<'_, '_>, &HeadScratch<'_>)>, input: CuteafdDeviceBuffer,
     logits: CuteafdDeviceBuffer, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
-    if fp8.is_none() && crate::shared::target_head::TargetHead::configured().tensor_cores() {
-        let weight = bf16.context("BF16 vocabulary is not resident; FP8 scratch required")?;
+    if copy.is_none() && crate::shared::target_head::TargetHead::configured().tensor_cores() {
+        let weight = bf16.context("BF16 vocabulary is not resident; head copy scratch required")?;
         return unsafe { projection.launch_tensor_invariant(input, weight, logits, rows, stream) };
     }
-    unsafe { project_vocabulary(library, projection, bf16, fp8, input, logits, rows, stream) }
+    unsafe { project_vocabulary(library, projection, bf16, copy, input, logits, rows, stream) }
 }
 
-/// GEMV scratch for `rows` rows of an FP8 head copy, when `site` uses one.
-pub(crate) fn fp8_scratch<'a>(library: &'a NativeLibrary, fp8: Option<&crate::shared::fp8_linear::Fp8Weight<'_>>,
-    rows: usize, site: Fp8Head) -> Result<Option<DeviceAllocation<'a>>> {
-    let enabled = match fp8_head() { Fp8Head::Off => false, Fp8Head::Draft => site == Fp8Head::Draft, Fp8Head::All => true };
-    match fp8.filter(|_| enabled) {
-        Some(weight) => Ok(Some(crate::shared::fp8_linear::scratch(library, rows, &[(weight.k, weight.n)])?)),
-        None => Ok(None),
+/// Whether `site` (`Fp8Head::All` for target logits, `Fp8Head::Draft` for the
+/// dSpark drafter) projects through the resident copy under `mode`, and if so
+/// whether it reads a packed head's coarse plane (the drafter does).
+fn copy_site(mode: Fp8Head, site: Fp8Head) -> Option<bool> {
+    let enabled = match mode {
+        Fp8Head::Off => false,
+        Fp8Head::Draft => site == Fp8Head::Draft,
+        Fp8Head::All | Fp8Head::Packed => true,
+    };
+    enabled.then_some(site == Fp8Head::Draft)
+}
+
+/// GEMV scratch for `rows` rows of a head copy, when `site` uses one (see [`copy_site`]).
+pub(crate) fn fp8_scratch<'a>(library: &'a NativeLibrary, copy: Option<HeadCopy<'_, '_>>,
+    rows: usize, site: Fp8Head) -> Result<Option<HeadScratch<'a>>> {
+    let (Some(copy), Some(coarse)) = (copy, copy_site(fp8_head(), site)) else { return Ok(None) };
+    let (n, k) = copy.shape();
+    let allocation = match copy {
+        HeadCopy::Fp8(_) => crate::shared::fp8_linear::scratch(library, rows, &[(k, n)])?,
+        HeadCopy::Packed(_) => crate::shared::packed_head::scratch(library, rows, &[(k, n)])?,
+    };
+    Ok(Some(HeadScratch { allocation, coarse }))
+}
+
+#[cfg(test)]
+mod head_site_tests {
+    use super::*;
+
+    /// `packed` sends both sites through the exact 12-bit copy (BF16 is gone):
+    /// target logits exactly, the drafter through the coarse plane. `draft`
+    /// keeps target logits on BF16; `off` never uses a copy.
+    #[test]
+    fn packed_reads_exact_target_and_coarse_draft_sites() {
+        let (target, draft) = (Fp8Head::All, Fp8Head::Draft);
+        assert_eq!([copy_site(Fp8Head::Packed, target), copy_site(Fp8Head::Packed, draft)], [Some(false), Some(true)]);
+        assert_eq!([copy_site(Fp8Head::All, target), copy_site(Fp8Head::All, draft)], [Some(false), Some(true)]);
+        assert_eq!([copy_site(Fp8Head::Draft, target), copy_site(Fp8Head::Draft, draft)], [None, Some(true)]);
+        assert_eq!([copy_site(Fp8Head::Off, target), copy_site(Fp8Head::Off, draft)], [None, None]);
+        // Every mode whose BF16 head is released serves both sites from its copy.
+        for mode in [Fp8Head::All, Fp8Head::Packed] {
+            assert!(mode.target() && mode.draft());
+            assert!(copy_site(mode, target).is_some() && copy_site(mode, draft).is_some());
+        }
     }
 }
 impl<'library> VocabularyHead<'library> {
@@ -241,7 +332,7 @@ impl<'library> VocabularyHead<'library> {
     }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.shard.weight() }
     pub fn device_id(&self) -> i32 { self.shard.device_id() }
-    pub fn fp8(&self) -> Option<&crate::shared::fp8_linear::Fp8Weight<'library>> { self.shard.fp8() }
+    pub fn copy(&self) -> Option<HeadCopy<'_, 'library>> { self.shard.copy() }
 }
 
 #[cfg(test)]

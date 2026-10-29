@@ -6,15 +6,23 @@ use std::collections::BTreeMap;
 
 pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
-/// One mode parser for checkpoint residency, startup packing and native execution.
+/// One mode parser for checkpoint residency, startup packing and native execution
+/// (`CUTEAFD_V41_FP8_HEAD`): `off` keeps the BF16 head; `draft` adds an E4M3 copy
+/// for dSpark; `all` (default) keeps only the E4M3 copy, for both; `packed` keeps
+/// only the exact 12-bit copy of the BF16 head (`cuteafd_core::packed_head`):
+/// target logits read it exactly, dSpark its coarse plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fp8Head { Off, Draft, All }
+pub enum Fp8Head { Off, Draft, All, Packed }
+
+/// Vocabulary rows are hidden_size (5120) wide.
+const HEAD_WIDTH: u64 = 5120;
 
 impl Fp8Head {
     pub fn parse(mode: &str) -> Self {
         match mode {
             "off" | "0" | "bf16" => Self::Off,
             "draft" => Self::Draft,
+            "packed" => Self::Packed,
             _ => Self::All,
         }
     }
@@ -23,14 +31,28 @@ impl Fp8Head {
         Self::parse(&std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default())
     }
 
-    pub fn target(self) -> bool { self == Self::All }
+    /// Target logits project through a resident copy (and its scratch), not BF16.
+    pub fn target(self) -> bool { matches!(self, Self::All | Self::Packed) }
+    /// dSpark projects through a resident copy.
     pub fn draft(self) -> bool { self != Self::Off }
 
     /// One E4M3 value and FP32 scales per 128-K block.
     pub fn packed_bytes(source: u64) -> u64 { source / 2 + source / 64 }
 
+    /// The exact 12-bit copy of `source` BF16 bytes: both planes, bases, row
+    /// pointers, an exception table of one entry per 1024 weights and the
+    /// pack's status, as the loader allocates them.
+    pub fn packed12_bytes(source: u64) -> u64 {
+        cuteafd_core::packed_head::PackedHeadLayout::bytes(source / (2 * HEAD_WIDTH), HEAD_WIDTH)
+    }
+
+    /// Peak while packing: the BF16 source and the copy's destination.
     pub fn load_bytes(self, source: u64) -> u64 {
-        source + if self.draft() { Self::packed_bytes(source) } else { 0 }
+        source + match self {
+            Self::Off => 0,
+            Self::Draft | Self::All => Self::packed_bytes(source),
+            Self::Packed => Self::packed12_bytes(source),
+        }
     }
 
     pub fn resident(self, source: u64) -> (u64, &'static str) {
@@ -38,6 +60,7 @@ impl Fp8Head {
             Self::Off => (source, "bf16"),
             Self::Draft => (self.load_bytes(source), "bf16+fp8-row128"),
             Self::All => (Self::packed_bytes(source), "fp8-row128"),
+            Self::Packed => (Self::packed12_bytes(source), "bf16-packed12"),
         }
     }
 }
@@ -291,17 +314,44 @@ mod tests {
     fn vocabulary_modes_share_execution_residency_and_startup_semantics() {
         let source = 1_323_827_200;
         let packed = 682_598_400;
+        let packed12 = 997_395_712;
         for (text, mode) in [("off", Fp8Head::Off), ("0", Fp8Head::Off),
             ("bf16", Fp8Head::Off), ("draft", Fp8Head::Draft),
-            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All)] {
+            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All),
+            ("packed", Fp8Head::Packed)] {
             assert_eq!(Fp8Head::parse(text), mode);
-            assert_eq!(mode.target(), mode == Fp8Head::All);
+            assert_eq!(mode.target(), matches!(mode, Fp8Head::All | Fp8Head::Packed));
             assert_eq!(mode.draft(), mode != Fp8Head::Off);
-            assert_eq!(mode.load_bytes(source), source + if mode.draft() { packed } else { 0 });
+            assert_eq!(mode.load_bytes(source), source + match mode {
+                Fp8Head::Off => 0, Fp8Head::Draft | Fp8Head::All => packed, Fp8Head::Packed => packed12,
+            });
             assert_eq!(mode.resident(source).0, match mode {
                 Fp8Head::Off => source, Fp8Head::Draft => source + packed, Fp8Head::All => packed,
+                Fp8Head::Packed => packed12,
             });
         }
+    }
+
+    /// `packed` charges exactly what the loader allocates for each shard: 12 bits
+    /// per weight, bases, row pointers, the exception table (one entry per 1024
+    /// weights) and status, each region 256-byte aligned.
+    #[test]
+    fn packed_head_charges_its_exact_allocation_per_shard() {
+        use cuteafd_core::packed_head::PackedHeadLayout;
+        let source = 129280 * 5120 * 2;
+        for ranks in [1u64, 2] {
+            let rows = 129280 / ranks as usize;
+            let layout = PackedHeadLayout::new(rows, 5120).unwrap();
+            let (bytes, format) = Fp8Head::Packed.resident(source / ranks);
+            assert_eq!((bytes, format), (layout.total_bytes() as u64, "bf16-packed12"));
+            assert_eq!(Fp8Head::Packed.load_bytes(source / ranks), source / ranks + bytes);
+            assert_eq!(layout.capacity as u64, rows as u64 * 5120 / 1024);
+        }
+        assert_eq!(Fp8Head::Packed.resident(source).0, 997_395_712);
+        assert_eq!(Fp8Head::Packed.resident(source / 2).0, 498_698_240);
+        // Between the E4M3 copy and BF16: 1.5 bytes per weight plus under half a percent.
+        let per_weight = Fp8Head::Packed.resident(source).0 as f64 / (129280.0 * 5120.0);
+        assert!(per_weight > 1.5 && per_weight < 1.5 * 1.005, "{per_weight}");
     }
 
     #[test]

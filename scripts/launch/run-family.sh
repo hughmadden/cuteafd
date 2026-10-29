@@ -918,16 +918,18 @@ dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
 release_validate_verbs_device_map
 # V41_FP8_HEAD: which vocabulary heads run from one resident E4M3 copy: all
 # (target and dSpark draft), draft (the draft only; the target keeps its BF16
-# head) or off. Unset passes nothing: the engine default is all. Planner and
-# server read the same CUTEAFD_V41_FP8_HEAD, so both get it.
+# head) or off. packed (opt-in, unqualified) keeps one exact 12-bit copy of
+# the BF16 head instead: target logits read it exactly, dSpark its coarse
+# plane. Unset passes nothing: the engine default is all. Planner and server
+# read the same CUTEAFD_V41_FP8_HEAD, so both get it.
 v41_fp8_head_args=()
 case "${V41_FP8_HEAD:-}" in
   "") ;;
-  off|draft|all)
+  off|draft|all|packed)
     [[ -z "${CUTEAFD_V41_FP8_HEAD:-}" || "$CUTEAFD_V41_FP8_HEAD" == "$V41_FP8_HEAD" ]] ||
       release_die "V41_FP8_HEAD=$V41_FP8_HEAD conflicts with CUTEAFD_V41_FP8_HEAD=$CUTEAFD_V41_FP8_HEAD in the environment; set one"
     v41_fp8_head_args=(-e "CUTEAFD_V41_FP8_HEAD=$V41_FP8_HEAD") ;;
-  *) release_die "V41_FP8_HEAD must be off, draft or all" ;;
+  *) release_die "V41_FP8_HEAD must be off, draft, all or packed" ;;
 esac
 # L2_PREFETCH (off, auto = 3/4 of the L2, or MiB; unset: off): one-lane decode and
 # verify passes pull the next layer's weights into L2 while each layer's routed

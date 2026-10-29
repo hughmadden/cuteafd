@@ -353,6 +353,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/load_scale_gather.cu
     shared/cuda/fp8_load_quant.cu
     shared/cuda/fp8_gemv.cu
+    shared/cuda/packed_head.cu
     shared/cuda/l2_prefetch.cu
     families/deepseek_v41/cuda/v41_dspark_cache.cu
     families/deepseek_v41/cuda/v41_dspark_attention.cu
@@ -703,6 +704,15 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_v41_sampling_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_v41_sampling_selftest COMMAND cuteafd_v41_sampling_selftest)
   set_tests_properties(cuteafd_v41_sampling_selftest PROPERTIES SKIP_RETURN_CODE 77)
+  # Exact 12-bit packed BF16 head: self-verifying pack, every weight bit-exact
+  # through the GEMV, an FP64 reference, row-count invariance, the coarse bound
+  # and refused corruptions (header of the source for the standalone build).
+  add_executable(cuteafd_packed_head_selftest tests/packed_head_selftest.cu)
+  set_target_properties(cuteafd_packed_head_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_link_libraries(cuteafd_packed_head_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_packed_head_selftest COMMAND cuteafd_packed_head_selftest)
+  set_tests_properties(cuteafd_packed_head_selftest PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
   # Sparse MLA prefill kernels (F16, E4M3) against an FP64 reference, determinism and times.
   add_executable(cuteafd_glm_mla_prefill_selftest tests/glm_mla_prefill_selftest.cu)
   set_target_properties(cuteafd_glm_mla_prefill_selftest PROPERTIES
