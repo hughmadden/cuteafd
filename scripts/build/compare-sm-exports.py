@@ -536,8 +536,16 @@ def compare(left, right, *, source_comparison=False):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
     right_names = {path.relative_to(right).as_posix() for path in right.rglob("*") if path.suffix in (".o", ".cubin")}
-    if not left_names or left_names != right_names:
+    if not left_names or not right_names or (not source_comparison and left_names != right_names):
         raise ValueError(f"object set mismatch: {left_names ^ right_names}, left={len(left_names)}, right={len(right_names)}")
+    added = sorted(right_names - left_names)
+    removed = sorted(left_names - right_names)
+    for directory, names in ((left, removed), (right, added)):
+        for name in names:
+            if not list(inspector.cuda_images((directory / name).read_bytes())):
+                raise ValueError(f"{name}: no CUDA ELF images; cannot classify device-code differences")
+            if name.endswith(".o") and not (directory / name).with_suffix(".h").is_file():
+                raise ValueError(f"{name}: missing exported ABI header")
     contexts = [json.loads((directory / "comparison-context.json").read_text()) for directory in (left, right)]
     if any(context.get("cuda_initialized") is not False for context in contexts):
         raise ValueError("comparison context did not prove CPU-only export")
@@ -567,7 +575,7 @@ def compare(left, right, *, source_comparison=False):
                     raise ValueError(f"{name}: default serving table contains co-resident paged_fused "
                                      "without a live-kernel residency gate/fallback")
     records = []
-    for name in sorted(left_names):
+    for name in sorted(left_names & right_names):
         blobs = [(directory / name).read_bytes() for directory in (left, right)]
         images = [list(inspector.cuda_images(blob)) for blob in blobs]
         if any(not item for item in images):
@@ -601,6 +609,7 @@ def compare(left, right, *, source_comparison=False):
                        if not all((directory / name).exists() for directory in (left, right))
                        or (left / name).read_bytes() != (right / name).read_bytes()]
     return {"contexts": contexts, "programs": records,
+            "added_programs": added, "removed_programs": removed,
             "manifest_changed_fields": differing_fields(*metas), "headers_changed": headers_changed}
 
 
@@ -690,6 +699,9 @@ def main():
         report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
         (output / name / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+        for label in ("added", "removed"):
+            for program in report[f"{label}_programs"]:
+                print(f"{name}/{program}: {label}", flush=True)
         for record in report["programs"]:
             print(f"{name}/{record['program']}: {record['classification']}; "
                   f"header={'same' if record['header_identical'] else 'different'}; "
@@ -712,8 +724,11 @@ def main():
         return 1
     different = sum(not row["object_identical"] for report in reports for row in report["programs"])
     total = sum(len(report["programs"]) for report in reports)
-    print(f"Compared {total} programs: {total - different} identical objects, {different} different. Report: {output / 'comparison.json'}")
-    return int(args.require_identical and different > 0)
+    inventory_delta = sum(len(report[key]) for report in reports
+                          for key in ("added_programs", "removed_programs"))
+    print(f"Compared {total} common programs: {total - different} identical objects, {different} different, "
+          f"{inventory_delta} added/removed. Report: {output / 'comparison.json'}")
+    return int(args.require_identical and (different > 0 or inventory_delta > 0))
 
 
 if __name__ == "__main__":
