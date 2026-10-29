@@ -583,19 +583,19 @@ mod tests {
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn three_queued_prefill_units_preserve_distinct_routes_inputs_and_replies() -> Result<()> {
-        queued_prefill_units(false, false)
+        queued_prefill_units(false, false, false)
     }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn grouped_prefill_orders_descriptors_before_launch_and_cancels_without_launching() -> Result<()> {
-        queued_prefill_units(true, false)
+        queued_prefill_units(true, false, false)
     }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn two_received_units_copy_before_one_flush_and_ignore_retired_source_bytes() -> Result<()> {
-        queued_prefill_units(true, true)
+        queued_prefill_units(true, true, false)
     }
 
     #[test]
@@ -610,7 +610,13 @@ mod tests {
         assert!(stage.contains("(resident.ptr as usize)"));
     }
 
-    fn queued_prefill_units(segmented: bool, received_pair: bool) -> Result<()> {
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn bf16_fallback_plane_cannot_overwrite_retained_wire_units() -> Result<()> {
+        queued_prefill_units(true, true, true)
+    }
+
+    fn queued_prefill_units(segmented: bool, received_pair: bool, bf16_sibling: bool) -> Result<()> {
         use crate::shared::memory::HostAllocation;
         use cuteafd_ffi::{fp8_moe::Fp8MoeModule, native_library_lifetime_fixture::Fixture};
         use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RequestView,
@@ -628,6 +634,13 @@ mod tests {
         let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
             128, geometry.experts, geometry.topk, 256, 2, 7, 0,
             2, 16, 4096, 0, 0, 0, 0];
+        let bf16_module = if bf16_sibling {
+            let mut bf16_words = words;
+            bf16_words[7] = 1;
+            fixture.configure_fp8(&library, &bf16_words, &[1024, 4096, 0, 0, 0, 0])?;
+            // SAFETY: the fixture snapshots the BF16 sibling's metadata independently.
+            Some(unsafe { Fp8MoeModule::load(fixture.directory())? })
+        } else { None };
         fixture.configure_fp8(&library, &words, &[1024, 4096, 0, 0, 0, 0])?;
         if segmented { fixture.configure_fp8_segments(&library)?; }
         // SAFETY: this test built the trusted CPU ABI immediately above.
@@ -636,7 +649,7 @@ mod tests {
             slice: cuteafd_core::SparkSlice { unit_map: None, layer: layer as u32, first: 0,
                 width: 128, stored_width: 128, tiers: vec![], projection_counts: vec![] },
             regions: vec![None, None, None, None, None, None] }).collect();
-        let weights = Rc::new(Fp8Weights { layers, module, bf16_module: None,
+        let weights = Rc::new(Fp8Weights { layers, module, bf16_module,
             tp: 2, rank: 0, weight_read_bytes: 256 });
         let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
             capacity: 4096, compiled: 4096, staging_rows: 769, buffered_units: 3 };
@@ -704,6 +717,14 @@ mod tests {
             assert_eq!(worker.segments.as_ref().unwrap().staged.len(), 2);
             assert_eq!(worker.segments.as_ref().unwrap().flushes, 0);
             fixture.advance_queued_experts(&library, 2)?; // both input copies, no FC1
+            if bf16_sibling {
+                let bf16_bytes = worker.capacity * hidden * 2;
+                assert_eq!(worker.segments.as_ref().unwrap().input_offset, bf16_bytes);
+                assert_eq!(worker.inputs[0].buffer.bytes, bf16_bytes + 3 * 769 * (hidden + hidden / 32));
+                // Overwrite the entire ordinary BF16 fallback plane while the
+                // wire units still await FC1. An aliased max(old, wire) fails.
+                library.copy_h2d(device_part(worker.inputs[0].buffer, 0, bf16_bytes)?, &vec![0xee; bf16_bytes])?;
+            }
             // Negative control: direct mapped gather would now produce different bytes.
             for frame in &mut frames[..2] { frame.bytes_mut().fill(0xff); }
             worker.flush_staged()?;

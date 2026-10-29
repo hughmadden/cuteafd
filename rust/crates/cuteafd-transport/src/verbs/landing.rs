@@ -201,6 +201,16 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a CUDA/RDMA container and an exclusive hardware lease"]
+    fn cuda_malloc_dma_buf_landing_probe() -> Result<()> {
+        let library = load_verbs_host_native_library()?;
+        let probe = gpu_landing_probe(&library, None, 64 << 20, 8)?;
+        println!("GPU landing probe: {}", serde_json::to_string(&probe)?);
+        anyhow::ensure!(probe.usable(), "CUDA-allocated RDMA landing unavailable: {probe:?}");
+        Ok(())
+    }
+
+    #[test]
     fn placed_landing_registers_the_whole_range_and_checks_slices() {
         let range = CuteafdDeviceBuffer { ptr: 4096usize as *mut c_void, bytes: 8256 * 128, ..Default::default() };
         let landing = DeviceLanding::placed(range).unwrap();
