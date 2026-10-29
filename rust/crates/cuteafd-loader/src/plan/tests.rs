@@ -4238,7 +4238,8 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
 #[test]
 fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     use super::encoder::EncoderKind;
-    let mut cfg = glm5_flash_config(2);
+    let mut cfg = glm5_flash_config(16);
+    cfg["text_config"]["n_routed_experts"] = json!(8);
     cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
         "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
         "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
