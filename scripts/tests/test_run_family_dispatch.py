@@ -1985,8 +1985,9 @@ def test_packed_prefill_mode_forwarding(tmp_path, family, mode):
     if family == "step5":
         keys += "SPARK_COUNT=4\nRTX_GPUS=1\n" + "".join(
             f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(1, 4))
+    if family == "qwen3_5":
+        keys += "SPARK_COUNT=0\n"
     result = _family_launch_result(tmp_path, config, "test/packed", keys,
-        extra_args=("--wip", "packed-test") if family == "qwen3_5" else (),
         encoder_plan={"spark_budget_bytes": 108 << 30} if family == "step5" else
             {"placement_supported": True, "fits": True, "spark_ranks": 0} if family == "qwen3_5" else None)
     assert result.returncode == 0, result.stderr
