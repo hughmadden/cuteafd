@@ -6189,3 +6189,18 @@ holds current continuation state; issue #836 holds the recipe/research and
 separate engine follow-up. Numerical code/pin and production identity are
 frozen while the job runs. Do not restart a live attempt or change these
 inputs; recover through its existing launcher and latest durable frontier.
+
+Quantization completed at 2026-10-29 07:14:45 UTC after 19h47m50s.
+All 37,476 projection commitments and 46 layer exports completed; the final
+47-shard checkpoint matches the reviewed 151,198-tensor / 154.247-GiB
+inventory. The independent completed-export audit reread and compared all
+1,294 retained native tensors (3,390,684,024 bytes), including 347 vision
+tensors, verified all MCG scalars/scales, calibrated evidence, asset bytes,
+47 diagnostic bundles and retirement barriers, with no findings. Evidence:
+`~/.cache/cuteafd/builds/glmf-core-k6/completed-export-audit.json`.
+
+The GPU container is stopped and the maxq lease released. The same durable
+supervisor is running authorized CPU-only upload and remote verification.
+Publication normalizes only the model-card license tag to the untouched
+source MIT license; every sealed numerical source hash remains unchanged.
+Do not report publication complete until its marker and successful exit exist.
