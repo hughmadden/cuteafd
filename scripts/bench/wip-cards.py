@@ -1745,6 +1745,9 @@ print(json.dumps(m))
 def cleanup_script(arm, task):
     # Ownership is durable and explicit. Existing WIP arms are never adopted by
     # running cards; only roots created by this task's build helper can be erased.
+    # An instance may hold several slots (e.g. gate/pre891/at891/devclone), so a
+    # cleanup removes one slot's build root, overlay and registrations, and only
+    # tears down the instance once no slot remains on that host.
     instance, slot = arm['instance'], arm['slot']
     root = arm.get('root', str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + instance)))
     owner = json.dumps({'task': task, 'instance': instance}, sort_keys=True)
@@ -1752,12 +1755,28 @@ def cleanup_script(arm, task):
 home=pathlib.Path.home()
 root=home/'.cache/cuteafd/builds'/ROOT_NAME
 owner=OWNER
+instance=INSTANCE
+slot=SLOT
+names=NAMES
+runs=home/'.cache/cuteafd/wip-run'/instance
+slots=home/'.cache/cuteafd/wip-slots'/instance
+overlay=runs/slot
+registration=slots/(slot+'.json')
+legacy=home/'.cache/cuteafd/wip-slots'/(slot+'.json')
+def remaining_slots():
+    # Any build slot, runtime overlay or per-instance registration still on
+    # this host means the instance root must survive.
+    remaining=set()
+    build_slots=root/'slots'
+    if build_slots.is_dir(): remaining.update(p.name for p in build_slots.iterdir())
+    if runs.is_dir(): remaining.update(p.name for p in runs.iterdir())
+    if slots.is_dir(): remaining.update(p.stem for p in slots.glob('*.json'))
+    remaining.discard(slot)
+    return remaining
+present=subprocess.check_output(['docker','ps','-a','--format','{{.Names}}'],text=True).splitlines()
+residual=[overlay,registration]
+if legacy.is_file() and json.loads(legacy.read_text()).get('wip_instance')==instance: residual.append(legacy)
 if not root.exists():
-    names=NAMES
-    present=subprocess.check_output(['docker','ps','-a','--format','{{.Names}}'],text=True).splitlines()
-    residual=[home/'.cache/cuteafd/wip-run'/INSTANCE/SLOT,home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json')]
-    legacy=home/'.cache/cuteafd/wip-slots'/(SLOT+'.json')
-    if legacy.is_file() and json.loads(legacy.read_text()).get('wip_instance')==INSTANCE: residual.append(legacy)
     if any(name in present for name in names) or any(p.exists() or p.is_symlink() for p in residual):
         raise RuntimeError('unowned cleanup residue without WIP root '+str(root))
     print('verified absent', root); sys.exit(0)
@@ -1765,31 +1784,36 @@ if root.is_symlink(): raise RuntimeError('refusing root symlink')
 marker=root/'.wip-card-owner.json'
 if not marker.is_file() or json.loads(marker.read_text())!=owner:
     raise RuntimeError('refusing unowned WIP root '+str(root))
-names=NAMES
 for name in names:
     ids=subprocess.check_output(['docker','ps','-aq','--filter','name=^'+name+'$'],text=True).split()
     for ident in ids:
         info=json.loads(subprocess.check_output(['docker','inspect',ident],text=True))[0]
         env=info['Config'].get('Env',[])
         mounts=info.get('Mounts',[])
-        if 'WIP_INSTANCE='+INSTANCE not in env or not any(m['Source']==str(root) for m in mounts):
+        if 'WIP_INSTANCE='+instance not in env or not any(m['Source']==str(root) for m in mounts):
             raise RuntimeError('refusing foreign container '+name)
         subprocess.run(['docker','rm','-f',ident],check=True)
     remaining=subprocess.check_output(['docker','ps','-a','--format','{{.Names}}'],text=True).splitlines()
     if name in remaining: raise RuntimeError('container still present '+name)
-overlay=home/'.cache/cuteafd/wip-run'/INSTANCE/SLOT
 if overlay.is_symlink(): raise RuntimeError('refusing overlay symlink')
 if overlay.exists(): shutil.rmtree(overlay)
-for registration, shared in [(home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json'), False),(home/'.cache/cuteafd/wip-slots'/(SLOT+'.json'), True)]:
+for registration, shared in [(slots/(slot+'.json'), False),(legacy, True)]:
     if registration.exists():
         data=json.loads(registration.read_text())
-        if data.get('wip_instance')==INSTANCE and data.get('slot')==SLOT: registration.unlink()
+        if data.get('wip_instance')==instance and data.get('slot')==slot: registration.unlink()
         # The legacy slot-name file is shared by every instance using that slot
         # name; another instance's entry there is not ours to remove or refuse.
         elif not shared: raise RuntimeError('refusing foreign registration '+str(registration))
-if root.is_symlink(): raise RuntimeError('refusing root symlink')
-shutil.rmtree(root)
-for path in [root,overlay,home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json')]:
+build_slot=root/'slots'/slot
+if build_slot.is_symlink(): raise RuntimeError('refusing slot root symlink')
+removed=[overlay,slots/(slot+'.json'),build_slot]
+if legacy.is_file() and json.loads(legacy.read_text()).get('wip_instance')==instance: removed.append(legacy)
+if build_slot.exists(): shutil.rmtree(build_slot)
+if not remaining_slots():
+    # The last slot on this host also releases the instance root.
+    if root.is_symlink(): raise RuntimeError('refusing root symlink')
+    shutil.rmtree(root)
+for path in removed:
     if path.exists() or path.is_symlink(): raise RuntimeError('cleanup failed '+str(path))
 print('verified absent', root, overlay)
 '''

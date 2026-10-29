@@ -707,6 +707,38 @@ def test_cleanup_leaves_another_instances_legacy_slot_registration(tmp_path):
     assert result.returncode and 'refusing foreign registration' in result.stderr
 
 
+def test_cleanup_multi_slot_instance_slot_by_slot(tmp_path):
+    # An instance can hold several slots; each cleanup removes only its own
+    # build root, overlay and registrations, and the last one takes the root.
+    home = tmp_path / 'home'
+    root = home / '.cache/cuteafd/builds/wip-test'
+    for slot in ('a', 'b'):
+        (root / 'slots' / slot / 'coordinator').mkdir(parents=True)
+    (root / '.wip-card-owner.json').write_text(json.dumps(dict(task='task', instance='test')))
+    runs = home / '.cache/cuteafd/wip-run' / 'test'
+    slots = home / '.cache/cuteafd/wip-slots' / 'test'
+    for slot in ('a', 'b'):
+        (runs / slot).mkdir(parents=True)
+        slots.mkdir(parents=True, exist_ok=True)
+        (slots / f'{slot}.json').write_text(json.dumps(dict(wip_instance='test', slot=slot)))
+    prefix = 'import subprocess\nsubprocess.check_output=lambda cmd,**kw: ""\n'
+    env = {**os.environ, 'HOME': str(home)}
+    clean = lambda slot: subprocess.run(
+        [sys.executable, '-c', prefix + cards.cleanup_script(dict(instance='test', slot=slot), 'task')],
+        env=env, text=True, capture_output=True)
+
+    first = clean('a')
+    assert first.returncode == 0, first.stderr
+    assert root.exists() and (root / 'slots' / 'b').exists() and not (root / 'slots' / 'a').exists()
+    assert (runs / 'b').exists() and not (runs / 'a').exists()
+    assert (slots / 'b.json').exists() and not (slots / 'a.json').exists()
+
+    second = clean('b')
+    assert second.returncode == 0, second.stderr
+    assert not root.exists()
+    assert not (runs / 'b').exists() and not (slots / 'b.json').exists()
+
+
 def test_summary_medians_paired_not_ratio_of_medians():
     rows = [dict(card='c', arm=arm, repeat=i, status='pass', simulated=False, C1=v) for i, values in enumerate(((10, 20), (100, 110), (20, 40)), 1) for arm, v in zip(('base', 'candidate'), values)]
     medians, paired = cards.summary_math(rows, ['base', 'candidate'])
