@@ -229,6 +229,52 @@ def test_missing_objects_fail_closed(tmp_path):
         compare_sm.compare(left, right)
 
 
+@pytest.mark.parametrize("source_comparison", [False, True])
+def test_inventory_changes_only_allowed_for_source_comparison(tmp_path, source_comparison):
+    left, right = exports(tmp_path)
+    if source_comparison:
+        path = right / "comparison-context.json"
+        context = json.loads(path.read_text())
+        context["sms"] = 188
+        path.write_text(json.dumps(context))
+    (left / "removed.cubin").write_bytes(cuda_elf(b"old-route"))
+    (right / "added.o").write_bytes(cuda_elf(b"new-route"))
+    (right / "added.h").write_text("new ABI\n")
+    if not source_comparison:
+        with pytest.raises(ValueError, match="object set mismatch"):
+            compare_sm.compare(left, right)
+        return
+    report = compare_sm.compare(left, right, source_comparison=True)
+    assert report["added_programs"] == ["added.o"]
+    assert report["removed_programs"] == ["removed.cubin"]
+    assert [row["program"] for row in report["programs"]] == ["test"]
+    assert report["programs"][0]["object_identical"]
+    assert report["headers_changed"] == ["added.h"]
+
+
+@pytest.mark.parametrize("side", ["added", "removed"])
+@pytest.mark.parametrize("invalid", ["cuda", "header"])
+def test_source_inventory_changes_require_cuda_and_object_headers(tmp_path, side, invalid):
+    left, right = exports(tmp_path)
+    path = right / "comparison-context.json"
+    context = json.loads(path.read_text())
+    context["sms"] = 188
+    path.write_text(json.dumps(context))
+    directory = right if side == "added" else left
+    (directory / "route.o").write_bytes(b"not CUDA" if invalid == "cuda" else cuda_elf())
+    if invalid == "cuda":
+        (directory / "route.h").write_text("ABI\n")
+    with pytest.raises(ValueError, match="no CUDA ELF" if invalid == "cuda" else "missing exported ABI"):
+        compare_sm.compare(left, right, source_comparison=True)
+
+
+def test_source_comparison_still_rejects_empty_inventory(tmp_path):
+    left, right = exports(tmp_path)
+    (right / "test.o").unlink()
+    with pytest.raises(ValueError, match="object set mismatch"):
+        compare_sm.compare(left, right, source_comparison=True)
+
+
 def test_missing_cubins_fail_closed(tmp_path):
     left, right = exports(tmp_path)
     (left / "test.o").write_bytes(b"no CUDA image")
@@ -670,7 +716,7 @@ def test_failed_group_does_not_discard_other_completed_reports(tmp_path, monkeyp
     def compare(left, right):
         if left.parent.name == "bad":
             raise ValueError("missing pair")
-        return {"programs": []}
+        return {"programs": [], "added_programs": [], "removed_programs": []}
 
     monkeypatch.setattr(compare_sm, "compare", compare)
     assert compare_sm.main() == 1
