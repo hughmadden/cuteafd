@@ -1528,9 +1528,10 @@ fn routed_exl3_multitier_is_unsupported_and_names_tensors() {
         assert_eq!(component(&report, Component::RoutedExpert).status, Status::MissingKernel);
         let output = render(&report);
         assert!(output.contains(&format!("unsupported: EXL3 with {tiers} expert tiers (2 supported)")), "{output}");
-        for expert in 0..tiers {
-            assert!(output.contains(&format!("model.language_model.layers.1.mlp.experts.{expert}.down_proj")), "{output}");
+        for bits in 2..2 + tiers {
+            assert!(output.contains(&format!("(K{bits})")), "{output}");
         }
+        assert!(output.contains("model.language_model.layers.1.mlp.experts."), "{output}");
         assert!(crate::read_expert_catalog(dir.path()).is_err());
     }
 }
@@ -3803,22 +3804,51 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
 }
 
 #[test]
-fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
+fn v41_exl3_is_unsupported_without_a_loader_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);
-    write_v41_workspaces(dir.path());
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(!report.executable());
+    assert!(render(&report).contains("unsupported: EXL3 for DeepSeek V4/V4.1 Flash"), "{}", render(&report));
+    assert!(crate::read_official_v41_catalog(dir.path()).unwrap_err().to_string()
+        .contains("unsupported: EXL3 for DeepSeek V4/V4.1 Flash"));
+}
+
+#[test]
+fn v4_flash_exl3_is_unsupported_without_a_loader_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    write_v4_snapshot(dir.path());
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["quantization_config"] = exl3_compact(2);
+    std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(!report.executable());
+    assert!(render(&report).contains("unsupported: EXL3 for DeepSeek V4/V4.1 Flash"), "{}", render(&report));
+}
+
+#[test]
+fn v4_pro_exl3_tp6_and_explicit_refusal_keep_default_fallback_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    write_v4_pro_exl3_snapshot(dir.path());
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        rtx_bytes: vec![96 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
         ..Default::default()
     }), ..sparks(6) };
-    let refused = plan_spark_count(dir.path(), &options, 6, Some(6)).unwrap();
+    let tp6 = plan_spark_count(dir.path(), &options, 6, Some(6)).unwrap();
+    assert!(tp6.executable(), "{}", render(&tp6));
+    assert_eq!(tp6.spark_ranks, 6);
+    // Seven ranks exceed the qualified package range; automatic selection still
+    // chooses the largest supported count, while an explicit request refuses.
+    let refused = plan_spark_count(dir.path(), &options, 7, Some(7)).unwrap();
     assert!(!refused.executable(), "{}", render(&refused));
-    assert_eq!(refused.spark_ranks, 6);
+    assert_eq!(refused.spark_ranks, 7);
     assert!(refused.hints.last().unwrap().what.contains("counts that work:"));
-    let fallback = plan_spark_count(dir.path(), &options, 6, None).unwrap();
+    let fallback = plan_spark_count(dir.path(), &options, 7, None).unwrap();
     assert!(fallback.executable(), "{}", render(&fallback));
-    assert_eq!(fallback.spark_ranks, 4);
-    assert!(fallback.spark_count_warning.as_ref().unwrap().contains("using 4 Sparks"));
+    assert_eq!(fallback.spark_ranks, 6);
+    assert!(fallback.spark_count_warning.as_ref().unwrap().contains("using 6 Sparks"));
 }
 
 #[test]

@@ -53,7 +53,6 @@ class GlmExl3PackageTest(unittest.TestCase):
             self.assertFalse(tool.token_major_rotation('kimik3', capacity, 'coordinator'))
             self.assertFalse(tool.token_major_rotation('kimik3', capacity, 'spark'))
             for width in (512, 3072, 1536):
-                self.assertIsNone(tool.decode_tile('kimik3', width, capacity))
                 if width == 512:
                     # Spark: width 512 is warp-specialized from m1024 up and
                     # keeps its cooperative 8-row export below that.
@@ -89,7 +88,8 @@ class GlmExl3PackageTest(unittest.TestCase):
         # Other geometries keep their policies.
         self.assertEqual([tool.route_block('dsv4p', c, 'coordinator') for c in (256, 1024, 4096)], [8, 64, 64])
         self.assertEqual([tool.route_block('dsv4p', c, 'spark') for c in (256, 1024, 4096)], [8, 16, 64])
-        self.assertEqual(tool.route_block('v41', 4096, 'coordinator'), 8)
+        self.assertNotIn('v41', tool.GEOMETRIES)
+        self.assertNotIn('dsv4f', tool.GEOMETRIES)
 
     def test_policy_functions_require_an_explicit_role(self):
         for call in (lambda: tool.route_block('dsv4p', 1024),

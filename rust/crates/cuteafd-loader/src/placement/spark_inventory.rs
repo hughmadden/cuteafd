@@ -816,10 +816,10 @@ mod checkpoint_load_tests {
     #[test]
     fn exl3_load_inventory_matches_simultaneous_banks_not_all_layers() {
         let dir=tempfile::tempdir().unwrap();
-        crate::plan::testing::write_v41_exl3_snapshot(dir.path(),3);
+        crate::plan::testing::write_v4_pro_exl3_snapshot(dir.path());
         let catalog=crate::read_expert_catalog(dir.path()).unwrap();
         let manifest=catalog.exl3().unwrap();
-        let plans=[3,4].into_iter().map(|layer|manifest.residency(crate::V41Exl3Layer::Backbone(layer),3,1).unwrap()).collect::<Vec<_>>();
+        let plans=[1,3].into_iter().map(|layer|manifest.residency(crate::V41Exl3Layer::Backbone(layer),3,1).unwrap()).collect::<Vec<_>>();
         let result=SparkLoadInventory::exl3(&catalog,&plans).unwrap();
         let staging=plans.iter().map(|p|p.loads.chunks(9).map(|jobs|jobs.iter().map(|j|j.bytes as u64).sum::<u64>()).max().unwrap()).max().unwrap();
         let init=plans.iter().flat_map(|p|&p.buffers).map(|b|b.initial_words.len() as u64*4).max().unwrap();

@@ -197,7 +197,7 @@ impl<'a> Weights<'a> {
                 Execution::Full(execution)
             }
             Self::Exl3(weights) => {
-                let mut execution = Exl3Worker::with_modules(
+                let execution = Exl3Worker::with_modules(
                     library,
                     weights.clone(),
                     &{
@@ -209,7 +209,6 @@ impl<'a> Weights<'a> {
                     config.exl3_schedule,
                     modules.take_exl3()?,
                 )?;
-                execution.install_topology(config.spark_world()?.ownership_topology())?;
                 Execution::Exl3(execution)
             }
             Self::Fp8(experts) => {

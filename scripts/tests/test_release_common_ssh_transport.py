@@ -402,8 +402,6 @@ class TestRunShLifecycle:
             "sparkinfer-revision",
             "hub/models--x--M/snapshots/rev",
             "seed0",
-            "true",
-            "k34",
             "__none__",
             "__none__",
             "__none__",

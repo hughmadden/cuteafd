@@ -93,7 +93,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
         v41::owners::DECODE_LANE_ROWS)?;
     let draft = if dspark {
-        ensure!(catalog.native_dspark_experts(), "V4.1 compressed dSpark owner manifest is not supported by this adapter");
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
         let resident = resident_weights(checkpoint, ranks, true).context("unsupported V4.1 dSpark resident format")?;

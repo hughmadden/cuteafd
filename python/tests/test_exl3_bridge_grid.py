@@ -103,7 +103,8 @@ static int wrapper_{role}({module_type}*,void*,int32_t active_m,int32_t grid_x,c
         for sms, blocks in ((0, 1), (188, 0), (188, 3), (2**31, 1)):
             with self.subTest(sms=sms, blocks=blocks):
                 with self.assertRaisesRegex(ValueError, 'cooperative grid capacity'):
-                    exporter().write_bridge(Path('/unused'), dict(sms=sms, blocks_per_sm=blocks))
+                    exporter().write_bridge(Path('/unused'),
+                                            dict(bits=[2, 3], sms=sms, blocks_per_sm=blocks))
 
 
 if __name__ == '__main__':

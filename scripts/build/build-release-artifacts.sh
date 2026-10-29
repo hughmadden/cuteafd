@@ -107,7 +107,6 @@ for bf16_family in "${bf16_family_list[@]}"; do
     { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
 done
 # Package each supported checkpoint decoder family, including K4/K5.
-exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}"
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -239,7 +238,6 @@ cmake \
   -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES=ON \
-  -DCUTEAFD_V41_EXL3_BIT_FAMILIES="$exl3_bit_families" \
   -DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
@@ -277,21 +275,6 @@ if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
   python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
     "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
 fi
-exl3_family_tags=()
-IFS=';' read -ra exl3_family_list <<<"$exl3_bit_families"
-for exl3_family in "${exl3_family_list[@]}"; do
-  exl3_family_tags+=("k${exl3_family//,/}")
-done
-# Families nest under exl3/ so images keep one well-known EXL3 root; the
-# daemon resolves exl3/exl3-kXX by checkpoint tiers and treats a direct
-# layout child of exl3/ as the legacy single-family package.
-for exl3_tag in "${exl3_family_tags[@]}"; do
-  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" install \
-    --package "$build_root/native/exl3-$exl3_tag" --output "$output_dir/exl3/exl3-$exl3_tag"
-  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" verify \
-    --package "$output_dir/exl3/exl3-$exl3_tag" --role "$role"
-done
-# Other expert geometries (FAMILY:exl3-kTIERS entries) ship as exl3-FAMILY-kTIERS.
 IFS=';' read -ra release_family_list <<<"$expert_families"
 for release_family in "${release_family_list[@]}"; do
   [[ "$release_family" == *:exl3-k* ]] || continue

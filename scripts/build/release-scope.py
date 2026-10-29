@@ -45,13 +45,9 @@ PREVIOUS_RELEASE_FLOOR = {
 DEFAULT_MATRIX = 'scripts/bench/release-smoke-v3.json'
 
 
-# Package/layout evidence extracted from both stopped v2.0.0 images. Base V4.1
-# EXL3 packages are always built, separately from the named expert families.
+# Retained package/layout floor from the stopped v2.0.0 images.
 def previous_release_packages():
     packages = {'coordinator': {}, 'expert': {}}
-    for name in ('exl3-k23', 'exl3-k34'):
-        packages['coordinator'][f'exl3/{name}'] = ['dspark', 'rtx-tp1', 'rtx-tp2']
-        packages['expert'][f'exl3/{name}'] = [f'tp{tp}-rank{rank}' for tp in (2, 3, 4) for rank in range(tp)]
     for name in ('dsv4p-k23', 'glm-k45', 'glmf-k34', 'qwen4-k45'):
         qwen = name.startswith('qwen4')
         path = f'exl3/exl3-{name}'

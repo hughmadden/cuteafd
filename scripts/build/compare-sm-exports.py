@@ -34,7 +34,7 @@ EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
-EXL3_GEOMETRIES = ("v41", "dsv4f", "dsv4p", "glm", "glmf", "qwen4", "kimik3")
+EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3")
 
 
 def load_file(name, path):
@@ -151,9 +151,7 @@ def jobs(scope):
     result.append(("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
-    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
-                           ("dsv4f", "2,3"), ("dsv4f", "4,5"), ("v41", "2,3"),
-                           ("v41", "3,4"), ("v41", "4,5")):
+    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4")):
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits,
                         "--compact-companions"]))
@@ -329,11 +327,10 @@ def _export_exl3(extra, output):
             options = {"compile_only": True}
             if compact:
                 options["compact_weights"] = True
-            tile = (64, 128, 64, 128) if compact else package.decode_tile(geometry, width, rows)
+            tile = (64, 128, 64, 128) if compact else None
             if tile is not None:
                 options["tile"] = tile
-            if geometry != "v41":
-                options["hidden"] = package.GEOMETRIES[geometry][0]
+            options["hidden"] = package.GEOMETRIES[geometry][0]
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows, *_policy_role_args(package.route_block, role))

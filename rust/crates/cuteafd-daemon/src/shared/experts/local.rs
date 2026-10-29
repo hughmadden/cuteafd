@@ -101,6 +101,11 @@ impl<'a> LocalExpertWave<'a> {
         capacities.push(capacity);
         Ok(capacities)
     }
+    fn exl3_capacities(capacity: u32) -> Result<Vec<u64>> {
+        // Retain the local owner's exact prefill set and canonical wide decode.
+        let capacity = if capacity > 1 && capacity < 80 { 80 } else { capacity };
+        Ok(Self::capacities(capacity)?.into_iter().map(u64::from).collect())
+    }
     pub fn device_bytes(
         library: &NativeLibrary,
         capacity: u32,
@@ -242,7 +247,7 @@ impl<'a> LocalExpertWave<'a> {
         geometry: ExpertGeometry,
     ) -> Result<usize> {
         Self::require_geometry(geometry)?;
-        let directories: Vec<_> = cuteafd_loader::placement::families::deepseek_v41::exl3_capacities(capacity as u64, true)?
+        let directories: Vec<_> = Self::exl3_capacities(capacity)?
             .into_iter()
             .map(|c| directory.join(format!("m{c}")))
             .collect();
@@ -293,7 +298,7 @@ impl<'a> LocalExpertWave<'a> {
             raw: library.cuda_stream_create()?,
         };
         let mut states = Vec::new();
-        let capacities = cuteafd_loader::placement::families::deepseek_v41::exl3_capacities(capacity as u64, true)?;
+        let capacities = Self::exl3_capacities(capacity)?;
         let directories: Vec<_> = capacities
             .iter()
             .map(|c| directory.join(format!("m{c}")))

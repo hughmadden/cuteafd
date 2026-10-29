@@ -996,23 +996,10 @@ if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gi
   fi
 fi
 snapshot_rel="hub/models--${RELEASE_MODEL_ID//\//--}/snapshots/$RELEASE_MODEL_REVISION"
-model_is_exl3="$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")"
-# Multi-family EXL3 images ship exl3-kXX packages per decoder-tier family.
-# The deployed checkpoint's resident tiers are [floor(bits), floor(bits)+1]
-# for both raw integer-bit publications and staged fractional-bit snapshots.
-exl3_family_tag=""
-if [[ "$model_is_exl3" == true ]]; then
-  # Family resolution is best-effort: without readable bits the remote
-  # manifest read falls back to the legacy single-package location.
-  exl3_bits="$(jq -er '.bits' "$hf_home/$snapshot_rel/quantize_config.json" 2>/dev/null || jq -er '.quantization_config.bits' "$hf_home/$snapshot_rel/config.json" 2>/dev/null || true)"
-  if [[ "$exl3_bits" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    exl3_family_base="${exl3_bits%%.*}"
-    exl3_family_tag="k${exl3_family_base}$((exl3_family_base + 1))"
-  fi
-fi
+[[ "$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")" != true ]] ||
+  release_die "unsupported: EXL3 for DeepSeek V4/V4.1 Flash"
 coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
 [[ "$TP2_DSPARK_EXPERTS" != on || "$SPECULATOR" == dspark ]] || release_die "TP2_DSPARK_EXPERTS requires dSpark"
-[[ "$TP2_DSPARK_EXPERTS" != on || "$model_is_exl3" != true ]] || release_die "TP2_DSPARK_EXPERTS requires native expert weights"
 
 reclaim_args=()
 if ((restart)) && docker container inspect "$coordinator" >/dev/null 2>&1; then
@@ -1026,32 +1013,17 @@ expert_format=native
 model_is_nvfp4="$(jq -r '.quantization_config.moe_quant_algo // empty' "$hf_home/$snapshot_rel/config.json" 2>/dev/null || true)"
 [[ "$model_is_nvfp4" == "NVFP4" ]] && expert_format=nvfp4
 # Replicated groups require native experts; NVFP4 supports pure TP3/4/6.
-# Compact EXL3 TP3EP1 retains compressed shards. Reject other modes early.
 if ((topology_explicit)); then
-  if [[ "$model_is_exl3" == true ]]; then
-    [[ "$EXPERT_FORMAT" == exl3 && "$spark_tp" == 3 && "$spark_ep" == 1 ]] ||
-      release_die "explicit EXL3 topology requires compact TP3EP1 with disjoint packages"
-  fi
   if [[ "$model_is_nvfp4" == "NVFP4" ]]; then
     [[ "$spark_ep" == 1 && ( "$spark_tp" == 3 || "$spark_tp" == 4 || "$spark_tp" == 6 ) ]] ||
       release_die "NVFP4 supports pure SPARK_TP=3/4/6 SPARK_EP=1, not replicated groups"
   fi
 fi
-if [[ "$model_is_exl3" == true ]]; then
-  case "$exl3_family_tag" in
-    k23) expert_format=exl3-k23 ;;
-    k34) expert_format=exl3-k34 ;;
-    # Unresolvable families keep the conservative native constants; the
-    # dual fit model is only exercised for two-RTX launches.
-    *) expert_format=native ;;
-  esac
-fi
 # Auto placement must not pick an RTX boundary so low that the remote Spark
 # weights cannot fit the device budget. The floor is derived from the actual
 # budget and the resolved TP degree, not a hardcoded 20.
 # These tensor-window constants describe native weights, not compressed shards.
-# EXL3 admission comes from the checkpoint-aware planner and package proofs.
-if ((topology_explicit)) && [[ "$model_is_exl3" != true && "$RTX_EXPERT_LAYERS" == auto ]]; then
+if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
   remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
   ((remote_capacity > 40)) && remote_capacity=40
   topology_min_layers=$((40 - remote_capacity))
@@ -1187,30 +1159,24 @@ expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")" ||
   release_die "cannot resolve expert row capacity"
 mapfile -t hosts < <(release_spark_values HOST)
 mapfile -t lanes < <(release_spark_values LANE_A)
-spark_exl3_identity=""
 for host in "${hosts[@]}"; do
-  # Every argument below is non-empty on purpose. OpenSSH joins the command
-  # arguments into one remote shell line, so an empty argument is elided and
-  # every later positional shifts; the optional EXL3 family tag therefore
-  # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
-exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
-wip_spark_container="${9:-cuteafd-spark-expert-wip}"
-wip_layout_slot="${10:-$wip_slot}"
-wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
-namespace_root="${13:-/mnt/sparknest}"
+wip_slot="${6:-__none__}"
+wip_spark_container="${7:-cuteafd-spark-expert-wip}"
+wip_layout_slot="${8:-$wip_slot}"
+wip_root_arg="${9:-__default__}"; wip_instance_arg="${10:-__none__}"
+namespace_root="${11:-/mnt/sparknest}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
   if docker container inspect "$wip_spark_container" >/dev/null 2>&1; then docker cp "$wip_spark_container:/wip/$1" "$2"
   else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
 }
-[[ "$exl3_family" == __none__ ]] && exl3_family=
 # Every failure names the host and the check: this block runs over SSH, so a
 # bare nonzero exit would otherwise surface as an unexplained transport error.
-# Diagnostics go to stderr; stdout stays the EXL3 manifest alone.
+# Diagnostics go to stderr; stdout stays empty on success.
 die() { echo "spark preflight on $host: $*" >&2; exit 1; }
 docker info >/dev/null 2>&1 || die "the Docker daemon is unavailable"
 if ! docker image inspect "$image" >/dev/null 2>&1; then
@@ -1257,24 +1223,10 @@ if [[ "$wip_slot" != __none__ ]]; then
     --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json" >&2 || die "slot SparkInfer verification failed"
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
 fi
-if [[ "$exl3" == true && "$wip_slot" != __none__ ]]; then
-  layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
-  if [ -f "$layout/lib/exl3/exl3-$exl3_family/manifest.json" ]; then cat "$layout/lib/exl3/exl3-$exl3_family/manifest.json"; else cat "$layout/lib/exl3/manifest.json"; fi
-elif [[ "$exl3" == true ]]; then
-  docker run --rm --network none --entrypoint /bin/sh "$image" -c \
-    'if [ -f "/opt/cuteafd/lib/exl3/exl3-'"$exl3_family"'/manifest.json" ]; then cat "/opt/cuteafd/lib/exl3/exl3-'"$exl3_family"'/manifest.json"; else cat /opt/cuteafd/lib/exl3/manifest.json; fi'
-fi
+
 REMOTE
 )" || release_die "Spark host preflight failed on $host (see the messages above)"
-  if [[ "$model_is_exl3" == true ]]; then
-    identity="$(release_exl3_package_identity "$sparkinfer_commit" <<<"$spark_manifest")"
-    if release_spark_compact_active || [[ "$SPARK_COUNT" == 6 || ( "$spark_tp" == 3 && "$spark_ep" == 1 ) ]]; then
-      release_validate_exl3_compact_variants "$expert_capacity" "$exl3_family_tag" "$SPARK_COUNT" <<<"$spark_manifest"
-    fi
-    [[ -z "$spark_exl3_identity" || "$spark_exl3_identity" == "$identity" ]] ||
-      release_die "Spark EXL3 packages differ across hosts; rebuild/distribute matching images"
-    spark_exl3_identity="$identity"
-  fi
+
 done
 
 # An explicit TP2/TP3/TP6 topology needs the matching SM121 expert role baked
@@ -1355,7 +1307,7 @@ if ((SPARK_COUNT == 0)); then
 else
   peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1392,7 +1344,6 @@ if ((dry_run)); then
   [[ -z "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" ]] || echo "  RDMA IB port: $CUTEAFD_VERBS_APP_IB_PORT_NUM"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
-  [[ -z "$spark_exl3_identity" ]] || echo "  Spark EXL3 package: $spark_exl3_identity"
   exit 0
 fi
 shared_api_state "$COORDINATOR_DOCKER_INFERENCE" "${INSTANCE:-default}"

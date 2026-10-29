@@ -43,8 +43,6 @@ DUAL_LAYER_BYTES_BY_FORMAT = {
     # plus E4M3 K16 scales) x 384 experts, as measured in the startup plan.
     # Placing with the native constant instead over-fills the card.
     "nvfp4": 3_822_059_520,
-    "exl3-k23": 1_760_000_000,
-    "exl3-k34": 2_800_000_000,
 }
 
 

@@ -81,8 +81,9 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 packages require two decoder tiers: {directory}')
         if meta.get('compute') != manifest['compute']:
             raise ValueError(f'EXL3 variant target differs from package target: {directory}')
-        # Records without a hidden size predate other geometries: they are V4.1.
-        if meta.get('hidden', GEOMETRIES['v41'][0]) != GEOMETRIES[manifest.get('geometry', 'v41')][0]:
+        if manifest.get('geometry') not in GEOMETRIES:
+            raise ValueError('unsupported EXL3 package geometry')
+        if meta.get('hidden') != GEOMETRIES[manifest['geometry']][0]:
             raise ValueError(f'EXL3 variant hidden size does not match the package geometry: {directory}')
         for key in ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits'):
             if meta[key] != variant[key]:
@@ -93,7 +94,7 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             if (record.get('descriptor_rows', 3), record.get('native_info_version', 2)) != contract:
                 raise ValueError(f'EXL3 variant descriptor contract mismatch: {directory}')
         if compact:
-            geometry = manifest.get('geometry', 'v41')
+            geometry = manifest['geometry']
             companions = compact_profiles(geometry, profiles_for_role('spark', geometry))
             widths = {dest: width for _, width, _, _, _, destinations in companions
                       for dest in destinations}
@@ -262,8 +263,6 @@ def install_package(source: Path, output: Path) -> None:
 # Routed-expert geometries the EXL3 packages can target: (hidden, intermediate,
 # experts, top-k). The names match cuteafd_core::ExpertGeometry::family.
 GEOMETRIES = {
-    'v41': (5120, 2304, 384, 6),
-    'dsv4f': (4096, 2048, 256, 6),
     'dsv4p': (7168, 3072, 384, 6),
     'glm': (6144, 2048, 256, 8),
     # GLM 5.3 Flash (glm5_next): 288 experts, SwiGLU clamped at 10.
@@ -391,7 +390,7 @@ TILE_RTX_MIXED = (64, 128, 64, 256)
 # Tier pairs measured for warp-specialized coordinator exports. Another tier
 # pair of the same geometry is a different kernel cost and stays cooperative.
 WS_TIER_PAIRS = {('glm', (4, 5)), ('glmf', (3, 4)), ('qwen4', (4, 5)),
-                 ('v41', (3, 4)), ('kimik3', (2, 3)), ('dsv4p', (2, 3))}
+                 ('kimik3', (2, 3)), ('dsv4p', (2, 3))}
 
 # The S1/S4 arm as it exports on SM120: 128-wide FC1/256-wide FC2 tiles with
 # dynamic tile claims, 32-row route blocks at m256 and 64 rows above it.
@@ -437,14 +436,6 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('qwen4', 384, 4096): _WS_S14,
     ('qwen4', 256, 4096): _WS_S14,
     # V4.1 EXL3 wins from m1024 up; m256 stays cooperative (0.77-0.84x).
-    ('v41', 2304, 1024): _WS_S14,
-    ('v41', 1152, 1024): _WS_S14,
-    ('v41', 2304, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
-    ('v41', 2304, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
-    ('v41', 1152, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
-    ('v41', 1152, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
-    ('v41', 2304, 4096): _WS_S14,
-    ('v41', 1152, 4096): _WS_S14,
     # Kimi K3 ships the warp-specialized kernel on every coordinator prefill
     # export (TJ 2026-10-29, kernel-tie rule): the prerotated 256-wide FC1 arm
     # ties the cooperative 64-row token-major rotation at m1024-m2752 (geomean
@@ -493,11 +484,6 @@ SPARK_WS_CELLS = {
     ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
     ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
-    ('v41', 1152): dict(dynamic=True, tile=(64, 192, 64, 256)),
-    ('v41', 768): dict(dynamic=True, tile=(64, 256, 64, 256)),
-    ('v41', 640): dict(dynamic=True, tile=(64, 128, 64, 256)),
-    ('v41', 512): dict(dynamic=True, tile=(64, 256, 64, 256)),
-    ('v41', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
 }
 
 
@@ -616,7 +602,6 @@ COMPACT_WS_CELLS = {
     # top-6) faster than N128 at m256/m1024/m2752 (5.594 vs 5.630, 6.630 vs
     # 6.766, 9.942 vs 10.093 ms) and slower at m4096 (13.868 vs 13.831), so
     # N192 takes the three smaller capacities and m4096 keeps N128.
-    ('v41', 640): {256: (32, 192), 1024: (32, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 128)},
     # Qwen4 K4/K5 TP2 compact width 384: N192 wins m1024/m2752 (3.141 vs
     # 3.159, 5.549 vs 5.596) and ties m4096 (7.570 vs 7.559), so the large
     # capacities consolidate onto the same N192/64 arm as the GLM cells; only
@@ -635,22 +620,11 @@ COMPACT_WS_CELLS = {
     # 13.928, m2752 14.319 -> 11.093 / 10.848, m1024 6.792 -> 5.645 / 5.405);
     # m256 keeps 32-row N128 (4.804 -> 4.140 vs 4.136).
     ('glmf', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
-    # V4 Flash K4/K5 (H4096/E256/top6) synthetic weights, uniform top-6 routes:
-    # both compact worlds take the 32-row N128 arm at m256 and the 64-row N192
-    # arm from m1024 up. Kernel + top-k sum, ms (cooperative -> WS): TP6 width
-    # 384 m4096 24.939 -> 6.940 (3.593x), m2752 16.886 -> 5.131 (3.291x),
-    # m1024 6.819 -> 3.054 (2.233x), m256 3.095 -> 2.496 (1.240x); TP3 width
-    # 768 m4096 41.574 -> 11.948 (3.480x), m2752 28.691 -> 8.811 (3.256x),
-    # m1024 11.763 -> 5.439 (2.163x), m256 5.478 -> 4.807 (1.140x). Exhaustive
-    # 1..4096 prefix row invariance and poisoned-tail graph replays are
-    # bitwise equal to the cooperative oracle.
-    ('dsv4f', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
-    ('dsv4f', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+
 }
 # Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
-COMPACT_WS_BITS = {('glm', (4, 5)), ('glmf', (3, 4)), ('v41', (3, 4)), ('qwen4', (4, 5)),
-                   ('dsv4f', (4, 5))}
+COMPACT_WS_BITS = {('glm', (4, 5)), ('glmf', (3, 4)), ('qwen4', (4, 5))}
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -917,32 +891,6 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
     return TILE_384
 
 
-# Decode capacities ship the tile m1 ships. B12x's mixed-Trellis planner widens
-# the tile of 10..32-row batches to (128,128,128,128) (`_projection_mixed_tile_config`
-# with no direct top-k routes, which no packaged EXL3 geometry uses). The tile is
-# part of the reduction signature a decode plan admits, so a widened decode export
-# can never be selected: rows in its range fall through to the next capacity, and
-# the export ships as dead weight (#309). Re-exporting it with the canonical tile is
-# what makes the capacity selectable again. Enabled for the geometry whose decode
-# capacities are measured; the other geometries carry the same B12x policy and can
-# be added here with their own gate run.
-DECODE_TILE_PIN = ('v41',)
-
-
-def decode_tile(geometry: str, width: int, capacity: int) -> tuple[int, ...] | None:
-    """Canonical m1 tile for a decode capacity the B12x planner would widen.
-
-    The canonical tile is the planner's own prefill/default answer at this width,
-    which is what m1 and every capacity above the widened window already compile:
-    tile_n is 256 when both the rank's intermediate width and the geometry's hidden
-    size are whole 256 tiles, 128 otherwise.
-    """
-    if geometry not in DECODE_TILE_PIN or not 10 <= capacity <= 32:
-        return None
-    tile_n = 256 if width % 256 == 0 and GEOMETRIES[geometry][0] % 256 == 0 else 128
-    return (64, tile_n, 64, tile_n)
-
-
 # Decode-schedule variants: a capacity directory m<capacity>-<name> beside the
 # default m<capacity>, exported with per-capacity options (bit-identical; the
 # worker's --exl3-schedule NAME selects it). gb10 is the DGX Spark schedule of
@@ -1011,7 +959,7 @@ def decode_schedule_variants(geometry: str, role: str, profile: str,
 def package_name(geometry: str, bits: list[int]) -> str:
     """Package directory for one tier family; mirrors the daemon's resolver."""
     tag = ''.join(map(str, bits))
-    return f'exl3-k{tag}' if geometry == 'v41' else f'exl3-{geometry}-k{tag}'
+    return f'exl3-{geometry}-k{tag}'
 
 
 def shard_profiles(geometry: str, role: str) -> list[tuple]:
@@ -1048,7 +996,7 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     return profiles
 
 
-def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
+def profiles_for_role(role: str, geometry: str = 'dsv4p') -> list[tuple]:
     """(profile, width, experts, top-k, dtype, [layout destinations]) per role.
 
     TP4 keeps the padded 640/512 pair-split because I=2304/4 is not a whole number
@@ -1059,24 +1007,12 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     if geometry == 'kimik3':
         return [profile for profile in shard_profiles(geometry, role)
                 if role != 'spark' or profile[0] == 'tp6-width512']
-    if geometry != 'v41':
-        return shard_profiles(geometry, role)
-    if role == 'spark':
-        return [('tp4-width640', 640, 384, 6, 'bf16', ['tp4-rank0', 'tp4-rank1']),
-                ('tp4-width512', 512, 384, 6, 'bf16', ['tp4-rank2', 'tp4-rank3']),
-                ('tp2-width1152', 1152, 384, 6, 'bf16', ['tp2-rank0', 'tp2-rank1']),
-                ('tp3-width768', 768, 384, 6, 'bf16',
-                 ['tp3-rank0', 'tp3-rank1', 'tp3-rank2']),
-                ('tp6-width384', 384, 384, 6, 'bf16',
-                 [f'tp6-rank{rank}' for rank in range(6)])]
-    return [('rtx-tp1', 2304, 384, 6, 'fp32', ['rtx-tp1']),
-            ('rtx-tp2', 1152, 384, 6, 'fp32', ['rtx-tp2']),
-            ('dspark', 2304, 128, 3, 'bf16', ['dspark'])]
+    return shard_profiles(geometry, role)
 
 
 def build_profiles(role: str, geometry: str, *, all_spark_counts: bool = False) -> list[tuple]:
     profiles = profiles_for_role(role, geometry)
-    if all_spark_counts or role != 'spark' or geometry == 'v41':
+    if all_spark_counts or role != 'spark':
         return profiles
     worlds = {2, 3, 4, 6} if GEOMETRIES[geometry][1] // 128 >= 6 else {2, 3, 4}
     if geometry == 'qwen4':
@@ -1095,7 +1031,7 @@ def compact_profiles(geometry: str, profiles: list[tuple]) -> list[tuple]:
             for world in worlds if units % world]
 
 
-def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41',
+def parse_requested_layouts(values: list[str], role: str, geometry: str = 'dsv4p',
                             companions: list[tuple] = ()) -> list[str]:
     """`--require-layout tp3-rank0,tp3-rank1` (repeatable): layouts the package needs.
 
@@ -1119,7 +1055,7 @@ def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41',
 
 
 def tile_overrides(values: list[str], capacities: list[int], role: str,
-                   geometry: str = 'v41') -> dict[str, dict[int, tuple]]:
+                   geometry: str = 'dsv4p') -> dict[str, dict[int, tuple]]:
     """Parse repeatable `--tile PROFILE=CAPACITIES:FC1_K,FC1_N,FC2_K,FC2_N`.
 
     Capacity scoping is the point: the pinned B12x policy already picks a wider
@@ -1282,7 +1218,7 @@ def build(args: argparse.Namespace) -> None:
     if len(args.bits) != 2:
         raise ValueError('EXL3 packages require two decoder tiers')
     validate_destination(args.output)
-    geometry = getattr(args, 'geometry', 'v41')
+    geometry = getattr(args, 'geometry', 'dsv4p')
     hidden = GEOMETRIES[geometry][0]
     capacities = package_capacities(geometry, args.capacities)
     all_counts = getattr(args, 'all_spark_counts', False)
@@ -1329,10 +1265,6 @@ def build(args: argparse.Namespace) -> None:
             for capacity in capacities:
                 requested = tiles.get(profile, {}).get(capacity)
                 tile = (64, 128, 64, 128) if compact else requested
-                if tile is None:
-                    # A decode capacity the B12x policy widens is pinned back to the
-                    # canonical tile (an explicit override above still wins).
-                    tile = decode_tile(geometry, width, capacity)
                 # Content-keyed: an override changes the compiled geometry, so it
                 # must never land in (or be read from) the policy-keyed export, and
                 # neither may a pinned capacity: a build tree that predates the pin
@@ -1355,8 +1287,7 @@ def build(args: argparse.Namespace) -> None:
                     options['activation'] = activation(geometry)
                 if tile is not None:
                     options['tile'] = tile
-                if geometry != 'v41':
-                    options['hidden'] = hidden
+                options['hidden'] = hidden
                 block = route_block(geometry, capacity, args.role)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
                                     and (args.role != 'coordinator'
@@ -1366,7 +1297,7 @@ def build(args: argparse.Namespace) -> None:
                     block = (compact_block if compact_block is not None
                              else ws_route_block(geometry, args.role, width, capacity))
                     if (geometry == 'kimik3' or args.role == 'coordinator'
-                            or (not compact and geometry in ('qwen4', 'v41'))):
+                            or (not compact and geometry == 'qwen4')):
                         # Existing policy-keyed directories contain cooperative exports.
                         # The input format and claim mode are part of the compiled
                         # program, so they name its cache directory.
@@ -1475,8 +1406,7 @@ def build(args: argparse.Namespace) -> None:
                     'variants': variants, 'files': files,
                     'runtime': {'library': 'libcute_dsl_runtime.so', 'sha256': digest(args.runtime),
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
-        if geometry != 'v41':
-            manifest['geometry'] = geometry
+        manifest['geometry'] = geometry
         if requested_layouts:
             present = {v['directory'].split('/')[0] for v in variants}
             missing = sorted(set(requested_layouts) - present)
@@ -1499,7 +1429,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest='command', required=True)
     create = commands.add_parser('build')
     create.add_argument('--role', choices=('spark', 'coordinator'), required=True)
-    create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='v41',
+    create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='dsv4p',
                         help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
     create.add_argument('--all-spark-counts', action='store_true',
                         help='Opt in to all nonempty H128 Spark TP profiles (1..6)')
@@ -1507,7 +1437,7 @@ def main() -> None:
                         help='Add compact two-tier exports for selected uneven Spark worlds only')
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
-                             'without selection the legacy role profiles remain the default')
+                             'without selection the family role profiles remain the default')
     create.add_argument('--require-layout', action='append', default=[],
                         help='Layouts this package must contain (comma list, repeatable). '
                              'Recorded in the manifest and re-checked on verify, so a '

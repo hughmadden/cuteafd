@@ -584,11 +584,19 @@ pub fn write_v4_snapshot(path: &Path) {
 }
 
 pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
+    write_v4_snapshot_format(path, stages, false);
+}
+
+pub fn write_v4_pro_exl3_snapshot(path: &Path) {
+    write_v4_snapshot_format(path, 0, true);
+}
+
+fn write_v4_snapshot_format(path: &Path, stages: usize, pro_exl3: bool) {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
-    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
+    let mut hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
     let mut ratios = vec![0, 0];
     ratios.extend([4, 128, 4]);
-    let args = json!({
+    let mut args = json!({
         "vocab_size": 64, "dim": 4096, "moe_inter_dim": 2048, "n_layers": 4, "n_hash_layers": 1, "n_heads": 64,
         "n_routed_experts": 256, "n_shared_experts": 1, "n_activated_experts": 6, "score_func": "sqrtsoftplus",
         "route_scale": 1.5, "swiglu_limit": 10.0, "q_lora_rank": 1024, "head_dim": 512, "rope_head_dim": 64,
@@ -598,6 +606,12 @@ pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
         "compress_ratios": ratios[1..].to_vec(), "dspark_block_size": if stages > 0 { 5 } else { 0 },
         "dspark_target_layer_ids": [1, 2, 3], "dspark_markov_rank": 256
     });
+    if pro_exl3 {
+        args["dim"] = json!(7168);
+        args["moe_inter_dim"] = json!(3072);
+        args["n_routed_experts"] = json!(384);
+        hf["quantization_config"] = exl3_compact(2);
+    }
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::from_model_args(&args, stages).unwrap();
     let mut tensors = vec![t("embed.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
         t("head.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
@@ -622,11 +636,16 @@ pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
         ]);
     }
     for layer in 0..4 {
-        for expert in 0..256 {
-            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
+        for expert in 0..cfg.n_routed_experts {
+            for (projection, rows, cols) in [("w1", cfg.moe_inter_dim, cfg.dim),
+                ("w2", cfg.dim, cfg.moe_inter_dim), ("w3", cfg.moe_inter_dim, cfg.dim)] {
                 let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
-                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
-                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+                if pro_exl3 {
+                    tensors.extend(exl3(&name, rows, cols, 2));
+                } else {
+                    tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
+                    tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+                }
             }
         }
     }
@@ -723,20 +742,6 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
                     json!({"capacity_rows":c,"core_scratch_nbytes":if c==16 {99999}else{c*7}})))});
             fs::write(share.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json")),
                 serde_json::to_vec(&manifest).unwrap()).unwrap();
-        }
-        for bits in 2..=5 {
-            let tiers = if bits == 5 { "45".to_owned() } else { format!("{bits}{}", bits+1) };
-            for capacity in [1,16,80,256,1024,4096] {
-                let path = share.join("exl3").join(format!("exl3-k{tiers}"))
-                    .join(format!("rtx-tp{ranks}")).join(format!("m{capacity}"));
-                fs::create_dir_all(&path).unwrap();
-                fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
-                    "capacity":capacity,"hidden":5120,"experts":384,
-                    "intermediate":2304/ranks,"top_k":6,"input_format":"e4m3_k32",
-                    "trellis_lut":{"bytes":32},"buffers":{
-                        "scratch":{"allocation":"scratch","dtype":"f32","bytes":capacity*7,
-                            "zero_on_create":false}}})).unwrap()).unwrap();
-            }
         }
     }
     let matrices = [(5120,1152),(1152,5120),(5120,1280),(1280,32768),

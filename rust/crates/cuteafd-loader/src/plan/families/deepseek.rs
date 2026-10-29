@@ -151,7 +151,7 @@ impl Family for DeepSeek {
             return Some(Hint {
                 what: "DeepSeek V4 routed experts in NVFP4".into(),
                 how: "Spark expertd-native serves native MXFP4 and EXL3 K2-K4 experts at the checkpoint \
-                      geometry (ExpertGeometry, read_expert_catalog; EXL3 packages exl3-dsv4f|dsv4p-k<tiers> \
+                      geometry (ExpertGeometry, read_expert_catalog; V4 Pro EXL3 packages exl3-dsv4p-k<tiers> \
                       from CUTEAFD_EXPERT_FAMILIES=dsv4p:exl3-k23). ModelOpt NVFP4 needs the V4.1 NVFP4 \
                       contract (loader v41_nvfp4) generalized the same way.".into(),
             });
@@ -375,6 +375,9 @@ impl DeepSeekModel {
         let moe = self.spec.moe.as_ref().ok_or("no MoE geometry")?;
         let geometry = self.geometry().ok_or_else(|| format!("no expert kernels at hidden {} / intermediate {} / {} \
             experts / top-{} (cuteafd_core::ExpertGeometry)", self.spec.hidden, moe.intermediate, moe.experts, moe.top_k))?;
+        if operand.exl3_bits().is_some() && matches!(geometry, "v41" | "dsv4f") {
+            return Err("unsupported: EXL3 for DeepSeek V4/V4.1 Flash".into());
+        }
         let shape = routed_shape(stem, self.spec.hidden, moe.intermediate)
             .ok_or_else(|| format!("not a routed projection (w1/w2/w3 or gate/up/down_proj)"))?;
         require(operand.logical == shape, || format!("{geometry} experts are {shape:?}, found {}", describe(operand)))?;

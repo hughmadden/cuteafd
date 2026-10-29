@@ -105,10 +105,9 @@ pub(crate) fn mount_two_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
 pub(crate) fn mount_tp2(library: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Catalog, layers: usize,
     out: &mut Digests) -> Result<()> {
     let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
-    let package = std::path::Path::new("/nonexistent-exl3");
     let budgets = [80usize << 30; 2];
     let routed = crate::families::deepseek_v41::v41_experts::tp2_ffn::load_routed_weights(devices, catalog,
-        layers, 80, budgets, package)?;
+        layers, 80, budgets)?;
     for weights in &routed {
         let crate::shared::experts::rtx::pair::OwnerWeights::Native(native) = weights else {
             anyhow::bail!("the golden covers native TP2 halves");

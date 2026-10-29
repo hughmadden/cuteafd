@@ -99,8 +99,7 @@ fn checkpoint_world(catalog: &cuteafd_loader::OfficialV41Catalog, ranks: usize) 
     let topology = if native && ranks != 4 {
         Some(SparkTopology::new(u8::try_from(ranks)?, 1)?)
     } else {
-        crate::shared::spark_topology::for_checkpoint(None, ranks,
-            catalog.exl3().is_some() && catalog.routed_experts().geometry()?.family() == Some("v41"))
+        None
     };
     let world = crate::shared::spark_topology::world(topology, ranks)?;
     crate::shared::spark_topology::require_wire(world, catalog)?;
@@ -116,9 +115,9 @@ fn checkpoint_world_preserves_generic_wire_and_native_tp6_ownership() -> Result<
     assert_eq!(checkpoint_world(&catalog, 4)?, SparkWorld::canonical(4)?);
     assert_eq!(checkpoint_world(&catalog, 6)?, SparkWorld::owned(SparkTopology::NATIVE_TP6_EP1)?);
     let root = tempfile::tempdir()?;
-    fixture::write_v41_exl3_snapshot(root.path(), 3);
+    fixture::write_v4_pro_exl3_snapshot(root.path());
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-    assert_eq!(checkpoint_world(&catalog, 3)?, SparkWorld::owned(SparkTopology::NATIVE_TP3_EP1)?);
+    assert_eq!(checkpoint_world(&catalog, 3)?, SparkWorld::canonical(3)?);
     let root = tempfile::tempdir()?;
     let mut config = fixture::glm5_config();
     config["quantization_config"] = fixture::exl3_compact(4);
@@ -236,7 +235,7 @@ fn gate_ingress_matches_production_checkpoint_contract() -> Result<()> {
         assert_eq!(checkpoint_ingress(root.path())?, (ingress, dtype));
     }
     let root = tempfile::tempdir()?;
-    fixture::write_v41_exl3_snapshot(root.path(), 4);
+    fixture::write_v4_pro_exl3_snapshot(root.path());
     assert_eq!(checkpoint_ingress(root.path())?, (SparkIngress::Fp8K32, ExpertV2Dtype::Fp8E4m3Ue8m0K32));
     Ok(())
 }

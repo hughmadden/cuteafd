@@ -899,13 +899,16 @@ mod tests {
     }
 
     #[test]
-    fn compact_exl3_topology_keeps_shards_packages_and_group_zero() {
+    fn canonical_exl3_keeps_shards_packages_and_rejects_ownership_wire() {
         for rank in 0..3 {
-            let config = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
-            assert_eq!(config.exl3_selection(7).unwrap(),
+            let canonical = config(3, rank, None);
+            assert_eq!(canonical.exl3_selection(7).unwrap(),
                 ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
-            assert!(config.exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
-            assert_eq!(config.native_group().unwrap(), Some(0));
+            assert!(canonical.exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
+            assert_eq!(canonical.native_group().unwrap(), None);
+            let owned = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
+            assert!(owned.exl3_selection(7).unwrap_err().to_string().contains("canonical Spark wire"));
+            assert_eq!(owned.native_group().unwrap(), Some(0));
         }
         let config = config(6, 0, Some(SparkTopology::NATIVE_TP3_EP2));
         assert!(config.exl3_selection(7).is_err());
@@ -1410,10 +1413,8 @@ impl NativeExpertServiceConfig {
 
     fn exl3_selection(&self, layer: usize) -> Result<ExpertLayer> {
         let world = self.spark_world()?;
-        if world.ownership_topology().is_some() {
-            ensure!(world.topology() == SparkTopology::NATIVE_TP3_EP1,
-                "compact EXL3 ownership wire requires TP3EP1");
-        }
+        ensure!(world.ownership_topology().is_none(),
+            "EXL3 experts require canonical Spark wire");
         let topology = world.topology();
         // Spark EXL3 always uses the compressed-shard variant. Coordinator
         // BackboneTp2 keeps its separate legacy layout and arithmetic.
@@ -1425,8 +1426,7 @@ impl NativeExpertServiceConfig {
         self.spark_world()?.ownership_topology().map(|topology| topology.group(self.rank)).transpose()
     }
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
-    /// decoder tiers (multi-family images) with the legacy single-family
-    /// location as fallback. An explicit --exl3-aot-dir is used verbatim.
+    /// decoder tiers and family. An explicit --exl3-aot-dir is used verbatim.
     fn exl3_directory_for(&self, tiers: &[usize], layout: &str) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
             crate::shared::experts::exl3::aot_layout_directory(&self.library, tiers, layout)

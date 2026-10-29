@@ -243,11 +243,9 @@ python/reference/mimo_dflash/	python/reference/families/mimo_v2/mimo_dflash/
 python/tools/_pinned_sparkinfer.py	python/tools/lib/_pinned_sparkinfer.py
 python/tools/_v41_expert_native.py	python/tools/lib/_v41_expert_native.py
 python/tools/analyze_expert_reduction_replay.py	python/tools/bench/analyze_expert_reduction_replay.py
-python/tools/analyze_v41_exl3_tp3_tile_tuning.py	python/tools/bench/analyze_v41_exl3_tp3_tile_tuning.py
 python/tools/bench_real_full_mtp_acceptance.py	python/tools/bench/bench_real_full_mtp_acceptance.py
 python/tools/bench_tp_ep_kernel.py	python/tools/bench/bench_tp_ep_kernel.py
 python/tools/bench_v41_dense_plans.py	python/tools/bench/bench_v41_dense_plans.py
-python/tools/bench_v41_exl3_tiles.py	python/tools/bench/bench_v41_exl3_tiles.py
 python/tools/bench_v41_native_ep.py	python/tools/bench/bench_v41_native_ep.py
 python/tools/benchmark_v41_ep_groups.py	python/tools/bench/benchmark_v41_ep_groups.py
 python/tools/build_ds4_flash_calibration_corpus.py	python/tools/qualify/deepseek_v4/build_ds4_flash_calibration_corpus.py
@@ -288,13 +286,6 @@ python/tools/prepare_ds4_hf_publication.py	python/tools/hf/prepare_ds4_hf_public
 python/tools/qualify_glmf_programs.py	python/tools/qualify/glm5_flash/qualify_glmf_programs.py
 python/tools/qualify_v41_attention_batch_aot.py	python/tools/qualify/deepseek_v41/qualify_v41_attention_batch_aot.py
 python/tools/qualify_v41_draft_expert_slices.py	python/tools/qualify/deepseek_v41/qualify_v41_draft_expert_slices.py
-python/tools/qualify_v41_exl3_aot.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_aot.py
-python/tools/qualify_v41_exl3_geometry.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_geometry.py
-python/tools/qualify_v41_exl3_package.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_package.py
-python/tools/qualify_v41_exl3_paired.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_paired.py
-python/tools/qualify_v41_exl3_residency.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_residency.py
-python/tools/qualify_v41_exl3_routes_aot.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_routes_aot.py
-python/tools/qualify_v41_exl3_wire.py	python/tools/qualify/deepseek_v41/qualify_v41_exl3_wire.py
 python/tools/qualify_v41_expert_handles.py	python/tools/qualify/deepseek_v41/qualify_v41_expert_handles.py
 python/tools/qualify_v41_expert_packing.py	python/tools/qualify/deepseek_v41/qualify_v41_expert_packing.py
 python/tools/qualify_v41_expert_slices.py	python/tools/qualify/deepseek_v41/qualify_v41_expert_slices.py
@@ -319,11 +310,9 @@ python/tools/qualify_v41_tp2_handles.py	python/tools/qualify/deepseek_v41/qualif
 python/tools/qualify_v41_tp2_numerics.py	python/tools/qualify/deepseek_v41/qualify_v41_tp2_numerics.py
 python/tools/qualify_v41_tp2_reduction.py	python/tools/qualify/deepseek_v41/qualify_v41_tp2_reduction.py
 python/tools/relink_v41_expert_candidate.py	python/tools/aot/relink_v41_expert_candidate.py
-python/tools/run_v41_exl3_tp3_tile_tuning.sh	python/tools/bench/run_v41_exl3_tp3_tile_tuning.sh
 python/tools/stage_ds4_hf_snapshot.py	python/tools/hf/stage_ds4_hf_snapshot.py
 python/tools/summarize_openai_metrics_capture.py	python/tools/bench/summarize_openai_metrics_capture.py
 python/tools/sync_ds4_hf_snapshot.py	python/tools/hf/sync_ds4_hf_snapshot.py
-python/tools/v41_exl3_family.py	python/tools/lib/v41_exl3_family.py
 python/tools/v41_spark_tp3_launch_geometry.py	python/tools/lib/v41_spark_tp3_launch_geometry.py
 python/tools/validate_ds4_exl3_checkpoint_layer.py	python/tools/qualify/deepseek_v4/validate_ds4_exl3_checkpoint_layer.py
 python/tools/validate_ds4_exl3_retained_native.py	python/tools/qualify/deepseek_v4/validate_ds4_exl3_retained_native.py
@@ -335,7 +324,6 @@ python/tools/verify_nvfp4_modelopt_real_tensor_decode_fixture.py	python/tools/hf
 scripts/ab-glm-weighted.sh	scripts/bench/glm5/ab-glm-weighted.sh
 scripts/ab-spark-intake.sh	scripts/bench/ab-spark-intake.sh
 scripts/aggregate-sampling-decode.py	scripts/bench/deepseek_v41/aggregate-sampling-decode.py
-scripts/analyze-ds41-exl3-quant.py	scripts/qualify/deepseek_v41/analyze-exl3-quant.py
 scripts/api-constrained-smoke.sh	scripts/qualify/api-constrained-smoke.sh
 scripts/api-smoke.sh	scripts/qualify/api-smoke.sh
 scripts/ask-file.sh	scripts/bench/ask-file.sh

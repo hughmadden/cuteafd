@@ -1113,7 +1113,6 @@ mod tests {
         eprintln!("loading all 20 encoder expert layers as TP2");
         let routed = tp2_ffn::load_routed_weights(
             devices, &catalog, 20, 16, [73_000_000_000; 2],
-            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()),
         )?;
         let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = [0, 1]
             .map(|r| {

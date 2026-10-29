@@ -554,7 +554,6 @@ mod tests {
         let single_lease = single_bank.begin_request(0, 1)?;
         let routed = tp2_ffn::load_routed_weights(
             devices, &catalog, 1, 16, [4_000_000_000; 2],
-            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()),
         )?;
         let shared = [
             Rc::new(vec![SharedWeights::load(

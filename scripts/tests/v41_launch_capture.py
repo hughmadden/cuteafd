@@ -153,15 +153,14 @@ if tool == "docker":
             report = dict(response)
             if family == "mimo_v2":
                 report["prefill_lanes"] = response["prefill_waves"]
-            exl3 = os.environ.get("CAPTURE_EXL3") == "1"
-            explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
+            explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and int(ranks) not in (0, 4)
             response.update(version=1, family=family, executable=True, wip_launchable=True,
                 report=report, spark_admission="coordinator_authoritative",
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
                 topology={"tp": tp, "ep": ep,
                           "wire": "native_ownership" if explicit_topology else "canonical"},
-                artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and not exl3 and explicit_topology and tp != 4 else None},
+                artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and explicit_topology and tp != 4 else None},
                 speculator=value("--speculator"),
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
                 peers=value("--deployment-peers", "").split(",")[:int(ranks)])

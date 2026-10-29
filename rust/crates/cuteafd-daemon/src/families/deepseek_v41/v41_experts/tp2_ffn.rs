@@ -3,7 +3,6 @@ use crate::families::deepseek_v41::v41_backbone_shared::tp2::{
     Wave as SharedWave, Weights as SharedWeights,
 };
 use crate::shared::experts::rtx::{
-    exl3::Exl3Tp2,
     native::NativeTp2,
     pair::{OwnerInputs, OwnerPair, OwnerPolicy, OwnerWeights},
 };
@@ -20,39 +19,7 @@ pub(crate) fn load_routed_weights<'a>(
     layers: usize,
     capacity: u32,
     budgets: [usize; 2],
-    package: &std::path::Path,
 ) -> Result<[OwnerWeights<'a>; 2]> {
-    if catalog.exl3().is_some() {
-        let OwnerPolicy::Exl3 { selection, .. } = OwnerPolicy::exl3(package) else { unreachable!() };
-        let workspace = Exl3Tp2::workspace_bytes_for_selection(
-            package,
-            5120,
-            capacity as usize,
-            cuteafd_core::Exl3RowPolicy::Nearest,
-            selection,
-        )?;
-        let budgets = budgets
-            .map(|budget| {
-                budget
-                    .checked_add(workspace)
-                    .ok_or_else(|| anyhow::anyhow!("TP2 EXL3 load budget overflow"))
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("two TP2 budgets"))?;
-        return Ok(Exl3Tp2::load_pair_weights(
-            devices,
-            catalog,
-            cuteafd_core::expert_geometry(),
-            [package; 2],
-            (0..layers).collect(),
-            capacity as usize,
-            budgets,
-            selection,
-        )?
-        .map(OwnerWeights::Exl3));
-    }
     let nvfp4 = catalog.nvfp4().is_some();
     let OwnerPolicy::Native { selection, output, .. } =
         devices[0].run(|| OwnerPolicy::native(devices[0].library, nvfp4))? else { unreachable!() };
@@ -161,15 +128,6 @@ impl<'a> Storage<'a> {
             + crate::families::deepseek_v41::v41_backbone_shared::tp2::Storage::storage_bytes(library, rows, unit)?
             + PeerInputs::allocation_sizes(rows).into_iter().sum::<usize>() + rows as usize * 10240)
     }
-    pub(crate) fn exl3_storage_bytes(directory: &std::path::Path, library: &cuteafd_ffi::NativeLibrary,
-        rows: u32, unit: u32) -> Result<usize> {
-        ensure!(unit > 0 && unit <= 4096 && unit <= rows
-            && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS, "invalid TP2 EXL3 storage geometry");
-        Ok(OwnerPair::device_bytes_for(library, unit, cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
-                OwnerPolicy::exl3(directory))?
-            + crate::families::deepseek_v41::v41_backbone_shared::tp2::Storage::storage_bytes(library, rows, unit)?
-            + PeerInputs::allocation_sizes(rows).into_iter().sum::<usize>() + rows as usize * 10240)
-    }
     pub(crate) fn new(routed: [OwnerWeights<'a>; 2], shared: [Rc<Vec<SharedWeights<'a>>>; 2],
         layers: usize, rows: u32, unit: u32,
         modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2]) -> Result<Rc<Self>> {
@@ -191,9 +149,6 @@ impl<'a> Wave<'a> {
     }
     pub(crate) fn nvfp4_device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
         Storage::storage_bytes(library, capacity, capacity, true)
-    }
-    pub(crate) fn exl3_device_bytes(directory: &std::path::Path, library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
-        Storage::exl3_storage_bytes(directory, library, capacity, capacity)
     }
     pub(crate) fn new(routed: [OwnerWeights<'a>; 2], shared: [Rc<Vec<SharedWeights<'a>>>; 2],
         layers: usize, capacity: u32,
@@ -627,7 +582,6 @@ mod tests {
             1,
             16,
             [4_000_000_000; 2],
-            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()),
         )?;
         let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = [0, 1]
             .map(|rank| {
@@ -1025,8 +979,7 @@ mod shared_storage_tests {
         let lib=unsafe {cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};lib.cuda_set_device(0)?;
         let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
-        let routed=load_routed_weights(devices,&catalog,1,16,[4_000_000_000;2],
-            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()))?;
+        let routed=load_routed_weights(devices,&catalog,1,16,[4_000_000_000;2])?;
         let shared=[Rc::new(vec![SharedWeights::load(devices[0],&catalog,0,SharedWeights::load_peak_device_bytes())?]),
             Rc::new(vec![SharedWeights::load(devices[1],&catalog,0,SharedWeights::load_peak_device_bytes())?])];
         let inputs=[PeerInputs::new(devices[0],16)?,PeerInputs::new(devices[1],16)?];
@@ -1115,8 +1068,7 @@ mod shared_storage_tests {
         let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
         let decode=crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS;
         for unit in [4096u32,2752,2048] {
-            let routed=load_routed_weights(devices,&catalog,1,unit,[8_000_000_000;2],
-                std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()))?;
+            let routed=load_routed_weights(devices,&catalog,1,unit,[8_000_000_000;2])?;
             let shared=[Rc::new(vec![SharedWeights::load(devices[0],&catalog,0,SharedWeights::load_peak_device_bytes())?]),
                 Rc::new(vec![SharedWeights::load(devices[1],&catalog,0,SharedWeights::load_peak_device_bytes())?])];
             let storage=Storage::new(routed.clone(),shared.clone(),1,8192,unit,[None,None])?;

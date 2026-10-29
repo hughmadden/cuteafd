@@ -57,34 +57,13 @@ if tool == 'docker':
             peers=value('--deployment-peers', '').split(',')[:ranks],
             spark_admission='coordinator_authoritative')))
         sys.exit(0)
-    if args[:1] == ['run'] and '--entrypoint' in args:
-        entry = args[args.index('--entrypoint') + 1]
-        assert '--gpus' not in args and '--network' in args
-        if entry == '/bin/cat':
-            # Legacy single-family image: read the package manifest directly.
-            assert args[-1] == '/opt/cuteafd/lib/exl3/manifest.json'
-        else:
-            # Multi-family image: a shell probes the tier family first and
-            # falls back to the legacy package manifest.
-            assert entry == '/bin/sh'
-            script = args[args.index('-c') + 1]
-            assert 'exl3' in script and 'manifest.json' in script and 'cat' in script
-        identity = 'different' if os.environ.get('MOCK_MISMATCH') == os.environ['MOCK_HOST'] else 'matching'
-        tp = int(os.environ.get('MOCK_TP', '2'))
-        variants = [dict(directory=f'tp{tp}-rank{rank}/m{capacity}', capacity=capacity,
-                         intermediate=2304//tp, experts=384, top_k=6, output_dtype='bf16', bits=[2,3])
-                    for rank in range(tp) for capacity in [1,16,80,256,1024,4096]]
-        if os.environ.get('MOCK_LEGACY') == '1': variants = []
-        print(json.dumps(dict(schema='cuteafd.exl3-package.v1', role='spark', variants=variants, compute=[12,1],
-                              sparkinfer_revision=os.environ['MOCK_REVISION'], files={identity: {}})))
-        sys.exit(0)
 raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
 '''
 
 
 class Exl3ReleasePreflightTest(unittest.TestCase):
-    def launch(self, *, exl3=True, mismatch=False, spark_count=4,
-               reservation='', rtx_gpus='1', extra=(), legacy=False, gpu_mib=97887,
+    def launch(self, *, exl3=False, mismatch=False, spark_count=4,
+               reservation='', rtx_gpus='1', extra=(), gpu_mib=97887,
                instance=''):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -103,13 +82,10 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
                        HF_HOME=str(directory / 'hf'), MOCK_LOG=str(directory / 'calls.jsonl'),
                        MOCK_REVISION=json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())['revision'],
-                       MOCK_LEGACY='1' if legacy else '', MOCK_GPU_MIB=str(gpu_mib),
-                       MOCK_TP=str(spark_count if spark_count in (2, 3, 6) else 2),
-                       MOCK_MISMATCH='dodo' if mismatch else '')
+                       MOCK_GPU_MIB=str(gpu_mib))
             config = directory / 'release.config'
             config.write_text((ROOT / 'cuteafd.config').read_text()
                               + f'\nSPARK_COUNT={spark_count}\n'
-                              + ('EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n' if spark_count in (2, 3, 6) else '')
                               + (f'MEMORY_RESERVATION={reservation}\n' if reservation else '')
                               + (f'INSTANCE={instance}\n' if instance else ''))
             result = subprocess.run(['bash', 'run.sh', '--config', str(config),
@@ -137,50 +113,40 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         self.assertEqual(plain.returncode, 0, plain.stderr)
         self.assertIn('coordinator container: cuteafd-coordinator\n', plain.stdout)
 
-    def test_matching_packages_pass_dry_run(self):
-        result, calls = self.launch()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Spark EXL3 package: disjoint:', result.stdout)
-        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls), 4)
+    def test_flash_exl3_refused_before_remote_preflight_or_restart(self):
+        for ranks in (2, 3, 4, 6):
+            result, calls = self.launch(exl3=True, spark_count=ranks, mismatch=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('unsupported: EXL3 for DeepSeek V4/V4.1 Flash', result.stderr)
+            self.assertFalse(any(tool == 'ssh' for tool, _, _ in calls))
 
-    def test_compact_two_rank_dry_run_selects_only_two_hosts(self):
+    def test_native_two_rank_dry_run_selects_only_two_hosts(self):
         result, calls = self.launch(spark_count=2, rtx_gpus='auto')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Spark ranks: 2; hosts: ostrich,dodo', result.stdout)
         self.assertIn('Spark peers: 10.55.0.1:19441,10.55.0.2:19441\n', result.stdout)
         self.assertNotIn('memory reservation: 32GiB', result.stdout)
         self.assertEqual({host for _, host, _ in calls if host}, {'ostrich', 'dodo'})
-        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls), 2)
         four, _ = self.launch()
         self.assertNotEqual(result.stdout.split('release identity: ')[1],
                             four.stdout.split('release identity: ')[1])
 
-    def test_compact_tp3_normalizes_topology_and_keeps_compressed_proofs(self):
+    def test_native_tp3_preserves_implicit_and_explicit_topology(self):
         for explicit in (False, True):
             extra = ('--set', 'SPARK_TP=3', '--set', 'SPARK_EP=1') if explicit else ()
-            result, calls = self.launch(spark_count=3, extra=extra)
+            result, _ = self.launch(spark_count=3, extra=extra)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Spark ranks: 3;', result.stdout)
-            self.assertIn('Spark EXL3 package: disjoint:', result.stdout)
-            self.assertNotIn('Spark image must advertise V41 expert role:', result.stdout)
             fixed, _ = self.launch(spark_count=3,
                                    extra=(*extra, '--set', 'RTX_EXPERT_LAYERS=20'))
             self.assertEqual(fixed.returncode, 0, fixed.stderr)
-            self.assertNotIn('unsupported Spark weight format', fixed.stderr)
-            for kwargs, message in (({'legacy': True}, 'lacks required TP3'),):
-                failed, _ = self.launch(spark_count=3, **kwargs, extra=extra)
-                self.assertNotEqual(failed.returncode, 0)
-                self.assertIn(message, failed.stderr)
 
-    def test_six_rank_disjoint_package_admission_is_exact_and_fail_fast(self):
+    def test_native_six_rank_preflight_reaches_every_host(self):
         result, calls = self.launch(spark_count=6)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Spark ranks: 6;', result.stdout)
-        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls), 6)
-        for kwargs, message in [({'legacy': True}, 'lacks required TP6')]:
-            result, _ = self.launch(spark_count=6, **kwargs)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(message, result.stderr)
+        self.assertEqual({host for _, host, _ in calls if host},
+                         {'ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa'})
 
     def test_spark_count_preserves_prefill_cli_override(self):
         for requested, expected, capacity in [('4096', '4096', '4096'), ('80', '80', '256')]:
@@ -193,25 +159,15 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         plan = next(args for tool, _, args in calls if tool == 'docker' and 'plan' in args)
         self.assertEqual(plan[plan.index('--prefill-rows') + 1], '0')
 
-    def test_compact_accepts_nominal_32gib_board_with_smaller_usable_total(self):
+    def test_native_accepts_nominal_32gib_board_with_smaller_usable_total(self):
         result, _ = self.launch(spark_count=2, gpu_mib=32607)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('memory reservation: 32GiB', result.stdout)
 
-    def test_compact_legacy_disjoint_package_rejected_before_restart(self):
-        result, _ = self.launch(spark_count=2, legacy=True, mismatch=True)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn('lacks required TP2', result.stderr)
-
-    def test_two_rank_packages_allow_memory_reservations(self):
+    def test_native_two_rank_allows_memory_reservations(self):
         for reservation in ('33GiB', '90%'):
             result, _ = self.launch(spark_count=2, reservation=reservation)
             self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_mismatch_rejects_restart_before_stopping_services(self):
-        result, _ = self.launch(mismatch=True)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn('Spark EXL3 packages differ across hosts', result.stderr)
 
     def test_full_model_skips_exl3_package_reads(self):
         result, calls = self.launch(exl3=False)

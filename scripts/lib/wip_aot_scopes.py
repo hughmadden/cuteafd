@@ -78,7 +78,7 @@ def family_scopes(cards, config_reader):
             if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
                 scopes.add(tag + ':rtx_tp2')
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
-            if 'exl3' in card['name']:
+            if tag == 'dsv4p' and 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
         if family == 'kimi_k3':
             # The max card only: TP6 width 512 EXL3 K2 experts (#273); no local-only layout.

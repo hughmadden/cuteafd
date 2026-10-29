@@ -216,18 +216,10 @@ class TopologyConfigTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
 
-    def test_compact_exl3_accepts_only_explicit_tp3_ep1(self) -> None:
-        for mode in ("auto", "force"):
-            result = load(f"SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3={mode}\n",
-                          "release_spark_rank_map")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), ["0 0 0", "1 0 1", "2 0 2"])
-        for tp, ep, count, extra in ((2, 1, 2, ""), (3, 2, 6, ""), (4, 1, 4, ""),
-                                      (3, 1, 3, "SPARKINFER_EXL3=disable\n")):
-            with self.subTest(tp=tp, ep=ep, extra=extra):
-                result = load(f"SPARK_COUNT={count}\nSPARK_TP={tp}\nSPARK_EP={ep}\n"
-                              "EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=force\n" + extra)
-                self.assertEqual(result.returncode, 2)
+    def test_flash_exl3_rejects_explicit_topology(self) -> None:
+        result = load("SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n", "release_spark_rank_map")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires EXPERT_FORMAT=native", result.stderr)
 
     def test_unknown_topology_alias_is_not_accepted(self) -> None:
         result = load("SPARK_GROUPS=2\n", "true")
@@ -243,12 +235,7 @@ class ExampleConfigTest(unittest.TestCase):
             "tp3ep2-native.config": ("6", "3", "2"),
             "tp2ep3-native.config": ("6", "2", "3"),
             "tp6ep1-native.config": ("6", "6", "1"),
-            # V10 candidate profiles. The native one names its explicit keys;
-            # the compact EXL3 one is IMPLICIT (no SPARK_TP/SPARK_EP keys),
-            # so its resolved keys stay empty while SPARK_COUNT=3 activates the
-            # compact TP3 rules.
             "tp3ep1-native.config": ("3", "3", "1"),
-            "exl3-compact-tp3.config": ("3", "", ""),
         }
         # The per-family starting configs (<model>-<quant>-<min|max>.config) are
         # covered by test_example_configs.py; this set is the V4.1 TP x EP layouts.
@@ -502,24 +489,6 @@ resolved_decode_lanes=2
             self.assertEqual(args[-8:-5], ["1", "2", "2"])
             self.assertEqual(args[-9], "4")
 
-    def test_compact_tp3_startup_keeps_compressed_admission_and_topology(self) -> None:
-        result, events = self.run_startup(
-            gpus=2,
-            plan=dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=20, spark_first_layer=20),
-            topology_explicit=1, spark_tp=3, spark_ep=1, spark_count=3,
-            hosts=["a", "b", "c"],
-            extra_setup='model_is_exl3=true\nexpert_format=exl3-k34\n',
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
-        self.assertEqual(coordinator[coordinator.index("--spark-tp") + 1], "3")
-        self.assertEqual(coordinator[coordinator.index("--spark-ep") + 1], "1")
-        self.assertNotIn("--exl3-paired-tp4", coordinator)
-        starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
-        self.assertEqual(len(starts), 3)
-        for args in starts:
-            self.assertEqual(args[-8:-5], ["1", "3", "1"])
-            self.assertEqual(args[-9], "3")
 
     def test_six_rank_explicit_topology_starts_six_workers(self) -> None:
         result, events = self.run_startup(
@@ -1557,16 +1526,7 @@ unset HF_HOME
         self.assertNotIn("carries SparkInfer", wip.stderr)
         self.assertIn("Spark host preflight failed on dodo", wip.stderr)
 
-    def test_exl3_family_tag_reaches_the_manifest_path(self) -> None:
-        result = self.preflight(exl3="true", family='"k23"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("exl3-k23/manifest.json", result.stdout)
-        self.assertNotIn("exl3-/manifest.json", result.stdout)
 
-    def test_empty_family_exl3_launch_uses_the_legacy_manifest(self) -> None:
-        result = self.preflight(exl3="true")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("exl3-/manifest.json", result.stdout)
 
 
 class SparkRoleGateTest(unittest.TestCase):

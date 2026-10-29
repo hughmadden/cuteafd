@@ -159,8 +159,7 @@ def test_mimop_k32_tp6_uses_production_exact_slice_export():
 
 
 @pytest.mark.parametrize("geometry,bits", [
-    ("qwen4", "45"), ("glm", "45"), ("glmf", "34"), ("dsv4f", "23"),
-    ("v41", "23"), ("v41", "34"), ("v41", "45"),
+    ("qwen4", "45"), ("glm", "45"), ("glmf", "34"),
 ])
 def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, geometry, bits):
     name = f"exl3-compact-{geometry}-k{bits}"
@@ -545,7 +544,7 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
 # Measured quant of each family's coordinator warp-specialized exports: another
 # tier pair of the same geometry is a different kernel cost and stays
 # cooperative until it is measured (`WS_TIER_PAIRS`).
-COORDINATOR_TIERS = {"glm": (4, 5), "glmf": (3, 4), "qwen4": (4, 5), "v41": (3, 4),
+COORDINATOR_TIERS = {"glm": (4, 5), "glmf": (3, 4), "qwen4": (4, 5),
                      "dsv4p": (2, 3), "kimik3": (2, 3)}
 CELL_OPTIONS = {"route_block", "wire", "stages", "dynamic", "tile"}
 

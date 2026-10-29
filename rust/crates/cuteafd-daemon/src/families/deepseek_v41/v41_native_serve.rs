@@ -348,19 +348,12 @@ fn worker(
         args.peers.len(),
         "serve-native",
     )?;
-    // Bind compact EXL3 to the same ownership contract on coordinator and workers
-    // before expert allocation or readiness publication.
-    let topology = crate::shared::spark_topology::for_checkpoint(
-        topology, args.peers.len(), catalog.exl3().is_some());
     let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
     crate::shared::spark_topology::require_world(spark_world, &catalog,
         &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
     // Check reduction support before CUDA allocation or readiness publication.
     lib.v41_compact_reducer()?
         .require_rank_count(spark_world.topology().world_size() as u32)?;
-    let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
-        &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
-    let mut exl3_modules = None;
     // Two private decode lanes at decode width, and `slots` prefill slots on
     // one shared storage set (PLAN "Prefill contract").
     let admitted = AdmittedPrefill::resolve(&args)?;
@@ -368,14 +361,9 @@ fn worker(
         admitted.unit_cap);
     let slots = admitted.waves;
     let decode_rows = DECODE_LANE_ROWS;
-    let mut decode_exl3_modules = None;
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
-        admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())?;
-        if catalog.exl3().is_some() && args.rtx_expert_layers != admission::LocalLayers::Count(0) {
-            exl3_modules = Some(admission::preload_exl3(&lib, &local_exl3_directory, aot_capacity, 1, slots)?);
-            decode_exl3_modules = Some(admission::preload_exl3(&lib, &local_exl3_directory, decode_rows, 1, 2)?);
-        }
+        admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some())?;
         Ok(())
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
@@ -528,7 +516,6 @@ fn worker(
         pass.enable_l2_prefetch(budget)?;
         second.enable_l2_prefetch(budget)?;
     }
-    let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let draft_weights = if args.dspark {
         Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(
@@ -539,7 +526,6 @@ fn worker(
             32 * 1024 * 1024 * 1024,
             16 * 1024 * 1024,
             if args.dspark_draft_limit > 5 { 7 } else { 5 },
-            Some(&crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "dspark")),
         )?)
     } else {
         None
@@ -604,16 +590,11 @@ fn worker(
     if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
         use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
-        use crate::families::deepseek_v41::v41_experts::exl3::Exl3Weights;
-        let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
-        let compressed = catalog.exl3().is_some();
-        let lane_bytes = |rows: u32| if compressed { LocalExpertWave::exl3_device_bytes(&exl3_directory, rows) }
-            else { LocalExpertWave::device_bytes_for(&lib, rows, catalog.nvfp4().is_some()) };
+        let lane_bytes = |rows: u32| LocalExpertWave::device_bytes_for(&lib, rows, catalog.nvfp4().is_some());
         let (per_slot, per_decode) = (lane_bytes(aot_capacity)?, lane_bytes(decode_rows)?);
         let budgets = (0..40).map(|layer| {
             let selection = ExpertLayer::BackboneFull { layer };
-            if compressed { Exl3Weights::plan(&catalog, selection) }
-            else { ExpertWeights::plan(&lib, &catalog, selection) }
+            ExpertWeights::plan(&lib, &catalog, selection)
         }).collect::<Result<Vec<_>>>()?;
         let admitted = pool.placement.expert_ranges[0];
         let expected = budgets.iter().take(local_layers).map(|b| b.resident_bytes).sum::<usize>()
@@ -621,28 +602,7 @@ fn worker(
                 + budgets.iter().take(local_layers).map(|b|b.device_staging_bytes).max().unwrap_or(0)} else {0};
         ensure!(expected as u64 <= admitted.peak_bytes,"runtime local owners exceed shared admission");
         tracing::info!(layers=local_layers,peak_bytes=admitted.peak_bytes,"shared RTX expert placement");
-        if local_layers > 0 && compressed {
-            let mut loaded = Vec::with_capacity(local_layers);
-            for layer in 0..local_layers {
-                loaded.push(Exl3Weights::load(&lib, &catalog, ExpertLayer::BackboneFull { layer },
-                    budgets[layer].peak_device_bytes()?)?);
-            }
-            let weights = std::rc::Rc::new(loaded);
-            let modules = exl3_modules.take().context("missing admitted EXL3 modules")?;
-            let decode_modules = decode_exl3_modules.take().context("missing admitted EXL3 decode modules")?;
-            ensure!(modules.len() == slots && decode_modules.len() == 2,
-                "EXL3 modules admitted for {} of {slots} prefill slots", modules.len());
-            for ((_, transport), modules) in prefill_slots.slots.iter_mut().zip(modules) {
-                // SAFETY: the admitted modules were loaded on this device from the same pinned exports.
-                transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights.clone(),
-                    &exl3_directory, aot_capacity, per_slot, modules)? })?;
-            }
-            for (transport, modules) in [&mut transport, &mut second_transport].into_iter().zip(decode_modules) {
-                // SAFETY: as above, at the decode width.
-                transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights.clone(),
-                    &exl3_directory, decode_rows, per_decode, modules)? })?;
-            }
-        } else if local_layers > 0 {
+        if local_layers > 0 {
             let mut loaded = Vec::with_capacity(local_layers);
             for layer in 0..local_layers {
                 loaded.push(ExpertWeights::load(&lib, &catalog, ExpertLayer::BackboneFull { layer },

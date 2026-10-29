@@ -11,27 +11,13 @@ const BANKS: usize = 2;
 pub(crate) mod execution;
 pub(crate) mod worker;
 
-/// EXL3 package directory name for one decoder-tier family: V4.1 keeps
-/// `exl3-k<tiers>`; other expert geometries ship as `exl3-<family>-k<tiers>`
-/// (for example `exl3-dsv4p-k23`), so one image can carry several models.
+/// Family-qualified package name for one decoder-tier pair.
 pub(crate) fn package_name(family: &str, tiers: &[usize]) -> String {
     let tag: String = tiers.iter().map(usize::to_string).collect();
-    if family == "v41" {
-        format!("exl3-k{tag}")
-    } else {
-        format!("exl3-{family}-k{tag}")
-    }
+    format!("exl3-{family}-k{tag}")
 }
 
-/// Resolve one EXL3 AOT layout directory for the running checkpoint.
-///
-/// v7 images ship decoder-tier families side by side under
-/// `<libdir>/exl3/exl3-k<tiers>/<layout>`; older images keep a single
-/// family at the legacy `<libdir>/exl3/<layout>`. The checkpoint's decoder
-/// tiers select the matching family first; otherwise the legacy location
-/// is returned and the downstream module-info bits check reports any
-/// mismatch with the checkpoint. Other expert geometries resolve only their
-/// own `exl3-<family>-k<tiers>` package, never the legacy V4.1 location.
+/// Resolve the checkpoint family's exact decoder-tier package and layout.
 pub(crate) fn aot_layout_directory(
     native_lib: &std::path::Path,
     tiers: &[usize],
@@ -42,13 +28,7 @@ pub(crate) fn aot_layout_directory(
         .unwrap_or(std::path::Path::new("."))
         .join("exl3");
     let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
-    if !tiers.is_empty() {
-        let package = root.join(package_name(family, tiers)).join(layout);
-        if package.is_dir() || family != "v41" {
-            return package;
-        }
-    }
-    root.join(layout)
+    root.join(package_name(family, tiers)).join(layout)
 }
 
 pub(crate) struct Exl3Weights<'a> {
@@ -550,8 +530,7 @@ mod tests {
     fn compressed_layer_uploads_match_staged_bytes() -> Result<()> {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
-        )?;
+        let catalog = cuteafd_loader::read_expert_catalog(std::path::Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?))?;
         let rank = std::env::var("CUTEAFD_EXL3_TEST_RANK").unwrap_or_else(|_| "2".into()).parse()?;
         let layer = ExpertLayer::Backbone { layer: 0, rank };
         let planned = Exl3Weights::plan(&catalog, layer)?;

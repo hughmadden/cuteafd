@@ -88,7 +88,6 @@ impl V41Exl3Info {
             sum_scalars: words[10] as usize,
         })
     }
-
 }
 
 type Launch = unsafe extern "C" fn(*mut c_void, *const *mut c_void, *const i32, *mut c_void) -> i32;
@@ -399,8 +398,9 @@ mod info_tests {
 
     #[test]
     fn native_info_rejects_invalid_tier_headers_before_slicing() {
-        let valid = [2, 5120, 512, 6, 16, 6, 4, 44, 18, 7, 3, 2, 3, 4, 5, 2];
-        for count in [0, 1, 5, u32::MAX] {
+        let valid = [2, 5120, 512, 6, 16, 6, 2, 32, 11, 6, 3, 2, 3, 0, 0, 2];
+        assert!(V41Exl3Info::from_words(valid).is_ok());
+        for count in [0, 1, 3, 4, 5, u32::MAX] {
             let mut words = valid;
             words[6] = count;
             assert!(V41Exl3Info::from_words(words).is_err());
@@ -411,7 +411,7 @@ mod info_tests {
             assert!(V41Exl3Info::from_words(words).is_err());
         }
         let mut nonzero_padding = valid;
-        nonzero_padding[6] = 3;
+        nonzero_padding[13] = 4;
         assert!(V41Exl3Info::from_words(nonzero_padding).is_err());
     }
 }

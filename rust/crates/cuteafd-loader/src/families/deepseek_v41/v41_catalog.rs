@@ -196,14 +196,6 @@ impl OfficialV41Catalog {
     pub fn nvfp4(&self) -> Option<&crate::V41Nvfp4Contract> {
         self.nvfp4.as_ref()
     }
-    /// True when the draft (MTP) routed experts load as native FP4 weights:
-    /// either the checkpoint is not EXL3 at all, or it is a raw EXL3
-    /// publication that kept its draft experts at source precision.
-    pub fn native_dspark_experts(&self) -> bool {
-        self.exl3
-            .as_ref()
-            .is_none_or(|manifest| manifest.mtp_experts_are_source())
-    }
     pub fn coordinator_tensor_reader(&self, name: &str) -> Result<V41CoordinatorTensorReader> {
         let tensor = self.tensor(name)?;
         ensure!(
@@ -458,18 +450,7 @@ impl OfficialV41Catalog {
             table.name_stats(format!("engram.{layer}.{suffix}"));
             Ok(table)
         };
-        if let Some(ple) = self.exl3.as_ref().and_then(|m| m.ple_quantization.as_ref()) {
-            let prefix = format!("layers.{layer}.engram.embed");
-            let tensor = self.tensor(&format!("{prefix}.weight_scale_2"))?;
-            let mut bytes = [0; 4];
-            self.shard_file(&tensor.shard)?.read_exact_at(&mut bytes, tensor.metadata.byte_offset)?;
-            let global = f32::from_le_bytes(bytes);
-            let declared = ple["tensors"][&prefix]["global_scale"].as_f64().context("missing NVFP4 global scale")? as f32;
-            ensure!(global.to_bits() == declared.to_bits(), "NVFP4 global scale differs from metadata");
-            crate::EngramTable::new_nvfp4(map("weight")?, map("weight_scale")?, global)
-        } else {
-            crate::EngramTable::new(map("weight")?, map("scale")?)
-        }
+        crate::EngramTable::new(map("weight")?, map("scale")?)
     }
 
     /// Physical checkpoint bytes only; packing, caches and execution scratch are additional.
@@ -640,58 +621,6 @@ fn placement(name: &str) -> V41TensorPlacement {
     }
 }
 
-/// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
-/// Shard names of an EXL3 publication: the `model-{i:05}-of-{n:05}` backbone
-/// shards plus the `ple-{layer}-{i:05}-of-{n:05}` files of Engram layers that
-/// ship their quantized PLE weights in the same index (V4.1 EXL3 K3.25 has
-/// Engram layers 1 and 14). The backbone set must be exactly 1..=n, so a
-/// partial index is still rejected; the fixed 48-shard official and NVFP4
-/// contract is unchanged.
-fn official_exl3_shards<'a>(shards: impl Iterator<Item = &'a String>) -> Result<BTreeSet<String>> {
-    fn numbered(text: &str) -> Option<(u32, u32)> {
-        let (index, count) = text.split_once("-of-")?;
-        let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
-        if !digits(index) || !digits(count) {
-            return None;
-        }
-        Some((index.parse().ok()?, count.parse().ok()?))
-    }
-    let mut total = None;
-    let mut indexes = BTreeSet::new();
-    let mut allowed = BTreeSet::new();
-    for shard in shards {
-        if !allowed.insert(shard.clone()) {
-            continue;
-        }
-        if let Some(rest) = shard.strip_prefix("model-") {
-            let (index, count) = rest
-                .strip_suffix(".safetensors")
-                .and_then(numbered)
-                .with_context(|| format!("unsupported checkpoint shard {shard}"))?;
-            ensure!(
-                *total.get_or_insert(count) == count,
-                "checkpoint shards mix total counts"
-            );
-            ensure!(index != 0 && index <= count, "unsupported checkpoint shard {shard}");
-            indexes.insert(index);
-        } else {
-            let ple = shard.strip_prefix("ple-").and_then(|rest| {
-                let (layer, tail) = rest.split_once('-')?;
-                let (index, count) = numbered(tail.strip_suffix(".safetensors")?)?;
-                (layer.bytes().all(|b| b.is_ascii_digit()) && index != 0 && index <= count)
-                    .then_some(())
-            });
-            ensure!(ple.is_some(), "unsupported checkpoint shard {shard}");
-        }
-    }
-    let total = total.context("checkpoint index names no backbone shards")?;
-    ensure!(
-        indexes.len() as u32 == total,
-        "checkpoint requires all {total} shards"
-    );
-    Ok(allowed)
-}
-
 pub fn read_official_v41_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     read_official_v41_role_catalog(snapshot, "full catalog", |_| true)
 }
@@ -710,19 +639,12 @@ pub fn read_official_v41_spark_catalog(snapshot: &Path, rank: usize, world: usiz
 pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl Fn(&str) -> bool)
     -> Result<OfficialV41Catalog> {
     let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
-        Some(crate::read_v41_exl3_manifest(snapshot)?)
-    } else { None };
-    let nvfp4 = if exl3.is_none() {
-        crate::read_v41_nvfp4_contract(snapshot)?
-    } else { None };
-    let config = match (&exl3, &nvfp4) {
-        (Some(manifest), _) => manifest
-            .config
-            .clone()
-            .context("V4.1 EXL3 manifest lacks the official configuration")?,
-        (None, Some(contract)) => contract.config.clone(),
-        (None, None) => read_official_v41_config(snapshot)?,
+    ensure!(raw_config["quantization_config"]["quant_method"] != "exl3",
+        "unsupported: EXL3 for DeepSeek V4/V4.1 Flash");
+    let nvfp4 = crate::read_v41_nvfp4_contract(snapshot)?;
+    let config = match &nvfp4 {
+        Some(contract) => contract.config.clone(),
+        None => read_official_v41_config(snapshot)?,
     };
     #[derive(Deserialize)]
     struct Index {
@@ -738,29 +660,6 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
     );
     let index: Index = serde_json::from_slice(&bytes)?;
     let mut expected = expected_tensors()?;
-    if let Some(manifest) = &exl3 {
-        // Raw publications keep their MTP draft experts at the native FP4
-        // source precision, so only backbone expert tensors leave the
-        // official contract; staged snapshots quantize drafts too.
-        let keep_native_mtp = manifest.mtp_experts_are_source();
-        expected.retain(|name, _| {
-            !name.contains(".ffn.experts.") || (keep_native_mtp && name.starts_with("mtp."))
-        });
-        for projection in manifest.projections.values() {
-            for (suffix, dtype, shape, bytes) in [
-                ("trellis", DType::I16, projection.trellis_shape().to_vec(), projection.trellis_bytes()),
-                ("suh", DType::F16, vec![projection.input_features], projection.input_features * 2),
-                ("svh", DType::F16, vec![projection.output_features], projection.output_features * 2),
-                ("mcg", DType::I32, vec![], 4),
-            ] {
-                expected.insert(format!("{}.{suffix}", projection.name),
-                    ExpectedTensor { dtype, shape, bytes: bytes as u64 });
-            }
-        }
-        if let Some(ple) = &manifest.ple_quantization {
-            apply_nvfp4_ple_contract(&mut expected, ple, config.text().engram_layer_ids.as_slice())?;
-        }
-    }
     if let Some(contract) = &nvfp4 {
         // ModelOpt NVFP4 replaces the two native routed-expert tensors with a
         // packed E2M1 payload, an E4M3 per-16 scale plane, a global weight
@@ -774,13 +673,9 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
         expected.len(),
         index.weight_map.len()
     );
-    let allowed_shards: BTreeSet<String> = if exl3.is_some() {
-        official_exl3_shards(index.weight_map.values())?
-    } else {
-        (1..=48u32)
-            .map(|i| format!("model-{i:05}-of-00048.safetensors"))
-            .collect()
-    };
+    let allowed_shards: BTreeSet<String> = (1..=48u32)
+        .map(|i| format!("model-{i:05}-of-00048.safetensors"))
+        .collect();
     let shard_count = allowed_shards.len();
     let mut shards: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (name, shard) in &index.weight_map {
@@ -821,10 +716,7 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
             );
             let spec = &expected[&tensor.name];
             validate_tensor(&tensor, spec)?;
-            let target = if exl3.is_some() && tensor.name.starts_with("layers.")
-                && tensor.name.contains(".ffn.experts.") {
-                V41TensorPlacement::BackboneExl3
-            } else if nvfp4.is_some() && tensor.name.starts_with("layers.")
+            let target = if nvfp4.is_some() && tensor.name.starts_with("layers.")
                 && tensor.name.contains(".ffn.experts.") {
                 nvfp4_placement(&tensor.name)
             } else { placement(&tensor.name) };
@@ -872,7 +764,7 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
         config: Some(config),
         snapshot: snapshot.to_path_buf(),
         tensors,
-        exl3,
+        exl3: None,
         nvfp4,
         fp8: None,
     })
@@ -1189,6 +1081,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
     };
     let raw_config = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if raw_config["quantization_config"]["quant_method"] == "exl3" {
+        ensure!(hidden != 4096, "unsupported: EXL3 for DeepSeek V4/V4.1 Flash");
         // dsv4p:exl3-k23.
         return exl3_catalog_or_read(snapshot, backbone, &[2, 3], checkpoint);
     }
@@ -1404,39 +1297,6 @@ fn validate_tensor(tensor: &SafetensorsTensorMetadata, spec: &ExpectedTensor) ->
     Ok(())
 }
 
-fn apply_nvfp4_ple_contract(expected: &mut BTreeMap<String, ExpectedTensor>,
-    ple: &serde_json::Value, layers: &[usize]) -> Result<()> {
-    ensure!(ple["schema"] == "cuteafd.nvfp4-ple.v1" && ple["format"] == "nvfp4"
-        && ple["block_size"] == 16 && ple["packing"] == "even-element-low-nibble"
-        && ple["scale_layout"] == "row-major"
-        && ple["reconstruction"] == "E2M1(weight) * FP8_E4M3(weight_scale) * FP32(weight_scale_2)",
-        "unsupported NVFP4 PLE storage contract");
-    let tables = ple["tensors"].as_object().context("missing NVFP4 PLE tables")?;
-    ensure!(tables.len() == layers.len(), "NVFP4 PLE must cover exactly the original tables");
-    for &layer in layers {
-        let prefix = format!("layers.{layer}.engram.embed");
-        let table = tables.get(&prefix).with_context(|| format!("missing {prefix} PLE metadata"))?;
-        let original = expected.get(&format!("{prefix}.weight")).context("missing original PLE weight")?;
-        let shape = original.shape.clone();
-        ensure!(shape.len() == 2 && shape[1] % 16 == 0
-            && table["logical_shape"] == serde_json::to_value(&shape)?
-            && table["weight_dtype"] == "uint8" && table["weight_scale_dtype"] == "float8_e4m3fn"
-            && table["weight_scale_2_dtype"] == "float32"
-            && table["global_scale"].as_f64().is_some_and(|s| s.is_finite() && s > 0.0),
-            "invalid NVFP4 PLE geometry or scale for {prefix}");
-        let rows = shape[0]; let columns = shape[1];
-        ensure!(expected.remove(&format!("{prefix}.scale")).is_some(), "missing original PLE scales");
-        for (suffix, dtype, shape, bytes) in [
-            ("weight", DType::U8, vec![rows, columns / 2], rows as u64 * columns as u64 / 2),
-            ("weight_scale", DType::F8E4M3, vec![rows, columns / 16], rows as u64 * columns as u64 / 16),
-            ("weight_scale_2", DType::F32, vec![], 4),
-        ] {
-            expected.insert(format!("{prefix}.{suffix}"), ExpectedTensor { dtype, shape, bytes });
-        }
-    }
-    Ok(())
-}
-
 /// Replace the official native routed-expert tensors with the ModelOpt NVFP4
 /// contract. Draft (`mtp.*`) experts keep the native FP4 layout.
 fn apply_nvfp4_expert_contract(
@@ -1504,36 +1364,11 @@ fn apply_nvfp4_expert_contract(
 mod tests {
     use super::*;
 
-    #[test]
-    fn exl3_shard_names_accept_engram_ple_files() -> Result<()> {
-        let backbone: Vec<String> = (1..=4u32)
-            .map(|i| format!("model-{i:05}-of-00004.safetensors"))
-            .collect();
-        let names: Vec<String> = backbone
-            .iter()
-            .cloned()
-            .chain(["ple-1-00001-of-00002.safetensors".to_string(),
-                    "ple-1-00002-of-00002.safetensors".to_string()])
-            .collect();
-        let allowed = official_exl3_shards(names.iter())?;
-        assert_eq!(allowed.len(), 6);
-        assert!(allowed.contains("ple-1-00002-of-00002.safetensors"));
-        // A partial backbone index still fails, and unknown files stay rejected.
-        let partial = [backbone[0].clone(), backbone[1].clone()];
-        assert!(official_exl3_shards(partial.iter()).is_err());
-        let unknown = [backbone[0].clone(), "draft-00001-of-00002.safetensors".to_string()];
-        assert!(format!("{:#}", official_exl3_shards(unknown.iter()).unwrap_err())
-            .contains("unsupported checkpoint shard"));
-        let mixed = ["model-00001-of-00004.safetensors".to_string(),
-                     "model-00001-of-00005.safetensors".to_string()];
-        assert!(format!("{:#}", official_exl3_shards(mixed.iter()).unwrap_err())
-            .contains("mix total counts"));
-        Ok(())
-    }
+
     pub(super) fn official_config() -> OfficialV41Config {
-        OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
-            .unwrap()
+        OfficialV41Config::from_json(include_bytes!("official-v41-config.json")).unwrap()
     }
+
     #[test]
     fn kimi_dispatch_uses_declared_family_before_v41_text_config() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1740,13 +1575,12 @@ mod tests {
                 metadata: SafetensorsTensorMetadata { name: (*name).into(), dtype: DType::Bf16,
                     shape: vec![128], byte_offset: 0, byte_length: 256 },
             }).collect(), exl3: Some(crate::V41Exl3Manifest {
-                config: None, experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
+                experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
                 projections: names[..2].iter().map(|name| {
                     let name = name.strip_suffix(".weight").unwrap().to_owned();
                     (name.clone(), crate::V41Exl3Projection { name, kind: crate::V41Exl3ProjectionKind::Gate,
                         bits: 4, input_features: 128, output_features: 128 })
-                }).collect(), decoder_tiers: vec![4], ple_quantization: None,
-                mtp_experts: crate::families::deepseek_v41::v41_exl3::V41Exl3MtpExperts::Exl3,
+                }).collect(), decoder_tiers: vec![4],
                 storage: crate::formats::exl3_storage::Exl3StorageSource::Headers,
             }), nvfp4: None, fp8: None,
         };
@@ -1973,35 +1807,7 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "requires CUTEAFD_EXL3_RAW_SNAPSHOT pointing to a raw local publication"]
-    fn raw_publication_catalog_keeps_native_draft_experts() {
-        let path = std::env::var_os("CUTEAFD_EXL3_RAW_SNAPSHOT").expect("CUTEAFD_EXL3_RAW_SNAPSHOT");
-        let catalog =
-            read_official_v41_catalog(Path::new(&path))
-                .unwrap();
-        assert!(catalog.exl3().is_some());
-        assert!(catalog.native_dspark_experts());
-        let mut backbone_exl3 = 0usize;
-        let mut native_mtp = 0usize;
-        for tensor in &catalog.tensors {
-            match tensor.placement {
-                V41TensorPlacement::BackboneExl3 => backbone_exl3 += 1,
-                V41TensorPlacement::CoordinatorRtx
-                    if tensor.metadata.name.starts_with("mtp.") && tensor.metadata.name.contains(".ffn.experts.") =>
-                {
-                    native_mtp += 1
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(backbone_exl3, 4 * 46_080);
-        assert_eq!(native_mtp, 6 * 3 * 128);
-        println!(
-            "raw catalog: {} tensors, {backbone_exl3} EXL3 backbone, {native_mtp} native draft",
-            catalog.tensors.len()
-        );
-    }
+
 }
 
 #[cfg(test)]

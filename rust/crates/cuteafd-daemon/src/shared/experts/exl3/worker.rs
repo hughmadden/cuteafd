@@ -9,7 +9,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::{BackboneRequest, SparkTopology}, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
+    expert::BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::{io::Write, path::Path, rc::Rc};
@@ -108,19 +108,6 @@ impl Drop for RouteDump {
     }
 }
 
-fn copy_routes(request: &BackboneRequest<'_>, topology: Option<SparkTopology>,
-    ids: &mut [i32], weights: &mut [f32]) -> Result<()> {
-    match (topology, request.is_native_group()) {
-        (Some(topology), true) => {
-            ensure!(topology == SparkTopology::NATIVE_TP3_EP1,
-                "compact EXL3 ownership requires TP3EP1");
-            request.copy_native_group_routes_into(ids, weights, 0)
-        }
-        (None, false) => request.copy_routes_into(ids, weights),
-        _ => anyhow::bail!("EXL3 request ownership differs from admitted topology"),
-    }
-}
-
 pub(crate) struct Exl3Worker<'a> {
     // Drain the stream before dropping kernels, weights or input allocations.
     stream: LoadStream<'a>,
@@ -138,7 +125,6 @@ pub(crate) struct Exl3Worker<'a> {
     /// queued unit keeps its own staging until its completion fence permits reuse.
     staging: Vec<HostAllocation<'a>>,
     weights_offset: usize,
-    topology: Option<SparkTopology>,
     host_path: HostPath,
     route_dump: Option<RouteDump>,
     library: &'a NativeLibrary,
@@ -332,7 +318,6 @@ impl<'a> Exl3Worker<'a> {
             inputs,
             staging,
             weights_offset,
-            topology: None,
             host_path,
             route_dump,
             library,
@@ -383,18 +368,6 @@ impl<'a> Exl3Worker<'a> {
     pub(crate) fn stream_idle(&self) -> Result<bool> {
         // SAFETY: the owned stream is live for the worker's lifetime.
         unsafe { self.library.cuda_stream_query(self.stream.raw) }
-    }
-
-    pub(crate) fn install_topology(&mut self, topology: Option<SparkTopology>) -> Result<()> {
-        ensure!(self.topology.is_none(), "EXL3 topology already installed");
-        if let Some(topology) = topology {
-            ensure!(topology == SparkTopology::NATIVE_TP3_EP1,
-                "compact EXL3 ownership requires disjoint TP3EP1 artifacts");
-            ensure!((0..3).any(|rank| topology.executor_id(rank).ok() == Some(self.executor_id)),
-                "EXL3 topology differs from loaded shard identity");
-        }
-        self.topology = topology;
-        Ok(())
     }
 
     pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -483,10 +456,9 @@ impl<'a> Exl3Worker<'a> {
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         let slot = self.pending.next_slot()?;
         let routes = request.rows() as usize * Self::topk();
-        let topology = self.topology;
         {
             let (ids, weights) = self.staged(slot, routes);
-            copy_routes(request, topology, ids, weights)?;
+            request.copy_routes_into(ids, weights)?;
         }
         ensure!(
             cfg!(target_endian = "little"),

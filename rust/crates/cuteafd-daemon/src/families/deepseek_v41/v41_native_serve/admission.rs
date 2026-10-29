@@ -307,13 +307,10 @@ pub(super) fn admit_startup(
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
         owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes)?, slots)?;
     let draft = if args.dspark {
-        let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
-        let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
-            &args.native_lib, tiers, "dspark");
         let mut draft =
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
                 lib, catalog, capacity, args.concurrency,
-                if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
+                if args.dspark_draft_limit > 5 { 7 } else { 5 })?;
         startup.extend(target_owners.draft_load_phases(&draft)?);
         draft.marks = resident::prefix_arena_bytes(slots, true, 1)[0]
             - resident::prefix_arena_bytes(slots, false, 1)[0];
@@ -474,16 +471,7 @@ pub(super) fn local_workspace(
         return Ok(0);
     }
     use crate::families::deepseek_v41::v41_experts::local::LocalExpertWave;
-    let lane = |rows: u32| -> Result<usize> { if let Some(exl3) = catalog.exl3() {
-        let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
-            &args.native_lib,
-            exl3.decoder_tiers(),
-            "rtx-tp1",
-        );
-        LocalExpertWave::exl3_device_bytes(&directory, rows)
-    } else {
-        LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some())
-    } };
+    let lane = |rows: u32| LocalExpertWave::device_bytes_for(lib, rows, catalog.nvfp4().is_some());
     // One local expert wave per prefill slot at the unit, one per decode lane
     // at decode width.
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
@@ -682,9 +670,7 @@ pub(super) fn expert_demands(
     rows: u32,
     ranks: usize,
 ) -> Result<Vec<ExpertCost>> {
-    let stored = if catalog.exl3().is_some() {
-        0
-    } else {
+    let stored = {
         let info = match (ranks, catalog.nvfp4().is_some()) {
             (1, false) => lib.v41_local_expert_info(rows)?,
             (1, true) => lib.v41_nvfp4_local_expert_info(rows)?,
@@ -760,37 +746,15 @@ pub(super) fn admission_memory(
         .collect()
 }
 
-/// Retain both independent lane contexts while RuntimeInventory samples CUDA.
-/// Weight and scratch allocations happen only after the resulting admission.
-pub(super) fn preload_exl3<'a>(
-    lib: &'a cuteafd_ffi::NativeLibrary, directory: &std::path::Path,
-    capacity: u32, ranks: usize, lanes: usize,
-) -> Result<Vec<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>> {
-    use crate::shared::experts::exl3::execution::{Exl3InputFormat, Exl3Modules, Exl3ReductionPlan};
-    let capacities = families::deepseek_v41::exl3_capacities(capacity as u64, ranks == 1)?;
-    let directories: Vec<_> = capacities.iter().map(|capacity| directory.join(format!("m{capacity}"))).collect();
-    Exl3ReductionPlan::new(&directories)?;
-    let mut lanes = (0..lanes).map(|_| Vec::new()).collect::<Vec<_>>();
-    for lane in &mut lanes {
-        for directory in &directories {
-            // SAFETY: operator-selected pinned native exports, owned on the current device.
-            lane.push(unsafe { Exl3Modules::load(lib, directory, Exl3InputFormat::Fp8K32)? });
-        }
-    }
-    Ok(lanes)
-}
-
-/// Bind target modules before the inventory sample and first immutable weight
-/// upload. EXL3 contexts are retained separately by `preload_exl3`.
+/// Bind target modules before the inventory sample and first immutable weight upload.
 pub(super) fn preload(
     lib: &cuteafd_ffi::NativeLibrary,
     rows: u32,
     ranks: usize,
     nvfp4: bool,
-    exl3: bool,
 ) -> Result<()> {
     use super::*;
-    if !nvfp4 && !exl3 {
+    if !nvfp4 {
         let capacity = if ranks == 1 {
             cuteafd_core::coordinator_programs::v41_aot_rows(rows).context("expert capacity")?
         } else {
@@ -820,7 +784,7 @@ pub(super) fn preload(
             lib.v41_fp8_matrix_plan(rows, k, n)?;
         }
     }
-    if !exl3 {
+    {
         let capacity = if ranks == 1 {
             cuteafd_core::coordinator_programs::v41_aot_rows(rows).context("expert capacity")?
         } else {
