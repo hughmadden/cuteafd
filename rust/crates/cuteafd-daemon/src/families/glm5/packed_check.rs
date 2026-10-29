@@ -1,4 +1,4 @@
-//! Stored-token packed/singleton byte-exact gate, including a resumed prompt.
+//! Stored-token packed/singleton exact or fidelity gate, including a resumed prompt.
 use super::engine::{GlmEngine, GlmPlacement, PageAllocator, PAGE_ROWS, RECORD_BYTES, INDEX_PAGE_BYTES};
 use crate::shared::prefill_packing::{self, Limits};
 use crate::shared::spark_intake::SparkLink;
@@ -42,7 +42,8 @@ fn state(engine: &GlmEngine<'_>, placement: &GlmPlacement) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], members: usize,
-    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    mode: prefill_packing::PackingMode, mut transport: Option<&mut SparkLink<'_>>,
+    runtime: &tokio::runtime::Runtime) -> Result<()> {
     ensure!(!tokens.is_empty() && (2..=LENGTHS.len()).contains(&members), "--packed-check needs 2..10 members and stored tokens");
     let resumed = members - 1;
     let prefix = |i| if i == resumed { 2100 } else { 0 };
@@ -53,8 +54,9 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], members: usize,
         prefill_packing::plan(&[*chunk], &Limits { rows: limits.chunk_rows, ..limits })?;
     }
     let groups = prefill_packing::groups(members, |range| prefill_packing::plan(&chunks[range], &limits).is_ok());
-    ensure!(groups.iter().any(|group| group.len() > 1),
-        "packed-check cannot exercise a pack with installed arithmetic row cap {}", limits.rows);
+    let exact = mode == prefill_packing::PackingMode::Exact;
+    ensure!(exact || groups.iter().any(|group| group.len() > 1),
+        "unrestricted packed-check must exercise a pack");
     let prompts = lengths.iter().enumerate().map(|(i, &rows)| sequence(tokens, i, prefix(i) + rows)).collect::<Vec<_>>();
     let mut allocator = PageAllocator::new(engine);
     let mut packed = prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>()?;
@@ -84,20 +86,34 @@ pub(crate) fn check(engine: &GlmEngine<'_>, tokens: &[u32], members: usize,
             for outcome in outcomes { outcome?; }
         }
     }
-    let mut equal = true;
+    let (mut equal, mut top1, mut worst_kl) = (true, 0usize, 0.0f64);
     for (i, placement) in alone.iter_mut().enumerate() {
         let logits = engine.prefill_device(placement, chunk(i), transport.as_deref_mut().map(|t| (t, runtime)), 1)?
             .context("packed-check singleton head")?.row_host(engine.library, 0)?;
         let same_logits = packed_logits[i].iter().map(|f| f.to_bits()).eq(logits.iter().map(|f| f.to_bits()));
         let same_state = state(engine, &packed[i])? == state(engine, placement)?;
-        println!("packed check: sequence {i}: {} rows at {}: logits {}, live cache {}", lengths[i], prefix(i),
-            if same_logits { "identical" } else { "DIFFER" }, if same_state { "identical" } else { "DIFFER" });
+        let kl = super::mean_kl(&packed_logits[i], &logits, logits.len());
+        let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(id, _)| id);
+        let same_top1 = argmax(&packed_logits[i]) == argmax(&logits);
+        top1 += usize::from(same_top1);
+        worst_kl = worst_kl.max(kl);
+        ensure!(kl.is_finite(), "packed sequence {i} produced nonfinite KL");
+        println!("packed check: sequence {i}: {} rows at {}: logits {}, live cache {}, KL {kl:.8}, top-1 {same_top1}",
+            lengths[i], prefix(i), if same_logits { "identical" } else { "DIFFER" },
+            if same_state { "identical" } else { "DIFFER" });
         equal &= same_logits && same_state;
     }
     for placement in packed.into_iter().chain(alone) { allocator.release(placement); }
     println!("packed check: {members} sequences, {packed_groups} packed groups, {} singleton groups; {}",
         groups.len() - packed_groups, if equal { "every sequence identical" } else { "DIFFER" });
-    ensure!(equal, "packed prefill differs from its singleton reference");
+    if exact {
+        ensure!(equal, "exact prefill differs from its singleton reference");
+    } else {
+        // The min-card EXL3 K4 checkpoint belongs to the 3..6 effective-bpw tier.
+        let agreement = top1 as f64 / members as f64;
+        println!("packed fidelity: worst member KL {worst_kl:.8}, top-1 {agreement:.4}; bars 0.05/0.93");
+        ensure!(worst_kl <= 0.05 && agreement >= 0.93, "unrestricted packing exceeds GLM K4 fidelity bars");
+    }
     Ok(())
 }
 
