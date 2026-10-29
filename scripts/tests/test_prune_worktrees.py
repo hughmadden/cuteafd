@@ -18,7 +18,7 @@ def git(path, *args):
 def trees(tmp_path):
     root = tmp_path / 'main'
     root.mkdir()
-    git(root, 'init', '-b', 'work/p0')
+    git(root, 'init', '-b', 'dev')
     git(root, 'config', 'user.email', 'test@example.invalid')
     git(root, 'config', 'user.name', 'Test')
     (root / 'source').write_text('base\n')
@@ -27,7 +27,7 @@ def trees(tmp_path):
     remote = tmp_path / 'origin.git'
     subprocess.run(['git', 'init', '--bare', str(remote)], check=True, capture_output=True)
     git(root, 'remote', 'add', 'origin', str(remote))
-    git(root, 'push', 'origin', 'work/p0')
+    git(root, 'push', 'origin', 'dev')
     paths = {}
     for name in ('merged', 'unmerged', 'dirty', 'live', 'pid', 'deleted', 'target', 'locked', 'never-pushed'):
         path = tmp_path / name
