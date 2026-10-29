@@ -1,3 +1,4 @@
+use cuteafd_core::expert_geometry::expert_request_payload_offset;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
@@ -98,14 +99,19 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
 
         let rows_start = header_len;
         let routes_start = rows_start + row_descriptor_bytes_usize;
-        let payload_start = routes_start + route_bytes_usize;
-        let frame_end = payload_start + hidden_payload_bytes_usize;
+        let routes_end = routes_start + route_bytes_usize;
+        let payload_start = expert_request_payload_offset(header_len, row_descriptor_bytes_usize, route_bytes_usize)
+            .context("request metadata extent overflow")?;
+        let frame_end = payload_start.checked_add(hidden_payload_bytes_usize)
+            .context("request frame extent overflow")?;
         if frame_end != bytes.len() {
             bail!(
                 "ExpertProtocolV2 request length mismatch: sections end at {frame_end}, frame has {}",
                 bytes.len()
             );
         }
+        anyhow::ensure!(bytes[routes_end..payload_start].iter().all(|&byte| byte == 0),
+            "request alignment padding must be zero");
 
         let view = Self {
             header: ExpertProtocolV2RequestHeader {
@@ -124,7 +130,7 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
             },
             frame_bytes: bytes,
             row_descriptor_bytes: &bytes[rows_start..routes_start],
-            route_bytes: &bytes[routes_start..payload_start],
+            route_bytes: &bytes[routes_start..routes_end],
             hidden_payload: &bytes[payload_start..frame_end],
             checksum: if debug_checksum_enabled(flags) {
                 Some(
@@ -245,10 +251,8 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
     pub fn wire_stats(&self) -> ExpertProtocolV2WireStats {
         ExpertProtocolV2WireStats {
             logical_payload_bytes: self.hidden_payload.len(),
-            wire_bytes: self.header_len()
-                + self.row_descriptor_bytes.len()
-                + self.route_bytes.len()
-                + self.hidden_payload.len(),
+            wire_bytes: expert_request_payload_offset(self.header_len(), self.row_descriptor_bytes.len(),
+                self.route_bytes.len()).expect("validated request metadata") + self.hidden_payload.len(),
         }
     }
 

@@ -43,10 +43,11 @@ pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32
 
 fn validate_frame_budget(capacity: u32, max_frame_bytes: usize) -> Result<()> {
     let geometry = cuteafd_core::expert_geometry();
-    let minimum = crate::protocol_v2::EXPERT_PROTOCOL_V2_REQUEST_DEBUG_HEADER_LEN
-        + crate::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
-        + geometry.topk as usize * crate::EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN
-        + geometry.hidden as usize * 2;
+    let minimum = cuteafd_core::expert_geometry::expert_request_payload_offset(
+        crate::protocol_v2::EXPERT_PROTOCOL_V2_REQUEST_DEBUG_HEADER_LEN,
+        crate::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
+        geometry.topk as usize * crate::EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN)
+        .context("native frame prefix overflow")? + geometry.hidden as usize * 2;
     let maximum = native_frame_budget(geometry, capacity)?;
     ensure!((minimum..=maximum).contains(&max_frame_bytes),
         "invalid native frame budget {max_frame_bytes}: expected {minimum}..={maximum} for capacity {capacity}");
@@ -640,7 +641,8 @@ mod tests {
             for capacity in [1, 64, 4096] {
                 let rows = capacity as usize;
                 let indexed_reply = 128 + rows * (geometry.hidden as usize * 2 + 4);
-                let request = 128 + rows * (40 + geometry.topk as usize * 12 + geometry.hidden as usize * 2);
+                let request = cuteafd_core::expert_geometry::expert_request_payload_offset(128, rows * 40,
+                    rows * geometry.topk as usize * 12).unwrap() + rows * geometry.hidden as usize * 2;
                 let budget = native_frame_budget(geometry, capacity)?;
                 assert_eq!(budget, indexed_reply.max(request).max(crate::DEFAULT_MAX_FRAME_BYTES));
                 let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
@@ -681,7 +683,8 @@ mod tests {
         cuteafd_core::set_expert_geometry(geometry).unwrap();
         for capacity in [1, 64, 4096] {
             let maximum = native_frame_budget(geometry, capacity)?;
-            let minimum = 128 + 40 + geometry.topk as usize * 12 + geometry.hidden as usize * 2;
+            let minimum = cuteafd_core::expert_geometry::expert_request_payload_offset(128, 40,
+                geometry.topk as usize * 12).unwrap() + geometry.hidden as usize * 2;
             for ranks in [1, 4, 6] {
                 let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19441 + rank).parse())
                     .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;

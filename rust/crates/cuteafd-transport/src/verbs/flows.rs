@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn persistent_bootstrap_rejects_legacy_and_unknown_versions_before_payload() {
-        for version in [None, Some(1), Some(2), Some(PERSISTENT_CONTROL_VERSION + 1)] {
+        for version in [None, Some(1), Some(2), Some(PERSISTENT_CONTROL_VERSION - 1), Some(PERSISTENT_CONTROL_VERSION + 1)] {
             // Deliberately omit all endpoint fields: version failure must be first.
             let mut value = serde_json::json!({"message":"protocol_v2_persistent_ready"});
             if let Some(version) = version { value["wire_version"] = version.into(); }

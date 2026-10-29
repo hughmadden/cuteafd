@@ -158,6 +158,8 @@ impl<'a> Fp8Worker<'a> {
         self.route_staging.pack(slot, request)?;
         let bytes = segments.descriptors[slot].bytes_mut();
         let stride = self.experts.module.info().wire_row_bytes();
+        ensure!((input.ptr as usize) % 16 == 0 && (output.ptr as usize) % 16 == 0 && stride % 16 == 0,
+            "segmented mapped rows require 16-byte aligned input/output payloads and input stride");
         ensure!(input.bytes >= rows * stride && output.bytes >= rows * self.experts.module.info().hidden * 2,
             "staged mapped row extent is too small");
         for row in 0..rows {
