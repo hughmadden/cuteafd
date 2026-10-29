@@ -182,6 +182,16 @@ def test_nsys_wraps_the_coordinator_paused_into_profile_dir():
     assert docker == ['--stop-signal', 'SIGINT', '--stop-timeout', '300', '--label', 'cuteafd.graceful-stop=1']
 
 
+def test_nsys_cpu_sampling_is_opt_in(monkeypatch):
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_CPU', 'on')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert '--sample=process-tree' in wrapper and '--cpuctxsw=process-tree' in wrapper and '--sample=none' not in wrapper
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_CPU', 'maybe')
+    out, _, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode != 0 and 'PROFILE_NSYS_CPU must be on or off' in out.stderr
+
+
 def test_nsys_gpu_metrics_samples_the_named_devices():
     out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', '0,1')
     assert out.returncode == 0, out.stderr
