@@ -360,6 +360,68 @@ impl<'a> DenseEngine<'a> {
         Ok(output)
     }
 
+    /// Attention keeps each member's native row route and state; the dense FFN
+    /// sees the adjacent packed rows once. Tables reuse the admitted singleton scratch.
+    pub(crate) fn prefill_packed(&mut self, sequences: &[(usize, &[u32])],
+        limits: &crate::shared::prefill_packing::Limits,
+        mut hook: impl FnMut(usize, CuteafdDeviceBuffer, usize) -> Result<()>)
+        -> Result<Vec<crate::shared::prefill_packing::Segment>> {
+        ensure!(self.healthy && self.verification.pending.is_none(), "dense packed prefill requires committed healthy state");
+        let chunks = sequences.iter().map(|&(slot, tokens)| {
+            let state = self.slots.get(slot).context("dense packed slot outside admission")?;
+            self.embedding.check(tokens)?;
+            Ok((state.position, tokens.len()))
+        }).collect::<Result<Vec<_>>>()?;
+        let segments = crate::shared::prefill_packing::plan(&chunks, limits)?;
+        let mut tables = Vec::with_capacity(sequences.len());
+        for (i, (&(slot, _), s)) in sequences.iter().zip(&segments).enumerate() {
+            ensure!(!sequences[..i].iter().any(|&(other, _)| other == slot), "dense pack aliases a state slot");
+            let state = &self.slots[slot];
+            let end = s.start + s.rows;
+            ensure!(!state.pages.is_empty() && end.div_ceil(64) <= state.pages.len(), "dense pack exceeds bound pages");
+            let positions = (s.start..end).map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
+            let kv = (s.start..end).map(|p| i64::try_from(state.pages[p / 64] as usize * 64 + p % 64))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let pages = state.pages[..end.div_ceil(64)].iter().copied().map(i32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            tables.push(rows::Rows { tokens: vec![], physical: vec![], groups: vec![],
+                slots: vec![i32::try_from(slot)?; s.rows], first: vec![0; s.rows], positions, kv, pages, stride: 0 });
+        }
+        let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
+        self.verification.invalidate()?;
+        self.healthy = false;
+        self.embedding.embed(&tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
+        let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
+            homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
+        for (index, layer) in self.weights.layers.iter().enumerate() {
+            for (s, table) in segments.iter().zip(&tables) {
+                self.row_tables(table)?;
+                blocks.attention(index, layer,
+                    self.planes.segment(s.first, s.rows, self.cfg.hidden, self.cfg.heads * self.cfg.head_dim)?,
+                    self.kv[index].as_ref().map(|v| v.buffer), &Step { rows: s.rows,
+                        capacity: if s.rows <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
+                        table_stride: 0, splits: 1, speculative: false })?;
+            }
+            blocks.ffn(layer, self.planes, &Step { rows: tokens.len(),
+                capacity: if tokens.len() <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
+                table_stride: 0, splits: 1, speculative: false })?;
+            hook(index, self.planes.residual, tokens.len())?;
+        }
+        for (&(slot, _), s) in sequences.iter().zip(&segments) { self.slots[slot].position = s.start + s.rows; }
+        self.position = self.slots[0].position;
+        self.healthy = true;
+        Ok(segments)
+    }
+
+    pub(crate) fn packed_head(&self, row: usize) -> Result<DeviceLogits> {
+        let hidden = crate::shared::prefix::view(self.planes.residual, row * self.cfg.hidden * 2, self.cfg.hidden * 2)?;
+        let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
+        // SAFETY: selected terminal row and norm scratch stay live on the one target stream.
+        unsafe { norm.launch(&[hidden.ptr, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
+            &[Scalar::I32(1)], self.stream.raw)?; }
+        self.target_head(self.planes.norm, self.logits.buffer, 1)
+    }
+
     fn row_tables(&self, rows: &rows::Rows) -> Result<()> {
         let i32_bytes = |values: &[i32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         let i64_bytes = |values: &[i64]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();

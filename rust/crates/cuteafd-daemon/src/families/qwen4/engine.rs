@@ -1103,6 +1103,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
     pub full_prefill_logits: bool,
+    packed_row_cap: Cell<Option<usize>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -1292,6 +1293,7 @@ impl<'a> Qwen4Engine<'a> {
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: false,
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
+            packed_row_cap: Cell::new(None),
             l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
@@ -2280,6 +2282,127 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(None);
         }
         Ok(Some(self.device_logits(w, logit_rows, false)))
+    }
+
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::{PackingMode, log_mode};
+        if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
+        let rows = self.prefill_shape.map_or(self.prefill_rows, |s| s.unit_rows as usize);
+        let cap = match &self.experts {
+            Some(Experts::Local(local)) => local.experts.borrow().packed_row_cap(true, rows)?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?.iter()
+                .map(|report| report.packed_row_cap(self.spark_bf16)).min().unwrap_or(0).min(rows),
+            Some(Experts::SharedOnly) => rows,
+            // Local EXL3 and the generic RTX trait do not publish arithmetic route metadata.
+            _ => 0,
+        };
+        self.packed_row_cap.set(Some(cap));
+        log_mode(mode, cap);
+        Ok(())
+    }
+
+    pub(crate) fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        if self.gdn_banks.len() != 1 || self.hops.is_some() { return None; }
+        let rows = self.prefill_shape.map_or(self.prefill_rows, |s| s.unit_rows as usize);
+        Some(crate::shared::prefill_packing::Limits {
+            rows: self.packed_row_cap.get().unwrap_or(rows),
+            chunk_rows: if self.weights.mtp.is_some() && self.prefill_shape.is_none() {
+                MTP_PENDING_ROWS.min(rows)
+            } else { rows },
+            max_context: self.max_context, taps: None,
+        })
+    }
+
+    pub(crate) fn prefill_packed(&self, sequences: &mut [crate::shared::qwen::scheduler::PrefillSeq<'_,
+        Qwen4Placement, super::speculate::MtpSeq>],
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+            ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(), "packed Qwen requires one attention owner");
+            let limits = self.packed_limits().context("Qwen packing limits")?;
+            let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+                .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &limits)?;
+            let mut tables: Vec<StepTables> = Vec::with_capacity(sequences.len());
+            for (i, s) in sequences.iter_mut().enumerate() {
+                ensure!(s.start == s.placement.len && !tables.iter().any(|t| t.slots.first() == Some(&s.placement.slot)),
+                    "Qwen packed frontier or state-slot alias");
+                if s.start == 0 { self.start(s.placement)?; }
+                let mut table = StepTables { page_table: s.placement.pages.clone(), pool_table: s.placement.pool_pages.clone(),
+                    page_width: s.placement.pages.len(), ..Default::default() };
+                self.rows(s.placement, s.tokens, 0, &mut table)?;
+                ensure!(table.positions.len() == segments[i].rows, "Qwen packed rows differ");
+                tables.push(table);
+            }
+            let tokens = sequences.iter().flat_map(|s| s.tokens.iter().copied()).collect::<Vec<_>>();
+            if self.prefill_shape.is_some() { self.prepare_prefill_units()?; }
+            if self.workspace.borrow().is_none() { *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, false, 1)?); }
+            let workspace = self.workspace.borrow();
+            let w = workspace.as_ref().context("Qwen packed workspace")?;
+            ensure!(tokens.len() <= w.rows, "Qwen pack exceeds admitted unit");
+            w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false); w.terminal_valid.set(false);
+            self.last_stream_offset.set(0);
+            let mut all = StepTables::default();
+            for (s, t) in segments.iter().zip(&tables) {
+                all.positions.extend_from_slice(&t.positions);
+                all.slots.extend_from_slice(&t.slots);
+                all.seq_first.extend(std::iter::repeat_n(s.first as i32, s.rows));
+                all.ple_ids.extend_from_slice(&t.ple_ids);
+            }
+            let all = Arc::new(all);
+            self.stage_step_tables(w, &all)?;
+            if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
+                drop(self.ple_pending.borrow_mut().take());
+                *self.ple_pending.borrow_mut() = Some(mapped.begin(Arc::clone(&all)
+                    as Arc<dyn crate::shared::mapped_table::RowSource>, false)?);
+            }
+            self.stage_embedding(w, &tokens, HC, &w.streams[0], false)?;
+            let rows = Scalar::I32(tokens.len() as i32);
+            let mut cur = 0;
+            if self.cfg.ple_layers.contains(&0) { self.finish_ple(w)?; }
+            self.enter(w, &mut cur, None, &self.weights.layers[0], 0, rows, false)?;
+            for (index, layer) in self.weights.layers.iter().enumerate() {
+                for (s, table) in segments.iter().zip(&tables) {
+                    w.row_offset.set(s.first); w.position.set(s.start);
+                    self.stage_step_tables(w, table)?;
+                    let n = Scalar::I32(s.rows as i32);
+                    match layer.attention {
+                        Qwen4Attention::Gdn => self.gdn(w, index, layer, n, "m4096", false)?,
+                        Qwen4Attention::Full => self.full(w, index, layer, n, "m4096", table)?,
+                    }
+                }
+                w.row_offset.set(0);
+                self.stage_step_tables(w, &all)?;
+                self.post_pre(w, cur, layer, "mlp", rows)?;
+                cur ^= 1;
+                self.moe(w, index, layer, tokens.len(), rows, false)?;
+                if let Some(next) = self.weights.layers.get(index + 1) {
+                    if self.cfg.ple_layers.contains(&(index + 1)) {
+                        self.post(w, &mut cur, rows)?;
+                        self.finish_ple(w)?;
+                        self.enter(w, &mut cur, None, next, index + 1, rows, false)?;
+                    } else { self.enter(w, &mut cur, Some(()), next, index + 1, rows, false)?; }
+                } else { self.post(w, &mut cur, rows)?; }
+            }
+            self.last_streams.set((false, cur)); self.last_stream_offset.set(0);
+            if let Some(terminal) = &w.terminal_streams {
+                // SAFETY: packed rows fit the existing terminal span and share its producer stream.
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, terminal.buffer,
+                    w.streams[cur].buffer, tokens.len() * HC * self.cfg.hidden * 2, self.execution_stream())?; }
+                w.terminal_valid.set(true);
+            }
+            for s in sequences.iter_mut() { s.placement.len += s.tokens.len(); s.placement.state_len = s.placement.len; }
+            let result = crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
+                let s = &segments[i];
+                w.row_offset.set(s.first); w.position.set(s.start);
+                self.head(w, &w.streams[cur], s.rows, Scalar::I32(s.rows as i32), 1)?;
+                Ok(self.device_logits(w, 1, false))
+            }, on_logits);
+            w.row_offset.set(0);
+            let outcomes = result?;
+            drop(workspace);
+            super::speculate::prefill_packed(self, sequences, &segments)?;
+            Ok(outcomes)
+        })
     }
 
     pub(crate) fn mtp_prefill_rows(&self) -> usize {

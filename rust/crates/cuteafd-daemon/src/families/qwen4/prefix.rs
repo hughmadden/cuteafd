@@ -380,6 +380,13 @@ fn paged_rows(family: &Qwen4Prefix<'_, '_>, placement: &Qwen4Placement, len: usi
     Ok(out)
 }
 
+pub(crate) fn packed_state(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement) -> Result<Vec<u8>> {
+    let family = Qwen4Prefix::new(engine, |_| 0)?;
+    let mut bytes = slot_state(engine, placement.slot)?;
+    bytes.extend(paged_rows(&family, placement, placement.len)?);
+    Ok(bytes)
+}
+
 /// One `--resume-at` case.
 pub(crate) struct ResumeCase {
     pub at: usize,

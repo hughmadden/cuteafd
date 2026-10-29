@@ -76,6 +76,9 @@ pub(crate) struct EngineArgs {
     /// Explicit per-unit rows for diagnostic cuts, including N=1.
     #[arg(long)]
     pub prefill_units: Option<usize>,
+    /// Arithmetic-route policy for already-queued short prompt packing.
+    #[arg(long, value_enum, default_value_t = crate::shared::prefill_packing::PackingMode::default())]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -156,6 +159,9 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/qwen4/golden.py, or a published shared fidelity set.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Compare real packed and singleton target state/logits on 2..=8 members.
+    #[arg(long)]
+    pub packed_check: Option<usize>,
     /// One window from the published shared fidelity quick subset (otherwise all eight).
     #[arg(long, requires_all = ["nll", "save_logits"])]
     pub window: Option<String>,
@@ -738,6 +744,7 @@ impl Opened {
             }
             engine.set_experts(experts);
         }
+        engine.configure_packing(args.prefill_packing)?;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
@@ -897,6 +904,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll;
+    if let Some(members) = args.packed_check {
+        args.engine.slots = args.engine.slots.max(2 * members);
+    }
     ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
     let windows = if args.golden.join("manifest.json").try_exists()? {
         ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
@@ -914,6 +924,11 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     };
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
+        if let Some(members) = args.packed_check {
+            let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+            let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            return packed_check(engine, &tokens, members, args.engine.prefill_packing);
+        }
         if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
         if let Some(dir) = &args.mtp_oracle {
             return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
@@ -929,6 +944,22 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
         }
         golden_run(&args, &opened, engine)
     })
+}
+
+fn packed_check(engine: &engine::Qwen4Engine<'_>, tokens: &[u32], members: usize,
+    mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+    let prompts = crate::shared::qwen::packed_check::prompts(tokens, members)?;
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
+    let mut admit = || prompts.iter().map(|p| allocator.admit(p.len() + 1)).collect::<Result<Vec<_>>>();
+    let packed = admit()?;
+    let alone = admit()?;
+    let limits = engine.packed_limits().context("packed Qwen requires one attention owner")?;
+    crate::shared::qwen::packed_check::check::<_, speculate::MtpSeq>(engine.library, &prompts, packed, alone,
+        limits, false, mode == crate::shared::prefill_packing::PackingMode::Exact, |s| {
+            let head = engine.prefill_device(s.placement, s.tokens, None, None, 1)?.context("packed check needs full model head")?;
+            head.row_host(engine.library, 0)
+        }, |sequences, callback| engine.prefill_packed(sequences, callback),
+        |p| prefix::packed_state(engine, p))
 }
 
 /// `--resume-at P,..`: [`prefix::resume_check`] for every P and every --prefill-chunk.

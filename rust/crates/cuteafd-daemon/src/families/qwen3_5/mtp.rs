@@ -352,6 +352,25 @@ impl<'a> MtpCache<'a> {
         Ok(())
     }
 
+    /// Packed target rows share one capture; never compact a member over its partner.
+    pub(crate) fn update_captured_at(&self, engine: &mut DenseEngine<'a>, slot: usize, start: usize,
+        tokens: &[u32], offset: usize) -> Result<()> {
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        ensure!(mtp.pool.frontier(mtp.binding)?.1 == start, "dense packed MTP frontier differs");
+        for first in (0..tokens.len()).step_by(HEAD_ROWS) {
+            let end = (first + HEAD_ROWS).min(tokens.len());
+            let hidden = crate::shared::prefix::view(mtp.hidden.buffer, (offset + first) * mtp.layout.hidden_bytes,
+                (end - first) * mtp.layout.hidden_bytes)?;
+            mtp.norm(engine, hidden, engine.weights.norm.buffer, hidden, end - first)?;
+            if start + first > 0 { mtp.resolve_pending_device(engine, tokens[first], start + first)?; }
+            if end - first > 1 { mtp.step_device(engine, hidden, &tokens[first + 1..end], start + first)?; }
+            let tail = crate::shared::prefix::view(hidden, (end - first - 1) * mtp.layout.hidden_bytes, mtp.layout.hidden_bytes)?;
+            mtp.pending(tail, start + end)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn draft_chain(&self, engine: &mut DenseEngine<'a>, slot: usize, anchor: u32,
         frontier: usize, depth: usize,
         select: impl FnMut(crate::shared::token_io::DeviceLogits, usize) -> Result<u32>) -> Result<Vec<u32>> {

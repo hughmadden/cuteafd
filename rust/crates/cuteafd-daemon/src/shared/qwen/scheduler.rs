@@ -67,7 +67,8 @@ pub(crate) struct DraftSeq<'p, P, D> {
 }
 
 /// One member of an already-queued packed prefill. The backend owns tap layout
-/// and advances both target and draft state before invoking its head callback.
+/// and advances target, draft and taps before returning. Each scratch head must
+/// be consumed by its callback before another head reuses that storage.
 pub(crate) struct PrefillSeq<'p, P, D> {
     pub placement: &'p mut P,
     pub tokens: &'p [u32],

@@ -52,6 +52,9 @@ pub(crate) struct GoldenArgs {
     /// Check exact recurrent prefix restore and copied GQA full/partial pages before scoring.
     #[arg(long)]
     pub prefix_check: bool,
+    /// Compare native packed and singleton state/logits on 2..=8 members.
+    #[arg(long)]
+    pub packed_check: Option<usize>,
     /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
     #[arg(long)]
     pub draft: Option<PathBuf>,
@@ -102,7 +105,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
     }
     ensure!(args.draft.is_none(), "--draft requires --spec-decode for dense qualification");
-    let slots = usize::from(args.state_slots);
+    let slots = usize::from(args.state_slots).max(args.packed_check.map_or(1, |n| 2 * n));
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
@@ -112,6 +115,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
     }
     let engine = std::cell::RefCell::new(engine);
+    if let Some(members) = args.packed_check { return serve::packed_check(&engine, &library, &tokens, members); }
     if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
     let mut engine = engine.into_inner();
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);

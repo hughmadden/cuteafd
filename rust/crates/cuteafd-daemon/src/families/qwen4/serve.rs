@@ -374,6 +374,15 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.prefill_device(placement, tokens, None, None, rows)
     }
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        self.engine.packed_limits()
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Self::Placement, Self::Draft>],
+        _pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        self.engine.prefill_packed(sequences, on_logits)
+    }
     fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
         _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {

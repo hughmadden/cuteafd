@@ -32,6 +32,23 @@ pub(crate) struct Step {
     pub(crate) speculative: bool,
 }
 
+impl Planes {
+    pub(crate) fn segment(self, first: usize, rows: usize, hidden: usize, query: usize) -> Result<Self> {
+        let view = crate::shared::prefix::view;
+        let h = hidden * 2;
+        let q = query * 2;
+        Ok(Self {
+            residual: view(self.residual, first * h, rows * h)?,
+            norm: view(self.norm, first * h, rows * h)?,
+            delta: view(self.delta, first * h, rows * h)?,
+            query: view(self.query, first * q, rows * q)?,
+            gate: view(self.gate, first * q, rows * q)?,
+            attention: view(self.attention, first * q, rows * q)?,
+            ..self
+        })
+    }
+}
+
 impl Step {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(matches!(self.capacity, 64 | 4096) && self.rows > 0 && self.rows <= self.capacity,
@@ -67,6 +84,12 @@ impl Blocks<'_, '_> {
     /// Enqueue one post-norm residual block. The caller retains all supplied
     /// planes, weights, page records and tables until the stream drains.
     pub(crate) fn run(&self, index: usize, layer: &DenseLayer<'_>, p: Planes,
+        kv: Option<CuteafdDeviceBuffer>, step: &Step) -> Result<()> {
+        self.attention(index, layer, p, kv, step)?;
+        self.ffn(layer, p, step)
+    }
+
+    pub(crate) fn attention(&self, index: usize, layer: &DenseLayer<'_>, p: Planes,
         kv: Option<CuteafdDeviceBuffer>, step: &Step) -> Result<()> {
         step.validate()?;
         ensure!(self.cfg.attention.get(index) == Some(&layer.attention), "dense layer/checkpoint type mismatch");
@@ -148,7 +171,12 @@ impl Blocks<'_, '_> {
                 self.launch("attn_o", Some(step.capacity), &pointers, &scalars)?;
             }
         }
-        self.launch("add", None, &[("a", p.residual.ptr), ("b", p.delta.ptr), ("out", p.residual.ptr)], &rows)?;
+        self.launch("add", None, &[("a", p.residual.ptr), ("b", p.delta.ptr), ("out", p.residual.ptr)], &rows)
+    }
+
+    pub(crate) fn ffn(&self, layer: &DenseLayer<'_>, p: Planes, step: &Step) -> Result<()> {
+        step.validate()?;
+        let rows = [Scalar::I32(i32::try_from(step.rows)?)];
         self.launch("norm", None, &[("x", p.residual.ptr), ("weight", layer.ptr("ffn.norm")?), ("out", p.norm.ptr)], &rows)?;
         let mut pointers = vec![("x", p.norm.ptr)];
         if self.admitted.format.fp8() {
