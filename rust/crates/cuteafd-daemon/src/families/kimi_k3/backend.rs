@@ -464,6 +464,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires one RTX GPU and sealed CUTEAFD_NATIVE_LIB/CUTEAFD_PROGRAM_MANIFEST"]
+    fn live_router_row_total_discriminator() -> Result<()> {
+        use crate::shared::memory::device::{Allocation, Device, Stream};
+        // SAFETY: explicit sealed library; allocations and stream drop before it.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = Device { library: &library, id: 0 };
+        library.cuda_set_device(0)?;
+        let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let program = programs.program("kimik3_router_scores", &["x", "w", "logits"])?;
+        let input = Allocation::new(device, 96 * 7168 * 2)?;
+        let weights = Allocation::new(device, 896 * 7168 * 2)?;
+        let output = Allocation::new(device, 96 * 896 * 4)?;
+        let stream = Stream::new(device)?;
+        let mut seed = 0x517cc1b727220a95u64;
+        let mut bf16 = |elements: usize| -> Vec<u8> {
+            (0..elements).flat_map(|_| {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                let value = ((seed >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.125;
+                ((value.to_bits() >> 16) as u16).to_ne_bytes()
+            }).collect()
+        };
+        library.copy_h2d(input.buffer, &bf16(96 * 7168))?;
+        library.copy_h2d(weights.buffer, &bf16(896 * 7168))?;
+        let mut arms = Vec::new();
+        for rows in [19, 64, 96] {
+            // SAFETY: sealed program pointer/scalar contract, retained disjoint
+            // dense planes sized for 96 rows; drain precedes readback and reuse.
+            unsafe { program.launch(&[input.buffer.ptr, weights.buffer.ptr, output.buffer.ptr],
+                &[cuteafd_ffi::programs::Scalar::I32(rows)], stream.raw)?; }
+            stream.drain()?;
+            let mut bytes = vec![0; 96 * 896 * 4];
+            library.copy_d2h(&mut bytes, output.buffer)?;
+            arms.push(bytes[..19 * 896 * 4].to_vec());
+        }
+        for (i, rows) in [64, 96].into_iter().enumerate() {
+            let mut changed = 0;
+            let mut max_diff = 0.0f32;
+            for (a, b) in arms[0].chunks_exact(4).zip(arms[i + 1].chunks_exact(4)) {
+                let a = f32::from_ne_bytes(a.try_into()?);
+                let b = f32::from_ne_bytes(b.try_into()?);
+                ensure!(a.is_finite() && b.is_finite(), "Kimi router discriminator nonfinite logits");
+                changed += usize::from(a.to_bits() != b.to_bits());
+                max_diff = max_diff.max((a - b).abs());
+            }
+            println!("Kimi router-only same first19 rows: total19 vs total{rows} changed_logits={changed}/{} max_abs_diff={max_diff:.10} byte_identical={}",
+                19 * 896, arms[0] == arms[i + 1]);
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires two RTX GPUs, six live Spark workers, DFlash2, CUTEAFD_KIMI_PACK_GATE_ARGS JSON serve-kimi argv, CUTEAFD_KIMI_PACK_GATE_TOKENS JSON token IDs and CUTEAFD_KIMI_PACK_GATE_GOLDEN immutable reference directory"]
     fn live_packed_prefill_matches_singletons_with_private_dflash() -> Result<()> {
         use anyhow::Context;
