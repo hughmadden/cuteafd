@@ -41,6 +41,9 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight on one transport; unset follows the shared six-Spark policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
+    /// Pack already queued prompts, or run unknown arithmetic routes alone in exact mode.
+    #[arg(long, value_enum, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -132,6 +135,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
             })?;
             crate::shared::memory_report::release_load_staging(&library);
+            loaded.engine.configure_packing(worker_args.prefill_packing)?;
             let backend = KimiBackend::new(&loaded.engine)?;
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
@@ -212,6 +216,15 @@ mod tests {
         for depth in ["0", "8"] {
             assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn queued_packing_defaults_unrestricted_and_accepts_exact() -> Result<()> {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(args(&[])?.prefill_packing, PackingMode::Unrestricted);
+        assert_eq!(args(&["--prefill-packing", "exact"])?.prefill_packing, PackingMode::Exact);
+        assert!(args(&["--prefill-packing", "invalid"]).is_err());
         Ok(())
     }
 

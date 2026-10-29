@@ -227,7 +227,7 @@ impl<'a> NativeDraft<'a> {
         self.owners.draft.device.run(|| self.owners.draft.discard_context(slot))
     }
     #[cfg(test)]
-    fn readback(&self, slot: usize, tap_rows: usize) -> Result<crate::shared::speculation::dflash::MlaReadback> {
+    pub(super) fn readback(&self, slot: usize, tap_rows: usize) -> Result<crate::shared::speculation::dflash::MlaReadback> {
         self.owners.draft.device.run(|| self.owners.draft.mla_readback(slot, tap_rows))
     }
 

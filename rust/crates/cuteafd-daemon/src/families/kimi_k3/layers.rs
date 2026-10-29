@@ -98,6 +98,32 @@ impl<'a> Execution<'a> {
         bindings.iter_mut().map(|binding| binding.output(output)).collect()
     }
 
+    pub(crate) fn run_packed<'e>(&'e self, scope: &'e SubmissionScope<'_>,
+        peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
+        local: &'e mut [LocalLane<'a>; 2], routed: &'e mut RoutedLane<'a>,
+        experts: &'e mut [Option<Exl3Tp2<'a>>; 2],
+        sequences: &[super::device::SequenceRows<'_>], pool: &cuteafd_engine::prefix::RefPagePool,
+        draft: Option<&'e super::draft::NativeDraft<'a>>) -> Result<CuteafdDeviceBuffer> {
+        let rows = sequences.iter().map(|sequence| sequence.rows).sum();
+        let protocol = self.protocol(peer, hops)?;
+        let mut binding = Bindings::new(local, routed, experts, self, peer, hops, scope, 0, rows, false)?;
+        binding.draft = draft;
+        // Validate all slots/pages before any member can update recurrent state.
+        binding.packed = Some(binding.local[0].packed_attention(sequences, pool)?);
+        // Selecting a row view also disables replay: captured singleton attention
+        // cannot stand in for a pack's member-specific state and positions.
+        for local in binding.local.iter_mut() { local.select_subwave(Some(0..rows))?; }
+        crate::shared::prefill_pipeline::with_cleanup(&mut binding, |binding| {
+            crate::shared::peer_split::attention::layer_pipeline_with(scope, &self.plan, &protocol,
+                crate::shared::peer_split::attention::LaneOrder::OrderedChunks, &[rows],
+                std::slice::from_mut(binding))?;
+            binding.output(Output::Normalized)
+        }, |binding| {
+            for local in binding.local.iter_mut() { local.clear_subwave(); }
+            Ok(())
+        })
+    }
+
     /// One sequence's prefill as row units on the single admitted lane and
     /// Spark link (PLAN "Prefill contract"): up to `waves` units' expert waves
     /// in flight, each unit owning its rows of every lane operand.
@@ -363,6 +389,7 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     probe: Option<&'e DraftProbe<'a>>,
     tap_first: usize,
     defer_publication: bool,
+    packed: Option<Vec<super::device::AttentionRows>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -414,7 +441,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         for rank in 0..2 { peer.recv(rank, lane)?; }
         ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false })
+        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
     }
 
     fn with_probe(&self, work: impl FnOnce(&mut crate::shared::draft::probe::RoundProbe<'a>) -> Result<()>) -> Result<()> {
@@ -447,7 +474,11 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
                 unsafe { stream.device.library.cuda_stream_wait_event(stream.raw, ready[rank].raw) }
             })?;
         }
-        self.local[rank].attention(layer, self.rows, self.speculative)?;
+        if let Some(members) = &self.packed {
+            self.local[rank].attention_packed(layer, members)?;
+        } else {
+            self.local[rank].attention(layer, self.rows, self.speculative)?;
+        }
         ready[rank].record(&stream)?;
         execution.state_pending[layer][rank].set(true);
         Ok(())

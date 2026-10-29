@@ -31,6 +31,8 @@ pub(crate) struct Engine<'a> {
     exchange_streams: [Rc<Stream<'a>>; 2],
     /// Prefill units: the unit and the waves in flight.
     prefill: PrefillUnits,
+    packed_row_cap: Cell<Option<usize>>,
+    coordinator_packing_cap: usize,
     /// The same shape as the shared prefill depth.
     depth: crate::shared::prefill_depth::PrefillDepth,
 }
@@ -39,6 +41,11 @@ pub(crate) struct Engine<'a> {
 /// equal units of at most `unit_rows` (`prefill_units`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrefillUnits { pub unit_rows: usize, pub waves: usize }
+
+fn packed_row_cap(mode: crate::shared::prefill_packing::PackingMode,
+    coordinator: usize, expert: usize) -> Option<usize> {
+    (mode == crate::shared::prefill_packing::PackingMode::Exact).then_some(coordinator.min(expert))
+}
 
 impl Drop for Engine<'_> {
     fn drop(&mut self) {
@@ -74,6 +81,34 @@ fn check_expert_owners(layers: &[cuteafd_loader::placement::LayerAssignment], ow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_packing_runs_unknown_exl3_and_k6_arithmetic_routes_alone() {
+        use crate::shared::prefill_packing::{self, PackingMode, Limits};
+        let chunks = [(0, 17), (4, 31), (0, 65)];
+        let groups = |mode| {
+            let limits = Limits { rows: packed_row_cap(mode, 64, 0).unwrap_or(2752), chunk_rows: 2752,
+                max_context: 1024, taps: Some(2048) };
+            prefill_packing::groups(chunks.len(), |range| prefill_packing::plan(&chunks[range], &limits).is_ok())
+        };
+        assert_eq!(groups(PackingMode::Exact), [0..1, 1..2, 2..3]);
+        assert_eq!(groups(PackingMode::Unrestricted), [0..3]);
+    }
+
+    #[test]
+    fn exact_packing_intersects_coordinator_and_expert_routes() {
+        use crate::shared::prefill_packing::{self, PackingMode, Limits};
+        assert_eq!(packed_row_cap(PackingMode::Exact, 64, 128), Some(64));
+        assert_eq!(packed_row_cap(PackingMode::Exact, 128, 32), Some(32));
+        assert_eq!(packed_row_cap(PackingMode::Exact, 0, 128), Some(0));
+        assert_eq!(packed_row_cap(PackingMode::Unrestricted, 0, 0), None);
+        let chunks = [(0, 29), (0, 31), (0, 80), (0, 17)];
+        let limits = Limits { rows: packed_row_cap(PackingMode::Exact, 64, 128).unwrap(),
+            chunk_rows: 256, max_context: 1024, taps: Some(2048) };
+        assert_eq!(prefill_packing::groups(chunks.len(), |range|
+            prefill_packing::plan(&chunks[range], &limits).is_ok()), [0..2, 2..3, 3..4]);
+        assert_eq!(chunks[2].1, 80, "oversized singleton is not rechunked");
+    }
 
     #[test]
     fn whole_expert_bindings_require_exact_sparse_owner_sets() -> Result<()> {
@@ -121,6 +156,7 @@ impl<'a> Engine<'a> {
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() == 6,
             "Kimi startup needs process latent geometry and six real expert ranks");
+        let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
         hops.validate_binding(&plan, &peer)?;
@@ -181,7 +217,8 @@ impl<'a> Engine<'a> {
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
-        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts, prefill)?;
+        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts,
+            prefill, coordinator_packing_cap)?;
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
@@ -194,7 +231,7 @@ impl<'a> Engine<'a> {
         local: Vec<[LocalLane<'a>; 2]>, routed: Vec<RoutedLane<'a>>,
         io: Vec<[TokenIo<'a>; 2]>,
         experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
-        prefill: PrefillUnits) -> Result<Self> {
+        prefill: PrefillUnits, coordinator_packing_cap: usize) -> Result<Self> {
         // The units in flight fit the lane.
         ensure!(prefill.waves > 0 && local.iter().all(|pair| pair[0].rows() >= prefill.unit_rows * prefill.waves
             || prefill.waves == 1), "Kimi lane rows hold fewer than the admitted prefill units in flight");
@@ -213,7 +250,7 @@ impl<'a> Engine<'a> {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         Ok(Self { depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, exchange_streams, prefill })
+            hops, peer, exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -245,6 +282,87 @@ impl<'a> Engine<'a> {
             // A call is the slots' units.
             slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
             full_prefill_logits: false })
+    }
+
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::log_mode;
+        // Coordinator metadata and the expert route both constrain exact packs.
+        // EXL3 arithmetic bounds remain unknown, so that route still runs alone.
+        let cap = packed_row_cap(mode, self.coordinator_packing_cap, 0);
+        self.packed_row_cap.set(cap);
+        log_mode(mode, cap.unwrap_or(self.prefill.unit_rows));
+        Ok(())
+    }
+
+    pub(crate) fn packed_limits(&self) -> Result<crate::shared::prefill_packing::Limits> {
+        Ok(crate::shared::prefill_packing::Limits {
+            rows: self.packed_row_cap.get().unwrap_or(self.prefill.unit_rows),
+            chunk_rows: self.prefill.unit_rows, max_context: self.geometry()?.max_context,
+            taps: self.draft.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),
+        })
+    }
+
+    /// One queued unit; state remains member-local and shared head scratch is
+    /// consumed before projecting the next member. Callback failures are local.
+    pub(crate) fn prefill_packed(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        self.prefill_packed_heads::<false>(sequences, pool, &mut |i, _, logits| on_logits(i, logits))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefill_packed_all_rows(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        self.prefill_packed_heads::<true>(sequences, pool, on_logits)
+    }
+
+    fn prefill_packed_heads<const ALL_ROWS: bool>(&self,
+        sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        self.require_live()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi packed prefill cannot overwrite pending verify");
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>(), &self.packed_limits()?)?;
+        let family = self.prefix_family()?;
+        for (placement, tokens) in sequences.iter() { family.check_append(placement, tokens.len())?; }
+        if let Some(draft) = &self.draft { draft.prepare_target()?; }
+        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            let mut lanes = self.lanes.try_borrow_mut()?;
+            let metadata = sequences.iter().map(|(p, tokens)| SequenceRows {
+                slot: p.slot, start: p.len, rows: tokens.len(), pages: &p.units,
+            }).collect::<Vec<_>>();
+            let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
+            lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
+            let Lanes { local, routed, io, experts } = &mut *lanes;
+            let normalized = self.execution.run_packed(scope, &self.peer, &self.hops,
+                &mut local[0], &mut routed[0], &mut experts[0], &metadata, pool, self.draft.as_deref())?;
+            drop(metadata);
+            for (placement, tokens) in sequences.iter_mut() {
+                family.commit(placement, placement.len, tokens.len())?;
+            }
+            crate::shared::prefill_packing::finish_members(sequences.len(), |i| Ok(i), &mut |i, _| {
+                let segment = segments[i];
+                let first = if ALL_ROWS { 0 } else { segment.rows - 1 };
+                for offset in (first..segment.rows).step_by(64) {
+                    let count = if ALL_ROWS { (segment.rows - offset).min(64) } else { 1 };
+                    let input = crate::shared::prefix::view(normalized,
+                        (segment.first + offset) * 7168 * 2, count * 7168 * 2)?;
+                    let logits = io[0][1].project(input, count, &local[0][1])?;
+                    let row = crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: count,
+                        vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
+                        stream: local[0][1].stream().raw, greedy: None };
+                    // Consume every diagnostic tile before reusing shared head scratch.
+                    if let Err(error) = on_logits(i, offset, row)? { return Ok(Err(error)); }
+                }
+                Ok(Ok(()))
+            })
+        })
     }
 
     pub(crate) fn arm_draft_probe(&self) -> Result<()> {
