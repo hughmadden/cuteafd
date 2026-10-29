@@ -265,7 +265,9 @@ impl<'a> TokenEmbedding<'a> {
     /// # Safety
     /// `ids` (and `index`) hold the ids (indices) once `stream` reaches the
     /// gather; `out` is a live `[rows * copies, hidden]` BF16 buffer and
-    /// `fallback` is null or a live row, all on this table's device.
+    /// `fallback` is null or a live row, all on the stream's device. A BF16
+    /// table may live on a peer with peer access enabled from this device;
+    /// its upload must finish before gathering and its lifetime spans the work.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
         fallback: *const c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {

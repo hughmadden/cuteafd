@@ -25,6 +25,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes),
         items: vec![], kv_tokens: 0 }).collect();
+    // Serving loads RTX media before sampling admission memory. Reserve the
+    // same tower first so embedding-home selection sees that occupied memory.
+    let early_encoder = report.spark_ranks == 0 || matches!(report.vision, super::super::MediaMode::Rtx(_));
+    if early_encoder {
+        resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut [],
+            &vec![0; ranks], options, &mut notes);
+    }
     let mut pool = 0;
     let mut waste = Vec::new();
     let admitted = (|| -> anyhow::Result<(placement::Placement, glmf::GlmfWorkingSet)> {
@@ -199,7 +206,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             } else {
                 devices[rank].items.push(runtime);
             }
-            baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes: 0 }));
+            let loaded_bytes = devices[rank].items.iter().filter(|item| item.group.starts_with("vision "))
+                .map(|item| item.bytes).sum();
+            baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes }));
         }
         let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256, spark_ranks == 0).target;
         let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
@@ -230,8 +239,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             notes.push(format!("first MLA owner: rtx{}", chosen_attention.first_owner));
         }
         if spark_ranks == 0 {
-            let mut weights: Vec<_> = chosen_resident.iter().map(|rank| rank.embedding.checked_add(rank.weights)
-                .ok_or_else(|| anyhow::anyhow!("GLM Flash resident weight overflow"))).collect::<anyhow::Result<_>>()?;
+            let mut weights: Vec<_> = chosen_resident.iter().map(|rank| rank.weights).collect();
+            let embedding_bytes = chosen_resident.iter().map(|rank| rank.embedding).sum::<u64>();
+            let embedding_rank = glmf::embedding_home(&placed) as usize;
+            weights[embedding_rank] = weights[embedding_rank].checked_add(embedding_bytes)
+                .ok_or_else(|| anyhow::anyhow!("GLM Flash resident weight overflow"))?;
             for ((layer, _), cost) in cfg.dense.iter().enumerate().filter(|(_, dense)| !**dense).zip(&inputs.experts) {
                 for (rank, bytes) in weights.iter_mut().enumerate() {
                     let resident = match placed.layers[layer].experts {
@@ -325,7 +337,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     // Media placement is still the shared planner path, outside the coordinator solver port.
     let mut sparks = devices.split_off(ranks);
-    resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
+    if !early_encoder {
+        resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
+    }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens: pool, waste, notes }
 }
