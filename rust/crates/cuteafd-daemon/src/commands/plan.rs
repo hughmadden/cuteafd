@@ -1677,7 +1677,8 @@ mod tests {
             assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
                 (staging * mark, state(concurrency)));
         }
-        assert_eq!(planned(&[]), (staging * mark, state(16)));
+        let default_sequences = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64;
+        assert_eq!(planned(&[]), served(default_sequences, 20, 2048));
         // Explicit host-off retains the legacy lane floor and entries/budget rule exactly.
         assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (34 * mark, state(16)));
         assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "128"]), (258 * mark, state(128)));

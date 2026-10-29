@@ -3512,8 +3512,12 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
                 glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default()
             }), ..sparks(4) };
             let automatic = plan(dir.path(), &options).unwrap();
-            options.layout.as_mut().unwrap().concurrency =
-                cuteafd_core::serving_capacity::default_concurrency(bytes);
+            options.layout.as_mut().unwrap().concurrency = match automatic.family.as_deref() {
+                Some("glm5") => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+                Some("glm5_flash") => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
+                Some("mimo_v2") => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+                _ => cuteafd_core::serving_capacity::default_concurrency(bytes),
+            };
             let explicit = plan(dir.path(), &options).unwrap();
             assert_eq!(automatic.memory_layout, explicit.memory_layout, "family {:?}, {bytes}", automatic.family);
             assert_eq!(automatic.placement_supported, explicit.placement_supported);
