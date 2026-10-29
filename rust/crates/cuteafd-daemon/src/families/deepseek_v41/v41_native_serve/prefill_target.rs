@@ -368,6 +368,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
 /// (replay, continuation, scoring, cold steps) at rows from 0.
 pub(crate) struct PrefillSlots<'a, P: PrefillTarget<'a>> {
     pub slots: Vec<(P, P::Transport)>,
+    pub packed_suffix: P::Suffix,
 }
 impl<'a, P: PrefillTarget<'a>> PrefillSlots<'a, P> {
     pub(crate) fn slot0(&mut self) -> (&mut P, &mut P::Transport) {
@@ -383,7 +384,8 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type PrefillLink;
     fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink>;
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()>;
-    fn new_packed_suffix(&self, lib: &'a NativeLibrary,
+    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize) -> Result<Self::Suffix>;
+    fn new_packed_suffix(storage: &Self::Suffix,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix>;
     /// # Safety
     /// Member leases, passes and packed suffix remain exclusive until all waves drain.
@@ -424,9 +426,12 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
         transport.restore_link(link)
     }
-    fn new_packed_suffix(&self, lib: &'a NativeLibrary,
+    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize) -> Result<Self::Suffix> {
+        EncoderSuffix::packed_storage(lib, unit)
+    }
+    fn new_packed_suffix(storage: &Self::Suffix,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix> {
-        EncoderSuffix::packed(lib, segments)
+        EncoderSuffix::packed(storage, segments)
     }
     async unsafe fn packed_encoder_unit(slots: Vec<(&mut Self, &mut Self::Transport)>,
         prefill: &mut Self::PrefillLink, requests: &mut Requests<'a>,
@@ -484,9 +489,12 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         ensure!(link.device.id == device.id, "prefill link device differs from slot 0's");
         device.run(|| transport.get_mut().restore_link(link.into_inner()))
     }
-    fn new_packed_suffix(&self, lib: &'a NativeLibrary,
+    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize) -> Result<Self::Suffix> {
+        self.encoder_device()?.own(|| EncoderSuffix::packed_storage(lib, unit))
+    }
+    fn new_packed_suffix(storage: &Self::Suffix,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix> {
-        self.encoder_device()?.own(|| EncoderSuffix::packed(lib, segments))
+        storage.device.own(|| EncoderSuffix::packed(storage.get(), segments))
     }
     async unsafe fn packed_encoder_unit(slots: Vec<(&mut Self, &mut Self::Transport)>,
         prefill: &mut Self::PrefillLink, requests: &mut Requests<'a>,

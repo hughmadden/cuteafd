@@ -1514,6 +1514,7 @@ mod tests {
         devices[1].run(|| slot_transports[0].get_mut().bootstrap(20, nvfp4))?;
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
+            packed_suffix: pass.new_packed_storage(&lib, unit_rows as usize)?,
             slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
         };
         if let Some(windows) = packed_windows {
@@ -1527,23 +1528,45 @@ mod tests {
                 devices, &draft_weights, &table, [&vocab[0], &vocab[1]], unit_rows, 2)?;
             let samples: Vec<_> = (0..20).flat_map(|sample| windows.iter().map(move |window|
                 (window, window.positions[sample].pos))).collect();
-            let mut scored = std::collections::BTreeMap::<_, Vec<_>>::new();
+            let mut scored = std::collections::BTreeMap::<_, (Vec<_>, Vec<_>)>::new();
             for pack in samples.chunks(2) {
                 let rows = crate::families::deepseek_v41::v41_native_serve::scheduler::exercise_packed_prefill(
                     &lib, &runtime, &mut requests, &mut prefill_slots, &args, pack, Some(draft.get_mut()))?;
-                for ((window, _), row) in pack.iter().zip(rows) {
-                    scored.entry(window.id.clone()).or_default().push(row);
+                for ((window, _), (packed, singleton)) in pack.iter().zip(rows) {
+                    let entry = scored.entry(window.id.clone()).or_default();
+                    entry.0.push(packed);
+                    entry.1.push(singleton);
                 }
             }
-            let (top1_min, kl_max) = cuteafd_bench::fidelity_precision::Tier::Strict.bars();
+            use cuteafd_bench::reference::Fidelity;
+            let mut packed_records = Vec::new();
+            let mut singleton_records = Vec::new();
             for window in windows {
-                let fidelity = window.score(scored.get(&window.id).context("missing packed reference rows")?);
-                eprintln!("V4.1 packed/reference window={} positions={} KL={:.8} top1={:.6}",
-                    window.id, fidelity.positions, fidelity.kl, fidelity.top1);
-                ensure!(fidelity.positions == 20 && fidelity.missing == 0 && fidelity.non_finite == 0
-                    && fidelity.kl <= kl_max && fidelity.top1 >= top1_min,
-                    "packed/reference window {} failed strict fidelity: {fidelity:?}", window.id);
+                let (packed, singleton) = scored.get(&window.id).context("missing packed reference rows")?;
+                let (packed, singleton) = (window.score(packed), window.score(singleton));
+                ensure!(packed.positions == 20 && singleton.positions == 20
+                    && packed.missing == 0 && singleton.missing == 0
+                    && packed.non_finite == 0 && singleton.non_finite == 0,
+                    "packed/singleton reference rows missing or nonfinite");
+                // Every endpoint is a member; a pooled tie cannot hide one degraded member.
+                for (p, s) in packed.records.iter().zip(&singleton.records) {
+                    ensure!(p.position == s.position && p.window == s.window,
+                        "packed/singleton reference positions differ");
+                    ensure!(p.kl - s.kl <= 0.005 && i32::from(p.agree) - i32::from(s.agree) >= 0,
+                        "packed member {}:{} regressed: packed {p:?}, singleton {s:?}", p.window, p.position);
+                }
+                eprintln!("V4.1 packed/reference window={} positions={} packed KL={:.8} top1={:.6}; singleton KL={:.8} top1={:.6}",
+                    window.id, packed.positions, packed.kl, packed.top1, singleton.kl, singleton.top1);
+                packed_records.extend(packed.records);
+                singleton_records.extend(singleton.records);
             }
+            let packed = Fidelity::from_records(packed_records);
+            let singleton = Fidelity::from_records(singleton_records);
+            eprintln!("V4.1 packed/reference pooled positions={} packed KL={:.8} top1={:.6}; singleton KL={:.8} top1={:.6}; delta KL={:.8} top1={:.6}",
+                packed.positions, packed.kl, packed.top1, singleton.kl, singleton.top1,
+                packed.kl - singleton.kl, packed.top1 - singleton.top1);
+            ensure!(packed.positions == 60 && packed.kl - singleton.kl <= 0.005
+                && packed.top1 - singleton.top1 >= -0.01, "packed pooled fidelity regressed");
             return Ok(());
         }
         for chunk_rows in [3, 16] {

@@ -20,8 +20,8 @@ fn packed_tails(segments: &[crate::shared::prefill_packing::Segment])
 /// One admitted prompt's final encoder rows, retained across encoder chunk reuse.
 /// Allocate at admission; capture copies only the final window's intersecting rows.
 pub(crate) struct EncoderSuffix<'a> {
-    residual: DeviceAllocation<'a>,
-    pre: DeviceAllocation<'a>,
+    residual: std::rc::Rc<DeviceAllocation<'a>>,
+    pre: std::rc::Rc<DeviceAllocation<'a>>,
     tokens: Vec<u64>,
     next: u64,
     end: u64,
@@ -38,18 +38,30 @@ impl<'a> EncoderSuffix<'a> {
         ensure!(Self::device_bytes(prompt_end)? <= budget, "encoder suffix exceeds budget");
         let start = prompt_end.saturating_sub(128);
         let rows = (prompt_end - start) as usize;
-        Ok(Self { residual: DeviceAllocation::new(library, rows * 40960)?,
-            pre: DeviceAllocation::new(library, rows * 16)?, tokens: (start..prompt_end).collect(),
+        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::new(library, rows * 40960)?),
+            pre: std::rc::Rc::new(DeviceAllocation::new(library, rows * 16)?), tokens: (start..prompt_end).collect(),
             next: start, end: prompt_end, binding: QueryBinding::new(19)?, invalid: false, packed: None })
     }
-    /// Retain each member's CED tail in replay order, with no extra device rows.
-    pub(crate) fn packed(library: &'a NativeLibrary,
+    /// One serially reused arena, charged before KV pool admission.
+    pub(crate) fn packed_storage(library: &'a NativeLibrary, unit: usize) -> Result<Self> {
+        ensure!(unit > 0 && unit <= 4096, "invalid packed suffix unit");
+        let rows = unit.min(16 * 128);
+        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::new(library, rows * 40960)?),
+            pre: std::rc::Rc::new(DeviceAllocation::new(library, rows * 16)?), tokens: Vec::new(),
+            next: 0, end: 0, binding: QueryBinding::new(19)?, invalid: true, packed: None })
+    }
+    /// Retain each member's CED tail in the startup arena, with no runtime allocation.
+    pub(crate) fn packed(storage: &Self,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self> {
+        ensure!(std::rc::Rc::strong_count(&storage.residual) == 1
+            && std::rc::Rc::strong_count(&storage.pre) == 1,
+            "packed suffix arena is already borrowed by a live group");
         let tails = packed_tails(segments)?;
         let tokens: Vec<_> = tails.into_iter().flat_map(|(_, positions)| positions).collect();
         let rows = tokens.len();
-        Ok(Self { residual: DeviceAllocation::new(library, rows * 40960)?,
-            pre: DeviceAllocation::new(library, rows * 16)?, tokens,
+        ensure!(rows * 40960 <= storage.residual.buffer.bytes && rows * 16 <= storage.pre.buffer.bytes,
+            "packed suffix exceeds admitted arena");
+        Ok(Self { residual: storage.residual.clone(), pre: storage.pre.clone(), tokens,
             next: 0, end: rows as u64, binding: QueryBinding::new(19)?, invalid: false,
             packed: Some(segments.to_vec()) })
     }
@@ -143,8 +155,10 @@ impl<'a> EncoderSuffix<'a> {
     }
     pub fn output(&self) -> Result<BlockOutput<'_>> {
         ensure!(!self.invalid && self.next == self.end, "encoder suffix is incomplete or invalid");
-        Ok(BlockOutput { binding: self.binding, residual: self.residual.buffer, pre: self.pre.buffer,
-            layer: 19, tokens: &self.tokens })
+        let (mut residual, mut pre) = (self.residual.buffer, self.pre.buffer);
+        residual.bytes = self.tokens.len() * 40960;
+        pre.bytes = self.tokens.len() * 16;
+        Ok(BlockOutput { binding: self.binding, residual, pre, layer: 19, tokens: &self.tokens })
     }
 }
 

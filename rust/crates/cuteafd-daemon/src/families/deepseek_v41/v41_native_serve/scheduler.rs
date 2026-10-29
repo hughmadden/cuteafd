@@ -296,6 +296,19 @@ fn packing_limits(mode: crate::shared::prefill_packing::PackingMode, rows: usize
     }
 }
 
+fn packing_probe_allowed(probe: &crate::shared::probe::ProbeRef) -> bool {
+    crate::shared::probe::scoring(probe).is_none()
+        && probe.as_ref().is_none_or(|p| p.spec.cold_steps.is_empty())
+}
+
+fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill_packing::Limits) -> bool {
+    chunks.len() <= 16 && crate::shared::prefill_packing::plan(chunks, limits).is_ok()
+}
+
+fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
+    !earlier.is_empty() && prompt.starts_with(earlier)
+}
+
 /// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
 /// media and scoring retain their ordinary prefill transaction.
 fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
@@ -311,13 +324,13 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
     let eligible: Vec<_> = admitted.iter().enumerate().filter_map(|(i, (prepared, _, lease, _, _, hit, _))| {
         (hit.is_none() && prepared.images.is_empty() && !prepared.prompt.is_empty()
             && prepared.prompt.len() <= limits.chunk_rows
-            && crate::shared::probe::scoring(&prepared.job.probe).is_none()
+            && packing_probe_allowed(&prepared.job.probe)
             && !prepared.job.events.is_closed()
             && requests.cache().committed_end(*lease).ok() == Some(0)).then_some(i)
     }).collect();
     let chunks: Vec<_> = eligible.iter().map(|&i| (0, admitted[i].0.prompt.len())).collect();
     for range in prefill_packing::groups(eligible.len(), |range|
-        range.len() <= 16 && prefill_packing::plan(&chunks[range], &limits).is_ok()) {
+        packing_group_fits(&chunks[range], &limits)) {
         if range.len() == 1 { continue; }
         let indices = &eligible[range.clone()];
         let segments = prefill_packing::plan(&chunks[range], &limits)?;
@@ -326,7 +339,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
             prefill_hold(&mut || prefixes.prefill_hold());
             for (_, transport) in &mut prefill.slots { P::begin_request(transport)?; }
             for &(lease, tokens) in &members { requests.begin_encoder(lease, tokens.len() as u64)?; }
-            let mut suffix = prefill.slot0().0.new_packed_suffix(lib, &segments)?;
+            let mut suffix = P::new_packed_suffix(&prefill.packed_suffix, &segments)?;
             let mut link = P::take_link(&mut prefill.slots[0].1)?;
             // SAFETY: all member leases and slot/suffix storage remain exclusive until drained.
             let encoded = runtime.block_on(unsafe { P::packed_encoder_unit(prefill.slots.iter_mut()
@@ -389,8 +402,10 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
     args: &crate::cli::NativeServeArgs, samples: &[(&cuteafd_bench::reference::Window, usize)],
     mut draft: Option<&mut DraftRuntime<'w, 'a,
         crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain<'w, 'a>>>,
-) -> Result<Vec<cuteafd_api::openai::probe::ProbeRow>> {
+) -> Result<Vec<(cuteafd_api::openai::probe::ProbeRow, cuteafd_api::openai::probe::ProbeRow)>> {
     type P<'w, 'a> = crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>;
+    ensure!(samples.iter().all(|(_, position)| *position > 128),
+        "packed hardware check must exercise nonzero CED replay starts");
     let prompts: Vec<_> = samples.iter().map(|(window, position)| &window.tokens[..*position]).collect();
     let mut prefixes = PrefixCache::disabled();
     let mut receivers = Vec::new();
@@ -429,7 +444,8 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         ensure!(a.iter().chain(&b).all(|x| x.is_finite()), "nonfinite packed comparison");
         let (window, position) = samples[member];
         let wanted = window.want().remove(&position).context("missing published reference position")?;
-        reference_rows.push(cuteafd_api::openai::probe::summarize(position, &b, 1, &wanted));
+        reference_rows.push((cuteafd_api::openai::probe::summarize(position, &b, 1, &wanted),
+            cuteafd_api::openai::probe::summarize(position, &a, 1, &wanted)));
         let log_probs = |values: &[f32]| {
             let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
             let norm = values.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln() + max;
@@ -472,6 +488,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
     let mut closed = false;
+    let mut prefix_waiters = std::collections::VecDeque::<admission::Prepared>::new();
     // A prepared request whose lifetime budget does not fit beside the running
     // ones waits here, holding no lease, until a request retires.
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<admission::Prepared>::default();
@@ -513,7 +530,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // both lanes; mixed prefill/decode interleaving is a subsequent policy.
         let mut media_ready = media_ready.into_iter();
         let mut intake = receive.len().max(1);
-        let mut admitted = Vec::new();
+        let mut admitted: Vec<PackedAdmission> = Vec::new();
+        let mut next_wave = std::collections::VecDeque::new();
         let mut held_slots = std::collections::BTreeSet::new();
         loop {
             let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len();
@@ -528,6 +546,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 |prepared| prepared.job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Ready(prepared) => prepared,
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Empty if !prefix_waiters.is_empty() => prefix_waiters.pop_front().unwrap(),
                 cuteafd_engine::prefix::AdmissionPoll::Empty if backlog => media.backlog.pop_front().unwrap(),
                 cuteafd_engine::prefix::AdmissionPoll::Empty => {
                 if intake == 0 { break; }
@@ -565,6 +584,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             };
             if prepared.job.events.is_closed() { continue; }
+            // An earlier member will publish its prompt snapshot after this wave.
+            // Defer before leasing, while unrelated queued prompts still pack.
+            if prefixes.engine().enabled() && prepared.images.is_empty()
+                && !crate::shared::probe::cold(&prepared.job.probe)
+                && admitted.iter().any(|(earlier, ..)| earlier.images.is_empty()
+                    && !crate::shared::probe::cold(&earlier.job.probe)
+                    && pending_prefix_hit(&prepared.prompt, &earlier.prompt)) {
+                next_wave.push_back(prepared);
+                continue;
+            }
             if !prepared.images.is_empty() && media.full() {
                 // Encoder waiters are full: wait host-side, holding no lease.
                 if media.backlog.len() < (args.concurrency as usize).max(8) {
@@ -679,6 +708,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             held_slots.insert(slot);
             admitted.push((prepared, id, lease, slot, image_keys, hit, restore));
         }
+        prefix_waiters.extend(next_wave);
         let mut packed_scores = prefill_packed_admissions::<P>(lib, runtime, requests, prefill_slots,
             &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
         for (member, (prepared, id, lease, slot, image_keys, hit, restore)) in admitted.into_iter().enumerate() {
@@ -765,7 +795,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if active.iter().all(Option::is_none) {
             crate::shared::decode_graph::census::idle();
             crate::shared::decode_graph::CaptureWatch::flush();
-            if closed && media.is_empty() && kv_waiter.is_empty() { break; }
+            if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty() { break; }
             if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
@@ -2274,6 +2304,36 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+
+    #[test]
+    fn packing_group_never_exceeds_the_sixteen_member_suffix_arena() {
+        let limits = packing_limits(crate::shared::prefill_packing::PackingMode::Unrestricted,
+            4096, 1048576, None, NATIVE_COORDINATOR_EXACT_CAP);
+        let chunks = [(0, 129); 17];
+        assert!(!packing_group_fits(&chunks, &limits));
+        let groups = crate::shared::prefill_packing::groups(chunks.len(), |range|
+            packing_group_fits(&chunks[range], &limits));
+        assert_eq!(groups, [0..16, 16..17]);
+        for range in groups {
+            let rows: usize = chunks[range.clone()].iter().map(|(_, rows)| rows.min(&128)).sum();
+            assert!(range.len() <= 16 && rows <= limits.chunk_rows.min(16 * 128));
+        }
+    }
+
+    #[test]
+    fn packing_preserves_cold_replay_and_pending_prefixes() {
+        use cuteafd_api::openai::probe::{Probe, ProbeColdStep, ProbeSpec};
+        assert!(packing_probe_allowed(&None));
+        assert!(packing_probe_allowed(&Some(Probe::new(ProbeSpec { cold: true, ..Default::default() }))));
+        let replay = Probe::new(ProbeSpec { cold: true,
+            cold_steps: vec![ProbeColdStep { end: 4, decode: false }], ..Default::default() });
+        assert!(!packing_probe_allowed(&Some(replay)));
+        assert!(pending_prefix_hit(&[1, 2, 3], &[1, 2]));
+        assert!(pending_prefix_hit(&[1, 2], &[1, 2]));
+        assert!(!pending_prefix_hit(&[1, 3], &[1, 2]));
+        assert!(!pending_prefix_hit(&[1], &[1, 2]));
+        assert!(!pending_prefix_hit(&[1], &[]));
+    }
 
     #[test]
     fn packed_prefill_caps_taps_and_unknown_exact_routes_without_rechunking() -> Result<()> {

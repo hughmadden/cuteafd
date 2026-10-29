@@ -270,6 +270,7 @@ impl<'a> NativePrograms<'a> {
                 add(&mut out, "index", index_query + selection + follower);
             }
             if !placed || rank == 0 {
+                add(&mut out, "encoder suffix", unit.min(16 * 128) * (40960 + 16));
                 add(&mut out, "embedding", u * (4 + 40960 + 16 + 10240 + 4));
             }
             // Engram: reserve row planes on each gate GPU (layers 1, 14), gates' scratch at the unit.
@@ -573,6 +574,10 @@ mod tests {
                     4 * owner(&target, rank, "lane 0 target head"));
                 assert!(owner(&target, rank, "prefill slots lane") > owner(&target, rank, "lane 0 backbone"));
             }
+            assert_eq!(owner(&target, 0, "prefill slots encoder suffix"), 2048 * (40960 + 16));
+            assert!(!target.iter().any(|d| d.gpu != 0 && d.group.ends_with("encoder suffix")));
+            let small = programs.prefill_slots(256, 64, ranks, 2, Fp8Head::Off, ranks == 1)?;
+            assert_eq!(owner(&small, 0, "prefill slots encoder suffix"), 64 * (40960 + 16));
             assert!(target.iter().all(|d| d.category == Category::Workspace));
             assert!(!target.iter().any(|d| d.group.starts_with("lane 2")), "decode lanes only");
             // Engram planes live with the gates (layers 1 and 14, GPU0 on two RTX).
