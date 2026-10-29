@@ -381,6 +381,60 @@ mod wait_tests {
     use super::*;
     use std::{future::Future, task::{Context as TaskContext, Poll, Wake, Waker}, time::{Duration, Instant}};
 
+    #[test]
+    fn strided_multipart_preload_preserves_weight_and_scale_rows() -> Result<()> {
+        use std::io::Write;
+        use crate::formats::mapped_preload::MappedPlacement;
+        let dir = tempfile::tempdir()?;
+        let mut tables = Vec::new();
+        let mut expected = Vec::new();
+        for layer in 0..2 {
+            let mut parts = Vec::new();
+            let mut payload = Vec::new();
+            let mut start = 0;
+            for (part, count) in [3, 5, 2].into_iter().enumerate() {
+                let path = dir.path().join(format!("{layer}-{part}"));
+                let mut file = std::fs::File::create(&path)?;
+                file.write_all(&[0xee; 13])?;
+                for row in start..start + count {
+                    let bytes: Vec<_> = (0..264).map(|col| ((layer * 41 + row * 17 + col) % 251) as u8).collect();
+                    file.write_all(&bytes)?;
+                    payload.extend(bytes);
+                }
+                parts.push(crate::TablePart { path, offset: 13, rows: count as u64 });
+                start += count;
+            }
+            // SAFETY: immutable fixture files remain owned until both tables drop.
+            let rows = unsafe { crate::MappedTable::open(&parts,
+                crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
+            tables.push(EngramTable::new_strided(rows)?);
+            expected.push(payload);
+        }
+        let bytes = 2 * 10 * 264;
+        for (cap, host, count) in [(0, bytes, 0), (bytes - 1, bytes, 0),
+            (bytes, bytes - 1, 0), (bytes, bytes, 2)] {
+            let placement = MappedPlacement::resolve(2, 0, 0, cap, host).admit_tables(bytes);
+            assert_eq!((placement.mapped, placement.preloaded), (2 - count, count));
+            assert_eq!(placement.preloaded_bytes, if count == 2 { bytes } else { 0 });
+        }
+        // Scale-only selection must not mistake interleaved rows for separate scales.
+        preload_tables(&mut tables, false)?;
+        assert!(tables.iter().all(|table| table.weights().backend() != crate::TableBackend::Resident));
+        preload_tables(&mut tables, true)?;
+        for (table, payload) in tables.iter().zip(expected) {
+            assert!(table.scales().is_none());
+            assert_eq!(table.weights().backend(), crate::TableBackend::Resident);
+            assert_eq!(table.weights().warm_bytes(), 0);
+            let mut packed = vec![0; 5 * 264];
+            table.weights().gather_slots(&[9, 2, 3, 8, 3], &[4, 1, 0, 3, 2], &mut packed)?;
+            for (slot, row) in [3, 2, 3, 8, 9].into_iter().enumerate() {
+                assert_eq!(&packed[slot * 264..slot * 264 + 256], &payload[row * 264..row * 264 + 256]);
+                assert_eq!(&packed[slot * 264 + 256..(slot + 1) * 264], &payload[row * 264 + 256..(row + 1) * 264]);
+            }
+        }
+        Ok(())
+    }
+
     struct ThreadWake(std::thread::Thread);
     impl Wake for ThreadWake {
         fn wake(self: Arc<Self>) { self.0.unpark(); }

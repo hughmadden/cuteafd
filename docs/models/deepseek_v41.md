@@ -19,7 +19,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
 Byte-identical StridedPLE storage: [min](../../examples/configs/v41-flash-strided-min.config) · [max](../../examples/configs/v41-flash-strided-max.config).
 Its U8 rows contain 256 FP8 weight bytes followed by eight UE8M0 scale bytes.
 Three row-range parts per layer form one shared mapped row space;
-`MAPPED_SCALE_PRELOAD_GIB` has no effect, while `ENGRAM_WARM` warms the whole table.
+`MAPPED_SCALE_PRELOAD_GIB` preloads both complete row tables (all parts, including embedded scales)
+only when the full payload fits the cap and available host memory; smaller caps leave them mapped.
+There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped table.
 
 ## Engineering summary
 

@@ -1045,6 +1045,35 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn strided_engram_preload_plan_counts_two_logical_maps_and_all_part_bytes() {
+    let mut config = v41_config();
+    let mut parts = serde_json::Map::new();
+    let mut tensors = Vec::new();
+    for layer in [1, 14] {
+        let declarations: Vec<_> = [3, 5, 2].into_iter().enumerate().map(|(part, rows)| {
+            let name = format!("layers.{layer}.engram.embed.strided_{part:05}");
+            tensors.push((name.clone(), "U8", vec![rows, 264]));
+            json!({"tensor": name, "rows": rows})
+        }).collect();
+        parts.insert(layer.to_string(), json!(declarations));
+    }
+    config["engram_storage"] = json!({"layout":"fp8_row_interleaved_v1", "weight_bytes":256,
+        "scale_bytes":8, "tensor_suffix":"strided", "parts":parts});
+    let dir = snapshot(config, &tensors);
+    let bytes = 2 * 10 * 264;
+    for (cap, host, count) in [(0, bytes, 0), (bytes - 1, bytes, 0),
+        (bytes, bytes - 1, 0), (bytes, bytes, 2)] {
+        let report = plan(dir.path(), &PlanOptions { mapped_scale_preload_bytes: cap,
+            mapped_scale_host_budget_bytes: Some(host), ..Default::default() }).unwrap();
+        let p = &report.mapped_placement;
+        assert_eq!((p.mapped, p.preloaded, p.scale_bytes, p.table_bytes), (2 - count, count, 0, bytes));
+        assert_eq!(p.preloaded_bytes, if count == 2 { bytes } else { 0 });
+        assert_eq!(report.bytes_by_owner.get("host-preloaded").copied().unwrap_or(0), p.preloaded_bytes);
+        assert!(report.hints.iter().all(|h| !h.what.contains("strided engram")), "{:?}", report.hints);
+    }
+}
+
+#[test]
 fn strided_engram_planner_detects_headers_and_requires_matching_config() {
     let mut config = v41_config();
     config["engram_storage"] = serde_json::json!({"layout": "fp8_row_interleaved_v1",

@@ -199,6 +199,8 @@ fleet-wide floor (minimum of `MemTotal - 20 GiB` across the six hosts); the
 `tp4ep1` control carries no override and keeps the 100 GiB default fallback.
 
 StridedPLE packs each Engram row as 256 FP8 bytes followed by eight scale bytes.
-`MAPPED_SCALE_PRELOAD_GIB` has no effect on this layout (there is no separate
-scale table); `ENGRAM_WARM` warms the complete interleaved table. The original
+`MAPPED_SCALE_PRELOAD_GIB` preloads both complete interleaved tables, across all
+parts, when their full payload fits the cap and available host memory. Smaller
+caps leave them mapped: there is no separate scale-only preload. `ENGRAM_WARM`
+warms the complete mapped interleaved table. The original
 checkpoint and its main release card remain unchanged.
