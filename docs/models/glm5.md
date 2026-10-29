@@ -10,6 +10,11 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
   full model (see `PLAN.md` quant scope).
 - `wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1` and similar EXL3 K4/K5 publications —
   the benchmarked path on both reference configs.
+- `wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6` at
+  `5a4e83a09a11f3145332ed632d28a9894ea88225` - native MCG K4 routed
+  experts and K6 attention, dense/shared FFNs and vocabulary head; qualified
+  on 1 RTX PRO 6000 + 4 Sparks and 2 RTX PRO 6000 + 6 Sparks with DFlash2
+  ([qualification and receipts](https://github.com/tpurtell/cuteafd/pull/856)).
 - NVIDIA ModelOpt NVFP4 (`nvidia/GLM-5.3-NVFP4`) — routed experts in NVFP4
   group-16; dense parts run through the FP8-block/W8A8 paths described
   below.
@@ -17,8 +22,8 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
 **Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): EXL3 K4 [min](../../examples/configs/glm53-exl3-min.config) · [max](../../examples/configs/glm53-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-nvfp4-min.config) · [max](../../examples/configs/glm53-nvfp4-max.config).
 
-Native EXL3 K4 + K6-core qualification recipes (require a native-K6 WIP
-build; not a published release card yet):
+Qualified native EXL3 K4 + K6-core starting configs (use `--wip SLOT` with
+a build containing native K6 support until that path is in a promoted release):
 [min](../../examples/configs/glm53-exl3-k6core-min.config) ·
 [max](../../examples/configs/glm53-exl3-k6core-max.config).
 
@@ -37,6 +42,11 @@ build; not a published release card yet):
 - Speculator: the native MTP layer is not run — DFlash2 external drafters
   are the measured-best speculator for this family, with an adaptive policy
   priced by distinct Spark expert reads.
+- Native K6 uses the shared trellis projection contracts, without a BF16
+  dense/head shadow. The stored 640-channel `kv_a` output completes its
+  native transform before cropping to 576 logical channels. DFlash2 borrows
+  the resident K6 target head on its admitted stream; unused K4 MTP weights
+  are validated but are not loaded into the routed workers.
 - KV format: FP8 MLA latent record (E4M3 + per-128 FP32 group scales, plus
   BF16 RoPE where the layer carries rotary dims); mHC hyper-connections with
   Sinkhorn iterations and an `hc_head` final collapse.
@@ -196,6 +206,12 @@ are not qualified by this two-lane decision pair.
 - Speculative verify and plain decode, and C1/C4 greedy outputs, can differ.
   The current smoke gate permits verified numerical rounding; it does not
   establish byte-identical speculative output or batch invariance.
+  The Core-K6 qualification additionally passed the ten-case strict lossless
+  set on the minimum layout: all 128 token IDs and raw-logit row hashes per
+  case matched drafts on/off, with real verified/accepted drafts recorded.
+  Both layouts passed exact prompt/turn cache restores and quick fidelity
+  against the official BF16 root. These scoped checks are not a general
+  row/batch-invariance or full-context qualification.
 - Prefill remains Spark-bound at both reference layouts; additional RTX
   head-split capacity does not remove the expert-wave bottleneck.
 - Declared NVFP4 routed experts use native W4A4 at every row count, including
