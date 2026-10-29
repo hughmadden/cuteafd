@@ -40,6 +40,9 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight: Spark waves outstanding on the one transport.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     prefill_waves: u8,
+    /// Pack queued short prompts, optionally preserving singleton arithmetic routes.
+    #[arg(long, value_enum, default_value = "unrestricted")]
+    prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -127,6 +130,57 @@ pub(crate) fn spark_model(exports: &[u32], endpoint: SparkEndpoint, waves: u64, 
     ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, spark_rings(max_frame_bytes)?, clients, executions)
 }
 
+// Startup loads the whole selected namespace, not just the current layer route.
+// Shared SWA/CSA projections are packed even when CSA finishes per member.
+const PACKED_PROGRAM_ROLES: &[(&str, crate::shared::prefill_packing::ProgramRows)] = {
+    use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    &[
+        ("hidden_norm", PackedRows),
+        ("attn_q", PackedRows), ("attn_kv", PackedRows), ("attn_gate", PackedRows),
+        ("attn_out", PackedRows), ("attn_out_partial", PackedRows),
+        ("head_gate", PackedRows),
+        ("swa_q_norm_rope", PackedRows), ("swa_k_norm_rope", PackedRows),
+        ("csa_q_norm_rope", PackedRows), ("csa_k_norm_rope", PackedRows),
+        ("index_q", PackedRows), ("index_kz", PackedRows),
+        ("index_q_norm", PackedRows), ("index_k_norm", PackedRows),
+        ("index_weight", PackedRows),
+        ("dense_gate_up", PackedRows), ("dense_down", PackedRows),
+        ("post_silu_w13824_c7", PackedRows), ("post_silu_w13824_c10", PackedRows),
+        ("router", PackedRows), ("route_weights", PackedRows),
+        ("shared_gate_up", PackedRows), ("shared_down", PackedRows),
+        ("post_silu_w1536_c7", PackedRows), ("post_silu_w1536_c10", PackedRows),
+        ("residual_bf16", PackedRows), ("residual_f32", PackedRows),
+        ("expert_input_quant", PackedRows), ("pack_fp8_kv_plane", PackedRows),
+        ("sliding_positions", SequenceLocal), ("sliding_commit", SequenceLocal),
+        ("swa_attention", SequenceLocal), ("swa_attention_fp8", SequenceLocal),
+        ("csa_attention", SequenceLocal), ("csa_attention_fp8", SequenceLocal),
+        ("region_compress", SequenceLocal), ("region_scores", SequenceLocal),
+        ("region_selection", SequenceLocal), ("region_commit", SequenceLocal),
+        // Predictor/head calls retain their member-local row count. RoPE runs at load.
+        ("final_norm", SequenceLocal), ("mtp_eh", SequenceLocal),
+        ("rope_s192_llama3", SequenceLocal), ("rope_s192_plain", SequenceLocal),
+        ("rope_s32_llama3", SequenceLocal), ("rope_s32_plain", SequenceLocal),
+        ("rope_s64_llama3", SequenceLocal), ("rope_s64_plain", SequenceLocal),
+    ]
+};
+
+fn packed_program_inventory(split: bool) -> Vec<(String, crate::shared::prefill_packing::ProgramRows)> {
+    std::iter::once("step5").chain(split.then_some("step52")).flat_map(|namespace|
+        PACKED_PROGRAM_ROLES.iter().map(move |&(suffix, role)| (format!("{namespace}_{suffix}"), role)))
+        .collect()
+}
+
+fn coordinator_packing_cap(programs: &cuteafd_ffi::programs::Programs<'_>, split: bool,
+    mode: crate::shared::prefill_packing::PackingMode, rows: usize) -> Result<usize> {
+    use crate::shared::prefill_packing::{coordinator_row_cap, validate_program_inventory, PackingMode};
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+        family: "step5", split_family: split.then_some("step52") };
+    let owned = packed_program_inventory(split);
+    let inventory = owned.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+    validate_program_inventory(programs.names().filter(|name| selected.contains(name)), &inventory)?;
+    if mode == PackingMode::Exact { coordinator_row_cap(programs, inventory, rows) } else { Ok(rows) }
+}
+
 fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
     cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(0),
         crate::shared::qwen::Encoder::Off, 16)
@@ -161,6 +215,8 @@ fn with_backend<T>(args: &ServeArgs,
     let ids = std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>();
     let devices = ids.iter().map(|&id| Device { library: &library, id }).collect::<Vec<_>>();
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    let coordinator_cap = coordinator_packing_cap(&programs, args.split_device.is_some(),
+        args.prefill_packing, args.prefill_rows as usize)?;
     let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
         family: "step5", split_family: args.split_device.map(|_| "step52") };
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
@@ -330,7 +386,8 @@ fn with_backend<T>(args: &ServeArgs,
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
-            args.prefill_rows as usize)?)?;
+            args.prefill_rows as usize)?)?
+        .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
@@ -660,6 +717,239 @@ mod tests {
             family.drain().map_err(|e| anyhow::anyhow!("live exactness drain: {e}"))?;
             Ok(())
         })
+    }
+
+    fn packing_non_inferior(delta_kl: f64, delta_top1: f64) -> bool {
+        delta_kl.is_finite() && delta_top1.is_finite()
+            && delta_kl <= 0.005 + 1e-12 && delta_top1 >= -0.01 - 1e-12
+    }
+
+    #[test]
+    fn packed_fidelity_non_inferiority_bounds_are_inclusive_and_finite() {
+        assert!(packing_non_inferior(0.005, -0.01));
+        assert!(packing_non_inferior(0.0, 0.0));
+        assert!(!packing_non_inferior(0.0051, 0.0));
+        assert!(!packing_non_inferior(0.0, -0.0101));
+        assert!(!packing_non_inferior(f64::NAN, 0.0));
+        assert!(!packing_non_inferior(0.0, f64::INFINITY));
+    }
+
+    #[test]
+    #[ignore = "requires sealed native exports, target weights and real Spark workers"]
+    fn live_packed_prefill_matches_singletons_with_private_mtp() -> Result<()> {
+        use super::super::{mtp::DraftState, prefix::Placement};
+        use cuteafd_engine::prefix::PrefixFamily;
+        let mut args = live_mtp_args();
+        args.split_device = std::env::var("CUTEAFD_STEP5_SPLIT_DEVICE").ok().map(|s| s.parse()).transpose()?;
+        args.device = std::env::var("CUTEAFD_STEP5_DEVICE").unwrap_or_else(|_| "0".into()).parse()?;
+        args.prefill_rows = 256;
+        args.max_sequences = 4;
+        args.prefill_packing = <crate::shared::prefill_packing::PackingMode as clap::ValueEnum>::from_str(
+            &std::env::var("CUTEAFD_STEP5_PACKING").unwrap_or_else(|_| "exact".into()), false)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?;
+        args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
+        args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
+        args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
+        args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
+            .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
+        let fixtures = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures.join("meta.json"))?)?;
+        super::super::golden::reference_identity(&meta, false)?;
+        use sha2::{Digest, Sha256};
+        let tokenizer = format!("{:x}", Sha256::digest(std::fs::read(args.snapshot.join("tokenizer.json"))?));
+        ensure!(meta["snapshot_identity"]["tokenizer_sha256"] == tokenizer,
+            "packed reference tokenizer differs from target");
+        let window = meta["windows"].as_array().context("packed reference windows")?.iter()
+            .find(|w| w["id"] == "original-page-leases" && w["path"] == "windows/original-page-leases")
+            .context("packed reference window absent")?;
+        let positions = window["positions"].as_array().context("packed reference positions")?.iter()
+            .map(|p| p.as_u64().map(|p| p as usize).context("invalid packed reference position"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!positions.is_empty() && positions.windows(2).all(|p| p[0] < p[1]),
+            "packed reference positions must increase");
+        let folder = fixtures.join("windows/original-page-leases");
+        let bytes = std::fs::read(folder.join("tokens.bin"))?;
+        ensure!(bytes.len() % 4 == 0, "packed exactness token byte extent");
+        let tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        ensure!(tokens.len() >= 192, "packed exactness needs 192 real tokens");
+        let reference_bytes = std::fs::read(folder.join("logits.bin"))?;
+        let vocab = window["vocab"].as_u64().context("packed reference vocabulary")? as usize;
+        ensure!(vocab > 0 && reference_bytes.len() == positions.len() * vocab * 4,
+            "packed reference logit extent");
+        let reference_logits = reference_bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        with_backend(&args, |backend, _| {
+            let (family, mut pool) = backend.prefix_cache(&args.prefix, 4)?;
+            let mut placements = (0..4).map(|sequence| pool.admit_cold(&family, 192, 256,
+                |pages| Placement { pages, sequence, committed: 0 }).map(|a| a.placement)).collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut drafts = (0..4).map(|_| DraftState::default()).collect::<Vec<_>>();
+            ensure!(backend.geometry().vocab_size == vocab, "packed reference vocabulary mismatch");
+            let prompts = [&tokens[..128], &tokens[..159]];
+            for (i, (p, draft)) in placements.iter_mut().zip(&mut drafts).enumerate() {
+                let prompt = prompts[i % 2];
+                backend.bind_request(p, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, prompt.len())?, prompt, 0)?;
+                if i % 2 == 1 {
+                    backend.prefill_device(p, &prompt[..65], 0, pool.pool())?;
+                    backend.prefill_draft(p, 0, &prompt[..65], prompt.get(65).copied(), draft)?;
+                }
+            }
+            let chunks = [&prompts[0][..96], &prompts[1][65..105]];
+            let limits = backend.packed_limits().context("Step-5 packing limits missing")?;
+            let layout = [(0, chunks[0].len()), (65, chunks[1].len())];
+            let groups = crate::shared::prefill_packing::groups(2, |range|
+                crate::shared::prefill_packing::plan(&layout[range], &limits).is_ok());
+            let mut packed_logits = vec![Vec::new(); 2];
+            let mut packed_scores = vec![Vec::new(); 2];
+            let mut packs = 0;
+            for range in groups {
+                if range.len() == 1 {
+                    let i = range.start;
+                    let start = placements[i].committed;
+                    let logits = backend.prefill_device(&mut placements[i], chunks[i], 1, pool.pool())?.context("singleton head")?;
+                    packed_logits[i] = logits.row_host(backend.library(), 0)?;
+                    backend.prefill_draft(&placements[i], start, chunks[i], None, &mut drafts[i])?;
+                } else {
+                    packs += 1;
+                    let mut sequences = placements[..2].iter_mut().zip(&mut drafts[..2]).enumerate().map(|(i, (p, draft))|
+                        scheduler::PrefillSeq { start: p.committed, placement: p, tokens: chunks[i], next: None, draft, neural: true })
+                        .collect::<Vec<_>>();
+                    let outcomes = backend.prefill_packed(&mut sequences, pool.pool(), &mut |i, logits| {
+                        packed_logits[i] = logits.row_host(backend.library(), 0)?;
+                        Ok(Ok(()))
+                    })?;
+                    for outcome in outcomes { outcome?; }
+                    // Each stored position p predicts token p from the true prefix [0, p).
+                    // MTP/head scratch may change, but the packed residual has its own owner.
+                    for i in 0..2 {
+                        let (start, rows) = layout[i];
+                        let selected = positions.iter().enumerate().filter(|(_, p)|
+                            **p > start && **p <= start + rows).collect::<Vec<_>>();
+                        ensure!(!selected.is_empty(), "packed member {i} has no official scored rows");
+                        let offset = chunks[..i].iter().map(|c| c.len()).sum::<usize>();
+                        let packed_rows = selected.iter().map(|(_, p)| offset + **p - start - 1).collect::<Vec<_>>();
+                        let actual = backend.diagnostic_packed_logits(&packed_rows)?;
+                        packed_scores[i] = actual.into_iter().flatten().collect();
+                    }
+                }
+            }
+            let exact = args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact;
+            ensure!(exact || packs == 1, "unrestricted fixture did not exercise packed execution");
+            let mut byte_exact = true;
+            let mut pooled = [0.0; 5]; // packed KL, singleton KL, packed hits, singleton hits, rows
+            let mut non_inferior = true;
+            for i in 0..2 {
+                let j = i + 2;
+                let start = placements[j].committed;
+                let logits = backend.prefill_device(&mut placements[j], chunks[i], 1, pool.pool())?.context("alone head")?;
+                let alone = logits.row_host(backend.library(), 0)?;
+                if !exact {
+                    let selected = positions.iter().enumerate().filter(|(_, p)|
+                        **p > start && **p <= start + chunks[i].len()).collect::<Vec<_>>();
+                    let rows = selected.iter().map(|(_, p)| **p - start - 1).collect::<Vec<_>>();
+                    let control = backend.diagnostic_packed_logits(&rows)?.into_iter().flatten().collect::<Vec<_>>();
+                    let expected = selected.iter().flat_map(|(row, _)|
+                        reference_logits[row * vocab..(row + 1) * vocab].iter().copied()).collect::<Vec<_>>();
+                    let score = |actual: &[f32]| -> Result<(f64, usize)> {
+                        let (kl, _) = crate::shared::golden_scores::scored_kl(&expected, actual, vocab)?;
+                        let argmax = |row: &[f32]| row.iter().enumerate()
+                            .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                        let hits = expected.chunks_exact(vocab).zip(actual.chunks_exact(vocab))
+                            .filter(|(a, b)| argmax(a) == argmax(b)).count();
+                        Ok((kl, hits))
+                    };
+                    let (packed_kl, packed_hits) = score(&packed_scores[i])?;
+                    let (control_kl, control_hits) = score(&control)?;
+                    let n = rows.len() as f64;
+                    let delta_kl = packed_kl - control_kl;
+                    let delta_top1 = (packed_hits as f64 - control_hits as f64) / n;
+                    non_inferior &= packing_non_inferior(delta_kl, delta_top1);
+                    println!("Step-5 packed official member={i} rows={} packed_KL={packed_kl:.9e} singleton_KL={control_kl:.9e} packed_top1={:.6} singleton_top1={:.6} delta_KL={delta_kl:.9e} delta_top1={delta_top1:.6}",
+                        rows.len(), packed_hits as f64 / n, control_hits as f64 / n);
+                    pooled[0] += packed_kl * n;
+                    pooled[1] += control_kl * n;
+                    pooled[2] += packed_hits as f64;
+                    pooled[3] += control_hits as f64;
+                    pooled[4] += n;
+                }
+                backend.prefill_draft(&placements[j], start, chunks[i], None, &mut drafts[j])?;
+                let packed = &packed_logits[i];
+                let (kl, _) = crate::shared::golden_scores::scored_kl(&alone, packed, backend.geometry().vocab_size)?;
+                let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                let top1 = argmax(packed) == argmax(&alone);
+                let logits_equal = packed.iter().map(|v| v.to_bits()).eq(alone.iter().map(|v| v.to_bits()));
+                let state = backend.diagnostic_state(&placements[i])?;
+                let reference = backend.diagnostic_state(&placements[j])?;
+                ensure!(state.len() == reference.len() && state.iter().zip(&reference).all(|(a, b)| a.len() == b.len()),
+                    "packed member {i} target/predictor state shape differs from singleton");
+                let differing = state.iter().flatten().zip(reference.iter().flatten()).filter(|(a, b)| a != b).count();
+                let bytes = state.iter().map(Vec::len).sum::<usize>();
+                let frontier = placements[i].committed == placements[j].committed
+                    && placements[i].committed == layout[i].0 + chunks[i].len();
+                ensure!(frontier, "packed member {i} frontier differs from singleton");
+                println!("Step-5 packed member={i} KL(alone||packed)={kl:.9e} top1_agreement={}/1 logits_byte_exact={logits_equal} state_differing_bytes={differing}/{bytes} frontier={frontier}", usize::from(top1));
+                byte_exact &= logits_equal && differing == 0;
+                if exact {
+                    ensure!(logits_equal, "packed member {i} logits differ from singleton");
+                    ensure!(differing == 0, "packed member {i} target/predictor state differs from singleton");
+                }
+            }
+            if !exact {
+                ensure!(pooled[4] > 0.0, "packed fidelity needs scored rows");
+                let delta_kl = (pooled[0] - pooled[1]) / pooled[4];
+                let delta_top1 = (pooled[2] - pooled[3]) / pooled[4];
+                println!("Step-5 packed pooled rows={} packed_KL={:.9e} singleton_KL={:.9e} packed_top1={:.6} singleton_top1={:.6} delta_KL={delta_kl:.9e} delta_top1={delta_top1:.6}",
+                    pooled[4], pooled[0] / pooled[4], pooled[1] / pooled[4], pooled[2] / pooled[4], pooled[3] / pooled[4]);
+                ensure!(non_inferior && packing_non_inferior(delta_kl, delta_top1),
+                    "packed member or pooled fidelity regresses its same-row singleton control");
+            }
+            println!("Step-5 packed check mode={:?} members=2 packs={packs} cap={} target_kv_csa=checked predictor_stages=3 logits=checked byte_exact={byte_exact}", args.prefill_packing, limits.rows);
+            for p in &placements { pool.release(&family, &p.pages)?; }
+            family.drain().map_err(|e| anyhow::anyhow!("packed exactness drain: {e}"))?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn packed_startup_catalogue_has_explicit_roles_and_rejects_new_programs() -> Result<()> {
+        use crate::shared::prefill_packing::{validate_program_inventory, ProgramRows::*};
+        for split in [false, true] {
+            let owned = packed_program_inventory(split);
+            let inventory = owned.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+            assert_eq!(inventory.len(), if split { 96 } else { 48 });
+            validate_program_inventory(inventory.iter().map(|(name, _)| *name), &inventory)?;
+            let mut required = inventory.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+            required.push("step5_new_projection");
+            assert!(validate_program_inventory(required, &inventory).is_err());
+            assert!(validate_program_inventory(inventory.iter().skip(1).map(|(name, _)| *name), &inventory).is_err());
+            for prefix in std::iter::once("step5").chain(split.then_some("step52")) {
+                let role = |suffix| inventory.iter().find(|(name, _)| *name == format!("{prefix}_{suffix}"))
+                    .map(|(_, role)| *role).unwrap();
+                for suffix in ["router", "attn_q", "index_weight", "pack_fp8_kv_plane", "shared_gate_up"] {
+                    assert_eq!(role(suffix), PackedRows);
+                }
+                for suffix in ["swa_attention", "csa_attention_fp8", "region_compress", "mtp_eh", "final_norm"] {
+                    assert_eq!(role(suffix), SequenceLocal);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_exact_coordinator_cap_keeps_large_partner_singleton() -> Result<()> {
+        use crate::shared::prefill_packing::{groups, plan, Limits};
+        let chunks = [(0, 32), (65, 80), (0, 16), (511, 48)];
+        let expert_cap = 256usize;
+        let limits = Limits { rows: expert_cap.min(64), chunk_rows: 256, max_context: 4096, taps: None };
+        assert_eq!(groups(chunks.len(), |range| plan(&chunks[range], &limits).is_ok()),
+            [0..1, 1..2, 2..4]);
+        assert!(plan(&chunks[..2], &Limits { rows: expert_cap, ..limits }).is_ok());
+        assert_eq!(chunks[1].1, 80, "the large member retains its singleton arithmetic");
+        let unknown = Limits { rows: 0, ..limits };
+        assert_eq!(groups(chunks.len(), |range| plan(&chunks[range], &unknown).is_ok()),
+            [0..1, 1..2, 2..3, 3..4]);
+        Ok(())
     }
 
     #[test]

@@ -1124,6 +1124,41 @@ fn zero(stream: &Stream<'_>, target: CuteafdDeviceBuffer) -> Result<()> {
 pub(super) mod tests {
     use super::*;
 
+    #[test]
+    fn packed_check_descriptors_equal_singletons_and_partners_cannot_change_positions() -> Result<()> {
+        use crate::shared::prefill_packing::{plan, Limits};
+        use cuteafd_transport::ExpertV2SourceKind;
+        let limits = Limits { rows: 256, chunk_rows: 256, max_context: 4096, taps: None };
+        for chunks in [vec![(65, 7), (511, 17), (0, 1)], vec![(0, 31), (7, 9)], vec![(63, 64), (64, 65)]] {
+            let segments = plan(&chunks, &limits)?;
+            let pages = [0, 1];
+            let descriptors = segments.iter().enumerate().map(|(i, segment)| SequenceRows {
+                sequence: i as u64 + 3, start: segment.first, rows: segment.rows, base: segment.start,
+                pages: &pages,
+            }).collect::<Vec<_>>();
+            let retained = retain_wave(&descriptors)?;
+            let packed = expert_rows(&retained, ExpertV2SourceKind::Prefill)?;
+            for (i, segment) in segments.iter().enumerate() {
+                let single = retain_wave(&[SequenceRows { start: 0, ..descriptors[i] }])?;
+                let alone = expert_rows(&single, ExpertV2SourceKind::Prefill)?;
+                for (offset, reference) in alone.iter().enumerate() {
+                    let actual = &packed[segment.first + offset];
+                    assert_eq!((actual.source_request_id, actual.token_position, actual.source_kind),
+                        (reference.source_request_id, reference.token_position, reference.source_kind));
+                    assert_eq!(actual.row_id as usize, segment.first + offset);
+                    assert_eq!(actual.route_offset as usize, (segment.first + offset) * 8);
+                }
+                // CSA's carry belongs to this sequence, not the packed row offset.
+                assert_eq!(retained[i].base % 8, single[0].base % 8);
+                assert_eq!(retained[i].raw, chunks[..i].iter().map(|(base, rows)| base % 8 + rows).sum::<usize>());
+                let changed = vec![(3000, 1), chunks[i]];
+                let partner = plan(&changed, &limits)?;
+                assert_eq!((partner[1].start, partner[1].rows), (segment.start, segment.rows));
+            }
+        }
+        Ok(())
+    }
+
     /// Units stage the span's raw indexer rows exactly as one whole step: the
     /// committed tail (rows % 8 before the span) carries only into the first
     /// unit, every unit lands at pending + offset, and per-unit compression of

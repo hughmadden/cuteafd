@@ -149,6 +149,7 @@ pub(super) struct Step5Backend<'e, 'a> {
     /// Prefill units: the unit and the waves in flight.
     prefill: (usize, usize),
     depth: Option<crate::shared::prefill_depth::PrefillDepth>,
+    packed_row_cap: Option<usize>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -181,7 +182,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false, prefill: (rows, 1), depth: None })
+            full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None })
     }
 
     /// Prefill units: `depth`'s waves of its unit, cut from the step's rows.
@@ -196,6 +197,26 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
 
 
 
+    pub(super) fn configure_packing(mut self, mode: crate::shared::prefill_packing::PackingMode,
+        coordinator_cap: usize) -> Result<Self> {
+        use crate::shared::prefill_packing::{log_mode, PackingMode};
+        if mode == PackingMode::Exact {
+            let cap = self.execution.packed_row_cap(self.prefill.0)?.min(coordinator_cap);
+            self.packed_row_cap = Some(cap);
+            log_mode(mode, cap);
+        }
+        Ok(self)
+    }
+
+    fn packing_limits(&self) -> crate::shared::prefill_packing::Limits {
+        crate::shared::prefill_packing::Limits {
+            rows: self.packed_row_cap.unwrap_or(self.prefill.0), chunk_rows: self.prefill.0,
+            max_context: self.context,
+            // Native MTP target history is request-owned, not a shared tap ring.
+            taps: None,
+        }
+    }
+
     /// The head was admitted at chunk width: all-row prefill scoring is served.
     pub(super) fn with_full_prefill_logits(mut self, enabled: bool) -> Self {
         self.full_prefill_logits = enabled;
@@ -205,6 +226,21 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     pub(super) fn with_mtp(mut self, mtp: &'e super::mtp::Runtime<'a>) -> Self {
         self.mtp = Some(mtp);
         self
+    }
+
+    /// Score retained packed target rows before another target pass replaces them.
+    #[cfg(test)]
+    pub(super) fn diagnostic_packed_logits(&self, rows: &[usize]) -> Result<Vec<Vec<f32>>> {
+        let rank = self.execution.ownership().execution().spec().head_gpu as usize;
+        let stages = self.execution.stages();
+        let stream = &stages[rank].stream;
+        let head = self.execution.head()?;
+        rows.iter().map(|&row| {
+            let source = super::mtp::slice(self.inputs.residual.buffer, row * H * 4, H * 4)?;
+            let logits = head.device_logits_on(source, 1, stream)?;
+            stream.drain()?;
+            logits.row_host(self.library, 0)
+        }).collect()
     }
 
     #[cfg(test)]
@@ -241,6 +277,13 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     /// needs its last row); None projects every row (decode and verify).
     fn execute(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
         kind: cuteafd_transport::ExpertV2SourceKind, logit_rows: Option<usize>) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
+        let (step, logits) = self.execute_inner(sequences, pool, kind, logit_rows)?;
+        Ok((step, logits.context("Step-5 target omitted requested logits")?))
+    }
+
+    fn execute_inner(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
+        kind: cuteafd_transport::ExpertV2SourceKind, logit_rows: Option<usize>)
+        -> Result<(Evidence<'e, 'a>, Option<DeviceLogits>)> {
         self.execution.require_live()?;
         let input = self.inputs;
         let mut first_row = 0usize;
@@ -310,11 +353,32 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                 }
             }
             let rows = logit_rows.unwrap_or(meta.rows);
+            #[cfg(test)]
+            if rows != 0 && kind == cuteafd_transport::ExpertV2SourceKind::Prefill {
+                // Singleton controls use the same retained rows and one-row head as packed diagnostics.
+                meta.stream.device.run(|| {
+                    // SAFETY: Step retains both admitted owners through stream drainage.
+                    unsafe { crate::shared::memory::device::copy_device_ordered(self.library,
+                        input.residual.buffer, output, meta.rows * H * 4, meta.stream.raw) }
+                })?;
+            }
+            if rows == 0 {
+                // Heads/MTP reuse native scratch. Preserve every member's terminal
+                // residual in the independent input owner before the first head.
+                ensure!(input.residual.buffer.device_id == device.id,
+                    "Step-5 packed residual must land on the entry/head device");
+                meta.stream.device.run(|| {
+                    // SAFETY: Step retains both admitted owners through stream drainage.
+                    unsafe { crate::shared::memory::device::copy_device_ordered(self.library,
+                        input.residual.buffer, output, meta.rows * H * 4, meta.stream.raw) }
+                })?;
+                return Ok(None);
+            }
             ensure!((1..=meta.rows).contains(&rows), "Step-5 head rows outside the wave");
             let skip = (meta.rows - rows) * H * 4;
             let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: output.ptr.wrapping_byte_add(skip),
                 bytes: output.bytes.checked_sub(skip).context("Step-5 head input extent")?, ..output };
-            head.device_logits_on(input, rows, meta.stream)
+            head.device_logits_on(input, rows, meta.stream).map(Some)
         })?;
         Ok((step, logits))
     }
@@ -419,6 +483,44 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         if logit_rows == 0 { return Ok(None); }
         Ok(Some(logits))
     }
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        Some(self.packing_limits())
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, NoDraft>], pool: &RefPagePool,
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        ensure!(sequences.iter().all(|s| s.start == s.placement.committed),
+            "Step-5 packed member frontier differs from placement");
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &self.packing_limits())?;
+        self.state.submit(|| {
+            let mut target = sequences.iter_mut().map(|s| (&mut *s.placement, s.tokens)).collect::<Vec<_>>();
+            let (step, _) = self.state.post_execution(self.execute_inner(&target, pool,
+                cuteafd_transport::ExpertV2SourceKind::Prefill, Some(0))?)?;
+            let mut accepted = target.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
+                .collect::<Vec<_>>();
+            step.publish_wave(&mut accepted)?;
+            drop(accepted);
+            drop(target);
+            let rank = self.execution.ownership().execution().spec().head_gpu as usize;
+            let stages = self.execution.stages();
+            let stream = &stages[rank].stream;
+            let head = self.execution.head()?;
+            crate::shared::prefill_packing::finish_members(segments.len(), |i| {
+                let sequence = &mut sequences[i];
+                if sequence.neural {
+                    self.prefill_draft(sequence.placement, sequence.start, sequence.tokens,
+                        sequence.next, sequence.draft)?;
+                }
+                let source = super::mtp::slice(self.inputs.residual.buffer,
+                    (segments[i].end_row() - 1) * H * 4, H * 4)?;
+                let logits = head.device_logits_on(source, 1, stream)?;
+                stream.drain()?;
+                Ok(logits)
+            }, on_logits)
+        })
+    }
+
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.verify(|| self.execute(sequences, pool, verify_kind(speculative), None)).map(Some)
@@ -500,6 +602,55 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_check_cancellation_is_member_local_and_heads_finish_before_scratch_reuse() {
+        use crate::shared::prefill_packing::{finish_members, member_outcomes};
+        let scratch = Cell::new(usize::MAX);
+        let consumed = RefCell::new(Vec::new());
+        let outcomes = finish_members(3, |i| { scratch.set(i); Ok(i) }, &mut |i, row| {
+            assert_eq!(scratch.get(), row);
+            consumed.borrow_mut().push(i);
+            Ok(if i == 1 { Err(anyhow::anyhow!("client cancelled")) } else { Ok(()) })
+        });
+        let outcomes = member_outcomes(3, outcomes);
+        assert_eq!(*consumed.borrow(), [0, 1, 2]);
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+        let failed = finish_members(3, |i| { ensure!(i != 1, "device failure"); Ok(i) },
+            &mut |_, _| Ok(Ok(())));
+        assert!(member_outcomes(3, failed).iter().all(Result::is_err));
+    }
+
+    #[test]
+    fn packed_check_exact_mode_honours_loaded_routes_and_unknown_metadata_runs_alone() -> Result<()> {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping,
+            InstalledExpertVariant, WorkerIdentity, WorkerSelection};
+        use crate::shared::prefill_packing::{groups, plan, Limits};
+        let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "manifest": null, "geometry": [4096, 352, 8, 1536, 91],
+            "world": 4, "topology": [4, 1], "ownership_wire": false }))?;
+        let variant = |cut| InstalledExpertVariant::from_queries(256, |_| Ok(64))?
+            .with_arithmetic_routes(|rows| Ok(Some(if rows <= cut { (1, cut) } else { (2, 256) })));
+        let report = InstalledExpertGrouping::new(WorkerSelection::new(identity.clone(), &[3, 4])?,
+            0, 256, ExpertGroupingSelector::Fp8Nearest, vec![variant(80)?])?
+            .with_bf16_variants(vec![variant(32)?])?;
+        let cap = |reports: &[InstalledExpertGrouping], inputs: &[(usize, bool)]|
+            super::super::execution::packed_route_cap(256, reports, inputs);
+        assert_eq!(cap(&[report.clone()], &[(3, false), (4, false)]), 80);
+        assert_eq!(cap(&[report.clone()], &[(3, true), (4, true)]), 32);
+        assert_eq!(cap(&[report.clone()], &[(3, false), (5, false)]), 0);
+        assert_eq!(cap(&[], &[(3, false)]), 0);
+        let limits = Limits { rows: cap(&[report], &[(3, true)]), chunk_rows: 256,
+            max_context: 4096, taps: None };
+        let chunks = [(0, 7), (65, 17), (0, 9), (511, 64), (0, 1)];
+        assert_eq!(groups(chunks.len(), |range| plan(&chunks[range], &limits).is_ok()),
+            [0..2, 2..3, 3..4, 4..5]);
+        let unknown = InstalledExpertGrouping::new(WorkerSelection::new(identity, &[3])?,
+            0, 256, ExpertGroupingSelector::Fp8Nearest,
+            vec![InstalledExpertVariant::from_queries(256, |_| Ok(64))?])?;
+        assert_eq!(cap(&[unknown], &[(3, false)]), 0);
+        Ok(())
+    }
 
     #[test]
     fn ungraphed_source_metadata_preserves_scoring_decode_and_speculation() {
