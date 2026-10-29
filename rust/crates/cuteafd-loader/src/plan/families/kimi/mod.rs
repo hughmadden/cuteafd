@@ -261,7 +261,7 @@ impl Family for KimiK3 {
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
     fn id(&self) -> &'static str { "kimi_k3" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|a| a == "KimiK3ForConditionalGeneration")
             || checkpoint.model_type() == Some("kimi_k3")

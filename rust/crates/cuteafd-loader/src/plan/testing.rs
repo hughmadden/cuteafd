@@ -25,6 +25,16 @@ impl BudgetedPlanInput {
     pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> { self.input.expert_catalog() }
 
     #[track_caller]
+    pub fn plan_spark_count(&self, options: &super::PlanOptions, available: usize,
+        explicit: Option<usize>) -> Result<super::PlanReport, super::PlanError> {
+        let started = std::time::Instant::now();
+        let result = self.input.plan_spark_count(options, available, explicit);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30),
+            "full Spark-count plan exceeded 30s: snapshot={} options={options:?}", self.checkpoint().snapshot.display());
+        result
+    }
+
+    #[track_caller]
     pub fn plan(&self, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
         let (result, phases) = self.input.plan_with_timings(options);
         eprintln!("full-plan {:?} ranks={} phases={phases:?}", self.checkpoint().snapshot, options.placement.spark_ranks());

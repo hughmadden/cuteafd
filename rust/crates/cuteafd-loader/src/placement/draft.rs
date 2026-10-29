@@ -13,9 +13,13 @@ use super::{Bytes2, Demand, Movable, MovableDemands, MovableId, Placement, Place
 /// Controls a device-driven draft bridge owns on each GPU: four zero-payload
 /// receive slots (256 B each), the control block and the abort word. No
 /// duplicate payload destination is allocated.
-pub const BRIDGE_EXCHANGE_BYTES: u64 = BRIDGE_SLOTS * 256 + 256 + 256;
+pub const BRIDGE_EXCHANGE_BYTES: u64 = BRIDGE_SLOTS * BRIDGE_SLOT_BYTES as u64 + 256 + 256;
 /// Receive slots of a draft bridge: context, input rows, hidden rows, logits.
 pub const BRIDGE_SLOTS: u64 = 4;
+/// Minimal receive allocation for each control-only slot; payloads go directly
+/// to their existing owners, but the exchange still needs valid receive slots.
+pub const BRIDGE_SLOT_BYTES: usize = 256;
+pub const BRIDGE_SLOT_SIZES: [usize; BRIDGE_SLOTS as usize] = [BRIDGE_SLOT_BYTES; BRIDGE_SLOTS as usize];
 
 /// Rank-1 drafter bridge with embedding/tap staging on rank 0. The head's
 /// owning rank is explicit: a rank-1 head reuses the drafter's hidden rows,

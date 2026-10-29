@@ -1149,16 +1149,37 @@ pub(super) mod tests {
         let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
-        let automatic = plan_input.plan(&PlanOptions {
+        let automatic = plan_input.plan_spark_count(&PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![capacity; 2], concurrency: 16,
                 workspace_manifest: Some(manifest_path.clone()),
                 spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }),
             ..Default::default()
-        })?;
-        ensure!(automatic.fits && automatic.placement_supported, "Auto shape/pool: {:?}", automatic.hints);
+        }, 6, Some(6))?;
+        ensure!(automatic.fits && automatic.placement_supported && automatic.executable(), "Auto shape/pool: {:?}", automatic.hints);
+        assert!(!automatic.hints.iter().any(|hint| hint.what.contains("prefill reserve does not fit")));
         assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves), (Some(2752), Some(3)));
+        let unit = automatic.prefill_unit_rows.context("planned Kimi unit rows")? as usize;
+        for f32_partials in [false, true] {
+            let receive = cuteafd_loader::families::kimi_k3::core::exchange_recv_bytes(unit, f32_partials)?;
+            crate::shared::peer_split::validate_slot_sizes([0, 1], &[receive])?;
+            let demands = super::super::startup::exchange_demands(unit, false, f32_partials)?;
+            assert!(demands.iter().all(|demand| demand.bytes >= receive as u64));
+        }
+        // The max config's remote DFlash bridge has control-only slots. Its
+        // planner charge and runtime extents must agree before touching CUDA.
+        use cuteafd_loader::placement::draft::{BRIDGE_SLOT_SIZES, BRIDGE_EXCHANGE_BYTES};
+        crate::shared::peer_split::validate_slot_sizes([0, 1], &BRIDGE_SLOT_SIZES)?;
+        assert_eq!(BRIDGE_SLOT_SIZES.iter().sum::<usize>() as u64 + 256 + 256, BRIDGE_EXCHANGE_BYTES);
+        let draft = draft_layout(16, 16, context);
+        let demands = super::super::draft::bridge_demands(&draft,
+            automatic.prefill_span_rows.context("planned Kimi span rows")? as usize)?;
+        for gpu in 0..2 {
+            let exchange = demands.iter().find(|demand| demand.gpu == gpu && demand.group == "DFlash bridge exchange")
+                .context("planned Kimi remote draft exchange")?;
+            assert_eq!(exchange.bytes, BRIDGE_EXCHANGE_BYTES);
+        }
         assert!(automatic.memory_layout.context("automatic Kimi ledger")?.pool_tokens
             >= cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT as u64);
         let mut refused = 0;
