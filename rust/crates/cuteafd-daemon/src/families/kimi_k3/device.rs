@@ -2057,7 +2057,8 @@ mod tests {
                 assert_eq!(shared.rows, rows);
                 for name in CORE_MEET_PLANES {
                     assert!(!shared.arena_offsets.contains_key(name));
-                    assert_eq!(shared.operands[name], rows * 7168 * 4);
+                    let element_bytes = if name == "K6 reduced" { 4 } else { 2 };
+                    assert_eq!(shared.operands[name], rows * 7168 * element_bytes);
                 }
                 for phase in shared.core_phases() {
                     for (i, &a) in phase.iter().enumerate() {
@@ -2076,8 +2077,8 @@ mod tests {
                     // keeps the 4096-row arena; only row planes double.
                     assert_eq!(base.arena_bytes, 1_340_473_344);
                     assert_eq!(shared.arena_bytes, base.arena_bytes);
-                    // Added bytes: the three FP32 meet planes over the lane.
-                    let meets = CORE_MEET_PLANES.len() * rows * 7168 * 4;
+                    // Two retained BF16 planes and the ordered F32 sum over the lane.
+                    let meets = rows * 7168 * (2 + 2 + 4);
                     let old = stages.values().sum::<usize>();
                     let added = shared.bytes()? - base.bytes()?;
                     assert_eq!(old - meets, 1_554_701_312 - 352_321_536);
