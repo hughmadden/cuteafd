@@ -341,12 +341,20 @@ def upload(args):
             expected = generated[name]["sha256"] if name in generated else evidence[name]["sha256"]
             if name not in {"README.md", "config.json", "model.safetensors.index.json"} and operation.upload_info.sha256.hex() != expected:
                 raise ValueError(f"publication bytes changed after verification: {name}")
+            if isinstance(value, SshFile):
+                value._stop()
             operations.append(operation)
             print(f"publication bytes checked {name}", flush=True)
-        # Public commit only after every input has been rehashed. LFS accepts
-        # file objects and streams SSH rows without local shard staging.
+        # Preupload only after all byte checks. LFS skips content-addressed objects
+        # already present; serialize missing objects and release each stream.
         api.create_repo(TARGET, repo_type="model", exist_ok=True)
-        commit = api.create_commit(TARGET, operations=operations, num_threads=2,
+        for operation in operations:
+            value = operation.path_or_fileobj
+            api.preupload_lfs_files(TARGET, additions=[operation], num_threads=1)
+            if isinstance(value, SshFile):
+                value.close()
+            print(f"publication object ready {operation.path_in_repo}", flush=True)
+        commit = api.create_commit(TARGET, operations=operations, num_threads=1,
             commit_message="Publish byte-identical row-interleaved Engram storage")
     write_json(output.parent / "upload.json", dict(repo=TARGET, commit=str(commit), revision=commit.oid))
     print(commit, flush=True)

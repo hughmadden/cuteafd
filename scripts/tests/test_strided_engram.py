@@ -107,18 +107,25 @@ def test_segmented_upload_inventory_and_storage_declaration(tmp_path, monkeypatc
     repack.write_json(tmp_path / "source-verified.json", evidence)
     repack.write_json(tmp_path / "repack-verified.json", dict(source=repack.SOURCE, target=repack.TARGET,
                       revision=repack.REVISION, source_files=len(siblings), shards=receipts))
-    operations_seen = []
+    operations_seen, preuploaded = [], []
 
     class Operation:
         def __init__(self, path_in_repo, path_or_fileobj):
             self.path_in_repo = path_in_repo
+            self.path_or_fileobj = path_or_fileobj
             self.upload_info = types.SimpleNamespace(sha256=hashlib.sha256(Path(path_or_fileobj).read_bytes()).digest())
 
     class Api:
         def create_repo(self, *args, **kwargs):
             pass
 
+        def preupload_lfs_files(self, repo, additions, num_threads):
+            assert num_threads == 1 and len(additions) == 1
+            preuploaded.extend(additions)
+
         def create_commit(self, repo, operations, **kwargs):
+            assert kwargs["num_threads"] == 1
+            assert operations == preuploaded
             operations_seen.extend(operations)
             return types.SimpleNamespace(oid="commit")
 
