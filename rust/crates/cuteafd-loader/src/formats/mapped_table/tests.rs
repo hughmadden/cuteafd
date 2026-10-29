@@ -64,27 +64,20 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
 }
 
 #[test]
-fn runtime_ring_setup_failure_falls_back_for_demand_and_prefetch() -> TestResult {
+fn runtime_batch_failure_recovers_without_disabling_table() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: this test owns immutable files through all owned reactor reads.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.initialize_reads();
+    if table.backend() != TableBackend::MincoreRouted { return Ok(()); }
     for errno in [libc::ENOMEM, libc::EPERM] {
-        {
-            for prefetch in [false, true] {
-                let (_dir, parts) = parted([3, 3, 2])?;
-                // SAFETY: this test owns immutable shards through all gathers.
-                let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-                for part in &table.parts { part.nowait.store(true, Ordering::Relaxed); }
-                // Startup probe succeeded; the worker's first setup then fails.
-                table.initialize_with_probe(|| Ok(()));
-                uring::fail_next_setup(errno);
-                let mut output = [0; 12];
-                if prefetch { assert_eq!(table.prefetch(&[7, 2, 7], 8)?, 2); }
-                else { table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut output)?; }
-                assert_eq!(table.backend(), TableBackend::Mmap);
-                table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut output)?;
-                assert_eq!(output, [2, 2, 2, 2, 7, 7, 7, 7, 7, 7, 7, 7]);
-                assert_eq!(table.stats().snapshot().unclassified_batches, 0);
-                assert_eq!(table.stats().snapshot().prefetch_unclassified_batches, 0);
-            }
-        }
+        let read = || uring::Read { part: &table.parts[0], row: 2, slot: 0 };
+        let mut bytes = [0; 4];
+        uring::fail_next_setup(errno);
+        assert!(uring::gather(&[read()], &mut bytes, 4, &[Some(false)]).is_err());
+        uring::gather(&[read()], &mut bytes, 4, &[Some(false)])?;
+        assert_eq!(bytes, [2; 4]);
+        assert_eq!(table.backend(), TableBackend::MincoreRouted);
     }
     Ok(())
 }
@@ -157,19 +150,19 @@ fn unclassified_waves_count_batches_not_rows() -> TestResult {
         return Ok(());
     }
     table.parts[0].nowait.store(false, Ordering::Relaxed);
-    assert_eq!(uring::MAX_BATCH, 4096);
+    assert_eq!(uring::MAX_BATCH, 2048);
     let n = uring::MAX_BATCH + 1;
     let reads: Vec<_> = (0..n).map(|i| uring::Read { part: &table.parts[0], row: (i % 3) as u64, slot: n - i - 1 }).collect();
     // Exercise mixed classified hits and unclassified reads in two waves.
     let resident: Vec<_> = (0..n).map(|i| if i % 2 == 0 { None } else { Some(true) }).collect();
     let mut output = vec![0; n * 4];
     let stats = uring::gather(&reads, &mut output, 4, &resident)?;
-    assert_eq!((stats.unclassified_rows, stats.hits, stats.misses), (2049, 2048, 0));
-    assert_eq!(stats.unclassified_bytes, 2049 * 4);
-    assert_eq!(stats.unclassified_batches, 2);
-    assert_eq!(stats.unclassified_batch_histogram.iter().sum::<u64>(), 2);
+    assert_eq!((stats.unclassified_rows, stats.hits, stats.misses), (1025, 1024, 0));
+    assert_eq!(stats.unclassified_bytes, 1025 * 4);
+    assert_eq!(stats.unclassified_batches, 1);
+    assert_eq!(stats.unclassified_batch_histogram.iter().sum::<u64>(), 1);
     assert!(stats.unclassified_batch_ns >= stats.unclassified_batch_max_ns && stats.unclassified_batch_max_ns > 0);
-    assert_eq!(stats.miss_histogram, [0; 7]);
+    assert_eq!(stats.miss_histogram.iter().sum::<u64>(), n as u64);
     for i in 0..n {
         assert_eq!(&output[(n-i-1)*4..(n-i)*4], &[(i % 3) as u8; 4]);
     }
@@ -188,7 +181,8 @@ fn every_ring_bounds_its_io_wq_workers() -> TestResult {
         eprintln!("SKIP io-wq bounds: kernel/seccomp disallows io_uring");
         return Ok(());
     }
-    assert_eq!(uring::ring_worker_bounds()?, [32; 2]);
+    assert!(Arc::ptr_eq(&reactor::global()?, &reactor::global()?));
+    assert_eq!(uring::IOWQ_MAX_WORKERS, 1024);
     Ok(())
 }
 
@@ -426,18 +420,19 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
 }
 
 #[test]
-fn mincore_routing_keeps_nowait_exact_and_falls_back_safely() -> TestResult {
+fn mincore_routing_keeps_hits_on_caller_and_falls_back_safely() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: test-owned shard files remain immutable through the table lifetime.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
     table.initialize_reads();
-    if table.backend() == TableBackend::MincoreRouted && table.stats.nowait.load(Ordering::Relaxed) {
+    if table.backend() == TableBackend::MincoreRouted {
         let mut output = [0; 12];
         table.gather_into(&[7, 2, 7], &mut output)?;
         let stats = table.stats().snapshot();
-        assert_eq!(table.stats.accounting(), "nowait-exact");
-        assert_eq!((stats.page_hits, stats.resident_copy_rows, stats.residency_ns), (3, 0, 0));
-        assert!(stats.nowait_batches > 0);
+        assert_eq!(table.stats.accounting(), "mincore-routed");
+        assert_eq!((stats.page_hits, stats.resident_copy_rows), (3, 3));
+        assert!(stats.residency_ns > 0);
+        assert_eq!(stats.nowait_batches, 0);
     }
     table.initialize_with_probe(|| Err(MappedTableError::Io {
         context: "injected unavailable io_uring".into(),

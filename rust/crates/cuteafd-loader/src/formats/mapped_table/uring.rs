@@ -1,29 +1,31 @@
-//! Buffered io_uring reads. Borrowed file/buffer pointers never escape a drained batch.
-use super::{invalid, MappedRows, MappedTableError, Result};
-use io_uring::{opcode, types, IoUring};
-use std::cell::RefCell;
+//! Caller-side residency classification and process-wide buffered miss reads.
+use super::{invalid, reactor, MappedRows, MappedTableError, ReadPriority, Result};
+use io_uring::{opcode, IoUring};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-pub(super) const MAX_BATCH: usize = 4096;
-/// io-wq workers per ring, bounded and unbound. Each cold FUSE read blocks a
-/// worker, but the connection's max_background (128 on raptor) and store
-/// daemon (~250 threads) bound useful depth. More workers consume the
-/// container's pids budget, not useful depth: cold reads once exhausted its
-/// 16,384-task limit. Thirty-two per ring leaves ample in-flight reads across
-/// gather pools. Deep O_DIRECT/native store I/O is separate from these reads.
-pub(super) const IOWQ_MAX_WORKERS: u32 = 32;
-thread_local! { static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) }; }
+pub(super) const MAX_BATCH: usize = 2048;
+pub(super) const IOWQ_MAX_WORKERS: u32 = 1024;
+pub(super) fn worker_limit() -> Result<u32> {
+    match std::env::var("CUTEAFD_DIAG_TABLE_READ_DEPTH") {
+        Ok(value) => match value.as_str() {
+            "1024" => Ok(1024), "2048" => Ok(2048),
+            _ => Err(invalid("CUTEAFD_DIAG_TABLE_READ_DEPTH must be 1024 or 2048")),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(IOWQ_MAX_WORKERS),
+        Err(_) => Err(invalid("invalid CUTEAFD_DIAG_TABLE_READ_DEPTH")),
+    }
+}
 #[cfg(test)]
 thread_local! { static SETUP_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
-
 #[cfg(test)]
-pub(super) fn fail_next_setup(errno: i32) {
-    RING.with(|ring| *ring.borrow_mut() = None);
-    SETUP_FAILURE.with(|failure| failure.set(Some(errno)));
+pub(super) fn fail_next_setup(errno: i32) { SETUP_FAILURE.with(|failure| failure.set(Some(errno))); }
+fn setup_error() -> Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = SETUP_FAILURE.with(|failure| failure.take()) {
+        return Err(io("injected table reactor failure", std::io::Error::from_raw_os_error(errno)));
+    }
+    Ok(())
 }
-
 #[derive(Default, Debug, Clone, Copy)]
 pub(super) struct ReadStats {
     pub resident_copy_rows: u64,
@@ -58,108 +60,26 @@ pub(super) struct Read<'a> {
 }
 
 fn io(context: &str, source: std::io::Error) -> MappedTableError {
-    MappedTableError::Io {
-        context: context.into(),
-        source,
-    }
+    MappedTableError::Io { context: context.into(), source }
 }
 
-/// The guard drains every queued SQE, including on errors and unwinding. Ring
-/// teardown alone is insufficient: kernel cancellation can outlive close(2).
-struct Batch<'a> {
-    ring: &'a mut IoUring,
-    outstanding: usize,
-}
-impl Batch<'_> {
-    fn push(&mut self, entry: io_uring::squeue::Entry) -> Result<()> {
-        // SAFETY: callers validate disjoint destinations and live files before
-        // queueing. This guard waits for all completions before either can drop.
-        unsafe { self.ring.submission().push(&entry) }
-            .map_err(|_| invalid("io_uring queue capacity exceeded"))?;
-        self.outstanding += 1;
-        Ok(())
-    }
-    fn next(&mut self) -> Result<io_uring::cqueue::Entry> {
-        loop {
-            if let Some(entry) = self.ring.completion().next() {
-                self.outstanding -= 1;
-                return Ok(entry);
-            }
-            match self.ring.submit_and_wait(1) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(io("waiting for mapped-table reads", error)),
-            }
-        }
-    }
-    fn submit(&mut self) -> Result<()> {
-        loop {
-            match self.ring.submit() {
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(io("submitting mapped-table reads", error)),
-            }
+fn setup_with(mut setup: impl FnMut(u32) -> std::io::Result<IoUring>) -> Result<IoUring> {
+    let mut entries = MAX_BATCH as u32;
+    loop {
+        match setup(entries) {
+            Ok(ring) => return Ok(ring),
+            Err(error) if error.raw_os_error() == Some(libc::ENOMEM) && entries > 64 => {
+                entries /= 2;
+                tracing::warn!(entries, "retrying smaller table reactor ring after ENOMEM");
+            },
+            Err(error) => return Err(io("io_uring_setup", error)),
         }
     }
 }
-impl Drop for Batch<'_> {
-    fn drop(&mut self) {
-        while self.outstanding > 0 {
-            // Remaining queued entries may not yet have been submitted. Draining
-            // also handles partial submit and operation errors without freeing
-            // storage that a kernel worker could still write.
-            if let Err(error) = self.next() {
-                tracing::error!(%error, "cannot drain borrowed io_uring buffers; refusing unsafe teardown");
-                std::process::abort();
-            }
-        }
-    }
-}
-
-fn entry(
-    read: &Read<'_>,
-    base: *mut u8,
-    width: usize,
-    nowait: bool,
-    asynchronous: bool,
-    done: usize,
-    index: usize,
-) -> Result<io_uring::squeue::Entry> {
-    let offset = read.part.file_offset + read.row * width as u64 + done as u64;
-    let at = read.slot * width + done;
-    // SAFETY: gather validates every slot and row before queueing; the exclusive
-    // output borrow and Batch guard outlive every kernel read into this slice.
-    let ptr = unsafe { base.add(at) };
-    Ok(opcode::Read::new(
-        types::Fd(read.part.file.as_raw_fd()),
-        ptr,
-        u32::try_from(width - done)
-            .map_err(|_| invalid("io_uring row exceeds signed CQE length"))?,
-    )
-    .offset(offset)
-    .rw_flags(if nowait { libc::RWF_NOWAIT as _ } else { 0 })
-    .build()
-    .flags(if asynchronous {
-        io_uring::squeue::Flags::ASYNC
-    } else {
-        io_uring::squeue::Flags::empty()
-    })
-    .user_data(index as u64))
-}
-
-fn new_ring(entries: u32) -> Result<IoUring> {
-    #[cfg(test)]
-    if let Some(errno) = SETUP_FAILURE.with(|failure| failure.take()) {
-        return Err(io(
-            "io_uring_setup",
-            std::io::Error::from_raw_os_error(errno),
-        ));
-    }
-    let mut ring = IoUring::new(entries).map_err(|error| io("io_uring_setup", error))?;
-    // Test enter/seccomp in each worker before exposing borrowed destinations.
-    // Closing a failed NOP-only ring cannot leave a buffer write in flight.
+pub(super) fn new_ring() -> Result<IoUring> {
+    let mut ring = setup_with(IoUring::new)?;
     let nop = opcode::Nop::new().build();
-    // SAFETY: NOP has no borrowed file or memory pointers.
+    // SAFETY: NOP holds no file or buffer pointers.
     unsafe { ring.submission().push(&nop) }.map_err(|_| invalid("io_uring probe queue full"))?;
     loop {
         match ring.submit_and_wait(1) {
@@ -168,297 +88,77 @@ fn new_ring(entries: u32) -> Result<IoUring> {
             Ok(_) => break,
         }
     }
-    let result = ring
-        .completion()
-        .next()
-        .ok_or_else(|| invalid("missing io_uring probe completion"))?
-        .result();
-    if result < 0 {
-        return Err(io(
-            "io_uring NOP probe",
-            std::io::Error::from_raw_os_error(-result),
-        ));
-    }
-    // Bound io-wq before any buffered read can block; a ring without the
-    // bound is refused (the caller falls back to mmap).
-    let mut workers = [IOWQ_MAX_WORKERS; 2];
-    ring.submitter()
-        .register_iowq_max_workers(&mut workers)
+    let result = ring.completion().next().ok_or_else(|| invalid("missing io_uring probe completion"))?.result();
+    if result < 0 { return Err(io("io_uring NOP probe", std::io::Error::from_raw_os_error(-result))); }
+    let limit = worker_limit()?;
+    let mut workers = [limit; 2];
+    ring.submitter().register_iowq_max_workers(&mut workers)
         .map_err(|error| io("io_uring IOWQ_MAX_WORKERS", error))?;
+    tracing::info!(sq_entries = ring.params().sq_entries(), iowq_max_workers = limit,
+        buffer_budget_bytes = 16 * reactor::BUFFER_BYTES, "process-wide table read reactor ready");
     Ok(ring)
 }
 
-/// The io-wq worker bounds a fresh ring carries (zero entries query without
-/// changing them).
-#[cfg(test)]
-pub(super) fn ring_worker_bounds() -> Result<[u32; 2]> {
-    let ring = new_ring(2)?;
-    let mut bounds = [0; 2];
-    ring.submitter()
-        .register_iowq_max_workers(&mut bounds)
-        .map_err(|error| io("io_uring IOWQ_MAX_WORKERS query", error))?;
-    Ok(bounds)
+/// Allocate/probe once on the owner thread before model readiness. No transient
+/// per-file probe rings or NOWAIT reads: all cache hits are caller-side copies.
+pub(super) fn probe(_part: &MappedRows) -> Result<bool> {
+    setup_error()?;
+    let owner = reactor::global()?;
+    if !owner.ready() { return Err(invalid("table reactor setup unavailable; batches will retry")); }
+    Ok(false)
 }
 
-/// Checks both ring setup (including seccomp) and this file's buffered NOWAIT
-/// support. EOPNOTSUPP/EINVAL must not be silently counted as cache misses.
-pub(super) fn probe(part: &MappedRows) -> Result<bool> {
-    let mut ring = new_ring(2)?;
-    let mut byte = [0];
-    let sqe = opcode::Read::new(types::Fd(part.file.as_raw_fd()), byte.as_mut_ptr(), 1)
-        .offset(part.file_offset)
-        .rw_flags(libc::RWF_NOWAIT as _)
-        .build();
-    let mut batch = Batch {
-        ring: &mut ring,
-        outstanding: 0,
-    };
-    batch.push(sqe)?;
-    batch.submit()?;
-    let result = batch.next()?.result();
-    if result == -libc::EOPNOTSUPP || result == -libc::EINVAL {
-        // A filesystem lacking NOWAIT can still support ordinary buffered Read.
-        let sqe = opcode::Read::new(types::Fd(part.file.as_raw_fd()), byte.as_mut_ptr(), 1)
-            .offset(part.file_offset)
-            .build();
-        batch.push(sqe)?;
-        batch.submit()?;
-        let result = batch.next()?.result();
-        if result != 1 {
-            return Err(io(
-                "buffered io_uring probe",
-                if result < 0 {
-                    std::io::Error::from_raw_os_error(-result)
-                } else {
-                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty immutable table")
-                },
-            ));
-        }
-        return Ok(false);
-    }
-    if result < 0 && result != -libc::EAGAIN {
-        return Err(io(
-            "buffered RWF_NOWAIT probe",
-            std::io::Error::from_raw_os_error(-result),
-        ));
-    }
-    Ok(true)
+pub(super) fn gather(reads: &[Read<'_>], output: &mut [u8], width: usize,
+    resident: &[Option<bool>]) -> Result<ReadStats> {
+    gather_priority(reads, output, width, resident, ReadPriority::Prefill)
 }
-
-/// All NOWAIT rows are submitted together, then all misses together. Large
-/// prefill batches use bounded 4K-row waves, limiting each worker's ring footprint.
-pub(super) fn gather(
-    reads: &[Read<'_>],
-    output: &mut [u8],
-    width: usize,
-    resident: &[Option<bool>],
-) -> Result<ReadStats> {
-    if width > i32::MAX as usize {
-        return Err(invalid("io_uring row exceeds signed CQE length"));
-    }
-    if reads.len() != resident.len() {
-        return Err(invalid("residency row count mismatch"));
+pub(super) fn gather_priority(reads: &[Read<'_>], output: &mut [u8], width: usize,
+    resident: &[Option<bool>], priority: ReadPriority) -> Result<ReadStats> {
+    if width == 0 || width > i32::MAX as usize || reads.len() != resident.len() {
+        return Err(invalid("invalid table reactor row width or residency count"));
     }
     let mut slots = std::collections::HashSet::with_capacity(reads.len());
     for read in reads {
         read.part.row_offset(read.row)?;
-        if read
-            .slot
-            .checked_add(1)
-            .and_then(|slot| slot.checked_mul(width))
-            .is_none_or(|end| end > output.len())
-            || !slots.insert(read.slot)
-        {
-            return Err(invalid("invalid or overlapping io_uring row destinations"));
+        if read.slot.checked_add(1).and_then(|slot| slot.checked_mul(width)).is_none_or(|end| end > output.len())
+            || !slots.insert(read.slot) { return Err(invalid("invalid or overlapping table reactor destinations")); }
+    }
+    if reads.is_empty() { return Ok(ReadStats::default()); }
+    setup_error()?;
+    let mut stats = reactor::global()?.read(reads, output, width, priority)?;
+    for (read, resident) in reads.iter().zip(resident) {
+        if *resident == Some(true) { stats.hits += 1; stats.hit_bytes += width as u64; }
+        else if *resident == Some(false) {
+            stats.misses += 1;
+            stats.miss_bytes += width as u64;
+            stats.device_bytes_estimate += read.part.pages(read.row)?.count() as u64 * read.part.page_bytes as u64;
+        } else {
+            stats.unclassified_rows += 1;
+            stats.unclassified_bytes += width as u64;
         }
     }
-    let base = output.as_mut_ptr();
-    RING.with(|cached| {
-        let mut cached = cached.borrow_mut();
-        let entries = reads.len().clamp(2, MAX_BATCH).next_power_of_two() as u32;
-        if cached
-            .as_ref()
-            .is_none_or(|ring| ring.params().sq_entries() < entries)
-        {
-            *cached = Some(new_ring(entries)?);
-        }
-        let ring = cached.as_mut().expect("ring initialized");
-        let mut stats = ReadStats::default();
-        for (reads, resident) in reads.chunks(MAX_BATCH).zip(resident.chunks(MAX_BATCH)) {
-            let nowait: Vec<_> = reads
-                .iter()
-                .map(|read| read.part.nowait.load(Ordering::Relaxed))
-                .collect();
-            let mut nowait_left = nowait.iter().filter(|&&enabled| enabled).count();
-            let unclassified = nowait
-                .iter()
-                .zip(resident)
-                .filter(|&(nowait, resident)| !nowait && resident.is_none())
-                .count();
-            let mut batch = Batch {
-                ring,
-                outstanding: 0,
-            };
-            let mut retry = Vec::with_capacity(reads.len());
-            let mut done = vec![0usize; reads.len()];
-            let mut missed = vec![false; reads.len()];
-            let mut error = None;
-            for (index, read) in reads.iter().enumerate() {
-                // Known misses go straight to kernel workers; warm buffered hits
-                // may finish inline. Neither mode creates a managed row cache.
-                batch.push(entry(
-                    read,
-                    base,
-                    width,
-                    nowait[index],
-                    !nowait[index] && resident[index] == Some(false),
-                    0,
-                    index,
-                )?)?;
-            }
-            let started = Instant::now();
-            batch.submit()?;
-            for _ in 0..reads.len() {
-                let cqe = batch.next()?;
-                let index = cqe.user_data() as usize;
-                let result = cqe.result();
-                if nowait[index] {
-                    nowait_left -= 1;
-                    if nowait_left == 0 {
-                        let elapsed = started.elapsed().as_nanos() as u64;
-                        stats.nowait_ns += elapsed;
-                        stats.nowait_max_ns = stats.nowait_max_ns.max(elapsed);
-                        stats.nowait_batches += 1;
-                    }
-                }
-                if result < 0 && !(nowait[index] && result == -libc::EAGAIN) {
-                    error = Some(io(
-                        "initial mapped-table read",
-                        std::io::Error::from_raw_os_error(-result),
-                    ));
-                    continue;
-                }
-                let hit = if nowait[index] {
-                    Some(result == width as i32)
-                } else {
-                    resident[index]
-                };
-                if hit == Some(true) {
-                    stats.hits += 1;
-                    stats.hit_bytes += width as u64;
-                } else if hit == Some(false) {
-                    missed[index] = true;
-                    stats.misses += 1;
-                    stats.miss_bytes += width as u64;
-                    let read = &reads[index];
-                    let start = read.part.file_offset + read.row * width as u64;
-                    let page = read.part.page_bytes as u64;
-                    stats.device_bytes_estimate +=
-                        ((start + width as u64 - 1) / page - start / page + 1) * page;
-                }
-                if result == width as i32 {
-                    if hit == Some(false) {
-                        record_miss(&mut stats, started);
-                    }
-                } else if !nowait[index] && result == 0 {
-                    error = Some(io(
-                        "blocking mapped-table read",
-                        std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "short immutable table",
-                        ),
-                    ));
-                } else {
-                    // Restart a short NOWAIT row; continue a short buffered row.
-                    done[index] = if nowait[index] { 0 } else { result as usize };
-                    retry.push(index);
-                }
-            }
-            if let Some(error) = error {
-                return Err(error);
-            }
-            for &index in &retry {
-                batch.push(entry(
-                    &reads[index],
-                    base,
-                    width,
-                    false,
-                    true,
-                    done[index],
-                    index,
-                )?)?;
-            }
-            if !retry.is_empty() {
-                batch.submit()?;
-            }
-            while batch.outstanding > 0 {
-                let cqe = batch.next()?;
-                let index = cqe.user_data() as usize;
-                let result = cqe.result();
-                if result <= 0 {
-                    error = Some(io(
-                        "blocking mapped-table read",
-                        if result == 0 {
-                            std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "short immutable table",
-                            )
-                        } else {
-                            std::io::Error::from_raw_os_error(-result)
-                        },
-                    ));
-                    continue;
-                }
-                done[index] += result as usize;
-                if done[index] < width {
-                    batch.push(entry(
-                        &reads[index],
-                        base,
-                        width,
-                        false,
-                        true,
-                        done[index],
-                        index,
-                    )?)?;
-                    batch.submit()?;
-                } else if missed[index] {
-                    record_miss(&mut stats, started);
-                }
-            }
-            if let Some(error) = error {
-                return Err(error);
-            }
-            if unclassified > 0 {
-                // One completed submission wave, including retries, not a clock
-                // read per row or a claim about individual read-service latency.
-                record_unclassified(
-                    &mut stats,
-                    unclassified,
-                    width,
-                    started.elapsed().as_nanos() as u64,
-                );
-            }
-        }
-        Ok(stats)
-    })
+    if stats.unclassified_rows > 0 {
+        stats.unclassified_batches = 1;
+        stats.unclassified_batch_ns = stats.miss_max_ns;
+        stats.unclassified_batch_max_ns = stats.miss_max_ns;
+        stats.unclassified_batch_histogram[tier(stats.miss_max_ns)] = 1;
+    }
+    Ok(stats)
 }
 
-fn record_unclassified(stats: &mut ReadStats, rows: usize, width: usize, elapsed: u64) {
-    stats.unclassified_rows += rows as u64;
-    stats.unclassified_bytes += (rows * width) as u64;
-    stats.unclassified_batches += 1;
-    stats.unclassified_batch_ns += elapsed;
-    stats.unclassified_batch_max_ns = stats.unclassified_batch_max_ns.max(elapsed);
-    stats.unclassified_batch_histogram[tier(elapsed)] += 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn setup_halves_enomem_to_floor_and_does_not_retry_other_errors() {
+        let mut sizes = Vec::new();
+        assert!(setup_with(|size| { sizes.push(size); Err(std::io::Error::from_raw_os_error(libc::ENOMEM)) }).is_err());
+        assert_eq!(sizes, [2048, 1024, 512, 256, 128, 64]);
+        sizes.clear();
+        assert!(setup_with(|size| { sizes.push(size); Err(std::io::Error::from_raw_os_error(libc::EPERM)) }).is_err());
+        assert_eq!(sizes, [2048]);
+    }
 }
-
-fn record_miss(stats: &mut ReadStats, started: Instant) {
-    let elapsed = started.elapsed().as_nanos() as u64;
-    stats.miss_ns += elapsed;
-    stats.miss_max_ns = stats.miss_max_ns.max(elapsed);
-    stats.miss_histogram[tier(elapsed)] += 1;
-}
-
 /// mincore is a residency snapshot, not proof that a later read avoids I/O.
 /// Query only requested pages, coalesced into bounded runs (not a table scan).
 pub(super) fn resident(

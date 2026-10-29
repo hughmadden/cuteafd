@@ -147,26 +147,27 @@ impl EngramGatherer {
             "engram gather pool exceeds host staging budget"
         );
         let staging = (0..slots).map(|_| EngramBatchStaging::new(capacity)).collect::<Result<Vec<_>>>()?;
-        Self::with_staging(capacity, staging)
+        Self::with_staging(capacity, staging, false)
     }
     pub fn new_pinned(library: &cuteafd_ffi::NativeLibrary, shape: EngramStagingShape) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("v41/engram-prefill");
         let staging = (0..shape.host_slots()).map(|_| EngramBatchStaging::new_pinned(library, shape.rows))
             .collect::<Result<Vec<_>>>()?;
         shape.validate_slots(staging.len())?;
-        Self::with_staging(shape.rows, staging)
+        Self::with_staging(shape.rows, staging, false)
     }
     pub fn new_decode(library: &cuteafd_ffi::NativeLibrary, shape: EngramStagingShape) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("v41/engram-decode");
         let staging = (0..shape.decode_slots()).map(|_| EngramBatchStaging::new_pinned(library, shape.decode_rows()))
             .collect::<Result<Vec<_>>>()?;
-        Self::with_staging(shape.decode_rows(), staging)
+        Self::with_staging(shape.decode_rows(), staging, true)
     }
     pub fn copy_capacity_stalled(&self) -> Result<bool> {
         self.worker.copy_capacity_stalled()
     }
-    fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>) -> Result<Self> {
-        let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?;
+    fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>, decode: bool) -> Result<Self> {
+        let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?
+            .with_priority(if decode { crate::formats::mapped_table::ReadPriority::Decode } else { crate::formats::mapped_table::ReadPriority::Prefill });
         let worker = TablePipeline::new("engram-gather", staging, move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
             let started = Instant::now();
             let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();

@@ -4,7 +4,7 @@
 //! A table is one or more safetensors tensors (parts) viewed as one row space.
 //! Parts are mapped read-only and page-cache backed with `MADV_RANDOM` (no
 //! sequential read-ahead across a hash table). Buffered io_uring reads use
-//! POSIX_FADV_RANDOM and NOWAIT, retrying misses without O_DIRECT.
+//! POSIX_FADV_RANDOM; a process-wide reactor reads only mincore misses without O_DIRECT.
 //! Rows reach the GPU in three steps, each bounded:
 //!
 //! - prefetch: as soon as row ids are known (a prefill chunk ahead, a wave's
@@ -18,7 +18,7 @@
 //!
 //! Page cache is the host cache: under memory pressure the kernel evicts table
 //! pages and the next gather brings them back. [`TableStats`] distinguishes
-//! NOWAIT hits from mmap residency snapshots, not just major faults.
+//! caller-side residency snapshots from completed miss reads, not just major faults.
 use cuteafd_core::DType;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -30,6 +30,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 
 mod uring;
+mod reactor;
+
+/// Explicit priority from the decode/prefill pipeline, never inferred from row count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadPriority { Decode, #[default] Prefill }
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -121,7 +126,7 @@ pub struct MappedRows {
     rows: u64,
     row_bytes: usize,
     page_bytes: usize,
-    file: File,
+    file: Arc<File>,
     file_offset: u64,
     nowait: AtomicBool,
     fuse: bool,
@@ -179,7 +184,7 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file };
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         // SAFETY: advice over exactly the mapping created above.
         if unsafe { libc::madvise(raw, mapped_len, libc::MADV_RANDOM) } != 0 {
@@ -237,6 +242,7 @@ impl MappedRows {
 
     /// Copy selected rows in input order, retaining duplicates and allocating no staging memory.
     pub fn gather_into(&self, rows: &[u64], output: &mut [u8]) -> Result<()> {
+
         let size = rows.len().checked_mul(self.row_bytes).ok_or_else(|| invalid("gather size overflow"))?;
         if output.len() != size {
             return Err(invalid("gather output size does not match requested rows"));
@@ -764,6 +770,9 @@ impl MappedTable {
     /// Copy selected rows in input order, retaining duplicates and allocating
     /// no staging memory; the whole batch is validated before any write.
     pub fn gather_into(&self, rows: &[u64], output: &mut [u8]) -> Result<()> {
+        self.gather_into_priority(rows, output, ReadPriority::Prefill)
+    }
+    pub fn gather_into_priority(&self, rows: &[u64], output: &mut [u8], priority: ReadPriority) -> Result<()> {
         let size = rows.len().checked_mul(self.row_bytes()).ok_or_else(|| invalid("gather size overflow"))?;
         if output.len() != size {
             return Err(invalid("gather output size does not match requested rows"));
@@ -772,7 +781,7 @@ impl MappedTable {
             self.locate(row)?;
         }
         let slots: Vec<_> = (0..rows.len()).collect();
-        self.gather_slots(rows, &slots, output)?;
+        self.gather_slots_priority(rows, &slots, output, priority)?;
         Ok(())
     }
 
@@ -780,6 +789,9 @@ impl MappedTable {
     /// destination layout is shared by both backends; all rows are validated
     /// before any write, and every io_uring batch drains before returning.
     pub fn gather_slots(&self, rows: &[u64], slots: &[usize], output: &mut [u8]) -> Result<()> {
+        self.gather_slots_priority(rows, slots, output, ReadPriority::Prefill)
+    }
+    pub fn gather_slots_priority(&self, rows: &[u64], slots: &[usize], output: &mut [u8], priority: ReadPriority) -> Result<()> {
         if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
         let width = self.row_bytes();
         let mut unique = BTreeSet::new();
@@ -795,8 +807,8 @@ impl MappedTable {
             }
             return Ok(());
         }
-        if self.backend() != TableBackend::Mmap {
-            match self.uring_reads(rows, &reads, output, false) {
+        {
+            match self.uring_reads(rows, &reads, output, false, priority) {
                 Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
                 Err(error) => self.uring_fallback(&error),
             }
@@ -861,51 +873,40 @@ impl MappedTable {
         Ok(())
     }
 
-    fn uring_reads(&self, rows: &[u64], reads: &[uring::Read<'_>], output: &mut [u8], prefetch: bool) -> Result<uring::ReadStats> {
-        let unsupported: Vec<_> = reads.iter().enumerate().filter_map(|(i, read)|
-            (!read.part.nowait.load(Ordering::Relaxed)).then_some(i)).collect();
-        let selected: Vec<_> = unsupported.iter().map(|&i| rows[i]).collect();
-        let mut hits = vec![None; reads.len()];
-        if !selected.is_empty() {
-            for (index, hit) in unsupported.into_iter().zip(self.residency(&selected, prefetch)?) { hits[index] = Some(hit); }
+    fn uring_reads(&self, rows: &[u64], reads: &[uring::Read<'_>], output: &mut [u8], prefetch: bool,
+        priority: ReadPriority) -> Result<uring::ReadStats> {
+        // All residency snapshots and cache-hit copies stay on the caller.
+        // mincore is intentionally approximate, including on NOWAIT-capable files.
+        let hits = self.residency(rows, prefetch)?;
+        let mut pending = Vec::with_capacity(reads.len());
+        let before = thread_faults();
+        let mut stats = uring::ReadStats::default();
+        for (read, hit) in reads.iter().zip(hits) {
+            if hit {
+                let width = self.row_bytes();
+                output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
+                stats.hits += 1;
+                stats.hit_bytes += width as u64;
+            } else { pending.push(uring::Read { part: read.part, row: read.row, slot: read.slot }); }
         }
-        if hits.contains(&Some(true)) {
-            // Unsupported-file resident rows use mmap; NOWAIT-capable files
-            // retain exact completion-based classification in this mode too.
-            let mut pending = Vec::with_capacity(reads.len());
-            let mut pending_hits = Vec::with_capacity(reads.len());
-            let before = thread_faults();
-            let mut copied = 0;
-            for (read, hit) in reads.iter().zip(hits) {
-                if hit == Some(true) {
-                    let width = self.row_bytes();
-                    output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
-                    copied += 1;
-                } else {
-                    pending.push(uring::Read { part: read.part, row: read.row, slot: read.slot });
-                    pending_hits.push(hit);
-                }
-            }
-            // Minor faults can merely populate PTEs for cached pages. Major
-            // faults during these copies witness late faults, not evicted rows.
-            let late = thread_faults_since(before)[1].max(0) as u64;
-            let mut stats = if pending.is_empty() { uring::ReadStats::default() }
-                else { uring::gather(&pending, output, self.row_bytes(), &pending_hits)? };
-            stats.hits += copied;
-            stats.hit_bytes += copied * self.row_bytes() as u64;
-            stats.resident_copy_rows += copied;
-            stats.late_major_faults += late;
-            return Ok(stats);
+        stats.resident_copy_rows = stats.hits;
+        stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
+        if !pending.is_empty() {
+            let misses = uring::gather_priority(&pending, output, self.row_bytes(), &vec![Some(false); pending.len()], priority)?;
+            stats.misses = misses.misses;
+            stats.miss_bytes = misses.miss_bytes;
+            stats.device_bytes_estimate = misses.device_bytes_estimate;
+            stats.miss_histogram = misses.miss_histogram;
+            stats.miss_ns = misses.miss_ns;
+            stats.miss_max_ns = misses.miss_max_ns;
         }
-        uring::gather(reads, output, self.row_bytes(), &hits)
+        Ok(stats)
     }
 
     fn uring_fallback(&self, error: &MappedTableError) {
-        // A demand/prefetch worker can fail concurrently with another worker.
-        // Only the first transition warns; subsequent batches use mmap.
-        if self.stats.uring.swap(false, Ordering::Relaxed) {
-            tracing::warn!(%error, "mapped table io_uring unavailable; falling back to mmap");
-        }
+        // Only this batch falls back. The shared owner retries a failed ring
+        // with bounded backoff instead of permanently disabling a table.
+        tracing::warn!(%error, "mapped table read batch unavailable; using mmap for this batch");
     }
 
     fn backend(&self) -> TableBackend {
@@ -929,9 +930,8 @@ impl MappedTable {
         tracing::info!(backend = %self.backend(), max_ring_entries = uring::MAX_BATCH,
             iowq_max_workers = uring::IOWQ_MAX_WORKERS,
             accounting = self.stats.accounting(),
-            reason = if !available { "io_uring unavailable" }
-                else if !self.stats.nowait.load(Ordering::Relaxed) { "resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
-                else { "NOWAIT supported" },
+            reason = if !available { "reactor setup pending; recoverable batch fallback" }
+                else { "caller resident memcpy and process-wide miss reactor" },
             locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "NOWAIT capability is probed per file" },
             "mapped table backend");
     }
@@ -963,13 +963,13 @@ impl MappedTable {
                 }
             }
         }
-        if self.backend() != TableBackend::Mmap && !rows.is_empty() {
+        if !rows.is_empty() {
             let mut output = vec![0; rows.len().checked_mul(self.row_bytes()).ok_or_else(|| invalid("prefetch size overflow"))?];
             let reads: Vec<_> = rows.iter().enumerate().map(|(slot, &row)| {
                 let (part, local) = self.locate(row)?;
                 Ok(uring::Read { part: &self.parts[part], row: local, slot })
             }).collect::<Result<_>>()?;
-            match self.uring_reads(rows, &reads, &mut output, true) {
+            match self.uring_reads(rows, &reads, &mut output, true, ReadPriority::Prefill) {
                 Ok(stats) => { self.stats.record_reads(stats, true); return Ok(pages.len()); }
                 Err(error) => self.uring_fallback(&error),
             }
@@ -1167,7 +1167,6 @@ impl TableStats {
     }
     fn accounting(&self) -> &'static str {
         if self.resident.load(Ordering::Relaxed) { "resident; no page-in" }
-        else if self.uring.load(Ordering::Relaxed) && self.nowait.load(Ordering::Relaxed) { "nowait-exact" }
         else if self.backend() == TableBackend::MincoreRouted {
             if self.approximate.load(Ordering::Relaxed) { "fuse: mincore-routed (approx)" } else { "mincore-routed" }
         }
@@ -1596,7 +1595,7 @@ impl GatherPool {
         let chunk = slots.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
-        if table.backend() != TableBackend::Mmap {
+        if table.backend() != TableBackend::Mmap || reactor::global().is_ok() {
             table.gather_slots(rows, slots, output)?;
         } else {
             table.record_residency(rows)?;

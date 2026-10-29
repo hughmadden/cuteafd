@@ -59,8 +59,8 @@ impl<'a> MappedTableDevice<'a> {
         let device = library.cuda_get_device()?;
         table.name_stats(name);
         let table = Arc::new(table);
-        let pipeline = |rows: usize, slots: usize, suffix: &str| -> Result<Arc<Pipeline>> {
-            let gather = RowGather::new(&format!("{name}-{suffix}-pages"), args.threads)?;
+        let pipeline = |rows: usize, slots: usize, suffix: &str, priority| -> Result<Arc<Pipeline>> {
+            let gather = RowGather::new(&format!("{name}-{suffix}-pages"), args.threads)?.with_priority(priority);
             let table = Arc::clone(&table);
             let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes())? }))
                 .collect::<Result<Vec<_>>>()?;
@@ -71,8 +71,8 @@ impl<'a> MappedTableDevice<'a> {
                 gather.gather(&table, &rows, &mut slot.bytes.bytes_mut()[..bytes])
             }, |slot| Ok(slot.bytes.copy_ready()?))?))
         };
-        let prefill = pipeline(prefill_rows, 2 * prefill_slots, "prefill")?;
-        let decode = pipeline(decode_rows, 2, "decode")?;
+        let prefill = pipeline(prefill_rows, 2 * prefill_slots, "prefill", cuteafd_loader::formats::mapped_table::ReadPriority::Prefill)?;
+        let decode = pipeline(decode_rows, 2, "decode", cuteafd_loader::formats::mapped_table::ReadPriority::Decode)?;
         let max_rows = prefill_rows.max(decode_rows);
         let prefetcher = if args.prefetch { Some(TablePrefetcher::new(&format!("{name}-prefetch"), 16, max_rows, 2 * max_rows)?) } else { None };
         Ok(Self { library, device, name, logged: Cell::new(table.stats().snapshot()), table, prefetcher,
