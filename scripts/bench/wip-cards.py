@@ -1181,6 +1181,58 @@ def fabric_assessment(phases):
     return list(dict.fromkeys(caveats))
 
 
+FALLBACK_BACKEND = 'mmap-fallback'
+
+
+def table_backend_phases(report):
+    """Every measured phase's mapped tables in run order: each panel pass and
+    the sub-phases it recorded. A pass's own mapped_tables are added after the
+    panel ran, so they read last."""
+    phases = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key != 'mapped_tables' and isinstance(child, (dict, list)):
+                    walk(child, f'{path}/{key}')
+            tables = node.get('mapped_tables')
+            if isinstance(tables, list):
+                fabric = node.get('fabric')
+                name = fabric.get('name') if isinstance(fabric, dict) else None
+                phases.append((name or path, tables))
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, f'{path}/{index}')
+
+    for panel in report.get('panels') or []:
+        for index, pass_value in enumerate(panel.get('passes') or []):
+            walk(pass_value, f"{panel.get('id', '?')}/pass{index + 1}")
+    return phases
+
+
+def table_backend_findings(phases):
+    """(caveats, contaminated) from raw per-phase stats: a backend change after
+    the table's first phase is contamination, while mmap from startup is one
+    configuration note (io_uring was never available)."""
+    first, caveats, contaminated = {}, [], False
+    for phase, tables in phases:
+        for table in tables or []:
+            name, backend = table.get('name'), table.get('backend')
+            if not name or not backend:
+                continue
+            if name not in first:
+                first[name] = backend
+                if backend == FALLBACK_BACKEND:
+                    caveats.append(f'{name}: read backend {FALLBACK_BACKEND} from startup '
+                                   '(io_uring unavailable); mapped gathers run slower, configuration only')
+                continue
+            if backend != first[name]:
+                contaminated = True
+                caveats.append(f'{phase}: {name} read backend changed from {first[name]} to {backend}; '
+                               'mapped gathers are slower, compare in a quiet window')
+    return caveats, contaminated
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -1211,6 +1263,7 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
+        row['table_caveats'], row['table_contaminated'] = table_backend_findings(table_backend_phases(report))
         if not row['fabric']:
             row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
@@ -1332,7 +1385,9 @@ def summarize_job(job, exit_code):
         if not row['requests'] and not (prefill_only or fidelity_only):
             fail(row, 'matched prompts produced no per-request console rounds')
     row['fabric_caveats'] = fabric_assessment(row['fabric'])
-    row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row['fabric']) else 'eligible'
+    row.setdefault('table_caveats', [])
+    row.setdefault('table_contaminated', False)
+    row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row['fabric']) or row['table_contaminated'] else 'eligible'
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
@@ -1473,11 +1528,14 @@ def write_summary(state, rows, arms):
     medians, paired = summary_math(rows, names, present or METRICS)
     for row in rows:
         row['fabric_caveats'] = fabric_assessment(row.get('fabric', []))
-        row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row.get('fabric', [])) else 'eligible'
+        row.setdefault('table_caveats', [])
+        row.setdefault('table_contaminated', False)
+        row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row.get('fabric', [])) or row['table_contaminated'] else 'eligible'
     rerun = any(row['ab_verdict'] == 'rerun' for row in rows)
-    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c) for r in rows for c in r.get('fabric_caveats', [])]
+    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c)
+               for r in rows for c in [*r.get('fabric_caveats', []), *r.get('table_caveats', [])]]
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
-                                    ab_verdict='rerun' if rerun else 'eligible', fabric_caveats=caveats))
+                                    ab_verdict='rerun' if rerun else 'eligible', caveats=caveats))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -1510,7 +1568,8 @@ def write_summary(state, rows, arms):
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
         text += '\n'
     if caveats:
-        text += ('## A/B Verdict: Rerun\n\nTimed foreign traffic or a used port down: compare in a quiet window.\n\n' if rerun else '## Fabric Notes\n\nResults remain valid; retransmits may reduce throughput.\n\n')
+        text += ('## A/B Verdict: Rerun\n\nTimed foreign traffic, a used port down, or a mapped-table backend change: compare in a quiet window.\n\n' if rerun
+                 else '## Measurement Notes\n\nResults remain valid; retransmits may reduce throughput, and mmap from startup is configuration.\n\n')
         for c in caveats:
             text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
         text += '\n'

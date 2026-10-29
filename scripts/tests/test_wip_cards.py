@@ -1903,6 +1903,37 @@ def test_fabric_assessment_timed_contamination_and_unknown():
     assert cards.fabric_assessment([]) == []
 
 
+def test_mapped_table_backend_change_makes_the_ab_rerun(tmp_path):
+    report = dict(panels=[dict(id='decode_content', passes=[dict(rows=[
+        dict(mapped_tables=[dict(name='engram', backend='mincore-routed')], fabric=dict(name='decode_content/0')),
+        dict(mapped_tables=[dict(name='engram', backend='mmap-fallback')], fabric=dict(name='decode_content/1')),
+    ])])])
+    caveats, contaminated = cards.table_backend_findings(cards.table_backend_phases(report))
+    assert contaminated
+    assert any('decode_content/1: engram read backend changed from mincore-routed to mmap-fallback' in c
+               for c in caveats)
+    rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
+                 table_caveats=caveats, table_contaminated=contaminated) for arm in ['base', 'candidate']]
+    cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'rerun'
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'mapped-table backend change' in text
+    assert 'engram read backend changed' in text
+
+
+def test_mmap_backend_from_startup_is_configuration_not_a_rerun(tmp_path):
+    report = dict(panels=[dict(id='speed', passes=[dict(
+        mapped_tables=[dict(name='ple', backend='mmap-fallback')])])])
+    caveats, contaminated = cards.table_backend_findings(cards.table_backend_phases(report))
+    assert not contaminated
+    assert len(caveats) == 1 and 'configuration only' in caveats[0]
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10,
+                 table_caveats=caveats, table_contaminated=contaminated)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'eligible'
+    assert 'Rerun' not in (tmp_path / 'summary.md').read_text()
+
+
 def test_summary_retains_fabric_and_requires_rerun(tmp_path):
     rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
                  fabric=[dict(name='decode', timed=True, ports=[dict(host='coordinator',device='nic',port=1,

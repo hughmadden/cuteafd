@@ -525,7 +525,7 @@ pub struct Outcome {
     #[serde(default)]
     pub fabric: Vec<crate::fabric::Phase>,
     #[serde(default)]
-    pub fabric_caveats: Vec<String>,
+    pub caveats: Vec<String>,
     #[serde(default)]
     pub ab_verdict: String,
 }
@@ -1106,7 +1106,7 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
                         pair(p.foreign_sent_bytes,p.foreign_received_bytes)));
                 }
             }
-            for caveat in &o.fabric_caveats { out.push_str(&format!("\nFabric note {}: {caveat}\n",e.name)); }
+            for caveat in &o.caveats { out.push_str(&format!("\nNote {}: {caveat}\n",e.name)); }
         }
     }
     out
@@ -1452,6 +1452,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         // Failure diagnostics exist even when no benchmark report was produced.
         let _ = std::fs::write(log_path.with_extension("hooks.json"), serde_json::to_vec_pretty(&outcome.hooks).unwrap_or_default());
     }
+    // Mapped-table backend findings come from the report's per-phase stats,
+    // which the outcome does not otherwise retain.
+    let mut table_caveats = Vec::new();
+    let mut table_contaminated = false;
     match result {
         Ok(None) => {
             outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
@@ -1465,6 +1469,9 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
         Ok(Some(report)) => {
             outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
+            let tables = crate::tables::report_findings(&report);
+            table_contaminated = tables.contaminated;
+            table_caveats = tables.caveats;
             if let (Some(hooks), Some(dir)) = (&outcome.hooks, &outcome.dir) {
                 let path = Path::new(dir).join("report.json");
                 if let Ok(mut value) = serde_json::to_value(&report) {
@@ -1524,9 +1531,14 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         outcome.status = "cancelled".into();
         outcome.error.get_or_insert_with(|| Cancelled(signal).to_string());
     }
-    outcome.fabric_caveats = crate::fabric::caveats(&outcome.fabric);
-    outcome.ab_verdict = if outcome.fabric.iter().any(|p| !crate::fabric::rerun_reasons(p).is_empty()) { "rerun" } else { "eligible" }.into();
-    for caveat in &outcome.fabric_caveats { let _ = writeln!(log, "fabric note: {caveat}"); }
+    outcome.caveats = crate::fabric::caveats(&outcome.fabric);
+    outcome.caveats.extend(table_caveats);
+    outcome.ab_verdict = if table_contaminated || outcome.fabric.iter().any(|p| !crate::fabric::rerun_reasons(p).is_empty()) {
+        "rerun"
+    } else {
+        "eligible"
+    }.into();
+    for caveat in &outcome.caveats { let _ = writeln!(log, "note: {caveat}"); }
     outcome.total_s = Some(started.elapsed().as_secs_f64());
     outcome.finished = crate::report::now_rfc3339();
     outcome
