@@ -334,8 +334,9 @@ pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
 /// export: publishing stops rather than leave the stale image in place.
 /// The committed copy of a placed `report.json`: per-row fidelity and probe rows and
 /// the baseline's duplicate fabric counters are measurement scratch (several MB
-/// per report) that no card, table or page reads. Run directories keep the full
-/// report for paired fidelity comparisons; the repository keeps summaries.
+/// per report). The verdict is set once, when the report is published from its
+/// full rows (`slim_placed`); a slimmed report keeps it (`quality::bar_met`).
+/// Run directories keep the full report for paired fidelity comparisons.
 pub fn slim(report: &mut Value) {
     if let Some(baseline) = report.get_mut("baseline").and_then(Value::as_object_mut) {
         baseline.remove("fabric");
@@ -356,6 +357,21 @@ fn slim_placed(dir: &Path) -> Result<()> {
     let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
     let mut value: Value = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
     let before = value.clone();
+    // Set the verdict from the full rows under the rule in force now, then keep it.
+    let mut report: Report = serde_json::from_value(value.clone()).with_context(|| format!("{}", path.display()))?;
+    crate::quality::reconcile(&mut report);
+    if let (Some(graded), Some(baseline)) = (report.baseline.as_ref(), value.get_mut("baseline")) {
+        baseline["quality"]["status"] = serde_json::to_value(graded.quality.status)?;
+        if let Some(checks) = baseline["quality"]["checks"].as_array_mut() {
+            for (check, graded) in checks.iter_mut().zip(&graded.quality.checks) {
+                check["status"] = serde_json::to_value(graded.status)?;
+                match &graded.note {
+                    Some(note) => check["note"] = Value::String(note.clone()),
+                    None => { check.as_object_mut().map(|c| c.remove("note")); }
+                }
+            }
+        }
+    }
     slim(&mut value);
     if value != before {
         crate::cli::write_if_changed(&path, &serde_json::to_string(&value)?)?;
@@ -1443,11 +1459,16 @@ mod tests {
         assert!(!panel.contains("FIDELITY FAILURE"), "{panel}");
         let report = std::fs::read_to_string(dir.join("report.svg")).unwrap();
         assert!(!report.contains("QUALITY GATE FAILED"), "{report}");
-        // The exports are never edited after publication: the rasterized card
-        // follows the SVG, and the data behind it is the file that was placed,
-        // byte for byte.
-        assert_eq!(std::fs::read(dir.join("report.json")).unwrap(), fixture["report.json"],
-            "publishing rewrote the run's data");
+        // Publishing sets the verdict once and slims the data: the stored failure
+        // becomes the calibrated W4A4 info status, the measured numbers stay.
+        let stored: Value = serde_json::from_slice(&fixture["report.json"]).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(dir.join("report.json")).unwrap()).unwrap();
+        let fidelity = |r: &Value| r["baseline"]["quality"]["checks"].as_array().unwrap().iter()
+            .find(|c| c["id"] == "fidelity").unwrap().clone();
+        assert_eq!(fidelity(&written)["status"], "info");
+        assert_eq!(fidelity(&written)["note"], crate::quality::CALIBRATED_W4A4);
+        assert_eq!(fidelity(&written)["metrics"]["kl"], fidelity(&stored)["metrics"]["kl"]);
+        assert_eq!(written["baseline"]["card"], stored["baseline"]["card"]);
         assert_ne!(std::fs::read(dir.join("card.png")).unwrap(), fixture["card.png"],
             "the stale card PNG was kept");
         // The caption under its image follows: no stored failure is republished.
