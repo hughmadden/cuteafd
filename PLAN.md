@@ -6134,3 +6134,94 @@ qualification remains the 16 CUDA cases and 798-projection real-weight proof.
 GPU ownership is released and production rolling tensors remain retired.
 Full-model quality/long-context/serving qualification is the separately scheduled
 next step; this branch is pushed for orchestrator review, not merged.
+
+
+## GLM 5.3 Flash BF16 to EXL3 K4 / Core K6 (MaxQ, 2026-10-28)
+
+TJ authorized the full job, a shortened pilot, autonomous recipe decisions
+and publication without another approval stop. This supersedes the Flash
+brief's Step 1 and upload confirmation points. Public target:
+`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6`. Integration stays on the
+`quant/glm53-flash-k4-core-k6` task branch; the implementation checkout is
+`~/Developer/cute-worktrees/flash-quant-integration`. No engine, serving,
+performance or shared infrastructure changes are part of this job.
+
+Pinned source `zai-org/GLM-5.3-Flash-BF16` revision
+`f9fed3bbc82291073373d67452e9f25317ef7577` is managed locally by Sparknest.
+Its 120 weight headers contain 38,770 tensors and 642,646,653,816 payload
+bytes. The fail-closed Flash recipe selects 316 target core/head matrices
+at K6, eight MTP core matrices at K4 and 37,152 routed expert matrices at
+K4. Retain 1,294 native tensors, including all 347 vision tensors, recurrent
+gates/convolutions, DSA indexer, kv_b, mHC, routers, norms and embeddings.
+Output: 151,198 tensors, 165,621,841,672 payload bytes (154.247 GiB) in 47
+shards. Flash kv_a has 512 outputs and no RoPE output padding.
+
+`quantization/glm5_flash/prepare_corpus.py` attests the same pinned public
+panel and native thinking/max-effort rendering: 1,426 calibration prompts,
+1,097,737 tokens. The shorter pilot compares serialized K6, block-128 FP8
+and BF16 on representative layers 1/4/7, with a small calibration/heldout
+subset and the original 2,205-token sparse-indexer witness. Native/staged
+KDA, mHC, MLA/indexer, serialized projection and independently aligned MTP
+checks precede production. The source checksum pass compares every source
+file to its actual Hub LFS/Git hash rather than Sparknest's internal IDs.
+
+`quantization/glm5_flash/core_k6/launch.py` runs the existing fair queue
+helper unchanged on raptor under `maxq.lock`; all GPU work stays on MaxQ.
+A durable systemd user supervisor holds the lease through container
+teardown, releases it, then runs authorized CPU-only publication. Every
+wait/run is bounded. Production retains only rolling front-edge recovery,
+with explicit identity/receipt checks and an 86 GiB GPU allocation ceiling.
+Run/token/pilot state: `~/.cache/cuteafd/quantization/glm53-flash-k4-core-k6/`.
+Output: `~/.cache/huggingface/cuteafd-exports/GLM-5.3-Flash-EXL3-K4-Core-K6/`.
+Report layer progress and ETA every 30 minutes once the full run is stable.
+Raptor quality/serving qualification and engine K6 shape support are separate.
+
+The short pilot is accepted after an audited reporting-only decision change:
+all native/reconstructed KDA, mHC, MLA/indexer and MTP checks passed; the
+absolute K6 activation-weighted NMSE bound is 1e-3. FP8 comparison remains
+informational because actual dense/MLA source weights re-encode to it almost
+losslessly. No numerical producer or observation changed, and no GPU work
+was repeated for this decision. The original capture commit is retained in
+Git ancestry; `finalization-audit.json` binds every historical candidate,
+Hessian, receipt and proof event. Completed pilot activation frontiers,
+proof-input banks and candidate payloads are retired; scalar evidence and
+receipts remain. Production admission still passes after retirement.
+
+Full production started 2026-10-28 11:26:55 UTC under durable user unit
+`glmf-core-k6-1793186791227193462`, with automatic CPU publication enabled.
+The initial launch was rejected before GPU work by a direct-script import
+bug; its regression and corrected launcher are committed. Draft PR #835
+holds current continuation state; issue #836 holds the recipe/research and
+separate engine follow-up. Numerical code/pin and production identity are
+frozen while the job runs. Do not restart a live attempt or change these
+inputs; recover through its existing launcher and latest durable frontier.
+
+Quantization completed at 2026-10-29 07:14:45 UTC after 19h47m50s.
+All 37,476 projection commitments and 46 layer exports completed; the final
+47-shard checkpoint matches the reviewed 151,198-tensor / 154.247-GiB
+inventory. The independent completed-export audit reread and compared all
+1,294 retained native tensors (3,390,684,024 bytes), including 347 vision
+tensors, verified all MCG scalars/scales, calibrated evidence, asset bytes,
+47 diagnostic bundles and retirement barriers, with no findings. Evidence:
+`~/.cache/cuteafd/builds/glmf-core-k6/completed-export-audit.json`.
+
+The GPU container is stopped and the maxq lease released. CPU-only publication
+completed at 2026-10-29 07:43:35 UTC, followed by supervisor exit zero.
+Public checkpoint: https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6
+revision `5d3fffe1df9c4a109bbbdafb60dc19df9fac019d`. All 107 published files
+pass independent remote checksums, including an anonymous weight-file check.
+The model-card license matches the untouched source MIT license; every sealed
+numerical source hash remains unchanged. Publication and exit markers are durable.
+
+Sparknest import completed with zero copied bytes: all 47 weight shards shared
+physical extents through a temporary reflink bridge, then hardlinked into the
+managed store. All 107 files were verified again through the mounted snapshot
+after removing the temporary bridge, standalone export and alternate local HF
+snapshot. `nest where` reports maxq ready. The default HF hub symlink and
+Sparknest-managed copy remain untouched. Audit:
+`~/.cache/cuteafd/builds/glmf-core-k6/sparknest-import-audit.json`.
+The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
+`models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-Core-K6/snapshots/5d3fffe1df9c4a109bbbdafb60dc19df9fac019d`.
+Do not replay publication against the deliberately retired standalone paths.
+Full-model generation/serving qualification and K6 engine shape support remain
+separate work; this task branch is pushed for review, not merged.
