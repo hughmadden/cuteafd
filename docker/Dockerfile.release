@@ -36,6 +36,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
       "nvidia-ml-py==13.610.43" \
       "tabulate==0.10.0" \
       "transformers==5.18.0" \
+      "datasets==5.1.0" \
       "rich==15.0.0" && \
     uv pip install --system --break-system-packages --no-deps \
       "flashinfer-python==0.6.14" && \
