@@ -344,6 +344,9 @@ impl Checkpoint {
                 return match declaration.get("quant_algo").and_then(Value::as_str) {
                     Some("NVFP4") => Ok(ModuleNumerics::W4A4),
                     Some("FP8") => Ok(ModuleNumerics::W8A8),
+                    // 128x128 block FP8 weights with no stored activation scales
+                    // (FP8_BLOCK_SCALES is the older spelling of the same layout).
+                    Some("FP8_PB_WO" | "FP8_BLOCK_SCALES") => Ok(ModuleNumerics::W8CheckpointActivations),
                     other => anyhow::bail!("{module}: unsupported declared quantization {other:?}"),
                 };
             }
@@ -739,5 +742,20 @@ mod embedding_tests {
         assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("aliases"));
         c.tensors.pop();
         assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("no separate LM head"));
+    }
+
+    #[test]
+    fn mixed_precision_block_fp8_declarations_are_weight_only() {
+        // Mistral Large 4 NVFP4 params.json: FP8_PB_WO dense linears, NVFP4 experts.
+        let mut c = fixture();
+        c.config = serde_json::json!({"quantization_config": {"quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION", "group_size": 16, "ignore": [], "quantized_layers": {
+                "layers.0.attention.wq": {"quant_algo": "FP8_PB_WO"},
+                "layers.1.experts": {"quant_algo": "NVFP4", "group_size": 16},
+                "layers.1.shared_experts.w1": {"quant_algo": "FP8_BLOCK_SCALES"}}}});
+        assert_eq!(c.declared_numerics("layers.0.attention.wq").unwrap(), ModuleNumerics::W8CheckpointActivations);
+        assert_eq!(c.declared_numerics("layers.1.shared_experts.w1.weight").unwrap(), ModuleNumerics::W8CheckpointActivations);
+        assert_eq!(c.declared_numerics("layers.1.experts.7.w2").unwrap(), ModuleNumerics::W4A4);
+        assert_eq!(c.declared_numerics("layers.0.attention.wkv_b").unwrap(), ModuleNumerics::CheckpointPrecision);
     }
 }

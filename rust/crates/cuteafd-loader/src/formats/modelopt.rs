@@ -62,7 +62,10 @@ impl ModelOptAlgo {
                 w4a4: algo == "NVFP4" },
             "FP8" => Self::Fp8,
             // FP8_PB_WO: the per-block weight-only spelling (config.json) of the same storage.
-            "FP8_BLOCK_SCALES" | "FP8_PB_WO" => Self::Fp8BlockScales { block: group.ok_or_else(|| need("group_size"))? },
+            // The checkpoint-wide group_size is the NVFP4 group; a block entry without its own
+            // takes ModelOpt's canonical 128 x 128 block (Mistral Large 4 NVFP4: group 16, blocks 128).
+            "FP8_BLOCK_SCALES" | "FP8_PB_WO" => Self::Fp8BlockScales {
+                block: spec.get("group_size").and_then(Value::as_u64).map_or(128, |g| g as usize) },
             "MXFP8" => Self::Mxfp8 { group: group.unwrap_or(32) },
             other => return Err(ModelOptError::Unsupported { module: module.into(), algo: other.into() }),
         })
@@ -508,6 +511,23 @@ mod tests {
         assert!(mo.experts_nvfp4());
         // Not ModelOpt.
         assert!(ModelOpt::from_json(None, Some(&json!({"quant_method": "fp8"}))).unwrap().is_none());
+    }
+
+    #[test]
+    fn block_fp8_does_not_inherit_the_nvfp4_group() {
+        // mistralai/Mistral-Large-4-1T-A52B-NVFP4 params.json: group_size 16 is the NVFP4 group;
+        // FP8_PB_WO entries carry none and their scales are [R/128, 1, C/128, 1].
+        let params = json!({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "group_size": 16,
+            "ignore": [], "quantized_layers": {
+                "layers.0.attention.wq": {"quant_algo": "FP8_PB_WO"},
+                "layers.1.shared_experts.w1": {"quant_algo": "FP8_BLOCK_SCALES", "group_size": 64},
+                "layers.1.experts": {"quant_algo": "NVFP4", "group_size": 16}}});
+        let mo = ModelOpt::from_json(None, Some(&params)).unwrap().unwrap();
+        assert_eq!(mo.declared("layers.0.attention.wq"),
+            Declared::Quantized { algo: &ModelOptAlgo::Fp8BlockScales { block: 128 }, module: "layers.0.attention.wq" });
+        assert_eq!(mo.declared("layers.1.shared_experts.w1"), Declared::Quantized {
+            algo: &ModelOptAlgo::Fp8BlockScales { block: 64 }, module: "layers.1.shared_experts.w1" });
+        assert!(mo.experts_nvfp4() && mo.experts_w4a4());
     }
 
     #[test]
