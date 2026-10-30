@@ -5,6 +5,7 @@
 use crate::report::{CheckStatus, Report};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -33,6 +34,9 @@ pub fn family_title(family: &str) -> &str {
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
         "qwen4" => "Qwen 3.8",
+        "qwen3_5" => "Qwen 3.5 / 3.8 dense",
+        "kimi_k3" => "Kimi K3",
+        "step5" => "Step-5",
         other => other,
     }
 }
@@ -328,6 +332,37 @@ pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
 ///
 /// A re-render that fails is the publisher's error, not a run without that
 /// export: publishing stops rather than leave the stale image in place.
+/// The committed copy of a placed `report.json`: per-row fidelity and probe rows and
+/// the baseline's duplicate fabric counters are measurement scratch (several MB
+/// per report) that no card, table or page reads. Run directories keep the full
+/// report for paired fidelity comparisons; the repository keeps summaries.
+pub fn slim(report: &mut Value) {
+    if let Some(baseline) = report.get_mut("baseline").and_then(Value::as_object_mut) {
+        baseline.remove("fabric");
+        if let Some(checks) = baseline.get_mut("quality").and_then(|q| q.get_mut("checks")).and_then(Value::as_array_mut) {
+            for check in checks {
+                for rows in ["/metrics/run/score/records", "/metrics/probe/rows"] {
+                    if let Some(rows) = check.pointer_mut(rows) {
+                        *rows = Value::Array(Vec::new());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn slim_placed(dir: &Path) -> Result<()> {
+    let path = dir.join("report.json");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
+    let mut value: Value = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let before = value.clone();
+    slim(&mut value);
+    if value != before {
+        crate::cli::write_if_changed(&path, &serde_json::to_string(&value)?)?;
+    }
+    Ok(())
+}
+
 fn rerender(dir: &Path, report: &Report) -> Result<()> {
     let mut names: Vec<String> = ["card.svg", "card.png", "report.svg", "report.png"]
         .map(str::to_string).to_vec();
@@ -799,6 +834,9 @@ pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(Pat
     let rows = select(&placed, &matrix)?;
     // Validate historical pins before touching any generated document or image.
     retired_results(&placed, &matrix.retired)?;
+    for p in &placed {
+        slim_placed(&root.join(&p.dir))?;
+    }
     for row in &rows {
         for cell in &row.cells {
             if let Resolved::Card(p) = cell {
@@ -1572,15 +1610,15 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_matrix_resolves_one_pinned_card_per_pro_cell() {
+    fn checked_in_matrix_resolves_every_row_to_a_pinned_pro_card() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(rows.len(), 12);
+        assert_eq!(rows.len(), matrix.rows.len());
         for row in rows {
             assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
-            // One release card per checkpoint; the other PRO column is n/a.
+            // Every published checkpoint has at least one PRO card; other cells say why not.
             assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
             assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
         }
@@ -1724,4 +1762,23 @@ mod tests {
         assert!(publish(root.path(), &[], &missing).is_err());
         assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }
+
+    #[test]
+    fn slim_drops_per_row_records_and_baseline_fabric_only() {
+        let mut report = serde_json::json!({
+            "fabric": [{"name": "decode/code/c1"}],
+            "baseline": {"fabric": [{"name": "decode/code/c1"}], "quality": {"status": "pass", "checks": [
+                {"id": "fidelity", "metrics": {"kl": 0.01, "probe": {"rows": [{"position": 0}], "cold": true},
+                    "run": {"score": {"kl": 0.01, "records": [{"position": 0}]}}}},
+                {"id": "cache", "metrics": {"restored": 2}}]}}});
+        super::slim(&mut report);
+        assert!(report["baseline"].get("fabric").is_none());
+        assert_eq!(report["fabric"][0]["name"], "decode/code/c1");
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["run"]["score"]["records"], serde_json::json!([]));
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["run"]["score"]["kl"], 0.01);
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["probe"]["rows"], serde_json::json!([]));
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["probe"]["cold"], true);
+        assert_eq!(report["baseline"]["quality"]["checks"][1]["metrics"]["restored"], 2);
+    }
+
 }
