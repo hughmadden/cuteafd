@@ -4,7 +4,7 @@
 CELL 1 × RTX PRO 6000 + 6 DGX Spark · REFERENCE `vllm/vllm-openai:mistral-large-4` (`SPEC.md`) ·
 SCOPE text-only, speculator off, one lane.
 
-**Resume here (30 Oct 2026).** Phase 0 is done: `SPEC.md` (reference semantics, every open question
+**Resume here (31 Oct 2026 09:57 AEDT, 22:57 UTC 30 Oct).** Phase 0 is done: `SPEC.md` (reference semantics, every open question
 settled from the image), `census.md`, and a `cuteafd plan` run on a header-only stub through
 `scripts/checkpoint_view.py mistral`. That run found two shared gaps, both fixed with tests on this
 branch (gaps 2 and 3). The planner now classifies every module correctly and stops at "family not

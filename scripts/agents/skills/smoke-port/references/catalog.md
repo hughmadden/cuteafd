@@ -1,6 +1,6 @@
 # Reuse catalog: what exists, where, and how far it stretches
 
-Distilled from reviews of every family on upstream `main` `1adc5bfb3` (30 Oct 2026) and the MiniMax
+Distilled from reviews of every family on upstream `main` `1adc5bfb3` (committed 30 Oct 2026 +0800) and the MiniMax
 M3 port on the fork, with SparkInfer at `7d13eb37`. Paths are stable; **find symbols by grep**:
 line numbers drift, and `docs/architecture/shared-engine.md`'s pointers already have. Prefixes:
 `L/` = `rust/crates/cuteafd-loader/src/`, `D/` = `rust/crates/cuteafd-daemon/src/`,

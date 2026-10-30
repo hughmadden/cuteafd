@@ -9,7 +9,7 @@ come from the reference implementation in the serving image
 `vllm/vllm-openai:mistral-large-4` (linux/amd64 manifest
 `sha256:13bc2adaca593fddfa8f88e41f7cea53582d46d169d63bd86e1477157575fa52`,
 vLLM `0.1.dev23730+g64053a10b`), extracted with `scripts/image_ref_extract.py`.
-vLLM `main` (`7495e9e5`, 30 Oct 2026) does **not** carry this model; the image
+vLLM `main` (`7495e9e5`, committed 30 Oct 2026 -0500) does **not** carry this model; the image
 does. File references below are relative to `site-packages/vllm/`:
 
 | Topic | File |

@@ -1,7 +1,7 @@
 # Evidence: where port time actually went
 
 From the commit histories of every family on upstream `main` `1adc5bfb3` and the MiniMax M3 port on
-the fork (reviewed 30 Oct 2026). Commit subjects quoted where they mark a milestone. Times are as
+the fork (reviewed 31 Oct 2026 AEDT, 30 Oct UTC). Commit subjects quoted where they mark a milestone. Times are as
 reported by each history; treat hour counts as calendar time.
 
 ## First coherent output was always fast
