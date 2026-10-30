@@ -417,3 +417,13 @@ def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
     assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == [
         p for p in GLM_PROGRAMS if p not in ('glm2', 'glm2_stage')
     ]
+
+
+def test_build_sh_forwards_every_aot_switch_to_the_coordinator_export():
+    """Each derived AOT switch must reach the coordinator build container, or the
+    family's programs silently drop out of the release image (Kimi K3, v4.0.0-rc1)."""
+    build = (REPO / 'build.sh').read_text()
+    export = build.split('/source/scripts/build/build-release-artifacts.sh /source coordinator', 1)[0]
+    export = export.rsplit('docker run', 1)[1]
+    missing = [s for s in SCOPE.SWITCHES if f'-e "{P}{s}_AOT=' not in export]
+    assert not missing, missing
