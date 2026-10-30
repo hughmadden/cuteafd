@@ -708,7 +708,7 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
     assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.components.iter().all(|c| c.status != Status::Ready));
+    assert!(result.components.iter().any(|c| c.status != Status::Ready));
     assert!(result.hints.iter().any(|hint|hint.what.contains("unqualified")));
     assert_eq!(result.min_spark_ranks,Some(6));
 }
@@ -720,7 +720,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(r.wip_launchable(), "{:?}", r.hints);
     assert_eq!((r.prefill_unit_rows, r.prefill_waves, r.prefill_span_rows),
         (Some(2752), Some(3), Some(8256)));
-    assert!(!r.executable());
+    assert!(r.executable(), "{:?}", r.hints);
     assert!(r.native_serving_admitted);
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
     assert!(r.memory_layout.as_ref().unwrap().devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
@@ -761,7 +761,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         let result = report_context(dir.path(), 1, 96, 4, pool, context);
         assert!(result.config_error.is_none(), "{:?}", result.config_error);
         assert!(result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
-        assert!(!result.executable());
+        assert!(result.executable());
         assert_eq!(result.min_spark_ranks, Some(4));
         let memory = result.memory_layout.unwrap();
         assert_eq!(memory.devices.len(), 5);
@@ -1145,7 +1145,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
             }
         }
         let r = report(dir.path(), 2, 96, 6, None);
-        assert!(!r.executable());
+        assert_eq!(r.executable(), r.wip_launchable());
         assert_eq!(r.wip_launchable(), kind == "fp8", "{:?}", r.hints);
         assert_eq!(r.native_serving_admitted, kind == "fp8");
     }

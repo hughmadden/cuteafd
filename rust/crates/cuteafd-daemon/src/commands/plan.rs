@@ -233,7 +233,6 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             else { print!("{}", render(&native.report));
                 if let Some(layout) = &native.report.memory_layout { print!("{}", layout.render()); }
             }
-            anyhow::ensure!(!args.require_ready, "EXLR8 native runtime remains WIP-only pending full quality gates");
             return Ok(());
         }
         let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,

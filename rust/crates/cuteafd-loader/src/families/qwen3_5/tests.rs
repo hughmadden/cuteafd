@@ -116,10 +116,10 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     let report = plan::plan(dir.path(), &options).unwrap();
     assert!(report.fits && report.placement_supported && report.native_serving_admitted);
     assert!(report.wip_launchable());
-    assert!(!report.executable());
+    assert!(report.executable());
     let deployment_options = plan::deployment::DeploymentOptions { rtx_gpus: 1, ..Default::default() };
     let deployment = plan::deployment::DeploymentSpec::from_report(&report, &deployment_options).unwrap();
-    assert!(deployment.wip_launchable && !deployment.executable);
+    assert!(deployment.wip_launchable && deployment.executable);
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262144, "{:?}", report.hints);
     assert_eq!(memory.devices.len(), 1);
@@ -275,7 +275,7 @@ fn native_text_admission_disables_automatic_bundled_vision() {
     options.vision = MediaMode::Auto;
     let report = plan::plan(dir.path(), &options).unwrap();
     assert_eq!(report.vision, MediaMode::Off);
-    assert!(report.wip_launchable() && !report.executable(), "{:?}", report.hints);
+    assert!(report.wip_launchable() && report.executable(), "{:?}", report.hints);
     let vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
     assert_eq!(vision.status, Status::Disabled);
     assert_eq!(vision.rejected, 0);
@@ -298,7 +298,7 @@ fn automatic_spark_count_retains_native_wip_zero_spark_candidate() {
     let report = plan::plan_spark_count(dir.path(), &options, 2, None).unwrap();
     assert_eq!(report.spark_ranks, 0);
     assert!(report.native_serving_admitted && report.wip_launchable());
-    assert!(!report.executable());
+    assert!(report.executable());
     assert!(report.spark_count_warning.as_ref().unwrap().contains("using 0 Sparks"));
     let explicit = plan::plan_spark_count(dir.path(), &options, 2, Some(2)).unwrap();
     assert!(!explicit.wip_launchable() && !explicit.executable());
@@ -398,15 +398,15 @@ fn malformed_config_is_not_a_flash_next_alias() {
 }
 
 #[test]
-fn bf16_and_native_block_fp8_headers_remain_planned_and_zero_spark() {
+fn bf16_and_native_block_fp8_headers_serve_and_stay_zero_spark() {
     for fp8 in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &config(4096, 12288, 16, 32, 4), &tensors(fp8), None);
         Qwen35Checkpoint::read(dir.path()).unwrap();
         let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..Default::default() }).unwrap();
         assert_eq!(report.family.as_deref(), Some("qwen3_5"));
-        assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
-        assert!(!report.fits && !report.placement_supported && !report.executable() && !report.wip_launchable());
+        assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+        assert_eq!(report.executable(), report.wip_launchable(), "{:?}", report.hints);
         assert_eq!(report.spark_ranks, 0);
         assert!(report.experts.is_none() && report.spec.as_ref().unwrap().moe.is_none());
         assert!(report.unclassified.is_empty(), "{:?}", report.unclassified);

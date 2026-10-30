@@ -12,7 +12,7 @@ impl Family for Qwen35 {
             reason: "dense Qwen runs RTX-only: no Spark round trip for a second lane to hide (#744)" }
     }
     fn id(&self) -> &'static str { "qwen3_5" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|a| a == "Qwen3_5ForConditionalGeneration")
             || checkpoint.model_type() == Some("qwen3_5")
@@ -68,8 +68,8 @@ impl Family for Qwen35 {
             Component::Speculator => "dense MTP feedback fc [H,2H], normalized hidden/token input order and dense block; MTP off for first golden",
             _ => "single-stream zero-centered norms, final norm/head, admission and exact prefix-state lifecycle",
         };
-        Some(Hint { what: format!("qwen3_5 {} is planned, not executable", component.label()),
-            how: format!("Implement {missing} using shared Qwen operators; gate against scripts/qualify/qwen3_5/reference.py before enabling runtime.") })
+        Some(Hint { what: format!("qwen3_5 {} has tensors without an executable kernel", component.label()),
+            how: format!("Needs {missing} using shared Qwen operators; gate against scripts/qualify/qwen3_5/reference.py.") })
     }
     fn optional(&self, component: Component) -> bool {
         matches!(component, Component::Vision | Component::Speculator)

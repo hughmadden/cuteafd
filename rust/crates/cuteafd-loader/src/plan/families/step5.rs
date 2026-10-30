@@ -346,7 +346,7 @@ impl Family for Step5 {
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
     fn id(&self) -> &'static str { "step5" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|a| matches!(a.as_str(), "Step5ForConditionalGeneration" | "Step5ForCausalLM"))
             || matches!(checkpoint.model_type(), Some("step5_vl" | "step5"))

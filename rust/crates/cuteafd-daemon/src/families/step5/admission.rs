@@ -213,7 +213,7 @@ mod tests {
                 assert_eq!(report.wip_launchable(), launchable,
                     "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
             }
-            assert!(!report.executable());
+            assert_eq!(report.executable(), report.wip_launchable());
             // A rejected allocation still reports the selected topology shape;
             // capacity admission never retries a smaller unit or fewer waves.
             let descriptor = cuteafd_loader::plan::Family::prefill_limits(

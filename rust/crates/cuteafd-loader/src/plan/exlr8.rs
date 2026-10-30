@@ -205,16 +205,16 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
         component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
             else { super::Owner::Rtx }, tensors, bytes, formats: BTreeMap::from([("exlr8".into(), tensors)]),
-        status: Status::Planned, rejected: 0, rejections: Vec::new(),
+        status: Status::Ready, rejected: 0, rejections: Vec::new(),
     }).collect();
     if placement.onboard_layers > 0 {
         report.components.push(super::ComponentPlan { component: Component::RoutedExpert,
             owner: super::Owner::Rtx, tensors: placement.onboard_layers, bytes: local_routed,
             formats: BTreeMap::from([("exlr8".into(), placement.onboard_layers)]),
-            status: Status::Planned, rejected: 0, rejections: Vec::new() });
+            status: Status::Ready, rejected: 0, rejections: Vec::new() });
     }
     report.snapshot = snapshot.display().to_string();
-    report.runtime = Some(RuntimeStatus::Planned);
+    report.runtime = Some(RuntimeStatus::Serving);
     report.native_serving_admitted = true;
     report.placement_supported = true;
     report.fits = true;
