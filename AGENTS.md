@@ -7,6 +7,7 @@ and the `benchmarks/` index; measurements go in commit messages as short
 before → after tables with conditions.
 
 Porting a family or changing shared serve, prefill, exchange or admission code: read [docs/architecture/shared-engine.md](docs/architecture/shared-engine.md) first.
+A new model's first release is a smoke port (coherent, served, one smoke card, the rest deferred): follow [scripts/agents/skills/smoke-port/SKILL.md](scripts/agents/skills/smoke-port/SKILL.md); the full gates in shared-engine.md §6-7 come after it.
 
 ## Working method
 
