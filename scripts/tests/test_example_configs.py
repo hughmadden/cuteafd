@@ -405,7 +405,7 @@ def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> N
 
 def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
-    assert len(matrix["cells"]) == 20
+    assert len(matrix["cells"]) == 21
     for row in matrix["cells"]:
         # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
         assert row["5090"]["status"] in ("current", "na")
