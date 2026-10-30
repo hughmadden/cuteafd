@@ -15,7 +15,10 @@ marked deferred in the spec.
 **Rules.**
 - Reuse first: compose or extend shared code; never copy a family file wholesale. When a shared
   file must change, put it on its own small branch with a test and name it in your report.
+- Build it the way it will be qualified (`SKILL.md` "Design bar"): no throwaway path. An interim
+  fallback needs a label and an issue.
 - No family name or per-family constant in shared code: add a descriptor or spec field.
+- No literal model dimensions in family code: derive them from the family's one spec struct.
 - Every unsupported semantic is a typed refusal, not a silent default.
 - Every per-layer property is data, asserted in tests.
 - New or recompiled programs carry a GPU oracle against dense FP32 (`SM120` and `SM121`).

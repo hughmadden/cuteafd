@@ -15,7 +15,7 @@
 | Layer replay | the family golden's per-layer dump on real weights against the reference golden (P4 builds the mode; flags differ per family): one layer of each kind | **required** | |
 | Teacher-forced windows | 2-8 windows through the family golden or the probe API; `scripts/bench/compare-logits.py` | **required, smoke bars** | full set, release bars |
 | Probe set | below | **required** | |
-| `cache_exact` | in the smoke card's baseline | required if the prefix cache is on; `PREFIX_CACHE_ENTRIES=0` shows Skipped | required |
+| `cache_exact` | in the smoke card's baseline; the prefix cache stays on (the shared engine provides it) | **required** | required |
 | Smoke card | `cuteafd bench --url URL --profile smoke` (≤ 5 min per config) | **the deliverable** | |
 | Golden N=1 vs N | family golden: prefill units N=1 vs N byte-identical (logits and KV), shared-engine.md §6.2 | recommended, cheap once the golden exists | required |
 | Lossless speculation | `spec_lossless_set` panel | deferred (speculator off: Skipped) | required with a speculator |
@@ -57,6 +57,7 @@ Greedy, through the OpenAI API of the WIP instance:
 ```markdown
 **Smoke release (unqualified).** Served text-only, speculator off, one decode lane, on <cell>.
 Deferred: published fidelity set; `cpu-gate --full`; lossless speculation; the <drafter> drafter;
-<vision/audio> tower; exact prefix cache <if off>; two-RTX placements; RTX 5090; RTX expert
-onboarding; CUDA graphs and packing; kernel row curves; performance tuning; card A/Bs.
+<vision/audio> tower; two-RTX placements; RTX 5090; RTX expert onboarding; CUDA graphs and
+packing; kernel row curves; performance tuning; card A/Bs. Nothing deferred is structural: the
+family follows the engine's contracts, and these items add measurements and speed.
 ```

@@ -55,7 +55,7 @@ of scope.
 | 10 | KV sharing: layers 39, 43, …, 71 read layer 35's pages and never write | T4 | P4, P1 (cache geometry) | spec field | open |
 | 11 | SSMax: `q *= s_h · log(pos + 1) + b_h`, 64 attention heads and 32 indexer heads | T3 | P3 | no | open; fold into the query-rope stage only if the KL holds |
 | 12 | YaRN × 2048 with LeRoPE `alpha` (interleaved; host cos/sin table; the drafter has no alpha) | T2 | P3 | `L/plan/rope.rs` recipe | open |
-| 13 | Indexer query from `LayerNorm(h)` (bias) rather than the q-LoRA residual; `k_norm` LayerNorm with bias; SSMax; `[rope | nope]` layout | T2 | P3 | no | open; **smoke shortcut:** ≤ 2,048 visible keys equals dense MLA, so bring up dense first and the indexer second |
+| 13 | Indexer query from `LayerNorm(h)` (bias) rather than the q-LoRA residual; `k_norm` LayerNorm with bias; SSMax; `[rope | nope]` layout | T2 | P3 | no | open; **bring-up order only:** ≤ 2,048 visible keys equals dense MLA, so debug dense attention first and the indexer second. The smoke release ships the indexer |
 | 14 | Shared-indexer map: 28 layers reuse the closest preceding indexer layer | T4 | P4 | no | open |
 | 15 | Final logits soft-cap `30 · tanh(x / 30)` (none in cuteafd today) | T3 | P3 | the shared head | open |
 | 16 | Dense layer 0 (FFN 24576) and the shared expert (6144), FP8 block weight-only | T1 | P3 | no | open |
