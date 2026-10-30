@@ -22,7 +22,7 @@
       "checkpoint": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
       "5090": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "1rtx": {
         "status": "current",
@@ -46,7 +46,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       }
     },
     {
@@ -54,11 +54,11 @@
       "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "2rtx": {
         "status": "current",
@@ -70,11 +70,11 @@
       "checkpoint": "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "2rtx": {
         "status": "current",
@@ -86,7 +86,7 @@
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "current",
@@ -102,7 +102,7 @@
       "checkpoint": "nvidia/GLM-5.3-NVFP4",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "current",
@@ -110,7 +110,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       }
     },
     {
@@ -118,7 +118,7 @@
       "checkpoint": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "current",
@@ -150,7 +150,7 @@
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
       "5090": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "1rtx": {
         "status": "current",
@@ -174,7 +174,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       }
     },
     {
@@ -190,7 +190,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       }
     },
     {
@@ -206,7 +206,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       }
     },
     {
@@ -214,11 +214,11 @@
       "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "2rtx": {
         "status": "current",
@@ -230,11 +230,11 @@
       "checkpoint": "stepfun-ai/Step-5-Preview",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "2rtx": {
         "status": "current",
@@ -246,7 +246,7 @@
       "checkpoint": "stepfun-ai/Step-5-Preview-NVFP4",
       "5090": {
         "status": "na",
-        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+        "reason": "doesn't fit"
       },
       "1rtx": {
         "status": "current",
@@ -254,7 +254,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       }
     },
     {
@@ -270,7 +270,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "The 1\u00d7 RTX card holds the model; no Sparks needed."
+        "reason": "\u2014"
       }
     },
     {
@@ -278,7 +278,7 @@
       "checkpoint": "Qwen/Qwen3.5-9B",
       "5090": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "1rtx": {
         "status": "current",
@@ -286,7 +286,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Dense: one RTX holds the model."
+        "reason": "\u2014"
       }
     },
     {
@@ -294,7 +294,7 @@
       "checkpoint": "Qwen/Qwen3.8-27B",
       "5090": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "1rtx": {
         "status": "current",
@@ -302,7 +302,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Dense: one RTX holds the model."
+        "reason": "\u2014"
       }
     },
     {
@@ -310,7 +310,7 @@
       "checkpoint": "Qwen/Qwen3.8-27B-FP8",
       "5090": {
         "status": "na",
-        "reason": "Not measured for v4 (one card per checkpoint)."
+        "reason": "\u2014"
       },
       "1rtx": {
         "status": "current",
@@ -318,7 +318,7 @@
       },
       "2rtx": {
         "status": "na",
-        "reason": "Dense: one RTX holds the model."
+        "reason": "\u2014"
       }
     }
   ],

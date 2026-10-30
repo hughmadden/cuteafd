@@ -407,15 +407,14 @@ fn coordinator_budget(report: &Report) -> Option<f64> {
 
 fn short_hardware(report: &Report) -> String {
     let hw = &report.server.hardware;
-    if report.server.simulated_5090() {
-        return report.server.hardware_line();
-    }
-    let mut out = if report.server.column_5090() {
+    let mut out = if report.server.simulated_5090() {
+        "simulated 5090".into()
+    } else if report.server.column_5090() {
         "RTX 5090".into()
     } else {
         format!("{}× RTX", hw.used_gpus())
     };
-    if let Some(gib) = coordinator_budget(report) {
+    if let Some(gib) = coordinator_budget(report).filter(|_| !report.server.simulated_5090()) {
         out.push_str(&format!(" ({gib} GiB budget)"));
     }
     if !hw.sparks.is_empty() {
@@ -1337,7 +1336,7 @@ mod tests {
             default: None, source: "cli".into(),
         });
         assert_eq!(coordinator_budget(&p.report), Some(31.8));
-        assert!(short_hardware(&p.report).contains("simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB"));
+        assert!(short_hardware(&p.report).starts_with("simulated 5090"));
         assert!(p.report.server.hardware_line().contains("RTX PRO 6000 (188 SMs) capped at 31.8 GiB"));
         assert!(crate::render::card::card_svg(&p.report).contains("simulated 5090"));
         p.report.server.configuration.settings.last_mut().unwrap().value = Some("NaN".into());
