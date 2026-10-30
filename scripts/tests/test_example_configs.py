@@ -405,14 +405,14 @@ def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> N
 
 def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
-    assert len(matrix["cells"]) == 12
+    assert len(matrix["cells"]) == 20
     for row in matrix["cells"]:
         # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
         assert row["5090"]["status"] in ("current", "na")
         if row["5090"]["status"] == "current":
             assert row["5090"]["report"].endswith("-5090")
         current = [row[c] for c in ("1rtx", "2rtx") if row[c]["status"] == "current"]
-        # v3 publishes one card per checkpoint (two for V4.1 and GLM Flash EXL3).
+        # Each published checkpoint has at least one PRO card; the other column says why not.
         assert current and all(row[c]["status"] in ("current", "na") for c in ("1rtx", "2rtx"))
         for cell in current:
             assert (ROOT / cell["report"] / "report.json").is_file()

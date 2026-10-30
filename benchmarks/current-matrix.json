@@ -1,298 +1,425 @@
 {
- "schema": "cuteafd.bench.matrix/1",
- "cells": [
-  {
-   "family": "deepseek_v41",
-   "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-rtx5090-v41-flash-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min"
-   },
-   "2rtx": {
-    "status": "current",
-    "report": "benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-4spark-v41-flash-max"
-   }
-  },
-  {
-   "family": "deepseek_v4",
-   "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "deepseek_v4",
-   "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
-   "5090": {
-    "status": "na",
-    "reason": "Doesn't fit one 32 GB card with this checkpoint."
-   },
-   "1rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   },
-   "2rtx": {
-    "status": "current",
-    "report": "benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max"
-   }
-  },
-  {
-   "family": "glm5",
-   "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
-   "5090": {
-    "status": "na",
-    "reason": "Doesn't fit one 32 GB card with this checkpoint."
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/glm5/2026-10-18-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "glm5",
-   "checkpoint": "nvidia/GLM-5.3-NVFP4",
-   "5090": {
-    "status": "na",
-    "reason": "Doesn't fit one 32 GB card with this checkpoint."
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/glm5/2026-10-18-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "glm5_flash",
-   "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min"
-   },
-   "2rtx": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-glm53f-exl3-max"
-   }
-  },
-  {
-   "family": "glm5_flash",
-   "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "glm5_flash",
-   "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "mimo_v2",
-   "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "mimo_v2",
-   "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
-   "5090": {
-    "status": "na",
-    "reason": "Doesn't fit one 32 GB card with this checkpoint."
-   },
-   "1rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   },
-   "2rtx": {
-    "status": "current",
-    "report": "benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max"
-   }
-  },
-  {
-   "family": "qwen4",
-   "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  },
-  {
-   "family": "qwen4",
-   "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090"
-   },
-   "1rtx": {
-    "status": "current",
-    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min"
-   },
-   "2rtx": {
-    "status": "na",
-    "reason": "Not measured for v3 (one card per checkpoint)."
-   }
-  }
- ]
-,
- "retired": [
-  {
-    "name": "glm53-nvfp4-max",
-    "config": "examples/configs/glm53-nvfp4-max.config",
-    "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max",
-    "release": "v3 dev 2026-10-15",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "glm53f-nvfp4-max",
-    "config": "examples/configs/glm53-flash-nvfp4-max.config",
-    "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "glm53f-tr3-max",
-    "config": "examples/configs/glm53-flash-tr3-max.config",
-    "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "mimo-pro-min",
-    "config": "examples/configs/mimo-v26-pro-mxfp4-min.config",
-    "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "mimo26-flash-max",
-    "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
-    "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "qwen38-exl3-max",
-    "config": "examples/configs/qwen38-exl3-min.config",
-    "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "qwen38-nvfp4-max",
-    "config": "examples/configs/qwen38-nvfp4-min.config",
-    "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "v4-flash-max",
-    "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
-    "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "v4-pro-exl3-min",
-    "config": "examples/configs/deepseek-v4-pro-exl3-min.config",
-    "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "glm53f-fp8-min",
-    "config": "examples/configs/glm53-flash-fp8-min.config",
-    "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "glm53f-fp8-max",
-    "config": "examples/configs/glm53-flash-fp8-max.config",
-    "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max",
-    "release": "v3 dev 2026-10-14",
-    "release_note": "Untagged v3 development build; date is the smoke report date."
-  },
-  {
-    "name": "qwen38-nvfp4-min",
-    "config": "examples/configs/qwen38-nvfp4-min.config",
-    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min",
-    "release": "v3.0.0-rc5",
-    "release_note": "Tagged build recorded by the report."
-  },
-  {
-    "name": "qwen38-nvfp4-5090",
-    "config": "examples/configs/qwen38-nvfp4-min.config",
-    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090",
-    "release": "v3.0.0-rc4",
-    "release_note": "Tagged build recorded by the report."
-  },
-  {
-    "name": "glm53f-exl3-v1",
-    "config": "examples/configs/glm53-flash-exl3-min.config",
-    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
-    "release": "v3.0.0-rc5",
-    "release_note": "Tagged build recorded by the report."
-  }
-]
+  "schema": "cuteafd.bench.matrix/1",
+  "cells": [
+    {
+      "family": "deepseek_v41",
+      "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-30-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-30-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-30-smoke-deepseek-v4-1-flash-1017-2rtx-6spark-v41-flash-max"
+      }
+    },
+    {
+      "family": "deepseek_v41",
+      "checkpoint": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+      "5090": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-30-smoke-deepseek-v4-1-flash-1017-stridedple-1rtx-3spark-v41-flash-strided-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-30-smoke-deepseek-v4-1-flash-1017-stridedple-2rtx-6spark-v41-flash-strided-max"
+      }
+    },
+    {
+      "family": "deepseek_v4",
+      "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      }
+    },
+    {
+      "family": "deepseek_v4",
+      "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max"
+      }
+    },
+    {
+      "family": "kimi_k3",
+      "checkpoint": "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/kimi_k3/2026-10-30-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max"
+      }
+    },
+    {
+      "family": "glm5",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max"
+      }
+    },
+    {
+      "family": "glm5",
+      "checkpoint": "nvidia/GLM-5.3-NVFP4",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      }
+    },
+    {
+      "family": "glm5",
+      "checkpoint": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
+      "5090": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      }
+    },
+    {
+      "family": "mimo_v2",
+      "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-30-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-30-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      }
+    },
+    {
+      "family": "mimo_v2",
+      "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-30-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max"
+      }
+    },
+    {
+      "family": "step5",
+      "checkpoint": "stepfun-ai/Step-5-Preview",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-2rtx-6spark-step5-fp8-max"
+      }
+    },
+    {
+      "family": "step5",
+      "checkpoint": "stepfun-ai/Step-5-Preview-NVFP4",
+      "5090": {
+        "status": "na",
+        "reason": "Doesn't fit one 32 GB card with this checkpoint."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      }
+    },
+    {
+      "family": "qwen4",
+      "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+      "5090": {
+        "status": "current",
+        "report": "benchmarks/qwen4/2026-10-30-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen4/2026-10-30-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "The 1\u00d7 RTX card holds the model; no Sparks needed."
+      }
+    },
+    {
+      "family": "qwen3_5",
+      "checkpoint": "Qwen/Qwen3.5-9B",
+      "5090": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Dense: one RTX holds the model."
+      }
+    },
+    {
+      "family": "qwen3_5",
+      "checkpoint": "Qwen/Qwen3.8-27B",
+      "5090": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Dense: one RTX holds the model."
+      }
+    },
+    {
+      "family": "qwen3_5",
+      "checkpoint": "Qwen/Qwen3.8-27B-FP8",
+      "5090": {
+        "status": "na",
+        "reason": "Not measured for v4 (one card per checkpoint)."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "Dense: one RTX holds the model."
+      }
+    }
+  ],
+  "retired": [
+    {
+      "name": "glm53-nvfp4-max",
+      "config": "examples/configs/glm53-nvfp4-max.config",
+      "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max",
+      "release": "v3 dev 2026-10-15",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-nvfp4-max",
+      "config": "examples/configs/glm53-flash-nvfp4-max.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-tr3-max",
+      "config": "examples/configs/glm53-flash-tr3-max.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "mimo-pro-min",
+      "config": "examples/configs/mimo-v26-pro-mxfp4-min.config",
+      "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "mimo26-flash-max",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
+      "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "qwen38-exl3-max",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "qwen38-nvfp4-max",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "v4-flash-max",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
+      "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "v4-pro-exl3-min",
+      "config": "examples/configs/deepseek-v4-pro-exl3-min.config",
+      "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-fp8-min",
+      "config": "examples/configs/glm53-flash-fp8-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-fp8-max",
+      "config": "examples/configs/glm53-flash-fp8-max.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "qwen38-nvfp4-min",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min",
+      "release": "v3.0.0-rc5",
+      "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "qwen38-nvfp4-5090",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090",
+      "release": "v3.0.0-rc4",
+      "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "glm53f-exl3-v1",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
+      "release": "v3.0.0-rc5",
+      "release_note": "Tagged build recorded by the report."
+    }
+  ]
 }
