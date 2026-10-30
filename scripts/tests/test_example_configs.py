@@ -84,7 +84,8 @@ CHECKPOINTS = {
     "incoai/GLM-5.3-Flash-DFlash2": {"architectures": ["DFlash2DraftModel"]},
 }
 FAMILY_DOCS = {"deepseek_v41": "deepseek_v41", "deepseek_v4": "deepseek_v4", "glm5": "glm5",
-               "glm5_flash": "glm5_flash", "mimo_v2": "mimo_v2", "qwen4": "qwen4"}
+               "glm5_flash": "glm5_flash", "mimo_v2": "mimo_v2", "qwen4": "qwen4",
+               "kimi_k3": "kimi_k3", "qwen3_5": "qwen3_5", "step5": "step5"}
 # Launcher keys that select the speculator and the KV pool.
 SPECULATOR_KEYS = ("SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH")
 POOL_KEYS = ("POOL_TOKENS",)

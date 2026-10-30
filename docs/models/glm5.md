@@ -22,8 +22,7 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
 **Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): EXL3 K4 [min](../../examples/configs/glm53-exl3-min.config) · [max](../../examples/configs/glm53-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-nvfp4-min.config) · [max](../../examples/configs/glm53-nvfp4-max.config).
 
-Qualified native EXL3 K4 + K6-core starting configs (use `--wip SLOT` with
-a build containing native K6 support until that path is in a promoted release):
+Native EXL3 K4 + K6-core starting configs:
 [min](../../examples/configs/glm53-exl3-k6core-min.config) ·
 [max](../../examples/configs/glm53-exl3-k6core-max.config).
 

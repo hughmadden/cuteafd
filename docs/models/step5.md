@@ -1,8 +1,8 @@
 # Step-5
 
 Step-5-Preview serves text from its standard Hugging Face checkpoint headers.
-The qualified WIP layouts are official FP8 on two RTX PRO 6000 GPUs plus six
-Sparks, and official NVFP4 on one RTX PRO 6000 plus four Sparks. NVFP4 experts
+The release layouts are official FP8 on two RTX PRO 6000 GPUs plus six Sparks,
+and official NVFP4 on one RTX PRO 6000 plus four Sparks. NVFP4 experts
 use the checkpoint's calibrated W4A4 math, including decode.
 
 ## Native MTP

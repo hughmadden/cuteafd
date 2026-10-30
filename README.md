@@ -24,9 +24,9 @@ DGX Sparks serves the routed experts over RoCE.
 - **Plan before you serve:** `cuteafd plan` names what a checkpoint needs and
   how it fits your cards, and can copy each host only the shards it reads.
   [Sliced checkpoints](docs/sliced-checkpoints.md)
-- **Claude Code and Codex on your model** (next release): Anthropic Messages,
-  OpenAI Responses and Realtime APIs with server-side web search, so the CLIs
-  connect directly. [Client APIs](docs/client-apis.md)
+- **Claude Code and Codex on your model:** Anthropic Messages, OpenAI
+  Responses and Realtime APIs with server-side web search, so the CLIs connect
+  directly. [Client APIs](docs/client-apis.md)
 - **Own your intelligence:** your weights, your hardware, no rate limits.
 
 Prefill reports without `prompt_content: "realistic-v1"` used synthetic filler.
@@ -36,21 +36,24 @@ Decode and agentic-session workloads are unchanged.
 
 ## What's new in v4.0.0
 
-- **New families:** Kimi K3 (2× RTX + 6 Sparks), Step-5 Preview (FP8 and NVFP4),
-  GLM 5.3 EXLR8 and dense Qwen 3.5 / 3.8 all serve from release images.
+- **New families:** Kimi K3 (2× RTX + 6 Sparks), Step-5 Preview (official FP8
+  and NVFP4, MTP drafts), GLM 5.3 EXLR8 (native K2/K3/K4 experts, optional A8
+  prefill), and dense Qwen 3.5 9B and Qwen 3.8 27B (BF16 and FP8, dSpark) on one
+  RTX card.
+- **EXL3 K4 + Core K6 quants** for GLM 5.3 and GLM 5.3 Flash: native K6
+  attention, dense and shared FFN and vocabulary head, with new verify-row
+  decode kernels and a BF16 cross-GPU exchange. Kimi K3 runs the same K6 core.
 - **DeepSeek V4.1 Flash:** about 207 tok/s at C1 and 10.3k tok/s 8K prefill on
-  2× RTX + 6 Sparks; one process-wide io_uring reactor keeps cold Engram reads
-  overlapped with compute.
-- **EXL3 K4 + Core K6 quants for GLM 5.3 and GLM 5.3 Flash:** a native K6
-  dense core with new verify-row decode kernels and a BF16 cross-GPU exchange
-  ([GLM 5.3 min](examples/configs/glm53-exl3-k6core-min.config) ·
-  [max](examples/configs/glm53-exl3-k6core-max.config)).
-- **Shared prefill:** every family prefills through one scheduler with fixed
-  three-unit depth, and packs queued short prompts into one call.
-- **One shared decode engine:** every family runs on the same lane structure
-  and off-thread Spark exchange.
-- **RTX expert onboarding** is on everywhere, with warp-specialized EXL3
-  prefill kernels.
+  2× RTX + 6 Sparks. One process-wide io_uring reactor keeps cold Engram reads
+  overlapped with compute, and StridedPLE storage is supported.
+- **Shared prefill:** every family prefills through one scheduler (three units
+  deep with Sparks) and packs queued short prompts into one call.
+- **One shared decode engine:** every family runs on the same lane structure and
+  off-thread Spark exchange.
+- **RTX expert onboarding** is on by default for every Spark-backed family except
+  Step-5, with warp-specialized EXL3 prefill kernels.
+- **Lossless RoCE:** engine traffic rides the switch's lossless class with no
+  launch key.
 
 Full notes: [v4.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v4.0.0) ·
 [all releases](https://github.com/tpurtell/cuteafd/releases)
@@ -61,7 +64,7 @@ One basic-profile card per model and quant on this release: the natural minimum
 (1× RTX + the fewest Sparks) or maximum (2× RTX + 4 or 6 Sparks). In the 5090
 column, cards labelled "simulated 5090" ran on an RTX PRO 6000 capped at
 31.8 GiB (memory only, not SM count or clocks) until real RTX 5090 cards replace
-them; the others ran on a GeForce RTX 5090. Earlier releases and every other
+them. Earlier releases and every other
 report: [benchmarks](benchmarks/README.md).
 
 V4.1 also supports [StridedPLE](https://huggingface.co/wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE),
