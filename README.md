@@ -41,8 +41,10 @@ Decode and agentic-session workloads are unchanged.
 - **DeepSeek V4.1 Flash:** about 207 tok/s at C1 and 10.3k tok/s 8K prefill on
   2× RTX + 6 Sparks; one process-wide io_uring reactor keeps cold Engram reads
   overlapped with compute.
-- **GLM 5.3 Flash EXL3 K4 + Core K6:** a native K6 dense core with new
-  verify-row decode kernels, at better fidelity than the FP8-core quant.
+- **EXL3 K4 + Core K6 quants for GLM 5.3 and GLM 5.3 Flash:** a native K6
+  dense core with new verify-row decode kernels and a BF16 cross-GPU exchange
+  ([GLM 5.3 min](examples/configs/glm53-exl3-k6core-min.config) ·
+  [max](examples/configs/glm53-exl3-k6core-max.config)).
 - **Shared prefill:** every family prefills through one scheduler with fixed
   three-unit depth, and packs queued short prompts into one call.
 - **One shared decode engine:** every family runs on the same lane structure
