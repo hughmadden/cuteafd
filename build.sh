@@ -77,7 +77,7 @@ BUILD_ROOT/container-home when a build root is set and /tmp/cuteafd-home inside
 the container otherwise.
 
 Release exports derive from CUTEAFD_RELEASE_MATRIX (default:
-scripts/bench/release-smoke-v3.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
+scripts/bench/release-smoke-v4.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
 (default), comma-separated family or entry names, or explicit (raw knobs only).
 Raw CUTEAFD_RELEASE_* export knobs add to selected cards; OFF/empty cannot remove
 required exports. Narrow or explicit builds are for development, not release tags.
@@ -140,7 +140,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 release_scope="${CUTEAFD_RELEASE_SCOPE:-all}"
-release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v4.json}"
 release_matrix_sha256="$(sha256sum "$release_matrix" | awk '{print $1}')"
 release_scope_exports="$(python3 "$repo_root/scripts/build/release-scope.py" derive \
   --matrix "$release_matrix" --scope "$release_scope" --shell)"

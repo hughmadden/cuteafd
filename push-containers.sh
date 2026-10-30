@@ -200,14 +200,14 @@ spark_matrix_sha256="$(release_ssh "$spark_host" docker image inspect -f \
   release_die "image release matrix SHA256 labels are missing or disagree"
 if ((require_full)); then
   [[ "$coordinator_revision" =~ ^[0-9a-f]{40}$ ]] || release_die "release publication requires a clean full Git revision"
-  default_matrix_sha256="$(git -C "$repo_root" show "$coordinator_revision:scripts/bench/release-smoke-v3.json" | sha256sum | awk '{print $1}')" ||
+  default_matrix_sha256="$(git -C "$repo_root" show "$coordinator_revision:scripts/bench/release-smoke-v4.json" | sha256sum | awk '{print $1}')" ||
     release_die "cannot read default release matrix at image revision"
   [[ "$coordinator_matrix_sha256" == "$default_matrix_sha256" ]] ||
     release_die "image matrix SHA256 differs from default matrix at image revision"
   release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \
     --revision "$coordinator_revision")"
 else
-  release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+  release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v4.json}"
   [[ "$(sha256sum "$release_matrix" | awk '{print $1}')" == "$coordinator_matrix_sha256" ]] ||
     release_die "development matrix SHA256 differs from image matrix"
   release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \

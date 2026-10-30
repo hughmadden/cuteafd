@@ -42,7 +42,7 @@ PREVIOUS_RELEASE_FLOOR = {
         }.items() for count in counts
     } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
-DEFAULT_MATRIX = 'scripts/bench/release-smoke-v3.json'
+DEFAULT_MATRIX = 'scripts/bench/release-smoke-v4.json'
 
 
 # Retained package/layout floor from the stopped v2.0.0 images.
