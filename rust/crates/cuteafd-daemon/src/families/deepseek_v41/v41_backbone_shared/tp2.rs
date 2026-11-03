@@ -209,6 +209,8 @@ impl<'a> Weights<'a> {
     pub fn device(&self) -> Device<'a> { self.device }
     /// Frees raw scales kept for a recorded scale pack (after it ran).
     pub fn release_raw_scales(&mut self) { for m in &mut self.matrices { drop(m.source_scales.take()); } }
+    /// The most a layer's halves hold: FP8 weights and SM120's packed scales.
+    /// SM89's packed scales are the smaller checkpoint grid, so this bounds both.
     pub fn device_bytes() -> usize { 3 * (5120 * 1152 + 5120 * 1152 / 32) }
     /// Including every matrix's raw scales (resident until their pack ran).
     pub fn load_peak_device_bytes() -> usize { Self::device_bytes() + 3 * (5120 * 1152 / 1024) }
@@ -223,7 +225,7 @@ impl<'a> Weights<'a> {
             let kernel = device.run(|| device.library.v41_fp8_matrix_kernel(1, k, n))?;
             let prefix = format!("layers.{layer}.ffn.shared_experts.{name}");
             let weight = Allocation::new(device, (k*n) as usize)?;
-            let scales = Allocation::new(device, (k*n/32) as usize)?;
+            let scales = Allocation::new(device, usize::try_from(kernel.info().packed_weight_scale_bytes)?)?;
             let source_scales = Allocation::new(device, (k*n/1024) as usize)?;
             for (suffix, target) in [("weight", &weight), ("scale", &source_scales)] {
                 let rect = super::super::v41_tensors::half(catalog, &format!("{prefix}.{suffix}"), axis, device.id as usize)?;
