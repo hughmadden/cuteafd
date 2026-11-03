@@ -627,3 +627,271 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
 fn families_manifest(native_lib: &std::path::Path) -> Result<serde_json::Value> {
     cuteafd_loader::placement::families::deepseek_v41::owners::native_manifest(native_lib, "V41_FP8_AOT.json")
 }
+
+/// One coordinator GPU: every V4.1 native handle kind at every capacity its
+/// package exports, without the two-GPU planned layout (no peers, no TP2
+/// pair, no planned-size storage). Expert roles check their reduction
+/// attestation; the attention plan installs with the device's compressed
+/// backend, and a BF16 AOT plan must refuse on SM89.
+#[test]
+#[ignore = "requires CUTEAFD_NATIVE_LIB with its manifests beside it and a coordinator GPU"]
+fn cuda_v41_single_gpu_handles_create_at_every_exported_capacity() -> Result<()> {
+    use crate::families::deepseek_v41::*;
+    let native_lib = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIB")?);
+    // SAFETY: the trusted library under test stays loaded for the whole sweep.
+    let lib = unsafe { NativeLibrary::load(&native_lib)? };
+    lib.cuda_set_device(0)?;
+    let device = Device { library: &lib, id: 0 };
+    let arch = crate::shared::inventory::device_arch(&lib, 0)?;
+    let sms = u32::try_from(lib.sm_count()?)?;
+    let (_, total) = lib.cuda_memory_info()?;
+    eprintln!("DEVICE arch={arch} sms={sms} total={total}");
+    let mut sweep = Sweep::default();
+
+    // Every FP8 geometry as a capacity plan (each exported kernel capacity,
+    // drafter covers included) with its scratch initialized, and the
+    // planner's charge from the library's manifest beside it.
+    let fp8_manifest = families_manifest(&native_lib)?;
+    let programs = cuteafd_loader::placement::families::deepseek_v41::owners::NativePrograms::new(&fp8_manifest, sms)?
+        .with_compressed_attention(arch.v41_compressed_attention());
+    let geometries = [(6144, 25600), (5120, 2304), (2304, 5120), (5120, 1152), (1152, 5120), (15360, 5120),
+        (5120, 1280), (1280, 32768), (1280, 16384), (1280, 4096), (5120, 512), (8192, 5120), (8192, 2560), (32768, 8192)];
+    for (k, n) in geometries {
+        for rows in [1, 16, 40, cuteafd_core::V41_VERIFY_ROWS as u32, 256, 1024, 4096] {
+            let runtime = sweep.record("FP8 plan", format!("m{rows} {k}x{n}"), fp8_plan(&lib, rows, k, n));
+            if let Some(runtime) = runtime.filter(|_| rows != 40 && n != 16384 && n != 2560) {
+                sweep.record("plan == runtime", format!("FP8 scratch m{rows} {k}x{n}"), (|| {
+                    let plan = programs.scratch(u64::from(rows), u64::from(k), u64::from(n))?;
+                    ensure!(plan == runtime, "planner charges {plan} B, the library's plan allocates {runtime} B");
+                    Ok(())
+                })());
+            }
+        }
+        sweep.record("FP8 info", format!("{k}x{n}"), lib.v41_fp8_matrix_info(1, k, n).map(drop));
+    }
+    sweep.record("FP8 kernel", "Engram m16", lib.v41_fp8_kernel(16).map(drop));
+    for rows in [16, cuteafd_core::V41_VERIFY_ROWS] {
+        for vocabulary in [64640, 129280] {
+            if let Some(scratch) = sweep.record("FP8 head scratch", format!("rows {rows} vocab {vocabulary}"),
+                crate::shared::fp8_linear::scratch(&lib, rows, &[(5120, vocabulary)]).map(|s| s.buffer.bytes)) {
+                sweep.record("plan == runtime", format!("FP8 head scratch rows {rows} vocab {vocabulary}"), (|| {
+                    let plan = programs.vocabulary_scratch(rows as u64, vocabulary as u64)?;
+                    ensure!(plan == scratch.max(256) as u64, "planner charges {plan} B, the head allocates {scratch} B");
+                    Ok(())
+                })());
+            }
+            sweep.record("packed head workspace", format!("rows {rows} vocab {vocabulary}"),
+                lib.packed_head_workspace(rows, 5120, vocabulary).map(drop));
+        }
+    }
+
+    // Every expert role at every exported capacity, with the routed roles'
+    // reduction attestation, then the single-RTX preload.
+    for (role, name) in [(0u32, "coordinator"), (2, "rtx_backbone"), (3, "rtx_tp2"), (4, "dspark_tp2")] {
+        let Some(exports) = sweep.record("expert package", name, lib.native_expert_exports(role)) else { continue };
+        eprintln!("EXPERTS {name} capacities={:?} decode={:?}", exports.capacities, exports.decode);
+        let mut infos = Vec::new();
+        for &capacity in &exports.capacities {
+            let at = format!("{name} m{capacity}");
+            let info = sweep.record("expert kernel", at.clone(), (|| {
+                let kernel = match role {
+                    0 => lib.v41_expert_kernel(capacity)?,
+                    2 => lib.v41_local_expert_kernel(capacity)?,
+                    3 => lib.v41_tp2_expert_kernel(capacity)?,
+                    _ => lib.v41_dspark_tp2_expert_kernel(capacity)?,
+                };
+                kernel.group_rows_for(0)?;
+                Ok(*kernel.info())
+            })());
+            if let Some(info) = info {
+                eprintln!("EXPERT {name} m{capacity}: scratch {} B, max_active_clusters {}, input_dtype {}",
+                    info.scratch_bytes, info.max_active_clusters, info.input_dtype);
+                if matches!(role, 2 | 3) {
+                    sweep.record("expert reduction", at, lib.native_expert_reduction(&info).map(|recipe| {
+                        eprintln!("REDUCTION {name} m{capacity}: {recipe:?}");
+                    }));
+                    infos.push(info);
+                }
+            }
+        }
+        if !infos.is_empty() {
+            sweep.record("expert reduction plan", name,
+                crate::shared::experts::ExpertReductionPlan::native(&lib, infos).map(drop));
+        }
+    }
+    sweep.record("native preload", "single RTX rows 2752", admission::preload(&lib, 2752, 1, false));
+    for intermediate in [2304, 1152] {
+        sweep.record("expert packer", intermediate, lib.v41_expert_packer(intermediate).map(drop));
+    }
+    sweep.record("expert load kernels", "", crate::shared::fp8_load_quant::LoadKernels::new(&lib).map(drop));
+    sweep.record("expert input quantizer", "", lib.v41_expert_input_quantizer().map(drop));
+    // The draft experts' execution as dSpark binds it (m40) and the TP2 rank's
+    // executions over every capacity (max rows 4096) and the decode width.
+    if let Some(weights) = sweep.record("synthetic experts", "dSpark stage 0",
+        synthetic_experts(device, v41_experts::ExpertLayer::Dspark { stage: 0 }, 2304, 128)) {
+        sweep.record("dSpark expert execution", "m40", weights.execution(40, 40, usize::MAX).map(drop));
+    }
+    {
+        use crate::shared::experts::rtx::{native::NativeTp2, pair::OwnerPolicy};
+        let OwnerPolicy::Native { selection, output, .. } = OwnerPolicy::native(&lib, false)?
+            else { anyhow::bail!("native TP2 owner policy") };
+        let weights = sweep.record("synthetic experts", "TP2 rank 0",
+            synthetic_experts(device, v41_experts::ExpertLayer::BackboneTp2 { layer: 0, rank: 0 }, 1152, 384))
+            .and_then(|w| sweep.record("TP2 weight owner", "rank 0", device.own(|| Ok(vec![w])).map(std::rc::Rc::new)));
+        if let Some(weights) = weights {
+            for rows in [cuteafd_core::V41_VERIFY_ROWS, 4096] {
+                sweep.record("TP2 expert execution", format!("max rows {rows}"), (|| {
+                    let workspace = NativeTp2::workspace_bytes_for_format(&lib, rows, selection, output, false)?;
+                    NativeTp2::execution(device, 0, vec![0], rows, workspace, weights.clone(), selection, output).map(drop)
+                })());
+            }
+        }
+    }
+    for ranks in 1..=8u32 {
+        sweep.record("compact reducer", format!("{ranks} ranks"), lib.v41_compact_reducer().and_then(|r| {
+            r.require_rank_count(ranks)?;
+            r.require_plane_reduction(ranks)
+        }));
+    }
+    sweep.record("route reducer", "", lib.v41_route_reducer().map(drop));
+    sweep.record("TP2 expert reducer", "route sums", lib.v41_tp2_expert_reducer().and_then(|r| {
+        ensure!(r.supports_route_sums(), "no ordered FP32 route sums");
+        Ok(())
+    }));
+    sweep.record("local expert reducer", "", lib.v41_local_expert_reducer().map(drop));
+
+    // The attention plan with the device's compressed backend, on decode and
+    // storage-backed sparse waves, and the guard on a BF16 AOT plan.
+    let args = serve_args(std::path::Path::new("/nonexistent"), &native_lib, 256, 3, 8192)?;
+    if let Some(plan) = sweep.record("attention plan", arch, super::attention_plan(&lib, 0, &args)) {
+        eprintln!("ATTENTION rows={} capacity={} compressed={:?} window={:?}", plan.rows(), plan.capacity_rows(),
+            plan.sparse_recipe(true), plan.sparse_recipe(false));
+        sweep.record("sparse attention install", "decode wave", (|| {
+            let rows = cuteafd_core::V41_VERIFY_ROWS;
+            let mut wave = v41_sparse_attention::SparseAttentionWave::new(&lib, rows,
+                v41_sparse_attention::SparseAttentionWave::device_bytes(rows)?)?;
+            wave.install_attention_plan(plan)
+        })());
+        if let Some(storage) = sweep.record("sparse attention storage", "unit 256",
+            v41_sparse_attention::SparseAttentionStorage::<'_, 64>::new(&lib, 256, &[0])) {
+            sweep.record("sparse attention install", "storage wave", (|| {
+                let mut wave = v41_sparse_attention::SparseAttentionWave::on_storage(storage.clone())?;
+                wave.install_attention_plan(plan)
+            })());
+        }
+        sweep.record("attention guard", "BF16 AOT plan", (|| {
+            let bf16_aot = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(plan.capacity_rows(),
+                Some(usize::from(args.dspark_draft_limit)), args.attention_plan_rows)?;
+            let rows = cuteafd_core::V41_VERIFY_ROWS;
+            let mut wave = v41_sparse_attention::SparseAttentionWave::new(&lib, rows,
+                v41_sparse_attention::SparseAttentionWave::device_bytes(rows)?)?;
+            let installed = wave.install_attention_plan(bf16_aot);
+            eprintln!("GUARD BF16 AOT plan on {arch}: {}", installed.as_ref().err()
+                .map_or_else(|| "installed".to_owned(), |error| format!("{error:#}")));
+            ensure!(installed.is_err() == (arch == cuteafd_core::GpuArch::Sm89),
+                "a BF16 AOT attention plan {} on {arch}", if installed.is_ok() { "installed" } else { "refused" });
+            Ok(())
+        })());
+    }
+    sweep.record("sparse attention", "32 heads", lib.v41_sparse_attention_heads32().map(drop));
+
+    // Every remaining handle kind, through the weight-free owners at decode
+    // width and an exported 256-row unit.
+    let rows = cuteafd_core::V41_VERIFY_ROWS;
+    sweep.record("mHC", "storage and projection", v41_hc::HcStorage::new(&lib, rows).and_then(|_| lib.v41_hc().map(drop)));
+    sweep.record("router", "storage, router and quantizer", (|| {
+        v41_backbone_router::BackboneRouterStorage::new(&lib, rows as u32, rows as u32)?;
+        lib.v41_router()?;
+        lib.v41_expert_input_quantizer().map(drop)
+    })());
+    for width in [5, 7] {
+        sweep.record("attention ops", format!("width {width}"), lib.v41_attention_ops_width(width).map(drop));
+        sweep.record("dSpark attention", format!("width {width}"), lib.v41_dspark_attention_width(width).map(drop));
+    }
+    sweep.record("layer clock", "40 layers", crate::shared::draft::clock::LayerClock::new(&lib, 40).map(drop));
+    for (rows, unit) in [(rows, rows), (256, 256)] {
+        if let Some(storage) = sweep.record("index selection storage", format!("rows {rows} unit {unit}"),
+            v41_index_selection::IndexSelectionWave::storage(&lib, rows, unit, &[0])) {
+            sweep.record("index selection follower", format!("rows {rows}"),
+                v41_index_selection::IndexSelectionWave::follower_storage(&storage)
+                    .and_then(v41_index_selection::IndexSelectionWave::on_storage).map(drop));
+            sweep.record("index selection", format!("rows {rows}"),
+                v41_index_selection::IndexSelectionWave::on_storage(storage).map(drop));
+        }
+        sweep.record("producer storage", format!("rows {rows} unit {unit}"),
+            v41_backbone_execution::ProducerStorage::new(&lib, rows, unit).map(drop));
+        sweep.record("Engram gate storage", format!("rows {rows} unit {unit}"),
+            v41_engram::layer::EngramGate::storage(&lib, rows, unit).map(drop));
+        sweep.record("Engram rows", format!("rows {rows} unit {unit}"),
+            v41_engram::EngramDeviceRows::storage(&lib, rows, unit).map(drop));
+        sweep.record("embedding storage", format!("rows {rows} unit {unit}"),
+            v41_target_embedding::TargetEmbeddingWave::storage(&lib, rows, unit).map(drop));
+        if let Some(storage) = sweep.record("target tap storage", format!("rows {rows} unit {unit}"),
+            v41_target_pass::TargetTapWave::storage(&lib, rows, unit)) {
+            sweep.record("target taps", format!("rows {rows}"), v41_target_pass::TargetTapWave::on_storage(storage).map(drop));
+        }
+    }
+    for layers in [vec![2usize], vec![20]] {
+        sweep.record("compressor storage", format!("layers {layers:?}"),
+            v41_compressor::CompressorStorage::new(&lib, rows, rows, &layers).map(drop));
+    }
+    sweep.record("window and KV", "", (|| {
+        lib.v41_kv()?;
+        lib.v41_compressed_kv()?;
+        lib.v41_kv_store_layers().map(drop)
+    })());
+    sweep.record("index scoring", "scores, top-k, candidate blocks", (|| {
+        lib.v41_index_scores()?;
+        lib.v41_index_topk()?;
+        lib.v41_candidate_blocks().map(drop)
+    })());
+    sweep.record("compressor", "4 MiB workspace", (|| {
+        let workspace = workspace(&lib)?;
+        // SAFETY: the workspace outlives the handle, dropped first.
+        unsafe { lib.v41_compressor(workspace.buffer) }.map(drop)
+    })());
+    sweep.record("grouped output", "4 MiB workspace", (|| {
+        let workspace = workspace(&lib)?;
+        // SAFETY: the workspace outlives the handle, dropped first.
+        unsafe { lib.v41_grouped_output(workspace.buffer) }.map(drop)
+    })());
+    for (kind, vocabulary) in [("vocabulary head", 0usize), ("vocabulary shard", 64640), ("Markov", 1)] {
+        sweep.record(kind, vocabulary, (|| {
+            let workspace = workspace(&lib)?;
+            // SAFETY: the workspace outlives the projection, dropped first.
+            unsafe { match vocabulary {
+                0 => lib.v41_vocabulary_head(workspace.buffer),
+                1 => lib.v41_dspark_markov(workspace.buffer),
+                rows => lib.v41_vocabulary_shard(workspace.buffer, rows),
+            } }.map(drop)
+        })());
+    }
+    sweep.record("target sampling", "rows 64", crate::shared::sampler::TargetSamplingWave::new(&lib, rows, 129280).map(drop));
+    sweep.record("dSpark heads", "confidence, draft step, cache", (|| {
+        lib.v41_dspark_confidence()?;
+        lib.v41_draft_step()?;
+        lib.v41_dspark_cache().map(drop)
+    })());
+    sweep.record("dSpark window", "8 slots, 256 rows", v41_dspark_cache::DsparkWindow::new(&lib, 8, 256,
+        v41_dspark_cache::DsparkWindow::device_bytes(8, 256)?).map(drop));
+    for unit in [40, rows as u32] {
+        sweep.record("shared FFN storage", unit, v41_shared_ffn::SharedFfnStorage::new(&lib, unit).map(drop));
+    }
+    sweep.record("shared SwiGLU", "full and TP2", (|| {
+        lib.v41_shared_swiglu()?;
+        lib.v41_shared_tp2_swiglu().map(drop)
+    })());
+    sweep.record("device ops", "peer copy and BF16 add", (|| { lib.v41_peer_copy()?; lib.bf16_add().map(drop) })());
+    sweep.record("transport", "unlinked rows 64", v41_experts::coordinator::NativeTp4Wave::unlinked(&lib, rows as u32).map(drop));
+    sweep.record("exchange setup", "", (|| { lib.tp2_native_initialize()?; lib.peer_exchange_initialize() })());
+    sweep.record("prefix arenas", "4 slots", super::prefix::Arenas::new(device, None, 4).map(drop));
+
+    sweep.record("device drained", "GPU0", lib.cuda_device_synchronize());
+    eprintln!("CREATED {} creation steps in {} kinds:", sweep.created.values().sum::<usize>(), sweep.created.len());
+    for (kind, count) in &sweep.created { eprintln!("  {count:6}  {kind}"); }
+    eprintln!("REFUSED {}", sweep.refused.len());
+    for line in &sweep.refused { eprintln!("  {line}"); }
+    ensure!(sweep.refused.is_empty(), "{} handles refused on {arch} ({sms} SMs):\n{}", sweep.refused.len(),
+        sweep.refused.join("\n"));
+    Ok(())
+}
