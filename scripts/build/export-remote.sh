@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Coordinator native/AOT export on a remote SM120 export host (maxq), with no
+# Coordinator native/AOT export on a remote export host (maxq, SM120), with no
 # GPU turn on raptor. Run from raptor by wip.sh's coordinator native phase.
 #
-#   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_LAYERS
+#   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_LAYERS [ARCH]
 #
 # STAGING_DIR is wip.sh's frozen source tree; KEY the native key raptor's Rust
-# phase recorded; ENV_FILE the coordinator build scopes (KEY=VALUE lines).
+# phase recorded; ENV_FILE the coordinator build scopes (KEY=VALUE lines); ARCH
+# the coordinator's CUDA architecture (120, or 89 on a host wip.sh found SM89):
+# exports compile for the GPU they run on.
 # Bulk data moves only through sparknest: the source goes up as one sealed archive
 # replicated to HOST, and the export comes back through the existing native
-# tier (build-cache/wip-native/x86_64/coordinator-120/KEY.tar.zst), which
+# tier (build-cache/wip-native/x86_64/coordinator-ARCH/KEY.tar.zst), which
 # wip.sh imports and restores with CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1.
 #
 # On HOST: admission reads the HOST's nvidia-smi (on WSL2 a container's
@@ -19,19 +21,20 @@
 # Exit 75 means "not here": wip.sh falls back.
 set -euo pipefail
 trap 'echo "export-remote: line $LINENO: \"$BASH_COMMAND\" exited $?" >&2' ERR
-host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
+host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6" arch="${7:-120}"
 # DEV_IMAGE_LAYERS is the sha256 of the image's RootFS layer list: its content
 # identity. A local image ID is not portable (docker save | load can give the
 # same layers a different ID on another host); the native key still carries
 # raptor's ID through ENV_FILE (CUTEAFD_WIP_DEV_IMAGE_ID), so the export lands
 # under the key raptor's own build expects.
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "export-remote: bad native key" >&2; exit 2; }
+[[ "$arch" == 120 || "$arch" == 89 ]] || { echo "export-remote: bad coordinator arch" >&2; exit 2; }
 NO_TURN=75
 # Connect by name using HOST's own ssh configuration.
 ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host")
 run_id="$$-$(date +%s%N)"
 area="/mnt/sparknest/build-cache/export/$key-$run_id"
-archive="/mnt/sparknest/build-cache/wip-native/x86_64/coordinator-120/$key.tar.zst"
+archive="/mnt/sparknest/build-cache/wip-native/x86_64/coordinator-$arch/$key.tar.zst"
 started=$SECONDS
 
 mountpoint -q /mnt/sparknest && command -v nest >/dev/null || { echo "export-remote: no sparknest here" >&2; exit "$NO_TURN"; }
@@ -58,9 +61,9 @@ if [[ ! -f "$archive" ]]; then
   timeout 900 nest replicate --hosts "$host" --wait "$area" >/dev/null
   echo "export-remote: staged source on $host in $((SECONDS - started))s"
   set +e
-  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$archive" "${CUTEAFD_REMOTE_EXPORT_SLOTS:-}" <<'REMOTE'
+  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$archive" "${CUTEAFD_REMOTE_EXPORT_SLOTS:-}" "$arch" <<'REMOTE'
 set -euo pipefail
-area="$1" image="$2" key="$3" archive="$4" slots="${5:-}"
+area="$1" image="$2" key="$3" archive="$4" slots="${5:-}" arch="$6"
 NO_TURN=75
 cores="$(nproc)"
 memory_mib="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
@@ -132,10 +135,10 @@ python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$cap" --ledger "$ledg
     --env-file "$area/scope.env" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
     -v "$HOME/.cache/cuteafd/export-workers:/export-slots" -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \
     "$image" /wip/source/scripts/build/build-wip-artifacts.sh \
-    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator export || status=$?
+    /wip/source coordinator "$arch" /wip/build/coordinator /wip/output/coordinator export || status=$?
 if ((status == 0)); then
   read -r _ got <"$root/output/coordinator/.native-cache-key"
-  entry="$root/build/native-store/coordinator-120/$got"
+  entry="$root/build/native-store/coordinator-$arch/$got"
   if [[ "$got" != "$key" ]]; then
     echo "export-remote: exported key $got, raptor expects $key" >&2
     status="$NO_TURN"

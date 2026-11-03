@@ -89,12 +89,14 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     assert admit < container  # admission precedes the export container
     assert 'mem_get_info' not in remote
     # Bulk data only through sparknest, never one ssh pipe.
-    assert 'nest replicate --hosts "$host"' in remote and 'wip-native/x86_64/coordinator-120' in remote
+    assert 'nest replicate --hosts "$host"' in remote and 'wip-native/x86_64/coordinator-$arch' in remote
+    assert 'arch="${7:-120}"' in remote and '/wip/source coordinator "$arch" /wip/build/coordinator' in remote
     # The interim SM-count guard went with #130: no export carries the card's SM count.
     assert 'sm-check' not in remote and 'sm-check' not in (ROOT / 'scripts/build/export-placement.py').read_text()
 
 
-def test_capped_export_runs_the_native_phase_in_a_one_off_container_on_the_held_gpu(tmp_path):
+@pytest.mark.parametrize('arch', ['120', '89'])
+def test_capped_export_runs_the_native_phase_in_a_one_off_container_on_the_held_gpu(tmp_path, arch):
     trace = tmp_path / 'trace'
     locks = tmp_path / 'locks'
     locks.mkdir()
@@ -115,7 +117,8 @@ esac
     cdi = (ROOT / 'scripts/lib/cdi-gpus.sh').read_text()
     script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
 repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
-wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
+wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc \
+  /wip/source/scripts/build/build-wip-artifacts.sh /wip/source coordinator {arch} /wip/build/coordinator /wip/output/coordinator
 '''
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + script], capture_output=True, text=True, timeout=60,
                             env={**os.environ, 'PATH': f'{bindir}:{os.environ["PATH"]}', 'CUTEAFD_LOCK_DIR': str(locks),
@@ -125,9 +128,33 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     run = next(line for line in calls.splitlines() if line.startswith('docker run'))
     assert '--device nvidia.com/gpu=GPU-one' in run and '--gpus' not in run and '--volumes-from wipc' in run
     assert '-e CUTEAFD_WIP_DSV4_AOT=ON' in run and '-e CUTEAFD_WIP_EXPERT_FAMILIES=a;b' in run
-    assert 'docker exec cid123 timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh' in calls
+    # The build's own command (its architecture included), as the native phase.
+    assert ('docker exec cid123 timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh '
+            f'/wip/source coordinator {arch} /wip/build/coordinator /wip/output/coordinator native\n') in calls
     assert 'docker ps -a' in calls
     assert 'capped on gpu1' in result.stdout
+
+
+@pytest.mark.parametrize('arch', ['120', '89'])
+def test_remote_export_exports_the_keys_architecture(tmp_path, arch):
+    repo = tmp_path / 'repo'
+    (repo / 'scripts/build').mkdir(parents=True)
+    trace = tmp_path / 'trace'
+    stub = repo / 'scripts/build/export-remote.sh'
+    stub.write_text(f'#!/bin/sh\necho "$@" > {trace}\nexit 75\n')
+    stub.chmod(0o755)
+    state = tmp_path / 'state'
+    (state / 'output/coordinator').mkdir(parents=True)
+    (state / 'output/coordinator/.native-cache-key').write_text(f'coordinator-{arch} ' + 'a' * 64 + '\n')
+    script = 'docker() { echo layers; }\n' + _function('wip_remote_export') + f'''
+repo_root={str(repo)!r} state_dir={str(state)!r} staging_dir=/staging COORDINATOR_DOCKER_DEV=img
+coordinator_build=(docker exec -e CUTEAFD_WIP_DSV4_AOT=OFF c /x)
+CUTEAFD_EXPORT_HOST=exporter wip_remote_export || echo "status $?"
+'''
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
+    assert 'status 75' in result.stdout, result.stdout + result.stderr
+    args = trace.read_text().split()
+    assert args[0] == 'exporter' and args[2] == 'a' * 64 and args[-1] == arch
 
 
 def test_the_export_containers_gpu_binding_has_one_call_site():
