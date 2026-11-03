@@ -423,6 +423,60 @@ impl ExpertRouteProfile {
     }
 }
 
+/// A routing census as serving writes it (the daemon's
+/// `CUTEAFD_V41_ROUTE_CENSUS`): the profile's `layers` (decode and verify
+/// rows, what the tier serves) plus prefill counts and provenance, which
+/// [`ExpertRouteProfile::read`] ignores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpertRouteCensus {
+    /// The served model id.
+    pub model: String,
+    /// When counting began (serving readiness) and when this file was written, RFC 3339 UTC.
+    pub started: String,
+    pub time: String,
+    /// Decode and verify passes counted.
+    pub steps: u64,
+    /// Decode and verify rows routed (each through every routed layer).
+    pub tokens: u64,
+    /// Prefill rows routed through the first routed layer (later layers of a
+    /// causal encoder/decoder see fewer).
+    pub prefill_tokens: u64,
+    pub experts: usize,
+    pub topk: usize,
+    /// Per routed layer, how many decode and verify rows chose each expert.
+    pub layers: Vec<Vec<u64>>,
+    /// The same for prefill rows.
+    pub prefill_layers: Vec<Vec<u64>>,
+}
+
+impl ExpertRouteCensus {
+    /// What the planner reads: the decode and verify counts.
+    pub fn profile(&self) -> ExpertRouteProfile {
+        ExpertRouteProfile { layers: self.layers.clone() }
+    }
+
+    /// Replaces `path` atomically: a synced sibling temporary file, renamed
+    /// over it, so a reader never sees a partial census.
+    pub fn write(&self, path: &std::path::Path) -> Result<(), ExpertTierError> {
+        use std::io::Write;
+        let name = path.file_name()
+            .ok_or_else(|| ExpertTierError::Profile(format!("{} names no file", path.display())))?;
+        let temporary = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| ExpertTierError::Profile(format!("encoding a census: {error}")))?;
+        let written = (|| {
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+        })();
+        written.map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            ExpertTierError::Profile(format!("writing {}: {error}", path.display()))
+        })
+    }
+}
+
 /// One resident expert's bytes on `gpu` for the layer's `cost`, exact: the
 /// layer's residency must divide evenly over its experts.
 pub(super) fn per_expert(cost: &ExpertCost, tp2: bool, gpu: usize, experts: usize)
@@ -494,6 +548,35 @@ mod tests {
         let empty = ExpertRouteProfile { layers: vec![vec![0; 8]; 2] };
         assert!(empty.validate(2, 8).is_err());
         assert!(profile.validate(3, 8).is_err());
+    }
+
+    #[test]
+    fn a_census_file_reads_back_as_its_decode_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("route-census.json");
+        let (mut layers, mut prefill_layers) = (vec![vec![0u64; 384]; 40], vec![vec![0u64; 384]; 40]);
+        for (layer, row) in layers.iter_mut().enumerate() { row[layer] = 4; row[383 - layer] = 2; }
+        prefill_layers[0][7] = 6;
+        let census = ExpertRouteCensus { model: "org/model".into(), started: "2026-11-05T00:00:00Z".into(),
+            time: "2026-11-05T00:10:00Z".into(), steps: 3, tokens: 1, prefill_tokens: 1, experts: 384, topk: 6,
+            layers, prefill_layers };
+        census.write(&path).unwrap();
+        // The planner reads the decode counts and ignores the rest.
+        let profile = ExpertRouteProfile::read(&path).unwrap();
+        assert_eq!(profile, census.profile());
+        profile.validate(40, 384).unwrap();
+        let back: ExpertRouteCensus = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back, census);
+        // A later dump replaces the file whole and leaves no temporary behind.
+        let later = ExpertRouteCensus { steps: 4, time: "2026-11-05T00:20:00Z".into(), ..census.clone() };
+        later.write(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<ExpertRouteCensus>(&std::fs::read(&path).unwrap()).unwrap(), later);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        // Prefill counts alone are no tier profile.
+        let prefill_only = ExpertRouteCensus { layers: vec![vec![0; 384]; 40], ..census };
+        assert!(prefill_only.profile().validate(40, 384).is_err());
+        assert!(prefill_only.write(&directory.path().join("missing").join("census.json")).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

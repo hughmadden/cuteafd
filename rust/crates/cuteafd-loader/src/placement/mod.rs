@@ -36,8 +36,8 @@ pub use pool::{PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
-pub use expert_tier::{ExpertActivation, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest, ExpertTierSetting,
-    ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
+pub use expert_tier::{ExpertActivation, ExpertRouteCensus, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest,
+    ExpertTierSetting, ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.
