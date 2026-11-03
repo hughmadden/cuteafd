@@ -2,10 +2,12 @@
 // `cuteafd fabric --p2p` probe that measures it against the copy engine and a
 // pinned-host bounce.
 #include "cuteafd_peer_exchange.h"
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -799,4 +801,140 @@ extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void
   }
   copy_regions<<<staging_blocks(largest), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
   return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_copy_engine_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream) {
+  if (!destinations || !sources || !bytes || !count || count > 4 || !stream) return cudaErrorInvalidValue;
+  for (uint32_t r = 0; r < count; ++r)
+    if (bytes[r] && (!destinations[r] || !sources[r])) return cudaErrorInvalidValue;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (!bytes[r]) continue;
+    const cudaError_t status = cudaMemcpyAsync(destinations[r], sources[r], bytes[r], cudaMemcpyDefault,
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
+}
+
+namespace {
+// The staging probe's own resources; freed on every return path.
+struct StagingProbeSide {
+  cudaStream_t stream = nullptr;
+  cudaEvent_t start = nullptr, stop = nullptr;
+  uint8_t* source = nullptr;
+  uint32_t* words = nullptr;  // mapped pinned: [hold, satisfied, published]
+  ~StagingProbeSide() {
+    if (stream) cudaStreamSynchronize(stream);
+    if (start) cudaEventDestroy(start);
+    if (stop) cudaEventDestroy(stop);
+    if (source) cudaFree(source);
+    if (words) cudaFreeHost(words);
+    if (stream) cudaStreamDestroy(stream);
+  }
+};
+
+CUdeviceptr mapped_alias(uint32_t* word) {
+  void* alias = nullptr;
+  return cudaHostGetDevicePointer(&alias, word, 0) == cudaSuccess ? reinterpret_cast<CUdeviceptr>(alias) : 0;
+}
+
+// Whether `bytes` of the host arena all read `value` (every 64th byte: a
+// copy-engine copy lands in whole lines).
+bool arena_reads(const uint8_t* host, uint64_t bytes, uint8_t value) {
+  const volatile uint8_t* seen = host;
+  for (uint64_t i = 0; i < bytes; i += 64)
+    if (seen[i] != value) return false;
+  return seen[bytes - 1] == value;
+}
+}  // namespace
+
+extern "C" int32_t cuteafd_staging_probe(void* host, void* alias, uint64_t capacity, uint32_t regions,
+    cuteafd_staging_probe_t* out) {
+  if (!host || !alias || !out || regions < 1 || regions > 4 || capacity < 4096) return cudaErrorInvalidValue;
+  *out = cuteafd_staging_probe_t{};
+  const uint64_t largest = std::min<uint64_t>(capacity & ~uint64_t(15), 512u << 10);
+  StagingProbeSide side;
+  CHECK(cudaStreamCreateWithFlags(&side.stream, cudaStreamNonBlocking));
+  CHECK(cudaEventCreate(&side.start));
+  CHECK(cudaEventCreate(&side.stop));
+  CHECK(cudaMalloc(&side.source, largest));
+  CHECK(cudaMemsetAsync(side.source, 0xA5, largest, side.stream));
+  CHECK(cudaHostAlloc(&side.words, 64, cudaHostAllocMapped | cudaHostAllocPortable));
+  std::memset(side.words, 0, 64);
+  const CUdeviceptr hold = mapped_alias(side.words), satisfied = mapped_alias(side.words + 1),
+      published = mapped_alias(side.words + 2);
+  if (!hold || !satisfied || !published) return cudaErrorInvalidValue;
+  CHECK(cudaStreamSynchronize(side.stream));
+  const CUstream stream = reinterpret_cast<CUstream>(side.stream);
+  uint8_t* arena = static_cast<uint8_t*>(host);
+  volatile uint32_t* hold_word = side.words;
+
+  // 1. A copy-engine copy queued behind a pending stream wait must not land
+  // (nor the stream go idle) until the host releases the wait.
+  bool held = true;
+  for (const uint64_t bytes : {uint64_t(4096), largest}) {
+    std::memset(arena, 0, bytes);
+    *hold_word = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (cuStreamWaitValue32(stream, hold, 1, CU_STREAM_WAIT_VALUE_GEQ) != CUDA_SUCCESS) return cudaErrorUnknown;
+    CHECK(cudaMemcpyAsync(alias, side.source, bytes, cudaMemcpyDefault, side.stream));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const cudaError_t idle = cudaStreamQuery(side.stream);
+    if (idle != cudaErrorNotReady) held = false;
+    if (!arena_reads(arena, bytes, 0)) held = false;
+    *hold_word = 1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    CHECK(cudaStreamSynchronize(side.stream));
+    cudaGetLastError();  // clears the query's not-ready
+    if (!arena_reads(arena, bytes, 0xA5)) return cudaErrorUnknown;  // the copy itself went wrong
+    if (!held) break;
+  }
+  out->copy_engine_held = held;
+  if (!held) return cudaSuccess;
+
+  // 2. The staging sequence per wave, SM against copy engine, best of two
+  // timed passes after a warm one.
+  constexpr uint32_t kWaves = 16;
+  for (uint64_t total = 2048; total <= largest && out->probes < CUTEAFD_STAGING_PROBE_SIZES; total *= 2) {
+    void* destinations[4];
+    const void* sources[4];
+    uint64_t sizes[4];
+    const uint64_t part = (total / regions) & ~uint64_t(15);
+    for (uint32_t r = 0; r < regions; ++r) {
+      destinations[r] = static_cast<uint8_t*>(alias) + r * part;
+      sources[r] = side.source + r * part;
+      sizes[r] = r + 1 < regions ? part : total - part * (regions - 1);
+    }
+    float best[2] = {0, 0};
+    for (int engine = 0; engine < 2; ++engine) {
+      for (int pass = 0; pass < 3; ++pass) {
+        CHECK(cudaEventRecord(side.start, side.stream));
+        for (uint32_t wave = 0; wave < kWaves; ++wave) {
+          if (cuStreamWaitValue32(stream, satisfied, 0, CU_STREAM_WAIT_VALUE_GEQ) != CUDA_SUCCESS) return cudaErrorUnknown;
+          const int32_t status = engine ? cuteafd_copy_engine_regions(destinations, sources, sizes, regions, side.stream)
+                                        : cuteafd_sm_copy_regions(destinations, sources, sizes, regions, side.stream);
+          if (status != cudaSuccess) return status;
+          if (cuStreamWriteValue32(stream, published, wave, CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS)
+            return cudaErrorUnknown;
+        }
+        CHECK(cudaEventRecord(side.stop, side.stream));
+        CHECK(cudaEventSynchronize(side.stop));
+        float ms = 0;
+        CHECK(cudaEventElapsedTime(&ms, side.start, side.stop));
+        const float us = 1000.0f * ms / kWaves;
+        if (pass > 0 && (pass == 1 || us < best[engine])) best[engine] = us;
+      }
+    }
+    out->bytes[out->probes] = total;
+    out->sm_us[out->probes] = best[0];
+    out->copy_engine_us[out->probes] = best[1];
+    ++out->probes;
+  }
+  // The smallest probed total from which the copy engine wins at every larger probe.
+  for (uint32_t p = out->probes; p-- > 0;) {
+    if (out->copy_engine_us[p] >= out->sm_us[p]) break;
+    out->crossover_bytes = out->bytes[p];
+  }
+  return cudaSuccess;
 }

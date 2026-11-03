@@ -219,6 +219,7 @@ HOST_ISA
 PROBE_DUMP_ROOT
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_STAGING
 HOST_WAIT
 IDLE_PARK_SECONDS
 CONSOLE_TEXT
@@ -274,6 +275,7 @@ DRAFT_ROW_COST
 SPECULATION_TRACE
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_STAGING
 HOST_WAIT
 IDLE_PARK_SECONDS
 CONSOLE_TEXT
@@ -544,6 +546,7 @@ SPARKINFER_EXL3
 SPECULATION_TRACE
 SPECULATOR
 SPARK_INTAKE
+SPARK_STAGING
 HOST_WAIT
 IDLE_PARK_SECONDS
 TARGET_HEAD
@@ -661,6 +664,10 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 # The coordinator environment every family reads:
 # SPARK_INTAKE: how routed partials reach the coordinator GPU (auto, gpu, pinned
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
+# SPARK_STAGING: how a wave's request reaches its pinned send arena: auto
+# (default: the copy engine from the size a startup probe measures, where this
+# GPU's stream waits hold copy-engine work), sm or copy-engine (A/B arms; see
+# StagingRoute in rust/crates/cuteafd-daemon/src/shared/spark_waves.rs).
 # CONSOLE_TEXT=on (default) lets the live console at / stream generated token text to
 # viewers holding the console unlock cookie; CONSOLE_TEXT=off disables it for everyone.
 # FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
@@ -677,6 +684,8 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 shared_coordinator_env_args() {
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
+staging="$(get SPARK_STAGING auto)"
+case "$staging" in auto|sm|copy-engine) ;; *) echo "SPARK_STAGING must be auto, sm or copy-engine" >&2; exit 2 ;; esac
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
@@ -692,6 +701,7 @@ shared_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intak
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
+[[ $staging == auto ]] || shared_env_args+=(-e "CUTEAFD_SPARK_STAGING=$staging")
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi

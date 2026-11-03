@@ -838,6 +838,86 @@ fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
     stream.finish()
 }
 
+/// How a wave's request reaches its mapped arena. SM stores into host memory
+/// run far below the link rate on some hosts (about 2 GB/s from a 4090 D
+/// behind an EPYC root complex, against 24 GB/s by copy engine), so waves of
+/// at least the measured crossover go by copy engine, where this device's
+/// stream memory waits hold copy-engine work (the staging wait protects the
+/// slot's previous wave from being overwritten while the NIC reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagingRoute {
+    Sm,
+    CopyEngineFrom(usize),
+}
+
+impl StagingRoute {
+    pub(crate) fn copy_engine(self, bytes: usize) -> bool {
+        matches!(self, Self::CopyEngineFrom(from) if bytes >= from)
+    }
+}
+
+/// `CUTEAFD_SPARK_STAGING`: `auto` (default; probe, copy engine from the
+/// measured crossover), `sm` (SM copies, no probe) or `copy-engine` (every
+/// wave, refused where stream waits don't hold the copy engine).
+pub(crate) const STAGING_ENV: &str = "CUTEAFD_SPARK_STAGING";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagingMode { Auto, Sm, CopyEngine }
+
+impl StagingMode {
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
+        Ok(match raw.map(str::trim) {
+            None | Some("") | Some("auto") => Self::Auto,
+            Some("sm") => Self::Sm,
+            Some("copy-engine") => Self::CopyEngine,
+            Some(other) => anyhow::bail!("{STAGING_ENV}={other}: expected auto, sm or copy-engine"),
+        })
+    }
+}
+
+/// The route a probe result allows under `mode`.
+pub(crate) fn staging_route(mode: StagingMode, probe: &cuteafd_ffi::peer_exchange::StagingProbe) -> Result<StagingRoute> {
+    let held = probe.copy_engine_held == 1;
+    Ok(match mode {
+        StagingMode::Sm => StagingRoute::Sm,
+        StagingMode::CopyEngine => {
+            ensure!(held, "{STAGING_ENV}=copy-engine, but a stream memory wait on this device does not hold \
+                copy-engine copies: staging by copy engine could overwrite a wave the NIC still reads");
+            StagingRoute::CopyEngineFrom(0)
+        }
+        StagingMode::Auto if held && probe.crossover_bytes > 0 => {
+            StagingRoute::CopyEngineFrom(usize::try_from(probe.crossover_bytes)?)
+        }
+        StagingMode::Auto => StagingRoute::Sm,
+    })
+}
+
+/// Probes the first slot's (idle) arena and picks the staging route.
+fn probe_staging_route(library: &NativeLibrary, arena: &StagingArena, alias: usize) -> Result<StagingRoute> {
+    let mode = StagingMode::parse(std::env::var(STAGING_ENV).ok().as_deref())?;
+    if mode == StagingMode::Sm {
+        tracing::info!("Spark staging: SM copies ({STAGING_ENV}=sm)");
+        return Ok(StagingRoute::Sm);
+    }
+    let host = arena.host();
+    // SAFETY: the link has not staged a wave yet, so nothing reads or writes
+    // the arena; `alias` is its device alias on the current device.
+    let probe = match unsafe { library.staging_probe(host.ptr, alias as *mut c_void, arena.bytes() as u64, 3) } {
+        Ok(probe) => probe,
+        Err(error) if mode == StagingMode::Auto => {
+            tracing::warn!("Spark staging: SM copies, the staging probe failed: {error:#}");
+            return Ok(StagingRoute::Sm);
+        }
+        Err(error) => return Err(error),
+    };
+    let route = staging_route(mode, &probe)?;
+    let table = (0..probe.probes as usize).map(|p| format!("{}K {:.1}/{:.1}", probe.bytes[p] >> 10,
+        probe.sm_us[p], probe.copy_engine_us[p])).collect::<Vec<_>>().join(", ");
+    tracing::info!(?route, copy_engine_held = probe.copy_engine_held == 1, crossover_bytes = probe.crossover_bytes,
+        "Spark staging route (us per wave, SM/copy engine: {table})");
+    Ok(route)
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
@@ -850,6 +930,7 @@ pub(crate) struct Waves<'a> {
     arenas: Vec<StagingArena>,
     /// Per slot: the request arena's device alias (mapped pinned memory).
     arena_alias: Vec<usize>,
+    staging: StagingRoute,
     /// Owns the pull descriptors of the ranks that arrive in host memory
     /// (mapped; written by the worker, read by pull kernels); freed only after
     /// the worker joined.
@@ -917,6 +998,10 @@ impl<'a> Waves<'a> {
             "native kernels loaded before Spark waits");
         library.peer_exchange_initialize()?;
         warm_reducer(library, &intake)?;
+        let staging = match (arenas.first(), arena_alias.first()) {
+            (Some(arena), Some(&alias)) => probe_staging_route(library, arena, alias)?,
+            _ => StagingRoute::Sm,
+        };
         let timeout = transport.timeout();
         let mut native = Native { transport, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
@@ -940,7 +1025,7 @@ impl<'a> Waves<'a> {
             let frames = native.frames();
             (Box::new((native.transport, frames)) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias,
+        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, staging,
             _pull_block: pull_block, pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
@@ -987,10 +1072,10 @@ impl<'a> Waves<'a> {
             // already reached on a slot's first use) has landed before the
             // copies overwrite its staging, so the NIC no longer reads it. The
             // caller vouches for the sources (`send`'s contract).
-            // The staging copies are SM copies into the arena's mapped alias:
-            // copy-engine work is not held by a stream memory wait, so a
-            // `cudaMemcpyAsync` here could overwrite the arena while the
-            // worker still reads the slot's previous wave.
+            // The staging copies go into the arena's mapped alias behind that
+            // wait: by copy engine from the measured crossover where this
+            // device's stream waits hold copy-engine work (`StagingRoute`),
+            // otherwise by SM, which stays in stream order behind the wait.
             let alias = self.arena_alias[slot];
             let sizes = [layout.route_bytes, layout.route_bytes, layout.wire_bytes];
             let offsets = [0, layout.route_bytes, 2 * layout.route_bytes];
@@ -1003,7 +1088,11 @@ impl<'a> Waves<'a> {
             unsafe {
                 let previous = staging_reuse(sequence, cut.waves);
                 self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), previous)?;
-                self.library.sm_copy_regions(&regions, stream)?;
+                if self.staging.copy_engine(layout.bytes) {
+                    self.library.copy_engine_regions(&regions, stream)?;
+                } else {
+                    self.library.sm_copy_regions(&regions, stream)?;
+                }
                 self.library.cuda_stream_write_value32(stream, self.words.ptr(Counter::Staged(slot)), sequence)?;
             }
             self.layouts[slot] = Some(layout);

@@ -63,6 +63,25 @@ mod diagnostic_abi_tests {
 /// `CUTEAFD_PEER_MAX_PLANES`.
 pub const PEER_MAX_PLANES: usize = 4;
 
+/// Entries in a [`StagingProbe`] table (`CUTEAFD_STAGING_PROBE_SIZES`).
+pub const STAGING_PROBE_SIZES: usize = 10;
+
+/// `cuteafd_staging_probe_t`: whether this device's stream memory waits hold
+/// copy-engine copies, and the staging time per wave by SM and copy engine.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StagingProbe {
+    /// 1: a pending stream wait held a later copy-engine copy.
+    pub copy_engine_held: u32,
+    /// Valid entries in `bytes`, `sm_us` and `copy_engine_us`.
+    pub probes: u32,
+    /// Smallest probed total from which the copy engine is faster (0: never).
+    pub crossover_bytes: u64,
+    pub bytes: [u64; STAGING_PROBE_SIZES],
+    pub sm_us: [f32; STAGING_PROBE_SIZES],
+    pub copy_engine_us: [f32; STAGING_PROBE_SIZES],
+}
+
 /// One `cuteafd_p2p_probe` measurement (see `cuteafd_peer_exchange.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum P2pTest {
@@ -469,6 +488,47 @@ impl NativeLibrary {
             bytes.as_ptr(), regions.len() as u32, stream) };
         ensure!(status == 0, "SM region copy failed with CUDA error {status}");
         Ok(())
+    }
+
+    /// The same regions by copy engine, one `cudaMemcpyAsync` each
+    /// (`cuteafd_copy_engine_regions`). Staging into mapped host memory uses
+    /// this only where [`Self::staging_probe`] found that this device's stream
+    /// memory waits hold copy-engine work.
+    ///
+    /// # Safety
+    /// As [`Self::sm_copy_regions`].
+    pub unsafe fn copy_engine_regions(&self, regions: &[(*mut c_void, *const c_void, u64)], stream: *mut c_void)
+        -> Result<()> {
+        type F = unsafe extern "C" fn(*const *mut c_void, *const *const c_void, *const u64, u32, *mut c_void) -> i32;
+        ensure!((1..=4).contains(&regions.len()), "{} regions in one copy-engine copy", regions.len());
+        let destinations: Vec<_> = regions.iter().map(|r| r.0).collect();
+        let sources: Vec<_> = regions.iter().map(|r| r.1).collect();
+        let bytes: Vec<_> = regions.iter().map(|r| r.2).collect();
+        // SAFETY: the caller vouches for the regions; native reads the descriptors during the call.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_copy_engine_regions")?(destinations.as_ptr(),
+            sources.as_ptr(), bytes.as_ptr(), regions.len() as u32, stream) };
+        ensure!(status == 0, "copy-engine region copy failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// Measures staging into an idle mapped arena on the current device
+    /// (`cuteafd_staging_probe`): whether a pending stream memory wait holds a
+    /// later copy-engine copy, and SM against copy-engine times per staged
+    /// wave of `regions` copies at totals doubling from 2 KiB.
+    ///
+    /// # Safety
+    /// `host` and `alias` are the host address and device alias of one mapped
+    /// pinned arena of `capacity` bytes that nothing else reads or writes
+    /// during the call (the probe overwrites it).
+    pub unsafe fn staging_probe(&self, host: *mut c_void, alias: *mut c_void, capacity: u64, regions: u32)
+        -> Result<StagingProbe> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, *mut StagingProbe) -> i32;
+        let mut probe = StagingProbe::default();
+        // SAFETY: the caller vouches for the arena; `probe` is a live repr(C) out-parameter.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_staging_probe")?(host, alias, capacity, regions, &mut probe) };
+        ensure!(status == 0, "staging probe failed with CUDA error {status}");
+        ensure!(probe.probes as usize <= STAGING_PROBE_SIZES, "staging probe reported {} sizes", probe.probes);
+        Ok(probe)
     }
 
     /// Pulls each rank's published reply frames ([`PullFrames`], in mapped

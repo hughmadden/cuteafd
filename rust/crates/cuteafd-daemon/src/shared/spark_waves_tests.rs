@@ -1284,3 +1284,34 @@ fn compact_wave_keeps_wire_bytes_and_reserved_landing_offsets() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn staging_mode_parses_the_three_settings_and_refuses_others() {
+    assert_eq!(StagingMode::parse(None).unwrap(), StagingMode::Auto);
+    assert_eq!(StagingMode::parse(Some(" ")).unwrap(), StagingMode::Auto);
+    assert_eq!(StagingMode::parse(Some("auto")).unwrap(), StagingMode::Auto);
+    assert_eq!(StagingMode::parse(Some("sm")).unwrap(), StagingMode::Sm);
+    assert_eq!(StagingMode::parse(Some("copy-engine")).unwrap(), StagingMode::CopyEngine);
+    let error = StagingMode::parse(Some("ce")).unwrap_err().to_string();
+    assert!(error.contains("CUTEAFD_SPARK_STAGING=ce"), "{error}");
+}
+
+#[test]
+fn staging_route_uses_the_copy_engine_only_where_waits_hold_it() {
+    use cuteafd_ffi::peer_exchange::StagingProbe;
+    let held = StagingProbe { copy_engine_held: 1, probes: 9, crossover_bytes: 16 << 10, ..Default::default() };
+    let never = StagingProbe { crossover_bytes: 0, ..held };
+    let loose = StagingProbe { copy_engine_held: 0, probes: 0, crossover_bytes: 0, ..Default::default() };
+    assert_eq!(staging_route(StagingMode::Auto, &held).unwrap(), StagingRoute::CopyEngineFrom(16 << 10));
+    assert_eq!(staging_route(StagingMode::Auto, &never).unwrap(), StagingRoute::Sm);
+    assert_eq!(staging_route(StagingMode::Auto, &loose).unwrap(), StagingRoute::Sm);
+    assert_eq!(staging_route(StagingMode::Sm, &held).unwrap(), StagingRoute::Sm);
+    assert_eq!(staging_route(StagingMode::CopyEngine, &never).unwrap(), StagingRoute::CopyEngineFrom(0));
+    assert!(staging_route(StagingMode::CopyEngine, &loose).is_err());
+
+    let route = StagingRoute::CopyEngineFrom(16 << 10);
+    assert!(!route.copy_engine((16 << 10) - 1));
+    assert!(route.copy_engine(16 << 10));
+    assert!(StagingRoute::CopyEngineFrom(0).copy_engine(1));
+    assert!(!StagingRoute::Sm.copy_engine(usize::MAX));
+}
