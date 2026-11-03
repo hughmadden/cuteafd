@@ -65,6 +65,68 @@ except (OSError, AttributeError, ValueError) as error:
 PYCAPACITY
 }
 
+# The architecture of the coordinator GPU with this UUID, spelled as
+# `cuteafd plan --coordinator-arch` takes it (sm_89, sm_120, ...), from the driver.
+release_cuda_coordinator_arch() {
+  python3 - "$1" <<'PYARCH'
+import ctypes, sys, uuid
+try:
+    wanted = uuid.UUID(sys.argv[1].removeprefix('GPU-')).bytes
+    cuda = ctypes.CDLL('libcuda.so.1')
+    def checked(name, *args):
+        function = getattr(cuda, name)
+        function.restype = ctypes.c_int
+        code = function(*args)
+        if code:
+            raise ValueError(f'{name} failed with CUDA error {code}')
+    checked('cuInit', ctypes.c_uint(0))
+    count = ctypes.c_int()
+    checked('cuDeviceGetCount', ctypes.byref(count))
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        checked('cuDeviceGet', ctypes.byref(device), ctypes.c_int(ordinal))
+        identity = (ctypes.c_ubyte * 16)()
+        checked('cuDeviceGetUuid_v2', ctypes.byref(identity), device)
+        if bytes(identity) != wanted:
+            continue
+        major, minor = ctypes.c_int(), ctypes.c_int()
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR (75) and _MINOR (76).
+        checked('cuDeviceGetAttribute', ctypes.byref(major), ctypes.c_int(75), device)
+        checked('cuDeviceGetAttribute', ctypes.byref(minor), ctypes.c_int(76), device)
+        print(f'sm_{major.value}{minor.value}')
+        break
+    else:
+        raise ValueError(f'no CUDA device matches UUID {sys.argv[1]}')
+except (OSError, AttributeError, ValueError) as error:
+    sys.exit(f'coordinator CUDA architecture: {error}')
+PYARCH
+}
+
+# The one architecture of these coordinator GPUs (comma-separated UUIDs), for a
+# deployment plan's `--coordinator-arch`. Fails on a driver error or a mix.
+release_coordinator_arch() {
+  local uuid arch first=""
+  local -a uuids
+  IFS=, read -r -a uuids <<<"$1"
+  ((${#uuids[@]})) || { echo "no coordinator GPU to read an architecture from" >&2; return 1; }
+  for uuid in "${uuids[@]}"; do
+    arch="$(release_cuda_coordinator_arch "$uuid")" || return 1
+    [[ -z "$first" || "$arch" == "$first" ]] || { echo "coordinator GPUs mix $first and $arch" >&2; return 1; }
+    first="$arch"
+  done
+  printf '%s\n' "$first"
+}
+
+# Plan flags for that architecture: none for SM120, the planner's default card
+# class, so its plans and their command lines stay as they were.
+release_coordinator_arch_args() {
+  local -n release_arch_args_out="$2"
+  local arch
+  arch="$(release_coordinator_arch "$1")" || release_die "cannot resolve the coordinator GPU architecture"
+  release_arch_args_out=()
+  [[ "$arch" == sm_120 ]] || release_arch_args_out=(--coordinator-arch "$arch")
+}
+
 # Resolve total capacity in bytes, never free memory. Rust owns the default rule.
 release_coordinator_profile() {
   local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
