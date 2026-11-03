@@ -966,6 +966,96 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
     Ok(())
 }
 
+/// A fake SparkNest hub for coordinator ranks alone (`ranks` of them): it
+/// takes the group driver's Create and plan upload, accepts every rank's Join
+/// while the plan uploads, streams each rank's runs in source file order
+/// through its ring (each slot released before reuse) and sends it Done, then
+/// withholds the group's Done until `commit` fires and expects the driver to
+/// close the group.
+pub(crate) fn fake_hub(listener: Listener, socket: String, root: std::path::PathBuf, ranks: usize,
+    commit: std::sync::mpsc::Receiver<()>) -> std::thread::JoinHandle<Result<()>> {
+    std::thread::spawn(move || -> Result<()> {
+        let timeout = Duration::from_secs(600);
+        let listener = std::sync::Arc::new(listener);
+        let accept = { let listener = listener.clone(); let socket = socket.clone();
+            move || crate::shared::memory::push_testing::accept_within(&listener, &socket, Duration::from_secs(120)) };
+        let coordinator = accept()?;
+        coordinator.set_timeout(Some(timeout))?;
+        let (request, _) = coordinator.next_request()?.context("no Create")?;
+        let Request::Create { ranks: specs, files, .. } = request else { anyhow::bail!("expected Create") };
+        anyhow::ensure!(specs.iter().map(|r| r.rank as usize).eq(0..ranks), "coordinator ranks alone, in order");
+        coordinator.send_event(&Event::Created { group: 7, token: 11 })?;
+        // Ranks join (on their own connections) while the plan uploads; the
+        // driver starts once every rank has joined.
+        let joins = std::thread::spawn(move || -> Result<Vec<_>> {
+            let mut joined = Vec::new();
+            for _ in 0..ranks {
+                let conn = accept()?;
+                conn.set_timeout(Some(timeout))?;
+                let (request, fd) = conn.next_request()?.context("rank did not join")?;
+                let Request::Join { rank, slots, slot_bytes, .. } = request else { anyhow::bail!("expected Join") };
+                conn.send_event(&Event::Joined)?;
+                joined.push((rank, conn, File::from(fd.context("ring fd")?), slots, slot_bytes));
+            }
+            Ok(joined)
+        });
+        let (mut patterns, mut entries) = (Vec::new(), Vec::new());
+        loop {
+            match coordinator.next_request()?.context("plan upload ended")?.0 {
+                Request::Patterns(p) => patterns.extend(p),
+                Request::Entries(e) => entries.extend(e),
+                Request::Start => break,
+                other => anyhow::bail!("unexpected {other:?}"),
+            }
+        }
+        coordinator.send_event(&Event::Planned(Default::default()))?;
+        let plan = cuteafd_loader::push_load::plan::Plan { files, patterns, entries };
+        let joined = joins.join().map_err(|_| anyhow::anyhow!("join acceptor panicked"))??;
+        let sources = plan.files.iter().map(|name| File::open(root.join(name))).collect::<std::io::Result<Vec<_>>>()?;
+        for (rank, conn, ring, slots, slot_bytes) in &joined {
+            let mut runs = Vec::new();
+            for entry in plan.entries.iter().filter(|e| e.rank == *rank) {
+                let pattern = &plan.patterns[entry.pattern as usize];
+                for (src, dst) in pattern.runs() { runs.push((entry.file, entry.src_base + src, entry.dst_base + dst, pattern.run)); }
+            }
+            runs.sort_unstable();
+            let mut index = 0usize;
+            let mut packer = slot::Packer::new(vec![0; *slot_bytes as usize]);
+            let mut send = |bytes: Vec<u8>| -> Result<()> {
+                let at = index % *slots as usize;
+                ring.write_all_at(&bytes, at as u64 * u64::from(*slot_bytes))?;
+                conn.send_event(&Event::Filled { slot: at as u32, len: bytes.len() as u32 })?;
+                let (release, _) = conn.next_request()?.context("missing release")?;
+                anyhow::ensure!(matches!(release, Request::Release { slot } if slot == at as u32), "release order");
+                index += 1;
+                Ok(())
+            };
+            for (file, src, dst, length) in runs {
+                let mut run = vec![0u8; length as usize];
+                sources[file as usize].read_exact_at(&mut run, src)?;
+                let (mut bytes, mut destination) = (&run[..], dst);
+                while !bytes.is_empty() {
+                    let n = packer.push(destination, bytes);
+                    if n == 0 {
+                        send(std::mem::replace(&mut packer, slot::Packer::new(vec![0; *slot_bytes as usize])).finish().0)?;
+                        continue;
+                    }
+                    destination += n as u64;
+                    bytes = &bytes[n..];
+                }
+            }
+            if !packer.is_empty() { send(packer.finish().0)?; }
+            conn.send_event(&Event::Done)?;
+        }
+        // Withhold the group's Done until the caller allows the commit.
+        commit.recv_timeout(timeout)?;
+        coordinator.send_event(&Event::Done)?;
+        // The driver keeps the group open until every rank initialized, then closes it.
+        anyhow::ensure!(coordinator.next_request()?.is_none(), "the driver closes its group after the commit");
+        Ok(())
+    })
+}
+
 /// Without Spark peers the coordinator GPUs form the push group alone: the
 /// owner's driver offers both ranks, creates the group on the SparkNest
 /// endpoint and uploads their dense entries; each rank joins, receives its
@@ -1075,86 +1165,7 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
     let listener = Listener::bind(&socket)?;
     let push = CoordinatorPush::prepare_alone_at(root.path(), None, 2, None, Some(socket.clone()))?;
-    let hub_root = root.path().to_path_buf();
-    let hub_socket = socket.clone();
-    let hub = std::thread::spawn(move || -> Result<()> {
-        let listener = std::sync::Arc::new(listener);
-        let accept = { let listener = listener.clone(); let hub_socket = hub_socket.clone();
-            move || crate::shared::memory::push_testing::accept_within(&listener, &hub_socket, Duration::from_secs(120)) };
-        let coordinator = accept()?;
-        coordinator.set_timeout(Some(Duration::from_secs(60)))?;
-        let (request, _) = coordinator.next_request()?.context("no Create")?;
-        let Request::Create { ranks, files, .. } = request else { anyhow::bail!("expected Create") };
-        anyhow::ensure!(ranks.iter().map(|r| r.rank).eq([0, 1]), "coordinator ranks 0 and 1 alone");
-        coordinator.send_event(&Event::Created { group: 7, token: 11 })?;
-        // Ranks join (on their own connections) while the plan uploads; the
-        // driver starts once both have joined.
-        let joins = std::thread::spawn(move || -> Result<Vec<_>> {
-            let mut joined = Vec::new();
-            for _ in 0..2 {
-                let conn = accept()?;
-                conn.set_timeout(Some(Duration::from_secs(60)))?;
-                let (request, fd) = conn.next_request()?.context("rank did not join")?;
-                let Request::Join { rank, slots, slot_bytes, .. } = request else { anyhow::bail!("expected Join") };
-                conn.send_event(&Event::Joined)?;
-                joined.push((rank, conn, File::from(fd.context("ring fd")?), slots, slot_bytes));
-            }
-            Ok(joined)
-        });
-        let (mut patterns, mut entries) = (Vec::new(), Vec::new());
-        loop {
-            match coordinator.next_request()?.context("plan upload ended")?.0 {
-                Request::Patterns(p) => patterns.extend(p),
-                Request::Entries(e) => entries.extend(e),
-                Request::Start => break,
-                other => anyhow::bail!("unexpected {other:?}"),
-            }
-        }
-        coordinator.send_event(&Event::Planned(Default::default()))?;
-        let plan = cuteafd_loader::push_load::plan::Plan { files, patterns, entries };
-        let joined = joins.join().map_err(|_| anyhow::anyhow!("join acceptor panicked"))??;
-        for (rank, conn, ring, slots, slot_bytes) in &joined {
-            let mut runs = Vec::new();
-            for entry in plan.entries.iter().filter(|e| e.rank == *rank) {
-                let pattern = &plan.patterns[entry.pattern as usize];
-                for (src, dst) in pattern.runs() { runs.push((entry.file, entry.src_base + src, entry.dst_base + dst, pattern.run)); }
-            }
-            runs.sort_unstable();
-            let mut index = 0usize;
-            let mut packer = slot::Packer::new(vec![0; *slot_bytes as usize]);
-            let mut send = |bytes: Vec<u8>| -> Result<()> {
-                let at = index % *slots as usize;
-                ring.write_all_at(&bytes, at as u64 * u64::from(*slot_bytes))?;
-                conn.send_event(&Event::Filled { slot: at as u32, len: bytes.len() as u32 })?;
-                let (release, _) = conn.next_request()?.context("missing release")?;
-                anyhow::ensure!(matches!(release, Request::Release { slot } if slot == at as u32), "release order");
-                index += 1;
-                Ok(())
-            };
-            for (file, src, dst, length) in runs {
-                let mut run = vec![0u8; length as usize];
-                File::open(hub_root.join(&plan.files[file as usize]))?.read_exact_at(&mut run, src)?;
-                let (mut bytes, mut destination) = (&run[..], dst);
-                while !bytes.is_empty() {
-                    let n = packer.push(destination, bytes);
-                    if n == 0 {
-                        send(std::mem::replace(&mut packer, slot::Packer::new(vec![0; *slot_bytes as usize])).finish().0)?;
-                        continue;
-                    }
-                    destination += n as u64;
-                    bytes = &bytes[n..];
-                }
-            }
-            if !packer.is_empty() { send(packer.finish().0)?; }
-            conn.send_event(&Event::Done)?;
-        }
-        // Withhold group Done until both rank finishes and the replica-byte check.
-        commit_allowed.recv_timeout(Duration::from_secs(60))?;
-        coordinator.send_event(&Event::Done)?;
-        // The driver keeps the group open until every rank initialized, then closes it.
-        anyhow::ensure!(coordinator.next_request()?.is_none(), "the driver closes its group after the commit");
-        Ok(())
-    });
+    let hub = fake_hub(listener, socket.clone(), root.path().to_path_buf(), 2, commit_allowed);
     let (pushed, observed) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || -> Result<()> {
         for _ in 0..2 { completed.recv_timeout(Duration::from_secs(60))?; }
         let checked = devices[0].run(|| -> Result<()> {
@@ -1350,6 +1361,116 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
                 device.run(|| { drop(weights); Ok(()) })?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Marks `root` a SparkNest namespace on this host and every safetensors file
+/// in it a pushable shard, as SparkNest marks its mount.
+pub(crate) fn mark_namespace(root: &std::path::Path) -> Result<()> {
+    let mark = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: both strings are NUL-terminated and live across the call; the
+        // value pointer and length describe one live buffer.
+        let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        Ok(())
+    };
+    mark(root, c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"coordinator")?; }
+    }
+    Ok(())
+}
+
+/// Each of `owners`' planes on its GPU, compared chunk by chunk with `with`'s.
+pub(crate) fn assert_planes_equal(library: &cuteafd_ffi::NativeLibrary,
+    owners: &[crate::shared::experts::layer::ExpertWeights<'_>],
+    with: &[crate::shared::experts::layer::ExpertWeights<'_>], what: &str) -> Result<()> {
+    anyhow::ensure!(owners.len() == with.len(), "{what}: layer counts differ");
+    for (index, (actual, expected)) in owners.iter().zip(with).enumerate() {
+        for (plane, (a, e)) in actual.buffers.iter().zip(&expected.buffers).enumerate() {
+            let (a, e) = (a.buffer, e.buffer);
+            anyhow::ensure!(a.bytes == e.bytes && a.device_id == e.device_id, "{what} {index} plane {plane}: extents differ");
+            let chunk = 64usize << 20;
+            for at in (0..a.bytes).step_by(chunk) {
+                let n = chunk.min(a.bytes - at);
+                // SAFETY (offsets): `at + n` lies inside both live planes.
+                let view = |b: cuteafd_ffi::CuteafdDeviceBuffer| cuteafd_ffi::CuteafdDeviceBuffer {
+                    ptr: unsafe { b.ptr.cast::<u8>().add(at) }.cast(), bytes: n, ..b };
+                let (mut left, mut right) = (vec![0u8; n], vec![1u8; n]);
+                Device { library, id: a.device_id }.run(|| {
+                    library.copy_d2h(&mut left, view(a))?;
+                    library.copy_d2h(&mut right, view(e))
+                })?;
+                if left != right {
+                    let first = left.iter().zip(&right).position(|(x, y)| x != y).unwrap_or(0);
+                    anyhow::bail!("{what} {index} plane {plane}: first difference at byte {}", at + first);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// dSpark's 3 x 128 draft experts as TP2 halves (`--tp2-dspark-experts`)
+/// under coordinator push: both GPUs record their halves while loading, the
+/// two coordinator ranks receive them alone from a fake hub, and every plane
+/// equals the mount load's byte for byte. Each GPU receives exactly what the
+/// planner charges it for the halves.
+#[test]
+#[ignore = "requires CUTEAFD_NATIVE_LIB (V4.1 draft TP2 exports), two CUDA GPUs and CUTEAFD_PUSH_FIXTURE_DIR on NVMe"]
+fn dspark_tp2_halves_push_byte_exact_on_two_gpus() -> Result<()> {
+    use crate::shared::experts::{layer::tp2_half_tests::pattern_expert,
+        rtx::{dense::{plan_records, Recorder}, draft::{rank::Weights, Layout}}};
+    use cuteafd_loader::V41ExpertSelection;
+    let _ = tracing_subscriber::fmt().with_env_filter("info").with_test_writer().try_init();
+    // SAFETY: the explicitly supplied architecture-matched library lives through the test.
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let fixtures = std::path::PathBuf::from(std::env::var("CUTEAFD_PUSH_FIXTURE_DIR")?);
+    let (root, catalog) = crate::shared::experts::layer::tp2_half_tests::expert_fixture_in(Some(&fixtures))?;
+    let snapshot = root.path().canonicalize()?;
+    mark_namespace(&snapshot)?;
+    // A spread of patterned experts in every stage; the rest read as zeros.
+    for stage in 0..3 { for expert in [0, 1, 2, 63, 64, 126, 127] {
+        pattern_expert(&catalog, V41ExpertSelection::Dspark { stage, expert }, stage * 128 + expert)?;
+    } }
+    let layout = Layout { geometry: cuteafd_core::ExpertGeometry { hidden: 5120, experts: 128, topk: 3,
+        intermediate: 2304, layers: 3 }, stages: 3, owner: 1 };
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let budgets = [64usize << 30; 2];
+    let mounted = Weights::load_pair(devices, &catalog, budgets, layout)?;
+    let recorder = Recorder::start(true)?.context("dense recorder")?;
+    let pushed = Weights::load_pair(devices, &catalog, budgets, layout);
+    let records = recorder.finish();
+    let pushed = pushed?;
+    let (plans, destinations) = plan_records(&snapshot, records, &devices, 0)?;
+    for (gpu, plan) in plans.iter().enumerate() {
+        eprintln!("GPU {gpu}: planned device bytes {} staged bytes {} pinned bound {}", plan.base, plan.host_bytes,
+            plan.host_staging.bytes()?);
+    }
+    let sockets = tempfile::tempdir_in(&fixtures)?;
+    let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let push = CoordinatorPush::prepare_alone_at(&snapshot, None, 2, None, Some(socket.clone()))?;
+    let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
+    let hub = fake_hub(listener, socket, snapshot.clone(), 2, commit_allowed);
+    let started = std::time::Instant::now();
+    let (received, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok((plans, destinations))),
+        || { let _ = allow_commit.send(()); });
+    let served = hub.join().map_err(|_| anyhow::anyhow!("fake hub panicked"))?;
+    served?;
+    anyhow::ensure!(received?.map(|ranks| ranks.len()) == Some(2), "both coordinator ranks commit");
+    eprintln!("both GPUs received their draft halves in {:.1} s", started.elapsed().as_secs_f64());
+    for weights in &pushed { weights.release_raw_scales(); }
+    let charge = 3 * cuteafd_loader::placement::families::deepseek_v41::resident::native_expert_bytes(128, 5120, 1152) as usize;
+    for rank in 0..2 {
+        anyhow::ensure!(pushed[rank].resident_bytes() == charge && mounted[rank].resident_bytes() == charge,
+            "GPU {rank}: pushed {} / mounted {} B against the planner's {charge}",
+            pushed[rank].resident_bytes(), mounted[rank].resident_bytes());
+        assert_planes_equal(&library, pushed[rank].stages(), mounted[rank].stages(), &format!("GPU {rank} stage"))?;
+        eprintln!("GPU {rank}: {charge} B of draft expert halves pushed byte-exact against the mount (planner {charge})");
     }
     Ok(())
 }
