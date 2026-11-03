@@ -179,7 +179,8 @@ pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib
     decode_rows: u32, reserve: u64, unit: u32, slots: usize, concurrency: u32) -> Result<()> {
     use cuteafd_ffi::memory_ledger::{snapshot, Space};
     let manifest = families::deepseek_v41::owners::native_manifest(native_lib, "V41_FP8_AOT.json")?;
-    let programs = families::deepseek_v41::owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
+    let programs = families::deepseek_v41::owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?
+        .with_compressed_attention(crate::shared::inventory::device_arch(lib, gpus[0])?.v41_compressed_attention());
     let head_mode = crate::families::deepseek_v41::v41_tensors::fp8_head();
     let window_batch = gpus.len() == 1 && super::BackboneExecution::window_batch_enabled();
     let ranks = gpus.len();
@@ -262,7 +263,8 @@ pub(super) fn admit_startup(
         .map(|item| Demand::new(0, item.category, item.group, item.bytes, item.basis))
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
-    let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
+    let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?
+        .with_compressed_attention(crate::shared::inventory::device_arch(lib, lib.cuda_get_device()?)?.v41_compressed_attention());
     // Every owner serve allocates: two decode lanes, the prefill slots' storage.
     let shape = super::AdmittedPrefill::resolve(args)?;
     let passes = shape.waves;

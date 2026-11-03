@@ -47,7 +47,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_FP8_AOT.json"))
         .context("missing V4.1 native FP8 allocation manifest")?)?;
     let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms);
-    let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
+    // The compressed attention kernel this architecture runs (serve applies
+    // the same rule to the measured device).
+    let attention = options.coordinator_arch.v41_compressed_attention();
+    let programs = v41::owners::NativePrograms::new(&fp8, sms)?.with_compressed_attention(attention);
     let mode = Fp8Head::configured();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     // The prefill slots, one storage set over their units; two decode lanes
@@ -67,6 +70,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; combined startup census residuals fit this bound. Pure LoadedCode and ready parity are not qualified.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is reserved by shared V4.1 solver demands, not included in the ready residency claim.".into()];
+    if attention != cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot {
+        notes.push(format!("compressed sparse attention: native FP32 ten-part kernel ({} exports no BF16 AOT \
+            attention); same split scratch as BF16 AOT", options.coordinator_arch));
+    }
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }

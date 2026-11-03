@@ -866,6 +866,23 @@ mod plan_installation_tests {
         assert!(validate_plan_installation(false, 0, true, 64, 64).is_err());
         assert!(validate_plan_installation(false, 0, false, 6, 64).is_err());
     }
+
+    /// The planner charges each architecture's compressed recipe exactly what
+    /// the storage allocates: SM89's native FP32 ten-part kernel and SM120's
+    /// BF16 AOT read one split extent, so both charges equal the runtime's.
+    #[test]
+    fn planner_charges_every_compressed_backend_what_storage_allocates() -> anyhow::Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::owners::sparse_attention_bytes;
+        for unit in [1usize, 16, 63, 64, 65, 256, 1024, 2048, 2752, 4096] {
+            let runtime = super::SparseAttentionStorage::<'_, 64>::storage_bytes(unit)?;
+            assert_eq!(runtime, super::SparseAttentionWave::device_bytes(unit)?);
+            for arch in cuteafd_core::GpuArch::ALL {
+                assert_eq!(sparse_attention_bytes(unit as u64, arch.v41_compressed_attention())?, runtime as u64,
+                    "{arch} unit {unit}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

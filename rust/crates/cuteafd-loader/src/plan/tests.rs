@@ -4619,6 +4619,11 @@ fn v41_omitted_pool_tokens_plan_like_automatic() {
         let omitted = plan_spark_count(dir.path(), &options(None), 6, Some(4)).unwrap();
         let automatic = plan_spark_count(dir.path(), &options(Some(0)), 6, Some(4)).unwrap();
         assert!(automatic.executable(), "{}", render(&automatic));
+        // The plan names SM89's compressed attention kernel; SM120's is the default.
+        let notes = &automatic.memory_layout.as_ref().unwrap().notes;
+        assert_eq!(notes.iter().any(|n| n == "compressed sparse attention: native FP32 ten-part kernel \
+            (sm_89 exports no BF16 AOT attention); same split scratch as BF16 AOT"), arch == cuteafd_core::GpuArch::Sm89,
+            "{notes:?}");
         assert_eq!(render(&omitted), render(&automatic));
         assert_eq!(omitted.memory_layout, automatic.memory_layout);
         let pinned = plan_spark_count(dir.path(), &options(Some(1 << 20)), 6, Some(4)).unwrap();

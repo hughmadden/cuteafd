@@ -192,6 +192,18 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         })?;
     Ok(Started { send, readiness, worker_thread, stats, http })
 }
+/// The attention reduction plan every lane installs. Its compressed kernel is
+/// the measured device's (`GpuArch::v41_compressed_attention`, the planner's
+/// rule): SM89 runs the native FP32 ten-part kernel. Installing the plan only
+/// checks that the library carries that kernel's symbols.
+pub(crate) fn attention_plan(lib: &NativeLibrary, device: i32, args: &crate::cli::NativeServeArgs)
+    -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
+    let arch = crate::shared::inventory::device_arch(lib, device)?;
+    Ok(cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
+        args.attention_plan_rows)?.with_compressed(arch.v41_compressed_attention()))
+}
+
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.
 fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
@@ -422,9 +434,7 @@ fn worker(
     );
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
-    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
-        args.attention_plan_rows)?;
+    let attention_plan = attention_plan(&lib, lib.cuda_get_device()?, &args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))
