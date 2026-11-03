@@ -85,6 +85,20 @@ impl GpuArch {
             _ => Err(CuteafdError::UnsupportedGpuArch(format!("sm_{major}{minor}"))),
         }
     }
+
+    /// The ten-part kernel DeepSeek V4.1's compressed (indexed) sparse
+    /// attention runs on this coordinator architecture: the one rule the
+    /// planner (`--coordinator-arch`) and serve (the measured device) apply.
+    /// The direct BF16 AOT attention export is SM120-only, so SM89 runs the
+    /// native FP32 kernel; both reserve the same split scratch
+    /// ([`crate::coordinator_programs::sparse_split_scratch_bytes`]).
+    pub const fn v41_compressed_attention(self) -> crate::coordinator_programs::SparseAttentionBackend {
+        use crate::coordinator_programs::SparseAttentionBackend;
+        match self {
+            GpuArch::Sm89 => SparseAttentionBackend::NativeFp32,
+            GpuArch::Sm120 | GpuArch::Sm121 => SparseAttentionBackend::Bf16Aot,
+        }
+    }
 }
 
 impl fmt::Display for GpuArch {
@@ -105,6 +119,12 @@ impl FromStr for GpuArch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v41_compressed_attention_is_bf16_aot_except_on_sm89() {
+        use crate::coordinator_programs::SparseAttentionBackend::{Bf16Aot, NativeFp32};
+        assert_eq!(GpuArch::ALL.map(GpuArch::v41_compressed_attention), [NativeFp32, Bf16Aot, Bf16Aot]);
+    }
 
     #[test]
     fn gpu_arch_round_trips_and_rejects_unknown_devices() {

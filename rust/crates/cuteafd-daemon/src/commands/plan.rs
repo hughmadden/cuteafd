@@ -149,6 +149,29 @@ pub(crate) fn layout_options_for_test(args: &PlanArgs) -> cuteafd_loader::plan::
     options(args).expect("valid plan options").layout.expect("--layout")
 }
 
+/// The report `run_plan` prints for a V4.1 checkpoint directory, without
+/// printing: the same options, speculator and V4.1 layout steps, in order,
+/// for tests that size runtime owners from the deployment plan.
+#[cfg(test)]
+pub(crate) fn v41_report_for_test(mut args: PlanArgs) -> Result<cuteafd_loader::plan::PlanReport> {
+    let mut options = options(&args)?;
+    let snapshot = PathBuf::from(&args.model);
+    let input = cuteafd_loader::plan::PlanInput::open(&snapshot)?;
+    let family = cuteafd_loader::plan::family::detect(input.checkpoint()).map_or("", |family| family.id());
+    anyhow::ensure!(family == "deepseek_v41", "expected a DeepSeek V4.1 checkpoint, found {family:?}");
+    let cfg = launch_config(args.config.as_deref())?;
+    resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
+    if let Some(layout) = &mut options.layout {
+        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        v41_layout(layout, &args);
+        layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?;
+        if cfg.get("TP2_DSPARK_EXPERTS").is_some_and(|value| value == "on") { layout.tp2_dspark_experts = true; }
+    }
+    options.vision = glm_flash_vision(&args, family, &snapshot);
+    Ok(input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?)
+}
+
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
     layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries.unwrap_or_else(|| cuteafd_core::concurrency::prefix_entries(layout.resolved_concurrency("deepseek_v41"))), 1, u64::MAX, layout.host_cache_bytes != Some(0))));
     // Workers must cover both prefill and the 256-row replay bucket.

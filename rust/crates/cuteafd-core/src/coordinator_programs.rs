@@ -8,6 +8,9 @@ pub struct AttentionReductionPlan {
     active_drafts: Option<usize>,
     override_rows: Option<usize>,
     rows: usize,
+    /// Compressed (indexed) attention's ten-part kernel, fixed per coordinator
+    /// architecture ([`crate::GpuArch::v41_compressed_attention`]).
+    compressed: SparseAttentionBackend,
 }
 
 impl AttentionReductionPlan {
@@ -24,7 +27,15 @@ impl AttentionReductionPlan {
             Some(rows) => rows,
             None => automatic,
         };
-        Ok(Self { capacity_rows, active_drafts, override_rows, rows })
+        Ok(Self { capacity_rows, active_drafts, override_rows, rows, compressed: SparseAttentionBackend::Bf16Aot })
+    }
+
+    /// The compressed recipe's kernel, from the coordinator architecture
+    /// ([`crate::GpuArch::v41_compressed_attention`]; BF16 AOT by default).
+    /// Keyed on the device, never on which symbols a library carries: an
+    /// SM120 library without its AOT export still refuses at plan install.
+    pub fn with_compressed(self, compressed: SparseAttentionBackend) -> Self {
+        Self { compressed, ..self }
     }
 
     pub fn rows(self) -> usize { self.rows }
@@ -34,7 +45,7 @@ impl AttentionReductionPlan {
     /// Alignment is a load contract, never a reason to change the reduction.
     pub fn sparse_recipe(self, compressed: bool) -> SparseAttentionRecipe {
         SparseAttentionRecipe { parts: if compressed { 10 } else { 2 },
-            backend: if compressed { SparseAttentionBackend::Bf16Aot } else { SparseAttentionBackend::NativeFp32 } }
+            backend: if compressed { self.compressed } else { SparseAttentionBackend::NativeFp32 } }
     }
 
     /// A row without indexed records must retain the window-only fold even when
@@ -59,7 +70,8 @@ impl AttentionReductionPlan {
     /// Admission may use validated checkpoint geometry before loading the drafter.
     /// Check raw geometry too: different widths can clamp to the same plan.
     pub fn validate_loaded(self, active_drafts: Option<usize>) -> Result<Self, AttentionPlanError> {
-        let loaded = Self::new(self.capacity_rows, active_drafts, self.override_rows)?;
+        let loaded = Self { compressed: self.compressed,
+            ..Self::new(self.capacity_rows, active_drafts, self.override_rows)? };
         if loaded != self {
             return Err(AttentionPlanError::DrafterMismatch {
                 provisional: self.active_drafts, loaded: active_drafts,
@@ -176,6 +188,14 @@ pub struct MlaDraftLayoutError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
+
+/// Split scratch of a `parts`-part sparse attention launch over `rows` x
+/// `heads`: the native FP32 kernel's per-part partial output (512), max and
+/// sum per head. The BF16 AOT ten-part recipe uses a prefix of it, so planner
+/// and runtime reserve this one extent whichever backend the plan names.
+pub const fn sparse_split_scratch_bytes(rows: usize, parts: usize, heads: usize) -> usize {
+    rows * parts * heads * 514 * 4
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseAttentionRecipe {
@@ -527,6 +547,39 @@ mod tests {
             assert!(plan.validate_loaded(Some(7)).is_err());
             assert_eq!(plan.rows(), plan_rows);
         }
+    }
+
+    #[test]
+    fn compressed_backend_follows_the_coordinator_architecture() {
+        use crate::GpuArch;
+        let chosen = |plan: AttentionReductionPlan, arch: GpuArch| plan.with_compressed(arch.v41_compressed_attention());
+        for (drafts, override_rows) in [(None, None), (Some(5), None), (Some(7), Some(3))] {
+            let plan = AttentionReductionPlan::new(64, drafts, override_rows).unwrap();
+            // SM120 (and SM121) keep the default plan exactly: BF16 AOT ten-part.
+            for arch in [GpuArch::Sm120, GpuArch::Sm121] {
+                assert_eq!(chosen(plan, arch), plan);
+            }
+            assert_eq!(plan.sparse_recipe(true), SparseAttentionRecipe { parts: 10,
+                backend: SparseAttentionBackend::Bf16Aot });
+            // SM89 has no direct attention AOT: native FP32, still ten parts.
+            let sm89 = chosen(plan, GpuArch::Sm89);
+            assert_ne!(sm89, plan);
+            assert_eq!(sm89.sparse_recipe(true), SparseAttentionRecipe { parts: 10,
+                backend: SparseAttentionBackend::NativeFp32 });
+            // Window attention, rows and drafts are the same on every architecture.
+            for arch in GpuArch::ALL {
+                let chosen = chosen(plan, arch);
+                assert_eq!(chosen.sparse_recipe(false), SparseAttentionRecipe { parts: 2,
+                    backend: SparseAttentionBackend::NativeFp32 });
+                assert_eq!((chosen.rows(), chosen.capacity_rows(), chosen.active_drafts()),
+                    (plan.rows(), plan.capacity_rows(), plan.active_drafts()));
+                // Loading the drafter keeps the architecture's backend.
+                assert_eq!(chosen.validate_loaded(drafts).unwrap(), chosen);
+            }
+            assert_eq!(chosen(sm89, GpuArch::Sm120), plan);
+        }
+        // One split extent for both backends: the native kernel's layout.
+        assert_eq!(sparse_split_scratch_bytes(64, 10, 64), 64 * 10 * 64 * 514 * 4);
     }
 
     #[test]
