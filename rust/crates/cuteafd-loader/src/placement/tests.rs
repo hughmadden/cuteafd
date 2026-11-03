@@ -7,7 +7,7 @@ const UNIT: u64 = 4 << 20;
 /// 1 GiB (+256 MiB staging), 4 MiB per pool unit of 256 tokens over all
 /// layers (2M tokens: 8192 units, 32 GiB).
 fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboard) -> PlacementRequest {
-    PlacementRequest {
+    PlacementRequest { expert_tier: None,
         attention_placement: None,
         context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
@@ -1949,4 +1949,140 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
     }).map(|p| attention::owner_score(&p)).max().unwrap();
     assert_eq!(attention::owner_score(&accepted), best);
     assert_eq!(solve_frozen(&req, &accepted).unwrap(), accepted);
+}
+
+const MIB: u64 = 1 << 20;
+
+/// A tier over every layer of `req`, 256 experts per layer (2 MiB TP2
+/// halves, 4 MiB whole experts in the fixtures above).
+fn tier(req: &PlacementRequest, size: ExpertTierSize, order: Option<Vec<TierSlot>>) -> ExpertTierRequest {
+    let layers = (0..req.layers.len()).collect::<Vec<_>>();
+    ExpertTierRequest { size, experts_per_layer: 256,
+        order: order.unwrap_or_else(|| expert_tier::uniform_order(&layers, 256)),
+        source: ExpertTierSource::Uniform }
+}
+
+fn tier_request(free: [u64; 2], size: ExpertTierSize) -> PlacementRequest {
+    let mut req = tp2_request(free, Onboard::Layers(0));
+    req.expert_tier = Some(tier(&req, size, None));
+    req
+}
+
+#[test]
+fn expert_tier_auto_fills_what_the_pool_target_leaves() {
+    let placement = solve(&tier_request([44 * GIB; 2], ExpertTierSize::Auto)).unwrap();
+    // Pool first: 2M tokens = 32 GiB per GPU; 12 GiB left. GPU0's arena binds:
+    // 0.5 GiB workspace + n * 2 MiB + 1/8 GiB staging <= 12 GiB.
+    assert_eq!(placement.pool_tokens, 2 << 20);
+    let t = placement.expert_tier.as_ref().unwrap();
+    let n = ((12 * GIB - GIB / 2 - GIB / 8) / (2 * MIB)) as usize;
+    assert_eq!(t.experts, n);
+    assert_eq!(t.shard, ExpertTierShard::Tp2);
+    assert_eq!(t.routed_experts, 60 * 256);
+    assert_eq!(t.resident_bytes, vec![n as u64 * 2 * MIB; 2]);
+    assert_eq!(t.peak_bytes, vec![GIB / 2 + n as u64 * 2 * MIB + GIB / 8, GIB / 4 + n as u64 * 2 * MIB + GIB / 8]);
+    assert_eq!(u64::from(t.byte_share_ppm), n as u64 * 1_000_000 / (60 * 256));
+    // Uniform: every layer within one expert, ascending ids per layer.
+    let counts = t.per_layer().collect::<Vec<_>>();
+    assert_eq!(counts.iter().sum::<usize>(), n);
+    assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+    assert!(t.resident.iter().all(|ids| ids.iter().enumerate().all(|(i, &id)| usize::from(id) == i)));
+    // No whole layer moved: the Sparks keep every layer.
+    assert_eq!(placement.onboard_layers, 0);
+    assert!(placement.tp2.is_none());
+    assert!(placement.layers.iter().all(|l| l.experts == ExpertHome::Spark));
+    for gpu in 0..2 {
+        let item = placement.items[gpu].iter().find(|i| i.format == "tier").unwrap();
+        assert_eq!((item.category, item.bytes), (Category::Experts, t.peak_bytes[gpu]));
+    }
+    assert!(placement.max_pool_tokens_no_onboard > placement.pool_tokens);
+    assert!(placement.summary().contains(&format!("GPU expert tier (Uniform): {n} of 15360 routed experts")),
+        "{}", placement.summary());
+}
+
+#[test]
+fn expert_tier_fixed_count_makes_the_pool_the_output() {
+    for free in [[44 * GIB; 2], [48 * GIB, 44 * GIB]] {
+        let placement = solve(&tier_request(free, ExpertTierSize::Experts(3000))).unwrap();
+        let t = placement.expert_tier.as_ref().unwrap();
+        assert_eq!(t.experts, 3000);
+        assert_eq!(t.per_layer().collect::<Vec<_>>(), vec![50; 60]);
+        let fit = (0..2).map(|g| (free[g] - t.peak_bytes[g]) / UNIT * 256).min().unwrap();
+        assert_eq!(placement.pool_tokens, fit);
+    }
+    // 15,000 halves of 2 MiB need 29.3 GiB beside the arena on each GPU.
+    let too_many = tier_request([24 * GIB; 2], ExpertTierSize::Experts(15_000));
+    assert!(matches!(solve(&too_many), Err(PlacementError::ExpertTier { requested: 15_000, placed }) if placed < 15_000));
+    let beyond = tier_request([44 * GIB; 2], ExpertTierSize::Experts(60 * 256 + 1));
+    assert!(matches!(solve(&beyond), Err(PlacementError::ExpertTier { .. })));
+}
+
+#[test]
+fn expert_tier_follows_its_order_and_profile_counts() {
+    // A profile that routes everything to layer 7's experts 3 and 9.
+    let mut counts = vec![vec![0u64; 256]; 60];
+    counts[7][9] = 50;
+    counts[7][3] = 100;
+    counts[12][0] = 1;
+    let profile = ExpertRouteProfile { layers: counts };
+    let layers = (0..60).collect::<Vec<_>>();
+    let order = expert_tier::profile_order(&layers, 256, &profile).unwrap();
+    let mut req = tp2_request([44 * GIB; 2], Onboard::Layers(0));
+    let mut request = tier(&req, ExpertTierSize::Experts(3), Some(order));
+    request.source = ExpertTierSource::Profile;
+    req.expert_tier = Some(request);
+    let t = solve(&req).unwrap().expert_tier.unwrap();
+    assert_eq!(t.resident[7], vec![3, 9]);
+    assert_eq!(t.resident[12], vec![0]);
+    assert_eq!(t.experts, 3);
+    assert_eq!(t.source, ExpertTierSource::Profile);
+    let resident = t.resident.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    assert!((profile.route_share(&resident) - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn expert_tier_on_one_gpu_holds_whole_experts() {
+    let mut req = request(1, 44 * GIB, 60, 4, Onboard::Layers(0));
+    req.expert_tier = Some(tier(&req, ExpertTierSize::Auto, None));
+    let placement = solve(&req).unwrap();
+    let t = placement.expert_tier.unwrap();
+    assert_eq!(t.shard, ExpertTierShard::Whole { gpu: 0 });
+    // 12 GiB left: 1/4 GiB workspace + n * 4 MiB + 1/4 GiB staging.
+    assert_eq!(t.experts, ((12 * GIB - GIB / 2) / (4 * MIB)) as usize);
+    assert_eq!(t.peak_bytes, vec![12 * GIB]);
+}
+
+#[test]
+fn expert_tier_refuses_requests_it_cannot_run() {
+    // No Sparks to hold the other experts.
+    let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+    req.inventory.spark_ranks = 0;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    // Whole-layer onboarding and a tier together.
+    for (onboard, minimum) in [(Onboard::Auto, 0), (Onboard::Layers(2), 0), (Onboard::Layers(0), 1)] {
+        let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+        req.onboard = onboard;
+        req.minimum_expert_layers = minimum;
+        assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))), "{onboard:?} {minimum}");
+    }
+    // A layer residency that does not divide over its experts.
+    let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+    req.expert_tier.as_mut().unwrap().experts_per_layer = 3;
+    req.expert_tier.as_mut().unwrap().order.retain(|slot| slot.expert < 3);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    // A repeated slot.
+    let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+    let first = req.expert_tier.as_ref().unwrap().order[0];
+    req.expert_tier.as_mut().unwrap().order.push(first);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn expert_tier_off_leaves_placements_unchanged() {
+    for onboard in [Onboard::Auto, Onboard::Layers(10)] {
+        let req = tp2_request([44 * GIB; 2], onboard);
+        let placement = solve(&req).unwrap();
+        assert!(placement.expert_tier.is_none());
+        assert!(!serde_json::to_string(&placement).unwrap().contains("expert_tier"));
+    }
 }

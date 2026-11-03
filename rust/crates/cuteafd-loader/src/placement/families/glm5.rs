@@ -490,7 +490,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 .ok_or(PlacementError::Overflow("GLM drafter packing peak"))?, Basis::Formula)]
     } else { Vec::new() };
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         pool_bounded: Vec::new(),
         attention_placement: None,
         layers_first_gpu: 0,

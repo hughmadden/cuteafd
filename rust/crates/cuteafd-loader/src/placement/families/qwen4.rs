@@ -75,7 +75,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     if inputs.pending_code_bytes > 0 {
         fixed.push(Demand::new(0, Category::Runtime, "loaded code", inputs.pending_code_bytes, Basis::Formula));
     }
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: inputs.capacity_bytes,
             headroom_bytes: admission.headroom, baseline: inputs.baseline }],
             spark_ranks: inputs.spark_ranks, peer_access: false },
@@ -512,7 +512,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     let mut pool = PoolPolicy::resolve(&capacities, inputs.max_context, inputs.requested_pool,
         QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context);
     pool.ceiling = pool.target;
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus: inputs.gpus.to_vec(), spark_ranks: inputs.spark_ranks, peer_access: true },
         attention_placement: Some(AttentionPlacement::Layers), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool_bounded: Vec::new(),

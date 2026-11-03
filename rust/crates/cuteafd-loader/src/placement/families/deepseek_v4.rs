@@ -297,7 +297,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         *bytes = bytes.checked_add(payload).ok_or(PlacementError::Overflow("V4 TP2 workspace"))?;
     }
     let geometry_unit = 256;
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         pool_bounded: Vec::new(),
         attention_placement: inputs.attention,
         layers_first_gpu: 0,

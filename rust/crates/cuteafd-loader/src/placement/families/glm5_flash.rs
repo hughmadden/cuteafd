@@ -393,7 +393,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     let workspace = if working.spark_ranks == 0 { &i.local_workspace } else { &i.workspace };
     fixed.extend(workspace.iter().cloned());
     let fixed = working.demands(&fixed).cloned().collect();
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         // The family resolves the mode before admission (its index cache depends on it: compact
         // under context, keys under heads), so two GPUs pin it.
         attention_placement: (ranks == 2).then_some(i.attention.mode),

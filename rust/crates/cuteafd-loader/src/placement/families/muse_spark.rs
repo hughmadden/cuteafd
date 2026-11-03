@@ -412,7 +412,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let capacities = gpus.iter().map(|gpu| gpu.capacity_bytes).collect::<Vec<_>>();
     let pool = PoolPolicy::resolve(&capacities, context, requested_pool, PAGE_ROWS, false)
         .with_automatic_context(automatic_context);
-    let mut request = PlacementRequest {
+    let mut request = PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus, spark_ranks, peer_access: pair },
         attention_placement: pair.then_some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; ranks], pool_bounded: Vec::new(), fixed,
