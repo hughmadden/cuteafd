@@ -163,6 +163,7 @@ impl<'a> AttentionQueryWeights<'a> {
         ensure!(storage.kernels.len() == self.scales.len(), "attention query storage plans differ from the weights");
         let value = AttentionQueryWave {
             position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
+            position_check: crate::shared::memory::staging_check::StagingCheck::new(self.library, "V4.1 attention query positions", 1),
             norm: self.library.v41_attention_ops()?,
             weights: self,
             capacity: storage.unit,
@@ -239,6 +240,8 @@ pub(crate) struct AttentionQueryWave<'w, 'a> {
     storage: std::rc::Rc<AttentionQueryStorage<'a>>,
     /// Per slot: rewritten on the host for each unit (pinned staging rule).
     position_staging: HostAllocation<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: its upload ran before each rewrite.
+    position_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     norm: V41AttentionOps<'a>,
     weights: &'w AttentionQueryWeights<'a>,
     capacity: u32,
@@ -493,6 +496,7 @@ impl AttentionQueryWave<'_, '_> {
             "invalid query tokens"
         );
         let binding = QueryBinding::new(self.weights.layer)?;
+        self.position_check.before_write(0)?;
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
@@ -503,6 +507,7 @@ impl AttentionQueryWave<'_, '_> {
                 self.storage.stream.library.copy_host_buffer_h2d_async(
                     self.positions(), self.position_staging.buffer, tokens.len() * 8, self.storage.stream.raw,
                 )?;
+                self.position_check.uploaded(0, self.storage.stream.raw)?;
             }
             prepare(self.storage.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
@@ -548,6 +553,7 @@ impl AttentionQueryWave<'_, '_> {
         ensure!(tokens.iter().all(|&p| p < 1048576), "invalid query tokens");
         let binding = QueryBinding::new(self.weights.layer)?;
         let rows = tokens.len() as u32;
+        self.position_check.before_write(0)?;
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
@@ -557,6 +563,7 @@ impl AttentionQueryWave<'_, '_> {
             self.acquire_scratch()?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
                 tokens.len()*8, self.storage.stream.raw)?;
+            self.position_check.uploaded(0, self.storage.stream.raw)?;
             prepare(self.storage.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
             crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?;
@@ -597,6 +604,7 @@ impl AttentionQueryWave<'_, '_> {
             && std::ptr::eq(projection.output_device().library,self.storage.stream.library),"TP2 query origin differs");
         let rows=tokens.len() as u32;
         let binding=QueryBinding::new(self.weights.layer)?;
+        self.position_check.before_write(0)?;
         for (dst,token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
@@ -618,6 +626,7 @@ impl AttentionQueryWave<'_, '_> {
             self.acquire_scratch()?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(),self.position_staging.buffer,
                 tokens.len()*8,self.storage.stream.raw)?;
+            self.position_check.uploaded(0, self.storage.stream.raw)?;
             prepare(self.storage.stream.raw,self.input())?;
             crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
                 rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))?;

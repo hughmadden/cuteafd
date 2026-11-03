@@ -95,6 +95,16 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         Ok(())
     }
+    /// This decode lane's device-ordered passes push every transfer between
+    /// the GPUs (`v41_peer_push`): the 19->20 hop (A1) and the chained head
+    /// (A8, A9). Its TP2 FFN, owned by its transport, is enabled there.
+    pub fn enable_peer_push(&mut self) -> Result<()> {
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let rows = crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS as usize;
+        let bytes = crate::families::deepseek_v41::v41_peer_push::lane_bytes(rows, usize::try_from(spec.row_bytes)?)?;
+        for transfer in &mut self.resources.transfers { transfer.enable_push(bytes)?; }
+        self.resources.head.enable_peer_push()
+    }
     pub fn enable_dual_attention(&mut self)->Result<()> {
         for lane in &mut self.resources.lanes {
             let device=lane.device;
@@ -204,6 +214,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             chain,
             device_order: true,
             device_default: true,
+            paced: false,
             l2_solo: true,
             sampled: None,
         })
@@ -417,10 +428,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             return self.settle_route_rings(result);
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
+        let paced = handle.paced();
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
             requests, batch, transport, placement, selected, suffix, encoder, greedy)) }).await;
         let issued_us = timed.map(|t| t.elapsed().as_micros() as u64);
-        let drained = self.drain_chain();
+        let drained = self.drain_pass_chain(paced).await;
         let drained_us = timed.map(|t| t.elapsed().as_micros() as u64);
         // A failed Spark wire released its waits over garbage planes.
         let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());

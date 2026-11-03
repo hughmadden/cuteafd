@@ -176,6 +176,14 @@ impl<'a> Wave<'a> {
     pub(crate) fn release_shared_output(&self, destination: usize) -> Result<()> {
         self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?.release_shared_output(destination)
     }
+    /// Device-ordered passes of this decode lane push every transfer between
+    /// the GPUs (`v41_peer_push`): routed partials, shared partials and the
+    /// returned result. `rows` is the decode lane's width.
+    pub(crate) fn enable_peer_push(&self, rows: usize) -> Result<()> {
+        ensure!(self.window.range().is_none(), "only a decode lane's private TP2 FFN pushes");
+        let mut execution = self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?;
+        execution.enable_push(rows)
+    }
     async fn execution(&self, rows: u32) -> Result<tokio::sync::MutexGuard<'_, Execution<'a>>> {
         ensure!(self.window.admits(rows as usize), "TP2 FFN rows differ from slot window");
         let mut execution = self.storage.execution.lock().await;
@@ -218,6 +226,29 @@ struct Execution<'a> {
     capacity: u32,
     window: crate::shared::memory::row_window::RowWindow,
     released: crate::shared::memory::row_window::ScratchGuard<'a>,
+    /// Device flags of the pushed transfers ([`Self::enable_push`]): rank =
+    /// GPU, flag [`RETURN`] carries the reduced result back (A7).
+    flags: Option<crate::shared::peer_split::PeerExchange<'a>>,
+}
+/// Flag of the result a Spark layer's reduce GPU returns to its block's GPU.
+const RETURN: usize = 0;
+/// Flag of the FFN input planes the attention GPU pushes to the other GPU
+/// (A2 on TP2 layers, A5 on Spark layers), one sequence per direction.
+const INPUT: usize = 1;
+/// Flags of a decode lane's TP2 FFN exchange.
+const FLAGS: usize = 2;
+
+/// Bytes of a flat plane pushed in whole 16-byte units: route ids and
+/// weights are 24 bytes a row. The rounding stays inside both ends: router
+/// planes are allocated in whole units, and a pushing wave's peer inputs
+/// hold an even number of rows (checked when pushes are enabled).
+fn padded(bytes: usize) -> usize { bytes.next_multiple_of(16) }
+/// A pushing wave's capacity: even, so its padded route planes fit (see
+/// [`padded`]), and at least the decode rows it pushes.
+fn push_capacity(capacity: u32, rows: usize) -> Result<()> {
+    ensure!(capacity % 2 == 0 && rows <= capacity as usize,
+        "TP2 FFN pushes need an even decode capacity of at least {rows} rows, got {capacity}");
+    Ok(())
 }
 impl Drop for Execution<'_> {
     fn drop(&mut self) {
@@ -248,6 +279,65 @@ unsafe fn peer_copy(
         },
     }
 }
+/// Whether this pass pushes, so the arena's scratch guard is neither taken
+/// nor released (a decode lane's private arena; see `push_inputs`).
+fn pushing_guards(flags: &Option<crate::shared::peer_split::PeerExchange<'_>>) -> bool {
+    flags.is_some() && crate::shared::memory::chain::deferred()
+}
+
+/// A2/A5's push: `planes` (source on `local`, final at the chain head;
+/// destination on the other GPU; bytes) as flat planes on `local`'s TP2
+/// stream after the head, then the other GPU's TP2 stream waits on the
+/// [`INPUT`] flag. Returns the head mark for a receiver on the other GPU that
+/// adopts the head. Push before wait, in one synchronous block.
+///
+/// No slot or acknowledgement: the next layer's push into the same peer
+/// inputs follows this layer's readers, because each layer's FFN output
+/// gates the next layer's input (layers do not pipeline;
+/// `v41_peer_push::schedule_tests`).
+///
+/// # Safety
+/// Inside a device-ordered chain scope; every plane stays live and unaliased
+/// until the chain drains.
+unsafe fn push_inputs(flags: &crate::shared::peer_split::PeerExchange<'_>, streams: &[Stream<'_>; 2], local: usize,
+    planes: &[(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize)]) -> Result<Option<crate::shared::memory::chain::HeadMark>> {
+    use crate::shared::memory::chain;
+    let remote = 1 - local;
+    let planes = planes.iter().map(|&(source, destination, bytes)| {
+        ensure!(source.device_id == streams[local].device.id && destination.device_id == streams[remote].device.id
+            && bytes % 16 == 0 && bytes <= destination.bytes, "TP2 FFN input plane devices or extent differ");
+        Ok(cuteafd_ffi::peer_exchange::PeerPlane { destination: destination.ptr, source: source.ptr.cast_const(),
+            rows: 1, row_bytes: bytes as u64, destination_pitch: bytes as u64, source_pitch: bytes as u64 })
+    }).collect::<Result<Vec<_>>>()?;
+    let (sender, receiver) = (&streams[local], &streams[remote]);
+    let mark = sender.device.run(|| unsafe { chain::join_for_push(sender.device.library, sender.raw) })?;
+    flags.push_planes_on(local, sender.raw, INPUT, &planes)?;
+    flags.wait_on(remote, receiver.raw, INPUT)?;
+    Ok(mark)
+}
+
+/// A7's push: `source` (final at the chain head, on the other GPU) into
+/// `output` on `destination`, ordered on the device by the exchange's
+/// [`RETURN`] flag. Push before wait, in one synchronous block.
+///
+/// # Safety
+/// Inside a device-ordered chain scope; both buffers stay live and unaliased
+/// until the chain drains.
+unsafe fn return_pushed(flags: &crate::shared::peer_split::PeerExchange<'_>, streams: &[Stream<'_>; 2],
+    source: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer, destination: usize) -> Result<()> {
+    use crate::shared::memory::chain;
+    let from = 1 - destination;
+    ensure!(source.device_id == streams[from].device.id && output.device_id == streams[destination].device.id
+        && source.bytes >= output.bytes, "TP2 result return devices or extent differ");
+    let (sender, receiver) = (&streams[from], &streams[destination]);
+    let mark = sender.device.run(|| unsafe { chain::join_for_push(sender.device.library, sender.raw) })?;
+    flags.push_to_on(from, sender.raw, RETURN, source.ptr, output.ptr, output.bytes)?;
+    receiver.device.run(|| unsafe {
+        flags.wait_on(destination, receiver.raw, RETURN)?;
+        chain::finish_after_flag(receiver.device.library, receiver.raw, mark)
+    })
+}
+
 impl<'a> Execution<'a> {
     pub fn new(
         routed: [OwnerWeights<'a>; 2],
@@ -306,7 +396,19 @@ impl<'a> Execution<'a> {
             layers,
             capacity, window: crate::shared::memory::row_window::RowWindow::NONE,
             released: crate::shared::memory::row_window::ScratchGuard::new(devices[0].library, &[0,1])?,
+            flags: None,
         })
+    }
+    /// See [`Wave::enable_peer_push`].
+    fn enable_push(&mut self, rows: usize) -> Result<()> {
+        use crate::families::deepseek_v41::v41_peer_push::lane_bytes;
+        push_capacity(self.capacity, rows)?;
+        self.routed.enable_push(lane_bytes(rows, self.routed.partial_row_bytes())?)?;
+        self.shared.enable_push(lane_bytes(rows, 10240)?)?;
+        let library = self.streams[0].device.library;
+        self.flags = Some(crate::shared::peer_split::PeerExchange::new_flags(library, [0, 1], FLAGS,
+            lane_bytes(rows, PeerInputs::allocation_sizes(1).iter().sum::<usize>())?)?);
+        Ok(())
     }
     pub fn contains(&self, layer: usize) -> bool {
         layer < self.layers
@@ -366,18 +468,27 @@ impl<'a> Execution<'a> {
         let remote = 1 - local;
         let upload = &self.streams[remote];
         let mut guard = upload.cancellation_guard("TP2 shared input upload");
-        if crate::shared::memory::chain::deferred() {
-            // Both GPUs' streams follow the input's producers (the chain head).
-            self.streams[0].join_chain()?;
-            self.streams[1].join_chain()?;
-        } else {
-            upload.wait().await?;
-        }
         let peer = self.window.apply(self.peers[remote].values.buffer, 10240);
-        let sm = self.sm[remote].as_ref();
-        upload
-            .device
-            .run(|| unsafe { peer_copy(upload, sm, peer, values, rows as usize * 10240) })?;
+        let pushing = self.flags.as_ref().filter(|_| crate::shared::memory::chain::deferred());
+        // A5 below the boundary reduces on the other GPU: its receiver adopts
+        // the head this push joined (no cross-device merge).
+        let mut adopt = None;
+        if let Some(flags) = pushing {
+            let mark = unsafe { push_inputs(flags, &self.streams, local, &[(values, peer, rows as usize * 10240)])? };
+            adopt = mark.filter(|_| destination != local);
+        } else {
+            if crate::shared::memory::chain::deferred() {
+                // Both GPUs' streams follow the input's producers (the chain head).
+                self.streams[0].join_chain()?;
+                self.streams[1].join_chain()?;
+            } else {
+                upload.wait().await?;
+            }
+            let sm = self.sm[remote].as_ref();
+            upload
+                .device
+                .run(|| unsafe { peer_copy(upload, sm, peer, values, rows as usize * 10240) })?;
+        }
         let mut inputs = [values; 2];
         inputs[remote] = peer;
         let output = unsafe {
@@ -388,6 +499,7 @@ impl<'a> Execution<'a> {
                     destination,
                     inputs,
                     [&self.streams[0], &self.streams[1]],
+                    adopt,
                 )
                 .await?
         };
@@ -412,12 +524,21 @@ impl<'a> Execution<'a> {
                 && source.bytes >= rows as usize * 10240,
             "invalid TP2 result transfer"
         );
+        let mut output = self.window.apply(self.output[destination].buffer, 10240);
+        output.bytes = rows as usize * 10240;
+        if let Some(flags) = self.flags.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
+            // A7: the reduce's GPU pushes its result, the block's GPU waits on
+            // the flag and adopts the chain head without a cross-device merge.
+            // No ack: the next push into `output` follows the next layer's
+            // reduce, which follows this layer's readers of it (layers do not
+            // pipeline; `v41_peer_push::schedule_tests`).
+            unsafe { return_pushed(flags, &self.streams, source, output, destination)? };
+            return Ok(output);
+        }
         if !crate::shared::memory::chain::deferred() {
             crate::shared::memory::chain::settle(self.streams[0].device.library)?;
         }
         let stream = &self.streams[destination];
-        let mut output = self.window.apply(self.output[destination].buffer, 10240);
-        output.bytes = rows as usize * 10240;
         let sm = self.sm[destination].as_ref();
         let queued = stream.device.run(|| unsafe {
             if crate::shared::memory::chain::deferred() {
@@ -467,35 +588,46 @@ impl<'a> Execution<'a> {
         let skip = SKIP_FFN_ACQUIRE.with(|s|s.get());
         #[cfg(not(test))]
         let skip = false;
-        if !skip {for stream in self.streams.iter() {
+        // A decode lane's pushing pass: the flags order every reuse of this
+        // lane's private arena, so its scratch guard is not taken.
+        let pushing = self.flags.as_ref().filter(|_| crate::shared::memory::chain::deferred());
+        if !skip && pushing.is_none() {for stream in self.streams.iter() {
             stream.device.run(|| unsafe { self.released.acquire(stream.raw) })?;
         }}
         let upload = &self.streams[remote];
         let mut guard = upload.cancellation_guard("TP2 FFN input upload");
-        // Do not submit DMA behind an unresolved stream dependency: a blocked
-        // copy packet can hold up independent lanes on the shared copy engine.
-        // Chained producers of these inputs are settled on the host as well.
-        if !crate::shared::memory::chain::deferred() {
-            crate::shared::memory::chain::settle(upload.device.library)?;
-        }
-        if crate::shared::memory::chain::deferred() {
-            self.streams[0].join_chain()?;
-            self.streams[1].join_chain()?;
-        } else {
-            upload.wait().await?;
-        }
         let peer = self.peers[remote].buffers().into_iter().zip(widths)
             .map(|(buffer, width)| self.window.apply(buffer, width)).collect::<Vec<_>>();
         let peer: [CuteafdDeviceBuffer; 4] = peer.try_into().ok().unwrap();
-        let sm = self.sm[remote].as_ref();
-        upload.device.run(|| {
-            for ((source, destination), width) in inputs.into_iter().zip(peer).zip(widths) {
-                unsafe {
-                    peer_copy(upload, sm, destination, source, rows as usize * width)?;
-                }
+        if let Some(flags) = pushing {
+            // A2: the four planes in one push; ids and weights as flat
+            // 16-byte-rounded planes.
+            let planes: Vec<_> = inputs.into_iter().zip(peer).zip(widths)
+                .map(|((source, destination), width)| (source, destination, padded(rows as usize * width))).collect();
+            unsafe { push_inputs(flags, &self.streams, local, &planes)?; }
+        } else {
+            // Do not submit DMA behind an unresolved stream dependency: a blocked
+            // copy packet can hold up independent lanes on the shared copy engine.
+            // Chained producers of these inputs are settled on the host as well.
+            if !crate::shared::memory::chain::deferred() {
+                crate::shared::memory::chain::settle(upload.device.library)?;
             }
-            Ok(())
-        })?;
+            if crate::shared::memory::chain::deferred() {
+                self.streams[0].join_chain()?;
+                self.streams[1].join_chain()?;
+            } else {
+                upload.wait().await?;
+            }
+            let sm = self.sm[remote].as_ref();
+            upload.device.run(|| {
+                for ((source, destination), width) in inputs.into_iter().zip(peer).zip(widths) {
+                    unsafe {
+                        peer_copy(upload, sm, destination, source, rows as usize * width)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
         let mut ranks = [inputs; 2];
         ranks[remote] = peer;
         // NVFP4 consumes the BF16 values already broadcast for shared experts,
@@ -524,6 +656,7 @@ impl<'a> Execution<'a> {
                     local,
                     [ranks[0][0], ranks[1][0]],
                     [&self.streams[0], &self.streams[1]],
+                    None,
                 )
             }
         )?;
@@ -543,7 +676,7 @@ impl<'a> Execution<'a> {
         // The add above read the shared output: release it for the next layer
         // (it is on the chain head now; no-op outside a chain).
         self.shared.release_output(local)?;
-        self.released.release()?;
+        if !pushing_guards(&self.flags) { self.released.release()?; }
         let mut result = output;
         result.bytes = rows as usize * 10240;
         Ok(result)
@@ -557,6 +690,21 @@ impl<'a> Execution<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// A2's padded route planes stay inside an even-capacity wave's peer
+    /// inputs and inside the router's whole-unit planes; odd capacities and
+    /// rows past the capacity are refused.
+    #[test]
+    fn padded_route_planes_fit_even_capacities() {
+        assert_eq!([24, 48, 72, 1536].map(super::padded), [32, 48, 80, 1536]);
+        for capacity in (2..=256u32).step_by(2) {
+            super::push_capacity(capacity, capacity as usize).unwrap();
+            for rows in 1..=capacity as usize {
+                assert!(super::padded(rows * 24) <= capacity as usize * 24, "{rows} of {capacity}");
+            }
+        }
+        assert!(super::push_capacity(63, 1).is_err());
+        assert!(super::push_capacity(64, 65).is_err());
+    }
     use super::*;
     #[test]
     #[ignore = "requires combined TP2 CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, two GPUs"]
@@ -660,6 +808,7 @@ mod tests {
                                 reference_inputs[1].values.buffer,
                             ],
                             [&producers[0], &producers[1]],
+                            None,
                         )
                     })?;
                     devices[local].run(|| {
@@ -795,6 +944,7 @@ mod tests {
                             reference_inputs[1].values.buffer,
                         ],
                         [&producers[0], &producers[1]],
+                        None,
                     )
                 })?;
                 let mut route_bytes = vec![0; actual[0].len()];
@@ -1081,6 +1231,126 @@ mod shared_storage_tests {
         }
         Ok(())
     }
+    /// A2/A5: the FFN input planes pushed to the other GPU (ids and weights
+    /// as 16-byte-rounded flat planes) equal the pulled planes on every row
+    /// the consumers read, both directions, at decode rows 1, 6, 17, 48 and
+    /// 64; nothing past the rounded extent changes.
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs with peer access"]
+    fn input_planes_push_matches_pull() -> Result<()> {
+        use crate::shared::memory::chain::{self, StageChain};
+        // SAFETY: the explicitly selected native library outlives every owner below.
+        let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
+        for gpu in 0..2 { devices[gpu].run(|| lib.cuda_enable_peer(1 - gpu as i32))?; }
+        const CAPACITY: usize = 64;
+        let widths = [10240usize, 5280, 24, 24];
+        let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
+        let flags = crate::shared::peer_split::PeerExchange::new_flags(&lib, [0, 1], FLAGS,
+            crate::families::deepseek_v41::v41_peer_push::lane_bytes_with(CAPACITY, 15568, None)?)?;
+        let sm = [devices[0].run(|| lib.v41_peer_copy())?, devices[1].run(|| lib.v41_peer_copy())?];
+        let chain = StageChain::on_devices(&lib, &[0, 1])?;
+        chain.set_device_order(true);
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for local in [0usize, 1] {
+            let remote = 1 - local;
+            let sources = widths.map(|width| Allocation::new(devices[local], CAPACITY * width));
+            let sources: Vec<_> = sources.into_iter().collect::<Result<_>>()?;
+            let peers: Vec<_> = widths.iter().map(|&width| Allocation::new(devices[remote], CAPACITY * width)).collect::<Result<_>>()?;
+            for rows in [1usize, 6, 17, 48, 64] {
+                for (plane, (source, &width)) in sources.iter().zip(&widths).enumerate() {
+                    let data: Vec<u8> = (0..CAPACITY * width).map(|i| ((i * 31 + plane * 7 + rows) % 253) as u8).collect();
+                    devices[local].run(|| lib.copy_h2d(source.buffer, &data))?;
+                }
+                let mut results = Vec::new();
+                for push in [false, true] {
+                    for peer in &peers { devices[remote].run(|| lib.copy_h2d(peer.buffer, &vec![0x6b; peer.buffer.bytes]))?; }
+                    let planes: Vec<_> = sources.iter().zip(&peers).zip(&widths).map(|((source, peer), &width)|
+                        (source.buffer, peer.buffer, if push { padded(rows * width) } else { rows * width })).collect();
+                    runtime.block_on(chain.handle().scope(async { unsafe {
+                        if push { return push_inputs(&flags, &streams, local, &planes).map(|_| ()); }
+                        streams[remote].device.run(|| {
+                            chain::join(&lib, streams[remote].raw)?;
+                            for &(source, destination, bytes) in &planes {
+                                peer_copy(&streams[remote], Some(&sm[remote]), destination, source, bytes)?;
+                            }
+                            chain::finish(&lib, streams[remote].raw)
+                        })
+                    } }))?;
+                    chain.drain_bounded(std::time::Duration::from_secs(10))?;
+                    lib.cuda_device_synchronize()?;
+                    let mut landed = Vec::new();
+                    for peer in &peers {
+                        let mut bytes = vec![0u8; peer.buffer.bytes];
+                        devices[remote].run(|| lib.copy_d2h(&mut bytes, peer.buffer))?;
+                        landed.push(bytes);
+                    }
+                    results.push(landed);
+                }
+                for (plane, &width) in widths.iter().enumerate() {
+                    let (pulled, pushed) = (&results[0][plane], &results[1][plane]);
+                    ensure!(pulled[..rows * width] == pushed[..rows * width],
+                        "A2/A5 plane {plane} differs from the pull at {rows} rows from GPU {local}");
+                    ensure!(pushed[padded(rows * width)..].iter().all(|&b| b == 0x6b),
+                        "A2/A5 plane {plane} wrote past its rounded extent at {rows} rows");
+                }
+            }
+        }
+        eprintln!("A2/A5 input planes: push == pull on every read row, both directions, rows 1, 6, 17, 48, 64");
+        Ok(())
+    }
+
+    /// A7: the reduced result returned GPU1 -> GPU0 by push equals the pull,
+    /// at decode rows 1, 6, 17, 48 and 64, and leaves rows past it untouched.
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs with peer access"]
+    fn result_return_push_matches_pull() -> Result<()> {
+        use crate::shared::memory::chain::{self, StageChain};
+        // SAFETY: the explicitly selected native library outlives every owner below.
+        let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
+        for gpu in 0..2 { devices[gpu].run(|| lib.cuda_enable_peer(1 - gpu as i32))?; }
+        let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
+        let flags = crate::shared::peer_split::PeerExchange::new_flags(&lib, [0, 1], FLAGS,
+            crate::families::deepseek_v41::v41_peer_push::lane_bytes_with(64, 15568, None)?)?;
+        let sm = devices[0].run(|| lib.v41_peer_copy())?;
+        let source = Allocation::new(devices[1], 64 * 10240)?;
+        let output = Allocation::new(devices[0], 64 * 10240)?;
+        let chain = StageChain::on_devices(&lib, &[0, 1])?;
+        chain.set_device_order(true);
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for rows in [1usize, 6, 17, 48, 64] {
+            let data: Vec<u8> = (0..64 * 10240).map(|i| ((i * 7 + rows * 13) % 251) as u8).collect();
+            devices[1].run(|| lib.copy_h2d(source.buffer, &data))?;
+            let mut results = Vec::new();
+            for push in [false, true] {
+                devices[0].run(|| lib.copy_h2d(output.buffer, &vec![0x77; 64 * 10240]))?;
+                let src = CuteafdDeviceBuffer { bytes: rows * 10240, ..source.buffer };
+                let out = CuteafdDeviceBuffer { bytes: rows * 10240, ..output.buffer };
+                runtime.block_on(chain.handle().scope(async { unsafe {
+                    if push { return return_pushed(&flags, &streams, src, out, 0); }
+                    devices[0].run(|| {
+                        chain::join(&lib, streams[0].raw)?;
+                        peer_copy(&streams[0], Some(&sm), out, src, out.bytes)?;
+                        chain::finish(&lib, streams[0].raw)
+                    })
+                } }))?;
+                chain.drain_bounded(std::time::Duration::from_secs(10))?;
+                lib.cuda_device_synchronize()?;
+                let mut landed = vec![0u8; 64 * 10240];
+                devices[0].run(|| lib.copy_d2h(&mut landed, output.buffer))?;
+                results.push(landed);
+            }
+            ensure!(results[0] == results[1], "A7 push differs from pull at {rows} rows");
+            ensure!(results[1][..rows * 10240] == data[..rows * 10240]
+                && results[1][rows * 10240..].iter().all(|&b| b == 0x77), "A7 push moved the wrong rows at {rows}");
+        }
+        eprintln!("A7 result return: push == pull at rows 1, 6, 17, 48, 64");
+        Ok(())
+    }
+
     #[test]
     fn peer_input_storage_bytes_equal_planned_allocations() {
         assert_eq!(PeerInputs::allocation_sizes(8192).into_iter().sum::<usize>(),8192*15568);

@@ -256,6 +256,16 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    // Decode lanes only: prefill slots keep their copy-engine transfers.
+    let peer_push = crate::families::deepseek_v41::v41_peer_push::mode()?
+        == crate::families::deepseek_v41::v41_peer_push::Mode::Push;
+    tracing::info!(peer_push, "V4.1 dual decode transfers ({})", crate::families::deepseek_v41::v41_peer_push::MODE_ENV);
+    let busy_lanes = super::scheduler::busy_lanes::mode()?;
+    tracing::info!(?busy_lanes, "V4.1 busy decode lanes ({})", super::scheduler::busy_lanes::ENV);
+    if peer_push {
+        pass.enable_peer_push()?;
+        second.enable_peer_push()?;
+    }
     memory_checkpoint("decode lanes")?;
     // The prefill slots: one storage set per GPU (row planes at the reserve,
     // scratch at the unit cap), each slot's host objects on it.
@@ -477,8 +487,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let mut decode_transport = |lane: usize| -> Result<_> {
         let mut transport = devices[1].own(|| NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, decode_rows,
             timing, spark_world, u32::try_from(lane)?)?, wave_bytes))?;
-        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows,
-            [None, None])?)?;
+        let wave = tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows, [None, None])?;
+        if peer_push { wave.enable_peer_push(decode_rows as usize)?; }
+        transport.install_tp2(wave)?;
         Ok(transport)
     };
     let [mut transport, mut second_transport] = lanes.try_map(|lane| decode_transport(lane.index()))?;

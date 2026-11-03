@@ -620,8 +620,9 @@ impl<'w> NativePendingFfn<'w, '_> {
         // host waits for the reply here, where everything this layer can
         // issue (router, staging, shared FFN, L2 prefetch) is already queued,
         // and only then queues the landing and reduce, so no stream sits
-        // blocked on a device wait through the round trip. A device-ordered
-        // pass queues them at once (the device waits).
+        // blocked on a device wait through the round trip. A paced
+        // device-ordered pass (both dual lanes busy) collects the same way;
+        // any other device-ordered pass queues them at once (the device waits).
         //
         // Every wait here yields to the executor rather than blocking the
         // thread (#815): prefill polls its two encoder lanes on this thread,
@@ -630,7 +631,7 @@ impl<'w> NativePendingFfn<'w, '_> {
         // ever in flight and the Sparks idled half the time. A lone future
         // (decode) re-polls at once, so its wait is still a spin.
         let host_ordered = !crate::shared::memory::chain::deferred();
-        if host_ordered {
+        if host_ordered || crate::shared::memory::chain::paced() {
             // The shared host-wait pacing still applies (`--host-wait block`
             // sleeps past its spin window), between yields. Pinned ranks that
             // arrived are pulled meanwhile (#815) on the reduce stream (after

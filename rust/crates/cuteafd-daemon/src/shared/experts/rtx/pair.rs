@@ -982,6 +982,19 @@ impl<'a> OwnerPair<'a> {
         self.bf16_input
     }
 
+    /// Device-ordered passes push each remote partial to its owner
+    /// ([`super::combine::OwnerReduce::enable_push`]). For a pair private to
+    /// one decode lane only.
+    pub(crate) fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        for reduction in &mut self.reductions { reduction.enable_push(decode_lane_bytes)?; }
+        Ok(())
+    }
+
+    /// Bytes per row of the widest partial a reduction moves.
+    pub(crate) fn partial_row_bytes(&self) -> usize {
+        self.reductions[0].partial_row_bytes()
+    }
+
     #[cfg(test)]
     pub(crate) fn rank_output(&self, rank: usize) -> CuteafdDeviceBuffer {
         self.ranks[rank].execution.allocation().buffer

@@ -59,7 +59,6 @@ impl<'w, 'a> Rank<'w, 'a> {
         }
     }
     unsafe fn begin(&mut self, input: CuteafdDeviceBuffer, rows: usize, greedy: bool) -> Result<()> {
-        let mode = usize::from(greedy);
         unsafe {
             let lib = self.stream.library;
             if input.device_id == self.input.buffer.device_id {
@@ -70,6 +69,16 @@ impl<'w, 'a> Rank<'w, 'a> {
             } else {
                 lib.copy_peer_async(self.input.buffer, input, rows * 10240, self.stream.raw)?;
             }
+            self.project(rows, greedy)
+        }
+    }
+    /// The projection (and greedy winners) of `rows` rows already in this
+    /// rank's input: copied by [`Self::begin`], or pushed there by the other
+    /// GPU behind a flag this stream waited on.
+    unsafe fn project(&mut self, rows: usize, greedy: bool) -> Result<()> {
+        let mode = usize::from(greedy);
+        unsafe {
+            let lib = self.stream.library;
             let span = self.draft_timing.as_ref().map(|timing| timing.begin("head_shard", None, rows, self.stream.raw)).transpose()?.flatten();
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
                 self.graphs[mode].get(rows), || self.enqueue(rows, greedy))?;
@@ -136,7 +145,14 @@ pub(crate) struct DistributedVocabularyWave<'w, 'a> {
     greedy_ready: bool,
     pending_logits: Option<(usize, [bool; 2])>,
     copy_pending: bool,
+    /// Device flags of the chained head's pushes ([`Self::enable_push`]):
+    /// rank = vocabulary rank, [`HEAD_INPUT`] and [`HEAD_WINNERS`].
+    push: Option<crate::shared::peer_split::PeerExchange<'a>>,
 }
+/// Flag of the normalized rows rank 1 pushes into rank 0's input (A8).
+const HEAD_INPUT: usize = 0;
+/// Flag of rank 0's winners pushed into the merge's remote block (A9).
+const HEAD_WINNERS: usize = 1;
 impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         ensure!((1..=cuteafd_core::V41_VOCAB_ROWS).contains(&capacity) && (1..129280).contains(&split), "invalid distributed vocabulary geometry");
@@ -179,7 +195,21 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             remote: Allocation::new(devices[1], capacity * 8)?,
             merged: Allocation::new(devices[1], capacity * 8)?,
             capacity, split, ready: None, greedy_ready: false, pending_logits: None, copy_pending: false,
+            push: None,
         })
+    }
+    /// The chained greedy head pushes between its GPUs from now on: rank 1
+    /// pushes the normalized rows into rank 0's input (A8) and rank 0 pushes
+    /// its winners into the merge's block (A9), each behind a device flag.
+    /// Each destination is written once per pass; the pass drain orders the
+    /// next write.
+    pub fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        ensure!(self.capacity * 8 % 16 == 0 && self.capacity * 8 <= decode_lane_bytes,
+            "head winner block of {} rows does not push as whole 16-byte rows", self.capacity);
+        let library = self.merge_stream.device.library;
+        self.push = Some(crate::shared::peer_split::PeerExchange::new_flags(library,
+            [self.ranks[0].device.id, self.ranks[1].device.id], 2, decode_lane_bytes)?);
+        Ok(())
     }
     /// # Safety
     /// Normalized BF16 input [rows,5120] is complete on rank 1's GPU. Its owner
@@ -259,6 +289,12 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         self.ready = None;
         self.greedy_ready = false;
         use crate::shared::memory::chain;
+        if self.push.is_some() {
+            unsafe { self.execute_pushed(normalized, rows)?; }
+            self.ready = Some(rows);
+            self.greedy_ready = true;
+            return Ok(());
+        }
         let [first, second] = &mut self.ranks;
         let (first_device, second_device) = (first.device, second.device);
         second_device.run(|| unsafe {
@@ -289,6 +325,46 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         self.ready = Some(rows);
         self.greedy_ready = true;
         Ok(())
+    }
+    /// [`Self::execute_chained`] with pushes: no cross-device event or SM
+    /// pull. Rank 1 joins the chain (the final norm) and pushes `normalized`
+    /// into rank 0's input; rank 0 waits on that flag, projects, and pushes
+    /// its winner block (ids then scores, the merge's layout) into `remote`;
+    /// the merge follows rank 1 on its GPU and rank 0 through that flag.
+    /// Rank 0 never joins the chain: the merge's head covers it.
+    ///
+    /// # Safety
+    /// As [`Self::execute_chained`].
+    unsafe fn execute_pushed(&mut self, normalized: CuteafdDeviceBuffer, rows: usize) -> Result<()> {
+        use crate::shared::memory::chain;
+        let push = self.push.as_ref().context("head pushes not enabled")?;
+        let [first, second] = &mut self.ranks;
+        let (first_device, second_device) = (first.device, second.device);
+        let rank_input = first.input.buffer;
+        let winners = first.candidates.buffer;
+        let block = self.capacity * 8;
+        second_device.run(|| unsafe {
+            chain::join(second_device.library, second.stream.raw)?;
+            push.push_to_on(1, second.stream.raw, HEAD_INPUT, normalized.ptr, rank_input.ptr, rows * 10240)?;
+            second.get_mut().begin(normalized, rows, true)?;
+            chain::finish(second_device.library, second.stream.raw)
+        })?;
+        first_device.run(|| unsafe {
+            push.wait_on(0, first.stream.raw, HEAD_INPUT)?;
+            first.get_mut().project(rows, true)?;
+            push.push_to_on(0, first.stream.raw, HEAD_WINNERS, winners.ptr, self.remote.buffer.ptr, block)
+        })?;
+        let local = self.ranks[1].candidates(rows)?;
+        let remote = (slice(self.remote.buffer, 0, rows * 4)?, slice(self.remote.buffer, self.capacity * 4, rows * 4)?);
+        let output = (slice(self.merged.buffer, 0, rows * 4)?, slice(self.merged.buffer, self.capacity * 4, rows * 4)?);
+        let stream = &self.merge_stream;
+        stream.device.run(|| unsafe {
+            let lib = stream.device.library;
+            chain::join(lib, stream.raw)?;
+            push.wait_on(1, stream.raw, HEAD_WINNERS)?;
+            lib.v41_vocabulary_merge_greedy([remote, local], output, rows, self.split, stream.raw)?;
+            chain::finish(lib, stream.raw)
+        })
     }
     pub fn greedy(&self) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
         ensure!(self.greedy_ready, "distributed vocabulary greedy output unpublished");

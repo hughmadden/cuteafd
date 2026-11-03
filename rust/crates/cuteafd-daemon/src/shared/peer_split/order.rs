@@ -21,6 +21,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+pub(crate) mod happens;
+
 /// A flag both GPUs agree on: which exchange and which slot (or hop index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Flag {

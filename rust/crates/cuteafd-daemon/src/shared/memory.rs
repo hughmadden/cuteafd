@@ -13,6 +13,8 @@ pub(crate) use download::RowDownload;
 pub(crate) mod device;
 #[path = "memory/staging.rs"]
 pub(crate) mod staging;
+#[path = "memory/staging_check.rs"]
+pub(crate) mod staging_check;
 #[path = "memory/peer_publication.rs"]
 pub(crate) mod peer_publication;
 #[path = "memory/proposal_replica.rs"]

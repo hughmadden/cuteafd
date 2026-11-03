@@ -352,6 +352,25 @@ impl<'a> OwnerReduce<'a> {
         })
     }
 
+    /// Device-ordered passes push the remote partial from its producer's
+    /// stream into this owner's staging ([`PeerTransfer::enable_push`]),
+    /// instead of pulling it behind a cross-device event. For a reduction
+    /// private to one decode lane only: the staging is rewritten every layer
+    /// with no slot or acknowledgement, because the next layer's partial
+    /// follows this reduce through that lane's flags (layers must not
+    /// pipeline; V4.1's `v41_peer_push::schedule_tests` check it).
+    pub(crate) fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        let [source, destination] = self.transfer.devices();
+        self.transfer.enable_push(Box::new(crate::shared::peer_split::FlagRoute::new(source.library,
+            [source.id, destination.id], decode_lane_bytes)?));
+        Ok(())
+    }
+
+    /// Bytes per row of the widest partial this reduction moves (FP32 route planes).
+    pub(crate) fn partial_row_bytes(&self) -> usize {
+        self.geometry.hidden as usize * self.geometry.topk as usize * 4
+    }
+
     /// # Safety
     /// Both rank outputs are immutable, live and ordered on their producer
     /// streams through completion or cancellation drainage. Deferred callers

@@ -41,7 +41,9 @@ impl<'a> BackboneRouterStorage<'a> {
             "invalid router storage rows/unit");
         Ok(Self::allocation_sizes(rows).into_iter().sum())
     }
-    fn allocation_sizes(rows: u32) -> [usize; 6] { ROW_BYTES.map(|n| n * rows as usize) }
+    /// Each plane in whole 16-byte units: a decode lane's peer push rounds
+    /// the 24-byte-row route planes up to them (`tp2_ffn::padded`).
+    fn allocation_sizes(rows: u32) -> [usize; 6] { ROW_BYTES.map(|n| (n * rows as usize).next_multiple_of(16)) }
     pub(crate) fn new(library: &'a NativeLibrary, rows: u32, unit: u32) -> Result<Rc<Self>> {
         Self::storage_bytes(rows, unit)?;
         Ok(Rc::new(Self {
@@ -1127,6 +1129,11 @@ mod storage_bytes_tests {
         for unit in [4096, 2752, 2048] {
             assert_eq!(BackboneRouterStorage::storage_bytes(8192, unit)?,
                 BackboneRouterStorage::allocation_sizes(8192).into_iter().sum::<usize>());
+        }
+        // Whole 16-byte units at any row count (a peer push rounds up to them).
+        for rows in [1, 7, 17, 63, 64] {
+            assert!(BackboneRouterStorage::allocation_sizes(rows).iter().zip(ROW_BYTES)
+                .all(|(&n, width)| n % 16 == 0 && n >= width * rows as usize));
         }
         Ok(())
     }

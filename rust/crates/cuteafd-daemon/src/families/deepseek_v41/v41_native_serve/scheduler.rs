@@ -3,6 +3,7 @@ use super::*;
 use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
+pub(crate) mod busy_lanes;
 mod admission;
 mod queue;
 mod round_failure;
