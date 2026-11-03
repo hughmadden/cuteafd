@@ -125,7 +125,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: NATIVE_CODE_ESTIMATE } });
         devices[gpu].capacity_bytes = ceiling;
         devices[gpu].items.clear();
-        devices[gpu].items.push(Item::new(Category::Runtime, "CUDA context and cuBLAS", "SM120 architecture inventory", context, Basis::Calibrated));
+        devices[gpu].items.push(Item::new(Category::Runtime, "CUDA context and cuBLAS",
+            format!("{} architecture inventory", options.coordinator_arch.as_str()), context, Basis::Calibrated));
         devices[gpu].items.push(Item::new(Category::Runtime, "native LoadedCode estimate", "unqualified native code/ready graph residency", NATIVE_CODE_ESTIMATE, Basis::Estimated));
         fixed.extend(v41::growth_demands(total, ranks, automatic, gpu as u8));
     }

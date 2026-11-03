@@ -4427,6 +4427,30 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
 }
 
 #[test]
+fn v41_two_4090d_with_four_sparks_plans_on_sm89() {
+    let dir = strict_v41_snapshot(false);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![50_950_569_984; 2],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89, workspace_manifest: v41_workspace(dir.path()),
+        pool_tokens: Some(0), context_tokens: 1 << 20, ..Default::default() }), ..sparks(4) };
+    // Two 47.45 GiB SM89 cards hold the head split, the default pool and
+    // some TP2 routed layers; the SM89 context is charged, not SM120's.
+    let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(report.executable(), "{}", render(&report));
+    let placement = report.solver_placement.as_ref().expect("V4.1 solver placement");
+    assert_eq!(placement.pool_tokens, 2 << 20, "{}", render(&report));
+    assert!((1..40).contains(&placement.onboard_layers), "{}", render(&report));
+    let layout = report.memory_layout.as_ref().expect("V4.1 memory layout");
+    let rtx = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).collect::<Vec<_>>();
+    assert_eq!(rtx.len(), 2);
+    for device in rtx {
+        let context = device.items.iter().find(|i| i.group == "CUDA context and cuBLAS").unwrap();
+        assert_eq!((context.bytes, context.format.as_str()), (374_472_704 + 11_534_336, "sm_89 architecture inventory"));
+        assert!(device.items.iter().map(|i| i.bytes).sum::<u64>() <= device.capacity_bytes, "{}", render(&report));
+    }
+}
+
+#[test]
 fn v41_exl3_is_unsupported_without_a_loader_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);
