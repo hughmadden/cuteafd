@@ -99,6 +99,13 @@ impl<'a> Weights<'a> {
     pub fn resident_bytes(&self) -> usize {
         self.stages.iter().map(|w| w.budget().resident_bytes).sum()
     }
+    /// Each stage's resident half (test inspection).
+    #[cfg(test)]
+    pub fn stages(&self) -> &[ExpertWeights<'a>] { &self.stages }
+    /// Frees raw scale images kept for recorded plane packs (after they ran).
+    pub fn release_raw_scales(&self) {
+        for stage in self.stages.iter() { stage.release_raw_scales(); }
+    }
 }
 
 struct State<'a> {
