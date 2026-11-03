@@ -43,6 +43,9 @@ ROLE_GEOMETRY.update({artifact.name: (384, artifact.logical, artifact.stored, 6)
 ROLE_SM = {role: (12, 0) for role in ("coordinator", "dspark_tp2", "rtx_tp2", "rtx_backbone")}
 ROLE_SM.update({artifact.name: (12, 1) for artifacts in native_spark_artifacts().values()
                 for artifact in artifacts})
+# V4.1 roles that also export for SM89 (Ada) coordinators: the promoted-MMA kernels
+# over the same resident layout, scratch census and ordered FP32 route planes.
+SM89_ROLES = ("coordinator", "dspark_tp2", "rtx_tp2", "rtx_backbone")
 # Native `cuteafd_expert_info_t.role` values (see native/shared/include/cuteafd_experts.h).
 ROLE_NATIVE_ID = {"coordinator": 0, "rtx_backbone": 2, "rtx_tp2": 3, "dspark_tp2": 4}
 ROLE_NATIVE_ID.update({artifact.name: artifact.role for artifacts in native_spark_artifacts().values()
@@ -107,6 +110,38 @@ def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bo
     )
 
 
+def sm89_numerical_recipe(intermediate: int, schedule: dict) -> dict:
+    """SM89 products and fold order, independent of launch capacity.
+
+    Every K32 step adds one promoted product fma(mma(A, B, 0), s_w * s_a, acc), an
+    exact power-of-two scaling, so a K range accumulates as an ascending FP32 fold
+    of 32-wide planes. FC1 folds its K parts and FC2 its K parts in ascending
+    order. The C attestation states the 32-wide plane fold.
+    """
+    if intermediate <= 0 or intermediate % 128:
+        raise ValueError("SM89 expert slices need a 128-aligned intermediate")
+    return dict(schema=1, slice_width=32, fc1_mma_mnk=[16, 8, 32], fc1_k_stage=128,
+                fc2_k_steps=1, block_threads=128, plane_count=intermediate // 32,
+                plane_fold="ascending_fp32", implementation="sm89_promoted_slices",
+                output_kind="fp32_routes", mma="m16n8k32 e4m3 x e4m3 into zero",
+                k32_promotion="fma(d, s_w * s_a, acc)", part_fold="ascending_fp32", **schedule)
+
+
+def sm89_schedule(pipeline) -> dict:
+    """The compiled SM89 kernels' K partition (part folds are part of the recipe)."""
+    pipeline = getattr(pipeline, "pipeline", pipeline)
+    return dict(fc1_k_parts=pipeline.fc1.warps, fc2_k_parts=pipeline.fc2.k_split,
+                fc1_batch_k32=pipeline.fc1.batch, fc2_batch_k32=pipeline.fc2.batch)
+
+
+def expert_storage(family: str, hidden: int, intermediate: int, stored: int) -> dict:
+    """Resident bytes the planner charges per expert of this role."""
+    planes = expert_plane_bytes(family, hidden, intermediate, stored)
+    return dict(weight_layout="e2m1_n256_k128_lane_major",
+                scale_layout="ue8m0_offset4_n256_k128" if family == "v41" else "ue8m0_n256_k128",
+                plane_bytes=list(planes), bytes_per_expert=sum(planes))
+
+
 def fc2_n_splits(role: str, capacity: int, width: int, hidden: int) -> int:
     """Static launch partition; canonical K steps and plane folds stay unchanged."""
     return 2 if role in ("spark", "rtx_tp2") and capacity == 1 and width == 128 and hidden % 256 == 0 else 1
@@ -145,8 +180,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     from export_b12x_v41_experts_aot import export_input_quantizer
 
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)):
-        raise ValueError("native Blackwell device required")
+    sm89 = (props.major, props.minor) == (8, 9)
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) and not sm89:
+        raise ValueError("native Blackwell or SM89 device required")
     width_role = role.startswith("spark_w")
     if role not in ROLE_GEOMETRY and not width_role:
         raise ValueError(f"unsupported expert placement role {role!r}")
@@ -154,6 +190,13 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     tp2 = role == "rtx_tp2"
     draft_tp2 = role == "dspark_tp2"
     expected_sm = (12, 1) if width_role else ROLE_SM[role]
+    if sm89:
+        if role not in SM89_ROLES or family != "v41":
+            raise ValueError(f"SM89 exports cover the V4.1 roles {SM89_ROLES}, not {family} {role}")
+        if (atomic_min_capacity is not None or compact_max_capacity is not None
+                or compact_live_rows is not None):
+            raise ValueError("SM89 expert slices use ordered route output only")
+        expected_sm = (8, 9)
     if (props.major, props.minor) != expected_sm:
         raise ValueError(
             f"{role} expert slices require SM{expected_sm[0]}{expected_sm[1]}, "
@@ -180,7 +223,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             raise ValueError("compact live-row cutoff must fit the selected capacities")
     elif compact_live_rows is not None:
         raise ValueError("compact live-row cutoff requires compact capacity selection")
-    workspace_sms = 48 if props.minor == 1 else 188
+    # SM120/SM121 keep their reference-card constants (byte-identical exports);
+    # SM89 takes the export card's SM count.
+    workspace_sms = props.multi_processor_count if sm89 else 48 if props.minor == 1 else 188
     output.mkdir(parents=True, exist_ok=True)
     manifest = dict(
         schema=1,
@@ -203,6 +248,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         decode_capacities=[n for n in capacities if n <= max(native_export_capacities(family, role)[1])],
         variants=[],
     )
+    if sm89:
+        # The planner charges resident experts from this declaration.
+        manifest["expert_storage"] = expert_storage(family, hidden, intermediate, kernel_intermediate)
     includes, entries, reductions = [], [], []
     artifacts = ["v41_expert_variants.h"]
     group_rows = slice_group_rows(_pinned_sparkinfer.SOURCE)
@@ -446,7 +494,10 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             + "}}"
         )
         recipe = numerical_recipe(selected_width, intermediate, atomic=atomic, compact=compact)
-        if stream_prefill:
+        if sm89:
+            recipe = sm89_numerical_recipe(intermediate, sm89_schedule(pipeline))
+            reductions.append(f"case {capacity}: *out = {{1,32,1,{recipe['plane_count']},1,1,32,128,128}}; return 0;")
+        elif stream_prefill:
             recipe = dict(schema=2, slice_width=128, fc1_mma_mnk=[16, 8, 32],
                           fc1_k_stage=128, fc2_k_steps=(intermediate + 31) // 32,
                           block_threads=256, plane_count=1, plane_fold="original_routes",
@@ -465,7 +516,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,
                 **({"fc1_k_splits": pipeline.fc1.k_splits}
-                   if not compact and not atomic and not coordinator and not stream_prefill else {}),
+                   if not compact and not atomic and not coordinator and not stream_prefill and not sm89 else {}),
                 numerical_recipe=recipe,
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
                 native_abi_version=3 if atomic else 2,
@@ -486,6 +537,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             [
                 "#pragma once",
                 *includes,
+                *([f"#define CUTEAFD_V41_CC_MAJOR {props.major}"] if sm89 else []),
                 f"#define CUTEAFD_V41_CC_MINOR {props.minor}",
                 f"#define CUTEAFD_V41_SMS {workspace_sms}",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),

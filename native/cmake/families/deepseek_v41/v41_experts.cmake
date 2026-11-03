@@ -8,8 +8,14 @@ if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120" OR CUTEAFD_CUDA_ARCHITECTURES STREQ
 elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
   set(CUTEAFD_V41_EXPERT_ROLE spark)
   set(CUTEAFD_V41_EXPERT_INPUT_FORMAT fp8_k32)
+elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+  # SM89 (Ada) coordinators: promoted-MMA slices over the same resident experts,
+  # scratch and route planes; the export runs on the SM89 card and sizes its
+  # quantizer grids and SM cap for that card.
+  set(CUTEAFD_V41_EXPERT_ROLE coordinator)
+  set(CUTEAFD_V41_EXPERT_INPUT_FORMAT bf16)
 else()
-  message(FATAL_ERROR "V4.1 expert AOT requires one native SM120 or SM121 target")
+  message(FATAL_ERROR "V4.1 expert AOT requires one native SM120, SM121 or SM89 target")
 endif()
 set(CUTEAFD_V41_EXPERT_SLICE_WIDTH "" CACHE STRING
   "Experimental fused-slice width (64, 128, 192); empty keeps qualified serving backend")

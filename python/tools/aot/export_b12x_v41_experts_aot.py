@@ -26,8 +26,11 @@ def export_input_quantizer(output_dir: Path, manifest: dict) -> None:
     )
     compiled.export_to_c(str(output_dir), label, "cuteafd_" + label)
     abi = validate_abi(output_dir / (label + ".h"), label, "quant")
-    grids = [mxfp8_rows_quant_aot_grid(size_k=5120, rows=m, expected_m=80,
-             sm_count=48 if manifest['capability'][1] == 1 else 188) for m in range(1, 4097)]
+    # SM120/SM121 keep their reference-card grids; SM89 sizes them for the export card.
+    sms = (manifest['physical_sms'] if manifest['capability'] == [8, 9]
+           else 48 if manifest['capability'][1] == 1 else 188)
+    grids = [mxfp8_rows_quant_aot_grid(size_k=5120, rows=m, expected_m=80, sm_count=sms)
+             for m in range(1, 4097)]
     header = ["#pragma once", f'#include "{label}.h"',
               f"#define CUTEAFD_V41_INPUT_QUANT_ENTRY {abi['symbol']}",
               "static const uint32_t cuteafd_v41_input_quant_grids[] = {" +
