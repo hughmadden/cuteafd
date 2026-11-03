@@ -42,6 +42,8 @@ struct Current {
     /// "everything chained so far" ([`fence_mark`]), and which device marked each.
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    /// Advances whenever the head changes; a [`HeadMark`] names one value.
+    generation: Rc<Cell<u64>>,
     /// This pass may run device-ordered ([`deferred`]).
     device: bool,
 }
@@ -66,6 +68,7 @@ pub(crate) struct StageChain<'a> {
     fork: Rc<Cell<Option<usize>>>,
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    generation: Rc<Cell<u64>>,
     device: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
@@ -104,14 +107,14 @@ impl<'a> StageChain<'a> {
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
             forks: forks.into(), fork: Rc::new(Cell::new(None)), fences: fences.into(),
-            marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true) })
+            marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
     pub fn handle(&self) -> ChainHandle<'a> {
         ChainHandle { library: self.library, current: Current {
             events: self.events.clone(), head: self.head.clone(),
             forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
-            marked: self.marked.clone(), device: self.device.get() } }
+            marked: self.marked.clone(), generation: self.generation.clone(), device: self.device.get() } }
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
@@ -119,6 +122,7 @@ impl<'a> StageChain<'a> {
         self.fork.set(None);
         self.marked.set([None; 2]);
         if let Some(head) = self.head.replace(None) {
+            self.generation.set(self.generation.get().wrapping_add(1));
             unsafe { self.library.cuda_event_synchronize(self.events[head].1)?; }
         }
         Ok(())
@@ -307,6 +311,7 @@ impl<F> Drop for ChainScope<'_, F> {
         if !self.drain_on_drop { return; }
         self.current.fork.set(None);
         if let Some(head) = self.current.head.replace(None) {
+            self.current.generation.set(self.current.generation.get().wrapping_add(1));
             // SAFETY: the pass retains the chain's events and library. All
             // recorded producers are already submitted (the Spark proxy runs
             // independently), so draining needs no progress from this future.
@@ -340,6 +345,53 @@ pub(crate) unsafe fn join(library: &NativeLibrary, stream: *mut c_void) -> Resul
     let Some(head) = current.head.get() else { return Ok(()) };
     // Cross-device event waits are permitted; the event lives on its own device.
     unsafe { library.cuda_stream_wait_event(stream, current.events[head].1) }
+}
+
+/// The chain head a pushing stage joined ([`join_for_push`]): its receiver on
+/// the other GPU follows exactly this head through the push's device flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeadMark {
+    generation: u64,
+}
+
+/// [`join`] for a stage that pushes to the other GPU: `stream` (on the
+/// pushing GPU) follows the head before its push, and the returned mark names
+/// that head for the receiver's [`finish_after_flag`]. `None` outside a scope.
+/// # Safety
+/// As [`join`].
+pub(crate) unsafe fn join_for_push(library: &NativeLibrary, stream: *mut c_void) -> Result<Option<HeadMark>> {
+    let Some(current) = current() else { return Ok(None) };
+    unsafe { join(library, stream)? };
+    Ok(Some(HeadMark { generation: current.generation.get() }))
+}
+
+/// Whether a receiver may adopt the head without merging it: the head is
+/// still the one its sender joined (no stage finished in between).
+fn adoptable(generation: u64, mark: Option<HeadMark>) -> Result<()> {
+    let mark = mark.ok_or_else(|| anyhow::anyhow!("flag-ordered receiver has no chain mark"))?;
+    anyhow::ensure!(mark.generation == generation,
+        "chain head moved between a push's join and its receiver ({} -> {generation})", mark.generation);
+    Ok(())
+}
+
+/// [`finish`] for the receiver of a push: `stream` (on this GPU) waited on the
+/// flag of a push whose stream joined the head named by `mark`, so it already
+/// follows that head. Records the head on `stream` without merging the
+/// previous head, which would be a cross-device event wait the flag makes
+/// redundant; the chain stays a total order. Refuses if any stage finished
+/// since the mark. Outside a scope, drains `stream` like [`finish`].
+/// # Safety
+/// `stream` holds this stage's queued work, behind its wait on that flag.
+pub(crate) unsafe fn finish_after_flag(library: &NativeLibrary, stream: *mut c_void, mark: Option<HeadMark>) -> Result<()> {
+    let Some(current) = current() else { return unsafe { library.cuda_stream_synchronize(stream) } };
+    adoptable(current.generation.get(), mark)?;
+    let device = library.cuda_get_device()?;
+    let index = current.events.iter().position(|&(d, _)| d == device)
+        .ok_or_else(|| anyhow::anyhow!("chain has no event on device {device}"))?;
+    unsafe { library.cuda_event_record(current.events[index].1, stream)?; }
+    current.head.set(Some(index));
+    current.generation.set(current.generation.get().wrapping_add(1));
+    Ok(())
 }
 
 /// Mark a fork on `stream`: work queued so far on it (for example the query
@@ -387,6 +439,7 @@ pub(crate) unsafe fn finish(library: &NativeLibrary, stream: *mut c_void) -> Res
     }
     unsafe { library.cuda_event_record(current.events[index].1, stream)?; }
     current.head.set(Some(index));
+    current.generation.set(current.generation.get().wrapping_add(1));
     Ok(())
 }
 
@@ -472,6 +525,7 @@ pub(crate) unsafe fn depend(library: &NativeLibrary, event: *mut c_void) -> Resu
         }
     }
     current.head.set(Some(index));
+    current.generation.set(current.generation.get().wrapping_add(1));
     Ok(())
 }
 
@@ -493,6 +547,17 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Waker;
     use std::time::Duration;
+
+    /// A receiver adopts the head only when it is still the one its push's
+    /// stream joined; any finish since (or no mark at all) refuses.
+    #[test]
+    fn adopting_the_head_requires_an_unmoved_mark() {
+        let mark = HeadMark { generation: 7 };
+        assert!(adoptable(7, Some(mark)).is_ok());
+        let moved = adoptable(8, Some(mark)).unwrap_err().to_string();
+        assert!(moved.contains("moved") && moved.contains("7 -> 8"), "{moved}");
+        assert!(adoptable(7, None).unwrap_err().to_string().contains("no chain mark"));
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
@@ -517,7 +582,7 @@ mod tests {
                     vec![Fence { device: 0, stream: std::ptr::null_mut(),
                         events: [std::ptr::null_mut(); 2] }; 2]
                 } else { vec![] }.into(),
-                marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true),
+                marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true),
             };
             if path == "cancel" {
                 let mut scope = Box::pin(chain.handle().scope(async move {
