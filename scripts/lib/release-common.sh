@@ -659,7 +659,7 @@ PYSTATE
 # mount arguments, for the coordinator and every Spark worker) in the caller's
 # shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST
 # [PROFILE_SPARK].
-release_profile_switches='census transport-timing expert-timing expert-routes draft-timing nsys ncu'
+release_profile_switches='census transport-timing expert-timing expert-routes route-census draft-timing nsys ncu'
 # nsys sessions are per container; the window is opened and closed with
 # `docker exec <coordinator> nsys start|stop --session=$RELEASE_NSYS_SESSION`.
 RELEASE_NSYS_SESSION=cuteafd-profile
@@ -690,6 +690,14 @@ release_profile_docker_args() {
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
       expert-routes) [[ -n "$dir" ]] || release_die "PROFILE=expert-routes needs PROFILE_DIR (the route log goes there)"
         RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES=1) ;;
+      route-census) [[ -n "$dir" ]] || release_die "PROFILE=route-census needs PROFILE_DIR (the census goes there)"
+        RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS=$dir/route-census-$host.json")
+        # Its dump interval in decode steps (default 1000), from the launching environment.
+        if [[ -n "${CUTEAFD_V41_ROUTE_CENSUS_STEPS:-}" ]]; then
+          [[ "$CUTEAFD_V41_ROUTE_CENSUS_STEPS" =~ ^[1-9][0-9]{0,8}$ ]] ||
+            release_die "CUTEAFD_V41_ROUTE_CENSUS_STEPS must be a positive decode step count"
+          RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_STEPS=$CUTEAFD_V41_ROUTE_CENSUS_STEPS")
+        fi ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
       # Process wrappers (release_profile_wrapper); Spark workers take PROFILE_SPARK.
       nsys|ncu) [[ -n "$dir" ]] || release_die "PROFILE=$switch needs PROFILE_DIR (the report goes there)" ;;

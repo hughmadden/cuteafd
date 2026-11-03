@@ -755,6 +755,13 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     PROFILE_EXPERT_INPUT_SAMPLE (default 64, 0 = none) serving
 #                     layer-steps as PROFILE_DIR/expert-input-HOST-NNNNN.safetensors.
 #                     PROFILE_EXPERT_ROUTE_WEIGHTS=on adds each narrow wave's gate weights.
+#   route-census      CUTEAFD_V41_ROUTE_CENSUS (needs PROFILE_DIR; V4.1 coordinators): every
+#                     routed layer's router also counts its routes per expert on the GPU,
+#                     decode/verify and prefill apart, written every 1000 decode steps
+#                     (CUTEAFD_V41_ROUTE_CENSUS_STEPS in the launching environment sets
+#                     another interval) and at shutdown to
+#                     PROFILE_DIR/route-census-HOST.json, the file
+#                     `cuteafd plan --gpu-expert-tier-profile` reads.
 #   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
 #   nsys              the coordinator runs under `nsys profile` (cuda, nvtx, osrt, CUDA
 #                     graph nodes; no CPU sampling), collection paused until
