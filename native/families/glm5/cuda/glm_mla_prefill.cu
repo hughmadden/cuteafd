@@ -482,11 +482,21 @@ __device__ __forceinline__ void cp_async_arrive(uint64_t* bar) {
 }
 __device__ __forceinline__ bool mbar_try_wait(uint64_t* bar, uint32_t parity) {
   uint32_t done;
+#if __CUDA_ARCH__ >= 900
   asm volatile(
       "{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
       : "=r"(done)
       : "r"(smem_addr(bar)), "r"(parity)
       : "memory");
+#else
+  // SM80/SM89 have no try_wait; test_wait is the same non-blocking phase probe, and
+  // mbar_wait below already backs off between polls.
+  asm volatile(
+      "{\n.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
+      : "=r"(done)
+      : "r"(smem_addr(bar)), "r"(parity)
+      : "memory");
+#endif
   return done;
 }
 // Backs off between polls so that a waiting warp leaves the issue slots to the warps it waits for.
