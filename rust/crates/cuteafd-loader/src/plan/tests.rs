@@ -4452,13 +4452,14 @@ fn v41_two_4090d_with_four_sparks_plans_on_sm89() {
 
 #[test]
 fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
-    // A 48 GB coordinator pair (47.45 GiB CUDA total each) at TP2 halves in
-    // front of four Sparks at TP4 that keep every expert.
+    // A 48 GB SM89 coordinator pair (47.45 GiB CUDA total each) at TP2
+    // halves in front of four Sparks at TP4 that keep every expert.
     let dir = strict_v41_snapshot(false);
-    let card = (47.45 * (1u64 << 30) as f64) as u64;
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
     let pair = |tier: crate::placement::ExpertTierSetting, onboard: Option<crate::placement::OnboardSetting>,
         profile: Option<std::path::PathBuf>| PlanOptions { layout: Some(layout::LayoutOptions {
         host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card, card],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89,
         workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         expert_tier: tier, expert_tier_profile: profile, onboard, ..Default::default() }), ..sparks(4) };
     use crate::placement::{ExpertTierSetting, ExpertTierShard, ExpertTierSource, OnboardSetting};
@@ -4496,7 +4497,7 @@ fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
     assert!(notes.iter().any(|n| n.starts_with("GPU expert tier resident experts per routed layer: [")), "{notes:?}");
     let predicted = notes.iter().find(|n| n.starts_with("GPU expert tier predicted expert time per verify step: 21.76 -> "))
         .unwrap_or_else(|| panic!("{notes:?}"));
-    assert!(predicted.contains("at a 15.6% byte hit rate") && predicted.contains("the same bytes as whole layers save"),
+    assert!(predicted.contains("at a 15.8% byte hit rate") && predicted.contains("the same bytes as whole layers save"),
         "{predicted}");
     for device in auto.memory_layout.as_ref().unwrap().devices.iter().take(2) {
         assert!(device.items.iter().any(|i| i.group.starts_with("GPU expert tier (")), "{:?}", device.items);

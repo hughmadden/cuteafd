@@ -202,7 +202,7 @@ pub struct TierStepModel {
     /// One resident active expert on the coordinator (TP2: both GPUs stream
     /// their halves in parallel).
     pub gpu_expert_ns: u64,
-    /// The coordinator's fixed part (launch, route reduce) per layer.
+    /// The coordinator's fixed part (launch, route plan, route reduce) per layer.
     pub gpu_fixed_ns: u64,
     /// One active expert on the Sparks (every TP rank streams its slice).
     pub spark_expert_ns: u64,
@@ -216,13 +216,16 @@ pub struct TierStepModel {
 
 impl TierStepModel {
     /// The C1 verify step (5-6 rows, ~24 distinct experts per layer) as
-    /// measured on a 48 GB coordinator pair and four Sparks at TP4: the SM89
-    /// W4A8 expert kernel runs 24 TP2 halves in 235 us (~9.55 us each plus
-    /// ~6 us, 959 GB/s per card); a 24-expert Spark wave takes 510 us of
-    /// kernel (21.25 us each) plus 34 us of transport and host.
+    /// measured on a 48 GB coordinator pair and four Sparks at TP4. The
+    /// production SM89 expert kernel streams TP2 halves in the coded-scale
+    /// layout (9,131,264 B each) at 6.4 us per layer plus 9.35 us per resident
+    /// active expert (24 halves in 230.9 us, 94% of the card's 1008 GB/s); the
+    /// per-layer route plan (the `slot_of` remap) adds 1.6-4.7 us, charged at
+    /// its upper bound. A 24-expert Spark wave takes 510 us of kernel (21.25 us
+    /// each) plus 34 us of transport and host.
     pub const C1_VERIFY_48GB_PAIR_4_SPARKS: Self = Self {
-        gpu_expert_ns: 9_550,
-        gpu_fixed_ns: 6_000,
+        gpu_expert_ns: 9_350,
+        gpu_fixed_ns: 6_400 + 4_700,
         spark_expert_ns: 21_250,
         spark_fixed_ns: 34_000,
         active_experts: 24,
@@ -463,8 +466,8 @@ mod tests {
         }
         assert_eq!(&tier.order[..4], &[TierSlot { layer: 1, expert: 0 }, TierSlot { layer: 2, expert: 0 },
             TierSlot { layer: 5, expert: 0 }, TierSlot { layer: 1, expert: 1 }]);
-        // Residency helps until the GPUs become the slower side: 9.55 us x
-        // 24 x share + 6 us = 34 us + 21.25 us x 24 x (1 - share) at ~72%.
+        // Residency helps until the GPUs become the slower side: 9.35 us x
+        // 24 x share + 11.1 us = 34 us + 21.25 us x 24 x (1 - share) at ~73%.
         let per_layer = tier.useful / 3;
         assert!((270..=280).contains(&per_layer), "useful {per_layer} per layer");
     }
@@ -496,7 +499,7 @@ mod tests {
     #[test]
     fn a_concentrated_profile_stops_before_the_gpus_become_the_bottleneck() {
         // 16 experts take ~98% of the routes: a step runs ~15 of them. Keeping
-        // all 16 resident would leave the GPUs the slower side (149 us against
+        // all 16 resident would leave the GPUs the slower side (151 us against
         // 51 us), so the order balances near 13 and only then spills over.
         let mut counts = vec![vec![1u64; 384]; 2];
         for row in &mut counts { row[300..316].fill(1000); }
@@ -525,18 +528,18 @@ mod tests {
         let uniform = ExpertActivation::uniform(40, 384, 24);
         // All on the Sparks: 34 us + 24 x 21.25 us per layer.
         assert!((MODEL.step_ns(&uniform, &[]) - 40.0 * 544_000.0).abs() < 1.0);
-        // Whole layers on the GPUs: 6 us + 24 x 9.55 us.
-        assert!((MODEL.whole_step_ns(&uniform) - 40.0 * 235_200.0).abs() < 1.0);
+        // Whole layers on the GPUs: 11.1 us + 24 x 9.35 us.
+        assert!((MODEL.whole_step_ns(&uniform) - 40.0 * 235_500.0).abs() < 1.0);
     }
 
     /// The tier's physics on a V4.1 C1 verify step (~29 ms on the 5090 card
     /// with four Sparks; ~24 distinct experts per layer), from bytes and
     /// rates, through the scheduler itself: `plan_resident` per layer, and a
     /// layer costs its makespan, the slower of the GPU tier and the Spark
-    /// round trip. Measured rates (4 Nov 2026): the SM89 W4A8 kernel streams
-    /// TP2 halves at 959 GB/s per card of a 48 GB coordinator pair (9.55 us
-    /// per expert plus ~6 us); a Spark TP4 wave takes 21.25 us per expert
-    /// plus 34 us. The resident layouts (MXFP4, coded UE8M0 scales): a TP4
+    /// round trip. Measured rates (4 Nov 2026): the production SM89 kernel
+    /// streams coded-scale TP2 halves at ~977 GB/s per card of a 48 GB
+    /// coordinator pair (9.35 us per expert plus 6.4 us, and a 1.6-4.7 us
+    /// route plan); a Spark TP4 wave takes 21.25 us per expert plus 34 us. The resident layouts (MXFP4, coded UE8M0 scales): a TP4
     /// slice is 4,573,312 B, so the Spark wave streams 215 GB/s per Spark,
     /// 77% of its 278 GB/s roofline.
     #[test]
@@ -550,10 +553,11 @@ mod tests {
         assert_eq!(slice, 4_573_312);
         let spark_rate = slice * ACTIVE as u64 * 1_000_000_000 / 510_000;
         assert_eq!(spark_rate / 1_000_000_000, 215);
-        // The checkpoint-layout TP2 half the measured kernel streams.
-        let half = 9_400_320u64;
+        // The coded-scale TP2 half the production kernel streams, as charged.
+        let half = crate::formats::scale_codes::expert_bytes(1, 5120, 1152).unwrap();
+        assert_eq!(half, 9_131_264);
         let gpu_rate = half * 1_000_000_000 / MODEL.gpu_expert_ns;
-        assert_eq!(gpu_rate / 1_000_000_000, 984);
+        assert_eq!(gpu_rate / 1_000_000_000, 976);
         let spark = Group::full(Cost::streaming(slice, spark_rate, 0, 16).unwrap()).with_call_cost(MODEL.spark_fixed_ns);
         let gpu = Group::partial(Cost::streaming(half, gpu_rate, 0, 16).unwrap()).with_call_cost(MODEL.gpu_fixed_ns);
         let config = ReplicatedExpertScheduleConfig::with_groups(&[gpu, spark]).unwrap();
@@ -593,9 +597,9 @@ mod tests {
             for set in &mut sets[..layers] { *set = ExpertResidencySet::from_ids(EXPERTS, 0..EXPERTS).unwrap(); }
             sets
         };
-        // One whole layer: 24 experts on the GPUs (235 us), no Spark wave.
+        // One whole layer: 24 experts on the GPUs (235.5 us), no Spark wave.
         let per_whole = all_spark - step_ns(&whole_layer(1), None, 1);
-        assert!((per_whole - 308_800.0).abs() < 200.0, "{per_whole}");
+        assert!((per_whole - 308_500.0).abs() < 200.0, "{per_whole}");
         // Seven whole layers.
         let seven = ms(all_spark - step_ns(&whole_layer(7), None, 1));
         assert!((2.1..=2.25).contains(&seven), "7 whole layers save {seven:.2} ms");
@@ -619,8 +623,9 @@ mod tests {
         let skew = ms(all_spark - step_ns(&uniform, Some(0.4), 50));
         assert!((7.8..=8.4).contains(&skew), "40% hit rate saves {skew:.2} ms");
 
-        // What today's planner admits on a 48 GB pair: 2,399 resident halves
-        // (60 per layer, 15.6%) against 6 whole TP2 layers.
+        // What the planner admits on the SM89 48 GB pair at the automatic
+        // pool: 2,429 resident halves (60-61 per layer, 15.8%) against 6
+        // whole TP2 layers.
         let planned = vec![ExpertResidencySet::from_ids(EXPERTS, 0..60).unwrap(); LAYERS];
         let planned_tier = ms(all_spark - step_ns(&planned, None, 50));
         let planned_whole = ms(all_spark - step_ns(&whole_layer(6), None, 1));
