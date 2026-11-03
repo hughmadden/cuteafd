@@ -796,9 +796,9 @@ mod tp2_tests {
             let mut output=device.own(||split.wave(capacity,usize::MAX))?;
             assert!(output.storage.scratch.is_none() && output.rebind(&weights).is_err());
             let halves=[vec![Weights::load(devices[0],&catalog,layer,Kind::OutputB,0,
-                Weights::load_peak_device_bytes(Kind::OutputB))?],
+                Weights::load_peak_device_bytes(&library,Kind::OutputB)?)?],
                 vec![Weights::load(devices[1],&catalog,layer,Kind::OutputB,1,
-                Weights::load_peak_device_bytes(Kind::OutputB))?]];
+                Weights::load_peak_device_bytes(&library,Kind::OutputB)?)?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::OutputB,capacity,owner)?)?;
             let input=Allocation::new(device,capacity as usize*ROW_BYTES[0])?;

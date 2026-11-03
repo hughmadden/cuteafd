@@ -142,7 +142,7 @@ mod tests {
             for layer in layers { shard_tests::pattern(&catalog, layer, kind)?; }
             let load = || -> Result<[Vec<Weights<'_>>; 2]> {
                 let [a, b] = [0usize, 1].map(|rank| layers.iter().map(|&layer| Weights::load(devices[rank], &catalog,
-                    layer, kind, rank, Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>());
+                    layer, kind, rank, Weights::load_peak_device_bytes(&lib, kind)?)).collect::<Result<Vec<_>>>());
                 Ok([a?, b?])
             };
             let mounted = load()?;
@@ -153,11 +153,17 @@ mod tests {
             let sockets = tempfile::tempdir_in(&fixtures)?;
             push_records_alone(&snapshot, sockets.path(), devices, records)?;
             for weights in pushed.iter().flatten() { weights.release_raw_scales(); }
+            // Every shard lands byte for byte, and each GPU holds exactly the
+            // bytes its loader charges (weight half and packed scales).
+            let planned = Weights::device_bytes(&lib, kind)?;
             for rank in 0..2 {
                 for (p, m) in pushed[rank].iter().zip(&mounted[rank]) {
                     assert_bytes_equal(&lib, p.buffers()[0], m.buffers()[0], &format!("{kind:?} layer {} rank {rank} weight", p.layer_index()))?;
                     assert_bytes_equal(&lib, p.buffers()[1], m.buffers()[1],
                         &format!("{kind:?} layer {} rank {rank} packed scales", p.layer_index()))?;
+                    let delivered: usize = p.buffers().iter().map(|b| b.bytes).sum();
+                    ensure!(delivered == planned, "{kind:?} layer {} rank {rank}: {delivered} B delivered, {planned} B charged",
+                        p.layer_index());
                 }
             }
             // Owner GPU0's TP2 lane over each shard set, on the same inputs.

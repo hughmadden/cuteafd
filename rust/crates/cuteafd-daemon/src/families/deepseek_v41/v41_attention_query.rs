@@ -735,9 +735,9 @@ mod tp2_tests {
             assert_eq!(query.storage.scratch.len(),1);
             assert!(query.rebind(&weights).is_err());
             let halves=[vec![Weights::load(devices[0],&catalog,layer,Kind::QueryB,0,
-                Weights::load_peak_device_bytes(Kind::QueryB))?],
+                Weights::load_peak_device_bytes(&library,Kind::QueryB)?)?],
                 vec![Weights::load(devices[1],&catalog,layer,Kind::QueryB,1,
-                Weights::load_peak_device_bytes(Kind::QueryB))?]];
+                Weights::load_peak_device_bytes(&library,Kind::QueryB)?)?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::QueryB,capacity,owner)?)?;
             let input=Allocation::new(device,capacity as usize*10240)?;

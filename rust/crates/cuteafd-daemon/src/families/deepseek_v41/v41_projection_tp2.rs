@@ -28,11 +28,17 @@ pub(crate) struct Weights<'a> {
     source_scales: std::cell::Cell<Option<Allocation<'a>>>,
 }
 impl<'a> Weights<'a> {
-    pub fn device_bytes(kind: Kind) -> usize {
-        let (k,n)=kind.geometry(); k*(n/2) + k*(n/2)/32
+    /// A shard's resident bytes: its FP8 weight half and packed scales, at the
+    /// packed size the loaded library's export reports (SM120 expands the
+    /// scale grid; SM89 keeps it).
+    pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
+        let (k,n)=kind.geometry();
+        let packed=library.v41_fp8_matrix_info(1,u32::try_from(k)?,u32::try_from(n/2)?)?.packed_weight_scale_bytes;
+        Ok(k*(n/2) + usize::try_from(packed)?)
     }
-    pub fn load_peak_device_bytes(kind: Kind) -> usize {
-        let (k,n)=kind.geometry(); Self::device_bytes(kind) + k*(n/2)/1024
+    /// The resident bytes plus the raw scale grid held until its pack runs.
+    pub fn load_peak_device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
+        let (k,n)=kind.geometry(); Ok(Self::device_bytes(library,kind)? + k*(n/2)/1024)
     }
     /// Rank `rank`'s output-channel half of layer `layer`'s projection: the
     /// row halves (`Rect::half`) of its FP8 weight and raw scales land
@@ -42,7 +48,7 @@ impl<'a> Weights<'a> {
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
         kind: Kind, rank: usize, budget: usize) -> Result<Self> {
         use crate::shared::experts::rtx::dense;
-        ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(kind),
+        ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(device.library,kind)?,
             "invalid projection shard layer, rank or budget");
         let (k,n)=kind.geometry(); let n=n/2;
         let prefix=format!("layers.{layer}.attn.{}",kind.name());
@@ -51,8 +57,11 @@ impl<'a> Weights<'a> {
             && catalog.tensor(&scale_name)?.metadata.shape==[2*n/32,k/32],
             "projection checkpoint geometry differs");
         let stream=Stream::new(device)?;
+        // Packed scales at the size the library's export reports (SM120 expands
+        // the grid, SM89 keeps it), as `device_bytes` charges.
+        let kernel=device.run(||device.library.v41_fp8_matrix_kernel(1,k as u32,n as u32))?;
         let weight=Allocation::new(device,k*n)?;
-        let scales=Allocation::new(device,k*n/32)?;
+        let scales=Allocation::new(device,usize::try_from(kernel.info().packed_weight_scale_bytes)?)?;
         let raw_scales=Allocation::new(device,k*n/1024)?;
         let loader=dense::DenseLoad::mount(device.library);
         for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
@@ -61,7 +70,6 @@ impl<'a> Weights<'a> {
             loader.operand(dense::Operand { device: device.id, buffer: target.buffer, lands: vec![(rect,0)],
                 bytes: target.buffer.bytes })?;
         }
-        let kernel=device.run(||device.library.v41_fp8_matrix_kernel(1,k as u32,n as u32))?;
         let queued=device.run(||unsafe { dense::v41_pack_scales(&kernel,raw_scales.buffer,scales.buffer,stream.raw) });
         let drained=stream.drain();queued.and(drained)?;
         // Through the mount the pack already drained: release the raw scales now.
@@ -390,9 +398,9 @@ mod tests {
         for kind in [Kind::QueryB,Kind::OutputB] {
             let (k,n)=kind.geometry();let capacity=16;
             let weights=[(0..2).map(|i|Weights::load(devices[0],&catalog,[2,20][i],kind,0,
-                Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>()?,
+                Weights::load_peak_device_bytes(&lib,kind)?)).collect::<Result<Vec<_>>>()?,
                 (0..2).map(|i|Weights::load(devices[1],&catalog,[2,20][i],kind,1,
-                Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>()?];
+                Weights::load_peak_device_bytes(&lib,kind)?)).collect::<Result<Vec<_>>>()?];
             let banks=[weights[0].as_slice(),weights[1].as_slice()];
             assert!(Wave::new(banks,capacity,0,[0,0]).is_err());
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
@@ -491,8 +499,8 @@ mod shared_storage_tests {
         let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
-        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(kind))?],
-            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(kind))?]];
+        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(&lib,kind)?)?],
+            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(&lib,kind)?)?]];
         let banks=[weights[0].as_slice(),weights[1].as_slice()];
         let (rows,unit)=(13u32,16u32);let (k,n)=kind.geometry();
         let inputs=[Allocation::new(devices[0],rows as usize*k*2)?,Allocation::new(devices[0],rows as usize*k*2)?];

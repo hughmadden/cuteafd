@@ -91,14 +91,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load(devices[rank],&catalog,layer,Kind::QueryB,rank,
-                Weights::load_peak_device_bytes(Kind::QueryB))).collect::<Result<Vec<_>>>())
+                Weights::load_peak_device_bytes(&lib,Kind::QueryB)?)).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     let output_shards=if args.tp2_output_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load(devices[rank],&catalog,layer,Kind::OutputB,rank,
-                Weights::load_peak_device_bytes(Kind::OutputB))).collect::<Result<Vec<_>>>())
+                Weights::load_peak_device_bytes(&lib,Kind::OutputB)?)).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     memory_checkpoint("attention mHC router weights")?;
