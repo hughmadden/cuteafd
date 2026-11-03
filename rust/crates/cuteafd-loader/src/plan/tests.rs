@@ -4511,7 +4511,7 @@ fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
 
     // A profile ranks the set: the most-routed experts first, in any layer.
     let mut counts = vec![vec![1u64; 384]; 40];
-    for layer in 0..40 { for expert in 300..316 { counts[layer][expert] = 50; } }
+    for row in &mut counts { row[300..316].fill(50); }
     let path = dir.path().join("routes.json");
     std::fs::write(&path, serde_json::to_vec(&json!({"model": "fixture", "layers": counts})).unwrap()).unwrap();
     let profiled = plan_spark_count(dir.path(), &pair(ExpertTierSetting::PerLayer(16), None, Some(path.clone())), 6, Some(4)).unwrap();

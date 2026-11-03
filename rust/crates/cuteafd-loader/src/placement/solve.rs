@@ -1076,6 +1076,6 @@ fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &
         routed_experts: routed.len() * experts,
         resident_bytes,
         peak_bytes,
-        byte_share_ppm: if all == 0 { 0 } else { (held * 1_000_000 / all) as u32 },
+        byte_share_ppm: (held * 1_000_000).checked_div(all).map_or(0, |ppm| ppm as u32),
     })
 }

@@ -343,7 +343,8 @@ pub fn optimized_order(layers: &[usize], activation: &ExpertActivation, model: &
         Layer { ranked, taken: 0, gpu: 0, spark: row.iter().sum() }
     }).collect::<Vec<_>>();
     // One candidate per layer: (cut, fewer resident first, lower layer, lower expert).
-    let candidate = |position: usize, layer: &Layer| -> Option<(i128, Reverse<usize>, Reverse<usize>, Reverse<usize>)> {
+    type Candidate = (i128, Reverse<usize>, Reverse<usize>, Reverse<usize>);
+    let candidate = |position: usize, layer: &Layer| -> Option<Candidate> {
         let expert = *layer.ranked.get(layer.taken)?;
         let active = rows[position][expert];
         let before = model.layer_scaled(layer.gpu, layer.spark);
@@ -498,7 +499,7 @@ mod tests {
         // all 16 resident would leave the GPUs the slower side (149 us against
         // 51 us), so the order balances near 13 and only then spills over.
         let mut counts = vec![vec![1u64; 384]; 2];
-        for row in &mut counts { for expert in 300..316 { row[expert] = 1000; } }
+        for row in &mut counts { row[300..316].fill(1000); }
         let profile = ExpertRouteProfile { layers: counts };
         let activation = ExpertActivation::from_profile(&profile, 2, 384, 6, 6, 24).unwrap();
         let tier = optimized_order(&[0, 1], &activation, &MODEL, 0);
