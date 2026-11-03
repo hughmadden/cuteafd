@@ -4605,6 +4605,28 @@ fn v41_tp2_dspark_experts_move_half_the_draft_experts_to_gpu0() {
 }
 
 #[test]
+fn v41_omitted_pool_tokens_plan_like_automatic() {
+    // `--pool-tokens` documents "0 or omitted: automatic": an omitted pool must
+    // charge the same 97% admission ceiling and growth reserve as 0, not plan
+    // to the whole card.
+    let dir = strict_v41_snapshot(false);
+    for (rtx_bytes, arch) in [(vec![50_950_569_984; 2], cuteafd_core::GpuArch::Sm89),
+        (vec![96 << 30], cuteafd_core::GpuArch::Sm120)] {
+        let options = |pool_tokens| PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: rtx_bytes.clone(), coordinator_arch: arch,
+            workspace_manifest: v41_workspace(dir.path()), pool_tokens, context_tokens: 1 << 20,
+            ..Default::default() }), ..sparks(4) };
+        let omitted = plan_spark_count(dir.path(), &options(None), 6, Some(4)).unwrap();
+        let automatic = plan_spark_count(dir.path(), &options(Some(0)), 6, Some(4)).unwrap();
+        assert!(automatic.executable(), "{}", render(&automatic));
+        assert_eq!(render(&omitted), render(&automatic));
+        assert_eq!(omitted.memory_layout, automatic.memory_layout);
+        let pinned = plan_spark_count(dir.path(), &options(Some(1 << 20)), 6, Some(4)).unwrap();
+        assert_ne!(render(&pinned), render(&automatic), "a positive pool still pins it");
+    }
+}
+
+#[test]
 fn v41_exl3_is_unsupported_without_a_loader_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);

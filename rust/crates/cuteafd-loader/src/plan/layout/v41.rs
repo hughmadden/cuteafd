@@ -112,7 +112,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             tp2_dspark_experts(draft, catalog, waves)?
         } else { draft })
     } else { None };
-    let automatic = options.pool_tokens == Some(0);
+    // `--pool-tokens` 0 or omitted: automatic (a 97% admission ceiling plus
+    // the growth reserve), as the flag documents; only a positive count pins the pool.
+    let automatic = options.pool_tokens.unwrap_or(0) == 0;
     let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0)
         .with_automatic_context(options.context_tokens == 0);
     if pool.requested.is_none() {
