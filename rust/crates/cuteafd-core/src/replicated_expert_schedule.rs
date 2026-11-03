@@ -1,23 +1,40 @@
-//! Deterministic CPU-only replicated expert-group scheduling for the routed FFN.
+//! Deterministic CPU-only expert-group scheduling for the routed FFN.
 //!
 //! The official backbone routes each token to top-6 of 384 routed experts per
-//! layer. A deployment may hold `1`, `2` or `3` replicated expert groups that
-//! each carry an identical copy of every routed expert. This module decides,
-//! per layer/request, which group executes each *active* expert. It is a pure
-//! CPU planner: it has no protocol, transport, topology or GPU dependency, and
-//! it does not bind any wire format. The internal tensor-parallel width of a
-//! group is irrelevant to the scheduling decision.
+//! layer. A deployment holds up to [`MAX_REPLICATED_EXPERT_GROUPS`] expert
+//! groups of two kinds:
+//!
+//! - *full* groups (the replicated Spark groups, `1`, `2` or `3` of them), each
+//!   carrying an identical copy of every routed expert;
+//! - *partial-residency* groups (the coordinator GPU expert tier), each holding
+//!   a fixed subset of a layer's experts beside the full groups.
+//!
+//! This module decides, per layer/request, which group executes each *active*
+//! expert. It is a pure CPU planner: it has no protocol, transport, topology or
+//! GPU dependency, and it does not bind any wire format. The internal
+//! tensor-parallel width of a group is irrelevant to the scheduling decision;
+//! it only enters through the group's cost model.
 //!
 //! Policy: whole-expert, largest-processing-time-first (LPT) greedy.
 //!
 //! 1. Every expert with at least one routed row is *active*; an expert with zero
 //!    routed rows is left at the [`ReplicatedExpertGroupId::INACTIVE`] sentinel.
-//! 2. Each active expert receives an estimated integer cost from the configured
-//!    [`ReplicatedExpertCostModel`] (weight-residency cost plus activation-tile
-//!    cost). Costs are model inputs, not measured coefficients.
-//! 3. Active experts are ordered by descending estimated cost, with a
-//!    deterministic tie break derived from a *local* tie seed, and each is
-//!    assigned to the group with the smallest current predicted load.
+//! 2. An active expert that a partial group holds is *pinned*: it may run only
+//!    on a partial group that holds it. Residency, not load, decides, so where
+//!    a resident expert runs is a function of the layer's static resident set
+//!    alone, never of batch composition or tie seeds. Every other active expert
+//!    may run on any full group.
+//! 3. Each active expert receives an estimated integer cost from the
+//!    [`ReplicatedExpertCostModel`] of each group allowed to run it
+//!    (weight-residency cost plus activation-tile cost); the cheapest of these
+//!    is its ordering key. Costs are model inputs, not measured coefficients.
+//! 4. Active experts are ordered by descending key, with a deterministic tie
+//!    break derived from a *local* tie seed, and each is assigned to the
+//!    allowed group that would finish it first: the group's predicted load,
+//!    plus its [`ReplicatedExpertGroupSpec::call_cost`] if it is still unused,
+//!    plus the expert's cost on that group. For identical full groups with no
+//!    call cost this is the group with the smallest current load, so their
+//!    plans are bit-identical to the historical replicated planner.
 //!
 //! Whole-expert assignment preserves weight reuse: an expert's weights are
 //! executed once, in one group, for all of its routed rows. The policy cannot
@@ -29,19 +46,22 @@
 //!
 //! Determinism and allocation:
 //!
-//! - Output is a pure function of `(config, route_counts, tie_seed,
-//!   expert_capacity)`. No process-global or cross-lane state is read.
-//! - The plan borrows the scheduler's preallocated buffers. A successful plan
-//!   whose histogram length is within the planned capacity performs no heap
-//!   allocation. `plan` rejects a larger histogram instead of growing; callers
-//!   grow explicitly with [`ReplicatedExpertScheduler::reserve_expert_capacity`].
+//! - Output is a pure function of `(config, route_counts, tie_seed, resident
+//!   sets, expert_capacity)`. No process-global or cross-lane state is read.
+//! - The plan borrows the scheduler's preallocated buffers, and resident sets
+//!   are borrowed bitsets. A successful plan whose histogram length is within
+//!   the planned capacity performs no heap allocation. `plan` rejects a larger
+//!   histogram instead of growing; callers grow explicitly with
+//!   [`ReplicatedExpertScheduler::reserve_expert_capacity`].
 //! - The caller copies or encodes the borrowed assignment into a request-owned
 //!   buffer before the next plan reuses the scheduler.
 
 use crate::CuteafdError;
 
-/// Maximum number of replicated expert groups this planner supports.
-pub const MAX_REPLICATED_EXPERT_GROUPS: u8 = 3;
+/// Maximum number of expert groups this planner supports: up to three
+/// replicated Spark groups (the native wire's limit) plus a partial-residency
+/// coordinator tier.
+pub const MAX_REPLICATED_EXPERT_GROUPS: u8 = 4;
 
 /// Encoded form of [`ReplicatedExpertGroupId::INACTIVE`].
 pub const INACTIVE_REPLICATED_EXPERT_GROUP: u8 = u8::MAX;
@@ -49,10 +69,13 @@ pub const INACTIVE_REPLICATED_EXPERT_GROUP: u8 = u8::MAX;
 /// Deterministic integer cost model for one whole routed expert.
 ///
 /// All values are abstract *cost units* (CU). They are not microseconds, bytes,
-/// FLOPs or any other physical quantity, and this module ships no calibrated
-/// production coefficients. Choose values that make the relative ordering and
-/// the group loads meaningful for the deployment being planned; the scheduler
-/// only relies on the ordering and on exact integer arithmetic.
+/// FLOPs or any other physical quantity unless a caller chooses so (see
+/// [`ReplicatedExpertCostModel::streaming`], which uses nanoseconds), and this
+/// module ships no calibrated production coefficients. Choose values that make
+/// the relative ordering and the group loads meaningful for the deployment
+/// being planned; the scheduler only relies on the ordering and on exact
+/// integer arithmetic. Groups compared against each other must use the same
+/// unit.
 ///
 /// The estimated cost of an active expert with `routed_rows` routed rows is:
 ///
@@ -86,6 +109,28 @@ impl ReplicatedExpertCostModel {
             tile_cost,
             tile_rows,
         }
+    }
+
+    /// Physical form in integer nanoseconds: each member of the group streams
+    /// `expert_bytes` of weights per active expert at `bytes_per_second` (a
+    /// Spark rank its TP slice, a GPU its TP2 half), plus `tile_ns` per
+    /// `tile_rows` routed rows. The weight term rounds up, so a positive byte
+    /// count never costs zero.
+    pub fn streaming(
+        expert_bytes: u64,
+        bytes_per_second: u64,
+        tile_ns: u64,
+        tile_rows: u32,
+    ) -> Result<Self, CuteafdError> {
+        if bytes_per_second == 0 {
+            return Err(rejected("streaming cost model needs a non-zero byte rate"));
+        }
+        let nanos = (u128::from(expert_bytes) * 1_000_000_000).div_ceil(u128::from(bytes_per_second));
+        let weight = u64::try_from(nanos)
+            .map_err(|_| rejected("streaming cost model weight cost overflow"))?;
+        let model = Self::new(weight, tile_ns, tile_rows);
+        model.validate()?;
+        Ok(model)
     }
 
     /// Rejects a model that cannot produce a positive cost for an active expert
@@ -122,23 +167,120 @@ impl ReplicatedExpertCostModel {
     }
 }
 
-/// Static planner configuration. Per-request inputs (histogram and tie seed)
-/// are passed to [`ReplicatedExpertScheduler::plan`] so one scheduler can serve
-/// a whole lane without rebuilding.
+/// Which routed experts a group holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ReplicatedExpertResidency {
+    /// Every routed expert: a replicated (Spark) group.
+    Full,
+    /// A fixed subset, passed to [`ReplicatedExpertScheduler::plan_resident`] as
+    /// a bitset per plan (one per layer). Every active expert it holds runs on
+    /// a partial group that holds it; full groups take only the rest.
+    Partial,
+}
+
+/// One group's static description: what it holds and what it costs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplicatedExpertGroupSpec {
+    pub residency: ReplicatedExpertResidency,
+    /// Per-expert cost on this group.
+    pub cost_model: ReplicatedExpertCostModel,
+    /// Fixed cost of using the group in one plan (a Spark round trip, or a
+    /// kernel launch and its combine), in the cost model's units. It is charged
+    /// once, when the group receives its first expert; an unused group costs
+    /// nothing. Zero for the historical replicated planner.
+    pub call_cost: u64,
+}
+
+impl ReplicatedExpertGroupSpec {
+    /// A replicated group holding every expert, with no call cost.
+    pub const fn full(cost_model: ReplicatedExpertCostModel) -> Self {
+        Self {
+            residency: ReplicatedExpertResidency::Full,
+            cost_model,
+            call_cost: 0,
+        }
+    }
+
+    /// A partial-residency group, with no call cost.
+    pub const fn partial(cost_model: ReplicatedExpertCostModel) -> Self {
+        Self {
+            residency: ReplicatedExpertResidency::Partial,
+            cost_model,
+            call_cost: 0,
+        }
+    }
+
+    /// The same group with a fixed per-plan call cost.
+    pub const fn with_call_cost(self, call_cost: u64) -> Self {
+        Self { call_cost, ..self }
+    }
+
+    pub const fn is_partial(&self) -> bool {
+        matches!(self.residency, ReplicatedExpertResidency::Partial)
+    }
+}
+
+/// Placeholder for group slots past `group_count`; never validated or read.
+const UNUSED_GROUP: ReplicatedExpertGroupSpec =
+    ReplicatedExpertGroupSpec::full(ReplicatedExpertCostModel::new(0, 0, 1));
+
+/// Static planner configuration. Per-request inputs (histogram, tie seed and
+/// the layer's resident sets) are passed to
+/// [`ReplicatedExpertScheduler::plan_resident`] so one scheduler can serve a
+/// whole lane without rebuilding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicatedExpertScheduleConfig {
-    /// Replicated groups to distribute experts across: `1`, `2` or `3`.
-    pub group_count: u8,
-    /// Integer cost model. See [`ReplicatedExpertCostModel`].
-    pub cost_model: ReplicatedExpertCostModel,
+    group_count: u8,
+    groups: [ReplicatedExpertGroupSpec; MAX_REPLICATED_EXPERT_GROUPS as usize],
 }
 
 impl ReplicatedExpertScheduleConfig {
+    /// `group_count` full replicas sharing one cost model, with no call cost:
+    /// the historical replicated planner.
     pub const fn new(group_count: u8, cost_model: ReplicatedExpertCostModel) -> Self {
+        let mut groups = [UNUSED_GROUP; MAX_REPLICATED_EXPERT_GROUPS as usize];
+        let mut index = 0;
+        while index < groups.len() && index < group_count as usize {
+            groups[index] = ReplicatedExpertGroupSpec::full(cost_model);
+            index += 1;
+        }
         Self {
             group_count,
-            cost_model,
+            groups,
         }
+    }
+
+    /// Groups in group-index order, each with its own residency and cost.
+    pub fn with_groups(specs: &[ReplicatedExpertGroupSpec]) -> Result<Self, CuteafdError> {
+        if specs.len() > MAX_REPLICATED_EXPERT_GROUPS as usize {
+            return Err(rejected(format!(
+                "group_count {} exceeds the supported maximum {MAX_REPLICATED_EXPERT_GROUPS}",
+                specs.len()
+            )));
+        }
+        let mut groups = [UNUSED_GROUP; MAX_REPLICATED_EXPERT_GROUPS as usize];
+        groups[..specs.len()].copy_from_slice(specs);
+        let config = Self {
+            group_count: specs.len() as u8,
+            groups,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Number of groups, the number of valid group indices.
+    pub const fn group_count(&self) -> u8 {
+        self.group_count
+    }
+
+    /// The groups, `group_count` entries in group order.
+    pub fn groups(&self) -> &[ReplicatedExpertGroupSpec] {
+        &self.groups[..(self.group_count as usize).min(self.groups.len())]
+    }
+
+    /// Whether any group holds only a subset of the experts.
+    pub fn has_partial_groups(&self) -> bool {
+        self.groups().iter().any(ReplicatedExpertGroupSpec::is_partial)
     }
 
     /// Rejects a zero or unsupported group count and an invalid cost model.
@@ -152,7 +294,149 @@ impl ReplicatedExpertScheduleConfig {
                 self.group_count
             )));
         }
-        self.cost_model.validate()
+        self.groups()
+            .iter()
+            .try_for_each(|group| group.cost_model.validate())
+    }
+
+    /// Whether `group` holds `expert_id`; partial groups read their bitset.
+    fn holds(&self, group: usize, expert_id: usize, resident: &[&[u64]]) -> bool {
+        match self.groups[group].residency {
+            ReplicatedExpertResidency::Full => true,
+            ReplicatedExpertResidency::Partial => bit(resident[group], expert_id),
+        }
+    }
+
+    /// Whether some partial group holds `expert_id`, which pins it to them.
+    fn pinned(&self, expert_id: usize, resident: &[&[u64]]) -> bool {
+        self.groups()
+            .iter()
+            .enumerate()
+            .any(|(group, spec)| spec.is_partial() && bit(resident[group], expert_id))
+    }
+
+    /// Whether `group` may run `expert_id` (pinned: only partial holders).
+    fn allowed(&self, group: usize, expert_id: usize, pinned: bool, resident: &[&[u64]]) -> bool {
+        self.groups[group].is_partial() == pinned && self.holds(group, expert_id, resident)
+    }
+
+    /// One bitset per group when any group is partial (full groups' entries
+    /// empty), sized exactly for the histogram with no bit past its end; or no
+    /// sets at all when every group is full.
+    fn validate_residency(&self, expert_count: usize, resident: &[&[u64]]) -> Result<(), CuteafdError> {
+        if resident.is_empty() {
+            if self.has_partial_groups() {
+                return Err(rejected(
+                    "partial-residency groups need their resident sets (plan_resident)",
+                ));
+            }
+            return Ok(());
+        }
+        if resident.len() != self.group_count as usize {
+            return Err(rejected(format!(
+                "{} resident sets for {} groups",
+                resident.len(),
+                self.group_count
+            )));
+        }
+        let words = expert_count.div_ceil(64);
+        for (group, (spec, set)) in self.groups().iter().zip(resident).enumerate() {
+            if !spec.is_partial() {
+                if !set.is_empty() {
+                    return Err(rejected(format!("full group {group} takes no resident set")));
+                }
+                continue;
+            }
+            if set.len() != words {
+                return Err(rejected(format!(
+                    "group {group} resident set has {} words for {expert_count} experts",
+                    set.len()
+                )));
+            }
+            let tail = expert_count % 64;
+            if tail != 0 && set[words - 1] >> tail != 0 {
+                return Err(rejected(format!(
+                    "group {group} resident set names an expert at or past {expert_count}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A fixed set of resident routed experts of one layer, as a bitset over expert
+/// ids: what a partial-residency group holds. Built once (at startup, from the
+/// placement); plans borrow its words.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ExpertResidencySet {
+    experts: usize,
+    words: Vec<u64>,
+}
+
+impl ExpertResidencySet {
+    /// No resident expert among `experts` routed experts.
+    pub fn empty(experts: usize) -> Self {
+        Self {
+            experts,
+            words: vec![0; experts.div_ceil(64)],
+        }
+    }
+
+    /// The set of `ids` among `experts` routed experts; out-of-range and
+    /// repeated ids are rejected.
+    pub fn from_ids(
+        experts: usize,
+        ids: impl IntoIterator<Item = usize>,
+    ) -> Result<Self, CuteafdError> {
+        let mut set = Self::empty(experts);
+        for id in ids {
+            if !set.insert(id)? {
+                return Err(rejected(format!("expert {id} named twice in a resident set")));
+            }
+        }
+        Ok(set)
+    }
+
+    /// Adds `id`; false when it was already resident.
+    pub fn insert(&mut self, id: usize) -> Result<bool, CuteafdError> {
+        if id >= self.experts {
+            return Err(rejected(format!(
+                "resident expert {id} is outside 0..{}",
+                self.experts
+            )));
+        }
+        let (word, mask) = (id / 64, 1u64 << (id % 64));
+        let fresh = self.words[word] & mask == 0;
+        self.words[word] |= mask;
+        Ok(fresh)
+    }
+
+    pub fn contains(&self, id: usize) -> bool {
+        id < self.experts && bit(&self.words, id)
+    }
+
+    /// Resident experts.
+    pub fn len(&self) -> usize {
+        self.words.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
+
+    /// Routed experts of the layer (the bitset's universe).
+    pub fn experts(&self) -> usize {
+        self.experts
+    }
+
+    /// The bitset [`ReplicatedExpertScheduler::plan_resident`] borrows.
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Resident expert ids, ascending.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.experts).filter(|&id| bit(&self.words, id))
     }
 }
 
@@ -177,7 +461,7 @@ impl ReplicatedExpertGroupId {
         }
     }
 
-    /// True when this id names a real replicated group.
+    /// True when this id names a real group.
     pub const fn is_active(self) -> bool {
         self.0 != INACTIVE_REPLICATED_EXPERT_GROUP
     }
@@ -200,8 +484,9 @@ impl ReplicatedExpertGroupId {
 /// Predicted per-group load for one plan, in the same cost units as the model.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReplicatedExpertGroupLoad {
-    /// Sum of estimated expert costs assigned to this group (predicted
-    /// makespan driver; the maximum over groups is the predicted makespan).
+    /// Sum of estimated expert costs assigned to this group, plus its call cost
+    /// when it received any expert (predicted makespan driver; the maximum over
+    /// groups is the predicted makespan).
     pub cost: u64,
     /// Number of active experts assigned to this group.
     pub expert_count: u32,
@@ -231,7 +516,8 @@ impl<'a> ReplicatedExpertGroupPlan<'a> {
         self.assignment
     }
 
-    /// Expert-id-indexed estimated cost; zero exactly for inactive experts.
+    /// Expert-id-indexed estimated cost on the group that runs the expert;
+    /// zero exactly for inactive experts.
     pub fn expert_cost(&self) -> &'a [u64] {
         self.expert_cost
     }
@@ -241,12 +527,23 @@ impl<'a> ReplicatedExpertGroupPlan<'a> {
         self.group_loads
     }
 
-    /// Sum of all active expert costs.
+    /// Sum of all group loads: every active expert's cost plus the call cost of
+    /// every used group.
     pub fn total_cost(&self) -> u64 {
         self.total_cost
     }
 
-    /// Number of replicated groups in this plan.
+    /// Predicted completion of the slowest group, the groups running in
+    /// parallel: the largest group load.
+    pub fn makespan(&self) -> u64 {
+        self.group_loads
+            .iter()
+            .map(|load| load.cost)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Number of groups in this plan.
     pub fn group_count(&self) -> u8 {
         self.group_count
     }
@@ -262,7 +559,7 @@ impl<'a> ReplicatedExpertGroupPlan<'a> {
     }
 }
 
-/// Lane-owned, reusable replicated expert-group planner.
+/// Lane-owned, reusable expert-group planner.
 ///
 /// A scheduler owns its scratch and output buffers. It reads no global state,
 /// so two lanes planning concurrently produce independent results, and a plan
@@ -323,7 +620,9 @@ impl ReplicatedExpertScheduler {
         Ok(())
     }
 
-    /// Plans whole-expert assignment for `route_counts`.
+    /// Plans whole-expert assignment for `route_counts` across full groups.
+    /// A configuration with partial-residency groups must use
+    /// [`Self::plan_resident`].
     ///
     /// `route_counts[expert_id]` is the number of routed rows that selected
     /// that expert for this layer/request; the official backbone passes 384
@@ -339,6 +638,23 @@ impl ReplicatedExpertScheduler {
         route_counts: &[u32],
         tie_seed: u64,
     ) -> Result<ReplicatedExpertGroupPlan<'_>, CuteafdError> {
+        self.plan_resident(route_counts, tie_seed, &[])
+    }
+
+    /// [`Self::plan`] with the layer's resident sets: `resident[group]` is the
+    /// bitset ([`ExpertResidencySet::words`]) of a partial group and empty for
+    /// a full group; with no partial group, `resident` may be empty. Each
+    /// partial set has exactly `route_counts.len().div_ceil(64)` words.
+    ///
+    /// Every active expert some partial group holds runs on such a group; every
+    /// other active expert runs on a full group. An active expert no group
+    /// holds is rejected. Borrowing the sets keeps the plan allocation-free.
+    pub fn plan_resident(
+        &mut self,
+        route_counts: &[u32],
+        tie_seed: u64,
+        resident: &[&[u64]],
+    ) -> Result<ReplicatedExpertGroupPlan<'_>, CuteafdError> {
         self.config.validate()?;
         let expert_count = route_counts.len();
         if expert_count > self.planned_expert_capacity {
@@ -348,7 +664,9 @@ impl ReplicatedExpertScheduler {
                 self.planned_expert_capacity
             )));
         }
+        self.config.validate_residency(expert_count, resident)?;
         let group_count = self.config.group_count as usize;
+        let config = self.config;
 
         self.assignment.clear();
         self.assignment
@@ -362,16 +680,29 @@ impl ReplicatedExpertScheduler {
         self.group_loads
             .resize(group_count, ReplicatedExpertGroupLoad::default());
 
-        let model = self.config.cost_model;
-        let mut total_cost = 0_u64;
+        // Ordering key: the cheapest cost among the groups allowed to run the
+        // expert (for identical full groups, the one model's cost).
+        let mut key_total = 0_u64;
         for (expert_id, &routed_rows) in route_counts.iter().enumerate() {
             if routed_rows == 0 {
                 continue;
             }
-            let cost = model.expert_cost(routed_rows as u64)?;
-            self.expert_cost[expert_id] = cost;
-            total_cost = total_cost
-                .checked_add(cost)
+            let pinned = config.pinned(expert_id, resident);
+            let mut key = None;
+            for group in 0..group_count {
+                if config.allowed(group, expert_id, pinned, resident) {
+                    let cost = config.groups[group]
+                        .cost_model
+                        .expert_cost(routed_rows as u64)?;
+                    key = Some(key.map_or(cost, |key: u64| key.min(cost)));
+                }
+            }
+            let key = key.ok_or_else(|| {
+                rejected(format!("active expert {expert_id} is held by no group"))
+            })?;
+            self.expert_cost[expert_id] = key;
+            key_total = key_total
+                .checked_add(key)
                 .ok_or_else(|| rejected("plan total estimated cost overflow"))?;
             self.tie_rank[expert_id] = expert_tie_rank(tie_seed, expert_id);
             self.order.push(expert_id);
@@ -396,25 +727,50 @@ impl ReplicatedExpertScheduler {
 
         for order_index in 0..self.order.len() {
             let expert_id = self.order[order_index];
-            let mut best_group = 0_usize;
-            for group in 1..group_count {
-                if group_load_better(
-                    self.group_loads[group].cost,
-                    group_rank[group],
-                    group,
-                    self.group_loads[best_group].cost,
-                    group_rank[best_group],
-                    best_group,
-                ) {
-                    best_group = group;
+            let routed_rows = route_counts[expert_id] as u64;
+            let pinned = config.pinned(expert_id, resident);
+            // The allowed group that would finish this expert first. A
+            // saturated finish only ties groups whose accumulation below
+            // overflows anyway.
+            let mut best: Option<(usize, u64, u64)> = None;
+            for group in 0..group_count {
+                if !config.allowed(group, expert_id, pinned, resident) {
+                    continue;
+                }
+                let spec = &config.groups[group];
+                let cost = spec.cost_model.expert_cost(routed_rows)?;
+                let load = &self.group_loads[group];
+                let opening = if load.expert_count == 0 { spec.call_cost } else { 0 };
+                let finish = load.cost.saturating_add(opening).saturating_add(cost);
+                if best.is_none_or(|(current, current_finish, _)| {
+                    group_load_better(
+                        finish,
+                        group_rank[group],
+                        group,
+                        current_finish,
+                        group_rank[current],
+                        current,
+                    )
+                }) {
+                    best = Some((group, finish, cost));
                 }
             }
-            self.assignment[expert_id] = ReplicatedExpertGroupId::active(best_group as u8)
+            let (group, _, cost) = best.ok_or_else(|| {
+                rejected(format!("active expert {expert_id} is held by no group"))
+            })?;
+            self.assignment[expert_id] = ReplicatedExpertGroupId::active(group as u8)
                 .ok_or_else(|| rejected("plan selected a group outside the supported range"))?;
-            let load = &mut self.group_loads[best_group];
+            self.expert_cost[expert_id] = cost;
+            let load = &mut self.group_loads[group];
+            if load.expert_count == 0 {
+                load.cost = load
+                    .cost
+                    .checked_add(config.groups[group].call_cost)
+                    .ok_or_else(|| rejected("plan group call cost overflow"))?;
+            }
             load.cost = load
                 .cost
-                .checked_add(self.expert_cost[expert_id])
+                .checked_add(cost)
                 .ok_or_else(|| rejected("plan group cost overflow"))?;
             load.expert_count = load
                 .expert_count
@@ -422,16 +778,22 @@ impl ReplicatedExpertScheduler {
                 .ok_or_else(|| rejected("plan group expert count overflow"))?;
             load.routed_rows = load
                 .routed_rows
-                .checked_add(route_counts[expert_id] as u64)
+                .checked_add(routed_rows)
                 .ok_or_else(|| rejected("plan group routed-row count overflow"))?;
         }
+
+        let total_cost = self.group_loads.iter().try_fold(0_u64, |total, load| {
+            total
+                .checked_add(load.cost)
+                .ok_or_else(|| rejected("plan total estimated cost overflow"))
+        })?;
 
         Ok(ReplicatedExpertGroupPlan {
             assignment: &self.assignment,
             expert_cost: &self.expert_cost,
             group_loads: &self.group_loads,
             total_cost,
-            group_count: self.config.group_count,
+            group_count: config.group_count,
             tie_seed,
         })
     }
@@ -545,6 +907,11 @@ fn reserve_to<T>(values: &mut Vec<T>, capacity: usize) {
         // The guard plus the `len <= capacity()` invariant makes this positive.
         values.reserve(capacity - values.len());
     }
+}
+
+/// Bit `id` of a bitset over expert ids; ids past its words are absent.
+fn bit(words: &[u64], id: usize) -> bool {
+    words.get(id / 64).is_some_and(|word| (word >> (id % 64)) & 1 == 1)
 }
 
 /// SplitMix64 finalizer: deterministic, allocation-free, no external state.
@@ -1314,6 +1681,393 @@ mod tests {
                 planner.group_loads.capacity(),
             ),
             "a successful plan within capacity must not reallocate"
+        );
+    }
+
+    // ---- Partial residency, per-group costs and call costs ----
+
+    /// The planner as it was before partial residency, kept verbatim as the
+    /// bit-identity oracle for full replicas: (assignment, expert costs,
+    /// (cost, experts, rows) per group, total).
+    fn legacy_plan(
+        group_count: usize,
+        model: ReplicatedExpertCostModel,
+        route_counts: &[u32],
+        tie_seed: u64,
+    ) -> Snapshot {
+        let mut assignment = vec![INACTIVE_REPLICATED_EXPERT_GROUP; route_counts.len()];
+        let mut expert_cost = vec![0_u64; route_counts.len()];
+        let mut tie_rank = vec![0_u64; route_counts.len()];
+        let mut order = Vec::new();
+        let mut loads = vec![(0_u64, 0_u32, 0_u64); group_count];
+        let mut total = 0_u64;
+        for (expert_id, &rows) in route_counts.iter().enumerate() {
+            if rows == 0 {
+                continue;
+            }
+            let cost = model.expert_cost(rows as u64).unwrap();
+            expert_cost[expert_id] = cost;
+            total += cost;
+            tie_rank[expert_id] = expert_tie_rank(tie_seed, expert_id);
+            order.push(expert_id);
+        }
+        order.sort_unstable_by(|l, r| {
+            expert_cost[*r]
+                .cmp(&expert_cost[*l])
+                .then_with(|| tie_rank[*l].cmp(&tie_rank[*r]))
+                .then_with(|| l.cmp(r))
+        });
+        let rank: Vec<u64> = (0..group_count).map(|g| group_tie_rank(tie_seed, g)).collect();
+        for expert_id in order {
+            let mut best = 0;
+            for group in 1..group_count {
+                if group_load_better(loads[group].0, rank[group], group, loads[best].0, rank[best], best) {
+                    best = group;
+                }
+            }
+            assignment[expert_id] = best as u8;
+            loads[best].0 += expert_cost[expert_id];
+            loads[best].1 += 1;
+            loads[best].2 += route_counts[expert_id] as u64;
+        }
+        (assignment, loads, total)
+    }
+
+    fn full_snapshot(plan: ReplicatedExpertGroupPlan<'_>) -> (Snapshot, Vec<u64>) {
+        (
+            (
+                plan.assignment().iter().map(|g| g.encoded()).collect(),
+                plan.group_loads()
+                    .iter()
+                    .map(|l| (l.cost, l.expert_count, l.routed_rows))
+                    .collect(),
+                plan.total_cost(),
+            ),
+            plan.expert_cost().to_vec(),
+        )
+    }
+
+    /// SplitMix-driven histograms: sparse decode-like and dense prefill-like.
+    fn histogram(seed: u64, experts: usize, routes: usize) -> Vec<u32> {
+        let mut counts = vec![0_u32; experts];
+        if experts == 0 {
+            return counts;
+        }
+        let mut state = seed;
+        for _ in 0..routes {
+            state = mix64(state);
+            counts[(state % experts as u64) as usize] += 1;
+        }
+        counts
+    }
+
+    fn mask(experts: usize, ids: impl IntoIterator<Item = usize>) -> ExpertResidencySet {
+        ExpertResidencySet::from_ids(experts, ids).unwrap()
+    }
+
+    #[test]
+    fn full_replica_plans_match_the_legacy_planner_bit_for_bit() {
+        let models = [model(1, 0, 16), model(7, 3, 2), model(2304, 1536, 64), model(0, 1, 1)];
+        for group_count in 1..=3_u8 {
+            for (index, &cost_model) in models.iter().enumerate() {
+                for (experts, routes) in [(0, 0), (4, 3), (17, 40), (384, 6), (384, 36), (384, 24_576)] {
+                    for seed in [0_u64, 7, 0xdead_beef, u64::MAX] {
+                        let counts = histogram(seed ^ index as u64 ^ routes as u64, experts, routes);
+                        let expected = legacy_plan(group_count as usize, cost_model, &counts, seed);
+                        let mut historical = scheduler(group_count, cost_model, experts);
+                        let (got, costs) = full_snapshot(historical.plan(&counts, seed).unwrap());
+                        assert_eq!(got, expected, "groups={group_count} model={index} experts={experts}");
+                        let legacy_costs: Vec<u64> = counts
+                            .iter()
+                            .map(|&rows| cost_model.expert_cost(rows as u64).unwrap())
+                            .collect();
+                        assert_eq!(costs, legacy_costs);
+
+                        // The same replicas spelled as explicit specs, with
+                        // empty resident sets, plan identically.
+                        let specs = vec![ReplicatedExpertGroupSpec::full(cost_model); group_count as usize];
+                        let config = ReplicatedExpertScheduleConfig::with_groups(&specs).unwrap();
+                        assert_eq!(config, ReplicatedExpertScheduleConfig::new(group_count, cost_model));
+                        let mut explicit = ReplicatedExpertScheduler::new(config, experts).unwrap();
+                        let empty: Vec<&[u64]> = vec![&[]; group_count as usize];
+                        let (spelled, spelled_costs) =
+                            full_snapshot(explicit.plan_resident(&counts, seed, &empty).unwrap());
+                        assert_eq!((spelled, spelled_costs), (expected, costs.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A GPU tier (partial, cheaper per expert) beside one Spark group (full).
+    fn tier_config(gpu_ns: u64, spark_ns: u64, gpu_call: u64, spark_call: u64) -> ReplicatedExpertScheduleConfig {
+        ReplicatedExpertScheduleConfig::with_groups(&[
+            ReplicatedExpertGroupSpec::partial(model(gpu_ns, 0, 16)).with_call_cost(gpu_call),
+            ReplicatedExpertGroupSpec::full(model(spark_ns, 0, 16)).with_call_cost(spark_call),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn resident_active_experts_run_on_the_partial_group_whatever_its_load() {
+        let resident = mask(384, 0..80);
+        // Even a partial group far slower than the Sparks keeps every resident
+        // expert: residency, not load, decides.
+        for (gpu_ns, spark_ns) in [(11_000, 21_000), (1_000_000, 1)] {
+            let mut planner = ReplicatedExpertScheduler::new(tier_config(gpu_ns, spark_ns, 0, 0), 384).unwrap();
+            let counts = histogram(42, 384, 4096 * 6);
+            let plan = planner.plan_resident(&counts, 9, &[resident.words(), &[]]).unwrap();
+            for (expert, &rows) in counts.iter().enumerate() {
+                let group = plan.group_for_expert(expert).unwrap();
+                match (rows, resident.contains(expert)) {
+                    (0, _) => assert!(!group.is_active()),
+                    (_, true) => assert_eq!(group.index(), Some(0), "resident expert {expert}"),
+                    (_, false) => assert_eq!(group.index(), Some(1), "non-resident expert {expert}"),
+                }
+            }
+            let loads = plan.group_loads();
+            assert_eq!(loads[0].expert_count as usize, (0..80).filter(|&e| counts[e] > 0).count());
+            assert_eq!(loads[0].cost, gpu_ns * loads[0].expert_count as u64);
+            assert_eq!(loads[1].cost, spark_ns * loads[1].expert_count as u64);
+            assert_eq!(plan.makespan(), loads[0].cost.max(loads[1].cost));
+        }
+    }
+
+    #[test]
+    fn pinned_owners_ignore_tie_seeds_and_batch_composition() {
+        // Byte-exact restores rely on this: whether an expert runs on the tier
+        // is fixed by the layer's resident set, never by what else is batched.
+        let resident = mask(384, (0..384).step_by(5));
+        let config = tier_config(11_000, 21_000, 5_000, 34_000);
+        let mut planner = ReplicatedExpertScheduler::new(config, 384).unwrap();
+        for seed in 0..64_u64 {
+            let counts = histogram(seed.wrapping_mul(31), 384, 6 * (1 + seed as usize % 9));
+            let plan = planner.plan_resident(&counts, mix64(seed), &[resident.words(), &[]]).unwrap();
+            for (expert, &rows) in counts.iter().enumerate() {
+                if rows > 0 {
+                    let expected = if resident.contains(expert) { 0 } else { 1 };
+                    assert_eq!(plan.group_for_expert(expert).unwrap().index(), Some(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn call_cost_is_charged_once_and_only_to_used_groups() {
+        let resident = mask(8, [0, 1]);
+        let mut planner = ReplicatedExpertScheduler::new(tier_config(10, 20, 5, 34), 8).unwrap();
+        // Two resident and three non-resident active experts.
+        let plan = planner
+            .plan_resident(&[1, 2, 0, 1, 1, 3, 0, 0], 3, &[resident.words(), &[]])
+            .unwrap();
+        assert_eq!(plan.group_loads()[0].cost, 5 + 2 * 10);
+        assert_eq!(plan.group_loads()[1].cost, 34 + 3 * 20);
+        assert_eq!(plan.total_cost(), 5 + 20 + 34 + 60);
+        assert_eq!(plan.makespan(), 94);
+        assert_eq!(plan.expert_cost(), &[10, 10, 0, 20, 20, 20, 0, 0]);
+
+        // Every active expert resident: the Spark group is unused, so its
+        // round trip is not charged.
+        let plan = planner
+            .plan_resident(&[1, 2, 0, 0, 0, 0, 0, 0], 3, &[resident.words(), &[]])
+            .unwrap();
+        assert_eq!(plan.group_loads()[1], ReplicatedExpertGroupLoad::default());
+        assert_eq!(plan.makespan(), 25);
+
+        // Nothing resident active: the tier is unused.
+        let plan = planner
+            .plan_resident(&[0, 0, 4, 0, 0, 0, 0, 0], 3, &[resident.words(), &[]])
+            .unwrap();
+        assert_eq!(plan.group_loads()[0], ReplicatedExpertGroupLoad::default());
+        assert_eq!(plan.makespan(), 54);
+    }
+
+    #[test]
+    fn call_cost_keeps_a_group_closed_until_it_pays_off() {
+        // Group 1 pays a 100-unit call (a round trip); group 0 none. Cheap
+        // experts stay on group 0 until its load reaches the call cost.
+        let config = ReplicatedExpertScheduleConfig::with_groups(&[
+            ReplicatedExpertGroupSpec::full(model(10, 0, 16)),
+            ReplicatedExpertGroupSpec::full(model(10, 0, 16)).with_call_cost(100),
+        ])
+        .unwrap();
+        let mut planner = ReplicatedExpertScheduler::new(config, 20).unwrap();
+        let plan = planner.plan(&[1; 5], 4).unwrap();
+        assert_eq!(plan.group_loads()[1], ReplicatedExpertGroupLoad::default());
+        assert_eq!(plan.makespan(), 50);
+        assert_eq!(plan.total_cost(), 50);
+        let plan = planner.plan(&[1; 20], 4).unwrap();
+        let loads = plan.group_loads();
+        assert!(loads[1].expert_count > 0);
+        assert_eq!(loads[0].expert_count + loads[1].expert_count, 20);
+        assert_eq!(plan.total_cost(), 200 + 100);
+        assert!(plan.makespan() <= 160, "{loads:?}");
+    }
+
+    #[test]
+    fn heterogeneous_full_groups_assign_by_earliest_finish() {
+        let config = ReplicatedExpertScheduleConfig::with_groups(&[
+            ReplicatedExpertGroupSpec::full(model(10, 0, 16)),
+            ReplicatedExpertGroupSpec::full(model(30, 0, 16)),
+        ])
+        .unwrap();
+        let mut planner = ReplicatedExpertScheduler::new(config, 4).unwrap();
+        // Finish times: 10, 20 on group 0 then 30 on either; group 0 keeps
+        // winning until its load passes the slow group's single cost.
+        let plan = planner.plan(&[1, 1, 1, 1], 0).unwrap();
+        assert_eq!(plan.group_loads()[0].expert_count, 3);
+        assert_eq!(plan.group_loads()[1].expert_count, 1);
+        assert_eq!(plan.makespan(), 30);
+        assert_eq!(plan.total_cost(), 60);
+    }
+
+    #[test]
+    fn replicated_partial_holders_balance_by_finish_time() {
+        // Two partial groups (EP2 GPU halves) both holding experts 0..4 and a
+        // full Spark group: the resident experts split across the holders.
+        let config = ReplicatedExpertScheduleConfig::with_groups(&[
+            ReplicatedExpertGroupSpec::partial(model(10, 0, 16)),
+            ReplicatedExpertGroupSpec::partial(model(10, 0, 16)),
+            ReplicatedExpertGroupSpec::full(model(20, 0, 16)),
+        ])
+        .unwrap();
+        let both = mask(8, 0..4);
+        let mut planner = ReplicatedExpertScheduler::new(config, 8).unwrap();
+        let counts = [1, 1, 1, 1, 1, 1, 0, 0];
+        let plan = planner
+            .plan_resident(&counts, 5, &[both.words(), both.words(), &[]])
+            .unwrap();
+        assert_eq!(plan.group_loads()[0].expert_count, 2);
+        assert_eq!(plan.group_loads()[1].expert_count, 2);
+        assert_eq!(plan.group_loads()[2].expert_count, 2);
+        // Expert 4 is pinned to the only partial group holding it.
+        let mut union = both.clone();
+        union.insert(4).unwrap();
+        let plan = planner
+            .plan_resident(&counts, 5, &[union.words(), both.words(), &[]])
+            .unwrap();
+        assert_eq!(plan.group_for_expert(4).unwrap().index(), Some(0));
+        assert_eq!(plan.group_for_expert(5).unwrap().index(), Some(2));
+    }
+
+    #[test]
+    fn residency_inputs_are_validated_then_recovered() {
+        let mut planner = ReplicatedExpertScheduler::new(tier_config(10, 20, 0, 0), 128).unwrap();
+        let counts = [1_u32; 100];
+        let set = mask(100, [3, 99]);
+        // Partial groups need their sets; plan() has none.
+        assert!(planner.plan(&counts, 1).is_err());
+        // Wrong set count, a set for the full group, wrong word count.
+        assert!(planner.plan_resident(&counts, 1, &[set.words()]).is_err());
+        assert!(planner.plan_resident(&counts, 1, &[set.words(), set.words()]).is_err());
+        assert!(planner.plan_resident(&counts, 1, &[&set.words()[..1], &[]]).is_err());
+        // A bit past the histogram's end.
+        let mut past = set.words().to_vec();
+        past[1] |= 1 << 40;
+        assert!(planner.plan_resident(&counts, 1, &[&past, &[]]).is_err());
+        // Recovery: a valid plan behaves as if the failures never happened.
+        let recovered = full_snapshot(planner.plan_resident(&counts, 1, &[set.words(), &[]]).unwrap());
+        let fresh = full_snapshot(
+            ReplicatedExpertScheduler::new(tier_config(10, 20, 0, 0), 128)
+                .unwrap()
+                .plan_resident(&counts, 1, &[set.words(), &[]])
+                .unwrap(),
+        );
+        assert_eq!(recovered, fresh);
+        assert_eq!(recovered.0 .0[3], 0);
+        assert_eq!(recovered.0 .0[4], 1);
+    }
+
+    #[test]
+    fn an_active_expert_no_group_holds_is_rejected() {
+        let config = ReplicatedExpertScheduleConfig::with_groups(&[ReplicatedExpertGroupSpec::partial(
+            model(10, 0, 16),
+        )])
+        .unwrap();
+        let mut planner = ReplicatedExpertScheduler::new(config, 4).unwrap();
+        let set = mask(4, [0, 1]);
+        assert!(planner.plan_resident(&[1, 1, 0, 0], 0, &[set.words()]).is_ok());
+        assert!(planner.plan_resident(&[1, 1, 1, 0], 0, &[set.words()]).is_err());
+        // Inactive experts need no holder.
+        assert!(planner.plan_resident(&[0, 3, 0, 0], 0, &[set.words()]).is_ok());
+    }
+
+    #[test]
+    fn group_specs_are_bounded_and_validated() {
+        let full = ReplicatedExpertGroupSpec::full(model(1, 0, 1));
+        assert!(ReplicatedExpertScheduleConfig::with_groups(&[]).is_err());
+        assert!(ReplicatedExpertScheduleConfig::with_groups(&[full; MAX_REPLICATED_EXPERT_GROUPS as usize]).is_ok());
+        assert!(ReplicatedExpertScheduleConfig::with_groups(&[full; MAX_REPLICATED_EXPERT_GROUPS as usize + 1]).is_err());
+        assert!(ReplicatedExpertScheduleConfig::with_groups(&[full, ReplicatedExpertGroupSpec::partial(model(0, 0, 1))]).is_err());
+        let config = tier_config(1, 2, 3, 4);
+        assert_eq!(config.group_count(), 2);
+        assert!(config.has_partial_groups());
+        assert!(!ReplicatedExpertScheduleConfig::new(3, model(1, 0, 1)).has_partial_groups());
+        assert_eq!(config.groups()[0].call_cost, 3);
+        assert_eq!(config.groups()[1].residency, ReplicatedExpertResidency::Full);
+    }
+
+    #[test]
+    fn streaming_cost_model_rounds_bytes_up_to_whole_nanoseconds() {
+        // One V4.1 MXFP4 expert's TP4 slice at 278 GB/s, and its TP2 half at 1 TB/s.
+        let spark = ReplicatedExpertCostModel::streaming(4_700_160, 278_000_000_000, 0, 16).unwrap();
+        assert_eq!(spark.expert_weight_cost, 16_908); // 16_907.05.. ns, rounded up
+        let gpu = ReplicatedExpertCostModel::streaming(9_400_320, 1_000_000_000_000, 0, 16).unwrap();
+        assert_eq!(gpu.expert_weight_cost, 9_401);
+        assert_eq!(gpu.expert_cost(5).unwrap(), 9_401);
+        assert_eq!(ReplicatedExpertCostModel::streaming(1, 1, 0, 16).unwrap().expert_weight_cost, 1_000_000_000);
+        assert!(ReplicatedExpertCostModel::streaming(1, 0, 0, 16).is_err());
+        assert!(ReplicatedExpertCostModel::streaming(0, 1, 0, 16).is_err());
+        assert!(ReplicatedExpertCostModel::streaming(u64::MAX, 1, 0, 16).is_err());
+    }
+
+    #[test]
+    fn residency_sets_round_trip_ids() {
+        let set = ExpertResidencySet::from_ids(130, [0, 63, 64, 129]).unwrap();
+        assert_eq!(set.len(), 4);
+        assert_eq!(set.experts(), 130);
+        assert_eq!(set.words().len(), 3);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 63, 64, 129]);
+        assert!(set.contains(129) && !set.contains(128) && !set.contains(130));
+        assert!(ExpertResidencySet::from_ids(130, [130]).is_err());
+        assert!(ExpertResidencySet::from_ids(130, [5, 5]).is_err());
+        let mut grown = ExpertResidencySet::empty(130);
+        assert!(grown.is_empty());
+        assert!(grown.insert(7).unwrap());
+        assert!(!grown.insert(7).unwrap());
+        assert!(!grown.is_empty());
+    }
+
+    #[test]
+    fn production_shape_resident_plans_are_allocation_stable() {
+        let resident = mask(384, (0..384).filter(|e| e % 5 == 1));
+        let mut planner = ReplicatedExpertScheduler::new(tier_config(9_401, 21_250, 5_000, 34_000), 384).unwrap();
+        let counts = histogram(11, 384, 36);
+        let _ = planner.plan_resident(&counts, 42, &[resident.words(), &[]]).unwrap();
+        let capacities = (
+            planner.assignment.capacity(),
+            planner.expert_cost.capacity(),
+            planner.tie_rank.capacity(),
+            planner.order.capacity(),
+            planner.group_loads.capacity(),
+        );
+        let expected = full_snapshot(planner.plan_resident(&counts, 42, &[resident.words(), &[]]).unwrap());
+        for _ in 0..512 {
+            assert_eq!(
+                full_snapshot(planner.plan_resident(&counts, 42, &[resident.words(), &[]]).unwrap()),
+                expected
+            );
+        }
+        assert_eq!(
+            capacities,
+            (
+                planner.assignment.capacity(),
+                planner.expert_cost.capacity(),
+                planner.tie_rank.capacity(),
+                planner.order.capacity(),
+                planner.group_loads.capacity(),
+            ),
+            "a resident plan within capacity must not reallocate"
         );
     }
 }
