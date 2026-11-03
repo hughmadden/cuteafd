@@ -313,6 +313,23 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
 
 
+def test_v41_dual_rtx_switches_reach_only_the_coordinator(tmp_root) -> None:
+    """The dual-RTX transfer, busy-lane and staging-check switches travel from the
+    operator's environment to the coordinator only, and only when set."""
+    import v41_launch_capture as capture_module
+
+    switches = {"CUTEAFD_V41_PEER_EXCHANGE": "pull", "CUTEAFD_V41_PUSH_MAX_BYTES": "1048576",
+                "CUTEAFD_V41_BUSY_LANES": "paced", "CUTEAFD_V41_CHECK_STAGING": "1"}
+    unset = parse_run(capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")["containers"][0]["argv"])["env"]
+    assert not any(name in unset for name in switches)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max", operator_env=switches)
+    coordinator = parse_run(result["containers"][0]["argv"])["env"]
+    for name, value in switches.items():
+        assert coordinator[name] == value
+    for worker in result["containers"][1:]:
+        assert not any(name in parse_run(worker["argv"])["env"] for name in switches)
+
+
 @pytest.mark.parametrize("value", [None, "LAZY", "EAGER", "eager"])
 def test_v41_module_loading_key_reaches_only_the_coordinator(tmp_root, monkeypatch, value) -> None:
     """CUDA_MODULE_LOADING=LAZY|EAGER sets the coordinator's CUDA_MODULE_LOADING; unset

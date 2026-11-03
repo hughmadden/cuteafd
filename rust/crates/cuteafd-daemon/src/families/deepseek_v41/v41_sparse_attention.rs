@@ -113,6 +113,9 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     descriptor_staging: LayerStaging<'a>,
     staging: LayerStaging<'a>,
     replay_staging: LayerStaging<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: per layer, the descriptor, metadata and
+    /// replay-begin regions (layer, 40 + layer and 80 + layer).
+    staging_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     capacity: usize,
     batch_rows: usize,
     attention_plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
@@ -186,6 +189,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40)?,
             staging: LayerStaging::new(library, capacity * 80, 40)?,
             replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
+            staging_check: crate::shared::memory::staging_check::StagingCheck::new(library,
+                "V4.1 sparse attention metadata", 120),
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
             graphs: GraphBank::new(None), graph_limit: 1, warmed_kernels: 0, cold: None,
@@ -668,10 +673,14 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             } else { self.storage.kernel.prepare_batch(self.storage.query.buffer, sink, self.storage.metadata.buffer,
                 selected, &bindings, self.storage.output.buffer, self.storage.descriptors.buffer,
                 self.storage.replay_begins.buffer, self.storage.split_scratch.buffer)? };
+            self.staging_check.before_write(layer % 40)?;
             let (host, bytes) = self.descriptor_staging.region(layer);
             bytes[..batch.bytes().len()].copy_from_slice(batch.bytes());
-            unsafe { self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.descriptors.buffer,
-                host, batch.bytes().len(), self.storage.stream.raw)?; }
+            unsafe {
+                self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.descriptors.buffer,
+                    host, batch.bytes().len(), self.storage.stream.raw)?;
+                self.staging_check.uploaded(layer % 40, self.storage.stream.raw)?;
+            }
             // The kernel reads current descriptors rather than capturing external
             // cache pointers or request row counts. Selection is lane-owned and
             // stable; still include its address to guard any future owner change.
@@ -679,6 +688,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 selected.map_or(0, |buffer| buffer.ptr as usize), batch.backend_key()];
             Some(batch)
         } else { None };
+        self.staging_check.before_write(40 + layer % 40)?;
         let (host, bytes) = self.staging.region(layer);
         for (i, m) in metadata.into_iter().enumerate() {
             bytes[i * 8..i * 8 + 8].copy_from_slice(&m.to_ne_bytes());
@@ -687,9 +697,11 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             self.storage.stream.library.copy_host_buffer_h2d_async(
                 self.storage.metadata.buffer, host, rows * 80, self.storage.stream.raw,
             )?;
+            self.staging_check.uploaded(40 + layer % 40, self.storage.stream.raw)?;
         }
         if HEADS==32 || batch.is_some() || requests.iter().any(|r| r.window.cache.begin != 0) {
             let mut row = 0;
+            self.staging_check.before_write(80 + layer % 40)?;
             let (host, bytes) = self.replay_staging.region(layer);
             for request in requests {
                 for _ in request.positions {
@@ -702,6 +714,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 self.storage.stream.library.copy_host_buffer_h2d_async(
                     self.storage.replay_begins.buffer, host, rows * 8, self.storage.stream.raw,
                 )?;
+                self.staging_check.uploaded(80 + layer % 40, self.storage.stream.raw)?;
             }
         }
         let queued = QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, rows * (HEADS*1024)), layer, rows };
