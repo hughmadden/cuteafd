@@ -1,6 +1,6 @@
 //! Bindings every family uses (program table, expert kernels, FP8 GEMV/MoE,
 //! L2 prefetch, vocabulary head, packed 12-bit head, peer copy, EXL3 wire and
-//! packages).
+//! packages, route census).
 
 pub(crate) mod fp8_gemv;
 pub(crate) mod packed_head;
@@ -23,6 +23,7 @@ pub(crate) mod v41_exl3;
 pub(crate) mod v41_exl3_wire;
 pub(crate) mod v41_experts;
 pub(crate) mod rtx_combine;
+pub(crate) mod route_census;
 pub(crate) mod v41_router;
 pub(crate) mod token_io;
 pub mod vision;

@@ -40,6 +40,19 @@ int32_t cuteafd_router_select(float* logits,const float* bias,const int32_t* tid
 // `route_scale`. experts <= 512, topk <= 16.
 int32_t cuteafd_router_select_softmax(const float* logits,uint32_t* ids,float* routing,int32_t rows,
     int32_t experts,int32_t topk,float route_scale,int32_t round_bf16,void* stream);
+// Route census (opt-in diagnostics): adds one count per live route of a
+// router's U32 IDs [rows,topk] into counts[plane][layer][expert] (U64; planes
+// 0 and 1, each [layers,experts]). Row r is live when live is null or
+// live[r] != 0; IDs >= experts are not counted. The plane is read on the
+// device from *phase (0: plane 0, else plane 1), so a captured launch counts
+// each replay in the plane its stream selected last. Reads ids, live and
+// phase, writes only counts (integer atomics): capturable, no host sync.
+// rows <= 65536, topk <= 16, experts <= 1024, layers <= 1024.
+int32_t cuteafd_route_census_count(const uint32_t* ids,const uint8_t* live,int32_t rows,int32_t topk,
+    const uint8_t* phase,uint64_t* counts,int32_t layer,int32_t layers,int32_t experts,void* stream);
+// Selects the plane (0 or 1) later counts on `stream` read from `phase`: a
+// one-byte write in stream order. Not for use inside a capture.
+int32_t cuteafd_route_census_select(uint8_t* phase,int32_t plane,void* stream);
 #ifdef __cplusplus
 }
 #endif

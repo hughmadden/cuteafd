@@ -208,6 +208,24 @@ bool span(const void* p,uint64_t n,int alignment) {
 bool disjoint(const void* a,uint64_t n,const void* b,uint64_t m) {
   auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);return x+n<=y || y+m<=x;
 }
+// Route census: each block bins its share of the live routes in shared memory,
+// then adds its nonzero bins to the selected plane's layer row.
+constexpr int kCensusThreads=256;
+__global__ void __launch_bounds__(kCensusThreads) route_census_kernel(const uint32_t* __restrict__ ids,
+    const uint8_t* __restrict__ live,int routes,int topk,const uint8_t* __restrict__ phase,
+    unsigned long long* __restrict__ counts,int layer,int layers,int experts) {
+  extern __shared__ uint32_t bins[];
+  for(int e=threadIdx.x;e<experts;e+=blockDim.x) bins[e]=0;
+  __syncthreads();
+  for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<routes;i+=gridDim.x*blockDim.x) {
+    const uint32_t expert=ids[i];
+    if(expert<uint32_t(experts) && (live==nullptr || live[i/topk])) atomicAdd(&bins[expert],1u);
+  }
+  __syncthreads();
+  unsigned long long* row=counts+(uint64_t(*phase!=0)*layers+layer)*uint64_t(experts);
+  for(int e=threadIdx.x;e<experts;e+=blockDim.x)
+    if(bins[e]) atomicAdd(row+e,static_cast<unsigned long long>(bins[e]));
+}
 }
 extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* weight,
     const float* bias,const float* bias_vl,const uint8_t* image_mask,float* scores,
@@ -295,4 +313,25 @@ extern "C" int32_t cuteafd_router_select_softmax(const float* logits,uint32_t* i
   softmax_select_kernel<<<rows,512,0,reinterpret_cast<cudaStream_t>(stream)>>>(logits,ids,routing,experts,topk,
       route_scale,round_bf16);
   return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_route_census_count(const uint32_t* ids,const uint8_t* live,int32_t rows,int32_t topk,
+    const uint8_t* phase,uint64_t* counts,int32_t layer,int32_t layers,int32_t experts,void* stream) {
+  static_assert(sizeof(unsigned long long)==sizeof(uint64_t),"census counts are 64-bit");
+  if(rows<1 || rows>65536 || topk<1 || topk>16 || experts<1 || experts>1024 || layers<1 || layers>1024 ||
+      layer<0 || layer>=layers) return cudaErrorInvalidValue;
+  const uint64_t routes=uint64_t(rows)*topk,planes=uint64_t(2)*layers*experts*8;
+  if(!span(ids,routes*4,4) || (live && !span(live,rows,1)) || !span(phase,1,1) || !span(counts,planes,8) ||
+      !disjoint(counts,planes,ids,routes*4) || !disjoint(counts,planes,phase,1) ||
+      (live && !disjoint(counts,planes,live,rows))) return cudaErrorInvalidValue;
+  // Four routes per thread: decode waves (<= 64 rows of 6) take one block,
+  // a 4096-row prefill unit 24; never more than 32 blocks flushing bins.
+  const uint64_t wanted=(routes+4*kCensusThreads-1)/(4*kCensusThreads);
+  const int blocks=int(wanted<32?wanted:32);
+  route_census_kernel<<<blocks,kCensusThreads,experts*sizeof(uint32_t),reinterpret_cast<cudaStream_t>(stream)>>>(
+      ids,live,int(routes),topk,phase,reinterpret_cast<unsigned long long*>(counts),layer,layers,experts);
+  return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_route_census_select(uint8_t* phase,int32_t plane,void* stream) {
+  if(!phase || (plane!=0 && plane!=1)) return cudaErrorInvalidValue;
+  return cudaMemsetAsync(phase,plane,1,reinterpret_cast<cudaStream_t>(stream));
 }
