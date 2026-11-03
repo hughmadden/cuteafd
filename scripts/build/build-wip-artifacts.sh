@@ -82,6 +82,21 @@ case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF
 # would otherwise keep an earlier build's ON.
 exlr8_aot="${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
 case "$exlr8_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $exlr8_aot" >&2; exit 2 ;; esac
+v41_expert_aot=ON
+# >>> sm89 base-only coordinator
+# SM89 (RTX 4090 class) coordinators: no AOT family has SM89 exports yet, so the
+# slot carries the daemon and the base native library only. Every AOT switch is
+# off and `cuteafd plan` names each missing program; drop a switch from this
+# block when its exporter gains SM89.
+if [[ "$role" == coordinator && "$cuda_arch" == 89 ]]; then
+  coordinator_aot=OFF v41_expert_aot=OFF exl3_aot=OFF nvfp4_aot=OFF audio_aot=OFF exlr8_aot=OFF
+  expert_families="" bf16_families=""
+  for switch in DSV4 GLM GLMF MIMO QWEN4 QWEN_DENSE STEP5 KIMIK3 MUSE ML4 VISION_ATTENTION; do
+    printf -v "CUTEAFD_WIP_${switch}_AOT" '%s' OFF
+  done
+  echo "WIP coordinator sm_89: base native library only (no SM89 AOT exports yet)" >&2
+fi
+# <<< sm89 base-only coordinator
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -286,7 +301,7 @@ cmake \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
-  -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
+  -DCUTEAFD_ENABLE_V41_EXPERT_AOT="$v41_expert_aot" \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
   -DCUTEAFD_GENERIC_SPARK_COUNTS="${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
@@ -393,7 +408,11 @@ for wip_family in "${wip_fp8_list[@]}"; do
       --package "$output_dir/fp8/$wip_package" --sparkinfer-revision "$fp8_revision" --role "$role" "${fp8_input_args[@]}"
   done
 done
-install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
+if [[ "$v41_expert_aot" == ON ]]; then
+  install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
+else
+  printf '%s\n' '{"schema":1,"enabled":false}' >"$output_dir/V41_EXPERT_AOT.json"
+fi
 # Keep planner workspace inputs identical to the linked coordinator exports.
 rm -rf "$output_dir/V41_EXPERT_WORKSPACES"
 mkdir -p "$output_dir/V41_EXPERT_WORKSPACES"
@@ -424,7 +443,7 @@ python3 "$source_dir/scripts/build/write-v41-expert-tp-manifest.py" \
 if [[ "$coordinator_aot" == ON ]]; then
   install -m 0644 "$build_dir/native/v41_fp8/v41_fp8.json" "$output_dir/V41_FP8_AOT.json"
 else
-  printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
+  printf '{"schema":1,"role":"%s","enabled":false}\n' "$role" >"$output_dir/V41_FP8_AOT.json"
 fi
 fi
 if [[ "${phase:-all}" != export ]]; then

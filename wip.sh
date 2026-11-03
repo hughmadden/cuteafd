@@ -1293,7 +1293,12 @@ wip_capped_export_on() (
 
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
-  local phase="${1:-all}"
+  # The coordinator's CUDA architecture: 120 (RTX 5090, RTX PRO 6000; default) or
+  # 89 (RTX 4090 class), which builds the daemon and the base native library only,
+  # with no AOT export and so no export GPU or export host.
+  local phase="${1:-all}" coordinator_arch="${CUTEAFD_WIP_COORDINATOR_ARCH:-120}"
+  [[ "$coordinator_arch" == 120 || "$coordinator_arch" == 89 ]] ||
+    release_die "CUTEAFD_WIP_COORDINATOR_ARCH must be 120 or 89"
   [[ "$phase" == native ]] || sync_local_source
   local image_id image_layers
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
@@ -1343,7 +1348,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \
     "$coordinator_container" \
     /wip/source/scripts/build/build-wip-artifacts.sh \
-    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator)
+    /wip/source coordinator "$coordinator_arch" /wip/build/coordinator /wip/output/coordinator)
   # Cargo first, holding no hardware; then the bounded native/AOT export.
   # A native-cache hit restores verified outputs without touching a GPU.
   # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
@@ -1370,7 +1375,8 @@ build_coordinator() {
   fi
   [[ "$phase" != rust ]] || return 0
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import
-  if [[ "${wip_export_locks:-off}" != on ]]; then
+  # An sm_89 coordinator exports nothing: its native phase needs no GPU turn.
+  if [[ "${wip_export_locks:-off}" != on || "$coordinator_arch" == 89 ]]; then
     "${coordinator_build[@]}" native
   elif native_store_has "" "${state_dir:-/nonexistent}" coordinator; then
     echo "WIP coordinator export: native cache hit, no GPU turn"
