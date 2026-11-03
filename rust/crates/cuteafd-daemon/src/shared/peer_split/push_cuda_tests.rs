@@ -260,16 +260,17 @@ fn adopted_head_follows_the_pushers_joined_stage() -> Result<()> { adopted_head(
 #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs with peer access"]
 fn adopted_head_without_the_flag_wait_overtakes() -> Result<()> { adopted_head(false) }
 
-/// Q0: do kernels on independent streams stall behind streams held by a
+/// Q0: does work on independent streams stall behind streams held by a
 /// device wait? Holds K of 32 streams on GPU0 with a spin wait (a peer flag
 /// released by GPU1), a cross-device event wait (released by a gate on
-/// GPU1) or `cuStreamWaitValue32` on a host word, each followed by a
-/// dependent kernel; then queues one short kernel on every other stream and
-/// counts those finished 20 ms later, before any release. Run once per
+/// GPU1) or `cuStreamWaitValue32` on a host word, each followed by dependent
+/// work; then queues the same work on every other stream and counts what
+/// finished 20 ms later, before any release. The work is a short kernel, or
+/// a 64 KiB pinned host-to-device copy (copy engine). Run once per
 /// `CUDA_DEVICE_MAX_CONNECTIONS` (it is read when CUDA starts).
 #[test]
 #[ignore = "probe: requires CUTEAFD_NATIVE_LIB and two CUDA GPUs with peer access"]
-fn q0_held_streams_stall_independent_kernels() -> Result<()> {
+fn q0_held_streams_stall_independent_work() -> Result<()> {
     use crate::shared::memory::HostAllocation;
     const STREAMS: usize = 32;
     let library = library()?;
@@ -280,17 +281,24 @@ fn q0_held_streams_stall_independent_kernels() -> Result<()> {
     let operands = [Allocation::new(devices[0], 512)?, Allocation::new(devices[0], 512)?];
     let outputs = (0..STREAMS).map(|_| Allocation::new(devices[0], 512)).collect::<Result<Vec<_>>>()?;
     let events = (0..STREAMS).map(|_| devices[0].run(|| library.cuda_event_create_ordering())).collect::<Result<Vec<_>>>()?;
-    let kernel = |stream: usize| devices[0].run(|| unsafe {
-        library.peer_add_bf16(operands[0].buffer.ptr, operands[1].buffer.ptr, outputs[stream].buffer.ptr, 256,
-            streams[stream].raw)
+    let host = HostAllocation::new(&library, 64 << 10)?;
+    let landings = (0..STREAMS).map(|_| Allocation::new(devices[0], 64 << 10)).collect::<Result<Vec<_>>>()?;
+    let queue = |work: &str, stream: usize| devices[0].run(|| unsafe {
+        if work == "kernel" {
+            library.peer_add_bf16(operands[0].buffer.ptr, operands[1].buffer.ptr, outputs[stream].buffer.ptr, 256,
+                streams[stream].raw)
+        } else {
+            library.copy_host_buffer_h2d_async(landings[stream].buffer, host.buffer, 64 << 10, streams[stream].raw)
+        }
     });
-    // Warm every kernel and stream before any wait exists.
-    for stream in 0..STREAMS { kernel(stream)?; }
+    // Warm every kernel, copy and stream before any wait exists.
+    for stream in 0..STREAMS { queue("kernel", stream)?; queue("copy", stream)?; }
     library.cuda_device_synchronize()?;
     let mut word = HostAllocation::new(&library, 64)?;
     let exchange = PeerExchange::new_flags(&library, [0, 1], 4, 4096)?;
     let mut report = Vec::new();
-    for hold in ["spin wait", "event wait", "wait-value"] {
+    for (work, hold) in ["kernel", "copy"].into_iter().flat_map(|work|
+        ["spin wait", "event wait", "wait-value"].map(|hold| (work, hold))) {
         for held in [1usize, 2, 4] {
             word.bytes_mut().fill(0);
             let gate = if hold == "event wait" {
@@ -307,10 +315,10 @@ fn q0_held_streams_stall_independent_kernels() -> Result<()> {
                         library.cuda_stream_wait_value32(streams[k].raw, word.buffer.ptr.cast::<u32>(), 1)
                     })?,
                 }
-                kernel(k)?;
+                queue(work, k)?;
             }
             for stream in held..STREAMS {
-                kernel(stream)?;
+                queue(work, stream)?;
                 devices[0].run(|| unsafe { library.cuda_event_record(events[stream], streams[stream].raw) })?;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -328,7 +336,7 @@ fn q0_held_streams_stall_independent_kernels() -> Result<()> {
             for stream in &streams { stream.drain()?; }
             release_stream.drain()?;
             devices[1].run(|| unsafe { library.cuda_event_destroy(gated) })?;
-            report.push(format!("{hold} x{held}: {}/{} independent kernels done while held, stalled streams {stalled:?}",
+            report.push(format!("{work} behind {hold} x{held}: {}/{} independent done while held, stalled streams {stalled:?}",
                 STREAMS - held - stalled.len(), STREAMS - held));
         }
     }
