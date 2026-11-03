@@ -414,16 +414,7 @@ impl<'a> NativePrograms<'a> {
             ("kernel_intermediate", 2304), ("experts", 128), ("topk", 3)] {
             ensure!(experts["geometry"][key].as_u64() == Some(expected), "dSpark expert geometry mismatch: {key}");
         }
-        let lanes = if requests == 1 { 1 } else { 2 };
-        let members = requests.div_ceil(lanes);
-        let live = members * width;
-        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
-        let variants = experts["variants"].as_array().context("missing dSpark expert variants")?;
-        let matching: Vec<_> = variants.iter().filter(|v|
-            v.get("requested_rows").unwrap_or(&v["capacity_rows"]).as_u64() == Some(capacity)).collect();
-        ensure!(matching.len() == 1, "missing or duplicate dSpark expert capacity {capacity}");
-        let expert = matching[0]["core_scratch_nbytes"].as_u64().context("missing dSpark expert scratch")?
-            + capacity * (10240 + 3 * 8 + 2 * 10240);
+        let DsparkWave { lanes, members, live, capacity, expert } = DsparkWave::new(experts, requests, width)?;
         let output = self.projection(capacity, 8192, 5120)?
             + self.scratch(capacity, 32768, 8192)? + 4 + capacity * (65536 + 256);
         let attention = live * (1024 + 8) + cuteafd_core::V41_READ_DESCRIPTOR_BYTES as u64 + output
@@ -453,6 +444,41 @@ impl<'a> NativePrograms<'a> {
             + if lanes > 1 { self.main_context(DECODE_LANE_ROWS)? } else { 0 });
         add(decoder, "dSpark windows", 3 * (requests * 128 * 528 + rows * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64));
         Ok(out)
+    }
+
+    /// `--tp2-dspark-experts`: the peer GPU's expert waves, one per stage and
+    /// lane. Bounded by the whole-width coordinator wave until the dSpark TP2
+    /// role publishes its own workspace manifest (`dspark` keeps charging the
+    /// whole-width waves on the decoder, also a bound for its half).
+    pub fn dspark_tp2_expert_waves(&self, experts: &Value, requests: u64, width: u64) -> Result<u64> {
+        let wave = DsparkWave::new(experts, requests, width)?;
+        wave.lanes.checked_mul(3).and_then(|n| n.checked_mul(wave.expert)).context("dSpark TP2 expert waves overflow")
+    }
+}
+
+/// One dSpark request lane's expert wave at its compiled capacity.
+struct DsparkWave {
+    lanes: u64,
+    members: u64,
+    live: u64,
+    capacity: u64,
+    /// One stage's coordinator expert wave: core scratch plus its row planes.
+    expert: u64,
+}
+
+impl DsparkWave {
+    fn new(experts: &Value, requests: u64, width: u64) -> Result<Self> {
+        let lanes = if requests == 1 { 1 } else { 2 };
+        let members = requests.div_ceil(lanes);
+        let live = members * width;
+        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
+        let variants = experts["variants"].as_array().context("missing dSpark expert variants")?;
+        let matching: Vec<_> = variants.iter().filter(|v|
+            v.get("requested_rows").unwrap_or(&v["capacity_rows"]).as_u64() == Some(capacity)).collect();
+        ensure!(matching.len() == 1, "missing or duplicate dSpark expert capacity {capacity}");
+        let expert = matching[0]["core_scratch_nbytes"].as_u64().context("missing dSpark expert scratch")?
+            + capacity * (10240 + 3 * 8 + 2 * 10240);
+        Ok(Self { lanes, members, live, capacity, expert })
     }
 }
 

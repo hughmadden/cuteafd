@@ -396,6 +396,11 @@ pub(crate) struct PlanArgs {
     /// rank the GPU expert tier's resident set; uniform without one.
     #[arg(long, requires = "gpu_expert_tier")]
     pub(crate) gpu_expert_tier_profile: Option<PathBuf>,
+    /// V4.1 with --rtx 2: plan dSpark's routed draft experts as TP2 halves on
+    /// both GPUs, as serving's --tp2-dspark-experts loads them
+    /// (TP2_DSPARK_EXPERTS=on in --config), instead of whole on the drafter's GPU.
+    #[arg(long)]
+    pub(crate) tp2_dspark_experts: bool,
     /// Removed whole-layer GPU1 placement flag.
     #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
     pub(crate) deprecated_peer_expert_ranges: bool,
@@ -753,6 +758,17 @@ mod tests {
             else { panic!("expected plan"); };
         assert_eq!(crate::commands::plan::layout_options_for_test(&args).expert_tier_profile,
             Some(std::path::PathBuf::from("r.json")));
+    }
+
+    #[test]
+    fn tp2_dspark_experts_is_off_by_default_and_reaches_the_layout() {
+        use clap::Parser;
+        for (flags, expected) in [(vec![], false), (vec!["--tp2-dspark-experts"], true)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model", "--layout", "--rtx", "2"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(crate::commands::plan::layout_options_for_test(&args).tp2_dspark_experts, expected);
+        }
     }
 
     #[test]

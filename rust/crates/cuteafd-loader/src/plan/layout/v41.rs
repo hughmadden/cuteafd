@@ -93,6 +93,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let catalog = input.expert_catalog()?;
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
         v41::owners::DECODE_LANE_ROWS)?;
+    ensure!(!options.tp2_dspark_experts || (dspark && ranks == 2),
+        "--tp2-dspark-experts needs the dSpark drafter and two RTX GPUs");
     let draft = if dspark {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
@@ -101,10 +103,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
         let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
-        Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
+        let draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
-            loader_peak: [bytes, 0], ..Default::default() })
+            loader_peak: [bytes, 0], ..Default::default() };
+        Some(if options.tp2_dspark_experts {
+            let waves = programs.dspark_tp2_expert_waves(&manifest, shape.concurrency, width)?;
+            tp2_dspark_experts(draft, catalog, waves)?
+        } else { draft })
     } else { None };
     let automatic = options.pool_tokens == Some(0);
     let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0)
@@ -208,6 +214,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
+    if let Some(draft) = draft.as_ref().filter(|draft| draft.peer_half > 0) {
+        notes.push(format!("dSpark routed experts: TP2 halves, {} B on each GPU (whole on rtx{}: {} B)",
+            draft.peer_half, ranks - 1, 3 * native_expert_bytes(128, 5120, 2304)));
+    }
     if let (Some(tier), Some((activation, _, profile))) = (&placement.expert_tier, &tier_inputs) {
         notes.extend(expert_tier_notes(tier, &request, activation, profile.as_ref(), &options.expert_tier_model));
     }
@@ -281,6 +291,10 @@ fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placeme
         if gpu == ranks - 1 {
             bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
         }
+        if gpu == 0 && ranks == 2 {
+            // --tp2-dspark-experts: GPU0 holds the other half of dSpark's experts.
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.peer_half)).context("V4.1 draft weight budget overflow")?;
+        }
         if let Some(tier) = &placed.expert_tier {
             bytes = bytes.checked_add(tier.resident_bytes.get(gpu).copied().unwrap_or(0))
                 .context("V4.1 GPU expert tier weight budget overflow")?;
@@ -297,6 +311,25 @@ fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placeme
         }
         Ok(bytes)
     }).collect()
+}
+
+/// `--tp2-dspark-experts`: dSpark's 3 x 128 routed experts as TP2 halves in the
+/// coded-scale layout. The drafter's GPU keeps one half beside its auxiliary
+/// weights, GPU0 holds the other with its own load staging and expert waves
+/// (`waves`), and each loads its half before anything else.
+fn tp2_dspark_experts(draft: DraftInventory, catalog: &crate::OfficialV41Catalog, waves: u64)
+    -> Result<DraftInventory> {
+    let whole = 3 * native_expert_bytes(128, 5120, 2304);
+    let half = 3 * native_expert_bytes(128, 5120, 2304 / 2);
+    let staging = |rank| (0..3).try_fold(0u64, |largest, stage| Ok::<_, anyhow::Error>(largest.max(catalog
+        .expert_staging(crate::V41ExpertSelection::DsparkTp2 { stage, expert: 0, rank })?.staging_bytes() as u64)));
+    let (home, peer) = (staging(1)?, staging(0)?);
+    let resident = draft.resident.checked_sub(whole).and_then(|bytes| bytes.checked_add(half))
+        .context("V4.1 dSpark TP2 residency")?;
+    let mut runtime = draft.runtime;
+    runtime.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert waves", waves, Basis::Estimated));
+    Ok(DraftInventory { resident, runtime, marks: draft.marks, peer_half: half, staging: [home, peer],
+        loading_experts: [half, half], loader_peak: [resident, half + peer] })
 }
 
 /// The tier's expected activations: `--gpu-expert-tier-profile` at the step

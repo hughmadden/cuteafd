@@ -79,6 +79,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 onboard: args.rtx_expert_layers,
                 expert_tier: args.gpu_expert_tier,
                 expert_tier_profile: args.gpu_expert_tier_profile.clone(),
+                tp2_dspark_experts: args.tp2_dspark_experts,
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
@@ -310,6 +311,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
         if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
+        if v41 && cfg.get("TP2_DSPARK_EXPERTS").is_some_and(|value| value == "on") { layout.tp2_dspark_experts = true; }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
@@ -961,6 +963,7 @@ mod tests {
             rtx_expert_layers: None,
             gpu_expert_tier: Default::default(),
             gpu_expert_tier_profile: None,
+            tp2_dspark_experts: false,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),

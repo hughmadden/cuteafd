@@ -4574,6 +4574,37 @@ fn v41_declared_expert_storage_must_match_the_charged_halves() {
 }
 
 #[test]
+fn v41_tp2_dspark_experts_move_half_the_draft_experts_to_gpu0() {
+    // Whole on GPU1, dSpark's 3 x 128 routed experts leave GPU0 with room the
+    // TP2 tier cannot use. As TP2 halves each GPU holds 3 x 128 x 9,131,264 B
+    // and the tier grows into the memory that moves.
+    let dir = strict_v41_snapshot(false);
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
+    let pair = |tp2: bool, cards: usize| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card; cards],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89, workspace_manifest: v41_workspace(dir.path()),
+        pool_tokens: Some(0), context_tokens: 1 << 20, expert_tier: crate::placement::ExpertTierSetting::Auto,
+        tp2_dspark_experts: tp2, ..Default::default() }), ..sparks(4) };
+    let whole = plan_spark_count(dir.path(), &pair(false, 2), 6, Some(4)).unwrap();
+    let split = plan_spark_count(dir.path(), &pair(true, 2), 6, Some(4)).unwrap();
+    assert!(whole.executable() && split.executable(), "{}", render(&split));
+    let bytes = |report: &PlanReport, gpu: usize, group: &str| report.memory_layout.as_ref().unwrap().devices[gpu]
+        .items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    let half = 3 * 128 * crate::formats::scale_codes::expert_bytes(1, 5120, 1152).unwrap();
+    let full = 3 * 128 * crate::formats::scale_codes::expert_bytes(1, 5120, 2304).unwrap();
+    assert_eq!(bytes(&whole, 1, "dSpark weights") - bytes(&split, 1, "dSpark weights"), full - half);
+    assert_eq!((bytes(&whole, 0, "dSpark TP2 expert half"), bytes(&split, 0, "dSpark TP2 expert half")), (0, half));
+    assert!(bytes(&whole, 0, "dSpark TP2 expert waves") == 0 && bytes(&split, 0, "dSpark TP2 expert waves") > 0);
+    let tier = |report: &PlanReport| report.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap().experts;
+    assert!(tier(&split) >= tier(&whole) + 200, "tier {} -> {}", tier(&whole), tier(&split));
+    let notes = &split.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("dSpark routed experts: TP2 halves")), "{notes:?}");
+    // One RTX has no peer for the other half.
+    let single = plan_spark_count(dir.path(), &pair(true, 1), 6, Some(4)).unwrap();
+    assert!(!single.executable() && render(&single).contains("two RTX GPUs"), "{}", render(&single));
+}
+
+#[test]
 fn v41_exl3_is_unsupported_without_a_loader_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);

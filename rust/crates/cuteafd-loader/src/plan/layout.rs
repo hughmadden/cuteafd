@@ -194,6 +194,10 @@ pub struct LayoutOptions {
     /// Per-layer pool rates the tier's residency minimises the predicted
     /// step time with (default: measured on a 48 GB pair and four Sparks).
     pub expert_tier_model: crate::placement::TierStepModel,
+    /// `--tp2-dspark-experts` (V4.1, two RTX): dSpark's routed draft experts as
+    /// TP2 halves on both GPUs, as serving's switch loads them, instead of
+    /// whole on the drafter's GPU.
+    pub tp2_dspark_experts: bool,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
     /// GLM Flash KDA partials and their peer payloads use FP32.
@@ -330,6 +334,7 @@ impl Default for LayoutOptions {
             expert_tier: Default::default(),
             expert_tier_profile: None,
             expert_tier_model: crate::placement::TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS,
+            tp2_dspark_experts: false,
             exchange_f32: false,
             glmf_kda_fp32_partials: false,
             workspace_manifest: None,
