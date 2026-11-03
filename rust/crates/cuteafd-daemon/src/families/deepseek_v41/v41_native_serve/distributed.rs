@@ -75,7 +75,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
-    let weights = BackboneLaneWeights::load_distributed_with_split(
+    let mut weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
         &catalog,
         map,
@@ -84,6 +84,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         args.tp2_query_projection,
         args.tp2_output_projection,
     )?;
+    // Each layer's router runs on its attention GPU (layers 0-19 on GPU0,
+    // 20-39 on GPU1), which counts it.
+    let census = super::route_census(&lib, &args, &[0, 1], &mut weights)?;
     let query_shards=if args.tp2_query_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
@@ -534,7 +537,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
-        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
+        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes,
+        census.as_ref())
 }
 
 

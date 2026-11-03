@@ -77,6 +77,16 @@ impl<'a> BackboneLaneWeights<'a> {
         );
         Self::load_placed(library, catalog, staging, None)
     }
+    /// Every layer's router counts its routes into `census` on the GPU that
+    /// runs it (`CachePlacement::attention`), so each layer is counted once.
+    /// Before any lane exists: lanes and graphs built later include the count.
+    pub(crate) fn install_route_census(&mut self, census: &crate::shared::route_census::RouteCensus<'a>) -> Result<()> {
+        for (layer, weights) in self.layers.iter_mut().enumerate() {
+            let gpu = weights.device.id;
+            weights.get_mut().router.install_census(census.counter(gpu, layer)?)?;
+        }
+        Ok(())
+    }
     /// Layer `layer`'s lane weights in the order a decode step reads them (L2
     /// prefetch): mHC attention, query, output projection, mHC FFN, router and
     /// shared expert. Window, compressor and index weights are not lane weights.
@@ -1328,6 +1338,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         else if let Some(sparse) = &mut self.sparse { sparse.set_decode(decode); }
         // Prefill never prefetches: its own work fills the exchange.
         if let Some(l2) = &mut self.l2 { l2.decode = decode; }
+        // The routing census counts decode/verify and prefill routes apart.
+        self.router.set_route_phase(crate::shared::route_census::RoutePhase::of_pass(decode));
     }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         if let Some(dual)=&mut self.dual_sparse { dual.reserve_decode_rows(rows) }

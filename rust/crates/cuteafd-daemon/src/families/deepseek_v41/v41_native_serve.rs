@@ -395,12 +395,13 @@ fn worker(
         Ok(())
     })?;
     let recorder = dense::Recorder::start(push_policy == PushPolicy::Required)?;
-    let weights = BackboneLaneWeights::load(
+    let mut weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
         BackboneLaneWeights::device_bytes(&lib, &catalog)?,
         16 * 1024 * 1024,
     )?;
+    let census = route_census(&lib, &args, &[lib.cuda_get_device()?], &mut weights)?;
     let producers = CacheProducerWeights::load(
         &lib,
         &catalog,
@@ -705,7 +706,22 @@ fn worker(
         .send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second,
-        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes)
+        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes,
+        census.as_ref())
+}
+
+/// `CUTEAFD_V41_ROUTE_CENSUS` (`shared::route_census`): the census of the
+/// routers on `gpus`, installed in every layer's router before any lane or
+/// graph exists. Its model id is `--model-id`, else the snapshot's hub id or
+/// directory name.
+fn route_census<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs, gpus: &[i32],
+    weights: &mut BackboneLaneWeights<'a>) -> Result<Option<crate::shared::route_census::RouteCensus<'a>>> {
+    let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&args.snapshot))
+        .unwrap_or_else(|| args.snapshot.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned()));
+    let census = crate::shared::route_census::RouteCensus::from_env(lib, gpus,
+        crate::families::deepseek_v41::v41_backbone_router::ROUTE_CENSUS_SHAPE, model)?;
+    if let Some(census) = &census { weights.install_route_census(census)?; }
+    Ok(census)
 }
 
 /// The HC-9 prefill pacing hold at a chunk boundary: bounded by the host cache's store
