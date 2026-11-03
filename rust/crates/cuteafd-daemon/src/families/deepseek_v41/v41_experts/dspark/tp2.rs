@@ -84,13 +84,18 @@ mod tests {
         let mut rounding_distinguished=false;
         for id in [0,1] {
             let device=Device {library:&library,id};
-            for capacity in [1,16,80,256,1024,4096] {
+            // Each role at its own exported capacities: draft rows for the
+            // dSpark halves, target rows (verify width 64) for the backbone.
+            let draft=[1,16,40,cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32,cuteafd_core::V41_DRAFT_WIDE_ROWS as u32,1024,4096];
+            for capacity in draft {
                 let kernel=device.run(||library.v41_dspark_tp2_expert_kernel(capacity))?;
                 let info=kernel.info();
                 ensure!((info.role,info.experts,info.logical_intermediate,info.topk,info.input_dtype)
                     ==(4,128,1152,3,7),"draft TP2 native geometry differs");
                 assert!(!kernel.accumulates_tokens());
-                let backbone=device.run(||library.v41_tp2_expert_kernel(capacity))?;
+            }
+            for capacity in cuteafd_core::V41_TARGET_CAPACITIES {
+                let backbone=device.run(||library.v41_tp2_expert_kernel(u32::try_from(capacity)?))?;
                 assert_eq!(backbone.info().role,3);
             }
             let reducer=library.v41_route_reducer()?;
