@@ -79,12 +79,15 @@ impl<'a> Wave<'a> {
     /// # Safety
     /// Inputs remain live and immutable until the enclosing chain drains; the
     /// caller consumes the returned plane before reusing this slot's window.
+    /// `adopt`: a pushing pass's head mark when the reduction's destination
+    /// is not the head's GPU (see [`PeerTransfer::copy_then_adopting`]).
     pub(crate) async unsafe fn execute(&mut self, layer: usize, rows: u32, destination: usize,
-        inputs: [CuteafdDeviceBuffer; 2], producers: [&Stream<'a>; 2]) -> Result<CuteafdDeviceBuffer> {
+        inputs: [CuteafdDeviceBuffer; 2], producers: [&Stream<'a>; 2],
+        adopt: Option<crate::shared::memory::chain::HeadMark>) -> Result<CuteafdDeviceBuffer> {
         ensure!(self.window.admits(rows as usize), "shared TP2 rows differ from window");
         let mut execution = self.storage.execution.lock().await;
         execution.window = self.window.clone();
-        unsafe { execution.execute(layer, rows, destination, inputs, producers).await }
+        unsafe { execution.execute(layer, rows, destination, inputs, producers, adopt).await }
     }
 }
 
@@ -147,7 +150,8 @@ impl<'a> Execution<'a> {
     /// completion. Each lane owns a separate Wave. Returned output remains valid
     /// only until the next execute or destruction of this owner.
     pub async unsafe fn execute(&mut self, layer: usize, rows: u32, destination: usize,
-        inputs: [CuteafdDeviceBuffer; 2], producers: [&Stream<'a>; 2]) -> Result<CuteafdDeviceBuffer> {
+        inputs: [CuteafdDeviceBuffer; 2], producers: [&Stream<'a>; 2],
+        adopt: Option<crate::shared::memory::chain::HeadMark>) -> Result<CuteafdDeviceBuffer> {
         ensure!(destination < 2 && rows > 0 && rows <= self.capacity, "invalid shared TP2 destination/rows");
         struct Drain<'s, 'a> { ranks: &'s mut [RankWave<'a>; 2], complete: bool }
         impl Drop for Drain<'_, '_> {
@@ -183,8 +187,8 @@ impl<'a> Execution<'a> {
         let add = &self.add;
         let count = rows as usize * 5120;
         let guard = (!pushing).then_some(&self.released[destination]);
-        unsafe { self.transfers[destination].copy_then_ordered(&remote.output, &mut self.staging[destination],
-            &remote.stream, count*2, guard, |peer, stream| {
+        unsafe { self.transfers[destination].copy_then_adopting(&remote.output, &mut self.staging[destination],
+            &remote.stream, count*2, guard, adopt.filter(|_| pushing), |peer, stream| {
                 output.device.library.cuda_stream_wait_event(stream, ready.raw)?;
                 add.launch(local.output.buffer, peer, output_buffer, count, stream)
             }).await?; }
@@ -347,8 +351,8 @@ mod tests {
             for input in &inputs { input.device.run(|| lib.copy_h2d(input.buffer, &host))?; }
             let [left, right] = &mut lanes;
             let (a,b) = runtime.block_on(async { tokio::join!(
-                unsafe { left.execute(0, rows, 0, [inputs[0].buffer, inputs[1].buffer], [&producers[0], &producers[1]]) },
-                unsafe { right.execute(0, rows, 1, [inputs[0].buffer, inputs[1].buffer], [&producers[0], &producers[1]]) }
+                unsafe { left.execute(0, rows, 0, [inputs[0].buffer, inputs[1].buffer], [&producers[0], &producers[1]], None) },
+                unsafe { right.execute(0, rows, 1, [inputs[0].buffer, inputs[1].buffer], [&producers[0], &producers[1]], None) }
             ) });
             let outputs = [a?,b?];
             let mut actual = [vec![0; rows as usize*5120*2], vec![0; rows as usize*5120*2]];
@@ -445,14 +449,14 @@ mod shared_storage_tests {
         }}
         let producers=[Stream::new(devices[0])?,Stream::new(devices[1])?];
         let mut private=Wave::new(weights.clone(),16)?;
-        runtime.block_on(unsafe {private.execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
+        runtime.block_on(unsafe {private.execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]],None)})?;
         let private_rank=private.storage.execution.try_lock().unwrap().ranks[0].output.buffer;
         let mut want=vec![0;16*10240];lib.copy_d2h(&mut want,private_rank)?;
         let storage=Storage::new(weights,48,16)?;
         let mut slots=[Wave::on_storage(storage.clone()),Wave::on_storage(storage.clone())];
         for (i,slot) in slots.iter_mut().enumerate() {
             slot.select_window(RowWindow::within(i*16..i*16+16,48)?)?;
-            runtime.block_on(unsafe {slot.execute(0,16,i,inputs[i].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
+            runtime.block_on(unsafe {slot.execute(0,16,i,inputs[i].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]],None)})?;
         }
         let rank=storage.execution.try_lock().unwrap().ranks[0].output.buffer;
         let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
@@ -460,7 +464,7 @@ mod shared_storage_tests {
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
         let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;
         runtime.block_on(chains[0].handle().scope(async {
-            unsafe {slots[0].execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]]).await?;}
+            unsafe {slots[0].execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]],None).await?;}
             devices[1].run(||unsafe {crate::shared::memory::chain::join(&lib,reader.raw)?;
                 lib.copy_peer_async(saved.buffer,rank,want.len(),reader.raw)?;
                 crate::shared::memory::chain::finish(&lib,reader.raw)})?;
@@ -468,7 +472,7 @@ mod shared_storage_tests {
         }))?;
         SKIP_RANK_ACQUIRE.with(|s|s.set(!guarded));
         let queued=runtime.block_on(chains[1].handle().scope(async {
-            unsafe {slots[1].execute(0,16,1,inputs[1].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]]).await?;}
+            unsafe {slots[1].execute(0,16,1,inputs[1].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]],None).await?;}
             anyhow::Ok(())
         }));SKIP_RANK_ACQUIRE.with(|s|s.set(false));queued?;
         let deadline=std::time::Instant::now()+std::time::Duration::from_secs(if guarded {2}else {10});let mut done=false;

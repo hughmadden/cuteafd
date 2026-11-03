@@ -65,6 +65,15 @@ impl Lane {
     fn wait(&mut self, stream: Name, flag: Name) {
         if self.keep(leak(format!("{flag} wait"))) { self.s.wait_flag(stream, flag); }
     }
+    /// A site's push on a flag it shares with another site (A2 and A5 share
+    /// one input flag per direction); `site` names the negative control.
+    fn push_site(&mut self, stream: Name, flag: Name, site: &str, reads: &[Name], writes: &[Name]) {
+        let label = self.label(&format!("{site} push"));
+        self.s.push(stream, flag, label, reads, writes);
+    }
+    fn wait_site(&mut self, stream: Name, flag: Name, site: &str) {
+        if self.keep(leak(format!("{site} wait"))) { self.s.wait_flag(stream, flag); }
+    }
 
     /// One layer: attention, the FFN by `kind`, then the block finish.
     fn layer(&mut self, kind: Layer) {
@@ -92,14 +101,23 @@ impl Lane {
         self.layer += 1;
     }
 
-    /// `tp2_ffn::Execution::execute` (A2 pulled; A3 and A4 by mode).
+    /// `tp2_ffn::Execution::execute` (A2, A3 and A4 by mode).
     fn tp2(&mut self) {
-        // The TP2 FFN's own scratch guard (A2 still pulls in Stage 1).
-        self.s.wait_event("tp2 stream0", "tp2 released").wait_event("tp2 stream1", "tp2 released");
-        self.join("tp2 stream0");
-        if self.keep("tp2 stream1 join") { self.join("tp2 stream1"); }
-        self.work("tp2 stream1", "A2 pull", &["values0", "wire0", "ids0", "routing0"],
-            &["peer1 values", "peer1 wire", "peer1 ids", "peer1 routing"]);
+        let inputs = ["values0", "wire0", "ids0", "routing0"];
+        let peers = ["peer1 values", "peer1 wire", "peer1 ids", "peer1 routing"];
+        if self.o.push {
+            // A2: one push of the four planes; the remote stream waits on the
+            // flag and does not join the chain. No scratch guard.
+            self.join("tp2 stream0");
+            self.push_site("tp2 stream0", "inputs 0>1", "A2", &inputs, &peers);
+            self.wait_site("tp2 stream1", "inputs 0>1", "A2");
+        } else {
+            // The TP2 FFN's own scratch guard, then the pull.
+            self.s.wait_event("tp2 stream0", "tp2 released").wait_event("tp2 stream1", "tp2 released");
+            self.join("tp2 stream0");
+            if self.keep("tp2 stream1 join") { self.join("tp2 stream1"); }
+            self.work("tp2 stream1", "A2 pull", &inputs, &peers);
+        }
         // Routed: OwnerPair::execute, owner = GPU0.
         self.s.record("tp2 stream0", "rank0 input").wait_event("rank0", "rank0 input");
         self.work("rank0", "routed rank0", &["wire0", "ids0", "routing0"], &["partial0"]);
@@ -118,17 +136,20 @@ impl Lane {
         self.work("owner transfer0", "routed reduce", &["owner staging0", "partial0"], &["routed output0"]);
         self.finish("owner transfer0");
         // Shared: SharedWave::execute, destination = GPU0.
-        self.shared(0, ["values0", "peer1 values"]);
+        self.shared(0, ["values0", "peer1 values"], false);
         self.join("tp2 stream0");
         self.work("tp2 stream0", "TP2 add", &["routed output0", "shared output0"], &["tp2 output0"]);
         self.finish("tp2 stream0");
-        if !self.o.push { self.release("shared released0"); }
-        self.release("tp2 released");
+        if !self.o.push {
+            self.release("shared released0");
+            self.release("tp2 released");
+        }
     }
 
     /// The shared expert's two halves reduced on `destination`
-    /// (`v41_backbone_shared::tp2::Execution::execute`); `inputs` per GPU.
-    fn shared(&mut self, destination: usize, inputs: [Name; 2]) {
+    /// (`v41_backbone_shared::tp2::Execution::execute`); `inputs` per GPU;
+    /// `adopt`: the destination adopts the head (`copy_then_adopting`).
+    fn shared(&mut self, destination: usize, inputs: [Name; 2], adopt: bool) {
         let guards = !self.o.push;
         if guards { self.s.wait_event("shared rank0", "rank released").wait_event("shared rank1", "rank released"); }
         let remote = 1 - destination;
@@ -159,7 +180,7 @@ impl Lane {
         }
         self.s.wait_event(transfer, ready);
         self.work(transfer, "shared add", &[out(destination), staging], &[output]);
-        self.finish(transfer);
+        if adopt { self.adopt(transfer); } else { self.finish(transfer); }
         if guards { self.release("rank released"); }
     }
 
@@ -170,13 +191,22 @@ impl Lane {
         let remote = 1 - local;
         let (tp2_local, tp2_remote) = if gpu1 { ("tp2 stream1", "tp2 stream0") } else { ("tp2 stream0", "tp2 stream1") };
         let peer_values = if gpu1 { "peer0 values" } else { "peer1 values" };
-        // `execute_shared_on` (A5 still pulls in Stage 1).
-        self.join(tp2_local);
-        if self.keep("tp2 remote join") { self.join(tp2_remote); }
-        self.work(tp2_remote, "A5 pull", &[values], &[peer_values]);
+        // `execute_shared_on` (A5).
+        let flag = if gpu1 { "inputs 1>0" } else { "inputs 0>1" };
+        if self.o.push {
+            self.join(tp2_local);
+            self.push_site(tp2_local, flag, "A5", &[values], &[peer_values]);
+            self.wait_site(tp2_remote, flag, "A5");
+        } else {
+            self.join(tp2_local);
+            if self.keep("tp2 remote join") { self.join(tp2_remote); }
+            self.work(tp2_remote, "A5 pull", &[values], &[peer_values]);
+        }
         let mut inputs = [values; 2];
         inputs[remote] = peer_values;
-        self.shared(1, inputs);
+        // Below the boundary the reduction is on the other GPU: it adopts
+        // the head the A5 push joined.
+        self.shared(1, inputs, self.o.push && !gpu1);
         // `finish_values`: land the wave and reduce on the transport GPU.
         self.join("reduce1");
         self.work("reduce1", "land and reduce", &["shared output1"], &["reduce output1"]);
@@ -291,7 +321,8 @@ fn pushed_decode_lane_is_ordered_without_the_shared_guards() {
 /// missing, on the buffer the scratch guards or the pull used to protect.
 #[test]
 fn pushed_lane_without_a_flag_wait_races() {
-    for (edge, buffer) in [("A3 wait", "owner staging0"), ("A4 wait", "shared staging0"),
+    for (edge, buffer) in [("A2 wait", "peer1 wire"), ("A5 wait", "peer1 values"),
+        ("A3 wait", "owner staging0"), ("A4 wait", "shared staging0"),
         ("A6 wait", "shared staging1"), ("A7 wait", "tp2 output0"), ("A1 wait", "x1"),
         ("A8 wait", "head input0"), ("A9 wait", "merge remote1")] {
         let (found, first, second) = race(schedule(Options { push: true, drop: Some(edge), ..Options::default() }).check());

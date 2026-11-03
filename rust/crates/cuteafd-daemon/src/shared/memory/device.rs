@@ -510,6 +510,19 @@ impl<'a> PeerTransfer<'a> {
     /// streams releases the guard after its read.
     pub async unsafe fn copy_then_ordered(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
         producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
+        unsafe { self.copy_then_adopting(source, destination, producer, bytes, guard, None, then).await }
+    }
+    /// As [`Self::copy_then_ordered`]; a pushing transfer given `adopt` (the
+    /// mark of a push whose stream the producer follows) adopts the chain
+    /// head on its destination stream instead of merging it (a merge is a
+    /// cross-device event wait when the head is on the source GPU).
+    /// # Safety
+    /// As `copy_then_ordered`; `producer` follows the stream that joined the
+    /// head `adopt` names, and no stage finished since.
+    pub async unsafe fn copy_then_adopting(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
+        producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        adopt: Option<super::chain::HeadMark>,
         mut then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
         let library = self.destination.device.library;
         ensure!(source.device.id == self.ready.device.id
@@ -534,7 +547,10 @@ impl<'a> PeerTransfer<'a> {
             self.destination.device.run(|| unsafe {
                 if !unordered { push.wait(self.destination.raw)?; }
                 then(destination.buffer, self.destination.raw)?;
-                super::chain::finish(library, self.destination.raw)
+                match adopt {
+                    Some(mark) => super::chain::finish_after_flag(library, self.destination.raw, Some(mark)),
+                    None => super::chain::finish(library, self.destination.raw),
+                }
             })?;
             drain.complete = true;
             return Ok(());
