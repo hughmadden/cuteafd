@@ -141,6 +141,8 @@ pub(crate) struct Pass<'a, R> {
     /// 1 RTX + 3 Sparks: device-ordered verify 37.9 -> 38.3-39.1 ms, decode
     /// 0.97-0.98x; 2 RTX + 6 Sparks: 25.8 -> 24.0 ms, decode 1.08-1.10x).
     device_default: bool,
+    /// The next device-ordered pass is paced ([`Self::set_pacing`]).
+    paced: bool,
     /// The next pass may L2-prefetch during its exchanges ([`Self::set_l2_prefetch`]).
     l2_solo: bool,
 }
@@ -164,6 +166,7 @@ impl<'a, R> Pass<'a, R> {
     fn begin_chain(&mut self, enabled: bool) -> Result<Option<crate::shared::memory::chain::ChainHandle<'a>>> {
         if let Some(chain) = &self.chain {
             chain.set_device_order(std::mem::replace(&mut self.device_order, self.device_default));
+            chain.set_pacing(std::mem::replace(&mut self.paced, false));
         }
         let Some(chain) = self.chain.as_ref().filter(|_| enabled) else { return Ok(None) };
         // Cancellation may have left work queued on this owner.
@@ -188,9 +191,18 @@ impl<'a, R> Pass<'a, R> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
         chain.drain_bounded(Duration::from_secs(60))
     }
+    /// The end of a chained pass: a paced pass yields while it drains
+    /// (`StageChain::drain_cooperative`), any other drains on the thread.
+    pub(super) async fn drain_pass_chain(&self, paced: bool) -> Result<()> {
+        let chain = self.chain.as_ref().context("target pass chain absent")?;
+        if paced { chain.drain_cooperative(Duration::from_secs(60)).await } else { self.drain_chain() }
+    }
 
     /// Device order for the next pass only, within this pass's default.
     pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on && self.device_default; }
+    /// Pacing for the next pass only, if it runs device-ordered
+    /// (`chain::paced`; `CUTEAFD_V41_BUSY_LANES=paced` with both lanes busy).
+    pub(crate) fn set_pacing(&mut self, on: bool) { self.paced = on; }
     /// Whether the next pass may prefetch weights into L2 during its Spark
     /// exchanges (`--l2-prefetch`): only while the other lane is idle. Consumed
     /// by that pass, like the device order.
@@ -269,6 +281,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             chain,
             device_order: false,
             device_default: false,
+            paced: false,
             l2_solo: true,
         })
     }
@@ -471,11 +484,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             if result.is_ok() { self.resources.lane.drain_route_ring()?; }
             return result;
         };
+        let paced = handle.paced();
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
             requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
-        let drained = self.drain_chain();
+        let drained = self.drain_pass_chain(paced).await;
         // A failed Spark wire released its waits over garbage planes.
         let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());
         if result.is_ok() {
@@ -872,6 +886,7 @@ mod tests {
             chain: None,
             device_order: false,
             device_default: true,
+            paced: false,
             l2_solo: true,
         };
         assert!(pass.begin_chain(false)?.is_none());

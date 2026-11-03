@@ -244,9 +244,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let operation: Result<()> = async {
                 if retain_shapes { pass.retain_small_graph_shapes()?; }
                 pass.set_capture(capture)?;
-                // Device-ordered passes only while the other lane is idle (two
-                // busy lanes interleave on host waits; see PLAN.md).
-                pass.set_device_order(!shared);
+                // Device-ordered passes while the other lane is idle; two busy
+                // lanes interleave on host waits, or on paced device-ordered
+                // passes (`CUTEAFD_V41_BUSY_LANES`; see PLAN.md).
+                let order = super::busy_lanes::mode()?.order(shared);
+                pass.set_device_order(order.device);
+                pass.set_pacing(order.paced);
                 // The peer lane's work would fill this lane's exchanges and evict an L2 prefetch.
                 pass.set_l2_prefetch(!shared);
                 let current = batch.as_mut().unwrap();

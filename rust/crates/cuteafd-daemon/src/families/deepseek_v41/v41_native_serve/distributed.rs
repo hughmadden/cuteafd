@@ -257,6 +257,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let peer_push = crate::families::deepseek_v41::v41_peer_push::mode()?
         == crate::families::deepseek_v41::v41_peer_push::Mode::Push;
     tracing::info!(peer_push, "V4.1 dual decode transfers ({})", crate::families::deepseek_v41::v41_peer_push::MODE_ENV);
+    let busy_lanes = super::scheduler::busy_lanes::mode()?;
+    tracing::info!(?busy_lanes, "V4.1 busy decode lanes ({})", super::scheduler::busy_lanes::ENV);
     if peer_push {
         pass.enable_peer_push()?;
         second.enable_peer_push()?;

@@ -214,6 +214,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             chain,
             device_order: true,
             device_default: true,
+            paced: false,
             l2_solo: true,
             sampled: None,
         })
@@ -427,10 +428,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             return self.settle_route_rings(result);
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
+        let paced = handle.paced();
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
             requests, batch, transport, placement, selected, suffix, encoder, greedy)) }).await;
         let issued_us = timed.map(|t| t.elapsed().as_micros() as u64);
-        let drained = self.drain_chain();
+        let drained = self.drain_pass_chain(paced).await;
         let drained_us = timed.map(|t| t.elapsed().as_micros() as u64);
         // A failed Spark wire released its waits over garbage planes.
         let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());

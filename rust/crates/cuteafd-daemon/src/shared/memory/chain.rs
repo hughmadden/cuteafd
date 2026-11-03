@@ -46,6 +46,8 @@ struct Current {
     generation: Rc<Cell<u64>>,
     /// This pass may run device-ordered ([`deferred`]).
     device: bool,
+    /// This device-ordered pass is paced ([`paced`]).
+    paced: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,12 +72,18 @@ pub(crate) struct StageChain<'a> {
     marked: Rc<Cell<[Option<usize>; 2]>>,
     generation: Rc<Cell<u64>>,
     device: Cell<bool>,
+    paced: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
     pub fn library(&self) -> &'a NativeLibrary { self.library }
     /// Whether the next scoped pass runs device-ordered; default on.
     pub fn set_device_order(&self, on: bool) {
         self.device.set(on);
+    }
+    /// Whether the next scoped device-ordered pass is paced ([`paced`]);
+    /// default off.
+    pub fn set_pacing(&self, on: bool) {
+        self.paced.set(on);
     }
     /// A chain for the current device only.
     pub fn new(library: &'a NativeLibrary) -> Result<Self> {
@@ -107,14 +115,16 @@ impl<'a> StageChain<'a> {
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
             forks: forks.into(), fork: Rc::new(Cell::new(None)), fences: fences.into(),
-            marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true) })
+            marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true),
+            paced: Cell::new(false) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
     pub fn handle(&self) -> ChainHandle<'a> {
         ChainHandle { library: self.library, current: Current {
             events: self.events.clone(), head: self.head.clone(),
             forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
-            marked: self.marked.clone(), generation: self.generation.clone(), device: self.device.get() } }
+            marked: self.marked.clone(), generation: self.generation.clone(), device: self.device.get(),
+            paced: self.paced.get() } }
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
@@ -150,6 +160,33 @@ impl<'a> StageChain<'a> {
         })();
         self.library.cuda_set_device(previous)?;
         result?;
+        self.drain()
+    }
+    /// [`Self::drain_bounded`] for a paced pass: between polls it yields to
+    /// the executor (after the shared host-wait pacing) instead of sleeping
+    /// on the thread, so the other busy lane keeps issuing meanwhile.
+    pub async fn drain_cooperative(&self, limit: std::time::Duration) -> Result<()> {
+        let Some(head) = self.head.get() else { return self.drain() };
+        let (device, event) = self.events[head];
+        let Some(fence) = self.fences.iter().find(|f| f.device == device).copied() else { return self.drain() };
+        let on_device = |work: &dyn Fn() -> Result<bool>| -> Result<bool> {
+            let previous = self.library.cuda_get_device()?;
+            self.library.cuda_set_device(device)?;
+            let result = work();
+            self.library.cuda_set_device(previous)?;
+            result
+        };
+        // SAFETY: the fence stream and head event belong to this chain's device.
+        on_device(&|| unsafe { self.library.cuda_stream_wait_event(fence.stream, event).map(|()| true) })?;
+        let started = std::time::Instant::now();
+        let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
+        // SAFETY: as above.
+        while !on_device(&|| unsafe { self.library.cuda_stream_query(fence.stream) })? {
+            anyhow::ensure!(started.elapsed() < limit,
+                "device-ordered pass did not complete within {limit:?} (a device wait never released)");
+            backoff.pause();
+            tokio::task::yield_now().await;
+        }
         self.drain()
     }
 }
@@ -237,6 +274,8 @@ pub(crate) struct ChainHandle<'a> {
     current: Current,
 }
 impl<'a> ChainHandle<'a> {
+    /// Whether the scope this handle installs is device-ordered and paced.
+    pub fn paced(&self) -> bool { self.current.device && self.current.paced }
     /// Poll `future` with this chain installed as the current scope. Cancellation
     /// drains its recorded work before the future releases borrowed storage.
     pub fn scope<F: Future>(self, future: F) -> ChainScope<'a, F> {
@@ -275,6 +314,16 @@ pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
 /// both V4.1 lanes busy).
 pub(crate) fn deferred() -> bool {
     CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
+}
+
+/// Inside a device-ordered scope the pass owner paced
+/// ([`StageChain::set_pacing`]: `CUTEAFD_V41_BUSY_LANES=paced` with both
+/// V4.1 lanes busy): a stage that would queue a wait on a Spark reply first
+/// waits, yielding, until the reply landed, as a host-ordered pass does, so
+/// no stream holds a wait through the round trip and the lanes interleave
+/// layer by layer.
+pub(crate) fn paced() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device && c.paced))
 }
 
 pub(crate) struct ChainScope<'a, F> {
@@ -583,6 +632,7 @@ mod tests {
                         events: [std::ptr::null_mut(); 2] }; 2]
                 } else { vec![] }.into(),
                 marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true),
+                paced: Cell::new(false),
             };
             if path == "cancel" {
                 let mut scope = Box::pin(chain.handle().scope(async move {
