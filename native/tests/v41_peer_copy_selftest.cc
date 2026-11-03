@@ -76,7 +76,9 @@ int main() {
       for(size_t i=0;i<bytes+32;++i)if(output[i]!=(i<bytes?input[i]:uint8_t(0xcd)))
         throw std::runtime_error("pitched split/gather payload or guard mismatch");
       for(auto& value:input)value^=0x5a;
-      Check(cudaMemcpy(source,input.data(),bytes,cudaMemcpyHostToDevice));Check(cudaSetDevice(peer));
+      // A pageable cudaMemcpy may return before its DMA lands: finish it before the peer reads.
+      Check(cudaMemcpy(source,input.data(),bytes,cudaMemcpyHostToDevice));Check(cudaDeviceSynchronize());
+      Check(cudaSetDevice(peer));
     }
     Check(cudaGraphExecDestroy(executable));Check(cudaGraphDestroy(graph));
     Check(cudaFree(half[0]));Check(cudaFree(half[1]));Check(cudaStreamDestroy(stream[peer]));

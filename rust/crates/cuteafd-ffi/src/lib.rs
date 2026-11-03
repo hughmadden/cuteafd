@@ -2860,8 +2860,9 @@ impl NativeLibrary {
 
 
     /// Blocking default-stream upload for fresh storage or a destination whose
-    /// prior consumers have completed. This does not join nonblocking streams;
-    /// use `copy_h2d_ordered` for queued workspace reuse.
+    /// prior consumers have completed: it returns once the DMA has landed, so any
+    /// later reader sees the bytes. It does not join nonblocking streams; use
+    /// `copy_h2d_ordered` for queued workspace reuse.
     pub fn copy_h2d(&self, dst: CuteafdDeviceBuffer, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());
