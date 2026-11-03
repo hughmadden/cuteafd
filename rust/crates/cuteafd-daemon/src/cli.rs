@@ -384,10 +384,12 @@ pub(crate) struct PlanArgs {
     /// layer count `N` (the KV pool is then the output).
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
-    /// V4.1 GPU expert tier for --layout, in place of whole-layer onboarding:
-    /// `off`, `auto` (pool first; the tier takes what is left) or `N` experts
-    /// resident on the coordinator GPUs in every routed layer (the KV pool is
-    /// then the output). The Sparks keep every expert.
+    /// V4.1 GPU expert tier for --layout: per-layer expert residency on the
+    /// coordinator GPUs, ranked by predicted step time, generalising
+    /// whole-layer onboarding (`--rtx-expert-layers N` then pins N whole
+    /// layers inside it). `off`, `auto` (pool first; the tier takes what is
+    /// left while it still helps) or `N` experts per routed layer on average
+    /// (the KV pool is then the output). The Sparks keep every expert.
     #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
     pub(crate) gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
     /// Per-layer expert route counts (JSON `{"layers": [[count; experts]; routed layers]}`) that
