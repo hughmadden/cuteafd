@@ -213,10 +213,7 @@ impl V41Fp8Kernel<'_> {
         destination: CuteafdDeviceBuffer,
         stream: *mut c_void,
     ) -> Result<()> {
-        require(
-            source,
-            self.info.packed_weight_scale_bytes as usize / 32,
-        )?;
+        require(source, scale_grid_bytes(self.info.input_dim, self.info.output_dim)?)?;
         require(
             destination,
             usize::try_from(self.info.packed_weight_scale_bytes)?,
@@ -293,10 +290,7 @@ impl V41Fp8Kernel<'_> {
             require(f, rows as usize * 256)?;
         }
         require(source, rows as usize * self.info.input_dim as usize * 2)?;
-        require(
-            weight,
-            self.info.packed_weight_scale_bytes as usize * 32,
-        )?;
+        require(weight, weight_bytes(self.info.input_dim, self.info.output_dim)?)?;
         require(
             scales,
             usize::try_from(self.info.packed_weight_scale_bytes)?,
@@ -381,9 +375,30 @@ fn groups(input: u32, output: u32) -> u64 {
     if (input, output) == (32768, 8192) { 8 } else { 1 }
 }
 
+/// FP8 weight bytes of a matrix: one E4M3 byte per element of each group.
+fn weight_bytes(input: u32, output: u32) -> Result<usize> {
+    Ok(usize::try_from(u64::from(input) * u64::from(output) / groups(input, output))?)
+}
+
+/// The checkpoint's UE8M0 weight-scale grid: one byte per 32 x 32 block. The
+/// guards come from geometry, not from the packed size, whose ratio to the
+/// grid depends on the architecture's layout (SM120 expands it, SM89 keeps it).
+fn scale_grid_bytes(input: u32, output: u32) -> Result<usize> {
+    Ok(weight_bytes(input, output)? / 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weight_and_scale_guards_come_from_geometry() -> Result<()> {
+        // Grouped WO-A, eight 4096 x 1024 blocks; the C side's src_bytes agrees.
+        assert_eq!((weight_bytes(32768, 8192)?, scale_grid_bytes(32768, 8192)?), (33_554_432, 32_768));
+        assert_eq!((weight_bytes(15360, 5120)?, scale_grid_bytes(15360, 5120)?), (78_643_200, 76_800));
+        assert_eq!((weight_bytes(5120, 512)?, scale_grid_bytes(5120, 512)?), (2_621_440, 2_560));
+        Ok(())
+    }
 
     /// Every supported geometry at every exported projection capacity creates a
     /// kernel through this FFI from the library under test (SM120 packed or
