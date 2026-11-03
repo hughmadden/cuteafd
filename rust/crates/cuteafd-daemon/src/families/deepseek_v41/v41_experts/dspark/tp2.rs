@@ -6,6 +6,8 @@ pub(super) const LAYOUT: Layout = Layout {
 };
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod push_tests;
 
 pub(super) use crate::shared::experts::rtx::draft::rank::Weights;
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
@@ -27,14 +29,22 @@ pub(super) struct RoutedWave<'w, 'a> {
 impl<'w,'a> RoutedWave<'w,'a> {
     pub fn device_bytes(library:&NativeLibrary,capacity:u32)->Result<[usize;2]> {
         let mut bytes=pair::Pair::device_bytes(library,capacity,LAYOUT)?;
-        bytes[1]+=capacity as usize*(10240*2+12*2);
+        bytes[1]+=capacity as usize*10240*2+pair::padded(capacity as usize*12)*2;
         Ok(bytes)
     }
+    /// Route ids and weights in whole 16-byte units: a pushing pair rounds
+    /// their planes up to them. Pushes unless `CUTEAFD_V41_PEER_EXCHANGE=pull`.
     pub fn new(owner:&'w DsparkWeights<'a>,weights:[Rc<Weights<'a>>;2],stage:usize,capacity:u32)->Result<Self> {
+        use crate::families::deepseek_v41::v41_peer_push;
         ensure!(stage<3 && owner.library.cuda_get_device()?==1,"draft TP2 transformer must reside on RTX1");
         let device=Device {library:owner.library,id:1};
-        Ok(Self {stream:Stream::new(device)?,pair:pair::Pair::new(weights,capacity,LAYOUT)?,
-            inputs:[Allocation::new(device,capacity as usize*10240)?,Allocation::new(device,capacity as usize*12)?,Allocation::new(device,capacity as usize*12)?],
+        let mut pair=pair::Pair::new(weights,capacity,LAYOUT)?;
+        if v41_peer_push::mode()?==v41_peer_push::Mode::Push {
+            pair.enable_push(v41_peer_push::lane_bytes(v41_peer_push::DECODE_ROWS,LAYOUT.route_bytes())?)?;
+        }
+        let routes=pair::padded(capacity as usize*12);
+        Ok(Self {stream:Stream::new(device)?,pair,
+            inputs:[Allocation::new(device,capacity as usize*10240)?,Allocation::new(device,routes)?,Allocation::new(device,routes)?],
             shared:Allocation::new(device,capacity as usize*10240)?,owner,stage,capacity})
     }
     pub fn stream(&self)->*mut c_void {self.stream.raw}

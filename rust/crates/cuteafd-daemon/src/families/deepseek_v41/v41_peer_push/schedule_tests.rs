@@ -349,3 +349,87 @@ fn pulled_lane_without_its_remote_join_races() {
     let (buffer, ..) = race(schedule(Options { drop: Some("tp2 stream1 join"), ..Options::default() }).check());
     assert_eq!(buffer, "values0");
 }
+
+/// B10: two draft rounds of three stages on the draft TP2 pairs (owner GPU1,
+/// peer GPU0), queued as `shared::experts::rtx::draft::pair` queues them,
+/// eagerly or into one graph (capture keeps the same edges). Each stage owns
+/// its pair and reads the previous stage's output.
+mod draft {
+    use super::{leak, race, Name, Schedule};
+
+    #[derive(Clone, Copy, Default)]
+    struct Draft {
+        push: bool,
+        /// Negative control: leave out this edge.
+        drop: Option<&'static str>,
+    }
+
+    fn rounds(o: Draft) -> Schedule {
+        let mut s = Schedule::default();
+        let keep = |edge: &str| o.drop != Some(edge);
+        let (owner, peer) = ("draft owner", "draft peer");
+        for round in 0..2 {
+            for stage in 0..3 {
+                let n = |what: &str| -> Name { leak(format!("{what}{stage}")) };
+                let label = |what: &str| format!("round {round} stage {stage} {what}");
+                let hidden = if stage == 0 { "draft hidden" } else { leak(format!("draft output{}", stage - 1)) };
+                let (wire, routes, shared) = (n("draft wire"), n("draft route ids"), n("draft shared"));
+                let (inputs, scratch) = (n("draft peer inputs"), n("draft peer scratch"));
+                let (local, landed, output) = (n("draft owner routes"), n("draft peer routes"), n("draft output"));
+                s.work(owner, label("router and shared FFN"), &[hidden], &[routes, shared]);
+                s.work(owner, label("quantize"), &[hidden], &[wire]);
+                s.record(owner, n("draft ready"));
+                if o.push {
+                    s.push(owner, n("draft input flag"), label("input push"), &[wire, routes], &[inputs]);
+                    s.work(owner, label("owner half"), &[wire, routes], &[local]);
+                    if keep("ready") { s.wait_event(peer, n("draft ready")); }
+                    if keep("input wait") { s.wait_flag(peer, n("draft input flag")); }
+                    s.work(peer, label("peer half"), &[inputs], &[scratch]);
+                    s.push(peer, n("draft routes flag"), label("routes push"), &[scratch], &[landed]);
+                    s.record(peer, n("draft done"));
+                    if keep("routes wait") { s.wait_flag(owner, n("draft routes flag")); }
+                    s.work(owner, label("reduce"), &[local, landed, shared], &[output]);
+                    if keep("done") { s.wait_event(owner, n("draft done")); }
+                } else {
+                    if keep("ready") { s.wait_event(peer, n("draft ready")); }
+                    s.work(peer, label("input pull"), &[wire, routes], &[inputs]);
+                    s.work(peer, label("peer half"), &[inputs], &[scratch]);
+                    s.record(peer, n("draft done"));
+                    s.work(owner, label("owner half"), &[wire, routes], &[local]);
+                    if keep("done") { s.wait_event(owner, n("draft done")); }
+                    s.work(owner, label("routes pull"), &[scratch], &[landed]);
+                    s.work(owner, label("reduce"), &[local, landed, shared], &[output]);
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn pulled_draft_rounds_are_ordered() {
+        assert_eq!(rounds(Draft::default()).check(), Ok(()));
+    }
+
+    /// The flags alone order the data, so the fork and join events only give
+    /// a capture its topology: without either the rounds stay ordered.
+    #[test]
+    fn pushed_draft_rounds_are_ordered_by_their_flags() {
+        for drop in [None, Some("ready"), Some("done")] {
+            assert_eq!(rounds(Draft { push: true, drop }).check(), Ok(()), "without {drop:?}");
+        }
+    }
+
+    #[test]
+    fn pushed_draft_round_without_a_flag_wait_races() {
+        for (edge, buffer) in [("input wait", "draft peer inputs0"), ("routes wait", "draft peer routes0")] {
+            let (found, first, second) = race(rounds(Draft { push: true, drop: Some(edge) }).check());
+            assert_eq!(found, buffer, "{edge}: {first} -> {second}");
+        }
+    }
+
+    #[test]
+    fn pulled_draft_round_without_its_join_races() {
+        let (found, ..) = race(rounds(Draft { drop: Some("done"), ..Draft::default() }).check());
+        assert_eq!(found, "draft peer scratch0");
+    }
+}

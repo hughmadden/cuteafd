@@ -62,6 +62,10 @@ fn max_bytes() -> Result<Option<usize>> {
         .clone().map_err(|error| anyhow::anyhow!(error))
 }
 
+/// A decode lane's rows (the verify width): the row count of the size rule
+/// for sites that do not know their lane's.
+pub(crate) const DECODE_ROWS: usize = cuteafd_core::V41_VERIFY_ROWS;
+
 /// The SM push bound of a site moving `rows` (a decode lane) of `row_bytes`:
 /// their product, capped by `cap` and kept a nonzero 16-byte multiple.
 pub(crate) fn lane_bytes_with(rows: usize, row_bytes: usize, cap: Option<usize>) -> Result<usize> {

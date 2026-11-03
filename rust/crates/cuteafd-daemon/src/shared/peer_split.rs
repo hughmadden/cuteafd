@@ -236,6 +236,10 @@ impl<'a> PeerExchange<'a> {
         Self::with_ends(library, ranks, sizes, sizes.len(), decode_lane_bytes)
     }
 
+    /// Device bytes [`Self::new_flags`] allocates on each GPU for `flags`
+    /// flags (without `CUTEAFD_PEER_WAIT_DIAGNOSTICS`).
+    pub fn flag_bytes(flags: usize) -> usize { ((flags + 1) * 16).max(256) }
+
     /// Control words for `flags` publication flags (plus [`DIRECT`]) and no
     /// receive slots: pushes land in the caller's own buffers
     /// ([`Self::push_to_on`], [`Self::push_planes_on`]), and every operation
@@ -277,7 +281,7 @@ impl<'a> PeerExchange<'a> {
                     recv: sizes.iter()
                         .map(|&bytes| zeroed(bytes))
                         .collect::<Result<_>>()?,
-                    control: zeroed((slots + 1) * 16)?,
+                    control: zeroed(Self::flag_bytes(slots))?,
                     progress: if diagnostics { Some(zeroed((slots + 1) * std::mem::size_of::<PeerProgress>())?) } else { None },
                 })
             })

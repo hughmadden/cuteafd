@@ -60,6 +60,29 @@ impl<'a> Weights<'a> {
         }
         Ok(pair.map(Rc::new))
     }
+    /// Both ranks' halves of every stage as synthetic test weights
+    /// ([`ExpertWeights::synthetic`]), without a checkpoint.
+    #[cfg(test)]
+    pub fn synthetic(devices: [Device<'a>; 2], layout: Layout, seed: u64) -> Result<[Rc<Self>; 2]> {
+        layout.validate()?;
+        Self::validate_info(devices[0].library.v41_dspark_tp2_expert_info(1)?, layout)?;
+        let mut pair = devices.map(|device| -> Result<Self> {
+            Ok(Self { device, layout, stages: device.own(|| Ok(Vec::with_capacity(layout.stages)))? })
+        });
+        for stage in 0..layout.stages {
+            for rank in 0..2 {
+                let weights = pair[rank].as_mut().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                let seed = seed ^ ((stage * 2 + rank) as u64 + 1) << 48;
+                devices[rank].run(|| {
+                    weights.stages.push(ExpertWeights::synthetic(devices[rank].library,
+                        ExpertLayer::DsparkTp2 { stage, rank }, seed)?);
+                    Ok(())
+                })?;
+            }
+        }
+        let [left, right] = pair;
+        Ok([Rc::new(left?), Rc::new(right?)])
+    }
     fn validate_info(info: cuteafd_ffi::V41ExpertInfo, layout: Layout) -> Result<()> {
         let g = layout.geometry;
         ensure!(

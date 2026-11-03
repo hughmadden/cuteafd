@@ -643,6 +643,45 @@ impl<'a> ExpertWeights<'a> {
     pub(crate) fn format(&self) -> ExpertFormat {
         self.format
     }
+    /// Test weights in `layer`'s native packed layout without a checkpoint:
+    /// payload planes (W13, W2) hold random E2M1 nibbles and scale planes
+    /// E8M0 codes for 2^-3..2^0, one random MiB from `seed` tiled over each
+    /// plane. For byte-identity and timing tests of the execution paths.
+    #[cfg(test)]
+    pub(crate) fn synthetic(library: &'a NativeLibrary, layer: ExpertLayer, seed: u64) -> Result<Self> {
+        let info = layer.info(library, 16)?;
+        ensure!(info.role == layer.role(), "native expert role does not match layer placement");
+        let experts = info.experts as usize;
+        let strides = library.v41_expert_packer(info.logical_intermediate)?.packed_bytes();
+        let mut owned = Vec::with_capacity(4);
+        for (plane, stride) in strides.into_iter().enumerate() {
+            let bytes = usize::try_from(stride)?.checked_mul(experts).context("synthetic expert plane overflow")?;
+            let allocation = DeviceAllocation::new(library, bytes)?;
+            let mut state = seed ^ (plane as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let tile: Vec<u8> = (0..bytes.min(1 << 20)).map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if plane % 2 == 1 { 124 + (state >> 40) as u8 % 4 } else { (state >> 32) as u8 }
+            }).collect();
+            library.copy_h2d(allocation.buffer, &tile)?;
+            let mut filled = tile.len();
+            while filled < bytes {
+                let n = filled.min(bytes - filled);
+                let at = |offset: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+                    // SAFETY: offset + n stays inside this allocation.
+                    ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                    bytes: n, ..allocation.buffer };
+                library.copy_d2d(at(filled), at(0), n)?;
+                filled += n;
+            }
+            owned.push(allocation);
+        }
+        let resident_bytes = owned.iter().map(|a| a.buffer.bytes).sum();
+        Ok(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native planes").map(Into::into),
+            layer, experts, budget: ExpertLoadBudget { resident_bytes, device_staging_bytes: 0, pinned_host_bytes: 0,
+                read_scratch_bytes: 0 }, nvfp4: None, format: ExpertFormat::Native, raw_scales: RawScales::none() })
+    }
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
