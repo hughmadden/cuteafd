@@ -160,6 +160,9 @@ pub struct LayoutOptions {
     pub mimo_decode_graphs: bool,
     /// Physical SM count for scratch when simulating a smaller memory budget.
     pub physical_sms: Option<u32>,
+    /// Coordinator GPU architecture: selects the card class (context, cuBLAS
+    /// and graph bytes, SM count) every coordinator plan charges.
+    pub coordinator_arch: cuteafd_core::GpuArch,
     /// MiMo bundled drafter representation; launch cards select single-copy FP8.
     pub mimo_draft_bf16: bool,
     /// Native local expert package manifest, required to qualify its scratch.
@@ -302,6 +305,7 @@ impl Default for LayoutOptions {
             draft_context_slots: None,
             mimo_decode_graphs: false,
             physical_sms: None,
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             mimo_draft_bf16: false,
             mimo_expert_manifest: None,
             context_tokens: 0,
@@ -352,8 +356,9 @@ mod scoring_workspace_tests {
     #[test]
     fn unknown_package_runtime_item_uses_manifest_formula() {
         let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
-        let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
-        let arch = crate::placement::ArchContext::for_device("sm_120", 96 << 30);
+        let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0,
+            cuteafd_core::GpuArch::Sm120, 96 << 30);
+        let arch = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         assert_eq!(item.basis, Basis::Formula);
         assert_eq!(item.bytes, arch.context_bytes + arch.cublas_bytes + 34 * MIB);
         assert!(item.bytes > arch.context_bytes);
@@ -919,7 +924,7 @@ impl Shape {
     pub fn select_card_plans(&mut self, report: &mut PlanReport, options: &LayoutOptions, notes: &mut Vec<String>) {
         if let Some(manifest) = self.manifest.as_mut() {
             let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-                "sm_120", options.rtx_bytes[0]).sms);
+                options.coordinator_arch, options.rtx_bytes[0]).sms);
             if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(manifest, sms) {
                 report.placement_supported = false;
                 notes.push(error.to_string());
@@ -934,8 +939,8 @@ impl Shape {
 /// cuBLAS and the manifest's modules of `programs` (`ProgramSet`), plus the
 /// peer context under a split.
 pub fn runtime_item(manifest: Option<&serde_json::Value>, programs: &[String], package: &str, split: bool,
-    rank: usize, total_bytes: u64) -> Item {
-    let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
+    rank: usize, arch: cuteafd_core::GpuArch, total_bytes: u64) -> Item {
+    let arch = crate::placement::ArchContext::coordinator(arch, total_bytes, None);
     let families = programs.iter().map(String::as_str).collect::<Vec<_>>();
     let set = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &families));
     let allowance = crate::placement::inventory::loaded_code_allowance(&programs[0], package,

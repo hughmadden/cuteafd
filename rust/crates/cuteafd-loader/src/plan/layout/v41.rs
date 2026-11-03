@@ -45,7 +45,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let directory = manifest.parent().context("V4.1 manifest has no parent")?;
     let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_FP8_AOT.json"))
         .context("missing V4.1 native FP8 allocation manifest")?)?;
-    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
+    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms);
     let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
     let mode = Fp8Head::configured();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
@@ -115,7 +115,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
     let mut inventory = Inventory { gpus: Vec::new(), spark_ranks, peer_access: ranks == 2 };
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
-        let arch = ArchContext::coordinator(total, None);
+        let arch = ArchContext::coordinator(options.coordinator_arch, total, None);
         let ceiling = if total <= 32 * GIB {
             cuteafd_core::serving_capacity::admission_ceiling(total, 97,
                 cuteafd_core::serving_capacity::small_card_headroom_bytes(total))?
@@ -263,7 +263,7 @@ mod tests {
         // Raw ready untracked samples from the min/max native startup census.
         // Removing the calibrated context/cuBLAS leaves a combined code/graph
         // residual, NOT pure LoadedCode or a 64 MiB ready-parity qualification.
-        let arch = ArchContext::coordinator(96 * GIB, None);
+        let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, 96 * GIB, None);
         assert_eq!(arch.context_bytes + arch.cublas_bytes, 657_719_296);
         for (card, untracked, residual, slack) in [
             ("min GPU0", 2_149_527_512, 1_491_808_216, 655_675_432),

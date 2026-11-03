@@ -14,6 +14,7 @@
 //! graphs are growth ([`Lifetime::Growth`]): reserved, but outside the ready
 //! ledger. S3's `GraphBank` consumes the same set as its warm list.
 use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_core::GpuArch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,8 +27,7 @@ const MIB: u64 = 1 << 20;
 /// A coordinator GPU class the planner can lay out without a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ArchContext {
-    /// `sm_120`, `sm_121`.
-    pub arch: &'static str,
+    pub arch: GpuArch,
     /// Card class: physical memory at most this many bytes (CUDA total).
     pub max_total_bytes: u64,
     /// The CUDA-reported total of the class's reference card (`cudaMemGetInfo`),
@@ -60,20 +60,28 @@ pub struct ArchContext {
 /// 2026-10-10): SM120 PRO 586,416,128 B context + 71,303,168 B cuBLAS =
 /// 657,719,296 B (rc3 MiMo `non_engine` samples agree: 586,416,128 /
 /// 596,901,888 B); GB10 by MemAvailable deltas (unified memory) 189-257 MiB
-/// context + 150-160 MiB cuBLAS, recorded at the larger sample.
+/// context + 150-160 MiB cuBLAS, recorded at the larger sample; RTX 4090 D 48 GB
+/// (SM89, 2026-11-04, driver 615.71.09) 374,472,704 B context + 11,534,336 B cuBLAS,
+/// identical on two cards and repeat runs.
+/// Every architecture ends with an unbounded class, so [`ArchContext::for_device`]
+/// always finds one (tested).
 pub const ARCH_CONTEXTS: &[ArchContext] = &[
-    ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
+    ArchContext { arch: GpuArch::Sm120, max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
         cublas_bytes: 71_303_168,
         peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX 5090 class: SM120 PRO probe on the same driver/CUDA 13.2; SM count from the 5090 spec" },
-    ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
+    ArchContext { arch: GpuArch::Sm120, max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
         context_bytes: 586_416_128, cublas_bytes: 71_303_168,
         peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX PRO 6000 Blackwell probe (CUDA 13.2); Qwen 12,397 graphs = 1,855,979,520 B" },
-    ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
+    ArchContext { arch: GpuArch::Sm121, max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
         context_bytes: 257 << 20, cublas_bytes: 160 << 20,
         peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "580.178.04",
         source: "GB10 probe (CUDA 13.0, MemAvailable deltas): context 189-257 MiB + cuBLAS 150-160 MiB; graph bytes from SM120" },
+    ArchContext { arch: GpuArch::Sm89, max_total_bytes: u64::MAX, total_bytes: 50_950_569_984, sms: 114,
+        context_bytes: 374_472_704, cublas_bytes: 11_534_336,
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "615.71.09",
+        source: "RTX 4090 D 48 GB probe (CUDA 13.2, cuda-context-probe.cu, 2026-11-04); graph bytes from SM120" },
 ];
 
 /// The coordinator GPU budget `cuteafd plan` lays out without a device or a
@@ -82,19 +90,27 @@ pub const ARCH_CONTEXTS: &[ArchContext] = &[
 pub const PRO_TOTAL_BYTES: u64 = 101_973_491_712;
 
 impl ArchContext {
-    /// The class of a device with `total_bytes` of memory on `arch`, or the
-    /// PRO entry when nothing matches.
-    pub fn for_device(arch: &str, total_bytes: u64) -> &'static ArchContext {
+    /// The class of a device with `total_bytes` of memory on `arch`: the first
+    /// class of that architecture whose memory bound holds it. Unknown
+    /// architectures cannot reach this; they fail where they are parsed
+    /// ([`GpuArch::from_compute_capability`], [`GpuArch`]'s `FromStr`).
+    pub fn for_device(arch: GpuArch, total_bytes: u64) -> &'static ArchContext {
         ARCH_CONTEXTS.iter().find(|c| c.arch == arch && total_bytes <= c.max_total_bytes)
-            .unwrap_or(&ARCH_CONTEXTS[1])
+            .expect("ARCH_CONTEXTS ends every architecture with an unbounded class")
     }
 
-    /// The planner's coordinator class: SM120, sized by its card budget. A
+    /// The planner's coordinator class on `arch`, sized by its card budget. A
     /// simulated small card (`--coordinator-gpu-budget-gib` on a PRO) keeps the
-    /// PRO's SM count: the simulation caps memory only.
-    pub fn coordinator(total_bytes: u64, simulated_on: Option<&'static ArchContext>) -> ArchContext {
-        let class = *Self::for_device("sm_120", total_bytes);
+    /// physical card's SM count: the simulation caps memory only.
+    pub fn coordinator(arch: GpuArch, total_bytes: u64, simulated_on: Option<&'static ArchContext>) -> ArchContext {
+        let class = *Self::for_device(arch, total_bytes);
         match simulated_on { Some(physical) => ArchContext { sms: physical.sms, ..class }, None => class }
+    }
+
+    /// The CUDA-reported total of `arch`'s reference card: what `cuteafd plan`
+    /// lays out without a device or an explicit budget.
+    pub fn reference_total_bytes(arch: GpuArch) -> u64 {
+        Self::for_device(arch, u64::MAX).total_bytes
     }
 }
 
@@ -311,7 +327,8 @@ impl ProgramSet {
         let compiled = covers.into_iter().find(|&n| n >= rows).unwrap();
         let capacities: Vec<_> = covers[..3].iter().copied().filter(|&n| n < compiled).chain([compiled]).collect();
         let variants = manifest["variants"].as_array().context("missing V4.1 FP8 variants")?;
-        let card = if sms >= 188 { 188 } else { 170 };
+        // Exact SM count: a card without its own plan fails closed below.
+        let card = u64::from(sms);
         let mut names = Vec::new();
         let mut scratch = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
@@ -870,9 +887,23 @@ mod tests {
 
     #[test]
     fn simulated_small_cards_keep_the_physical_sm_count() {
-        let pro = ArchContext::for_device("sm_120", 96 << 30);
+        let pro = ArchContext::for_device(GpuArch::Sm120, 96 << 30);
         assert_eq!(pro.sms, 188);
-        assert_eq!(ArchContext::coordinator(32 << 30, Some(pro)).sms, 188);
-        assert_eq!(ArchContext::coordinator(32 << 30, None).sms, 170);
+        assert_eq!(ArchContext::coordinator(GpuArch::Sm120, 32 << 30, Some(pro)).sms, 188);
+        assert_eq!(ArchContext::coordinator(GpuArch::Sm120, 32 << 30, None).sms, 170);
+    }
+
+    #[test]
+    fn every_arch_has_a_class_and_ada_is_not_planned_as_a_pro() {
+        for arch in GpuArch::ALL {
+            assert_eq!(ArchContext::for_device(arch, u64::MAX).arch, arch);
+            assert_eq!(ArchContext::for_device(arch, 0).arch, arch);
+        }
+        let ada = ArchContext::for_device(GpuArch::Sm89, 50_950_569_984);
+        assert_eq!((ada.sms, ada.total_bytes), (114, 50_950_569_984));
+        assert_eq!(ArchContext::coordinator(GpuArch::Sm89, 47 << 30, None).sms, 114);
+        assert_eq!(ArchContext::reference_total_bytes(GpuArch::Sm89), 50_950_569_984);
+        assert_eq!(ArchContext::reference_total_bytes(GpuArch::Sm120), PRO_TOTAL_BYTES);
+        assert_eq!(serde_json::to_value(ada).unwrap()["arch"], "sm_89");
     }
 }

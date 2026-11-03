@@ -341,10 +341,10 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
 }
 
 /// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
-/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
-pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
+/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs of `arch`.
+pub fn code_bytes(dim: usize, experts: &str, gpus: usize, arch: cuteafd_core::GpuArch) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
+    let arch = crate::placement::ArchContext::for_device(arch, crate::placement::inventory::ArchContext::reference_total_bytes(arch));
     (0..gpus).map(|rank| crate::placement::inventory::loaded_code_allowance(
         family, experts, gpus == 2, rank as u8, arch, None).bytes).collect()
 }

@@ -117,7 +117,7 @@ pub use layerwave::{
 pub use model::{
     AttentionKind, DType, ModelFacts, ModelVariant, TensorCatalog, TensorInfo, TensorRole,
 };
-pub use node::NodeRole;
+pub use node::{GpuArch, NodeRole};
 pub use placement::{
     owner_for_expert, ExpertOwnerLookup, LoadPlan, PlacementPolicy, TensorAssignment,
 };

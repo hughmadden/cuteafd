@@ -141,7 +141,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
     let capacity = inventory::PRO_TOTAL_BYTES;
-    let arch = ArchContext::coordinator(capacity, None);
+    let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
         let inputs = RuntimeInputs {

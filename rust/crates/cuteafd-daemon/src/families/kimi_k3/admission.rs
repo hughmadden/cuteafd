@@ -1251,7 +1251,7 @@ pub(super) mod tests {
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
                 cuteafd_loader::families::kimi_k3::spark_reserve_bytes(waves as u64, unit as u64)?)?;
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
-            let arch = ArchContext::for_device("sm_120", capacity);
+            let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
             let mut i = inputs(&cfg);
             i.cache_format = format;
             i.requested_pool = requested_pool;

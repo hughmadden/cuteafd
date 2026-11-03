@@ -140,7 +140,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, true,
             "kimik3", "exl3", &selected)?;
-        let arch = cuteafd_loader::placement::ArchContext::for_device(&sample.arch, sample.total_bytes);
+        let arch = cuteafd_loader::placement::ArchContext::for_device(sample.arch.parse()?, sample.total_bytes);
         fixed.push(code_demand(rank, pending, arch.cublas_bytes, 1)?);
     }
     let gpus = inventory.gpus.iter().map(|sample| {

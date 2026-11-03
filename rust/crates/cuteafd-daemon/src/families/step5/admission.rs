@@ -248,7 +248,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(rank, &capacity_bytes)| {
-                    let arch = ArchContext::coordinator(capacity_bytes, None);
+                    let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity_bytes, None);
                     code.push(
                         inventory::loaded_code_allowance(
                             "step5",

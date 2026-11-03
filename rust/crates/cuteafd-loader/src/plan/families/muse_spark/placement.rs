@@ -92,7 +92,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let inputs = crate::placement::families::muse_spark::MuseInputs { cfg, core: &model.core, catalog, mark_slots,
         gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
-            baseline: Baseline::Planned { context_bytes: ArchContext::for_device("sm_120", *bytes).context_bytes,
+            baseline: Baseline::Planned { context_bytes: ArchContext::for_device(opts.coordinator_arch, *bytes).context_bytes,
                 loaded_bytes: 0 } }).collect(),
         spark_ranks: ranks, prefill, full_prefill_logits: opts.full_prefill_logits, slots, context,
         automatic_context: opts.context_tokens == 0,
@@ -113,7 +113,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
             let head = model.core.get_weight(crate::families::muse_spark::core::HEAD)
                 .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
-            let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", opts.rtx_bytes[gpus - 1]).sms);
+            let sms = opts.physical_sms.unwrap_or(ArchContext::for_device(opts.coordinator_arch, opts.rtx_bytes[gpus - 1]).sms);
             crate::placement::families::muse_spark::drafter_inventory(cfg, &config, usize::try_from(slots)?,
                 usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)
         }).transpose() {
@@ -248,7 +248,7 @@ fn planned_code(opts: &crate::plan::layout::LayoutOptions, gpus: usize) -> anyho
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let programs = ProgramSet::from_manifest(&manifest, crate::placement::families::muse_spark::program_families(gpus));
     (0..gpus).map(|rank| {
-        let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
+        let arch = ArchContext::for_device(opts.coordinator_arch, opts.rtx_bytes[rank]);
         let code = crate::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2, rank as u8,
             arch, Some(&programs));
         crate::placement::families::muse_spark::code_demand(rank, code.bytes)

@@ -338,9 +338,14 @@ pub(crate) struct PlanArgs {
     /// Attention placement: auto is the qualified family default (heads until decided).
     #[arg(long, default_value = "auto", value_parser = ["auto", "context", "layers", "heads"])]
     pub(crate) attention_placement: String,
-    /// Resolved global logical GPU ceiling; PRO defaults to its CUDA total (94.97 GiB).
+    /// Resolved global logical GPU ceiling; defaults to the CUDA total of the
+    /// coordinator arch's reference card (PRO 94.97 GiB, RTX 4090 D 47.45 GiB).
     #[arg(skip)]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// Coordinator GPU architecture to plan for: sm_120 (RTX 5090 / RTX PRO 6000)
+    /// or sm_89 (RTX 4090 class). Selects the card class every coordinator plan charges.
+    #[arg(long, default_value = "sm_120")]
+    pub(crate) coordinator_arch: cuteafd_core::GpuArch,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,

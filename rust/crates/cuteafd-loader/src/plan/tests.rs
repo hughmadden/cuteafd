@@ -3273,7 +3273,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs { automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
-                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
+                context_bytes: placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: opts.headroom_bytes,
             spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
@@ -3870,7 +3870,7 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     for layout in [&enabled, &disabled] {
         assert!(!layout.devices[0].items.iter().any(|i| i.group == "workspace runtime overhead"));
         let context = layout.devices[0].items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
-        assert_eq!(context, crate::placement::ArchContext::coordinator(crate::placement::inventory::PRO_TOTAL_BYTES,
+        assert_eq!(context, crate::placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, crate::placement::inventory::PRO_TOTAL_BYTES,
             None).context_bytes + code);
     }
 }

@@ -698,7 +698,7 @@ mod tests {
     }
 
     fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
-        let context = ArchContext::coordinator(capacity, None).context_bytes;
+        let context = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None).context_bytes;
         GlmfInputs { automatic_context: false,
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
@@ -802,7 +802,7 @@ mod tests {
             assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), baseline);
             assert_eq!(baseline + graphs.at_ready(rank), ready);
             let code = loaded_code("glmf", "exl3-tp2-local", true, rank as u8).unwrap();
-            assert_eq!(inventory::ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None).context_bytes + code.bytes, baseline);
+            assert_eq!(inventory::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, inventory::PRO_TOTAL_BYTES, None).context_bytes + code.bytes, baseline);
             let sampled = [598_999_040, 609_484_800][rank];
             assert_eq!(sampled + code.pending(sampled, 586_416_128), baseline);
             assert!(graphs.growth(rank) >= 64 << 20);
@@ -823,7 +823,7 @@ mod tests {
             let (p, admitted_graphs) = solve_with_graphs(&planned, target, true, 188, true).unwrap();
             let mut measured = planned.clone();
             for rank in 0..ranks {
-                let context = ArchContext::coordinator(capacity, None).context_bytes;
+                let context = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None).context_bytes;
                 let code = loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap();
                 let sample = context + code.bytes / 3;
                 measured.gpus[rank].1 = Baseline::Measured { free_bytes: capacity - sample };

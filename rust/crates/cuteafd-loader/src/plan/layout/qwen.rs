@@ -140,7 +140,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, basis));
     }
     devices[0].items.push(runtime_item(shape.manifest.as_ref(), &program_families("qwen4", false),
-        local_package(report), false, 0, options.rtx_bytes[0]));
+        local_package(report), false, 0, options.coordinator_arch, options.rtx_bytes[0]));
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
@@ -281,7 +281,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
-        let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
+        let arch = crate::placement::ArchContext::for_device(options.coordinator_arch, capacity);
         let programs = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| crate::placement::ProgramSet::from_names(&["qwen4"], []));
         let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", local_package(report),
@@ -336,7 +336,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64,
         mtp.then_some(options.native_mtp_layers), options.qwen_attention_plan_rows)?;
     let sms = [0, 1].map(|rank| options.physical_sms.unwrap_or_else(||
-        crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[rank]).sms));
+        crate::placement::ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[rank]).sms));
     let selected_manifests = manifest.map(|m| qwen4::dual_program_manifests(m, sms, plan)).transpose()?;
     let owner_manifests = [0, 1].map(|rank| selected_manifests.as_ref().map(|m| &m[rank]));
     let manifest = owner_manifests[0];

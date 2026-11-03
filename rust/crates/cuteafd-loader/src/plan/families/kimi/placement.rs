@@ -139,7 +139,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
             for rank in 0..2 {
-                let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
+                let arch = ArchContext::for_device(opts.coordinator_arch, opts.rtx_bytes[rank]);
                 let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
                     rank as u8, arch, Some(&programs));
                 baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };
@@ -206,7 +206,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?;
+            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or_else(|| ArchContext::for_device(opts.coordinator_arch, u64::MAX).sms) as usize, 0, opts.mla_kv)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout, rows)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns

@@ -428,29 +428,32 @@ pub fn select_attention_plans(manifest: &mut serde_json::Value, plan: AttentionR
 #[error("invalid attention recipe scratch contract or numerical domain mismatch")]
 pub struct AttentionScratchError;
 
-/// Select the same 170/188-SM program recipe as native load, before admission.
-/// The retained plans allow another device to select its own scratch envelope.
+/// Select the program recipe exported for exactly this card's SM count, as native load does,
+/// before admission. Every exported plan must be well formed (unique positive `sm_count`,
+/// integral scratch, object geometry); a card without its own plan fails closed rather than
+/// borrowing another card's split geometry. The retained plans let another device select its
+/// own scratch envelope.
 pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(), CardPlanError> {
     let Some(programs) = manifest["programs"].as_array_mut() else { return Ok(()) };
     for program in programs {
         if program.get("card_plans").is_none() { continue; }
         let name = program["name"].as_str().unwrap_or("<unnamed>").to_string();
-        let invalid = || CardPlanError { name: name.clone() };
+        let invalid = || CardPlanError { name: name.clone(), reason: "invalid card-plan contract".into() };
         let plans = program["card_plans"].as_array().ok_or_else(invalid)?;
-        if sms == 0 || plans.len() != 2 { return Err(invalid()); }
-        let selected_sms = if sms >= 188 { 188 } else { 170 };
+        if sms == 0 || plans.is_empty() { return Err(invalid()); }
+        let mut exported = std::collections::BTreeSet::new();
         let mut selected = None;
-        for expected in [170, 188] {
-            let matching: Vec<_> = plans.iter().filter(|p| p["sm_count"].as_u64() == Some(expected)).collect();
-            if matching.len() != 1 { return Err(invalid()); }
-            let plan = matching[0];
+        for plan in plans {
+            let count = plan["sm_count"].as_u64().filter(|&count| count > 0).ok_or_else(invalid)?;
+            if !exported.insert(count) { return Err(invalid()); }
             let scratch = plan["scratch_bytes_at_capacity"].as_object().ok_or_else(invalid)?;
             if scratch.values().any(|v| v.as_u64().is_none()) || !plan["geometry"].is_object() {
                 return Err(invalid());
             }
-            if expected == selected_sms { selected = Some(plan.clone()); }
+            if count == u64::from(sms) { selected = Some(plan.clone()); }
         }
-        let plan = selected.ok_or_else(invalid)?;
+        let plan = selected.ok_or_else(|| CardPlanError { name: name.clone(),
+            reason: format!("no card plan for {sms} SMs (exported for {exported:?}); export one for this card") })?;
         program["scratch_bytes_at_capacity"] = plan["scratch_bytes_at_capacity"].clone();
         program["geometry"] = plan["geometry"].clone();
     }
@@ -458,9 +461,10 @@ pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("program {name} has an invalid 170/188-SM card-plan contract")]
+#[error("program {name}: {reason}")]
 pub struct CardPlanError {
     pub name: String,
+    pub reason: String,
 }
 
 #[cfg(test)]
@@ -672,6 +676,25 @@ mod tests {
             }
             let error = select_card_plans(&mut manifest, if defect == 4 { 0 } else { 188 }).unwrap_err();
             assert_eq!(error.name, "dsv4p_sparse_mla_decode_c128_m64");
+        }
+    }
+
+    #[test]
+    fn card_plans_select_the_exact_sm_count_and_never_round_to_another_card() {
+        // A 114-SM card (RTX 4090 D) on a 170/188-only export fails closed by name.
+        let error = select_card_plans(&mut dual_manifest(), 114).unwrap_err();
+        assert_eq!(error.name, "dsv4p_sparse_mla_decode_c128_m64");
+        assert!(error.reason.contains("114 SMs"), "{error}");
+        // A card between the two exported counts no longer borrows the 170-SM plan.
+        assert!(select_card_plans(&mut dual_manifest(), 180).is_err());
+        // An export carrying the card's own plan selects it; the others stay valid.
+        let mut manifest = dual_manifest();
+        manifest["programs"][0]["card_plans"].as_array_mut().unwrap().push(serde_json::json!(
+            {"sm_count": 114, "scratch_bytes_at_capacity": {"scratch": 77}, "geometry": {"num_splits": 7}}));
+        for (sms, bytes, splits) in [(114, 77, 7), (170, 1094778880, 130), (188, 8421376, 1)] {
+            select_card_plans(&mut manifest, sms).unwrap();
+            assert_eq!(manifest["programs"][0]["scratch_bytes_at_capacity"]["scratch"], bytes);
+            assert_eq!(manifest["programs"][0]["geometry"]["num_splits"], splits);
         }
     }
 

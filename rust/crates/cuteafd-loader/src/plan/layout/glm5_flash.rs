@@ -177,7 +177,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             }
         }
         let draft_sms: Vec<_> = options.rtx_bytes[..ranks].iter().map(|&total|
-            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
+            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.coordinator_arch, total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
         let mut draft_rows = None;
         let (draft, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, vec![0; ranks], None) }
@@ -247,18 +247,19 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             let runtime = if let (Some(charge), Some(manifest)) = (&native_charge, manifest) {
                 let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2", "exlr8_glmf"]);
                 set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
-                let arch = placement::ArchContext::coordinator(total, None);
+                let arch = placement::ArchContext::coordinator(options.coordinator_arch, total, None);
                 let allowance = placement::inventory::loaded_code_allowance("glmf", package,
                     ranks == 2, rank as u8, &arch, Some(&set));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
             } else if let (Some(charge), Some(manifest)) = (&core_charge, manifest) {
                 let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2"]);
                 set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
-                let arch = placement::ArchContext::coordinator(total, None);
+                let arch = placement::ArchContext::coordinator(options.coordinator_arch, total, None);
                 let allowance = placement::inventory::loaded_code_allowance("glmf-k6", package,
                     ranks == 2, rank as u8, &arch, Some(&set));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
-            } else { runtime_item(manifest, &program_families("glmf", ranks == 2), package, ranks == 2, rank, total) };
+            } else { runtime_item(manifest, &program_families("glmf", ranks == 2), package, ranks == 2, rank,
+                options.coordinator_arch, total) };
             let code = runtime.bytes;
             if local_tp2_exl3 && !native {
                 devices[rank].items.extend(placement::inventory::glmf_local_tp2_runtime_items(rank));
@@ -276,7 +277,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             } else { options.target_pool_tokens.max(context) });
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
-                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
+                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or_else(|| placement::ArchContext::for_device(options.coordinator_arch, u64::MAX).sms) as usize));
         let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.resolved_state_slots("glm5_flash"),
@@ -289,7 +290,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, options.context_tokens == 0,
-            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
+            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.coordinator_arch, options.rtx_bytes[0], None).sms) as usize,
             available.is_some())?;
         let chosen_attention = glmf::placed_attention(attention, &placed);
         let chosen_resident = if chosen_attention.first_owner == attention.first_owner { &inputs.resident }

@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use crate::cli::PlanArgs;
 
-/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the RTX PRO
-/// 6000's CUDA-reported total (`placement::inventory::PRO_TOTAL_BYTES`), what the
-/// runtime's own sample sees.
-fn coordinator_bytes(gib: Option<f64>) -> Result<u64, PlanError> {
-    gib.map_or(Ok(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES),
+/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the CUDA-reported
+/// total of `arch`'s reference card (the RTX PRO 6000's
+/// `placement::inventory::PRO_TOTAL_BYTES` on sm_120), what the runtime's own sample sees.
+fn coordinator_bytes(gib: Option<f64>, arch: cuteafd_core::GpuArch) -> Result<u64, PlanError> {
+    gib.map_or(Ok(cuteafd_loader::placement::inventory::ArchContext::reference_total_bytes(arch)),
         |gib| budget_bytes("--coordinator-gpu-budget-gib", gib))
 }
 
@@ -36,8 +36,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
         spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
-            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
-                coordinator_bytes(args.coordinator_gpu_budget_gib)?
+            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some()
+                || args.coordinator_arch != cuteafd_core::GpuArch::Sm120 {
+                coordinator_bytes(args.coordinator_gpu_budget_gib, args.coordinator_arch)?
             } else { u64::MAX }),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
@@ -51,7 +52,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
                 },
                 media_cache_bytes: args.media_cache_bytes,
-                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
+                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib, args.coordinator_arch)?; args.rtx],
+                coordinator_arch: args.coordinator_arch,
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
@@ -910,6 +912,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             expert_partial_wide_format: Default::default(),
