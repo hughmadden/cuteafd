@@ -106,13 +106,17 @@ impl NativeLibrary {
             status == 0,
             "native V4.1 FP8 info failed with CUDA status {status}"
         );
+        // Packed weight scales: one UE8M0 per 32 inputs of every output row in
+        // the SM120 MMA layout, or the checkpoint's own [N/32, K/32] grid
+        // (plain) where the export's kernels read it directly (SM89).
+        let per_group = u64::from(input_dim) * u64::from(output_dim) / groups(input_dim, output_dim);
         ensure!(
             info.abi_version == 1
                 && info.capacity_rows == capacity as u32
                 && info.input_dim == input_dim
                 && info.output_dim == output_dim
-                && info.packed_weight_scale_bytes
-                    == u64::from(input_dim) * u64::from(output_dim) / groups(input_dim, output_dim) / 32,
+                && (info.packed_weight_scale_bytes == per_group / 32
+                    || info.packed_weight_scale_bytes == per_group / 1024),
             "unsupported native V4.1 FP8 geometry/ABI"
         );
         ensure!(
@@ -375,4 +379,33 @@ impl V41SharedSwiGlu<'_> {
 // The official WO-A projection is block diagonal over eight head groups.
 fn groups(input: u32, output: u32) -> u64 {
     if (input, output) == (32768, 8192) { 8 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every supported geometry at every exported projection capacity creates a
+    /// kernel through this FFI from the library under test (SM120 packed or
+    /// SM89 plain weight scales).
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB with the V4.1 FP8 bundle and a GPU"]
+    fn cuda_v41_fp8_matrices_create_at_every_exported_capacity() -> Result<()> {
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let geometries = [(6144, 25600), (5120, 2304), (2304, 5120), (5120, 1152), (1152, 5120), (15360, 5120),
+            (5120, 1280), (1280, 32768), (1280, 16384), (1280, 4096), (5120, 512), (8192, 5120), (8192, 2560),
+            (32768, 8192)];
+        let capacities = [1, 16, cuteafd_core::V41_VERIFY_ROWS as u32, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32,
+            256, 1024, 4096];
+        for (input_dim, output_dim) in geometries {
+            for capacity in capacities {
+                let kernel = library.v41_fp8_matrix_kernel(capacity, input_dim, output_dim)?;
+                let per_group = u64::from(input_dim) * u64::from(output_dim) / groups(input_dim, output_dim);
+                let scales = kernel.info().packed_weight_scale_bytes;
+                ensure!(scales == per_group / 32 || scales == per_group / 1024,
+                    "{input_dim}x{output_dim} m{capacity}: {scales} packed scale bytes");
+            }
+        }
+        Ok(())
+    }
 }
