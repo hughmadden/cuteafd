@@ -64,6 +64,18 @@ impl<'a> Wave<'a> {
     pub(crate) fn release_scratch(&self) -> Result<()> {
         self.storage.execution.try_lock().context("shared TP2 submission still borrowed")?.rank_released.release()
     }
+    /// Device-ordered passes push the remote half's partial into the
+    /// destination's staging ([`PeerTransfer::enable_push`]). For a wave
+    /// private to one decode lane only (see [`Execution::pushing`]).
+    pub(crate) fn enable_push(&self, decode_lane_bytes: usize) -> Result<()> {
+        let mut execution = self.storage.execution.try_lock().context("shared TP2 submission still borrowed")?;
+        for transfer in &mut execution.transfers {
+            let [source, destination] = transfer.devices();
+            transfer.enable_push(Box::new(crate::shared::peer_split::FlagRoute::new(source.library,
+                [source.id, destination.id], decode_lane_bytes)?));
+        }
+        Ok(())
+    }
     /// # Safety
     /// Inputs remain live and immutable until the enclosing chain drains; the
     /// caller consumes the returned plane before reusing this slot's window.
@@ -97,7 +109,16 @@ impl<'a> Execution<'a> {
     /// unit's chain: the next `add` there may overwrite it.
     pub(crate) fn release_output(&self, destination: usize) -> Result<()> {
         ensure!(destination < 2, "invalid shared TP2 destination");
+        if self.pushing() { return Ok(()); }
         self.released[destination].release()
+    }
+    /// This device-ordered pass pushes (a decode lane's private wave): the
+    /// scratch guards order nothing the flags do not already order. Every
+    /// next write here follows the last read of the previous layer because
+    /// each layer's FFN output gates the next layer's input (no slots needed
+    /// while layers do not pipeline: `v41_peer_push::schedule_tests`).
+    fn pushing(&self) -> bool {
+        self.transfers.iter().all(PeerTransfer::pushes)
     }
     pub fn contains(&self, layer: usize) -> bool {
         self.ranks.iter().all(|rank| rank.weights.get(layer).is_some_and(|w| w.layer == layer))
@@ -142,7 +163,8 @@ impl<'a> Execution<'a> {
         let skip = SKIP_RANK_ACQUIRE.with(|s|s.get());
         #[cfg(not(test))]
         let skip = false;
-        if !skip { for rank in &self.ranks {
+        let pushing = self.pushing();
+        if !skip && !pushing { for rank in &self.ranks {
             rank.stream.device.run(|| unsafe { self.rank_released.acquire(rank.stream.raw) })?;
         }}
         let mut drain = Drain { ranks: &mut self.ranks, complete: false };
@@ -160,13 +182,14 @@ impl<'a> Execution<'a> {
         let output_buffer = self.window.apply(output.buffer, 10240);
         let add = &self.add;
         let count = rows as usize * 5120;
+        let guard = (!pushing).then_some(&self.released[destination]);
         unsafe { self.transfers[destination].copy_then_ordered(&remote.output, &mut self.staging[destination],
-            &remote.stream, count*2, Some(&self.released[destination]), |peer, stream| {
+            &remote.stream, count*2, guard, |peer, stream| {
                 output.device.library.cuda_stream_wait_event(stream, ready.raw)?;
                 add.launch(local.output.buffer, peer, output_buffer, count, stream)
             }).await?; }
         drain.complete = true;
-        self.rank_released.release()?;
+        if !pushing { self.rank_released.release()?; }
         let mut result = output_buffer;
         result.bytes = count*2;
         Ok(result)

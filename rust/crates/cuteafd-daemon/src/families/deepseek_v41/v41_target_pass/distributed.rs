@@ -95,6 +95,16 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         Ok(())
     }
+    /// This decode lane's device-ordered passes push every transfer between
+    /// the GPUs (`v41_peer_push`): the 19->20 hop (A1) and the chained head
+    /// (A8, A9). Its TP2 FFN, owned by its transport, is enabled there.
+    pub fn enable_peer_push(&mut self) -> Result<()> {
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let rows = crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS as usize;
+        let bytes = crate::families::deepseek_v41::v41_peer_push::lane_bytes(rows, usize::try_from(spec.row_bytes)?)?;
+        for transfer in &mut self.resources.transfers { transfer.enable_push(bytes)?; }
+        self.resources.head.enable_peer_push()
+    }
     pub fn enable_dual_attention(&mut self)->Result<()> {
         for lane in &mut self.resources.lanes {
             let device=lane.device;
