@@ -10,6 +10,8 @@ pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
 pub(crate) mod admission;
+#[cfg(test)]
+mod creation_sweep;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
