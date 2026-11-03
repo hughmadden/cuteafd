@@ -184,6 +184,13 @@ pub struct LayoutOptions {
     /// layer count by each family. A fixed onboard makes the KV pool the
     /// output. `None` takes the family default.
     pub onboard: Option<crate::placement::OnboardSetting>,
+    /// `--gpu-expert-tier` (V4.1): a fixed share of every routed layer's
+    /// experts resident on the coordinator GPUs beside the Sparks, in place
+    /// of whole-layer onboarding. Off by default.
+    pub expert_tier: crate::placement::ExpertTierSetting,
+    /// `--gpu-expert-tier-profile`: per-layer route counts that rank the
+    /// resident set; uniform without one.
+    pub expert_tier_profile: Option<std::path::PathBuf>,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
     /// GLM Flash KDA partials and their peer payloads use FP32.
@@ -317,6 +324,8 @@ impl Default for LayoutOptions {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
             onboard: None,
+            expert_tier: Default::default(),
+            expert_tier_profile: None,
             exchange_f32: false,
             glmf_kda_fp32_partials: false,
             workspace_manifest: None,

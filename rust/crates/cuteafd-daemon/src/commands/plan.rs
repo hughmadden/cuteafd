@@ -77,6 +77,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 onboard: args.rtx_expert_layers,
+                expert_tier: args.gpu_expert_tier,
+                expert_tier_profile: args.gpu_expert_tier_profile.clone(),
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
@@ -138,6 +140,12 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
+}
+
+/// The `--layout` options `args` resolve to, for CLI parsing tests.
+#[cfg(test)]
+pub(crate) fn layout_options_for_test(args: &PlanArgs) -> cuteafd_loader::plan::layout::LayoutOptions {
+    options(args).expect("valid plan options").layout.expect("--layout")
 }
 
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
@@ -951,6 +959,8 @@ mod tests {
             fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
             rtx_expert_layers: None,
+            gpu_expert_tier: Default::default(),
+            gpu_expert_tier_profile: None,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),

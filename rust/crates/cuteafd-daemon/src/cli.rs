@@ -384,6 +384,16 @@ pub(crate) struct PlanArgs {
     /// layer count `N` (the KV pool is then the output).
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
+    /// V4.1 GPU expert tier for --layout, in place of whole-layer onboarding:
+    /// `off`, `auto` (pool first; the tier takes what is left) or `N` experts
+    /// resident on the coordinator GPUs in every routed layer (the KV pool is
+    /// then the output). The Sparks keep every expert.
+    #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
+    pub(crate) gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
+    /// Per-layer expert route counts (JSON `{"layers": [[count; experts]; routed layers]}`) that
+    /// rank the GPU expert tier's resident set; uniform without one.
+    #[arg(long, requires = "gpu_expert_tier")]
+    pub(crate) gpu_expert_tier_profile: Option<PathBuf>,
     /// Removed whole-layer GPU1 placement flag.
     #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
     pub(crate) deprecated_peer_expert_ranges: bool,
@@ -718,6 +728,29 @@ mod tests {
         for repeats in ["0", "6", "-1"] {
             assert!(super::Cli::try_parse_from(["cuteafd", "fabric", "--landing-repeats", repeats]).is_err());
         }
+    }
+
+    #[test]
+    fn gpu_expert_tier_is_off_by_default_and_takes_auto_or_a_count() {
+        use clap::Parser;
+        use cuteafd_loader::placement::ExpertTierSetting;
+        for (flags, expected) in [(vec![], ExpertTierSetting::Off), (vec!["--gpu-expert-tier", "auto"], ExpertTierSetting::Auto),
+            (vec!["--gpu-expert-tier", "60"], ExpertTierSetting::PerLayer(60)), (vec!["--gpu-expert-tier", "off"], ExpertTierSetting::Off)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model", "--layout"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(args.gpu_expert_tier, expected);
+            let options = crate::commands::plan::layout_options_for_test(&args);
+            assert_eq!(options.expert_tier, expected);
+        }
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--gpu-expert-tier", "most"]).is_err());
+        // A routing profile ranks a tier; alone it is refused.
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--gpu-expert-tier-profile", "r.json"]).is_err());
+        let super::Commands::Plan(args) = super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--layout",
+            "--gpu-expert-tier", "auto", "--gpu-expert-tier-profile", "r.json"]).unwrap().command
+            else { panic!("expected plan"); };
+        assert_eq!(crate::commands::plan::layout_options_for_test(&args).expert_tier_profile,
+            Some(std::path::PathBuf::from("r.json")));
     }
 
     #[test]

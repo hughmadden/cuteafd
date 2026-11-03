@@ -694,6 +694,15 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
         cache.concurrency = u32::try_from(concurrency)?;
         cache.state_slots = u32::try_from(options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
     }
+    if (options.expert_tier.enabled() || options.expert_tier_profile.is_some()) && family != "deepseek_v41" {
+        report.fits = false;
+        report.placement_supported = false;
+        let what = format!("{family}: --gpu-expert-tier is implemented for deepseek_v41 only");
+        report.hints.push(Hint { what: what.clone(), how: "Build the family's expert tier request \
+            (placement::expert_tier: an admission order over its routed layers) in its layout, as \
+            plan/layout/v41.rs does, before claiming a tier.".into() });
+        return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] });
+    }
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
             report.native_serving_admitted = model.native_serving_admission();

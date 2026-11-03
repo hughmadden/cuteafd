@@ -4451,6 +4451,90 @@ fn v41_two_4090d_with_four_sparks_plans_on_sm89() {
 }
 
 #[test]
+fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
+    // A 48 GB coordinator pair (47.45 GiB CUDA total each) at TP2 halves in
+    // front of four Sparks at TP4 that keep every expert.
+    let dir = strict_v41_snapshot(false);
+    let card = (47.45 * (1u64 << 30) as f64) as u64;
+    let pair = |tier: crate::placement::ExpertTierSetting, onboard: Option<crate::placement::OnboardSetting>,
+        profile: Option<std::path::PathBuf>| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card, card],
+        workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
+        expert_tier: tier, expert_tier_profile: profile, onboard, ..Default::default() }), ..sparks(4) };
+    use crate::placement::{ExpertTierSetting, ExpertTierShard, ExpertTierSource, OnboardSetting};
+    let whole = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Off, None, None), 6, Some(4)).unwrap();
+    assert!(whole.executable(), "{}", render(&whole));
+    let auto = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, None, None), 6, Some(4)).unwrap();
+    assert!(auto.executable(), "{}", render(&auto));
+    let placed = auto.solver_placement.as_ref().unwrap();
+    let tier = placed.expert_tier.as_ref().expect("GPU expert tier placement");
+    assert_eq!((tier.shard, tier.source, tier.routed_experts), (ExpertTierShard::Tp2, ExpertTierSource::Uniform, 40 * 384));
+    // Uniform: the same count in every layer to within one, ascending ids.
+    let counts = tier.per_layer().collect::<Vec<_>>();
+    assert_eq!(counts.len(), 40);
+    assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+    assert!(tier.experts > 0 && counts.iter().sum::<usize>() == tier.experts);
+    // Exact resident bytes: one TP2 half of the MXFP4 expert with coded UE8M0
+    // scales is 9,131,264 bytes (checkpoint MXFP4: 9,400,320).
+    let half = crate::formats::scale_codes::expert_bytes(1, 5120, 1152).unwrap();
+    assert_eq!(half, 9_131_264);
+    let catalog = crate::read_official_v41_catalog(dir.path()).unwrap();
+    assert_eq!(crate::placement::families::deepseek_v41::expert_cost(&catalog, 7, 2, 1, 1152).unwrap().resident, 384 * half);
+    assert_eq!(tier.resident_bytes, vec![tier.experts as u64 * half; 2]);
+    // No whole layer moves; the Sparks keep all 40.
+    assert_eq!(placed.onboard_layers, 0);
+    assert!(placed.tp2.is_none());
+    // The same pool target as whole-layer onboarding, and at least the same
+    // expert bytes: the tier fills at expert, not layer, granularity.
+    let whole_placed = whole.solver_placement.as_ref().unwrap();
+    assert_eq!(placed.pool_tokens, whole_placed.pool_tokens);
+    let whole_bytes = whole_placed.tp2.map_or(0, |t| t.layers as u64 * 384 * half);
+    assert!(tier.resident_bytes[0] >= whole_bytes, "tier {} B vs {} whole layers", tier.resident_bytes[0],
+        whole_placed.onboard_layers);
+    let notes = &auto.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("placement: ") && n.contains("GPU expert tier (Uniform)")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier resident experts per routed layer: [")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier uniform: expected byte hit rate")), "{notes:?}");
+    for device in auto.memory_layout.as_ref().unwrap().devices.iter().take(2) {
+        assert!(device.items.iter().any(|i| i.group.starts_with("GPU expert tier (")), "{:?}", device.items);
+    }
+
+    // N per layer: exact, and the pool is the output.
+    let fixed = plan_spark_count(dir.path(), &pair(ExpertTierSetting::PerLayer(16), None, None), 6, Some(4)).unwrap();
+    assert!(fixed.executable(), "{}", render(&fixed));
+    let fixed_tier = fixed.solver_placement.as_ref().unwrap().expert_tier.clone().unwrap();
+    assert_eq!(fixed_tier.per_layer().collect::<Vec<_>>(), vec![16; 40]);
+    assert!(fixed.solver_placement.as_ref().unwrap().pool_tokens >= placed.pool_tokens);
+
+    // A profile ranks the set: the most-routed experts first, in any layer.
+    let mut counts = vec![vec![1u64; 384]; 40];
+    for layer in 0..40 { for expert in 300..316 { counts[layer][expert] = 1000; } }
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, serde_json::to_vec(&json!({"model": "fixture", "layers": counts})).unwrap()).unwrap();
+    let profiled = plan_spark_count(dir.path(), &pair(ExpertTierSetting::PerLayer(16), None, Some(path.clone())), 6, Some(4)).unwrap();
+    assert!(profiled.executable(), "{}", render(&profiled));
+    let profiled_tier = profiled.solver_placement.as_ref().unwrap().expert_tier.clone().unwrap();
+    assert_eq!(profiled_tier.source, ExpertTierSource::Profile);
+    assert!(profiled_tier.resident.iter().all(|ids| *ids == (300..316).collect::<Vec<u16>>()));
+    let notes = &profiled.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier profile: route hit rate 97.8%")), "{notes:?}");
+
+    // Refusals: with whole-layer onboarding, without Sparks, a profile without
+    // the tier, a malformed profile.
+    let both = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, Some(OnboardSetting::Layers(2)), None), 6, Some(4)).unwrap();
+    assert!(!both.executable() && render(&both).contains("replaces whole-layer onboarding"), "{}", render(&both));
+    let mut free = pair(ExpertTierSetting::Auto, None, None);
+    free.placement = ExpertPlacement::from_spark_ranks(0);
+    let alone = plan(dir.path(), &free).unwrap();
+    assert!(!alone.executable() && render(&alone).contains("Spark ranks"), "{}", render(&alone));
+    let orphan = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Off, None, Some(path.clone())), 6, Some(4)).unwrap();
+    assert!(!orphan.executable(), "{}", render(&orphan));
+    std::fs::write(&path, br#"{"layers": [[1, 2]]}"#).unwrap();
+    let malformed = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, None, Some(path)), 6, Some(4)).unwrap();
+    assert!(!malformed.executable() && render(&malformed).contains("expert route profile"), "{}", render(&malformed));
+}
+
+#[test]
 fn v41_exl3_is_unsupported_without_a_loader_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);
