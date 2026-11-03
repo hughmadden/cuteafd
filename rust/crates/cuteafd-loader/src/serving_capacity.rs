@@ -106,8 +106,14 @@ pub struct CacheOptions {
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
-    /// DeepSeek V4's window ring holds one prefill chunk plus its window.
+    /// One staged prefill unit (one wave's rows): the largest step a shared
+    /// prefill kernel reads at once. Rings sized by the whole multi-wave span
+    /// are oversized ([`cuteafd_core::prefix::swa_ring`]).
     pub prefill_rows: u64,
+    /// The whole admitted prefill span (`waves * prefill_rows`), for state a
+    /// step publishes for later steps to read (Step-5's target hidden history).
+    /// Zero means "no wider than one unit".
+    pub prefill_span_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
     pub glmf_index: GlmfIndexCache,
     /// Bytes of one GLM Flash KDA recurrent-state element: 4 (FP32) or 2 (`--kda-state bf16`).
@@ -129,6 +135,7 @@ impl Default for CacheOptions {
             step5_kv: Qwen4KvCache::Bf16,
             mla_kv: Default::default(),
             prefill_rows: 4096,
+            prefill_span_rows: 0,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
             glmf_decode_rows: GLMF_DECODE_ROWS,

@@ -18,9 +18,10 @@ pub const PAGE_ROWS: u64 = 64;
 /// (`export_b12x_muse_aot.py`: `window + SWA_RING_STEP`, page aligned).
 pub const SWA_RING_STEP: u64 = 64;
 
-/// The one sliding ring geometry of the cache, the planner and the kernels.
+/// The one sliding ring geometry of the cache, the planner and the kernels
+/// ([`cuteafd_core::prefix::swa_ring`]: window + one step, page aligned).
 pub fn swa_ring(cfg: &MuseSparkConfig) -> Result<cuteafd_core::prefix::AppendRing, CacheGeometryError> {
-    cuteafd_core::prefix::AppendRing::new(cfg.window as u64, SWA_RING_STEP, PAGE_ROWS)
+    cuteafd_core::prefix::swa_ring(cfg.window as u64, SWA_RING_STEP, PAGE_ROWS)
         .ok_or_else(|| invalid("sliding ring geometry"))
 }
 
