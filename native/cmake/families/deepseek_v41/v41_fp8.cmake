@@ -1,7 +1,13 @@
 # Coordinator-only native K32 activation and block-FP8 projection artifacts.
-if(NOT CUTEAFD_ENABLE_CUDA OR NOT
+# SM120 uses block-scaled MMA; SM89 promotes each K32 E4M3 MMA and reads
+# plain scale layouts (no packed scales), with one card plan sized for the
+# export GPU (CUTEAFD_V41_FP8_PLAN_SMS) where SM120 has 170/188 plans.
+set(CUTEAFD_V41_FP8_PLAN_SMS "114" CACHE STRING "SMs of the SM89 export card (its q_a/kv decode plans)")
+if(CUTEAFD_ENABLE_CUDA AND CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+  set(CUTEAFD_V41_FP8_SM89 ON)
+elseif(NOT CUTEAFD_ENABLE_CUDA OR NOT
    (CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120" OR CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120f"))
-  message(FATAL_ERROR "V4.1 coordinator FP8 AOT requires a native SM120 CUDA target")
+  message(FATAL_ERROR "V4.1 coordinator FP8 AOT requires a native SM120 or SM89 CUDA target")
 endif()
 set(CUTEAFD_V41_FP8_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_fp8")
 set(CUTEAFD_V41_FP8_OBJECTS)
@@ -14,7 +20,11 @@ foreach(rows IN LISTS CUTEAFD_V41_PROJECTION_ROWS)
   endif()
   set(plans "common")
   if((projection STREQUAL "q_a" OR projection STREQUAL "kv") AND (rows EQUAL 1 OR rows EQUAL 16))
-    set(plans 170 188)
+    if(CUTEAFD_V41_FP8_SM89)
+      set(plans ${CUTEAFD_V41_FP8_PLAN_SMS})
+    else()
+      set(plans 170 188)
+    endif()
   endif()
   foreach(plan IN LISTS plans)
     set(card_suffix "")
@@ -46,6 +56,7 @@ add_custom_command(
     ${CUTEAFD_V41_FP8_OBJECTS} ${CUTEAFD_V41_FP8_HEADERS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV} ${CUTEAFD_HC_LAGGED_ENV} ${CUTEAFD_NARROW_ENV}
+    "CUTEAFD_V41_FP8_PLAN_SMS=$<IF:$<BOOL:${CUTEAFD_V41_FP8_SM89}>,${CUTEAFD_V41_FP8_PLAN_SMS},>"
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
     --output-dir "${CUTEAFD_V41_FP8_DIR}"
@@ -60,6 +71,10 @@ add_custom_target(cuteafd_v41_fp8_export DEPENDS "${CUTEAFD_V41_FP8_DIR}/v41_fp8
 add_dependencies(cuteafd_v41_fp8_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties(${CUTEAFD_V41_FP8_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_FP8_OBJECTS} families/deepseek_v41/src/v41_fp8.cc families/deepseek_v41/cuda/v41_fp8.cu)
+if(CUTEAFD_V41_FP8_SM89)
+  set_source_files_properties(families/deepseek_v41/cuda/v41_fp8.cu PROPERTIES
+    COMPILE_DEFINITIONS CUTEAFD_V41_FP8_PLAIN_SCALES=1)
+endif()
 
 # Independent scorer export keeps its pointer ABI auditable.
 set(CUTEAFD_V41_INDEX_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_index")

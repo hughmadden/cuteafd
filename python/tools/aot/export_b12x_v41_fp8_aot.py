@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Export native V4.1 K32 activation quantization and 32x32-scale projections."""
+"""Export native V4.1 K32 activation quantization and 32x32-scale projections.
+
+Targets native SM120 (block-scaled MMA, swizzled MMA-layout scales) and SM89
+(per-K32 promoted E4M3 MMA reading plain scale layouts: activation row scales
+[rows, K/32] as the row quantizer writes them, weight scales [N/32, K/32]
+unpacked). The C ABI is identical; SM89 manifests alias the MMA-scale offset
+to the row scales and size packed weight scales as the plain grid.
+"""
 from __future__ import annotations
 
 import sys as _sys
@@ -53,10 +60,20 @@ def validate_abi(path: Path, label: str, kind: str) -> dict:
     return {'symbol': symbols[0], 'pointers': pointers, 'i32': scalars, 'stream': stream, 'argument_count': count}
 
 
+# SM120 bundles keep their reference-card constants (byte-identical exports);
+# SM89 bundles take SMs and grids from the export device.
+SM120_SMS = 188
+
+
 def dispatch_header(output: Path, manifest: dict) -> None:
     from b12x._lib.quant.mxfp8_rows import mxfp8_rows_quant_aot_grid
+    plain = manifest['capability'] == [8, 9]
+    sms = manifest['physical_sms'] if plain else SM120_SMS
     lines = ['#pragma once', '#include <stdint.h>',
-             '#define CUTEAFD_V41_FP8_SMS 188']
+             f'#define CUTEAFD_V41_FP8_SMS {sms}']
+    if plain:
+        lines += ['#define CUTEAFD_V41_FP8_CC_MAJOR 8', '#define CUTEAFD_V41_FP8_CC_MINOR 9',
+                  '#define CUTEAFD_V41_FP8_PLAIN_SCALES 1']
     lines.append('#include "v41_hc_project.h"')
     prefix = '_mlir_cuteafd_v41_hc_project'
     lines.append('#define CUTEAFD_V41_HC_PROJECT_MODULE {' + ','.join((
@@ -76,13 +93,13 @@ def dispatch_header(output: Path, manifest: dict) -> None:
         if groups > 1:
             lines.append(f'#include "{label}_quant_rope.h"')
         grids = [mxfp8_rows_quant_aot_grid(size_k=k, rows=rows, expected_m=variant.get('expected_m', capacity),
-                                         sm_count=188) for rows in range(1, capacity + 1)]
+                                         sm_count=sms) for rows in range(1, capacity + 1)]
         if groups > 1:
-            grids = [min(rows * 32, 188 * 4) for rows in range(1, capacity + 1)]
+            grids = [min(rows * 32, sms * 4) for rows in range(1, capacity + 1)]
         lines.append('static const uint32_t ' + label + '_grids[] = {' + ','.join(map(str, grids)) + '};')
         info = [1, capacity, k, n, variant['scratch_bytes'],
                 variant['activation_values_offset'], variant['activation_row_scales_offset'],
-                variant['activation_mma_scales_offset'], n * k // groups // 32]
+                variant['activation_mma_scales_offset'], n * k // groups // (1024 if plain else 32)]
         modules = []
         for kind in ('quant', 'gemm', *(['quant_rope'] if groups > 1 else [])):
             prefix = '_mlir_cuteafd_' + label + '_' + kind
@@ -106,8 +123,13 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
 
     device = torch.device('cuda', torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
-    if (props.major, props.minor) != (12, 0):
-        raise ValueError('coordinator FP8 export requires native SM120')
+    if (props.major, props.minor) not in ((12, 0), (8, 9)):
+        raise ValueError('coordinator FP8 export requires native SM120 or SM89')
+    plain = (props.major, props.minor) == (8, 9)
+    card_sms = int(props.multi_processor_count)
+    expected_sms = os.environ.get('CUTEAFD_V41_FP8_PLAN_SMS')
+    if plain and expected_sms and int(expected_sms) != card_sms:
+        raise ValueError(f'SM89 FP8 export planned for {expected_sms} SMs, device has {card_sms}')
     output.mkdir(parents=True, exist_ok=True)
     (output / 'v41_fp8.json').unlink(missing_ok=True)
     manifest = {'schema': 2, 'role': 'coordinator', 'capability': [props.major, props.minor],
@@ -120,7 +142,9 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
     for name, n, k in projections:
         for capacity in rows:
             dual = name in ('q_a', 'kv') and capacity in (1, 16)
-            for plan_sms in ((170, 188) if dual else (188,)):
+            # SM89 replaces the two SM120 card plans with the export card's.
+            dual_plans = (card_sms,) if plain else (170, 188)
+            for plan_sms in (dual_plans if dual else (card_sms if plain else 188,)):
                 label = f'v41_{name}_fp8_m{capacity}' + (f'_sm{plan_sms}' if dual else '')
                 groups = 8 if name == 'o_a' else 1
                 expected_m = capacity
@@ -157,6 +181,9 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                     row_scale_offset = (values_bytes + 255) // 256 * 256
                     mma_offset = (row_scale_offset + capacity * k // 32 + 255) // 256 * 256
                     mma_bytes = groups * ((capacity + 127) // 128) * 512 * (k // groups // 128)
+                    if plain:
+                        # SM89 GEMMs read the row scales; the MMA slot aliases them.
+                        mma_offset, mma_bytes = row_scale_offset, capacity * k // 32
                     output_offset = (mma_offset + mma_bytes + 255) // 256 * 256
                     group_layout = dict(groups=groups, activation_values_offset=0,
                                         activation_row_scales_offset=row_scale_offset,
@@ -164,20 +191,25 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                                         grouped_output_offset=output_offset,
                                         activation_scratch_bytes=output_offset,
                                         scratch_bytes=output_offset + capacity * n * 2,
-                                        activation_mma_scale_shape=[32, 4, (capacity + 127) // 128, 4, k // groups // 128, groups])
+                                        activation_mma_scale_shape=[groups, capacity, k // groups // 32] if plain else [32, 4, (capacity + 127) // 128, 4, k // groups // 128, groups])
                 manifest['variants'].append({'capacity': capacity, 'plan_sms': plan_sms if dual else 0, 'expected_m': expected_m, 'split_k_all_m': all_m, 'all_rows': fixed_output or capacity == 1, 'label': label, 'input_dim': k, 'output_dim': n,
                     'activation_scratch_bytes': layout.nbytes,
                     'scratch_bytes': split_offset + split_bytes if split_k > 1 else layout.nbytes,
                     'split_k_offset': split_offset, 'split_k_bytes': split_bytes,
                     'activation_values_offset': layout.x_values_offset_bytes,
                     'activation_row_scales_offset': layout.x_scale_rows_offset_bytes,
-                    'activation_mma_scales_offset': layout.x_scale_mma_offset_bytes,
-                    'activation_mma_scale_shape': list(layout.x_scale_mma_physical_shape),
+                    'activation_mma_scales_offset': layout.x_scale_rows_offset_bytes if plain else layout.x_scale_mma_offset_bytes,
+                    'activation_mma_scale_shape': [capacity, k // 32] if plain else list(layout.x_scale_mma_physical_shape),
                     'split_k_slices': split_k, 'gemm_output_dtype': 'FP32' if split_k > 1 else 'BF16', 'output_dtype': 'BF16', 'output_bytes': capacity * n * 2,
                     'quant_abi': validate_abi(output / (label + '_quant.h'), label + '_quant', 'group_quant' if groups > 1 else 'quant'),
                     'gemm_abi': validate_abi(output / (label + '_gemm.h'), label + '_gemm', 'gemm'), **group_layout})
                 if groups > 1:
                     manifest['variants'][-1]['quant_rope_abi'] = validate_abi(output / (label + '_quant_rope.h'), label + '_quant_rope', 'group_quant')
+                if plain:
+                    manifest['variants'][-1].update(
+                        activation_scale_layout='rows', weight_scale_layout='plain',
+                        weight_scale_shape=[groups, n // groups // 32, k // groups // 32],
+                        packed_weight_scale_bytes=n * k // groups // 1024)
                 print(f'exported {label}', flush=True)
     from b12x.norm.mhc._v41_project import compile_v41_mhc_project_aot
     compile_v41_mhc_project_aot().export_to_c(str(output), 'v41_hc_project', 'cuteafd_v41_hc_project')

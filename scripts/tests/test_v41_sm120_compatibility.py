@@ -454,3 +454,66 @@ def test_capability_only_admission_and_live_launch_caps(family, device):
                         str(directory / "main.cc"), "-o", str(directory / "test")],
                        check=True, timeout=750)
         subprocess.run([str(directory / "test")], check=True, timeout=30)
+
+
+SM89_FP8_HEADER = r"""
+#pragma once
+#define CUTEAFD_V41_FP8_SMS 114
+#define CUTEAFD_V41_FP8_CC_MAJOR 8
+#define CUTEAFD_V41_FP8_CC_MINOR 9
+#define CUTEAFD_V41_FP8_PLAIN_SCALES 1
+static const uint32_t grids[] = {456};
+#define CUTEAFD_V41_FP8_VARIANTS \
+ {{1,1,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan188},{init,load,noop},grids,0,1,1,0,114,1,1}, \
+ {{1,16,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,0,16,0}
+#define CUTEAFD_V41_HC_PROJECT_MODULE {init,load,noop}
+"""
+
+SM89_FP8_MAIN = r"""
+#include <cassert>
+#include "SOURCE"
+extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t*,uint16_t*,int32_t,void*) { return 0; }
+extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float*,uint16_t*,int32_t,int32_t,int32_t,void*) { return 0; }
+extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void*,uint64_t,float*,void*) { return 0; }
+int main() {
+ void* h=nullptr;
+ // An SM89 bundle refuses SM120 devices and admits compute 8.9.
+ assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==cudaErrorInvalidDevice && h==nullptr);
+ major=8; minor=9;
+ for (int sms : {114, 128}) {
+  override_sms=sms;
+  // The only card plan serves any SM count; the exact plan is preferred.
+  cuteafd_v41_fp8_info_t info;
+  assert(cuteafd_v41_fp8_matrix_info(1,32,32,&info)==0 && info.mma_scales_offset==info.row_scales_offset);
+  assert(info.packed_weight_scale_bytes==1);
+  assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==0);
+  assert(cuteafd_v41_fp8_launch(h,reinterpret_cast<uint16_t*>(0x10000),
+    reinterpret_cast<uint8_t*>(0x20000),reinterpret_cast<uint8_t*>(0x30000),
+    reinterpret_cast<void*>(0x40000),64,reinterpret_cast<float*>(0x50000),
+    reinterpret_cast<uint16_t*>(0x60000),1,nullptr)==0);
+  assert(recorded_plan==188 && recorded_grid==456);
+  assert(cuteafd_v41_fp8_matrix_initialize(16,32,32,&h)==0);
+ }
+ assert(cuteafd_v41_hc_project_initialize()==0);
+}
+"""
+
+
+def test_sm89_bundle_admits_compute_89_and_its_single_card_plan():
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("native bridge qualification needs a C++ compiler")
+    subprocess.run(["python3", str(ROOT / "scripts/build/assert-build-filesystem.py"), str(BUILD_ROOT)], check=True)
+    BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=BUILD_ROOT) as temp:
+        directory = Path(temp)
+        (directory / "cuda_runtime.h").write_text(CUDA)
+        (directory / "v41_fp8_variants.h").write_text(SM89_FP8_HEADER)
+        source = ROOT / "native/families/deepseek_v41/src/v41_fp8.cc"
+        (directory / "main.cc").write_text(SM89_FP8_MAIN.replace("SOURCE", str(source)))
+        subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
+                        "-I", str(ROOT / "native/shared/include"),
+                        "-I", str(ROOT / "native/families/deepseek_v41/include"),
+                        str(directory / "main.cc"), "-o", str(directory / "test")],
+                       check=True, timeout=750)
+        subprocess.run([str(directory / "test")], check=True, timeout=30)
