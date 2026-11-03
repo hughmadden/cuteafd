@@ -854,6 +854,18 @@ impl StagingRoute {
     pub(crate) fn copy_engine(self, bytes: usize) -> bool {
         matches!(self, Self::CopyEngineFrom(from) if bytes >= from)
     }
+
+    /// Whether wave `sequence` of `bytes` stages by copy engine now, with the
+    /// exchange's `landed` counter at `landed`. A copy-engine copy queued
+    /// behind a wait that is not yet met parks the engine for every stream
+    /// (four parked copies stop all copy-engine work at the default eight
+    /// hardware queues), and device-ordered passes queue a layer ahead of its
+    /// predecessor's landing. So the copy engine stages only once every
+    /// earlier wave has landed: that meets both this slot's reuse wait and any
+    /// earlier landing queued ahead on the stream. Otherwise SM copies stage.
+    pub(crate) fn copy_engine_now(self, bytes: usize, landed: u32, sequence: u32) -> bool {
+        self.copy_engine(bytes) && reached(landed, sequence.wrapping_sub(1))
+    }
 }
 
 /// `CUTEAFD_SPARK_STAGING`: `auto` (default; probe, copy engine from the
@@ -1087,8 +1099,9 @@ impl<'a> Waves<'a> {
             }).collect::<Result<_>>()?;
             unsafe {
                 let previous = staging_reuse(sequence, cut.waves);
+                let copy_engine = self.staging.copy_engine_now(layout.bytes, self.words.load(Counter::Landed), sequence);
                 self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), previous)?;
-                if self.staging.copy_engine(layout.bytes) {
+                if copy_engine {
                     self.library.copy_engine_regions(&regions, stream)?;
                 } else {
                     self.library.sm_copy_regions(&regions, stream)?;

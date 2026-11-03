@@ -1315,3 +1315,21 @@ fn staging_route_uses_the_copy_engine_only_where_waits_hold_it() {
     assert!(StagingRoute::CopyEngineFrom(0).copy_engine(1));
     assert!(!StagingRoute::Sm.copy_engine(usize::MAX));
 }
+
+#[test]
+fn copy_engine_staging_waits_until_every_earlier_wave_landed() {
+    let route = StagingRoute::CopyEngineFrom(16 << 10);
+    // Large enough and caught up: the copy engine stages.
+    assert!(route.copy_engine_now(16 << 10, 9, 10));
+    assert!(route.copy_engine_now(1 << 20, 12, 10));
+    // An earlier wave still in flight: its landing may be queued ahead on the
+    // stream, so SM copies stage instead of parking the copy engine.
+    assert!(!route.copy_engine_now(1 << 20, 8, 10));
+    // Below the crossover, or with the SM route, never the copy engine.
+    assert!(!route.copy_engine_now((16 << 10) - 1, 9, 10));
+    assert!(!StagingRoute::Sm.copy_engine_now(1 << 20, 9, 10));
+    // The first wave has nothing earlier; sequences wrap.
+    assert!(route.copy_engine_now(1 << 20, 0, 1));
+    assert!(route.copy_engine_now(1 << 20, u32::MAX, 0));
+    assert!(!route.copy_engine_now(1 << 20, u32::MAX - 1, 0));
+}
