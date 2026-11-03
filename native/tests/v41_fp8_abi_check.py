@@ -8,7 +8,10 @@ torch replica of the K32 quantizer (E4M3 values, UE8M0 row scales, amax floor
 1e-4, WO-A floor 0); outputs must match the FP64 product of the dequantized
 operands to BF16 rounding (max relative error below 8e-3).
 
-Usage: v41_fp8_abi_check.py NATIVE_LIB MANIFEST [--rows full|odd] [--labels L1,L2]
+Usage: v41_fp8_abi_check.py NATIVE_LIB MANIFEST [--rows full|odd|R1,R2,..] [--labels L1,L2]
+
+A row list runs every listed count up to each variant's capacity, plus
+capacity - 3 (variants may split their kernels by live rows).
 """
 import argparse
 import ctypes as C
@@ -60,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('native_lib', type=Path)
     parser.add_argument('manifest', type=Path)
-    parser.add_argument('--rows', choices=('full', 'odd'), default='full')
+    parser.add_argument('--rows', default='full')
     parser.add_argument('--labels')
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
@@ -92,48 +95,55 @@ def main():
         cap, k, n = variant['capacity'], variant['input_dim'], variant['output_dim']
         groups = variant.get('groups', 1)
         gk, gn = k // groups, n // groups
-        rows = cap if args.rows == 'full' else max(1, cap - 3)
+        if args.rows == 'full':
+            row_counts = [cap]
+        elif args.rows == 'odd':
+            row_counts = [max(1, cap - 3)]
+        else:
+            listed = [int(r) for r in args.rows.split(',') if int(r) <= cap]
+            row_counts = sorted(set(listed + [max(1, cap - 3)]))
         info = Info()
         info_fn(cap, k, n, C.byref(info))
         handle = P()
         init(cap, k, n, C.byref(handle))
         torch.manual_seed(cap * 7 + k + n)
-        x = (torch.randn(rows, k, device='cuda') * torch.rand(rows, 1, device='cuda') * 4).bfloat16()
         w = (torch.randn(groups, gn, gk, device='cuda') * 2).to(torch.float8_e4m3fn)
         scales = torch.randint(118, 128, (groups, gn // 32, gk // 32), device='cuda', dtype=torch.uint8)
         packed = torch.empty(info.weight_scales, device='cuda', dtype=torch.uint8)
         scratch = torch.empty(info.scratch, device='cuda', dtype=torch.uint8)
         alpha = torch.empty(1, device='cuda')
-        out = torch.empty(rows, n, device='cuda', dtype=torch.bfloat16)
         pack(scales.data_ptr(), packed.data_ptr(), k, n, stream)
         init_scratch(handle, scratch.data_ptr(), info.scratch, alpha.data_ptr(), stream)
         rope = groups > 1 and cap == 80
-        freqs = torch.randn(rows, 32, 2, device='cuda') if rope else None
-        if rope:
-            launch_rope(handle, x.data_ptr(), freqs.data_ptr(), w.data_ptr(), packed.data_ptr(),
-                        scratch.data_ptr(), info.scratch, alpha.data_ptr(), out.data_ptr(), rows, stream)
-        else:
-            launch(handle, x.data_ptr(), w.data_ptr(), packed.data_ptr(), scratch.data_ptr(), info.scratch,
-                   alpha.data_ptr(), out.data_ptr(), rows, stream)
-        torch.cuda.synchronize()
-        source = rope_reference(x, freqs) if rope else x
-        floor = 0.0 if groups > 1 else 1e-4
-        mismatch, worst = 0, 0.0
-        values = scratch[info.values:info.values + groups * rows * gk].view(groups, rows, gk)
-        row_scales = scratch[info.row_scales:info.row_scales + groups * rows * (gk // 32)].view(groups, rows, gk // 32)
-        for g in range(groups):
-            qv, qs = quant_reference(source[:, g * gk:(g + 1) * gk], floor)
-            mismatch += int((values[g] != qv.view(torch.uint8)).sum()) + int((row_scales[g] != qs).sum())
-            a = (qv.double().view(rows, gk // 32, 32) * torch.exp2(qs.double() - 127)[..., None]).view(rows, gk)
-            b = (w[g].double().view(gn // 32, 32, gk // 32, 32)
-                 * torch.exp2(scales[g].double() - 127)[:, None, :, None]).view(gn, gk)
-            ref = a @ b.T
-            got = out[:, g * gn:(g + 1) * gn].double()
-            worst = max(worst, ((got - ref).abs().max() / ref.abs().max()).item())
-        ok = mismatch == 0 and worst < 8e-3
-        failures += not ok
-        print(f'{label:28s} rows={rows:4d} quant_mismatch={mismatch} rel_err={worst:.2e}'
-              f'{" rope" if rope else ""} ok={ok}', flush=True)
+        for rows in row_counts:
+            x = (torch.randn(rows, k, device='cuda') * torch.rand(rows, 1, device='cuda') * 4).bfloat16()
+            out = torch.empty(rows, n, device='cuda', dtype=torch.bfloat16)
+            freqs = torch.randn(rows, 32, 2, device='cuda') if rope else None
+            if rope:
+                launch_rope(handle, x.data_ptr(), freqs.data_ptr(), w.data_ptr(), packed.data_ptr(),
+                            scratch.data_ptr(), info.scratch, alpha.data_ptr(), out.data_ptr(), rows, stream)
+            else:
+                launch(handle, x.data_ptr(), w.data_ptr(), packed.data_ptr(), scratch.data_ptr(), info.scratch,
+                       alpha.data_ptr(), out.data_ptr(), rows, stream)
+            torch.cuda.synchronize()
+            source = rope_reference(x, freqs) if rope else x
+            floor = 0.0 if groups > 1 else 1e-4
+            mismatch, worst = 0, 0.0
+            values = scratch[info.values:info.values + groups * rows * gk].view(groups, rows, gk)
+            row_scales = scratch[info.row_scales:info.row_scales + groups * rows * (gk // 32)].view(groups, rows, gk // 32)
+            for g in range(groups):
+                qv, qs = quant_reference(source[:, g * gk:(g + 1) * gk], floor)
+                mismatch += int((values[g] != qv.view(torch.uint8)).sum()) + int((row_scales[g] != qs).sum())
+                a = (qv.double().view(rows, gk // 32, 32) * torch.exp2(qs.double() - 127)[..., None]).view(rows, gk)
+                b = (w[g].double().view(gn // 32, 32, gk // 32, 32)
+                     * torch.exp2(scales[g].double() - 127)[:, None, :, None]).view(gn, gk)
+                ref = a @ b.T
+                got = out[:, g * gn:(g + 1) * gn].double()
+                worst = max(worst, ((got - ref).abs().max() / ref.abs().max()).item())
+            ok = mismatch == 0 and worst < 8e-3
+            failures += not ok
+            print(f'{label:28s} rows={rows:4d} quant_mismatch={mismatch} rel_err={worst:.2e}'
+                  f'{" rope" if rope else ""} ok={ok}', flush=True)
     print('V41_FP8_ABI', 'PASS' if not failures else f'FAIL ({failures})')
     raise SystemExit(1 if failures else 0)
 
