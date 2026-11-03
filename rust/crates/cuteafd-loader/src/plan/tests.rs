@@ -4546,6 +4546,34 @@ fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
 }
 
 #[test]
+fn v41_declared_expert_storage_must_match_the_charged_halves() {
+    // SM89 packages declare their resident expert layout. The planner charges
+    // the coded-scale TP2 half (9,131,264 B) and refuses any other layout.
+    let dir = strict_v41_snapshot(false);
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card; 2],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89, workspace_manifest: v41_workspace(dir.path()),
+        pool_tokens: Some(0), context_tokens: 1 << 20, ..Default::default() }), ..sparks(4) };
+    let path = dir.path().join("share/V41_EXPERT_WORKSPACES/mxfp4_rtx_tp2.json");
+    let base: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let declare = |planes: [u64; 4], bytes: u64| {
+        let mut manifest = base.clone();
+        manifest["expert_storage"] = json!({"weight_layout": "e2m1_n256_k128_lane_major",
+            "scale_layout": "ue8m0_offset4_n256_k128", "plane_bytes": planes, "bytes_per_expert": bytes});
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap()
+    };
+    let charged = declare([5_898_240, 186_624, 2_949_120, 97_280], 9_131_264);
+    assert!(charged.executable(), "{}", render(&charged));
+    // The checkpoint's own MXFP4 half (9,400,320 B) is not a layout the planner loads.
+    let other = declare([5_898_240, 184_320, 2_949_120, 368_640], 9_400_320);
+    assert!(!other.executable() && render(&other).contains("does not load this expert layout"), "{}", render(&other));
+    let inconsistent = declare([1, 2, 3, 4], 9_131_264);
+    assert!(!inconsistent.executable() && render(&inconsistent).contains("do not sum"), "{}", render(&inconsistent));
+}
+
+#[test]
 fn v41_exl3_is_unsupported_without_a_loader_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_v41_exl3_snapshot(dir.path(), 3);

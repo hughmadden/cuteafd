@@ -303,19 +303,12 @@ fn expert_workspace(
     let role = if local { "rtx_backbone" } else { "rtx_tp2" };
     // A compiled capacity on one RTX (the caller covers live rows); TP2 rows.
     let capacity = rows;
+    let format = if catalog.nvfp4().is_some() { "nvfp4" } else { "mxfp4" };
+    let path = parent.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json"));
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| {
+        format!("missing exact workspace manifest {}", path.display())
+    })?)?;
     let (stored, routed) = {
-        let format = if catalog.nvfp4().is_some() {
-            "nvfp4"
-        } else {
-            "mxfp4"
-        };
-        let path = parent
-            .join("V41_EXPERT_WORKSPACES")
-            .join(format!("{format}_{role}.json"));
-        let value =
-            serde_json::from_slice(&std::fs::read(&path).with_context(|| {
-                format!("missing exact workspace manifest {}", path.display())
-            })?)?;
         let workspace = NativeWorkspace::from_manifest(
             &value,
             role,
@@ -366,7 +359,37 @@ fn expert_workspace(
             Ok(cost)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(storage) = value.get("expert_storage") {
+        for cost in &experts {
+            check_expert_storage(storage, cost, shape.experts as u64)
+                .with_context(|| path.display().to_string())?;
+        }
+    }
     Ok((experts, lane))
+}
+
+/// A package that declares its resident expert layout (`expert_storage`, as
+/// SM89 exports do) must store exactly the bytes the planner charges for this
+/// role: one TP2 half per expert on two RTX, one whole expert on one.
+fn check_expert_storage(storage: &serde_json::Value, cost: &ExpertCost, experts: u64) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    let declared = storage["bytes_per_expert"].as_u64().context("expert_storage has no bytes_per_expert")?;
+    if let Some(planes) = storage.get("plane_bytes") {
+        let planes = planes.as_array().context("expert_storage plane_bytes is not a list")?.iter()
+            .map(|plane| plane.as_u64().context("expert_storage plane is not a byte count"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(planes.iter().sum::<u64>() == declared,
+            "expert_storage planes {planes:?} do not sum to its {declared} B per expert");
+    }
+    let parts = if cost.tp2 { cost.half.to_vec() } else { vec![cost.whole] };
+    for part in parts {
+        ensure!(experts > 0 && part.resident == declared.checked_mul(experts).context("expert_storage overflow")?,
+            "the package stores {declared} B per expert ({}, {}) but the planner charges {} B: \
+             it does not load this expert layout",
+            storage["weight_layout"].as_str().unwrap_or("unnamed weights"),
+            storage["scale_layout"].as_str().unwrap_or("unnamed scales"), part.resident / experts.max(1));
+    }
+    Ok(())
 }
 
 pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64> {
