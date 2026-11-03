@@ -1389,34 +1389,65 @@ pub(crate) fn mark_namespace(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Each of `owners`' planes on its GPU, compared chunk by chunk with `with`'s.
-pub(crate) fn assert_planes_equal(library: &cuteafd_ffi::NativeLibrary,
-    owners: &[crate::shared::experts::layer::ExpertWeights<'_>],
-    with: &[crate::shared::experts::layer::ExpertWeights<'_>], what: &str) -> Result<()> {
-    anyhow::ensure!(owners.len() == with.len(), "{what}: layer counts differ");
-    for (index, (actual, expected)) in owners.iter().zip(with).enumerate() {
-        for (plane, (a, e)) in actual.buffers.iter().zip(&expected.buffers).enumerate() {
-            let (a, e) = (a.buffer, e.buffer);
+/// Each pair's four planes (on one GPU), compared chunk by chunk.
+pub(crate) fn assert_planes_equal<'w, 'a: 'w>(library: &cuteafd_ffi::NativeLibrary,
+    pairs: impl IntoIterator<Item = (&'w crate::shared::experts::layer::ExpertWeights<'a>,
+        &'w crate::shared::experts::layer::ExpertWeights<'a>)>, what: &str) -> Result<()> {
+    for (index, (actual, expected)) in pairs.into_iter().enumerate() {
+        for plane in 0..4 {
+            let (a, e) = (actual.buffers[plane].buffer, expected.buffers[plane].buffer);
             anyhow::ensure!(a.bytes == e.bytes && a.device_id == e.device_id, "{what} {index} plane {plane}: extents differ");
-            let chunk = 64usize << 20;
-            for at in (0..a.bytes).step_by(chunk) {
-                let n = chunk.min(a.bytes - at);
-                // SAFETY (offsets): `at + n` lies inside both live planes.
-                let view = |b: cuteafd_ffi::CuteafdDeviceBuffer| cuteafd_ffi::CuteafdDeviceBuffer {
-                    ptr: unsafe { b.ptr.cast::<u8>().add(at) }.cast(), bytes: n, ..b };
-                let (mut left, mut right) = (vec![0u8; n], vec![1u8; n]);
-                Device { library, id: a.device_id }.run(|| {
-                    library.copy_d2h(&mut left, view(a))?;
-                    library.copy_d2h(&mut right, view(e))
-                })?;
-                if left != right {
-                    let first = left.iter().zip(&right).position(|(x, y)| x != y).unwrap_or(0);
-                    anyhow::bail!("{what} {index} plane {plane}: first difference at byte {}", at + first);
-                }
-            }
+            assert_bytes_equal(library, a, e, &format!("{what} {index} plane {plane}"))?;
         }
     }
     Ok(())
+}
+
+/// Two equal-sized device ranges on one GPU, compared chunk by chunk.
+pub(crate) fn assert_bytes_equal(library: &cuteafd_ffi::NativeLibrary, a: cuteafd_ffi::CuteafdDeviceBuffer,
+    e: cuteafd_ffi::CuteafdDeviceBuffer, what: &str) -> Result<()> {
+    anyhow::ensure!(a.bytes == e.bytes && a.device_id == e.device_id, "{what}: extents differ");
+    let chunk = 64usize << 20;
+    for at in (0..a.bytes).step_by(chunk) {
+        let n = chunk.min(a.bytes - at);
+        // SAFETY (offsets): `at + n` lies inside both live ranges.
+        let view = |b: cuteafd_ffi::CuteafdDeviceBuffer| cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: unsafe { b.ptr.cast::<u8>().add(at) }.cast(), bytes: n, ..b };
+        let (mut left, mut right) = (vec![0u8; n], vec![1u8; n]);
+        Device { library, id: a.device_id }.run(|| {
+            library.copy_d2h(&mut left, view(a))?;
+            library.copy_d2h(&mut right, view(e))
+        })?;
+        if left != right {
+            let first = left.iter().zip(&right).position(|(x, y)| x != y).unwrap_or(0);
+            anyhow::bail!("{what}: first difference at byte {}", at + first);
+        }
+    }
+    Ok(())
+}
+
+/// Pushes `records` (both GPUs' recorded loads) to `devices` as coordinator
+/// ranks alone through a fake hub serving `snapshot` (a marked namespace),
+/// and requires both ranks to commit. Returns each GPU's planned (device,
+/// staged) bytes.
+pub(crate) fn push_records_alone(snapshot: &std::path::Path, sockets: &std::path::Path, devices: [Device<'_>; 2],
+    records: crate::shared::experts::rtx::dense::Records) -> Result<Vec<(u64, u64)>> {
+    let (plans, destinations) = crate::shared::experts::rtx::dense::plan_records(snapshot, records, &devices, 0)?;
+    let planned = plans.iter().map(|plan| (plan.base, plan.host_bytes)).collect::<Vec<_>>();
+    let socket = sockets.join("hub.sock").to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let push = CoordinatorPush::prepare_alone_at(snapshot, None, 2, None, Some(socket.clone()))?;
+    let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
+    let hub = fake_hub(listener, socket, snapshot.to_path_buf(), 2, commit_allowed);
+    let started = std::time::Instant::now();
+    let (received, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok((plans, destinations))),
+        || { let _ = allow_commit.send(()); });
+    let served = hub.join().map_err(|_| anyhow::anyhow!("fake hub panicked"))?;
+    served?;
+    anyhow::ensure!(received?.map(|ranks| ranks.len()) == Some(2), "both coordinator ranks commit");
+    eprintln!("both GPUs received their ranks in {:.1} s: planned (device, staged) bytes {planned:?}",
+        started.elapsed().as_secs_f64());
+    Ok(planned)
 }
 
 /// dSpark's 3 x 128 draft experts as TP2 halves (`--tp2-dspark-experts`)
@@ -1428,7 +1459,7 @@ pub(crate) fn assert_planes_equal(library: &cuteafd_ffi::NativeLibrary,
 #[ignore = "requires CUTEAFD_NATIVE_LIB (V4.1 draft TP2 exports), two CUDA GPUs and CUTEAFD_PUSH_FIXTURE_DIR on NVMe"]
 fn dspark_tp2_halves_push_byte_exact_on_two_gpus() -> Result<()> {
     use crate::shared::experts::{layer::tp2_half_tests::pattern_expert,
-        rtx::{dense::{plan_records, Recorder}, draft::{rank::Weights, Layout}}};
+        rtx::{dense::Recorder, draft::{rank::Weights, Layout}}};
     use cuteafd_loader::V41ExpertSelection;
     let _ = tracing_subscriber::fmt().with_env_filter("info").with_test_writer().try_init();
     // SAFETY: the explicitly supplied architecture-matched library lives through the test.
@@ -1445,36 +1476,26 @@ fn dspark_tp2_halves_push_byte_exact_on_two_gpus() -> Result<()> {
         intermediate: 2304, layers: 3 }, stages: 3, owner: 1 };
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     let budgets = [64usize << 30; 2];
+    // A whole drafter stage rides in the same group on the drafter's GPU.
+    let whole = crate::shared::experts::layer::ExpertLayer::Dspark { stage: 0 };
+    let load_whole = || devices[1].run(|| crate::shared::experts::layer::ExpertWeights::load(&library, &catalog, whole, 40 << 30));
     let mounted = Weights::load_pair(devices, &catalog, budgets, layout)?;
+    let whole_mounted = load_whole()?;
     let recorder = Recorder::start(true)?.context("dense recorder")?;
-    let pushed = Weights::load_pair(devices, &catalog, budgets, layout);
+    let pushed = Weights::load_pair(devices, &catalog, budgets, layout).and_then(|pushed| Ok((pushed, load_whole()?)));
     let records = recorder.finish();
-    let pushed = pushed?;
-    let (plans, destinations) = plan_records(&snapshot, records, &devices, 0)?;
-    for (gpu, plan) in plans.iter().enumerate() {
-        eprintln!("GPU {gpu}: planned device bytes {} staged bytes {} pinned bound {}", plan.base, plan.host_bytes,
-            plan.host_staging.bytes()?);
-    }
+    let (pushed, whole_pushed) = pushed?;
     let sockets = tempfile::tempdir_in(&fixtures)?;
-    let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
-    let push = CoordinatorPush::prepare_alone_at(&snapshot, None, 2, None, Some(socket.clone()))?;
-    let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
-    let hub = fake_hub(listener, socket, snapshot.clone(), 2, commit_allowed);
-    let started = std::time::Instant::now();
-    let (received, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok((plans, destinations))),
-        || { let _ = allow_commit.send(()); });
-    let served = hub.join().map_err(|_| anyhow::anyhow!("fake hub panicked"))?;
-    served?;
-    anyhow::ensure!(received?.map(|ranks| ranks.len()) == Some(2), "both coordinator ranks commit");
-    eprintln!("both GPUs received their draft halves in {:.1} s", started.elapsed().as_secs_f64());
+    push_records_alone(&snapshot, sockets.path(), devices, records)?;
     for weights in &pushed { weights.release_raw_scales(); }
+    whole_pushed.release_raw_scales();
+    assert_planes_equal(&library, [(&whole_pushed, &whole_mounted)], "GPU 1 whole draft stage")?;
     let charge = 3 * cuteafd_loader::placement::families::deepseek_v41::resident::native_expert_bytes(128, 5120, 1152) as usize;
     for rank in 0..2 {
         anyhow::ensure!(pushed[rank].resident_bytes() == charge && mounted[rank].resident_bytes() == charge,
             "GPU {rank}: pushed {} / mounted {} B against the planner's {charge}",
             pushed[rank].resident_bytes(), mounted[rank].resident_bytes());
-        assert_planes_equal(&library, pushed[rank].stages(), mounted[rank].stages(), &format!("GPU {rank} stage"))?;
+        assert_planes_equal(&library, pushed[rank].stages().iter().zip(mounted[rank].stages()), &format!("GPU {rank} stage"))?;
         eprintln!("GPU {rank}: {charge} B of draft expert halves pushed byte-exact against the mount (planner {charge})");
     }
     Ok(())
