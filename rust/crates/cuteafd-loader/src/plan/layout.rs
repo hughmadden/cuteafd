@@ -189,8 +189,11 @@ pub struct LayoutOptions {
     /// of whole-layer onboarding. Off by default.
     pub expert_tier: crate::placement::ExpertTierSetting,
     /// `--gpu-expert-tier-profile`: per-layer route counts that rank the
-    /// resident set; uniform without one.
+    /// resident set; uniform popularity without one.
     pub expert_tier_profile: Option<std::path::PathBuf>,
+    /// Per-layer pool rates the tier's residency minimises the predicted
+    /// step time with (default: measured on a 48 GB pair and four Sparks).
+    pub expert_tier_model: crate::placement::TierStepModel,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
     /// GLM Flash KDA partials and their peer payloads use FP32.
@@ -326,6 +329,7 @@ impl Default for LayoutOptions {
             onboard: None,
             expert_tier: Default::default(),
             expert_tier_profile: None,
+            expert_tier_model: crate::placement::TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS,
             exchange_f32: false,
             glmf_kda_fp32_partials: false,
             workspace_manifest: None,

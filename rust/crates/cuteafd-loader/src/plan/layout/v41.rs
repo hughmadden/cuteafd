@@ -4,8 +4,8 @@ pub use crate::placement::families::deepseek_v41::resident::*;
 use super::*;
 use anyhow::{ensure, Context, Result};
 use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Baseline,
-    Demand, ExpertRouteProfile, ExpertTierRequest, ExpertTierSize, ExpertTierSource, GpuBudget, Inventory, Onboard,
-    PoolPolicy, SparkWorkingSet};
+    Demand, ExpertActivation, ExpertRouteProfile, ExpertTierRequest, ExpertTierSize, ExpertTierSource, GpuBudget,
+    Inventory, Onboard, PoolPolicy, SparkWorkingSet};
 use v41::DraftInventory;
 
 // Conservative combined code/ready-graph envelope; pure LoadedCode is unqualified.
@@ -131,15 +131,19 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         devices[gpu].items.push(Item::new(Category::Runtime, "native LoadedCode estimate", "unqualified native code/ready graph residency", NATIVE_CODE_ESTIMATE, Basis::Estimated));
         fixed.extend(v41::growth_demands(total, ranks, automatic, gpu as u8));
     }
-    // A GPU expert tier replaces whole-layer onboarding (the Sparks keep
-    // every expert): no RTX expert layer, and no mandatory TP2 prefix.
-    let profile = expert_tier_profile(options)?;
+    // A GPU expert tier generalises whole-layer onboarding: --rtx-expert-layers
+    // pins whole layers inside it, and the Sparks keep every expert.
+    let routed = catalog.routed_experts();
+    let tier_inputs = expert_tier_activation(options, routed.routed_layers(), routed.experts, routed.topk as u32)?;
     let onboard = if options.expert_tier.enabled() { Onboard::Layers(0) }
-        else if spark_ranks == 0 { Onboard::Layers(catalog.routed_experts().routed_layers()) } else {
-        options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto)
+        else if spark_ranks == 0 { Onboard::Layers(routed.routed_layers()) } else {
+        options.resolve_onboard(routed.routed_layers()).unwrap_or(Onboard::Auto)
     };
     let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
-    request.expert_tier = expert_tier_request(options, &request, catalog.routed_experts().experts, profile.as_ref())?;
+    request.expert_tier = match &tier_inputs {
+        Some((activation, source, _)) => expert_tier_request(options, &request, routed.experts, activation, *source)?,
+        None => None,
+    };
     request.fixed = fixed;
     request.startup = startup.clone();
     if let Some(draft) = &draft { request.startup.extend(owners.draft_load_phases(draft)?); }
@@ -158,9 +162,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         encoder_request.onboard = Onboard::Layers(request.minimum_expert_layers);
         encoder_request.pool.pin_selected(placement.pool_tokens);
     }
-    // An automatic tier is optional too: the encoder displaces it, not the pool.
-    if request.expert_tier.as_ref().is_some_and(|tier| tier.size == ExpertTierSize::Auto) {
-        encoder_request.expert_tier = None;
+    // An automatic tier is optional too, apart from its pinned whole layers:
+    // the encoder displaces it, not the pool.
+    if let Some(tier) = request.expert_tier.as_ref().filter(|tier| tier.size == ExpertTierSize::Auto) {
+        encoder_request.expert_tier = (tier.pinned > 0)
+            .then(|| ExpertTierRequest { size: ExpertTierSize::Experts(tier.pinned), ..tier.clone() });
         encoder_request.pool.pin_selected(placement.pool_tokens);
     }
     let encoder_budget = placement::solve(&encoder_request)?;
@@ -202,8 +208,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
-    if let Some(tier) = &placement.expert_tier {
-        notes.extend(expert_tier_notes(tier, &request, profile.as_ref(), catalog.routed_experts().topk as u32));
+    if let (Some(tier), Some((activation, _, profile))) = (&placement.expert_tier, &tier_inputs) {
+        notes.extend(expert_tier_notes(tier, &request, activation, profile.as_ref(), &options.expert_tier_model));
     }
     if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
         let e = catalog.routed_experts();
@@ -242,8 +248,11 @@ fn solve_with_weight_limit(request: &placement::PlacementRequest, draft: Option<
             let drop = usize::try_from(excess.div_ceil(largest.max(1)))?.max(1);
             let mut trial = request.clone();
             let mut shrunk = trial.expert_tier.take().context("GPU expert tier request")?;
+            let keep = tier.experts.saturating_sub(drop);
+            ensure!(keep >= shrunk.pinned,
+                "V4.1 coordinator weight budget exceeded; pinned whole layers need more than {limit} bytes");
             if shrunk.size == ExpertTierSize::Auto { trial.pool.pin_selected(placement.pool_tokens); }
-            shrunk.size = ExpertTierSize::Experts(tier.experts.saturating_sub(drop));
+            shrunk.size = ExpertTierSize::Experts(keep);
             trial.expert_tier = Some(shrunk);
             placement = placement::solve(&trial)?;
             continue;
@@ -290,49 +299,72 @@ fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placeme
     }).collect()
 }
 
-/// `--gpu-expert-tier-profile`, read once; it requires the tier.
-fn expert_tier_profile(options: &LayoutOptions) -> Result<Option<ExpertRouteProfile>> {
-    let Some(path) = &options.expert_tier_profile else { return Ok(None) };
-    ensure!(options.expert_tier.enabled(), "--gpu-expert-tier-profile needs --gpu-expert-tier auto or N");
-    Ok(Some(ExpertRouteProfile::read(path)?))
+/// The tier's expected activations: `--gpu-expert-tier-profile` at the step
+/// model's verify width, else uniform popularity; `None` when the tier is off.
+/// A profile without a tier is refused.
+#[allow(clippy::type_complexity)]
+fn expert_tier_activation(options: &LayoutOptions, routed: usize, experts: usize, topk: u32)
+    -> Result<Option<(ExpertActivation, ExpertTierSource, Option<ExpertRouteProfile>)>> {
+    let model = &options.expert_tier_model;
+    match (&options.expert_tier_profile, options.expert_tier.enabled()) {
+        (Some(_), false) => anyhow::bail!("--gpu-expert-tier-profile needs --gpu-expert-tier auto or N"),
+        (_, false) => Ok(None),
+        (None, true) => Ok(Some((ExpertActivation::uniform(routed, experts, model.active_experts),
+            ExpertTierSource::Uniform, None))),
+        (Some(path), true) => {
+            let profile = ExpertRouteProfile::read(path)?;
+            let activation = ExpertActivation::from_profile(&profile, routed, experts, model.step_rows, topk,
+                model.active_experts)?;
+            Ok(Some((activation, ExpertTierSource::Profile, Some(profile))))
+        }
+    }
 }
 
-/// The tier V4.1 asks the solver for: every routed layer's experts in uniform
-/// round-robin order, or the profile's most-routed first. The tier replaces
-/// whole-layer onboarding and needs Sparks holding every expert.
+/// The tier V4.1 asks the solver for: every routed slot ranked by how much
+/// its residency cuts the predicted step time, behind the whole layers
+/// `--rtx-expert-layers` pins. It needs Sparks holding every expert.
 fn expert_tier_request(options: &LayoutOptions, request: &placement::PlacementRequest, experts: usize,
-    profile: Option<&ExpertRouteProfile>) -> Result<Option<ExpertTierRequest>> {
+    activation: &ExpertActivation, source: ExpertTierSource) -> Result<Option<ExpertTierRequest>> {
     let routed = request.layers.iter().enumerate().filter(|(_, layer)| layer.experts.is_some())
         .map(|(index, _)| index).collect::<Vec<_>>();
     let Some(size) = options.expert_tier.size(routed.len()) else { return Ok(None) };
     ensure!(request.inventory.spark_ranks > 0,
         "the GPU expert tier runs non-resident experts on the Sparks: plan it with Spark ranks");
-    ensure!(options.onboard.is_none_or(|setting| setting.resolve(routed.len()) == Onboard::Layers(0)),
-        "--gpu-expert-tier replaces whole-layer onboarding: drop --rtx-expert-layers (or pass 0)");
-    let (order, source) = match profile {
-        Some(profile) => (placement::expert_tier::profile_order(&routed, experts, profile)?, ExpertTierSource::Profile),
-        None => (placement::expert_tier::uniform_order(&routed, experts), ExpertTierSource::Uniform),
+    let pinned = match options.resolve_onboard(routed.len()) {
+        None | Some(Onboard::Auto) => 0,
+        Some(Onboard::Layers(layers)) => layers,
     };
-    Ok(Some(ExpertTierRequest { size, experts_per_layer: experts, order, source }))
+    ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
+    let order = placement::expert_tier::optimized_order(&routed, activation, &options.expert_tier_model, pinned);
+    Ok(Some(ExpertTierRequest::new(size, experts, order, source)))
 }
 
-/// Plan notes: resident experts per routed layer and the byte hit rate the
-/// set implies (uniform: its byte share at every step width; a profile: its
-/// route share, and its expected hit rate on six-row verify steps).
+/// Plan notes: resident experts per routed layer, and the expert time the step
+/// model predicts per verify step against all-Spark and against the same
+/// bytes spent on whole layers.
 fn expert_tier_notes(tier: &placement::ExpertTierPlacement, request: &placement::PlacementRequest,
-    profile: Option<&ExpertRouteProfile>, topk: u32) -> Vec<String> {
+    activation: &ExpertActivation, profile: Option<&ExpertRouteProfile>, model: &placement::TierStepModel)
+    -> Vec<String> {
     let routed = request.layers.iter().zip(&tier.resident).filter(|(layer, _)| layer.experts.is_some())
         .map(|(_, ids)| ids.as_slice()).collect::<Vec<_>>();
     let mut notes = vec![format!("GPU expert tier resident experts per routed layer: {:?}",
         routed.iter().map(|ids| ids.len()).collect::<Vec<_>>())];
-    let share = f64::from(tier.byte_share_ppm) / 1e4;
-    notes.push(match profile {
-        None => format!("GPU expert tier uniform: expected byte hit rate {share:.1}% at every step width \
-            (no routing skew assumed); a --gpu-expert-tier-profile of route counts raises it"),
-        Some(profile) => format!("GPU expert tier profile: route hit rate {:.1}%, expected byte hit rate {:.1}% \
-            on 6-row verify steps, from a {share:.1}% byte share",
-            100.0 * profile.route_share(&routed), 100.0 * profile.step_hit_rate(&routed, 6, topk)),
-    });
+    let ms = |ns: f64| ns / 1e6;
+    let all_spark = model.step_ns(activation, &[]);
+    let tiered = model.step_ns(activation, &routed);
+    let experts = activation.layers.first().map_or(1, Vec::len).max(1);
+    let per_whole_layer = (all_spark - model.whole_step_ns(activation)) / activation.layers.len().max(1) as f64;
+    let whole = per_whole_layer * tier.experts as f64 / experts as f64;
+    notes.push(format!("GPU expert tier predicted expert time per verify step: {:.2} -> {:.2} ms ({:.2} ms saved) \
+        at a {:.1}% byte hit rate; the same bytes as whole layers save {:.2} ms (step model: GPU {:.2} us per \
+        expert + {:.0} us, Spark {:.2} us per expert + {:.0} us, {} active experts per layer)",
+        ms(all_spark), ms(tiered), ms(all_spark - tiered), 100.0 * activation.hit_rate(&routed), ms(whole),
+        model.gpu_expert_ns as f64 / 1e3, model.gpu_fixed_ns as f64 / 1e3, model.spark_expert_ns as f64 / 1e3,
+        model.spark_fixed_ns as f64 / 1e3, model.active_experts));
+    if let Some(profile) = profile {
+        notes.push(format!("GPU expert tier profile: route hit rate {:.1}% (one-row steps)",
+            100.0 * profile.route_share(&routed)));
+    }
     notes
 }
 

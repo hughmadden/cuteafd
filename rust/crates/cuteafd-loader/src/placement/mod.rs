@@ -36,8 +36,8 @@ pub use pool::{PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
-pub use expert_tier::{ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest, ExpertTierSetting, ExpertTierShard,
-    ExpertTierSize, ExpertTierSource, TierSlot};
+pub use expert_tier::{ExpertActivation, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest, ExpertTierSetting,
+    ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.
@@ -72,8 +72,9 @@ pub struct PlacementRequest {
     pub tp2_workspace: [u64; 2],
     /// Which fixes the plan: the pool (`Auto`) or the RTX expert layers.
     pub onboard: Onboard,
-    /// A GPU expert tier ([`expert_tier`]) in place of whole-layer
-    /// onboarding: its size, not `onboard`, then fixes the plan.
+    /// A GPU expert tier ([`expert_tier`]): per-layer residency in place of
+    /// the whole-layer prefix (a whole layer is a tier layer at 100%). Its
+    /// size, not `onboard`, then fixes the plan.
     pub expert_tier: Option<ExpertTierRequest>,
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
     pub expert_gpus: usize,

@@ -1954,12 +1954,13 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
 const MIB: u64 = 1 << 20;
 
 /// A tier over every layer of `req`, 256 experts per layer (2 MiB TP2
-/// halves, 4 MiB whole experts in the fixtures above).
-fn tier(req: &PlacementRequest, size: ExpertTierSize, order: Option<Vec<TierSlot>>) -> ExpertTierRequest {
+/// halves, 4 MiB whole experts in the fixtures above), uniform popularity
+/// unless `order` is given.
+fn tier(req: &PlacementRequest, size: ExpertTierSize, order: Option<TierOrder>) -> ExpertTierRequest {
     let layers = (0..req.layers.len()).collect::<Vec<_>>();
-    ExpertTierRequest { size, experts_per_layer: 256,
-        order: order.unwrap_or_else(|| expert_tier::uniform_order(&layers, 256)),
-        source: ExpertTierSource::Uniform }
+    let order = order.unwrap_or_else(|| expert_tier::optimized_order(&layers,
+        &ExpertActivation::uniform(layers.len(), 256, 24), &TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS, 0));
+    ExpertTierRequest::new(size, 256, order, ExpertTierSource::Uniform)
 }
 
 fn tier_request(free: [u64; 2], size: ExpertTierSize) -> PlacementRequest {
@@ -1989,6 +1990,7 @@ fn expert_tier_auto_fills_what_the_pool_target_leaves() {
     assert!(t.resident.iter().all(|ids| ids.iter().enumerate().all(|(i, &id)| usize::from(id) == i)));
     // No whole layer moved: the Sparks keep every layer.
     assert_eq!(placement.onboard_layers, 0);
+    assert_eq!(t.whole_layers, 0);
     assert!(placement.tp2.is_none());
     assert!(placement.layers.iter().all(|l| l.experts == ExpertHome::Spark));
     for gpu in 0..2 {
@@ -2026,7 +2028,9 @@ fn expert_tier_follows_its_order_and_profile_counts() {
     counts[12][0] = 1;
     let profile = ExpertRouteProfile { layers: counts };
     let layers = (0..60).collect::<Vec<_>>();
-    let order = expert_tier::profile_order(&layers, 256, &profile).unwrap();
+    let model = TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS;
+    let activation = ExpertActivation::from_profile(&profile, 60, 256, 6, 6, 24).unwrap();
+    let order = expert_tier::optimized_order(&layers, &activation, &model, 0);
     let mut req = tp2_request([44 * GIB; 2], Onboard::Layers(0));
     let mut request = tier(&req, ExpertTierSize::Experts(3), Some(order));
     request.source = ExpertTierSource::Profile;
@@ -2038,6 +2042,34 @@ fn expert_tier_follows_its_order_and_profile_counts() {
     assert_eq!(t.source, ExpertTierSource::Profile);
     let resident = t.resident.iter().map(Vec::as_slice).collect::<Vec<_>>();
     assert!((profile.route_share(&resident) - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn expert_tier_stops_where_residency_stops_helping_and_honours_pinned_layers() {
+    // Plenty of memory: an automatic tier stops at the step model's balance
+    // point (~73% of each layer at 24 of 256 experts active), not at memory.
+    let roomy = solve(&tier_request([96 * GIB; 2], ExpertTierSize::Auto)).unwrap();
+    let t = roomy.expert_tier.unwrap();
+    let useful = tier_request([96 * GIB; 2], ExpertTierSize::Auto).expert_tier.unwrap().useful;
+    assert_eq!(t.experts, useful);
+    assert!(t.per_layer().all(|n| (180..=190).contains(&n)), "{:?}", t.per_layer().collect::<Vec<_>>());
+    // Pinned whole layers lead the order and must fit.
+    let mut req = tp2_request([44 * GIB; 2], Onboard::Layers(0));
+    let layers = (0..60).collect::<Vec<_>>();
+    let pinned = expert_tier::optimized_order(&layers, &ExpertActivation::uniform(60, 256, 24),
+        &TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS, 3);
+    req.expert_tier = Some(tier(&req, ExpertTierSize::Auto, Some(pinned.clone())));
+    let t = solve(&req).unwrap().expert_tier.unwrap();
+    assert_eq!(t.whole_layers, 3);
+    assert_eq!(&t.per_layer().take(4).collect::<Vec<_>>()[..3], &[256, 256, 256]);
+    assert!(t.per_layer().skip(3).all(|n| n < 256));
+    req.expert_tier = Some(tier(&req, ExpertTierSize::Experts(3 * 256 - 1), Some(pinned.clone())));
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    let mut tight = tp2_request([34 * GIB; 2], Onboard::Layers(0));
+    let many = expert_tier::optimized_order(&layers, &ExpertActivation::uniform(60, 256, 24),
+        &TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS, 20);
+    tight.expert_tier = Some(tier(&tight, ExpertTierSize::Auto, Some(many)));
+    assert!(matches!(solve(&tight), Err(PlacementError::ExpertTier { requested: 5120, .. })));
 }
 
 #[test]

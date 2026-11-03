@@ -4494,7 +4494,10 @@ fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
     let notes = &auto.memory_layout.as_ref().unwrap().notes;
     assert!(notes.iter().any(|n| n.starts_with("placement: ") && n.contains("GPU expert tier (Uniform)")), "{notes:?}");
     assert!(notes.iter().any(|n| n.starts_with("GPU expert tier resident experts per routed layer: [")), "{notes:?}");
-    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier uniform: expected byte hit rate")), "{notes:?}");
+    let predicted = notes.iter().find(|n| n.starts_with("GPU expert tier predicted expert time per verify step: 21.76 -> "))
+        .unwrap_or_else(|| panic!("{notes:?}"));
+    assert!(predicted.contains("at a 15.6% byte hit rate") && predicted.contains("the same bytes as whole layers save"),
+        "{predicted}");
     for device in auto.memory_layout.as_ref().unwrap().devices.iter().take(2) {
         assert!(device.items.iter().any(|i| i.group.starts_with("GPU expert tier (")), "{:?}", device.items);
     }
@@ -4508,7 +4511,7 @@ fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
 
     // A profile ranks the set: the most-routed experts first, in any layer.
     let mut counts = vec![vec![1u64; 384]; 40];
-    for layer in 0..40 { for expert in 300..316 { counts[layer][expert] = 1000; } }
+    for layer in 0..40 { for expert in 300..316 { counts[layer][expert] = 50; } }
     let path = dir.path().join("routes.json");
     std::fs::write(&path, serde_json::to_vec(&json!({"model": "fixture", "layers": counts})).unwrap()).unwrap();
     let profiled = plan_spark_count(dir.path(), &pair(ExpertTierSetting::PerLayer(16), None, Some(path.clone())), 6, Some(4)).unwrap();
@@ -4517,12 +4520,19 @@ fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
     assert_eq!(profiled_tier.source, ExpertTierSource::Profile);
     assert!(profiled_tier.resident.iter().all(|ids| *ids == (300..316).collect::<Vec<u16>>()));
     let notes = &profiled.memory_layout.as_ref().unwrap().notes;
-    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier profile: route hit rate 97.8%")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier profile: route hit rate 68.5%")), "{notes:?}");
 
-    // Refusals: with whole-layer onboarding, without Sparks, a profile without
-    // the tier, a malformed profile.
+    // --rtx-expert-layers pins whole layers inside the tier; the Sparks still
+    // hold every layer.
     let both = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, Some(OnboardSetting::Layers(2)), None), 6, Some(4)).unwrap();
-    assert!(!both.executable() && render(&both).contains("replaces whole-layer onboarding"), "{}", render(&both));
+    assert!(both.executable(), "{}", render(&both));
+    let pinned = both.solver_placement.as_ref().unwrap().expert_tier.clone().unwrap();
+    assert_eq!(pinned.whole_layers, 2);
+    assert_eq!(pinned.per_layer().take(2).collect::<Vec<_>>(), vec![384, 384]);
+    assert!(pinned.per_layer().skip(2).all(|n| n < 384));
+    assert_eq!(both.solver_placement.as_ref().unwrap().onboard_layers, 0);
+
+    // Refusals: without Sparks, a profile without the tier, a malformed profile.
     let mut free = pair(ExpertTierSetting::Auto, None, None);
     free.placement = ExpertPlacement::from_spark_ranks(0);
     let alone = plan(dir.path(), &free).unwrap();

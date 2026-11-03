@@ -406,14 +406,15 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             return Err(PlacementError::Mandatory { gpu: gpu as u8, what: describe(&selected_fixed, gpu, &movables) });
         }
     }
-    // A GPU expert tier replaces whole-layer onboarding: its size, not the
-    // onboard, fixes the plan (auto: pool first; N experts: pool as output).
+    // A GPU expert tier generalises whole-layer onboarding (its pinned whole
+    // layers included): its size, not the onboard, fixes the plan (auto: pool
+    // first; N experts: pool as output).
     let tier = request.expert_tier.as_ref();
     if tier.is_some() && (spark_free || request.inventory.spark_ranks == 0) {
         return Err(PlacementError::Inventory("a GPU expert tier needs Spark ranks that hold every expert"));
     }
     if tier.is_some() && (request.onboard != Onboard::Layers(0) || request.minimum_expert_layers != 0) {
-        return Err(PlacementError::Inventory("a GPU expert tier replaces whole-layer RTX onboarding (onboard 0 layers)"));
+        return Err(PlacementError::Inventory("a GPU expert tier holds its whole layers itself (onboard 0 layers)"));
     }
     let fixed_layers = match (tier.map(|tier| tier.size), request.onboard.layers(routed)) {
         (Some(ExpertTierSize::Auto), _) => None,
@@ -992,7 +993,8 @@ fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &
 /// experts, then the largest per-expert load staging), after any TP1 movable
 /// arena. Two peer GPUs with TP2-capable layers hold TP2 halves on both; one
 /// GPU holds whole experts. `exact` admits exactly that many slots or refuses;
-/// otherwise the longest prefix that fits. An empty tier charges nothing.
+/// otherwise the longest prefix that fits, up to `tier.useful`. Either way the
+/// pinned whole layers must fit. An empty tier charges nothing.
 fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &[u64], used: &[u64],
     arenas: &mut [Arena], exact: Option<usize>) -> Result<ExpertTierPlacement, PlacementError> {
     use PlacementError::{Inventory, Overflow};
@@ -1013,7 +1015,10 @@ fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &
                 .ok_or(Inventory("GPU expert tier needs a layer residency that divides evenly over its experts"))?;
         }
     }
-    let limit = exact.unwrap_or(tier.order.len());
+    if tier.pinned > tier.order.len() || exact.is_some_and(|count| count < tier.pinned) {
+        return Err(Inventory("GPU expert tier is smaller than its pinned whole layers"));
+    }
+    let limit = exact.unwrap_or(tier.useful.clamp(tier.pinned, tier.order.len()));
     if limit > tier.order.len() {
         return Err(PlacementError::ExpertTier { requested: limit, placed: tier.order.len() });
     }
@@ -1037,7 +1042,7 @@ fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &
         arena = candidate;
         placed += 1;
     }
-    if let Some(requested) = exact.filter(|&requested| placed < requested) {
+    if let Some(requested) = exact.filter(|&requested| placed < requested).or((placed < tier.pinned).then_some(tier.pinned)) {
         return Err(PlacementError::ExpertTier { requested, placed });
     }
     let mut resident = vec![Vec::new(); request.layers.len()];
@@ -1065,6 +1070,7 @@ fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &
     Ok(ExpertTierPlacement {
         shard: if tp2 { ExpertTierShard::Tp2 } else { ExpertTierShard::Whole { gpu: 0 } },
         source: tier.source,
+        whole_layers: resident.iter().filter(|ids| ids.len() == experts).count(),
         resident,
         experts: placed,
         routed_experts: routed.len() * experts,
