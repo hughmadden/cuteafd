@@ -1012,6 +1012,9 @@ pub(crate) fn fake_hub(listener: Listener, socket: String, root: std::path::Path
         let plan = cuteafd_loader::push_load::plan::Plan { files, patterns, entries };
         let joined = joins.join().map_err(|_| anyhow::anyhow!("join acceptor panicked"))??;
         let sources = plan.files.iter().map(|name| File::open(root.join(name))).collect::<std::io::Result<Vec<_>>>()?;
+        // As SparkNest does, report progress to the driver while ranks stream,
+        // so a long group never looks idle to it.
+        let mut sent = 0u64;
         for (rank, conn, ring, slots, slot_bytes) in &joined {
             let mut runs = Vec::new();
             for entry in plan.entries.iter().filter(|e| e.rank == *rank) {
@@ -1028,6 +1031,8 @@ pub(crate) fn fake_hub(listener: Listener, socket: String, root: std::path::Path
                 let (release, _) = conn.next_request()?.context("missing release")?;
                 anyhow::ensure!(matches!(release, Request::Release { slot } if slot == at as u32), "release order");
                 index += 1;
+                sent += bytes.len() as u64;
+                if index % 256 == 0 { coordinator.send_event(&Event::Progress { done: sent, total: 0 })?; }
                 Ok(())
             };
             for (file, src, dst, length) in runs {
