@@ -533,11 +533,12 @@ mod tests {
     /// with four Sparks; ~24 distinct experts per layer), from bytes and
     /// rates, through the scheduler itself: `plan_resident` per layer, and a
     /// layer costs its makespan, the slower of the GPU tier and the Spark
-    /// round trip. Rates measured tonight: the SM89 W4A8 kernel streams TP2
-    /// halves at 959 GB/s per 4090 D (9.55 us per expert plus ~6 us); a Spark
-    /// TP4 wave takes 21.25 us per expert plus 34 us. The resident layouts
-    /// (MXFP4, coded UE8M0 scales): a TP4 slice is 4,573,312 B, so the Spark
-    /// wave streams 215 GB/s per Spark, 77% of its 278 GB/s roofline.
+    /// round trip. Measured rates (4 Nov 2026): the SM89 W4A8 kernel streams
+    /// TP2 halves at 959 GB/s per card of a 48 GB coordinator pair (9.55 us
+    /// per expert plus ~6 us); a Spark TP4 wave takes 21.25 us per expert
+    /// plus 34 us. The resident layouts (MXFP4, coded UE8M0 scales): a TP4
+    /// slice is 4,573,312 B, so the Spark wave streams 215 GB/s per Spark,
+    /// 77% of its 278 GB/s roofline.
     #[test]
     fn c1_verify_step_model_reproduces_the_tier_physics() {
         use cuteafd_core::{ExpertResidencySet, ReplicatedExpertCostModel as Cost, ReplicatedExpertGroupSpec as Group,
