@@ -473,6 +473,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     drop(records);
     // Every recorded scale pack ran (Done or mount fill): release raw scales.
     for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
+    for shards in [&query_shards, &output_shards].into_iter().flatten() {
+        for weights in shards.iter().flatten() { weights.release_raw_scales(); }
+    }
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }

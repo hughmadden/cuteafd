@@ -487,8 +487,9 @@ impl<'library> DsparkWeights<'library> {
 impl DsparkWeights<'_> {
     /// Frees the experts' raw scale images kept for recorded plane packs.
     pub(crate) fn release_raw_scales(&self) {
-        if let ExpertStages::Full(stages) = &self.experts {
-            for stage in stages { stage.release_raw_scales(); }
+        match &self.experts {
+            ExpertStages::Full(stages) => for stage in stages { stage.release_raw_scales(); },
+            ExpertStages::Tp2(ranks) => for rank in ranks { rank.release_raw_scales(); },
         }
     }
 }
