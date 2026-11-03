@@ -13,8 +13,8 @@ pub(super) fn wanted(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Ca
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
     policy.plan(|| {
         anyhow::ensure!(!args.peers.is_empty() && catalog.exl3().is_none() && catalog.nvfp4().is_none()
-            && catalog.fp8().is_none() && !args.tp2_query_projection && !args.tp2_output_projection
-            && !args.tp2_dspark_experts, "V4.1 coordinator push does not support this weight placement yet");
+            && catalog.fp8().is_none() && !args.tp2_query_projection && !args.tp2_output_projection,
+            "V4.1 coordinator push does not support this weight placement yet");
         Ok(())
     }).map(|planned| planned.is_some()).map_err(Into::into)
 }
