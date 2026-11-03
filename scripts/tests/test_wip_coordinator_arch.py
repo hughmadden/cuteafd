@@ -1,4 +1,4 @@
-"""An sm_89 coordinator slot builds on an SM89 GPU, in the export turn like SM120."""
+"""An sm_89 coordinator slot carries DeepSeek V4.1's SM89 exports, made on an SM89 GPU."""
 import os
 import subprocess
 from pathlib import Path
@@ -116,6 +116,62 @@ def test_remote_only_mode_needs_an_sm89_host_for_sm89(tmp_path, arch, host, caps
         assert result.returncode == 0 and result.stdout.split() == ['remote', 'wait-remote']
 
 
+SWITCHES = ['v41_candidate_aot', 'exl3_aot', 'nvfp4_aot', 'audio_aot', 'exlr8_aot']
+FAMILY_SWITCHES = ['DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'ML4',
+                   'VISION_ATTENTION']
+
+
+@pytest.mark.parametrize('role,arch', [('coordinator', 89), ('coordinator', 120), ('expert', 121)])
+def test_sm89_coordinator_keeps_the_v41_exports_and_turns_the_rest_off(role, arch):
+    start = ARTIFACTS.index('# The V4.1 coordinator candidates')
+    end = ARTIFACTS.index('# <<< sm89 V4.1 coordinator', start)
+    coordinator_aot = 'ON' if role == 'coordinator' else 'OFF'
+    preset = ' '.join(f'{name}=ON' for name in SWITCHES if name != 'v41_candidate_aot')
+    preset += ' ' + ' '.join(f'CUTEAFD_WIP_{name}_AOT=ON' for name in FAMILY_SWITCHES)
+    report = 'printf "<%s> <%s> %s" "$expert_families" "$bf16_families" "$coordinator_aot"\n'
+    report += ''.join(f'printf " %s" "${name}"\n' for name in SWITCHES)
+    report += ''.join(f'printf " %s" "$CUTEAFD_WIP_{name}_AOT"\n' for name in FAMILY_SWITCHES)
+    script = (f'set -u\nrole={role} cuda_arch={arch} coordinator_aot={coordinator_aot} '
+              f'expert_families=dsv4f:fp8 bf16_families=glm {preset}\n' + ARTIFACTS[start:end] + report)
+    result = _run(script)
+    assert result.returncode == 0, result.stderr
+    words = result.stdout.split()
+    sm89 = (role, arch) == ('coordinator', 89)
+    assert words[:2] == (['<>', '<>'] if sm89 else ['<dsv4f:fp8>', '<glm>'])
+    # The FP8 bundle (with router and index scorer) and the local, TP2 and dSpark
+    # TP2 experts follow coordinator_aot, which an sm_89 coordinator keeps ON.
+    assert words[2] == coordinator_aot
+    expected = 'OFF' if sm89 else 'ON'
+    assert words[3:] == [coordinator_aot if not sm89 else 'OFF'] + [expected] * (len(SWITCHES) - 1 + len(FAMILY_SWITCHES))
+    assert ('DeepSeek V4.1 exports only' in result.stderr) == sm89
+
+
+def test_v41_switches_reach_cmake():
+    cmake = ARTIFACTS[ARTIFACTS.index('\ncmake \\\n'):ARTIFACTS.index('-DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"')]
+    for flag in ('V41_FP8_AOT', 'V41_LOCAL_EXPERT_AOT', 'V41_TP2_EXPERT_AOT'):
+        assert f'-DCUTEAFD_ENABLE_{flag}="$coordinator_aot"' in cmake, flag
+    for flag in ('V41_ATTENTION_AOT', 'V41_HC_LAGGED_AOT', 'V41_NARROW_AOT'):
+        assert f'-DCUTEAFD_ENABLE_{flag}="$v41_candidate_aot"' in cmake, flag
+    assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON' in cmake
+    assert '-DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot"' in cmake
+    # Every slot ships the exported dSpark coordinator manifest; there is no disabled form.
+    assert 'install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"' in ARTIFACTS
+    assert '"enabled":false}\' >"$output_dir/V41_EXPERT_AOT.json"' not in ARTIFACTS
+
+
+def test_v41_cmake_admits_sm89_for_every_enabled_role_and_refuses_the_rest():
+    cmake = ROOT / 'native/cmake/families/deepseek_v41'
+    assert 'CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89"' in (cmake / 'v41_fp8.cmake').read_text()
+    experts = (cmake / 'v41_experts.cmake').read_text()
+    assert 'elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")\n' in experts
+    for role in ('v41_local_experts', 'v41_tp2_experts', 'v41_dspark_tp2_experts'):
+        assert 'SM120 or SM89 coordinator expert build' in (cmake / f'{role}.cmake').read_text(), role
+    assert 'CUTEAFD_V41_ROUTER_CC' in (cmake / 'v41_router.cmake').read_text()
+    # The switches this block turns off name SM120 (or SM121) only.
+    assert 'requires SM120' in (cmake / 'v41_attention.cmake').read_text()
+    assert 'single native SM120 or SM121 target' in (cmake / 'v41_nvfp4_experts.cmake').read_text()
+
+
 def test_coordinator_build_key_names_a_non_default_arch_only():
     start = WIP.index('  wip_coordinator_key="$( {')
     tail = "} | sha256sum | awk '{print $1}')\"\n"
@@ -129,35 +185,3 @@ def test_coordinator_build_key_names_a_non_default_arch_only():
     # SM120 keeps its key material (and so its key) unchanged.
     assert keys['120'] == 'k coordinator image'
     assert keys['89'] == 'k coordinator image\narch 89'
-
-
-LOCALS = ['coordinator_aot', 'v41_expert_aot', 'exl3_aot', 'nvfp4_aot', 'audio_aot', 'exlr8_aot']
-FAMILY_SWITCHES = ['DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'ML4',
-                   'VISION_ATTENTION']
-
-
-@pytest.mark.parametrize('role,arch,disabled', [
-    ('coordinator', 89, True), ('coordinator', 120, False), ('expert', 121, False)])
-def test_sm89_coordinator_turns_every_aot_switch_off(role, arch, disabled):
-    start = ARTIFACTS.index('v41_expert_aot=ON\n')
-    end = ARTIFACTS.index('# <<< sm89 base-only coordinator', start)
-    preset = ' '.join(f'{name}=ON' for name in LOCALS if name != 'v41_expert_aot')
-    preset += ' ' + ' '.join(f'CUTEAFD_WIP_{name}_AOT=ON' for name in FAMILY_SWITCHES)
-    report = 'printf "<%s> <%s>" "$expert_families" "$bf16_families"\n'
-    report += ''.join(f'printf " %s" "${name}"\n' for name in LOCALS)
-    report += ''.join(f'printf " %s" "$CUTEAFD_WIP_{name}_AOT"\n' for name in FAMILY_SWITCHES)
-    script = (f'set -u\nrole={role} cuda_arch={arch} expert_families=dsv4f:fp8 bf16_families=glm {preset}\n'
-              + ARTIFACTS[start:end] + report)
-    result = _run(script)
-    assert result.returncode == 0, result.stderr
-    words = result.stdout.split()
-    state = 'OFF' if disabled else 'ON'
-    assert words[:2] == (['<>', '<>'] if disabled else ['<dsv4f:fp8>', '<glm>'])
-    assert words[2:] == [state] * (len(LOCALS) + len(FAMILY_SWITCHES))
-    assert ('base native library only' in result.stderr) == disabled
-
-
-def test_v41_expert_aot_reaches_cmake_and_its_manifest_has_an_off_form():
-    assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT="$v41_expert_aot"' in ARTIFACTS
-    assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON' not in ARTIFACTS
-    assert '\'{"schema":1,"enabled":false}\' >"$output_dir/V41_EXPERT_AOT.json"' in ARTIFACTS
