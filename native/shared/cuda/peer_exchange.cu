@@ -62,6 +62,32 @@ __device__ void diagnostic_published(cuteafd_peer_diagnostic_t d, uint32_t seque
   __threadfence_system();
 }
 
+__device__ __forceinline__ uint32_t arrive_acq_rel_gpu(uint32_t* counter) {
+  uint32_t previous;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(previous) : "l"(counter) : "memory");
+  return previous;
+}
+
+// Publishes the next sequence on the peer `flag` once every block's stores are
+// visible there. The barrier orders a block's stores before its thread 0's
+// arrival, a release at GPU scope; the last block's arrival acquires every
+// other block's, and its system-scope release of the flag carries them all
+// (causality is transitive across the two scopes). Exactly one system-scope
+// operation per push: on a GeForce PCIe pair each system fence costs a PCIe
+// round trip and they serialise, so a fence per block cost about 1.3 us per
+// block (a 1 MiB push with 32 blocks took 82 us instead of 44 on 4090 Ds).
+template<bool Diagnostic>
+__device__ __forceinline__ void publish(uint32_t* flag, uint32_t* state, cuteafd_peer_diagnostic_t diagnostic) {
+  __syncthreads();
+  if (threadIdx.x == 0 && arrive_acq_rel_gpu(&state[1]) == gridDim.x - 1) {
+    state[1] = 0;
+    const uint32_t sequence = state[0] + 1;
+    state[0] = sequence;
+    store_release_sys(flag, sequence);
+    if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
+  }
+}
+
 template<bool Diagnostic = false>
 __global__ void push_signal(uint4* destination, const uint4* source, uint64_t units, uint32_t* flag,
     uint32_t* state, cuteafd_peer_diagnostic_t diagnostic = {}) {
@@ -69,20 +95,7 @@ __global__ void push_signal(uint4* destination, const uint4* source, uint64_t un
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride)
     destination[i] = source[i];
-  // Every block's peer stores are ordered before its arrival; the last block
-  // to arrive publishes the sequence (fence cumulativity carries the others').
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    if (atomicAdd(&state[1], 1u) == gridDim.x - 1) {
-      __threadfence_system();
-      state[1] = 0;
-      const uint32_t sequence = state[0] + 1;
-      state[0] = sequence;
-      store_release_sys(flag, sequence);
-      if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
-    }
-  }
+  publish<Diagnostic>(flag, state, diagnostic);
 }
 
 // Up to four strided byte planes (each local or on the peer), then one
@@ -109,19 +122,7 @@ __global__ void push_planes(Planes planes, uint32_t* flag, uint32_t* state,
     reinterpret_cast<uint4*>(static_cast<uint8_t*>(plane.destination) + row * plane.destination_pitch)[column] =
         reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(plane.source) + row * plane.source_pitch)[column];
   }
-  if (!flag) return;
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    if (atomicAdd(&state[1], 1u) == gridDim.x - 1) {
-      __threadfence_system();
-      state[1] = 0;
-      const uint32_t sequence = state[0] + 1;
-      state[0] = sequence;
-      store_release_sys(flag, sequence);
-      if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
-    }
-  }
+  if (flag) publish<Diagnostic>(flag, state, diagnostic);
 }
 
 __device__ __forceinline__ uint64_t global_ns() {
