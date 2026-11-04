@@ -178,6 +178,8 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   budget with phase diagnostics; multi-shape tests may take longer in total.
   The nextest and cargo-test fallback selections agree. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
+  SM89 exporter changes add `--arch sm89` (offline SM89 target, 128 and 114 SMs); programs in
+  `scripts/build/sm89-export-variation.json` may differ in device code only, the toolchain's own run-to-run variation.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
   (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
   relative submodule gitfiles resolve only from the real path.

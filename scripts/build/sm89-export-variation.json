@@ -1,0 +1,17 @@
+{
+  "reason": "CuTe DSL's cute-to-nvvm step compiles these SM89 kernels to different instruction orders from run to run, from identical MLIR. The plan, kernel set, headers and manifests do not change. A fixed PYTHONHASHSEED, disabled address randomization, glibc malloc perturb, a single CPU and the CUDA-free offline target each leave it in place. compare-sm-exports --arch sm89 allows device-code differences for these programs only, and only with this toolchain.",
+  "toolchain": {
+    "nvidia-cutlass-dsl": "4.6.2"
+  },
+  "programs": [
+    "v41-fp8/v41_engram_fp8_m256_sm128_gemm",
+    "v41-fp8/v41_ffn_up_fp8_m256_gemm",
+    "v41-fp8/v41_index_q_fp8_m256_sm128_gemm",
+    "v41-fp8/v41_main_fp8_m64_gemm",
+    "v41-fp8/v41_o_a_fp8_m256_sm114_gemm",
+    "v41-fp8/v41_q_b_fp8_m256_sm114_gemm",
+    "v41-fp8/v41_q_b_tp2_fp8_m256_sm114_gemm",
+    "v41-fp8/v41_q_b_tp2_fp8_m64_sm128_gemm",
+    "v41-fp8/v41_q_b_tp2_fp8_m80_sm114_gemm"
+  ]
+}

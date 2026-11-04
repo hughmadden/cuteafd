@@ -1179,3 +1179,80 @@ def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_
     override.mkdir()
     assert compare_sm.resolve_source_root(alias, env={"CUTEAFD_SOURCE_ROOT": str(override)}) == real_wt.resolve()
     assert compare_sm.resolve_source_root(env={"CUTEAFD_SOURCE_ROOT": str(override)}) == override.resolve()
+
+
+def sm89_exports(tmp_path, kernels, headers=(b"same ABI\n", b"same ABI\n"), toolchain="4.6.2"):
+    """Two exports of one program on the SM89 target; kernels share a section name."""
+    left, right = exports(tmp_path, kernels=kernels)
+    for directory, header in zip((left, right), headers):
+        context = json.loads((directory / "comparison-context.json").read_text())
+        context.update(capability=[8, 9], toolchain={**context["toolchain"], "nvidia-cutlass-dsl": toolchain})
+        (directory / "comparison-context.json").write_text(json.dumps(context))
+        (directory / "test.h").write_bytes(header)
+    return left, right
+
+
+VARIATION = {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["v41-fp8/test"]}
+
+
+def test_sm89_mode_exports_the_sm89_build_groups():
+    jobs = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    assert set(compare_sm.SM89_GROUPS) <= set(jobs)
+    assert compare_sm.ARCHES["sm89"] == {"sms": (128, 114), "capability": [8, 9]}
+    # The SM120-only candidate groups are not part of an sm_89 build.
+    assert not {"v41-attention", "v41-attention-tp2"} & set(compare_sm.SM89_GROUPS)
+    assert not any(name.startswith("v41-nvfp4") for name in compare_sm.SM89_GROUPS)
+
+
+def test_sm89_recorded_variation_allows_device_code_only(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00first", b"kern\x00other"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-fp8")["programs"]
+    assert record["classification"] == "recorded-variation"
+    assert not record["cubins_identical"] and record["header_identical"]
+
+
+@pytest.mark.parametrize("change", ["unlisted", "header", "toolchain", "kernel-set"])
+def test_sm89_variation_fails_closed(tmp_path, change):
+    kernels = (b"kern\x00first", b"other\x00kern" if change == "kernel-set" else b"kern\x00other")
+    headers = (b"same ABI\n", b"changed ABI\n" if change == "header" else b"same ABI\n")
+    left, right = sm89_exports(tmp_path, kernels=kernels, headers=headers,
+                               toolchain="4.7.0" if change == "toolchain" else "4.6.2")
+    group = "v41-router" if change == "unlisted" else "v41-fp8"
+    record, = compare_sm.compare(left, right, variation=VARIATION, group=group)["programs"]
+    assert record["classification"] == "cubin-bytes"
+
+
+def test_unrecorded_device_code_variation_is_named_but_still_differs(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00first", b"kern\x00other"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-router")["programs"]
+    assert record["classification"] == "cubin-bytes" and record["variation_candidate"]
+    (tmp_path / "header").mkdir()
+    left, right = sm89_exports(tmp_path / "header", kernels=(b"kern\x00first", b"kern\x00other"),
+                               headers=(b"same ABI\n", b"changed ABI\n"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-router")["programs"]
+    assert record["classification"] == "cubin-bytes" and not record["variation_candidate"]
+
+
+def test_identical_sm89_exports_stay_identical_with_variation(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00same", b"kern\x00same"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-fp8")["programs"]
+    assert record["classification"] == "identical"
+
+
+def test_recorded_sm89_variation_names_sm89_groups():
+    record = compare_sm.read_variation(compare_sm.SM89_VARIATION)
+    assert record["toolchain"] == {"nvidia-cutlass-dsl": "4.6.2"}
+    assert all(name.split("/")[0] in compare_sm.SM89_GROUPS for name in record["programs"])
+
+
+@pytest.mark.parametrize("record", [
+    {"programs": ["v41-fp8/a"]},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": []},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["no-group"]},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["v41-fp8/a", "v41-fp8/a"]},
+])
+def test_malformed_variation_is_refused(tmp_path, record):
+    path = tmp_path / "variation.json"
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="recorded variation"):
+        compare_sm.read_variation(path)
