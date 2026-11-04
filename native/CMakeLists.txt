@@ -312,6 +312,12 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
     "PYTHONDONTWRITEBYTECODE=1"
     "PYTHONPATH=${CUTEAFD_SPARKINFER_SOURCE_DIR}"
   )
+  # sm_89 exports compile on b12x's offline SM89 target (python/tools/lib/
+  # sm89_cards.py) with CUDA hidden: the build needs no GPU, and the card it
+  # sees shapes no kernel. SM120 and SM121 exports run on their GPU.
+  if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+    list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "CUTEAFD_EXPORT_OFFLINE_TARGET=sm89")
+  endif()
   execute_process(
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     RESULT_VARIABLE CUTEAFD_SPARKINFER_VERIFY_RESULT
