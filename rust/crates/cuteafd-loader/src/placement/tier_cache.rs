@@ -106,9 +106,11 @@ struct Window {
 
 /// Replays `windows` (those with decode steps; `topk` routes per row) through
 /// `policy` with at most `capacity` resident experts. Every dynamic policy
-/// starts from `initial`'s tier (the static tier it would replace).
+/// starts from `initial`'s tier (the static tier it would replace). With a
+/// `gate`, residents change only at the windows it opens (by position in
+/// `windows`; [`quiet_points`]), while the policy keeps learning between them.
 pub fn simulate(windows: &[RouteWindow], topk: usize, capacity: usize, costs: &CacheCosts, policy: &CachePolicy,
-    initial: &ExpertRouteProfile) -> Result<CacheOutcome, ExpertTierError> {
+    initial: &ExpertRouteProfile, gate: Option<&[bool]>) -> Result<CacheOutcome, ExpertTierError> {
     let windows = prepare(windows, topk, &costs.model)?;
     let first = windows.first().ok_or_else(|| ExpertTierError::Profile("no window with decode steps".into()))?;
     let (layers, experts) = (first.counts.len(), first.counts[0].len());
@@ -131,7 +133,9 @@ pub fn simulate(windows: &[RouteWindow], topk: usize, capacity: usize, costs: &C
     let (mut time, mut expert_time, mut interference, mut uploads, mut hits, mut steps) = (0.0, 0.0, 0.0, 0u64, 0.0, 0u64);
     let mut changed = Vec::new();
     for (index, window) in windows.iter().enumerate() {
+        let open = gate.is_none_or(|gate| gate.get(window.position).copied().unwrap_or(false));
         let next = match policy {
+            _ if !open => residents.clone(),
             CachePolicy::Static(_) => residents.clone(),
             CachePolicy::Oracle => plan(&window.counts, None)?,
             CachePolicy::WindowedLfu { windows: span, margin } => {
@@ -276,6 +280,37 @@ pub fn window_sessions(windows: &[RouteWindow], requests: &[ReplayedRequest]) ->
     }).collect()
 }
 
+/// The window starts at which no live prefix depends on the residents: no
+/// session has a turn before and a turn after, unless it has been idle past
+/// `lifetime_ms` (its snapshots gone; `None`: snapshots outlive any gap).
+/// A change there invalidates nothing.
+pub fn quiet_points(windows: &[RouteWindow], requests: &[ReplayedRequest], lifetime_ms: Option<i64>) -> Vec<bool> {
+    let mut sessions: std::collections::BTreeMap<&str, Vec<&ReplayedRequest>> = Default::default();
+    for request in requests { sessions.entry(request.session.as_str()).or_default().push(request); }
+    for turns in sessions.values_mut() { turns.sort_by_key(|request| request.started_ms); }
+    windows.iter().map(|window| {
+        let Some((open, _)) = span_ms(window) else { return false };
+        // A change at a window's start precedes every turn admitted in it: it
+        // reaches the snapshots of turns that started before it and are
+        // restored at or after it.
+        !sessions.values().any(|turns| turns.windows(2).any(|pair|
+            pair[0].started_ms < open && open <= pair[1].started_ms
+                && lifetime_ms.is_none_or(|lifetime| open < pair[0].ended_ms + lifetime)))
+    }).collect()
+}
+
+/// Replays merged one after another, as one outcome (step-weighted means).
+pub fn combine(policy: String, outcomes: &[CacheOutcome]) -> CacheOutcome {
+    let steps: u64 = outcomes.iter().map(|o| o.steps).sum();
+    let windows: usize = outcomes.iter().map(|o| o.windows).sum();
+    let mean = |field: fn(&CacheOutcome) -> f64| if steps == 0 { 0.0 } else {
+        outcomes.iter().map(|o| field(o) * o.steps as f64).sum::<f64>() / steps as f64 };
+    let uploads: f64 = outcomes.iter().map(|o| o.uploads_per_window * o.windows as f64).sum();
+    CacheOutcome { policy, windows, steps, step_ns: mean(|o| o.step_ns), expert_ns: mean(|o| o.expert_ns),
+        upload_ns: mean(|o| o.upload_ns), uploads_per_window: if windows == 0 { 0.0 } else { uploads / windows as f64 },
+        hit_rate: mean(|o| o.hit_rate), changed: Vec::new() }
+}
+
 /// What byte-exact prefix restores cost a policy: the turns whose cached
 /// prefix was computed before a resident change and reused after it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -290,8 +325,10 @@ pub struct Invalidation {
 
 /// Prices `changed` (window positions in `windows` whose residents changed
 /// at their start) against `requests`: a turn whose cached prefix came from
-/// its session's previous turn loses it when a change falls between that
-/// turn's start and its own, and prefills it again at `prefill_tok_s`.
+/// its session's previous turn loses it when a change falls after that
+/// turn's start and no later than its own, and prefills it again at
+/// `prefill_tok_s`. A change at a window's start precedes the turns
+/// admitted in it, so the turn that starts there runs on the new residents.
 pub fn invalidations(windows: &[RouteWindow], changed: &[usize], requests: &[ReplayedRequest],
     prefill_tok_s: f64) -> Invalidation {
     let mut changes: Vec<i64> = changed.iter().filter_map(|&position|
@@ -307,7 +344,7 @@ pub fn invalidations(windows: &[RouteWindow], changed: &[usize], requests: &[Rep
             let cached = turn.cached_tokens.unwrap_or(0);
             if cached == 0 { continue; }
             priced.cached_turns += 1;
-            let first = changes.partition_point(|&change| change < previous.started_ms);
+            let first = changes.partition_point(|&change| change <= previous.started_ms);
             if changes.get(first).is_some_and(|&change| change <= turn.started_ms) {
                 priced.turns += 1;
                 priced.tokens += cached;
@@ -388,7 +425,7 @@ mod tests {
     fn totals(windows: &[RouteWindow]) -> ExpertRouteProfile { trace_totals(windows).unwrap() }
 
     fn run(windows: &[RouteWindow], policy: &CachePolicy, costs: &CacheCosts) -> CacheOutcome {
-        simulate(windows, 6, CAPACITY, costs, policy, &totals(windows)).unwrap()
+        simulate(windows, 6, CAPACITY, costs, policy, &totals(windows), None).unwrap()
     }
 
     const A: [usize; 4] = [0, 1, 2, 3];
@@ -485,11 +522,46 @@ mod tests {
         // A change at window 2 falls between turns 1 and 2 of s: turn 2 loses its 9000-token prefix.
         assert_eq!(invalidations(&windows, &[2], &requests, 1000.0),
             Invalidation { turns: 1, cached_turns: 2, tokens: 9000, seconds: 9.0 });
-        // A change at window 1 (turn 1's start) costs turn 1 and turn 2 both.
-        assert_eq!(invalidations(&windows, &[1], &requests, 1000.0).tokens, 14_000);
+        // A change at window 1 (turn 1's start) costs turn 1 its prefix from turn 0;
+        // turn 1 then runs on the new residents, so turn 2 keeps turn 1's.
+        assert_eq!(invalidations(&windows, &[1], &requests, 1000.0).tokens, 5000);
         // Windows without times join nothing and price nothing.
         assert_eq!(window_sessions(&[window(0, &A)], &requests), [None]);
         assert_eq!(invalidations(&[window(0, &A)], &[0], &requests, 1000.0).turns, 0);
+    }
+
+    /// Sessions s (windows 0-2) and t (windows 3-5) one after the other: the
+    /// only quiet point is t's first window, so a gated LFU follows A to B
+    /// there alone, a window later than ungated, and loses no prefix.
+    #[test]
+    fn quiet_points_fall_between_sessions_and_gate_the_changes() {
+        let windows: Vec<_> = (0..6).map(|i| timed(i, if i < 2 { &A } else { &B })).collect();
+        let requests: Vec<_> = (0..6).map(|i| request(if i < 3 { "s" } else { "t" }, i % 3, 10 * i as i64,
+            10 * i as i64 + 9, 1000 * (i % 3))).collect();
+        let quiet = quiet_points(&windows, &requests, None);
+        assert_eq!(quiet, [true, false, false, true, false, false]);
+        // A session idle past the snapshot lifetime no longer pins its residents.
+        assert_eq!(quiet_points(&windows, &requests, Some(500)), [true; 6]);
+        let costs = CacheCosts::measured(15_000_000);
+        let initial = totals(&windows[..2]);
+        let lfu = CachePolicy::WindowedLfu { windows: 1, margin: 0.0 };
+        let free = simulate(&windows, 6, CAPACITY, &costs, &lfu, &initial, None).unwrap();
+        let gated = simulate(&windows, 6, CAPACITY, &costs, &lfu, &initial, Some(&quiet)).unwrap();
+        assert_eq!((free.changed.clone(), gated.changed.clone()), (vec![3], vec![3]));
+        assert_eq!(invalidations(&windows, &free.changed, &requests, 1000.0).turns, 0);
+        // A gate that opens only at window 0 holds A's tier through B.
+        let mut shut = [false; 6];
+        shut[0] = true;
+        let held = simulate(&windows, 6, CAPACITY, &costs, &lfu, &initial, Some(&shut)).unwrap();
+        assert!(held.changed.is_empty() && held.step_ns > gated.step_ns);
+        // Replays merged: step-weighted, so two halves equal the whole.
+        let static_tier = CachePolicy::Static(initial.clone());
+        let halves = [&windows[..3], &windows[3..]].map(|part| simulate(part, 6, CAPACITY, &costs, &static_tier,
+            &initial, None).unwrap());
+        let whole = simulate(&windows, 6, CAPACITY, &costs, &static_tier, &initial, None).unwrap();
+        let merged = combine("static".into(), &halves);
+        assert_eq!((merged.windows, merged.steps), (whole.windows, whole.steps));
+        assert!((merged.step_ns - whole.step_ns).abs() < 1e-6 && (merged.hit_rate - whole.hit_rate).abs() < 1e-9);
     }
 
     #[test]
@@ -507,6 +579,6 @@ mod tests {
         let mut idle = window(0, &A);
         idle.steps = [5, 5];
         assert!(simulate(&[idle], 6, CAPACITY, &CacheCosts::measured(0), &CachePolicy::Oracle,
-            &totals(&[window(0, &A)])).is_err());
+            &totals(&[window(0, &A)]), None).is_err());
     }
 }

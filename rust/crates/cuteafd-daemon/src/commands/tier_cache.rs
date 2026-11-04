@@ -3,8 +3,8 @@
 //! experts (`cuteafd_loader::placement::tier_cache`).
 use anyhow::{ensure, Context, Result};
 use clap::Args;
-use cuteafd_loader::placement::tier_cache::{invalidations, simulate, trace_totals, window_sessions, CacheCosts,
-    CacheOutcome, CachePolicy, Invalidation, ReplayedRequest};
+use cuteafd_loader::placement::tier_cache::{combine, invalidations, quiet_points, simulate, trace_totals,
+    window_sessions, CacheCosts, CacheOutcome, CachePolicy, Invalidation, ReplayedRequest};
 use cuteafd_loader::placement::{ExpertRouteProfile, RouteTrace, RouteWindow};
 use std::path::PathBuf;
 
@@ -32,6 +32,15 @@ pub(crate) struct TierCacheArgs {
     /// Prefill speed for prefixes a resident change invalidates, tokens/s.
     #[arg(long, default_value_t = 3300.0)]
     pub(crate) prefill_tok_s: f64,
+    /// How long an idle session's snapshot lives, seconds (default: until its
+    /// next turn). Quiet points, where gated policies change residents, need
+    /// every session between turns to have been idle that long.
+    #[arg(long)]
+    pub(crate) prefix_lifetime_s: Option<f64>,
+    /// Offline re-plan (needs --requests): the static tier re-planned at a
+    /// restart before every N sessions, from the N sessions before.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) replan_sessions: usize,
     /// The rest of a step in ms: attention, dense layers, the drafter, sampling.
     #[arg(long, default_value_t = 15.0)]
     pub(crate) base_ms: f64,
@@ -65,14 +74,27 @@ struct Row {
 
 pub(crate) fn run(args: TierCacheArgs) -> Result<()> {
     ensure!(args.base_ms >= 0.0 && args.upload_ms >= 0.0 && args.upload_slowdown >= 0.0 && args.margin >= 0.0
-        && args.prefill_tok_s > 0.0, "tier-cache costs, margin and prefill speed must not be negative");
+        && args.prefill_tok_s > 0.0 && args.replan_sessions > 0 && args.prefix_lifetime_s.is_none_or(|s| s >= 0.0),
+        "tier-cache costs, margin, prefill speed, lifetime and re-plan size must be positive");
     let trace = RouteTrace::read(&args.trace)?;
     let topk = trace.sessions.first().map(|(session, _)| session.topk).context("the trace has no session")?;
     ensure!(trace.sessions.iter().all(|(session, _)| session.topk == topk), "the trace's sessions differ in top-k");
     let windows: Vec<RouteWindow> = trace.sessions.iter().flat_map(|(_, windows)| windows.iter().cloned()).collect();
     let requests = args.requests.as_deref().map(ReplayedRequest::read).transpose()?;
     // The windows every policy is judged on, and the held-out static tier.
-    let (replayed, requests, held_out) = if args.train_sessions.is_empty() { (windows, requests, None) } else {
+    // With requests, every policy is judged on the client sessions' windows alone.
+    let (replayed, requests, held_out) = if args.train_sessions.is_empty() {
+        match requests {
+            None => (windows, None, None),
+            Some(requests) => {
+                let sessions = window_sessions(&windows, &requests);
+                let replayed: Vec<RouteWindow> = windows.iter().zip(&sessions).filter(|(_, s)| s.is_some())
+                    .map(|(w, _)| w.clone()).collect();
+                ensure!(!replayed.is_empty(), "no window overlaps a request of --requests");
+                (replayed, Some(requests), None)
+            }
+        }
+    } else {
         let requests = requests.context("--train-sessions needs --requests")?;
         let sessions = window_sessions(&windows, &requests);
         let train = |session: &Option<String>| session.as_ref().is_some_and(|s| args.train_sessions.contains(s));
@@ -95,23 +117,57 @@ pub(crate) fn run(args: TierCacheArgs) -> Result<()> {
         ..CacheCosts::measured((args.base_ms * 1e6) as u64) };
     // Dynamic policies replace the tier production would have.
     let initial = realistic.as_ref().map_or(&hindsight, |(_, profile)| profile);
-    let mut policies = vec![("static-hindsight".to_owned(), CachePolicy::Static(hindsight.clone()))];
-    if let Some((name, profile)) = &realistic { policies.push(((*name).to_owned(), CachePolicy::Static(profile.clone()))); }
-    for policy in args.lfu_windows.iter().map(|&windows| CachePolicy::WindowedLfu { windows, margin: args.margin })
-        .chain([CachePolicy::Lru { threshold: args.lru_threshold }, CachePolicy::Oracle]) {
-        policies.push((policy.name(), policy));
+    let quiet = requests.as_ref().map(|requests|
+        quiet_points(&replayed, requests, args.prefix_lifetime_s.map(|s| (s * 1000.0) as i64)));
+    let mut policies = vec![("static-hindsight".to_owned(), CachePolicy::Static(hindsight.clone()), None)];
+    if let Some((name, profile)) = &realistic {
+        policies.push(((*name).to_owned(), CachePolicy::Static(profile.clone()), None));
     }
-    let rows = policies.iter().map(|(name, policy)| -> Result<Row> {
-        let mut outcome = simulate(&replayed, topk, args.capacity, &costs, policy, initial)?;
-        outcome.policy = name.clone();
+    let dynamic: Vec<_> = args.lfu_windows.iter().map(|&windows| CachePolicy::WindowedLfu { windows, margin: args.margin })
+        .chain([CachePolicy::Lru { threshold: args.lru_threshold }, CachePolicy::Oracle]).collect();
+    for policy in &dynamic { policies.push((policy.name(), policy.clone(), None)); }
+    // The same policies changing residents only where no live prefix depends on them.
+    if let Some(quiet) = &quiet {
+        for policy in &dynamic { policies.push((format!("{}-quiet", policy.name()), policy.clone(), Some(quiet.as_slice()))); }
+    }
+    let row = |outcome: CacheOutcome| {
         let invalidation = requests.as_ref()
             .map(|requests| invalidations(&replayed, &outcome.changed, requests, args.prefill_tok_s));
-        Ok(Row { changes: outcome.changed.len(), outcome, invalidation })
+        Row { changes: outcome.changed.len(), outcome, invalidation }
+    };
+    let mut rows = policies.iter().map(|(name, policy, gate)| -> Result<Row> {
+        let mut outcome = simulate(&replayed, topk, args.capacity, &costs, policy, initial, *gate)?;
+        outcome.policy = name.clone();
+        Ok(row(outcome))
     }).collect::<Result<Vec<_>>>()?;
+    // Offline re-plan: a static tier per group of sessions, planned from the group before.
+    if let Some(requests) = &requests {
+        let sessions = window_sessions(&replayed, requests);
+        let mut order: Vec<(i64, String)> = Vec::new();
+        for request in requests {
+            if sessions.iter().flatten().any(|s| s == &request.session) && !order.iter().any(|(_, s)| s == &request.session) {
+                order.push((requests.iter().filter(|r| r.session == request.session).map(|r| r.started_ms).min()
+                    .unwrap_or(request.started_ms), request.session.clone()));
+            }
+        }
+        order.sort();
+        let mut planned = initial.clone();
+        let mut parts = Vec::new();
+        for group in order.chunks(args.replan_sessions) {
+            let part: Vec<RouteWindow> = replayed.iter().zip(&sessions)
+                .filter(|(_, s)| s.as_ref().is_some_and(|s| group.iter().any(|(_, g)| g == s)))
+                .map(|(w, _)| w.clone()).collect();
+            if part.iter().all(|w| w.step_count() == 0) { continue; }
+            parts.push(simulate(&part, topk, args.capacity, &costs, &CachePolicy::Static(planned.clone()), &planned, None)?);
+            planned = trace_totals(&part).context("an empty re-plan group")?;
+        }
+        if !parts.is_empty() { rows.push(row(combine(format!("replan-{}", args.replan_sessions), &parts))); }
+    }
     if args.json {
         let report = serde_json::to_string_pretty(&serde_json::json!({
             "trace": args.trace, "sessions": trace.sessions.len(), "capacity": args.capacity, "costs": costs,
-            "train_sessions": args.train_sessions, "rows": rows }))?;
+            "train_sessions": args.train_sessions,
+            "quiet_points": quiet.as_ref().map(|q| q.iter().filter(|&&q| q).count()), "rows": rows }))?;
         println!("{report}");
         return Ok(());
     }
@@ -123,6 +179,10 @@ pub(crate) fn run(args: TierCacheArgs) -> Result<()> {
     println!("{} trace sessions, {} replayed windows with decode steps, {} steps; {} resident experts; \
         base {} ms, upload {} ms (+{}%)", trace.sessions.len(), first.windows, first.steps, args.capacity,
         args.base_ms, args.upload_ms, args.upload_slowdown * 100.0);
+    if let Some(quiet) = &quiet {
+        println!("quiet points (no live prefix depends on the residents): {} of {} windows",
+            quiet.iter().filter(|&&q| q).count(), quiet.len());
+    }
     println!("{:<18} {:>8} {:>10} {:>9} {:>14} {:>8} {:>10} {:>10} {:>11} {:>11} {:>10}", "policy", "step ms",
         "experts ms", "upload ms", "uploads/window", "hit", "vs hind.", "vs real", "lost turns", "re-prefill", "net real");
     for row in &rows {
