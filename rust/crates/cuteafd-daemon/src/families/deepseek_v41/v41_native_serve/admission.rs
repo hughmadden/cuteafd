@@ -991,7 +991,7 @@ mod admission_tests {
         let snapshot = catalog.snapshot().to_path_buf();
         let (experts, ffn) = expert_inventory(&catalog, &snapshot.join("share/PROGRAMS.json"), 256, 2, 128, 2, 512,
             DECODE_LANE_ROWS)?;
-        let workspace = ffn + 2 * tier_lane_bytes(40, 384, DECODE_LANE_ROWS);
+        let workspace = ffn + 2 * tier_lane_bytes(40, 384, DECODE_LANE_ROWS) + tier_lane_bytes(40, 384, 256);
         let card = ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89) as usize;
         let memory = vec![(card - (4 << 30), card); 2];
         let serve = |tier: &str, layers: &str, memory: &[(usize, usize)], experts: Vec<ExpertCost>, minimum: usize|

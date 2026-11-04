@@ -384,14 +384,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + 2 * ffn_bytes(decode_rows, decode_rows)?;
     admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
         slots, prefill_reserve, ffn_arenas as u64)?;
-    // Each decode lane's GPU expert tier adds its slot tables and slots on
-    // both GPUs (the planner's `tier_lane_bytes`); its routed pair is the
-    // lane's TP2 FFN's, already in `ffn_arenas`.
+    // Each TP2 FFN's GPU expert tier (both decode lanes', the prefill
+    // slots') adds its slot tables and slots on both GPUs (the planner's
+    // `tier_lane_bytes`); its routed pair and result plane are the FFN's own,
+    // already in `ffn_arenas`.
     let routed_shape = catalog.routed_experts();
-    let tier_lanes = if tier_ask.is_some() {
-        2 * cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(routed_shape.layers as u64,
-            routed_shape.experts as u64, u64::from(decode_rows))
-    } else { 0 };
+    let lane_bytes = |rows: u32| cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(
+        routed_shape.layers as u64, routed_shape.experts as u64, u64::from(rows));
+    let tier_lanes = if tier_ask.is_some() { 2 * lane_bytes(decode_rows) + lane_bytes(capacity) } else { 0 };
     let expert_workspace = ffn_arenas as u64 + tier_lanes;
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
@@ -510,8 +510,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         crate::families::deepseek_v41::v41_experts::tier::TierHalves::new(residency, halves, capacity as usize))
         .transpose()?;
     if let Some(halves) = &tier_halves {
-        let lanes = 2 * crate::families::deepseek_v41::v41_experts::tier::TierLane::table_bytes(&halves.residency,
-            decode_rows) as u64;
+        use crate::families::deepseek_v41::v41_experts::tier::TierLane;
+        let lanes = (2 * TierLane::table_bytes(&halves.residency, decode_rows)
+            + TierLane::table_bytes(&halves.residency, capacity)) as u64;
         ensure!(lanes == tier_lanes, "GPU expert tier lanes: planned {tier_lanes} B per GPU, allocate {lanes} B");
     }
     let routed = match (&tier_halves, pushed) {
@@ -537,8 +538,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
     // The prefill slots' TP2 FFN: one execution arena per GPU at the unit cap,
     // its planes at the reserve (WP7), every slot's wave on it.
-    let ffn_storage = tp2_ffn::Storage::new(routed.clone(), shared.clone(), expert_layers, prefill_reserve as u32,
-        capacity, [None, None])?;
+    let ffn_storage = match &tier_halves {
+        Some(halves) => tp2_ffn::Storage::tiered(halves, shared.clone(), prefill_reserve as u32, capacity)?,
+        None => tp2_ffn::Storage::new(routed.clone(), shared.clone(), expert_layers, prefill_reserve as u32,
+            capacity, [None, None])?,
+    };
     // Decode lanes own a link each at decode width; prefill slot 0 holds the
     // one prefill link (endpoint after the lanes'), every slot's units send on it.
     let mut decode_transport = |lane: usize| -> Result<_> {
@@ -563,6 +567,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             _ => devices[1].own(|| NativeTp4Wave::unlinked(&lib, capacity))?,
         };
         transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?;
+        // Slot 0 holds the prefill link: its units leave the tier's experts
+        // to the slots' TP2 FFN (checked as a decode lane's), before bootstrap.
+        if slot == 0 && tier_halves.is_some() { devices[1].run(|| transport.get_mut().enable_tier())?; }
         Ok(transport)
     }).collect::<Result<Vec<_>>>()?;
     drop(ffn_storage);

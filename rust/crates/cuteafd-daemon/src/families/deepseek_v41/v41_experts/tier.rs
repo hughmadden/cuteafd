@@ -5,13 +5,13 @@
 //! the mount the selected halves are read alone, and under a dense recording
 //! they record for the coordinator push group instead.
 //!
-//! At run time a decode lane's TP2 FFN runs the tier beside its Spark wave,
-//! in place of whole TP2 layers: its routed owner pair is over the tier's
-//! halves, each GPU turns the router's expert ids into compact slots
-//! ([`TierLane`]: `slot_of`, -1 for the experts it does not hold), runs its
-//! half of the resident experts on the unchanged TP2 expert kernel, and the
-//! halves meet on the Spark reduce's GPU, whose result joins that reduce as
-//! one more plane. The Spark request leaves the same experts to the
+//! At run time each TP2 FFN (a decode lane's, the prefill slots') runs the
+//! tier beside its Spark waves, in place of whole TP2 layers: its routed owner
+//! pair is over the tier's halves, each GPU turns the router's expert ids into
+//! compact slots ([`TierLane`]: `slot_of`, -1 for the experts it does not
+//! hold), runs its half of the resident experts on the unchanged TP2 expert
+//! kernel, and the halves meet on the Spark reduce's GPU, whose result joins
+//! that reduce as one more plane. The Spark request leaves the same experts to the
 //! coordinator (`ReplicatedGroupPlanner::set_tier`), so every route runs
 //! exactly once.
 use super::{ExpertLayer, ExpertWeights};

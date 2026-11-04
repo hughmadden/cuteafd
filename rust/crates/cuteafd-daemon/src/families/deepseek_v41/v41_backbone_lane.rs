@@ -319,12 +319,12 @@ pub(crate) struct LaneFfn<'s, 'w, 'a> {
 
 /// A prefill unit's remote FFN between its send and land hooks (shared
 /// executor): every field is owned, so no lane borrow survives the hook. The
-/// shared contribution stays in this lane's shared workspace, which only this
-/// unit's slot uses until it lands.
+/// shared contribution (and the GPU expert tier's result) stays in this
+/// unit's slot's workspace, which only that slot uses until it lands.
 pub(crate) struct LaneUnitFfn {
     ticket: crate::families::deepseek_v41::v41_experts::coordinator::NativeUnitFfn,
     binding: QueryBinding,
-    shared: CuteafdDeviceBuffer,
+    shared: crate::families::deepseek_v41::v41_experts::coordinator::UnitShared,
     /// The lane's GPU, which the reduced result returns to.
     destination: i32,
     started: std::time::Instant,
@@ -580,13 +580,13 @@ impl LaneFfn<'_, '_, '_> {
         // Two RTX: the shared expert runs TP2 into this slot's transport-owned
         // workspace; one RTX: in this lane's shared workspace.
         let shared_values = if transport.has_tp2_shared_layer(self.input.layer) {
-            unsafe { transport.unit_shared(&self.input).await? }
+            unsafe { transport.unit_shared(&self.input, &ticket).await? }
         } else {
             let shared = self.shared.as_mut().context("prefill unit shared workspace absent")?;
             let contribution = unsafe { if self.cooperative { shared.execute_ffn_cooperative(&self.input).await? }
                 else { shared.execute_ffn(&self.input)? } };
             ensure!(contribution.binding()? == self.input.binding(), "prefill unit shared contribution differs");
-            contribution.values
+            crate::families::deepseek_v41::v41_experts::coordinator::UnitShared { values: contribution.values, tier: None }
         };
         let shared_us = started.elapsed().as_micros() as u64;
         if let Some(l2) = self.l2 { l2.issue(self.input.layer)?; }

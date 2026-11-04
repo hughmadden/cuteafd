@@ -155,10 +155,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let onboard = if spark_ranks == 0 { Onboard::Layers(routed.routed_layers()) } else {
         options.resolve_onboard(routed.routed_layers()).unwrap_or(Onboard::Auto)
     };
-    // Two decode lanes run the tier, each on its own slot tables.
-    let workspace = workspace + if tier_inputs.is_some() {
-        2 * v41::tier_lane_bytes(routed.layers as u64, routed.experts as u64, v41::owners::DECODE_LANE_ROWS)
-    } else { 0 };
+    // Both decode lanes and the prefill slots run the tier, each TP2 FFN on
+    // its own slot tables (the slots' at the unit).
+    let lane = |rows: u64| v41::tier_lane_bytes(routed.layers as u64, routed.experts as u64, rows);
+    let workspace = workspace + if tier_inputs.is_some() { 2 * lane(v41::owners::DECODE_LANE_ROWS) + lane(rows) }
+        else { 0 };
     let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
     if let Some(inputs) = &tier_inputs {
         tier.apply(&mut request, inputs, options.resolve_onboard(routed.routed_layers()), routed.experts)?;

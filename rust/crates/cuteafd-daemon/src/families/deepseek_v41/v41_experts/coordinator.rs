@@ -592,12 +592,15 @@ impl<'a> NativeTp4Wave<'a> {
         router_stream: *mut std::ffi::c_void, placement: u64,
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativeUnitFfn> {
         self.ready_rows = None;
-        // Prefill units do not run the GPU expert tier: their link must leave
-        // every expert to the Sparks.
-        ensure!(link.tier().is_none(), "prefill units do not run the GPU expert tier; its link must not mark it");
+        // As a decode lane's: the Sparks skip the layer's tier experts
+        // exactly when the slots' TP2 FFN runs them.
+        let tiered = link.tier_holds(routed.layer);
+        ensure!(tiered == self.tp2.as_ref().is_some_and(|tp2| tp2.tier_holds(routed.layer)),
+            "layer {}: the prefill link and the TP2 FFN disagree on the GPU expert tier", routed.layer);
         let (ticket, binding) = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
         Ok(NativeUnitFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
-            owner: self.output.buffer.ptr as usize })
+            owner: self.output.buffer.ptr as usize,
+            tier: tiered.then_some([routed.expert_input, routed.ids, routed.routing]) })
     }
     /// Lands a unit's wave from the shared prefill `link` (waves land in
     /// dispatch order: the executor's FIFO) and reduces it with its `shared`
@@ -607,34 +610,47 @@ impl<'a> NativeTp4Wave<'a> {
     /// `shared` holds the unit's completed shared contribution for exactly this
     /// wave's rows and stays unchanged until the reduce completes.
     pub(crate) async unsafe fn collect_unit<'w>(&'w mut self, link: &'w mut V41Link<'a>, unit: NativeUnitFfn,
-        shared: CuteafdDeviceBuffer, destination: i32) -> Result<NativeFfnOutput<'w>> {
+        shared: UnitShared, destination: i32) -> Result<NativeFfnOutput<'w>> {
         ensure!(unit.owner == self.output.buffer.ptr as usize, "prefill unit ticket belongs to another slot");
-        ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= unit.rows as usize * 10240,
+        let rows = unit.rows as usize;
+        ensure!(shared.values.device_id == self.output.buffer.device_id && shared.values.bytes >= rows * 10240
+            && shared.tier.is_some() == unit.tier.is_some() && shared.tier.is_none_or(|tier|
+                tier.device_id == self.output.buffer.device_id && tier.bytes >= rows * 10240),
             "prefill unit shared contribution differs from its wave");
-        let mut values = shared;
-        values.bytes = unit.rows as usize * 10240;
+        let mut values = shared.values;
+        values.bytes = rows * 10240;
         let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(), tier: None };
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(), tier: unit.tier };
         let destination = Some(destination).filter(|&device| device != self.output.buffer.device_id);
         if destination.is_some() {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.buffer.device_id };
-            device.future(unsafe { pending.finish_values(values, destination, None) }).await
+            device.future(unsafe { pending.finish_values(values, destination, shared.tier) }).await
         } else {
-            unsafe { pending.finish_values(values, None, None).await }
+            unsafe { pending.finish_values(values, None, shared.tier).await }
         }
     }
-    /// The TP2 shared contribution of a prefill unit, into this transport's
-    /// workspace (one transport per in-flight slot), on the reduce GPU.
+    /// The TP2 shared contribution of `unit` (a prefill unit's wave), and the
+    /// GPU expert tier's result when it holds experts of the layer, into this
+    /// slot's windows of the TP2 FFN's planes on the reduce GPU.
     /// # Safety
-    /// The unit's normalized input stays unchanged until it completes; the
-    /// returned values stay unchanged until the unit lands.
-    pub(crate) async unsafe fn unit_shared(&mut self,
-        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<CuteafdDeviceBuffer> {
-        ensure!(matches!(input.values.device_id, 0 | 1), "TP2 shared input device differs");
-        unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
-            .execute_shared_on(input.layer, input.tokens.len() as u32, input.values,
-                self.output.buffer.device_id as usize).await }
+    /// The unit's normalized input and router outputs stay unchanged until it
+    /// completes; the returned values stay unchanged until the unit lands.
+    pub(crate) async unsafe fn unit_shared(&mut self, input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>,
+        unit: &NativeUnitFfn) -> Result<UnitShared> {
+        ensure!(matches!(input.values.device_id, 0 | 1) && unit.layer == input.layer
+            && unit.rows as usize == input.tokens.len(), "TP2 shared input device or unit differs");
+        let destination = self.output.buffer.device_id as usize;
+        let tp2 = self.tp2.as_mut().context("TP2 shared workspace missing")?;
+        Ok(match unit.tier {
+            Some([wire, ids, routing]) => {
+                let (values, tier) = unsafe { tp2.execute_shared_and_tier_on(input.layer, unit.rows, input.values,
+                    wire, ids, routing, destination).await? };
+                UnitShared { values, tier: Some(tier) }
+            }
+            None => UnitShared { values: unsafe { tp2.execute_shared_on(input.layer, unit.rows, input.values,
+                destination).await? }, tier: None },
+        })
     }
     /// Borrowed device view; never free it or retain it across wave reuse/drop.
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {
@@ -710,6 +726,18 @@ pub(crate) struct NativeUnitFfn {
     layer: usize,
     rows: u32,
     owner: usize,
+    /// The router's FP8-K32 wire, ids and gate weights when the GPU expert
+    /// tier holds experts of this layer (the request left them to the coordinator).
+    tier: Option<[CuteafdDeviceBuffer; 3]>,
+}
+
+/// A prefill unit's coordinator contributions on the reduce GPU, from its
+/// send ([`NativeTp4Wave::unit_shared`]) to its land: the TP2 shared values,
+/// and the GPU expert tier's result when the tier holds experts of the layer.
+#[derive(Clone, Copy)]
+pub(crate) struct UnitShared {
+    pub(crate) values: CuteafdDeviceBuffer,
+    pub(crate) tier: Option<CuteafdDeviceBuffer>,
 }
 
 /// A remote layer's wave on the exchange, borrowed until its reduction is
@@ -833,8 +861,6 @@ impl<'w> NativePendingFfn<'w, '_> {
         // release it now that the reduce is on the chain head.
         if let Some(tp2) = self.tp2.as_deref() {
             tp2.release_shared_output(values.device_id as usize)?;
-            // So did the tier's result: its scratch may be rewritten next layer.
-            if tier.is_some() { tp2.release_tier_scratch()?; }
         }
         if host_ordered && crate::shared::memory::chain::active() {
             // The layer's one host wait for its streams: the reduce joined the

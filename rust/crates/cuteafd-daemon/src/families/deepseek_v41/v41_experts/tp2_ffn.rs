@@ -144,7 +144,9 @@ impl<'a> Storage<'a> {
     /// A TP2 FFN that runs the GPU expert tier in place of whole TP2 layers:
     /// its routed owner pair is over the tier's `halves` (no whole layer), and
     /// its tier lane turns the router's ids into their slots. Planes at
-    /// `rows`, scratch at `unit`.
+    /// `rows`, scratch at `unit`. Without whole layers the reduce GPU's output
+    /// plane (otherwise their final sums) holds each slot's tier result, in
+    /// the slot's window, until its Spark reduce reads it.
     pub(crate) fn tiered(halves: &super::tier::TierHalves<'a>, shared: [Rc<Vec<SharedWeights<'a>>>; 2],
         rows: u32, unit: u32) -> Result<Rc<Self>> {
         let storage = Self::new(halves.weights.clone(), shared, 0, rows, unit, [None, None])?;
@@ -207,10 +209,6 @@ impl<'a> Wave<'a> {
     pub(crate) fn release_shared_output(&self, destination: usize) -> Result<()> {
         self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?.release_shared_output(destination)
     }
-    /// After the Spark reduce that read the GPU expert tier's result.
-    pub(crate) fn release_tier_scratch(&self) -> Result<()> {
-        self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?.release_tier_scratch()
-    }
     /// Device-ordered passes of this decode lane push every transfer between
     /// the GPUs (`v41_peer_push`): routed partials, shared partials and the
     /// returned result. `rows` is the decode lane's width.
@@ -236,10 +234,11 @@ impl<'a> Wave<'a> {
         unsafe { self.execution(rows).await?.execute_shared_on(layer, rows, values, destination).await }
     }
     /// A Spark layer's shared TP2 contribution and the GPU expert tier's
-    /// result for `layer` (both BF16 on `destination`, the Spark reduce's GPU).
+    /// result for `layer` (both BF16 on `destination`, the Spark reduce's GPU;
+    /// the tier's in this wave's window of that GPU's output plane).
     /// # Safety
-    /// Inputs are complete and retained until the enclosing chain drains; the
-    /// tier result stays unchanged until [`Self::release_tier_scratch`] after its reduce.
+    /// Inputs are complete and retained until the enclosing chain drains; both
+    /// results stay unchanged until this window's next execution.
     pub(crate) async unsafe fn execute_shared_and_tier_on(&mut self, layer: usize, rows: u32, values: CuteafdDeviceBuffer,
         wire: CuteafdDeviceBuffer, ids: CuteafdDeviceBuffer, routing: CuteafdDeviceBuffer, destination: usize)
         -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
@@ -757,10 +756,11 @@ impl<'a> Execution<'a> {
     /// TP2 layer's do), each GPU turns the router's ids into its tier slots,
     /// and both halves run beside the shared halves.
     ///
-    /// The tier's arenas (slots, its owner pair's partials and result) and
-    /// the peer planes are this lane's scratch: under a device-ordered pass
-    /// that does not push, they are guarded through the Spark reduce, which
-    /// releases them ([`Wave::release_tier_scratch`]) once it read the result.
+    /// The tier's result lands in this window of `destination`'s output plane
+    /// (free in a tier FFN, which has no whole layer to sum there; see
+    /// [`Storage::tiered`]), so a prefill slot's result survives other slots'
+    /// units until its Spark reduce. The tier's slots and its owner pair's
+    /// arenas are unit scratch, guarded only through these executions.
     /// # Safety
     /// As [`Self::execute`]: the router's outputs are complete, immutable and
     /// retained until the enclosing chain drains (or the cancellation drain).
@@ -830,28 +830,28 @@ impl<'a> Execution<'a> {
         let slots = [0, 1].map(|rank| unsafe { tier.slot_routes(rank, layer, rows, ranks[rank][2], &self.streams[rank]) });
         let [first, second] = slots;
         let slots = [first?, second?];
-        // The routed pair is over the tier's halves (`Storage::tiered`).
+        // The routed pair is over the tier's halves (`Storage::tiered`); its
+        // result goes to this window of the reduce GPU's output plane.
+        let mut plane = self.window.apply(self.output[destination].buffer, 10240);
+        plane.bytes = rows as usize * 10240;
         let (shared, tiered) = tokio::try_join!(
             unsafe {
                 self.shared.execute(layer, rows, destination, [ranks[0][0], ranks[1][0]],
                     [&self.streams[0], &self.streams[1]], adopt)
             },
             unsafe {
-                self.routed.execute(layer, rows, destination, std::array::from_fn(|rank| OwnerInputs {
+                self.routed.execute_into(layer, rows, destination, std::array::from_fn(|rank| OwnerInputs {
                     input: ranks[rank][1], ids: slots[rank], weights: ranks[rank][3], producer: &self.streams[rank],
-                }))
+                }), Some(plane))
             }
         )?;
         guard.complete = true;
+        // The executions joined the chain head: the scratch is free for the
+        // next unit or layer (the result is in the output plane).
+        if !pushing_guards(&self.flags) { self.released.release()?; }
         Ok((shared, tiered))
     }
 
-    /// The Spark reduce that read the tier's result finished on the chain:
-    /// this lane's tier and peer scratch may be rewritten by its next layer.
-    pub(crate) fn release_tier_scratch(&self) -> Result<()> {
-        if !pushing_guards(&self.flags) { self.released.release()?; }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
