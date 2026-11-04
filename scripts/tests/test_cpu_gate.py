@@ -666,3 +666,36 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
         assert env.get('KEEP_PLAIN_VAR') == 'kept'
         for key in expected_scrubbed:
             assert key not in env
+
+
+def test_base_worktree_fetches_local_only_submodule_pins(tmp_path, monkeypatch):
+    # A pin that exists only in the gated checkout's submodule (never pushed).
+    monkeypatch.setenv('GIT_CONFIG_COUNT', '1')
+    monkeypatch.setenv('GIT_CONFIG_KEY_0', 'protocol.file.allow')
+    monkeypatch.setenv('GIT_CONFIG_VALUE_0', 'always')
+    def git(*args, cwd):
+        return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args],
+                              cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    upstream, source = tmp_path / 'upstream', tmp_path / 'source'
+    for repo in (upstream, source):
+        repo.mkdir()
+        git('init', '-q', '-b', 'main', cwd=repo)
+    (upstream / 'f').write_text('upstream')
+    git('add', 'f', cwd=upstream)
+    git('commit', '-qm', 'upstream', cwd=upstream)
+    git('submodule', 'add', '-q', str(upstream), 'third_party/sub', cwd=source)
+    sub = source / 'third_party/sub'
+    (sub / 'f').write_text('local only')
+    git('commit', '-qam', 'local only', cwd=sub)
+    pin = git('rev-parse', 'HEAD', cwd=sub)
+    git('add', 'third_party/sub', cwd=source)
+    git('commit', '-qm', 'pin a local-only commit', cwd=source)
+    base = tmp_path / 'base'
+    git('worktree', 'add', '-q', '--detach', str(base), 'HEAD', cwd=source)
+    with pytest.raises(SystemExit, match='failed'):
+        gate.update_submodules(base)
+    gate.update_submodules(base, local=source)
+    assert git('rev-parse', 'HEAD', cwd=base / 'third_party/sub') == pin
+    # The upstream URL is restored for the lock checks.
+    assert git('config', 'submodule.third_party/sub.url', cwd=base) == str(upstream)
+    assert git('remote', 'get-url', 'origin', cwd=base / 'third_party/sub') == str(upstream)

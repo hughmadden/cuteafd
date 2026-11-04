@@ -146,7 +146,35 @@ def python_for(source):
     raise SystemExit('cpu-gate: no .venv here or in the main checkout (uv venv --python 3.12 .venv; see AGENTS.md)')
 
 
-def prepare(source, root, owned=False):
+def update_submodules(source, local=None):
+    """Check out every submodule at the commit HEAD records. A --base worktree can
+    pin commits its upstreams don't have (an unpushed SparkInfer pin is "not our
+    ref"): when that update fails, fetch each submodule from the same path in
+    `local`, the checkout being gated, then restore the upstream URLs."""
+    update = ['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive']
+    try:
+        checked(update, timeout=1800)
+        return
+    except SystemExit:
+        if local is None:
+            raise
+    log(f'submodule pins missing upstream; fetching them from {local}')
+    paths = checked(['git', '-C', str(source), 'config', '-f', '.gitmodules', '--get-regexp', r'^submodule\..*\.path$'])
+    for line in paths.splitlines():
+        key, path = line.split(maxsplit=1)
+        name, copy = key[len('submodule.'):-len('.path')], local / path
+        if not (copy / '.git').exists():
+            continue
+        checked(['git', '-C', str(source), 'config', f'submodule.{name}.url', str(copy)])
+        if (source / path / '.git').exists():
+            checked(['git', '-C', str(source / path), 'remote', 'set-url', 'origin', str(copy)])
+    try:
+        checked(['git', '-C', str(source), '-c', 'protocol.file.allow=always', *update[3:]], timeout=1800)
+    finally:
+        checked(['git', '-C', str(source), 'submodule', 'sync', '--recursive'])
+
+
+def prepare(source, root, owned=False, local=None):
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(root)])
     for path in (root / 'tmp', root / 'logs'):
         path.mkdir(parents=True, exist_ok=True)
@@ -159,7 +187,7 @@ def prepare(source, root, owned=False):
     if moved:
         raise SystemExit('cpu-gate: submodule pins differ from HEAD (commit the bump first): ' + ', '.join(moved))
     log(f'submodules at their pinned commits ({source})')
-    checked(['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive'], timeout=1800)
+    update_submodules(source, local if owned else None)
     checked([sys.executable, str(source / 'scripts/build/verify-sparkinfer-source.py'), '--source',
              str(source / 'third_party/sparkinfer'), '--lock', str(source / 'third_party/sparkinfer.lock.json')])
 
@@ -648,8 +676,8 @@ def scripts(source, root, args, env):
     return result
 
 
-def gate(source, root, args, owned=False):
-    prepare(source, root, owned)
+def gate(source, root, args, owned=False, local=None):
+    prepare(source, root, owned, **({'local': local} if local is not None else {}))
     # Record the gated commit before running: a checkout that moves during the
     # gate would otherwise be credited with tests that ran against older source.
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
@@ -771,7 +799,7 @@ def run_gate(args, root):
             checked(['git', '-C', str(base_source), 'checkout', '-q', '--detach', args.base])
         else:
             checked(['git', '-C', str(args.source), 'worktree', 'add', '-q', '--detach', str(base_source), args.base])
-        record['base'] = gate(base_source, root / 'base', args, owned=True)
+        record['base'] = gate(base_source, root / 'base', args, owned=True, local=args.source.resolve())
         record['new_failing'] = {}
         for suite in record['suites']:
             before = next((s for s in record['base']['suites'] if s['suite'] == suite['suite']), {})
