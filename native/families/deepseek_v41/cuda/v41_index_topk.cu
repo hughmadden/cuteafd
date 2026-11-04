@@ -103,9 +103,9 @@ __device__ unsigned long long topk_phase[32];
 #define TOPK_PHASE(i) do {} while(0)
 #define TOPK_NOTE(i,v) do {} while(0)
 #endif
-__device__ __forceinline__ uint64_t shr(uint64_t x,int s) {return s>=64?0:x>>s;}
 // Position of a compacted entry: (position << 32) | ordered score, bit 63
 // marking an entry that came from the carry.
+__device__ __forceinline__ uint64_t shr(uint64_t x,int s) {return s>=64?0:x>>s;}
 __device__ __forceinline__ uint32_t position_of(uint64_t v) {return uint32_t(v>>32)&0x7fffffffu;}
 struct Partials {uint32_t any_lo[32],any_hi[32],all_lo[32],all_hi[32],n[32];};
 __device__ __forceinline__ void warp_fold(uint64_t& any,uint64_t& all,uint32_t& n) {
@@ -122,8 +122,9 @@ __device__ __forceinline__ void warp_fold(uint64_t& any,uint64_t& all,uint32_t& 
   }
 #endif
 }
-// Every warp folds the 32 warp partials itself, so no broadcast barrier
+// Every warp folds the warp partials itself, so no broadcast barrier
 // follows. Callers separate two folds by at least one barrier.
+template<int Warps>
 __device__ __forceinline__ void block_fold(uint64_t& any,uint64_t& all,uint32_t& n,Partials& p,int lane,int warp) {
   warp_fold(any,all,n);
   if(lane==0) {
@@ -131,9 +132,12 @@ __device__ __forceinline__ void block_fold(uint64_t& any,uint64_t& all,uint32_t&
     p.all_lo[warp]=uint32_t(all);p.all_hi[warp]=uint32_t(all>>32);p.n[warp]=n;
   }
   __syncthreads();
-  any=(uint64_t(p.any_hi[lane])<<32)|p.any_lo[lane];
-  all=(uint64_t(p.all_hi[lane])<<32)|p.all_lo[lane];
-  n=p.n[lane];
+  any=0;all=~0ull;n=0;
+  if(lane<Warps) {
+    any=(uint64_t(p.any_hi[lane])<<32)|p.any_lo[lane];
+    all=(uint64_t(p.all_hi[lane])<<32)|p.all_lo[lane];
+    n=p.n[lane];
+  }
   warp_fold(any,all,n);
 }
 // The bin holding the need-th largest key of a 256-bin histogram (each lane
@@ -173,13 +177,16 @@ __device__ __forceinline__ uint32_t rank_in(const uint64_t* a,uint32_t lo,uint32
   }
   return first-lo;
 }
-template<int K,uint64_t Limit,int Items>
-__global__ void __launch_bounds__(kSelectThreads,1) radix_select(const float* scores,const uint64_t* positions,
+// Items keys per thread stay in registers: 1024 threads hold up to 9 each
+// within their 64-register budget, the widest calls run 512 threads of 36.
+template<int K,uint64_t Limit,int Items,int Threads>
+__global__ void __launch_bounds__(Threads,1) radix_select(const float* scores,const uint64_t* positions,
     uint64_t* carry,int32_t* output,int count,int reset) {
-  constexpr int Threads=kSelectThreads,SortItems=(K+Threads-1)/Threads,Segments=Items*32;
+  constexpr int Warps=Threads/32,SortItems=(K+Threads-1)/Threads,Segments=Items*Warps;
+  constexpr int PerThread=(Segments+Threads-1)/Threads;
   constexpr int PositionBits=Limit==1048576?21:18;
   static_assert(Limit==1048576 || Limit==131072);
-  static_assert(Segments<=Threads);
+  static_assert(Threads%32==0 && Threads>=256 && Warps<=32);
   using RowSort=cub::BlockRadixSort<uint64_t,Threads,SortItems>;
   using Scan=cub::BlockScan<uint32_t,Threads>;
   __shared__ union {
@@ -196,31 +203,41 @@ __global__ void __launch_bounds__(kSelectThreads,1) radix_select(const float* sc
   } shared;
   const int tid=threadIdx.x,lane=tid%32,warp=tid/32;
   const uint64_t row=blockIdx.x;
-  const int total=count+(reset?0:K);
+  // Item i is column i*Threads+tid: a candidate below count, then carry
+  // entries. Comparing i*Threads with these per-thread bounds keeps no
+  // per-item column live past the loads.
+  const int fresh=count-tid,filled=count+(reset?0:K)-tid;
   TOPK_PHASE(0);
   uint64_t keys[Items];
   uint64_t any=0,all=~0ull;uint32_t valid=0;
-  #pragma unroll
-  for(int i=0;i<Items;++i) {
-    const int col=i*Threads+tid;
-    uint64_t key=0;
-    if(col<count)key=encode<Limit>(scores[row*count+col],positions[row*count+col]);
-    else if(col<total)key=carry[row*K+col-count];
-    keys[i]=key;
-    if(key) {any|=key;all&=key;++valid;}
+  {
+    const float* row_scores=scores+row*count+tid;
+    const uint64_t* row_positions=positions+row*count+tid;
+    const uint64_t* row_carry=carry+row*K;
+    #pragma unroll
+    for(int i=0;i<Items;++i) {
+      uint64_t key=0;
+      if(i*Threads<fresh)key=encode<Limit>(row_scores[i*Threads],row_positions[i*Threads]);
+      else if(i*Threads<filled)key=row_carry[i*Threads-fresh];
+      keys[i]=key;
+      if(key) {any|=key;all&=key;++valid;}
+    }
   }
   if(tid<256)shared.select.histogram[0][tid]=0;
   if(tid==0)shared.select.gathered=0;
-  block_fold(any,all,valid,shared.select.partials,lane,warp);
+  block_fold<Warps>(any,all,valid,shared.select.partials,lane,warp);
   TOPK_PHASE(1);
-  // Selection: every key k with (k>>shift)>prefix, plus the first `need` keys
-  // with (k>>shift)==prefix in column order. Those ties are either all taken
-  // or identical keys, so which copies are taken never changes the output.
-  int shift=0;uint64_t prefix=0;uint32_t need=0;
+  // Selection: every key above the bin [lo, hi], plus the first `need` keys in
+  // it in column order. Those ties are either all taken or identical keys, so
+  // which copies are taken never changes the output.
+  uint64_t lo=0,hi=0;uint32_t need=0;
   if(valid>uint32_t(K)) {
     // MSB-first 8-bit digits over the bits where the active keys still
     // differ: constant runs (BF16 score tails, high position bits) cost nothing.
-    shift=64;need=K;
+    // The active bin is keys k with (k>>shift)==prefix; the bounds are formed
+    // once at the end (both forms keep the widest variants spill-free).
+    int shift=64;uint64_t prefix=0;
+    need=K;
     int active=-1;  // keys gathered to shared memory once the threshold bin fits
     for(int pass=0;;++pass) {
       const uint64_t diff=any^all;
@@ -243,6 +260,7 @@ __global__ void __launch_bounds__(kSelectThreads,1) radix_select(const float* sc
       __syncthreads();
       int bin;uint32_t above,size;
       find_bin(histogram,need,lane,bin,above,size);
+      // Bits above `high` are common to the active keys; the bin fixes the rest down to `low`.
       prefix=(high==63?0:(all>>(high+1))<<width)|uint64_t(bin);
       shift=low;need-=above;
       TOPK_PHASE(2+(pass<9?pass:9));
@@ -282,37 +300,41 @@ __global__ void __launch_bounds__(kSelectThreads,1) radix_select(const float* sc
         }
       }
       uint32_t unused=0;
-      block_fold(any,all,unused,shared.select.partials,lane,warp);
+      block_fold<Warps>(any,all,unused,shared.select.partials,lane,warp);
     }
+    lo=shift>=64?0:prefix<<shift;hi=shift>=64?~0ull:lo|((uint64_t(1)<<shift)-1);
   }
   // Column order (col = i*Threads + tid) is item-major, then warp, then lane:
   // count each (item, warp) segment, scan the segments, then place.
   #pragma unroll
   for(int i=0;i<Items;++i) {
-    const uint64_t key=keys[i],high=shr(key,shift);
-    const uint32_t up=__popc(__ballot_sync(0xffffffffu,key && high>prefix));
-    const uint32_t tie=__popc(__ballot_sync(0xffffffffu,key && high==prefix));
-    if(lane==0)shared.select.segments[i*32+warp]=up|(tie<<16);
+    const uint64_t key=keys[i];
+    const uint32_t up=__popc(__ballot_sync(0xffffffffu,key>hi));
+    const uint32_t tie=__popc(__ballot_sync(0xffffffffu,key && key>=lo && key<=hi));
+    if(lane==0)shared.select.segments[i*Warps+warp]=up|(tie<<16);
   }
   __syncthreads();
-  uint32_t segment=tid<Segments?shared.select.segments[tid]:0,totals;
+  uint32_t segment[PerThread],totals;
+  #pragma unroll
+  for(int j=0;j<PerThread;++j)segment[j]=tid*PerThread+j<Segments?shared.select.segments[tid*PerThread+j]:0;
   Scan(shared.select.scan).ExclusiveSum(segment,segment,totals);
-  if(tid<Segments)shared.select.segments[tid]=segment;
+  #pragma unroll
+  for(int j=0;j<PerThread;++j)if(tid*PerThread+j<Segments)shared.select.segments[tid*PerThread+j]=segment[j];
   __syncthreads();
   TOPK_PHASE(12);
   const uint32_t taken=totals&65535u,ties=totals>>16,selected=taken+(ties<need?ties:need);
   const uint32_t before=(1u<<lane)-1;
   #pragma unroll
   for(int i=0;i<Items;++i) {
-    const uint64_t key=keys[i],high=shr(key,shift);
-    const bool up=key && high>prefix,tie=key && high==prefix;
+    const uint64_t key=keys[i];
+    const bool up=key>hi,tie=key && key>=lo && key<=hi;
     const uint32_t ups=__ballot_sync(0xffffffffu,up),tied=__ballot_sync(0xffffffffu,tie);
-    const uint32_t offset=shared.select.segments[i*32+warp];
+    const uint32_t offset=shared.select.segments[i*Warps+warp];
     const uint32_t a=(offset&65535u)+__popc(ups&before),t=(offset>>16)+__popc(tied&before);
     uint32_t slot=K;
     if(up)slot=a+(t<need?t:need);
     else if(tie && t<need)slot=a+t;
-    if(slot<uint32_t(K))shared.select.selected[slot]=(uint64_t(i*Threads+tid>=count)<<63)|
+    if(slot<uint32_t(K))shared.select.selected[slot]=(uint64_t(i*Threads>=fresh)<<63)|
         (uint64_t(~uint32_t(key))<<32)|(key>>32);
   }
   for(uint32_t s=selected+tid;s<uint32_t(K);s+=Threads)shared.select.selected[s]=UINT64_MAX;
@@ -377,18 +399,20 @@ __global__ void __launch_bounds__(kSelectThreads,1) radix_select(const float* sc
 template<int K,uint64_t Limit,int Items>
 cudaError_t launch_radix(const float* scores,const uint64_t* positions,uint64_t* carry,int32_t* output,
     int queries,int candidates,int reset,cudaStream_t stream) {
-  radix_select<K,Limit,Items><<<queries,kSelectThreads,0,stream>>>(scores,positions,carry,output,candidates,reset);
+  constexpr int Threads=Items>9?512:kSelectThreads;
+  static_assert(Items<=9 || 16384+K<=Items*512);
+  radix_select<K,Limit,Items,Threads><<<queries,Threads,0,stream>>>(scores,positions,carry,output,candidates,reset);
   return cudaGetLastError();
 }
 template<int K,uint64_t Limit>
 cudaError_t select_radix(const float* scores,const uint64_t* positions,uint64_t* carry,int32_t* output,
     int queries,int candidates,int reset,cudaStream_t stream) {
   const int total=candidates+(reset?0:K);
-  static_assert(16384+K<=18*kSelectThreads);
+  constexpr int Widest=(16384+K+511)/512;  // 33 for K=512, 36 for K=2048
   if(total<=2*kSelectThreads)return launch_radix<K,Limit,2>(scores,positions,carry,output,queries,candidates,reset,stream);
   if(total<=5*kSelectThreads)return launch_radix<K,Limit,5>(scores,positions,carry,output,queries,candidates,reset,stream);
   if(total<=9*kSelectThreads)return launch_radix<K,Limit,9>(scores,positions,carry,output,queries,candidates,reset,stream);
-  return launch_radix<K,Limit,18>(scores,positions,carry,output,queries,candidates,reset,stream);
+  return launch_radix<K,Limit,Widest>(scores,positions,carry,output,queries,candidates,reset,stream);
 }
 // CUTEAFD_V41_INDEX_TOPK=merge selects the original sort-and-merge path (A/B).
 bool merge_path() {
