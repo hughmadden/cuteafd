@@ -203,7 +203,10 @@ fn tier_half_equals_the_whole_layer_half_with_other_routes_dropped() -> Result<(
     let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     lib.cuda_set_device(0)?;
     let device = Device { library: &lib, id: 0 };
-    let slot_kernel = lib.v41_tier_slots()?;
+    // A library without the slot kernel (another branch's build) gets the
+    // kernel's CPU contract instead: the expert kernels are what this checks.
+    let slot_kernel = lib.v41_tier_slots().ok();
+    eprintln!("tier half slots from {}", if slot_kernel.is_some() { "the slot kernel" } else { "the CPU contract" });
     let (layer, capacity) = (11usize, 256usize);
     // The planner's uniform spread plus a contiguous block: 64 residents.
     let resident: Vec<u16> = (0..384u16).filter(|e| e % 7 == 3 || (100..110).contains(e)).collect();
@@ -255,7 +258,12 @@ fn tier_half_equals_the_whole_layer_half_with_other_routes_dropped() -> Result<(
                         Routes { ids: masked.buffer.ptr, weights: routing.buffer.ptr }, stream.raw, &mut || {})?;
                     stream.drain()?;
                     let reference = host(cuteafd_ffi::CuteafdDeviceBuffer { ptr: full.output(), ..wire.buffer }, bytes)?;
-                    slot_kernel.launch(ids.buffer, tables.buffer, slots.buffer, shape, layer, rows * 6, stream.raw)?;
+                    match &slot_kernel {
+                        Some(kernel) => kernel.launch(ids.buffer, tables.buffer, slots.buffer, shape, layer, rows * 6,
+                            stream.raw)?,
+                        None => lib.copy_h2d(slots.buffer, &cuteafd_ffi::tier_slots(&ids_host, &residency.slot_of(layer))
+                            .iter().flat_map(|slot| slot.to_ne_bytes()).collect::<Vec<_>>())?,
+                    }
                     tier.enqueue(layer, rows, ExpertInput::Fp8K32(wire.buffer.ptr),
                         Routes { ids: slots.buffer.ptr, weights: routing.buffer.ptr }, stream.raw, &mut || {})?;
                     stream.drain()?;
