@@ -605,6 +605,7 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
     let allowed = match label {
         "request" => {
             crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
+                | crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
@@ -634,11 +635,18 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
     // never present in a response.
     if label == "request" && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
         let native_allowed = crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
+            | crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG
             | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
             | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
             bail!("native group ownership requires the native compact request contract");
         }
+    }
+    // The coordinator owner extends the native group owner field: it is
+    // meaningless without it.
+    if label == "request" && flags & crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG != 0
+        && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG == 0 {
+        bail!("the coordinator route owner requires native group ownership");
     }
     let unknown = flags & !allowed;
     if unknown != 0 {

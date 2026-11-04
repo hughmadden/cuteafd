@@ -1,5 +1,6 @@
 //! Bounded chunks carry request-selected rank partials in token order.
-use super::{BackboneRequest, SparkTopology, V41_NATIVE_GROUP_REQUEST_FLAG, V41Tp4Planes};
+use super::{BackboneRequest, SparkTopology, V41_NATIVE_COORDINATOR_REQUEST_FLAG, V41_NATIVE_GROUP_REQUEST_FLAG,
+    V41Tp4Planes};
 use crate::{
     EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN,
@@ -75,7 +76,7 @@ impl BackboneRequest<'_> {
                 output_row_stride_bytes: self.output_row_bytes()?,
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
-                flags: (request.flags & !V41_NATIVE_GROUP_REQUEST_FLAG)
+                flags: (request.flags & !(V41_NATIVE_GROUP_REQUEST_FLAG | V41_NATIVE_COORDINATOR_REQUEST_FLAG))
                     | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                     | if end < self.rows() {
                         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
