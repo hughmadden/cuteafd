@@ -345,6 +345,7 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
   )
   list(APPEND CUTEAFD_SPARKINFER_EXPORT_INPUTS
     "${CUTEAFD_SPARKINFER_SOURCE_DIR}/pyproject.toml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/sm89_cards.py"
   )
   set(CUTEAFD_MXFP4_POLICY_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"

@@ -458,13 +458,16 @@ def test_capability_only_admission_and_live_launch_caps(family, device):
 
 SM89_FP8_HEADER = r"""
 #pragma once
-#define CUTEAFD_V41_FP8_SMS 114
+#define CUTEAFD_V41_FP8_SMS 128
 #define CUTEAFD_V41_FP8_CC_MAJOR 8
 #define CUTEAFD_V41_FP8_CC_MINOR 9
 #define CUTEAFD_V41_FP8_PLAIN_SCALES 1
-static const uint32_t grids[] = {456};
+inline void plan114(void**, int) { recorded_plan=114; }
+inline void plan128(void**, int) { recorded_plan=128; }
+static const uint32_t grids[] = {512};
 #define CUTEAFD_V41_FP8_VARIANTS \
- {{1,1,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan188},{init,load,noop},grids,0,1,1,0,114,1,1}, \
+ {{1,1,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan114},{init,load,noop},grids,0,1,1,0,114,1,1}, \
+ {{1,1,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan128},{init,load,noop},grids,0,1,1,0,128,1,1}, \
  {{1,16,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,0,16,0}
 #define CUTEAFD_V41_HC_PROJECT_MODULE {init,load,noop}
 """
@@ -480,26 +483,33 @@ int main() {
  // An SM89 bundle refuses SM120 devices and admits compute 8.9.
  assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==cudaErrorInvalidDevice && h==nullptr);
  major=8; minor=9;
- for (int sms : {114, 128}) {
-  override_sms=sms;
-  // The only card plan serves any SM count; the exact plan is preferred.
-  cuteafd_v41_fp8_info_t info;
+ cuteafd_v41_fp8_info_t info;
+ // Another SM89 card has no plan for a card-planned shape and is refused;
+ // shapes with one plan for every card still describe themselves.
+ override_sms=142;
+ assert(cuteafd_v41_fp8_matrix_info(1,32,32,&info)==cudaErrorInvalidValue);
+ assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==cudaErrorInvalidDevice && h==nullptr);
+ assert(cuteafd_v41_fp8_matrix_initialize(1,32,64,&h)==cudaErrorInvalidValue && h==nullptr);
+ assert(cuteafd_v41_fp8_matrix_info(16,32,32,&info)==0);
+ // Each supported card runs its own plan; grids are capped at four CTAs per SM.
+ for (int dev : {2,5}) {
+  device=dev; override_sms=dev==2 ? 114 : 128;
   assert(cuteafd_v41_fp8_matrix_info(1,32,32,&info)==0 && info.mma_scales_offset==info.row_scales_offset);
   assert(info.packed_weight_scale_bytes==1);
-  assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==0);
+  assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==0 && handle(h)->device_sms==override_sms);
   assert(cuteafd_v41_fp8_launch(h,reinterpret_cast<uint16_t*>(0x10000),
     reinterpret_cast<uint8_t*>(0x20000),reinterpret_cast<uint8_t*>(0x30000),
     reinterpret_cast<void*>(0x40000),64,reinterpret_cast<float*>(0x50000),
     reinterpret_cast<uint16_t*>(0x60000),1,nullptr)==0);
-  assert(recorded_plan==188 && recorded_grid==456);
-  assert(cuteafd_v41_fp8_matrix_initialize(16,32,32,&h)==0);
+  assert(recorded_plan==override_sms && recorded_grid==std::min(512,4*override_sms));
+  assert(cuteafd_v41_fp8_matrix_initialize(16,32,32,&h)==0 && handle(h)->device_sms==override_sms);
+  assert(cuteafd_v41_hc_project_initialize()==0);
  }
- assert(cuteafd_v41_hc_project_initialize()==0);
 }
 """
 
 
-def test_sm89_bundle_admits_compute_89_and_its_single_card_plan():
+def test_sm89_bundle_runs_each_card_plan_and_refuses_other_cards():
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("native bridge qualification needs a C++ compiler")
@@ -521,17 +531,17 @@ def test_sm89_bundle_admits_compute_89_and_its_single_card_plan():
 
 SM89_EXPERT_HEADER = r"""
 #pragma once
-#define CUTEAFD_V41_SMS 114
+#define CUTEAFD_V41_SMS 128
 #define CUTEAFD_V41_CC_MAJOR 8
 #define CUTEAFD_V41_CC_MINOR 9
 #define CUTEAFD_V41_GROUP_ROWS(capacity, rows) ((capacity)==1 ? 16u : 0u)
 #define CUTEAFD_V41_VARIANTS \
- {{2,0,128,5120,2304,2304,3,1,64,1,1,3,3,114,1},init,load,expert_launch,{}}
+ {{2,0,128,5120,2304,2304,3,1,64,1,1,3,3,128,1},init,load,expert_launch,{}}
 """
 
 SM89_INPUT_QUANT_HEADER = r"""
 #pragma once
-static const uint32_t cuteafd_v41_input_quant_grids[] = {752};
+static const uint32_t cuteafd_v41_input_quant_grids[] = {1024};
 #define _mlir_cuteafd_v41_expert_input_quant_cuda_init ::init
 #define _mlir_cuteafd_v41_expert_input_quant_cuda_load_to_device ::load
 #define CUTEAFD_V41_INPUT_QUANT_ENTRY quant
@@ -546,29 +556,32 @@ int main() {
  // An SM89 expert table refuses SM120/SM121 devices and admits compute 8.9.
  assert(cuteafd_v41_expert_initialize(1,&h)==cudaErrorInvalidDevice && h==nullptr);
  assert(cuteafd_v41_expert_input_quant_initialize(&h)==cudaErrorInvalidDevice && h==nullptr);
- major=8; minor=9; override_sms=128;
+ // Capacity is sized for the largest supported SM89 card (128 SMs).
+ major=8; minor=9; override_sms=142;
  assert(cuteafd_v41_expert_initialize(1,&h)==cudaErrorInvalidDevice && h==nullptr);
- override_sms=114;
- assert(cuteafd_v41_expert_initialize(1,&h)==0 && by_handle(h)->device_sms==114);
+ override_sms=TEST_SMS;
+ assert(cuteafd_v41_expert_initialize(1,&h)==0 && by_handle(h)->device_sms==TEST_SMS);
  cuteafd_expert_launch_t args{};
  for (auto& p : args.tensors) p=reinterpret_cast<void*>(0x10000);
  args.num_tokens=1; args.scatter_rows=3; args.max_rows=1;
  args.rows_padded=1; args.max_tasks=3; args.max_phys_tiles=3;
- for (int cap : {228,114,57}) {
+ // Launch capacity never exceeds the runtime card's SMs.
+ for (int cap : {256,128,114,57}) {
   args.max_active_clusters=cap;
-  assert(cuteafd_v41_expert_launch(h,&args)==0 && recorded_cap==std::min(cap,114));
+  assert(cuteafd_v41_expert_launch(h,&args)==0 && recorded_cap==std::min(cap,TEST_SMS));
  }
- args.max_active_clusters=229;
+ args.max_active_clusters=257;
  assert(cuteafd_v41_expert_launch(h,&args)==cudaErrorInvalidValue);
  assert(cuteafd_v41_expert_input_quant_initialize(&h)==0);
  assert(cuteafd_v41_expert_input_quantize_async(h,reinterpret_cast<uint16_t*>(0x10000),
    reinterpret_cast<uint8_t*>(0x20000),1,nullptr)==0);
- assert(recorded_grid==456);
+ assert(recorded_grid==std::min(1024,4*TEST_SMS));
 }
 """
 
 
-def test_sm89_expert_table_admits_compute_89_up_to_its_sm_count():
+@pytest.mark.parametrize("sms", [114, 128])
+def test_sm89_expert_table_admits_every_supported_card(sms):
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("native bridge qualification needs a C++ compiler")
@@ -581,7 +594,7 @@ def test_sm89_expert_table_admits_compute_89_up_to_its_sm_count():
         (directory / "v41_input_quant_dispatch.h").write_text(SM89_INPUT_QUANT_HEADER)
         source = ROOT / "native/shared/src/v41_experts.cc"
         (directory / "main.cc").write_text(SM89_EXPERT_MAIN.replace("SOURCE", str(source)))
-        subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
+        subprocess.run([compiler, "-std=c++17", "-pthread", f"-DTEST_SMS={sms}", "-I", str(directory),
                         "-I", str(ROOT / "native/shared/include"),
                         "-I", str(ROOT / "native/families/deepseek_v41/include"),
                         str(directory / "main.cc"), "-o", str(directory / "test")],

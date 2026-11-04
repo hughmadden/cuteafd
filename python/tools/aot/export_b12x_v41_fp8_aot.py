@@ -19,6 +19,7 @@ import os
 import re
 from pathlib import Path
 import _pinned_sparkinfer  # noqa: F401
+from sm89_cards import CARD_SMS as SM89_CARD_SMS, WORKSPACE_SMS as SM89_WORKSPACE_SMS
 from v41_capacities import PROJECTION_CAPACITIES
 
 
@@ -60,15 +61,71 @@ def validate_abi(path: Path, label: str, kind: str) -> dict:
     return {'symbol': symbols[0], 'pointers': pointers, 'i32': scalars, 'stream': stream, 'argument_count': count}
 
 
-# SM120 bundles keep their reference-card constants (byte-identical exports);
-# SM89 bundles take SMs and grids from the export device.
+# Bundles size grids for their architecture's largest card (SM120: the RTX
+# PRO 6000; SM89: sm89_cards); launches cap them by the runtime SM count.
 SM120_SMS = 188
+SM120_CARD_SMS = (170, 188)
+# Shapes with one exact plan per card (label suffix _sm<SMs>); every other
+# shape has one plan for any card of its architecture. SM120 plans q_a/kv
+# decode for the RTX 5090 and PRO 6000. SM89 plans the same shapes for each
+# supported card, so another SM89 card fails closed as on SM120, and every
+# shape whose SM89 plan depends on the SM count (sm89_card_shapes).
+CARD_PLAN_SHAPES = frozenset((name, rows) for name in ('q_a', 'kv') for rows in (1, 16))
+
+
+def expected_rows(name: str, capacity: int, k: int, n: int, groups: int, sms: int) -> int:
+    """The row regime a projection's kernels are planned for on ``sms`` SMs."""
+    expected_m = capacity
+    if os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
+        from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
+        expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
+            sm_count=sms, num_groups=groups)
+    if name in ("o_b", "o_b_tp2") and capacity <= 80:
+        # Decode and verify share the fast unsplit m16 arithmetic.
+        expected_m = 16
+    return expected_m
+
+
+def sm89_card_shapes(projections, rows, sm89_block32_plan=None) -> set[tuple[str, int]]:
+    """CARD_PLAN_SHAPES plus every shape whose SM89 kernels differ between the
+    supported cards, planned exactly as compile_dense_gemm_mxfp8_aot plans SM89."""
+    if sm89_block32_plan is None:
+        from b12x._lib.sm89_fp8 import sm89_block32_plan
+    shapes = set()
+    for name, n, k in projections:
+        groups = 8 if name == 'o_a' else 1
+        for capacity in rows:
+            plans = []
+            for sms in SM89_CARD_SMS:
+                expected_m = expected_rows(name, capacity, k, n, groups, sms)
+                plans.append((expected_m, sm89_block32_plan(
+                    size_m=capacity, size_n=n // groups, size_k=k // groups, num_groups=groups,
+                    sm_count=sms, fixed_rows=expected_m < capacity)))
+            if (name, capacity) in CARD_PLAN_SHAPES or any(plan != plans[0] for plan in plans):
+                shapes.add((name, capacity))
+    return shapes
+
+
+def check_declared_card_plans(cards, shapes, projections, rows) -> None:
+    """The build lists every exported file in advance: refuse a stale list."""
+    declared_cards = os.environ.get('CUTEAFD_V41_FP8_CARD_PLANS')
+    declared_shapes = os.environ.get('CUTEAFD_V41_FP8_CARD_SHAPES')
+    if declared_cards is None and declared_shapes is None:
+        return
+    exported = {(name, capacity) for name, _, _ in projections for capacity in rows}
+    listed = {(name, int(capacity)) for name, capacity in
+              (item.split(':') for item in (declared_shapes or '').split(',') if item)}
+    if tuple(int(sms) for sms in (declared_cards or '').split(',') if sms) != tuple(cards) \
+            or listed & exported != shapes:
+        raise ValueError(
+            f'v41_fp8.cmake lists card plans {declared_cards} for {sorted(listed & exported)}; '
+            f'this export plans {",".join(map(str, cards))} for {sorted(shapes)}')
 
 
 def dispatch_header(output: Path, manifest: dict) -> None:
     from b12x._lib.quant.mxfp8_rows import mxfp8_rows_quant_aot_grid
     plain = manifest['capability'] == [8, 9]
-    sms = manifest['physical_sms'] if plain else SM120_SMS
+    sms = SM89_WORKSPACE_SMS if plain else SM120_SMS
     lines = ['#pragma once', '#include <stdint.h>',
              f'#define CUTEAFD_V41_FP8_SMS {sms}']
     if plain:
@@ -126,10 +183,12 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
     if (props.major, props.minor) not in ((12, 0), (8, 9)):
         raise ValueError('coordinator FP8 export requires native SM120 or SM89')
     plain = (props.major, props.minor) == (8, 9)
-    card_sms = int(props.multi_processor_count)
-    expected_sms = os.environ.get('CUTEAFD_V41_FP8_PLAN_SMS')
-    if plain and expected_sms and int(expected_sms) != card_sms:
-        raise ValueError(f'SM89 FP8 export planned for {expected_sms} SMs, device has {card_sms}')
+    cards = SM89_CARD_SMS if plain else SM120_CARD_SMS
+    shared_sms = SM89_WORKSPACE_SMS if plain else SM120_SMS
+    card_shapes = (sm89_card_shapes(projections, rows) if plain else
+                   {(name, capacity) for name, _, _ in projections for capacity in rows
+                    if (name, capacity) in CARD_PLAN_SHAPES})
+    check_declared_card_plans(cards, card_shapes, projections, rows)
     output.mkdir(parents=True, exist_ok=True)
     (output / 'v41_fp8.json').unlink(missing_ok=True)
     manifest = {'schema': 2, 'role': 'coordinator', 'capability': [props.major, props.minor],
@@ -141,21 +200,12 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                 'variants': []}
     for name, n, k in projections:
         for capacity in rows:
-            dual = name in ('q_a', 'kv') and capacity in (1, 16)
-            # SM89 replaces the two SM120 card plans with the export card's.
-            dual_plans = (card_sms,) if plain else (170, 188)
-            for plan_sms in (dual_plans if dual else (card_sms if plain else 188,)):
+            dual = (name, capacity) in card_shapes
+            for plan_sms in (cards if dual else (shared_sms,)):
                 label = f'v41_{name}_fp8_m{capacity}' + (f'_sm{plan_sms}' if dual else '')
                 groups = 8 if name == 'o_a' else 1
-                expected_m = capacity
-                if os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
-                    from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
-                    expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
-                        sm_count=plan_sms, num_groups=groups)
+                expected_m = expected_rows(name, capacity, k, n, groups, plan_sms)
                 fixed_output = name in ("o_b", "o_b_tp2") and capacity <= 80
-                if fixed_output:
-                    # Decode and verify share the fast unsplit m16 arithmetic.
-                    expected_m = 16
                 all_m = False
                 quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
                          if groups > 1 else compile_mxfp8_rows_quant_aot(

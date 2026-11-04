@@ -10,8 +10,8 @@ elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
   set(CUTEAFD_V41_EXPERT_INPUT_FORMAT fp8_k32)
 elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
   # SM89 (Ada) coordinators: promoted-MMA slices over the same resident experts,
-  # scratch and route planes; the export runs on the SM89 card and sizes its
-  # quantizer grids and SM cap for that card.
+  # scratch and route planes; quantizer grids and the SM cap are sized for the
+  # largest supported SM89 card (python/tools/lib/sm89_cards.py).
   set(CUTEAFD_V41_EXPERT_ROLE coordinator)
   set(CUTEAFD_V41_EXPERT_INPUT_FORMAT bf16)
 else()

@@ -25,6 +25,7 @@ from spark_packages import native_spark_artifacts, native_width_role
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
 os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
 import _pinned_sparkinfer
+from sm89_cards import WORKSPACE_SMS as SM89_WORKSPACE_SMS
 
 # Plan-time expert placement roles. Geometry, SM guard and native role id are
 # properties of the role, never of the live row count. `spark` is the historical
@@ -223,9 +224,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             raise ValueError("compact live-row cutoff must fit the selected capacities")
     elif compact_live_rows is not None:
         raise ValueError("compact live-row cutoff requires compact capacity selection")
-    # SM120/SM121 keep their reference-card constants (byte-identical exports);
-    # SM89 takes the export card's SM count.
-    workspace_sms = props.multi_processor_count if sm89 else 48 if props.minor == 1 else 188
+    # Every architecture sizes launch capacity for its largest supported card
+    # (SM89: sm89_cards); grids come from the runtime SM count.
+    workspace_sms = SM89_WORKSPACE_SMS if sm89 else 48 if props.minor == 1 else 188
     output.mkdir(parents=True, exist_ok=True)
     manifest = dict(
         schema=1,

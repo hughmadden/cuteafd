@@ -1,14 +1,29 @@
 # Coordinator-only native K32 activation and block-FP8 projection artifacts.
 # SM120 uses block-scaled MMA; SM89 promotes each K32 E4M3 MMA and reads
-# plain scale layouts (no packed scales), with one card plan sized for the
-# export GPU (CUTEAFD_V41_FP8_PLAN_SMS) where SM120 has 170/188 plans.
-set(CUTEAFD_V41_FP8_PLAN_SMS "114" CACHE STRING "SMs of the SM89 export card (its q_a/kv decode plans)")
+# plain scale layouts (no packed scales).
 if(CUTEAFD_ENABLE_CUDA AND CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
   set(CUTEAFD_V41_FP8_SM89 ON)
 elseif(NOT CUTEAFD_ENABLE_CUDA OR NOT
    (CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120" OR CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120f"))
   message(FATAL_ERROR "V4.1 coordinator FP8 AOT requires a native SM120 or SM89 CUDA target")
 endif()
+# Card plans: these projection:rows shapes get one exact plan per supported
+# card (suffix _sm<SMs>); every other shape has one plan for every card of the
+# architecture. SM120 plans q_a/kv decode for the RTX 5090 and PRO 6000. SM89
+# plans the same shapes for the RTX 4090 D and 4090 (python/tools/lib/
+# sm89_cards.py), so another SM89 card fails closed, plus every shape whose
+# SM89 plan depends on the SM count. The exporter derives this list from the
+# plan rule and refuses a stale one.
+set(CUTEAFD_V41_FP8_CARD_SHAPES q_a:1 q_a:16 kv:1 kv:16)
+if(CUTEAFD_V41_FP8_SM89)
+  set(CUTEAFD_V41_FP8_CARD_PLANS 114 128)
+  list(APPEND CUTEAFD_V41_FP8_CARD_SHAPES engram:64 engram:80 engram:256 q_b:64 q_b:80 q_b:256
+    o_a:80 o_a:256 index_q:64 index_q:80 index_q:256 q_b_tp2:64 q_b_tp2:80 q_b_tp2:256)
+else()
+  set(CUTEAFD_V41_FP8_CARD_PLANS 170 188)
+endif()
+string(REPLACE ";" "," CUTEAFD_V41_FP8_CARD_PLANS_ENV "${CUTEAFD_V41_FP8_CARD_PLANS}")
+string(REPLACE ";" "," CUTEAFD_V41_FP8_CARD_SHAPES_ENV "${CUTEAFD_V41_FP8_CARD_SHAPES}")
 set(CUTEAFD_V41_FP8_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_fp8")
 set(CUTEAFD_V41_FP8_OBJECTS)
 set(CUTEAFD_V41_FP8_HEADERS)
@@ -19,12 +34,8 @@ foreach(rows IN LISTS CUTEAFD_V41_PROJECTION_ROWS)
     list(APPEND kinds quant_rope)
   endif()
   set(plans "common")
-  if((projection STREQUAL "q_a" OR projection STREQUAL "kv") AND (rows EQUAL 1 OR rows EQUAL 16))
-    if(CUTEAFD_V41_FP8_SM89)
-      set(plans ${CUTEAFD_V41_FP8_PLAN_SMS})
-    else()
-      set(plans 170 188)
-    endif()
+  if("${projection}:${rows}" IN_LIST CUTEAFD_V41_FP8_CARD_SHAPES)
+    set(plans ${CUTEAFD_V41_FP8_CARD_PLANS})
   endif()
   foreach(plan IN LISTS plans)
     set(card_suffix "")
@@ -56,7 +67,8 @@ add_custom_command(
     ${CUTEAFD_V41_FP8_OBJECTS} ${CUTEAFD_V41_FP8_HEADERS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV} ${CUTEAFD_HC_LAGGED_ENV} ${CUTEAFD_NARROW_ENV}
-    "CUTEAFD_V41_FP8_PLAN_SMS=$<IF:$<BOOL:${CUTEAFD_V41_FP8_SM89}>,${CUTEAFD_V41_FP8_PLAN_SMS},>"
+    "CUTEAFD_V41_FP8_CARD_PLANS=${CUTEAFD_V41_FP8_CARD_PLANS_ENV}"
+    "CUTEAFD_V41_FP8_CARD_SHAPES=${CUTEAFD_V41_FP8_CARD_SHAPES_ENV}"
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
     --output-dir "${CUTEAFD_V41_FP8_DIR}"

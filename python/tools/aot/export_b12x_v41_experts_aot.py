@@ -12,6 +12,7 @@ import hashlib
 from pathlib import Path
 
 import _pinned_sparkinfer
+from sm89_cards import WORKSPACE_SMS as SM89_WORKSPACE_SMS
 from v41_capacities import TARGET_CAPACITIES, DRAFT_CAPACITIES
 
 
@@ -26,8 +27,9 @@ def export_input_quantizer(output_dir: Path, manifest: dict) -> None:
     )
     compiled.export_to_c(str(output_dir), label, "cuteafd_" + label)
     abi = validate_abi(output_dir / (label + ".h"), label, "quant")
-    # SM120/SM121 keep their reference-card grids; SM89 sizes them for the export card.
-    sms = (manifest['physical_sms'] if manifest['capability'] == [8, 9]
+    # Grids for each architecture's largest card; launches cap them at four
+    # CTAs per runtime SM, which is this table's own per-SM bound.
+    sms = (SM89_WORKSPACE_SMS if manifest['capability'] == [8, 9]
            else 48 if manifest['capability'][1] == 1 else 188)
     grids = [mxfp8_rows_quant_aot_grid(size_k=5120, rows=m, expected_m=80, sm_count=sms)
              for m in range(1, 4097)]
