@@ -880,8 +880,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // This point is reached only after both complete stacks have drained and
         // committed. No cache owner is migrated or retired inside a layer stack.
         stall::mark(stall::Phase::Retire, active.iter().flatten().count());
-        // Drained: the routing census reads its device counts here when a dump is due.
-        if let Some(census) = census { census.tick(); }
+        // Drained: the routing census reads its device counts here when a dump
+        // or a trace window is due; a window notes the requests in serving.
+        if let Some(census) = census {
+            census.tick(active.iter().flatten().map(|r| (r.id(), round_failure::RoundMember::is_done(r))));
+        }
         {
             let mut releaser = round_failure::RetireAdapter { requests: &mut *requests,
                 prefixes: &mut prefixes, draft: draft.as_deref_mut() };

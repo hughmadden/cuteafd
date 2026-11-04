@@ -19,6 +19,7 @@ use thiserror::Error;
 
 pub mod draft;
 pub mod expert_tier;
+pub mod route_trace;
 pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
@@ -38,6 +39,7 @@ pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 pub use expert_tier::{ExpertActivation, ExpertRouteCensus, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest,
     ExpertTierSetting, ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
+pub use route_trace::{RouteTrace, RouteTraceLine, RouteTraceSession, RouteWindow};
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.

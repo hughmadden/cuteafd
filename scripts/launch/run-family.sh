@@ -763,7 +763,10 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     (CUTEAFD_V41_ROUTE_CENSUS_STEPS in the launching environment sets
 #                     another interval) and at shutdown to
 #                     PROFILE_DIR/route-census-HOST.json, the file
-#                     `cuteafd plan --gpu-expert-tier-profile` reads.
+#                     `cuteafd plan --gpu-expert-tier-profile` reads. Beside it,
+#                     route-census-HOST.windows.jsonl gets the routes of every
+#                     window of 64 decode steps (CUTEAFD_V41_ROUTE_CENSUS_WINDOW,
+#                     0 = none) and of each request's end, with the requests seen.
 #   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
 #   nsys              the coordinator runs under `nsys profile` (cuda, nvtx, osrt, CUDA
 #                     graph nodes; no CPU sampling), collection paused until
