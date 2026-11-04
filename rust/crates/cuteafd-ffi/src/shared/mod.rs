@@ -24,6 +24,7 @@ pub(crate) mod v41_exl3_wire;
 pub(crate) mod v41_experts;
 pub(crate) mod rtx_combine;
 pub(crate) mod route_census;
+pub(crate) mod tier_slots;
 pub(crate) mod v41_router;
 pub(crate) mod token_io;
 pub mod vision;
