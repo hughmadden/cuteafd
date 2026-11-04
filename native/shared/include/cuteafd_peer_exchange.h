@@ -173,6 +173,13 @@ typedef struct cuteafd_pull_frames {
 // frame past its plane or misaligned copies nothing.
 int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* replies, void* const* planes,
     const uint64_t* capacity, uint32_t count, void* stream);
+// *capturing = 1 while `stream` captures a graph (active or invalidated),
+// else 0: copies of one moment's addresses must not enter a captured graph.
+int32_t cuteafd_cuda_stream_capturing(void* stream, int32_t* capturing);
+// As cuteafd_pull_frames with `blocks` (1..1024) blocks of 256 threads; 0
+// sizes the grid by the planes' capacity, as cuteafd_pull_frames does.
+int32_t cuteafd_pull_frames_blocks(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, uint32_t blocks, void* stream);
 
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time

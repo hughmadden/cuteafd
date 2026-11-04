@@ -37,11 +37,15 @@
 //!   of waves between post and consumed, so a receive ring at least that deep
 //!   never runs dry ([`Waves::start`] checks it).
 //!
-//! Every copy the engine queues around these waits (the staging copies in
-//! [`Waves::send`], the pinned ranks' pulls in [`Waves::land`]) is an SM
-//! copy through mapped host memory, never `cudaMemcpyAsync`. CUDA documents that ordering through stream memory
+//! Every copy the engine queues behind a wait that may still be pending (the
+//! staging copies in [`Waves::send`], the pinned ranks' pulls in
+//! [`Waves::land`]) is an SM copy through mapped host memory, never
+//! `cudaMemcpyAsync`. CUDA documents that ordering through stream memory
 //! operations is invisible to its scheduler, and a small H2D may read its
-//! host source when queued; a kernel reads and writes when it runs. A lazily
+//! host source when queued; a kernel reads and writes when it runs. The
+//! copy engine stages or lands a wave only behind waits the host already
+//! saw met ([`StagingRoute`], [`LandingRoute`]), where the bytes are final
+//! when queued and no copy can park behind the wait. A lazily
 //! loaded kernel's first launch can wait for the device to idle, so a first
 //! launch behind a pending wait stalls the engine thread until that wait is
 //! released, and for good when the release depends on the stalled thread
@@ -930,6 +934,195 @@ fn probe_staging_route(library: &NativeLibrary, arena: &StagingArena, alias: usi
     Ok(route)
 }
 
+/// How a wave's pinned ranks reach their planes once the host has seen the
+/// wave land (a host-ordered collect, [`Waves::pull_arrived`]): the SM pull of
+/// the published frames ([`Waves::land`]'s device-ordered form), or
+/// copy-engine copies of the frames, whose addresses the host reads from the
+/// same descriptors. The pull's kernel reads every rank's descriptor over
+/// PCIe from each block before its payload, which bounds it at decode sizes:
+/// on an RTX 4090 behind a desktop root complex a 40 KiB wave of four ranks
+/// lands in 16.2 us by pull and 11.1 us by copy engine, 640 KiB in 60.8 and
+/// 42.6. The copy engine is not monotonic in the frame size there (frames of
+/// 16-21 KiB copy slower than 10 or 40 KiB ones), so the probe decides per
+/// frame size the link carries. Copies queue only behind waits the host
+/// already saw met, never inside a capture (they would replay one wave's
+/// frame addresses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LandingRoute {
+    Pull,
+    CopyEngine,
+    /// Per probed frame size (bytes per rank, ascending), whether the copy
+    /// engine won: a frame takes the decision of the smallest probed size at
+    /// least as large, a frame past the largest the largest's.
+    Probed(Vec<(usize, bool)>),
+}
+
+impl LandingRoute {
+    /// Whether frames of `frame_bytes` per rank land by copy engine.
+    pub(crate) fn copy_engine(&self, frame_bytes: usize) -> bool {
+        match self {
+            Self::Pull => false,
+            Self::CopyEngine => true,
+            Self::Probed(sizes) => sizes.iter().find(|(bytes, _)| *bytes >= frame_bytes)
+                .or(sizes.last()).is_some_and(|&(_, copy)| copy),
+        }
+    }
+}
+
+/// `CUTEAFD_SPARK_LANDING`: `auto` (default; probe the frame sizes the link
+/// carries), `sm` (pull only, no probe) or `copy-engine` (every landed wave).
+pub(crate) const LANDING_ENV: &str = "CUTEAFD_SPARK_LANDING";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LandingMode { Auto, Sm, CopyEngine }
+
+impl LandingMode {
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
+        Ok(match raw.map(str::trim) {
+            None | Some("") | Some("auto") => Self::Auto,
+            Some("sm") => Self::Sm,
+            Some("copy-engine") => Self::CopyEngine,
+            Some(other) => anyhow::bail!("{LANDING_ENV}={other}: expected auto, sm or copy-engine"),
+        })
+    }
+}
+
+/// One landing probe point: bytes per rank's frame and each route's median
+/// microseconds from the frames being in host memory to the planes holding them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LandingSample {
+    pub frame_bytes: usize,
+    pub pull_us: f64,
+    pub copy_engine_us: f64,
+}
+
+/// The route `mode` allows over `samples` (ascending frame sizes): per size,
+/// the copy engine where it was faster.
+pub(crate) fn landing_route(mode: LandingMode, samples: &[LandingSample]) -> LandingRoute {
+    match mode {
+        LandingMode::Sm => LandingRoute::Pull,
+        LandingMode::CopyEngine => LandingRoute::CopyEngine,
+        LandingMode::Auto if samples.is_empty() => LandingRoute::Pull,
+        LandingMode::Auto => LandingRoute::Probed(samples.iter()
+            .map(|sample| (sample.frame_bytes, sample.copy_engine_us < sample.pull_us)).collect()),
+    }
+}
+
+/// Rows per wave the landing probe times (up to the link's widest wave and
+/// [`LANDING_PROBE_MAX_FRAME`] per rank): every decode and verify width
+/// V4.1 runs to 6 rows, then sparser to wide waves.
+const LANDING_PROBE_ROWS: [usize; 13] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96];
+/// Largest probed frame per rank; wider waves take its decision.
+const LANDING_PROBE_MAX_FRAME: usize = 1 << 20;
+
+/// Frame sizes per rank the landing probe times for a link of `row_bytes`
+/// rows and waves of up to `max_rows` rows.
+pub(crate) fn landing_probe_frames(row_bytes: usize, max_rows: usize) -> Vec<usize> {
+    let mut frames: Vec<usize> = LANDING_PROBE_ROWS.iter().filter(|&&rows| rows <= max_rows.max(1))
+        .map(|&rows| rows * row_bytes).filter(|&bytes| bytes <= LANDING_PROBE_MAX_FRAME).collect();
+    if frames.is_empty() { frames.push(row_bytes.clamp(16, LANDING_PROBE_MAX_FRAME)); }
+    frames
+}
+
+/// Times both landing routes of `ranks` pinned frames per wave on the current
+/// device, one frame of each `frames` size per rank (`iterations` each,
+/// interleaved), from the host queuing the landing to the host seeing it
+/// complete, and checks both land the frames' bytes. Its own frames,
+/// descriptors, planes and stream.
+pub(crate) fn probe_landing(library: &NativeLibrary, ranks: usize, frames: &[usize], iterations: usize)
+    -> Result<Vec<LandingSample>> {
+    use crate::shared::memory::DeviceAllocation;
+    ensure!((1..=MAX_INTAKE_RANKS).contains(&ranks) && iterations > 0 && !frames.is_empty()
+        && frames.windows(2).all(|pair| pair[0] < pair[1]) && frames.iter().all(|&bytes| bytes > 0 && bytes % 4 == 0),
+        "invalid landing probe");
+    let largest = frames[frames.len() - 1];
+    let mut sources = (0..ranks).map(|_| HostAllocation::new(library, largest)).collect::<Result<Vec<_>>>()?;
+    for (rank, frame) in sources.iter_mut().enumerate() {
+        for (index, byte) in frame.bytes_mut().iter_mut().enumerate() { *byte = (index * 7 + rank * 13 + 1) as u8; }
+    }
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, largest)).collect::<Result<Vec<_>>>()?;
+    let mut block = HostAllocation::new(library, ranks * PULL_STRIDE)?;
+    ensure!(library.cuda_host_buffer_device_alias(block.buffer)?.ptr == block.buffer.ptr,
+        "mapped pinned memory is not device-visible at its host address (no unified addressing)");
+    let pulls = Pulls { base: block.buffer.ptr as usize };
+    let replies: Vec<*const PullFrames> = (0..ranks).map(|rank| pulls.at(0, rank).cast_const()).collect();
+    let stream = crate::shared::spark_intake::WarmStream::new(library)?;
+    let done = library.cuda_event_create()?;
+    let measured = (|| -> Result<Vec<LandingSample>> {
+        let mut samples = Vec::with_capacity(frames.len());
+        for &bytes in frames {
+            block.bytes_mut().fill(0);
+            for (rank, frame) in sources.iter().enumerate() {
+                pulls.write(0, rank, &[PullEntry { source: frame.buffer.ptr as u64, offset: 0, bytes: bytes as u64 }]);
+            }
+            let targets: Vec<(*mut c_void, u64)> = planes.iter().map(|plane| (plane.buffer.ptr, bytes as u64)).collect();
+            let regions: Vec<(*mut c_void, *const c_void, u64)> = planes.iter().zip(&sources)
+                .map(|(plane, frame)| (plane.buffer.ptr, frame.buffer.ptr.cast_const(), bytes as u64)).collect();
+            let mut times = [Vec::with_capacity(iterations), Vec::with_capacity(iterations)];
+            for iteration in 0..iterations + 4 {
+                for (route, samples) in times.iter_mut().enumerate() {
+                    let started = Instant::now();
+                    // SAFETY: frames, descriptors and planes are this probe's and
+                    // outlive the event's completion, which each step waits for.
+                    unsafe {
+                        match route {
+                            0 => library.pull_frames(&replies, &targets, stream.raw())?,
+                            _ => for chunk in regions.chunks(4) { library.copy_engine_regions(chunk, stream.raw())?; },
+                        }
+                        library.cuda_event_record(done, stream.raw())?;
+                        while !library.cuda_event_query(done)? { std::hint::spin_loop(); }
+                    }
+                    if iteration >= 4 { samples.push(started.elapsed().as_secs_f64() * 1e6); }
+                    if iteration == 0 {
+                        for (plane, frame) in planes.iter().zip(&sources) {
+                            let mut landed = vec![0u8; bytes];
+                            library.copy_d2h(&mut landed, CuteafdDeviceBuffer { bytes, ..plane.buffer })?;
+                            ensure!(landed == frame.bytes()[..bytes], "landing probe route {route} landed other bytes");
+                            library.cuda_zero_bytes(plane.buffer, bytes)?;
+                        }
+                    }
+                }
+            }
+            let [mut pull, mut copy] = times;
+            let median = |values: &mut Vec<f64>| { values.sort_by(f64::total_cmp); values[values.len() / 2] };
+            samples.push(LandingSample { frame_bytes: bytes, pull_us: median(&mut pull), copy_engine_us: median(&mut copy) });
+        }
+        Ok(samples)
+    })();
+    // SAFETY: idle (every record completed, or none queued after a failure,
+    // which the stream drain below also covers).
+    unsafe { let _ = library.cuda_event_destroy(done); }
+    stream.finish()?;
+    // The probe leaves no frame bytes behind in device memory it returns.
+    for plane in &planes { library.cuda_zero_bytes(plane.buffer, largest)?; }
+    measured
+}
+
+/// Picks the landing route of a link with `ranks` pinned ranks, `row_bytes`
+/// rows and waves of up to `max_rows` rows ([`LANDING_ENV`]); an `auto`
+/// probe that fails keeps the pull.
+fn probe_landing_route(library: &NativeLibrary, ranks: usize, row_bytes: usize, max_rows: usize)
+    -> Result<LandingRoute> {
+    let mode = LandingMode::parse(std::env::var(LANDING_ENV).ok().as_deref())?;
+    if mode != LandingMode::Auto {
+        let route = landing_route(mode, &[]);
+        tracing::info!(?route, "Spark landing route ({LANDING_ENV})");
+        return Ok(route);
+    }
+    let samples = match probe_landing(library, ranks, &landing_probe_frames(row_bytes, max_rows), 24) {
+        Ok(samples) => samples,
+        Err(error) => {
+            tracing::warn!("Spark landing: SM pulls, the landing probe failed: {error:#}");
+            return Ok(LandingRoute::Pull);
+        }
+    };
+    let table = samples.iter().map(|sample| format!("{}K {:.1}/{:.1}{}", sample.frame_bytes >> 10, sample.pull_us,
+        sample.copy_engine_us, if sample.copy_engine_us < sample.pull_us { " CE" } else { "" }))
+        .collect::<Vec<_>>().join(", ");
+    tracing::info!(ranks, "Spark landing route (per rank frame: us per landed wave, SM pull/copy engine: {table})");
+    Ok(landing_route(mode, &samples))
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
@@ -943,6 +1136,8 @@ pub(crate) struct Waves<'a> {
     /// Per slot: the request arena's device alias (mapped pinned memory).
     arena_alias: Vec<usize>,
     staging: StagingRoute,
+    /// How pinned ranks land once the host saw their wave in ([`LandingRoute`]).
+    landing: LandingRoute,
     /// Owns the pull descriptors of the ranks that arrive in host memory
     /// (mapped; written by the worker, read by pull kernels); freed only after
     /// the worker joined.
@@ -1014,6 +1209,10 @@ impl<'a> Waves<'a> {
             (Some(arena), Some(&alias)) => probe_staging_route(library, arena, alias)?,
             _ => StagingRoute::Sm,
         };
+        let landing = match pinned.count_ones() as usize {
+            0 => LandingRoute::Pull,
+            ranks => probe_landing_route(library, ranks, intake.row_bytes, intake.geometry.cut().rows)?,
+        };
         let timeout = transport.timeout();
         let mut native = Native { transport, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
@@ -1037,7 +1236,7 @@ impl<'a> Waves<'a> {
             let frames = native.frames();
             (Box::new((native.transport, frames)) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, staging,
+        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, staging, landing,
             _pull_block: pull_block, pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
@@ -1162,7 +1361,10 @@ impl<'a> Waves<'a> {
         let cut = self.geometry.cut();
         ensure!(ticket.rows <= cut.rows, "Spark wave of {} rows lands past its {}-row planes", ticket.rows, cut.rows);
         let rest = self.pinned & !pulled;
-        if rest != 0 && self.wide(ticket.payload_bytes, rest) {
+        // A wave the host already saw land (a host-ordered collect) may land
+        // by copy engine: its frames are final and every wait below is met.
+        let copied = rest != 0 && self.copies(ticket.payload_bytes, rest, stream)? && self.landed(&ticket);
+        if rest != 0 && !copied && self.wide(ticket.payload_bytes, rest) {
             for rank in (0..self.ranks).filter(|rank| rest & (1 << rank) != 0) {
                 // SAFETY: as `pull`'s contract; the wait precedes the pull.
                 unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, 1 << rank, true, stream)? };
@@ -1171,11 +1373,58 @@ impl<'a> Waves<'a> {
         self.outstanding.pop_front();
         // SAFETY: as `submit`'s waits.
         unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)? };
-        if rest != 0 && !self.wide(ticket.payload_bytes, rest) {
+        if copied {
+            // SAFETY: as `copy_frames`' contract: `landed` reached the wave.
+            unsafe { self.copy_frames(slot, ticket.payload_bytes, rest, stream)? };
+        } else if rest != 0 && !self.wide(ticket.payload_bytes, rest) {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
         self.unread[slot] = true;
+        Ok(())
+    }
+
+    /// Whether `ranks`' frames of a `payload_bytes`-per-rank wave land by copy
+    /// engine on `stream` once their arrival is met ([`LandingRoute`], by the
+    /// frame size): never while `stream` captures a graph.
+    fn copies(&self, payload_bytes: usize, ranks: u8, stream: *mut c_void) -> Result<bool> {
+        Ok(ranks != 0 && self.landing.copy_engine(payload_bytes) && !self.library.cuda_stream_capturing(stream)?)
+    }
+
+    /// Queues on `stream` copy-engine copies of `ranks`' published frames (in
+    /// `slot`, exactly `payload_bytes` per rank) into their planes, the
+    /// copy-engine form of [`Self::pull`].
+    ///
+    /// # Safety
+    /// Every rank's arrival is already published (the host saw it reached, so
+    /// its descriptor is final and the waits before these copies are met);
+    /// `stream` is ordered after the slot's previous reduce and not capturing.
+    unsafe fn copy_frames(&self, slot: usize, payload_bytes: usize, ranks: u8, stream: *mut c_void) -> Result<()> {
+        let pulls = self.pulls.context("no pinned ranks to copy")?;
+        let planes: Vec<CuteafdDeviceBuffer> = self.slot_planes(slot).collect();
+        let mut regions = Vec::with_capacity(PULL_MAX_FRAMES * self.ranks);
+        for rank in (0..self.ranks).filter(|rank| ranks & (1 << rank) != 0) {
+            validate_payload(payload_bytes, planes[rank].bytes)?;
+            // SAFETY: an aligned descriptor of the live block, final once the
+            // rank's arrival was published (the worker stores it after).
+            let reply = unsafe { std::ptr::read_volatile(pulls.at(slot, rank)) };
+            ensure!(reply.count as usize <= PULL_MAX_FRAMES, "rank {rank} publishes {} frames", reply.count);
+            let mut landed = 0u64;
+            for frame in &reply.frame[..reply.count as usize] {
+                ensure!(frame.source != 0 && frame.offset.checked_add(frame.bytes)
+                    .is_some_and(|end| end <= payload_bytes as u64), "rank {rank}'s frame runs past its plane");
+                regions.push(((planes[rank].ptr as usize + frame.offset as usize) as *mut c_void,
+                    frame.source as *const c_void, frame.bytes));
+                landed += frame.bytes;
+            }
+            ensure!(landed == payload_bytes as u64, "rank {rank} published {landed} of {payload_bytes} bytes");
+        }
+        for chunk in regions.chunks(4) {
+            // SAFETY: the frames stay in their receive slots until this slot's
+            // consumed (after the reduce that follows on `stream`); each range
+            // lies inside its rank's plane, unread before the reduce.
+            unsafe { self.library.copy_engine_regions(chunk, stream)? };
+        }
         Ok(())
     }
 
@@ -1200,10 +1449,25 @@ impl<'a> Waves<'a> {
         }
         if arrived == 0 { return Ok(()); }
         front.2 |= arrived;
+        if self.copies(ticket.payload_bytes, self.pinned, stream)? {
+            for rank in (0..self.ranks).filter(|rank| arrived & (1 << rank) != 0) {
+                // SAFETY: as `copy_frames`' contract; the rank's arrival is
+                // published, so the wait queued first is met.
+                unsafe {
+                    self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Arrived(rank)), ticket.sequence)?;
+                    self.copy_frames(ticket.slot, ticket.payload_bytes, 1 << rank, stream)?;
+                }
+            }
+            return Ok(());
+        }
         // SAFETY: as `pull`'s contract; every rank's arrival is already
         // published (the wait it queues is satisfied).
         unsafe { self.pull(ticket.sequence, ticket.slot, ticket.payload_bytes, arrived, true, stream) }
     }
+
+    /// Tests: lands by `route` from now on.
+    #[cfg(test)]
+    pub(crate) fn set_landing_route(&mut self, route: LandingRoute) { self.landing = route; }
 
     /// Queues on `stream` the pull of `ranks`' published frames of wave
     /// `sequence` (in `slot`, exactly `payload_bytes` per rank) into their planes, each behind its

@@ -651,6 +651,9 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
     let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
     let input = DeviceAllocation::new(&library, rows * row_bytes)?;
+    // The worker checks each request against the layer's (zero) input rows;
+    // a fresh allocation is not zeroed.
+    library.cuda_zero_bytes(input.buffer, rows * row_bytes)?;
     let mut tickets = Vec::new();
     for layer in 0..waves {
         let h = hidden;
@@ -1332,4 +1335,314 @@ fn copy_engine_staging_waits_until_every_earlier_wave_landed() {
     assert!(route.copy_engine_now(1 << 20, 0, 1));
     assert!(route.copy_engine_now(1 << 20, u32::MAX, 0));
     assert!(!route.copy_engine_now(1 << 20, u32::MAX - 1, 0));
+}
+
+/// Microseconds from the last reply frame in pinned host memory to the GPU
+/// holding the whole wave in its planes (the host sees the completion), per
+/// path, median of `iterations`: how a pinned reply wave of `ranks` frames
+/// of `plane_bytes` reaches the reduce on this host.
+#[derive(Debug, Clone)]
+struct ReplyPathTimes {
+    /// The exchange's host-ordered landing: the host queues the SM pull of
+    /// the frames in place once they are in.
+    pull_us: f64,
+    /// The exchange's device-ordered landing: the pull queued behind a
+    /// stream wait on a host word, which the host then stores.
+    wait_pull_us: f64,
+    /// A copy-engine upload straight from each frame, queued once it is in.
+    upload_us: f64,
+    /// `SparkIntake::receive`'s staged path: a CPU copy of the frames into
+    /// pinned staging, then one upload per rank.
+    staged_us: f64,
+    /// The host-ordered SM pull on a chosen grid: (blocks, us).
+    grids: Vec<(u32, f64)>,
+    /// An SM copy of the frames with their addresses as kernel arguments
+    /// (no device read of the descriptors), queued once they are in.
+    regions_us: f64,
+}
+
+/// Pull grids the reply bench tries beside the capacity-sized default.
+const PROBE_GRIDS: [u32; 6] = [4, 8, 16, 32, 64, 128];
+
+fn reply_path_times(library: &NativeLibrary, ranks: usize, plane_bytes: usize, iterations: usize) -> Result<ReplyPathTimes> {
+    use crate::shared::memory::DeviceAllocation;
+    use cuteafd_ffi::peer_exchange::{PullEntry, PullFrames};
+    ensure!((1..=MAX_INTAKE_RANKS).contains(&ranks) && plane_bytes % 16 == 0, "invalid reply probe shape");
+    let mut frames = (0..ranks).map(|_| HostAllocation::new(library, plane_bytes)).collect::<Result<Vec<_>>>()?;
+    for (rank, frame) in frames.iter_mut().enumerate() {
+        for (index, byte) in frame.bytes_mut().iter_mut().enumerate() { *byte = (index * 7 + rank * 13) as u8; }
+    }
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes)).collect::<Result<Vec<_>>>()?;
+    let mut staging = HostAllocation::new(library, ranks * plane_bytes)?;
+    let mut block = HostAllocation::new(library, ranks * std::mem::size_of::<PullFrames>() + LINE)?;
+    ensure!(library.cuda_host_buffer_device_alias(block.buffer)?.ptr == block.buffer.ptr,
+        "mapped pinned memory is not device-visible at its host address");
+    let word = block.buffer.ptr.cast::<u8>().wrapping_add(ranks * std::mem::size_of::<PullFrames>()).cast::<u32>();
+    let replies: Vec<*const PullFrames> = (0..ranks).map(|rank|
+        block.buffer.ptr.cast::<PullFrames>().wrapping_add(rank).cast_const()).collect();
+    {
+        let descriptors = block.bytes_mut();
+        for (rank, frame) in frames.iter().enumerate() {
+            let mut reply = PullFrames { count: 1, ..Default::default() };
+            reply.frame[0] = PullEntry { source: frame.buffer.ptr as u64, offset: 0, bytes: plane_bytes as u64 };
+            let at = rank * std::mem::size_of::<PullFrames>();
+            // SAFETY: inside the descriptor block; PullFrames is plain old data.
+            unsafe { std::ptr::write_unaligned(descriptors[at..].as_mut_ptr().cast::<PullFrames>(), reply) };
+        }
+    }
+    let targets: Vec<(*mut c_void, u64)> = planes.iter().map(|plane| (plane.buffer.ptr, plane_bytes as u64)).collect();
+    let stream = crate::shared::spark_intake::WarmStream::new(library)?;
+    let done = library.cuda_event_create()?;
+    let spin = || -> Result<()> {
+        // SAFETY: a live event recorded on the probe stream.
+        while !unsafe { library.cuda_event_query(done)? } { std::hint::spin_loop(); }
+        Ok(())
+    };
+    let check = |planes: &[DeviceAllocation<'_>]| -> Result<()> {
+        for (plane, frame) in planes.iter().zip(&frames) {
+            let mut landed = vec![0u8; plane_bytes];
+            library.copy_d2h(&mut landed, plane.buffer)?;
+            ensure!(landed == frame.bytes()[..plane_bytes], "a reply path landed other bytes");
+            library.cuda_zero_bytes(plane.buffer, plane_bytes)?;
+        }
+        Ok(())
+    };
+    let median = |samples: &mut Vec<f64>| { samples.sort_by(f64::total_cmp); samples[samples.len() / 2] };
+    let mut times: Vec<Vec<f64>> = (0..5 + PROBE_GRIDS.len()).map(|_| Vec::new()).collect();
+    let regions: Vec<(*mut c_void, *const c_void, u64)> = planes.iter().zip(&frames)
+        .map(|(plane, frame)| (plane.buffer.ptr, frame.buffer.ptr.cast_const(), plane_bytes as u64)).collect();
+    for iteration in 0..iterations + 20 {
+        for (path, samples) in times.iter_mut().enumerate() {
+            let sequence = (iteration * 4 + path + 1) as u32;
+            if path == 1 {
+                // SAFETY: the word and descriptors live in the mapped block, the
+                // planes on this device; the host stores the word below.
+                unsafe {
+                    library.cuda_stream_wait_value32(stream.raw(), word, sequence)?;
+                    library.pull_frames(&replies, &targets, stream.raw())?;
+                    library.cuda_event_record(done, stream.raw())?;
+                }
+            }
+            let started = std::time::Instant::now();
+            // SAFETY (every arm): frames, staging, descriptors and planes stay
+            // allocated until the event completes, which each arm waits for.
+            match path {
+                0 => unsafe { library.pull_frames(&replies, &targets, stream.raw())?; },
+                4 => unsafe { library.sm_copy_regions(&regions, stream.raw())?; },
+                5.. => unsafe { library.pull_frames_blocks(&replies, &targets, PROBE_GRIDS[path - 5], stream.raw())?; },
+                // SAFETY: an aligned word of the mapped block, read by the queued wait.
+                1 => unsafe { std::ptr::write_volatile(word, sequence) },
+                2 => for (plane, frame) in planes.iter().zip(&frames) {
+                    unsafe { library.copy_host_buffer_h2d_async(plane.buffer, frame.buffer, plane_bytes, stream.raw())?; }
+                },
+                3 => {
+                    let bytes = staging.bytes_mut();
+                    for (rank, frame) in frames.iter().enumerate() {
+                        crate::shared::spark_intake::copy_parallel(&mut bytes[rank * plane_bytes..][..plane_bytes],
+                            &frame.bytes()[..plane_bytes]);
+                    }
+                    for (rank, plane) in planes.iter().enumerate() {
+                        let source = cuteafd_ffi::CuteafdHostBuffer {
+                            ptr: staging.buffer.ptr.cast::<u8>().wrapping_add(rank * plane_bytes).cast(),
+                            bytes: plane_bytes, ..staging.buffer };
+                        unsafe { library.copy_host_buffer_h2d_async(plane.buffer, source, plane_bytes, stream.raw())?; }
+                    }
+                }
+            }
+            if path != 1 { unsafe { library.cuda_event_record(done, stream.raw())?; } }
+            spin()?;
+            let elapsed = started.elapsed().as_secs_f64() * 1e6;
+            if iteration >= 20 { samples.push(elapsed); }
+            if iteration == 0 { check(&planes)?; }
+        }
+    }
+    // SAFETY: the event is idle (every record above completed).
+    unsafe { library.cuda_event_destroy(done)?; }
+    stream.finish()?;
+    let grids = PROBE_GRIDS.iter().zip(&mut times[5..]).map(|(&blocks, samples)| (blocks, median(samples))).collect();
+    Ok(ReplyPathTimes { pull_us: median(&mut times[0]), wait_pull_us: median(&mut times[1]),
+        upload_us: median(&mut times[2]), staged_us: median(&mut times[3]), regions_us: median(&mut times[4]), grids })
+}
+
+/// How a V4.1 reply wave (four ranks, 10 KiB a row) reaches the reduce on
+/// this host at C1 (1 row), verify (6) and C16 (16) widths: the exchange's
+/// SM pull of the frames in place (host- or device-ordered) against a
+/// copy-engine upload from the frames and the CPU staging copy
+/// (`SparkIntake::receive`, which no Spark family calls since the exchange).
+#[test]
+#[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY); measures this host's reply paths"]
+fn reply_wave_paths_on_this_host() -> Result<()> {
+    let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
+    // SAFETY: the opt-in path names the built native library for this GPU.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    library.peer_exchange_initialize()?;
+    eprintln!("| Wave (4 ranks) | SM pull, host-ordered | SM pull behind a stream wait | Copy-engine upload | \
+        CPU staging + upload | SM copy, frames by value |");
+    eprintln!("|---|---:|---:|---:|---:|---:|");
+    let mut grids = Vec::new();
+    for rows in [1usize, 6, 16, 64] {
+        let times = reply_path_times(&library, 4, rows * 10240, 400)?;
+        eprintln!("| {} KiB ({rows} rows) | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |", rows * 40, times.pull_us,
+            times.wait_pull_us, times.upload_us, times.staged_us, times.regions_us);
+        grids.push((rows, times.grids));
+    }
+    eprintln!("\nHost-ordered SM pull by grid (us):\n| Wave | {} |", PROBE_GRIDS.map(|b| format!("{b} blocks")).join(" | "));
+    eprintln!("|---|{}", "---:|".repeat(PROBE_GRIDS.len()));
+    for (rows, times) in grids {
+        eprintln!("| {} KiB | {} |", rows * 40, times.iter().map(|(_, us)| format!("{us:.1}")).collect::<Vec<_>>().join(" | "));
+    }
+    Ok(())
+}
+
+#[test]
+fn landing_route_decides_per_probed_frame_size() {
+    let sample = |kib: usize, pull_us: f64, copy_engine_us: f64| LandingSample { frame_bytes: kib << 10, pull_us,
+        copy_engine_us };
+    // The copy engine's dip at 20 KiB frames keeps the pull there only.
+    let probed = [sample(10, 16.2, 11.1), sample(20, 19.4, 27.0), sample(40, 23.8, 14.7), sample(160, 60.8, 42.6)];
+    let route = landing_route(LandingMode::Auto, &probed);
+    assert_eq!(route, LandingRoute::Probed(vec![(10 << 10, true), (20 << 10, false), (40 << 10, true), (160 << 10, true)]));
+    for (frame, copy) in [(1, true), (10 << 10, true), ((10 << 10) + 4, false), (20 << 10, false), (30 << 10, true),
+        (160 << 10, true), (40 << 20, true)] {
+        assert_eq!(route.copy_engine(frame), copy, "frame of {frame} bytes");
+    }
+    // A frame past the largest probe takes the largest's decision.
+    let slow = landing_route(LandingMode::Auto, &[sample(10, 9.0, 7.0), sample(80, 50.0, 60.0)]);
+    assert!(slow.copy_engine(10 << 10) && !slow.copy_engine(1 << 30));
+    assert_eq!(landing_route(LandingMode::Auto, &[]), LandingRoute::Pull);
+    assert_eq!(landing_route(LandingMode::Sm, &probed), LandingRoute::Pull);
+    assert!(!LandingRoute::Pull.copy_engine(1) && LandingRoute::CopyEngine.copy_engine(1 << 30));
+    assert_eq!(landing_route(LandingMode::CopyEngine, &[]), LandingRoute::CopyEngine);
+    for (raw, mode) in [(None, LandingMode::Auto), (Some(""), LandingMode::Auto), (Some("auto"), LandingMode::Auto),
+        (Some(" sm "), LandingMode::Sm), (Some("copy-engine"), LandingMode::CopyEngine)] {
+        assert_eq!(LandingMode::parse(raw).unwrap(), mode);
+    }
+    assert!(LandingMode::parse(Some("pinned")).is_err());
+    // The probed frames follow the link's rows: every width to six rows,
+    // capped at the widest wave and at 1 MiB per rank.
+    assert_eq!(landing_probe_frames(10240, 6), [1, 2, 3, 4, 6].map(|rows| rows * 10240));
+    assert_eq!(landing_probe_frames(10240, 4096).last(), Some(&(96 * 10240)));
+    assert_eq!(landing_probe_frames(1 << 21, 4), [1 << 20]);
+}
+
+/// The landing probe on this host: both routes' times at every probed size
+/// and the route it picks (`CUTEAFD_SPARK_LANDING=auto`), for four and six
+/// pinned ranks.
+#[test]
+#[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY); measures this host's landing routes"]
+fn landing_probe_on_this_host() -> Result<()> {
+    let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
+    // SAFETY: the opt-in path names the built native library for this GPU.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    library.peer_exchange_initialize()?;
+    for ranks in [4usize, 6] {
+        let samples = probe_landing(&library, ranks, &landing_probe_frames(10240, 4096), 24)?;
+        eprintln!("\n{ranks} pinned ranks of V4.1 rows (10 KiB):");
+        eprintln!("| Rows | Wave | SM pull us | Copy engine us | Route |\n|---|---|---:|---:|---|");
+        for sample in &samples {
+            eprintln!("| {} | {} KiB | {:.1} | {:.1} | {} |", sample.frame_bytes / 10240, sample.frame_bytes * ranks >> 10,
+                sample.pull_us, sample.copy_engine_us,
+                if sample.copy_engine_us < sample.pull_us { "copy engine" } else { "SM pull" });
+        }
+    }
+    Ok(())
+}
+
+/// Host-ordered collects through the real exchange (as `finish_values` runs
+/// them): the host waits for each wave, queuing arrived ranks of wide waves
+/// meanwhile (`pull_arrived`), then lands, reduces and consumes. Landed by
+/// copy engine and by SM pull alike, every layer's reduce equals the host
+/// reference byte for byte, at decode, verify and rank-by-rank widths, with
+/// GPU-landing ranks mixed in.
+#[test]
+#[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY)"]
+fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
+    use crate::shared::memory::DeviceAllocation;
+    let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
+    // SAFETY: the opt-in path names the built native library for this GPU.
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
+    let (hidden, topk) = (5120usize, 6usize);
+    let row_bytes = hidden * 2;
+    // (ranks, landing ranks, slots, rows per wave, layers, per-rank stagger us).
+    for route in [LandingRoute::CopyEngine, LandingRoute::Pull] {
+        for (ranks, landing, slots, rows, layers, stagger_us) in [(4usize, 0u8, 1usize, 1usize, 24u32, 0u64),
+            (4, 0, 2, 6, 24, 0), (4, 0, 1, 16, 24, 50), (4, 0, 2, 128, 12, 200), (6, 0b100001, 1, 6, 24, 0)] {
+            let reserve = slots * rows;
+            let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes))
+                .collect::<Result<Vec<_>>>()?;
+            let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
+            let layout = RouteStaging::new(rows, topk, row_bytes)?;
+            let arenas = (0..slots).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
+            let words = Arc::new(std::sync::OnceLock::new());
+            let total = layers as usize;
+            let hosts: Vec<Vec<u8>> = (0..total).map(|layer| (0..rows * hidden).flat_map(|i| {
+                // Multiples of 0.5 in [-2, 2]: the rank sums are exact in BF16.
+                let value = ((i * 7 + layer * 13) % 9) as f32 / 2.0 - 2.0;
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect()).collect();
+            let echo = EchoWorld::new(library.clone(), ranks, row_bytes, landing,
+                ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(),
+                Duration::ZERO, Duration::from_micros(stagger_us), slots, rows.div_ceil(2) * row_bytes)?;
+            let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, rows)?;
+            let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
+            let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
+            let _ = words.set(exchange.words());
+            exchange.set_landing_route(route.clone());
+            let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
+            assert_eq!(exchange.copies(rows * row_bytes, 1, stream.raw())?, route != LandingRoute::Pull);
+            let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
+            let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
+            let inputs = (0..total).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+            let outputs = (0..total).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+            let reducer = library.v41_compact_reducer()?;
+            for (layer, input) in inputs.iter().enumerate() {
+                library.copy_h2d(input.buffer, &hosts[layer])?;
+                let (h, l) = (hidden, layer);
+                // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
+                let ticket = unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, input.buffer],
+                    stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(l as u64 + 1, 1, l as u32,
+                        h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
+                            cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
+                            source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
+                            token_position: row.into(), route_offset: row * topk as u32, route_count: topk as u32 })
+                            .collect(), routes, wire)))? };
+                // The host-ordered collect: wait for the wave, queuing arrived ranks.
+                let started = Instant::now();
+                while !exchange.landed(&ticket) {
+                    healthy()?;
+                    exchange.pull_arrived(&ticket, stream.raw())?;
+                    ensure!(started.elapsed() < Duration::from_secs(20), "wave {layer} never landed");
+                    std::hint::spin_loop();
+                }
+                let slot = ticket.slot();
+                exchange.land(ticket, stream.raw())?;
+                // SAFETY: planes and output are live; no shared plane.
+                unsafe { reducer.reduce_planes(exchange.planes(slot), ranks as u32, std::ptr::null(),
+                    outputs[layer].buffer.ptr.cast(), rows as u32, stream.raw())?; }
+                exchange.consumed(slot, stream.raw())?;
+            }
+            stream.finish()?;
+            healthy()?;
+            for (layer, output) in outputs.iter().enumerate() {
+                let expected: Vec<u8> = (0..rows * hidden).flat_map(|i| {
+                    let total: f32 = (0..ranks).map(|rank| {
+                        let word = rank_rows(&hosts[layer][2 * i..2 * i + 2], rank);
+                        f32::from_bits(u32::from(u16::from_le_bytes([word[0], word[1]])) << 16)
+                    }).sum();
+                    ((total.to_bits() >> 16) as u16).to_le_bytes()
+                }).collect();
+                let mut actual = vec![0u8; rows * row_bytes];
+                library.copy_d2h(&mut actual, output.buffer)?;
+                ensure!(actual == expected, "{route:?} ranks={ranks} landing={landing:#b} rows={rows} layer {layer} differs");
+            }
+            let (_, frames, _) = exchange.stop::<EchoWorld>()?;
+            ensure!(frames.is_empty(), "a stopped exchange whose waves were all consumed holds no frames");
+            eprintln!("host-ordered {route:?}: ranks={ranks} landing={landing:#b} slots={slots} rows={rows}: \
+                {total} layers byte-exact");
+        }
+    }
+    Ok(())
 }
