@@ -267,7 +267,7 @@ impl<'a> V41Link<'a> {
         let topology = transport.ownership_topology();
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         Self::new(crate::shared::spark_intake::SparkLink::from_transport_waves(library, transport,
-            V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, slots, unit_rows,
+            V41_PARTIAL_ROW_BYTES as usize, slots, unit_rows,
             timing)?, topology)
     }
     /// Device bytes of the prefill link's intake: every rank's partial-sum
@@ -509,7 +509,7 @@ impl<'a> NativeTp4Wave<'a> {
         let topology = transport.ownership_topology();
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let link = V41Link::new(crate::shared::spark_intake::SparkLink::from_transport(library, transport,
-            V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, timing)?, topology)?;
+            V41_PARTIAL_ROW_BYTES as usize, timing)?, topology)?;
         let mut wave = Self::unlinked(library, capacity)?;
         wave.link = Some(link);
         Ok(wave)

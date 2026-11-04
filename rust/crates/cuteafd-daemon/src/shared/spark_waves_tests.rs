@@ -536,7 +536,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(), delay, stagger,
             slots, max_rows.div_ceil(2) * row_bytes)?;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows)?;
-        let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
+        let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -606,8 +606,11 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                     {bad} of {rows} rows");
             }
         }
-        let (echo, frames, _) = exchange.stop::<EchoWorld>()?;
-        assert!(frames.is_empty(), "a stopped exchange whose waves were all consumed holds no frames");
+        ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+            "the exchange closes at rest: every wave landed and was consumed");
+        let (echo, frames, result) = exchange.close::<EchoWorld>()?;
+        result?;
+        assert!(frames.is_empty(), "a closed exchange whose waves were all consumed holds no frames");
         if landing != (1 << ranks) - 1 {
             assert_eq!(echo.buffers.released.load(Ordering::SeqCst), 2 * total * (ranks - landing.count_ones() as usize),
                 "every pinned frame went back to its ring");
@@ -644,7 +647,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 0, ranges.iter().map(|range| range.ptr as usize).collect(),
         hosts, words.clone(), Duration::from_secs(1), Duration::ZERO, waves, rows * row_bytes)?;
     let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows)?;
-    let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
+    let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true };
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -1059,7 +1062,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         let buffers = echo.buffers.clone();
         echo.stagger = Duration::ZERO;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows)?;
-        let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
+        let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true };
         let stagger = Arc::new(AtomicUsize::new(0));
         let mut exchange = Waves::start(&library, intake, StaggerSwitch { echo, stagger: stagger.clone() }, Vec::new(),
             arenas, false)?;
@@ -1127,7 +1130,10 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         } else {
             ensure!(actual == expected, "the ordered pull's reduce differs from the reference");
         }
-        let (_, frames, _) = exchange.stop::<StaggerSwitch>()?;
+        ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+            "the exchange closes at rest: every wave landed and was consumed");
+        let (_, frames, result) = exchange.close::<StaggerSwitch>()?;
+        result?;
         drop(frames);
         stream.finish()?;
         // SAFETY: the event is idle (the stream drained).
@@ -1587,7 +1593,7 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
                 ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(),
                 Duration::ZERO, Duration::from_micros(stagger_us), slots, rows.div_ceil(2) * row_bytes)?;
             let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, rows)?;
-            let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
+            let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true };
             let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
             let _ = words.set(exchange.words());
             exchange.set_landing_route(route.clone());
@@ -1638,8 +1644,11 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
                 library.copy_d2h(&mut actual, output.buffer)?;
                 ensure!(actual == expected, "{route:?} ranks={ranks} landing={landing:#b} rows={rows} layer {layer} differs");
             }
-            let (_, frames, _) = exchange.stop::<EchoWorld>()?;
-            ensure!(frames.is_empty(), "a stopped exchange whose waves were all consumed holds no frames");
+            ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+                "the exchange closes at rest: every wave landed and was consumed");
+            let (_, frames, result) = exchange.close::<EchoWorld>()?;
+            result?;
+            ensure!(frames.is_empty(), "a closed exchange whose waves were all consumed holds no frames");
             eprintln!("host-ordered {route:?}: ranks={ranks} landing={landing:#b} slots={slots} rows={rows}: \
                 {total} layers byte-exact");
         }
