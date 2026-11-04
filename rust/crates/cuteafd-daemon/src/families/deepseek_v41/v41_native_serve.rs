@@ -616,7 +616,15 @@ fn worker(
     }
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
+    // The plan's coordinator weight cap, over the loaded backbone and the
+    // drafter as the plan counts them.
+    let draft_inventory = if args.dspark {
+        Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(&lib, &catalog,
+            capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 })?)
+    } else { None };
+    let cap = admission::WeightCap::loaded(&args, &catalog, 1, memory[0].1, draft_inventory.as_ref())?;
+    let pool = admission::resolve_tiered(&args, &memory, experts, local_workspace, &[0], 0, &[], &[], None, None,
+        Some(&cap))?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
     for (slot, _) in &mut prefill_slots.slots { slot.bind_execution_plan(&pool.placement)?; }

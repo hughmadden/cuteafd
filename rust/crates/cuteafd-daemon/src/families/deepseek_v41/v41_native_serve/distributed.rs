@@ -404,8 +404,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
+    // The plan's coordinator weight cap, over the loaded backbone and the
+    // drafter as the plan counts them.
+    let cap = admission::WeightCap::loaded(&args, &catalog, 2, memory[0].1, dspark_inventory.as_ref())?;
     let pool=admission::resolve_tiered(&args,&memory,expert_demands,expert_workspace,&[0; 2],
-        minimum_expert_layers,&deferred,&draft_load,dspark_inventory.as_ref(),tier_ask.as_ref())?;
+        minimum_expert_layers,&deferred,&draft_load,dspark_inventory.as_ref(),tier_ask.as_ref(),Some(&cap))?;
     // The loaders re-check the admitted load phase (their own conservative
     // peak is part of it); retained owners are the Movable's exact bytes.
     let draft_budgets = |gpu: usize| -> usize { draft_load.iter().filter(|d| usize::from(d.gpu) == gpu)

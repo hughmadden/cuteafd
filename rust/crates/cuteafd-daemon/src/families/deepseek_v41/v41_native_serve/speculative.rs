@@ -420,6 +420,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         self.commit_batch(pass, requests, batch, &[accepted])
     }
+    /// The queued commit on main context 0, waited for in place: its copies and
+    /// launches go out without a host round trip, and the host waits once. A
+    /// failure drains and revokes it, as a lane commit does.
     pub fn commit_batch(
         &mut self,
         pass: &mut TargetPass<'_, 'a>,
@@ -428,29 +431,20 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         accepted: &[u32],
     ) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        let ids = batch.cache()?.request_ids();
-        ensure!(ids.len() == accepted.len(), "draft acceptance count differs");
-        let leases = ids.iter().map(|id| self.requests.get(id)
-            .map(|request| request.leases).context("draft request not admitted"))
-            .collect::<Result<Vec<_>>>()?;
-        let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
-            leases.iter().map(|request| request[stage]).collect());
-        let taps = pass.taps(batch)?;
-        let mut proposal = unsafe {
-            self.mains[0]
-                .execute_rows(taps.values(), taps.batch_identity(), taps.rows())?
-        };
-        let [a, b, c] = &mut self.windows;
-        unsafe {
-            pass.commit_with_dspark(
-                requests,
-                batch,
-                &mut proposal,
-                &mut [a, b, c],
-                [&stage_leases[0], &stage_leases[1], &stage_leases[2]],
-                accepted,
-            )
+        // The abort below must only ever drain a commit this call began.
+        ensure!(self.pending_commit_ids[0].is_empty(), "draft commit lane 0 is busy");
+        let result = (|| -> Result<()> {
+            self.begin_queued_commit(0, pass, requests, batch, accepted)?;
+            self.mains[0].wait_commit()?;
+            self.finish_queued_commit(0, pass, requests, batch, accepted)
+        })();
+        if let Err(error) = result {
+            if let Err(cleanup) = self.abort_queued_commit(0, requests, batch) {
+                tracing::error!(%cleanup, "draining a failed draft commit");
+            }
+            return Err(error);
         }
+        Ok(())
     }
     /// Begin a completed decode batch's accepted-cache transaction on its own lane.
     pub fn begin_queued_commit(&mut self, lane: usize, pass: &impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
@@ -610,7 +604,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 impl<'w, 'a> DraftRuntime<'w, 'a> {
     /// Inputs are (request identity, anchor, committed end, remaining output budget).
     /// Returned rows retain input order; short histories/budgets use the anchor only.
-    pub fn propose(&mut self, lib: &'a NativeLibrary, lane: usize,
+    /// Chain 0's queued draft, waited for in place: the uploads, replay and
+    /// downloads go out without a host round trip, and the host waits once.
+    pub fn propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Vec<Vec<u32>>> {
         ensure!(lane < self.lanes.len(), "invalid draft lane");
@@ -636,32 +632,20 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
         let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
             .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        self.chains[0].set_tokens(&tokens)?;
+        self.chains[0].stage_tokens(&tokens)?;
         let mut rngs: Vec<_> = self.requests.iter_mut().filter_map(|(id, request)|
             active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
                 .map(|index| (index, &mut request.rng))).collect();
         rngs.sort_by_key(|(index, _)| *index);
-        self.chains[0].prepare_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
+        self.chains[0].stage_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
             &vec![0.0; count])?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        if !self.chains[0].has_graph(count) {
-            unsafe { self.chains[0].capture(windows, bindings)?; }
-        }
-        unsafe { self.chains[0].replay(windows, bindings)?; }
-        let buffer = self.chains[0].draft_output()?[0];
-        let mut bytes = vec![0; buffer.bytes];
-        lib.copy_d2h(&mut bytes, buffer)?;
-        ensure!(bytes.len() == (width + 1) * count * 4, "draft token extent differs");
-        let packed: Vec<_> = bytes.chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap())).collect();
+        unsafe { self.chains[0].begin_replay(windows, bindings)?; }
+        let (packed, values) = self.chains[0].wait_replay()?;
+        ensure!(packed.len() == (width + 1) * count && values.len() == width * count,
+            "draft output extent differs");
         if self.wants_confidence() {
-            let confidence = self.chains[0].draft_output()?[2];
-            ensure!(confidence.bytes == width * count * 4, "draft confidence extent differs");
-            let mut bytes = vec![0; confidence.bytes];
-            lib.copy_d2h(&mut bytes, confidence)?;
-            let values: Vec<_> = bytes.chunks_exact(4)
-                .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
             for (row, &(_, &(id, _, _, _))) in active.iter().enumerate() {
                 self.confidence_trace.insert(id,
                     (0..width).map(|step| values[step * count + row]).collect());

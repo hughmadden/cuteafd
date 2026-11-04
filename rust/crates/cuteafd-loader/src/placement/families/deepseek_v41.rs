@@ -618,7 +618,100 @@ pub fn tier_lane_bytes(layers: u64, experts: u64, rows: u64) -> u64 {
     layers * experts * 4 + rows * 6 * 4
 }
 
-/// What the V4.1 dSpark drafter retains, measured from its own plan before
+/// Each GPU's weights outside the routed experts, as `--coordinator-weight-
+/// budget-gib` counts them: the weight, embedding and table owners in
+/// `fixed` (and an external drafter's weights), plus the dSpark drafter's
+/// resident bytes beside the head on the last GPU and, with its TP2 experts,
+/// the other half on GPU0.
+pub fn fixed_weight_bytes(fixed: &[Demand], draft: Option<&DraftInventory>, gpus: usize) -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    (0..gpus).map(|gpu| {
+        let mut bytes = fixed.iter().filter(|d| usize::from(d.gpu) == gpu
+            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
+                || d.group == "external drafter weights"))
+            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
+        if gpu == gpus - 1 {
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
+        }
+        if gpu == 0 && gpus == 2 {
+            // --tp2-dspark-experts: GPU0 holds the other half of dSpark's experts.
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.peer_half)).context("V4.1 draft weight budget overflow")?;
+        }
+        Ok(bytes)
+    }).collect()
+}
+
+/// Each GPU's retained weights in `placed`: its `fixed` weights
+/// ([`fixed_weight_bytes`]) plus the GPU expert tier's and the onboarded
+/// routed layers' resident experts.
+pub fn retained_weight_bytes(request: &PlacementRequest, placed: &Placement, fixed: &[u64])
+    -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    fixed.iter().enumerate().map(|(gpu, &fixed)| {
+        let mut bytes = fixed;
+        if let Some(tier) = &placed.expert_tier {
+            bytes = bytes.checked_add(tier.resident_bytes.get(gpu).copied().unwrap_or(0))
+                .context("V4.1 GPU expert tier weight budget overflow")?;
+        }
+        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
+            if let Some(cost) = layer.experts {
+                let resident = match assigned.experts {
+                    ExpertHome::RtxTp2 => cost.half[gpu].resident,
+                    ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
+                    _ => 0,
+                };
+                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
+            }
+        }
+        Ok(bytes)
+    }).collect()
+}
+
+/// Solves `request` within `limit` retained weight bytes per GPU
+/// (`--coordinator-weight-budget-gib`), as `cuteafd plan` and serving both
+/// admit: an over-budget solution sheds GPU expert tier experts (whole
+/// experts, by the excess), else optional whole layers, and solves again
+/// (an automatic pool kept as first admitted). `fixed` is each GPU's weights
+/// outside the routed experts ([`fixed_weight_bytes`]).
+pub fn solve_with_weight_limit(request: &PlacementRequest, fixed: &[u64], limit: u64) -> anyhow::Result<Placement> {
+    use anyhow::{ensure, Context};
+    let mut placement = solve(request)?;
+    loop {
+        let retained = retained_weight_bytes(request, &placement, fixed)?;
+        if retained.iter().all(|&bytes| bytes <= limit) { return Ok(placement); }
+        if let Some(tier) = placement.expert_tier.as_ref().filter(|tier| tier.experts > 0) {
+            // Shrink the tier by the excess, in whole experts (the largest
+            // per-expert part bounds how many must go).
+            let excess = retained.iter().map(|&bytes| bytes.saturating_sub(limit)).max().unwrap_or(0);
+            let largest = request.layers.iter().filter_map(|layer| layer.experts)
+                .flat_map(|cost| [cost.half[0].resident, cost.half[1].resident, cost.whole.resident])
+                .max().unwrap_or(0) / request.expert_tier.as_ref().map_or(1, |t| t.experts_per_layer.max(1)) as u64;
+            let drop = usize::try_from(excess.div_ceil(largest.max(1)))?.max(1);
+            let mut trial = request.clone();
+            let mut shrunk = trial.expert_tier.take().context("GPU expert tier request")?;
+            let keep = tier.experts.saturating_sub(drop);
+            ensure!(keep >= shrunk.pinned,
+                "V4.1 coordinator weight budget exceeded; pinned whole layers need more than {limit} bytes");
+            if shrunk.size == ExpertTierSize::Auto { trial.pool.pin_selected(placement.pool_tokens); }
+            shrunk.size = ExpertTierSize::Experts(keep);
+            trial.expert_tier = Some(shrunk);
+            placement = solve(&trial)?;
+            continue;
+        }
+        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
+            && placement.onboard_layers > request.minimum_expert_layers,
+            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
+        let mut trial = request.clone();
+        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
+        // Keep pool-first's admitted pool while reducing only the optional prefix.
+        if matches!(request.onboard, Onboard::Auto) {
+            trial.pool.pin_selected(placement.pool_tokens);
+        }
+        placement = solve(&trial)?;
+    }
+}
+
+/// What the V4.1 dSpark drafter retains, measured from its own plan before/// What the V4.1 dSpark drafter retains, measured from its own plan before
 /// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
 /// (request lanes, main context, windows) on the default native BF16 path;
 /// EXL3 arenas and TP2 expert halves are sized from their packages.

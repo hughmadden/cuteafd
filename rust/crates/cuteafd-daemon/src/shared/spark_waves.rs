@@ -936,13 +936,13 @@ fn probe_staging_route(library: &NativeLibrary, arena: &StagingArena, alias: usi
 /// wave land (a host-ordered collect, [`Waves::pull_arrived`]): the SM pull of
 /// the published frames ([`Waves::land`]'s device-ordered form), or
 /// copy-engine copies of the frames, whose addresses the host reads from the
-/// same descriptors. The pull's kernel reads every rank's descriptor over
-/// PCIe from each block before its payload, which bounds it at decode sizes:
-/// on an RTX 4090 behind a desktop root complex a 40 KiB wave of four ranks
-/// lands in 16.2 us by pull and 11.1 us by copy engine, 640 KiB in 60.8 and
-/// 42.6. The copy engine is not monotonic in the frame size there (frames of
-/// 16-21 KiB copy slower than 10 or 40 KiB ones), so the probe decides per
-/// frame size the link carries. Copies queue only behind waits the host
+/// same descriptors. Each pull block reads only its rank's descriptor, so on
+/// an RTX 4090 behind a desktop root complex a 40 KiB wave of four ranks
+/// lands in 11.2 us by pull and 11.2 by copy engine, 640 KiB in 33.5 and
+/// 42.5: the pull is the default, and the copy engine an opt-in route
+/// ([`LANDING_ENV`]) whose probe decides per frame size the link carries (the
+/// copy engine is not monotonic in the frame size: frames of 16-21 KiB copy
+/// slower than 10 or 40 KiB ones). Copies queue only behind waits the host
 /// already saw met, never inside a capture (they would replay one wave's
 /// frame addresses).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -967,8 +967,11 @@ impl LandingRoute {
     }
 }
 
-/// `CUTEAFD_SPARK_LANDING`: `auto` (default; probe the frame sizes the link
-/// carries), `sm` (pull only, no probe) or `copy-engine` (every landed wave).
+/// `CUTEAFD_SPARK_LANDING`: `sm` (default; the pull, no probe), `auto` (probe
+/// the frame sizes the link carries, the copy engine where it measured
+/// faster) or `copy-engine` (every landed wave). The last two are opt-in:
+/// the copy engine stays only if it wins host-ordered rounds by a margin
+/// somewhere.
 pub(crate) const LANDING_ENV: &str = "CUTEAFD_SPARK_LANDING";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -977,10 +980,10 @@ pub(crate) enum LandingMode { Auto, Sm, CopyEngine }
 impl LandingMode {
     pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
         Ok(match raw.map(str::trim) {
-            None | Some("") | Some("auto") => Self::Auto,
-            Some("sm") => Self::Sm,
+            None | Some("") | Some("sm") => Self::Sm,
+            Some("auto") => Self::Auto,
             Some("copy-engine") => Self::CopyEngine,
-            Some(other) => anyhow::bail!("{LANDING_ENV}={other}: expected auto, sm or copy-engine"),
+            Some(other) => anyhow::bail!("{LANDING_ENV}={other}: expected sm, auto or copy-engine"),
         })
     }
 }

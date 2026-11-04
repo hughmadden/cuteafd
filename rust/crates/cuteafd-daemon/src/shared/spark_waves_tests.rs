@@ -1520,7 +1520,8 @@ fn landing_route_decides_per_probed_frame_size() {
     assert_eq!(landing_route(LandingMode::Sm, &probed), LandingRoute::Pull);
     assert!(!LandingRoute::Pull.copy_engine(1) && LandingRoute::CopyEngine.copy_engine(1 << 30));
     assert_eq!(landing_route(LandingMode::CopyEngine, &[]), LandingRoute::CopyEngine);
-    for (raw, mode) in [(None, LandingMode::Auto), (Some(""), LandingMode::Auto), (Some("auto"), LandingMode::Auto),
+    // The pull is the default; the copy engine is opt-in.
+    for (raw, mode) in [(None, LandingMode::Sm), (Some(""), LandingMode::Sm), (Some("auto"), LandingMode::Auto),
         (Some(" sm "), LandingMode::Sm), (Some("copy-engine"), LandingMode::CopyEngine)] {
         assert_eq!(LandingMode::parse(raw).unwrap(), mode);
     }
