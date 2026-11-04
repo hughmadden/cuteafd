@@ -2,8 +2,9 @@
 use super::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{
-    replicated_expert_tie_seed_for, ReplicatedExpertCostModel, ReplicatedExpertScheduleConfig,
-    ReplicatedExpertScheduler, ReplicatedExpertTieSeedMode, INACTIVE_REPLICATED_EXPERT_GROUP,
+    replicated_expert_tie_seed_for, ExpertResidencySet, ReplicatedExpertCostModel, ReplicatedExpertGroupSpec,
+    ReplicatedExpertScheduleConfig, ReplicatedExpertScheduler, ReplicatedExpertTieSeedMode,
+    INACTIVE_REPLICATED_EXPERT_GROUP, MAX_REPLICATED_EXPERT_GROUPS,
 };
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
@@ -21,6 +22,12 @@ pub(crate) struct ReplicatedGroupPlanner {
     scheduler: ReplicatedExpertScheduler,
     histogram: [u32; V41_ROUTED_EXPERTS],
     owners: [u8; V41_ROUTED_EXPERTS],
+    /// The coordinator's GPU expert tier ([`Self::set_tier`]): scheduler group
+    /// 0, a partial group holding each layer's resident experts, which always
+    /// run there; the Spark groups follow as groups `1..=EP`.
+    tier: Option<std::sync::Arc<super::tier::TierResidency>>,
+    /// The resident set of a layer the tier does not describe.
+    no_residents: ExpertResidencySet,
 }
 
 /// Opt-in tie-seed control. Unset selects `dispatch`, which reproduces the
@@ -107,7 +114,35 @@ impl ReplicatedGroupPlanner {
             scheduler,
             histogram: [0; V41_ROUTED_EXPERTS],
             owners: [INACTIVE_REPLICATED_EXPERT_GROUP; V41_ROUTED_EXPERTS],
+            tier: None,
+            no_residents: ExpertResidencySet::empty(V41_ROUTED_EXPERTS),
         })
+    }
+
+    /// Plans for a link whose coordinator holds `tier`: every active expert a
+    /// layer's tier holds runs on the coordinator (its routes carry the
+    /// coordinator owner, which every Spark group skips), every other one on
+    /// the Spark groups as before (whole-expert LPT across them). Requests
+    /// then carry the coordinator request flag, residents or not. Set once,
+    /// before the link's first request.
+    pub(crate) fn set_tier(&mut self, tier: std::sync::Arc<super::tier::TierResidency>) -> Result<()> {
+        ensure!(tier.experts() == V41_ROUTED_EXPERTS, "the GPU expert tier describes {} experts per layer, not {}",
+            tier.experts(), V41_ROUTED_EXPERTS);
+        let ep = self.topology.group_count();
+        ensure!(ep < MAX_REPLICATED_EXPERT_GROUPS, "a GPU expert tier needs a scheduler group beside {ep} Spark groups");
+        // The tier is pinned, so its cost does not change who runs what; it
+        // only enters the plan's makespan.
+        let cost = replicated_cost_model()?;
+        let mut groups = vec![ReplicatedExpertGroupSpec::partial(cost)];
+        groups.extend((0..ep).map(|_| ReplicatedExpertGroupSpec::full(cost)));
+        let config = ReplicatedExpertScheduleConfig::with_groups(&groups)
+            .map_err(|error| anyhow::anyhow!("GPU expert tier scheduler rejected: {error}"))?;
+        self.scheduler = ReplicatedExpertScheduler::new(config, V41_ROUTED_EXPERTS)
+            .map_err(|error| anyhow::anyhow!("GPU expert tier scheduler rejected: {error}"))?;
+        tracing::info!(experts = tier.total(), layers = tier.resident_layers().len(), spark_groups = ep,
+            "Spark requests leave the GPU expert tier's experts to the coordinator");
+        self.tier = Some(tier);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -146,22 +181,38 @@ impl ReplicatedGroupPlanner {
             request.header.request_id,
         );
         {
-            let plan = self
-                .scheduler
-                .plan(&self.histogram, seed)
-                .map_err(|error| anyhow::anyhow!("replicated expert schedule rejected: {error}"))?;
+            let tiered = self.tier.is_some();
+            let plan = match &self.tier {
+                None => self.scheduler.plan(&self.histogram, seed),
+                Some(tier) => {
+                    // Group 0 is the tier (this layer's residents), the Spark
+                    // groups hold every expert and take no resident set.
+                    let mask = tier.mask(request.header.layer_id as usize).unwrap_or(&self.no_residents);
+                    let mut resident: [&[u64]; MAX_REPLICATED_EXPERT_GROUPS as usize] =
+                        [&[]; MAX_REPLICATED_EXPERT_GROUPS as usize];
+                    resident[0] = mask.words();
+                    self.scheduler.plan_resident(&self.histogram, seed,
+                        &resident[..1 + self.topology.group_count() as usize])
+                }
+            }
+            .map_err(|error| anyhow::anyhow!("replicated expert schedule rejected: {error}"))?;
             ensure!(
-                plan.group_count() == self.topology.group_count(),
+                plan.group_count() == self.topology.group_count() + u8::from(tiered),
                 "replicated expert plan group count differs from the bound topology"
             );
             self.owners.fill(INACTIVE_REPLICATED_EXPERT_GROUP);
             for (expert, group) in plan.assignment().iter().enumerate() {
                 // Every routed expert is active, so it carries an active owner;
                 // the transport rejects inactive or out-of-range owners.
-                self.owners[expert] = group.encoded();
+                self.owners[expert] = match (tiered, group.index()) {
+                    (_, None) => INACTIVE_REPLICATED_EXPERT_GROUP,
+                    (true, Some(0)) => cuteafd_transport::expert::V41_NATIVE_COORDINATOR_OWNER,
+                    (true, Some(group)) => group - 1,
+                    (false, Some(group)) => group,
+                };
             }
         }
-        request.with_native_group_owners(&self.owners, self.topology)
+        request.with_native_owners(&self.owners, self.topology, self.tier.is_some())
     }
 }
 
@@ -199,6 +250,15 @@ impl<'a> V41Link<'a> {
         let logical = reserve_rows.checked_mul(V41_PARTIAL_ROW_BYTES as usize).context("prefill link budget overflow")?;
         let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(u64::try_from(logical)?)?;
         usize::try_from(backing)?.checked_mul(ranks).context("prefill link budget overflow")
+    }
+    /// Leaves `tier`'s experts to the coordinator in every request of this
+    /// link ([`ReplicatedGroupPlanner::set_tier`]). The link must carry the
+    /// owned Spark wire (an explicit `TP×EP` topology): the canonical wire has
+    /// no owner field to mark. Before the link's first request.
+    pub(crate) fn enable_tier(&mut self, tier: std::sync::Arc<super::tier::TierResidency>) -> Result<()> {
+        let (_, planner) = self.native.as_ref().context(
+            "the GPU expert tier needs the owned Spark wire (an explicit TP×EP topology) to mark its routes")?;
+        planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.set_tier(tier)
     }
     pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
     pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }
@@ -731,6 +791,134 @@ mod replicated_tests {
             assert!(word.expert_id < 384);
             word.owner
         }).collect()
+    }
+
+    fn tier(layer: usize, ids: &[u16]) -> std::sync::Arc<super::super::tier::TierResidency> {
+        let mut resident = vec![Vec::new(); 40];
+        resident[layer] = ids.to_vec();
+        std::sync::Arc::new(super::super::tier::TierResidency::new(V41_ROUTED_EXPERTS, resident).unwrap())
+    }
+
+    /// Owners under the coordinator request flag (group, or the coordinator).
+    fn tier_owners(request: &ExpertProtocolV2Request, topology: SparkTopology) -> Vec<u8> {
+        request.routes.iter().map(|route| {
+            V41NativeOwnerRouteWord::decode_owned(route.expert_id, topology.group_count(), true).unwrap().owner
+        }).collect()
+    }
+
+    const TIERED: [SparkTopology; 4] = [SparkTopology::NATIVE_TP4_EP1, SparkTopology::NATIVE_TP2_EP2,
+        SparkTopology::NATIVE_TP3_EP2, SparkTopology::NATIVE_TP2_EP3];
+
+    /// A layer's resident experts carry the coordinator owner; every other
+    /// routed expert keeps one Spark group, balanced across the groups, and
+    /// each group's worker unpacks exactly its own non-resident routes.
+    #[test]
+    fn tier_experts_go_to_the_coordinator_and_the_rest_to_the_spark_groups() {
+        use cuteafd_transport::expert::{V41_NATIVE_COORDINATOR_OWNER, V41_NATIVE_COORDINATOR_REQUEST_FLAG,
+            V41_NATIVE_UNASSIGNED_EXPERT_ID};
+        let experts = [0u32, 7, 19, 88, 200, 383, 7, 19, 88, 201, 383, 1];
+        let resident = [7u16, 200, 201, 300];
+        for topology in TIERED {
+            let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
+            planner.set_tier(tier(3, &resident)).unwrap();
+            let mut request = request(3, 11, &experts);
+            planner.encode(&mut request).unwrap();
+            assert_ne!(request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
+            assert_ne!(request.header.flags & V41_NATIVE_COORDINATOR_REQUEST_FLAG, 0);
+            BackboneRequest::validate_owned_native_group(&request, 2, topology).unwrap();
+            let owners = tier_owners(&request, topology);
+            let mut per_group = [std::collections::BTreeSet::new(), std::collections::BTreeSet::new(),
+                std::collections::BTreeSet::new()];
+            for (route, (&owner, &expert)) in request.routes.iter().zip(owners.iter().zip(&experts)) {
+                assert_eq!(route.expert_id & 511, expert);
+                if resident.contains(&(expert as u16)) {
+                    assert_eq!(owner, V41_NATIVE_COORDINATOR_OWNER, "resident expert {expert}");
+                } else {
+                    assert!(owner < topology.group_count(), "expert {expert} owner {owner}");
+                    per_group[owner as usize].insert(expert);
+                }
+            }
+            // Whole-expert LPT over the Spark groups: within one expert.
+            let counts = per_group[..topology.group_count() as usize].iter().map(|set| set.len()).collect::<Vec<_>>();
+            assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+            let frame = request.encode().unwrap();
+            let parsed = BackboneRequest::parse_native_group(&frame, 2, topology).unwrap();
+            let mut kept = 0;
+            for group in 0..topology.group_count() {
+                let mut ids = vec![0i32; experts.len()];
+                let mut weights = vec![0.0f32; experts.len()];
+                parsed.copy_native_group_routes_into(&mut ids, &mut weights, group).unwrap();
+                for ((&id, &weight), &expert) in ids.iter().zip(&weights).zip(&experts) {
+                    if id == V41_NATIVE_UNASSIGNED_EXPERT_ID {
+                        assert_eq!(weight, 0.0);
+                    } else {
+                        assert!(!resident.contains(&(expert as u16)), "group {group} kept resident expert {expert}");
+                        assert_eq!(id as u32, expert);
+                        kept += 1;
+                    }
+                }
+            }
+            assert_eq!(kept, experts.iter().filter(|&&e| !resident.contains(&(e as u16))).count());
+        }
+    }
+
+    /// A layer the tier does not hold still carries the coordinator flag (one
+    /// contract per link) but leaves every route to the Spark groups.
+    #[test]
+    fn layers_without_residents_keep_every_route_on_the_sparks() {
+        use cuteafd_transport::expert::{V41_NATIVE_COORDINATOR_OWNER, V41_NATIVE_COORDINATOR_REQUEST_FLAG};
+        let experts = [0u32, 7, 19, 88, 200, 383];
+        for topology in TIERED {
+            let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
+            planner.set_tier(tier(3, &[0, 7, 19, 88, 200, 383])).unwrap();
+            for layer in [0u32, 5, 39] {
+                let mut request = request(layer, 11, &experts);
+                planner.encode(&mut request).unwrap();
+                assert_ne!(request.header.flags & V41_NATIVE_COORDINATOR_REQUEST_FLAG, 0);
+                assert!(tier_owners(&request, topology).iter()
+                    .all(|&owner| owner != V41_NATIVE_COORDINATOR_OWNER && owner < topology.group_count()));
+            }
+            // The same experts in the tier's layer all go to the coordinator.
+            let mut request = request(3, 11, &experts);
+            planner.encode(&mut request).unwrap();
+            assert!(tier_owners(&request, topology).iter().all(|&owner| owner == V41_NATIVE_COORDINATOR_OWNER));
+        }
+    }
+
+    /// A resident expert's device is a function of (layer, expert) alone:
+    /// neither the tie seed nor the batch composition moves it.
+    #[test]
+    fn tier_owners_ignore_tie_seeds_and_batch_composition() {
+        use cuteafd_transport::expert::V41_NATIVE_COORDINATOR_OWNER;
+        let resident: Vec<u16> = (0..384).step_by(7).collect();
+        for topology in TIERED {
+            let mut planner = ReplicatedGroupPlanner::new_with_seed_mode(topology,
+                ReplicatedExpertTieSeedMode::Dispatch).unwrap();
+            planner.set_tier(tier(9, &resident)).unwrap();
+            for request_id in [1u64, 2, 99, 12_345] {
+                for offset in [0u32, 1, 13, 200] {
+                    let experts: Vec<u32> = (0..4).flat_map(|row| (0..6u32).map(move |k| (offset + row * 31 + k * 61) % 384))
+                        .collect();
+                    let mut request = request(9, request_id, &experts);
+                    planner.encode(&mut request).unwrap();
+                    for (&owner, &expert) in tier_owners(&request, topology).iter().zip(&experts) {
+                        assert_eq!(owner == V41_NATIVE_COORDINATOR_OWNER, resident.contains(&(expert as u16)),
+                            "expert {expert} request {request_id}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tier_must_describe_the_full_expert_width() {
+        let mut planner = ReplicatedGroupPlanner::new(SparkTopology::NATIVE_TP4_EP1).unwrap();
+        let narrow = std::sync::Arc::new(super::super::tier::TierResidency::new(128, vec![vec![1, 2]]).unwrap());
+        assert!(planner.set_tier(narrow).is_err());
+        // Without a tier nothing changes: no coordinator flag.
+        let mut request = request(3, 11, &[0u32, 7, 19, 88, 200, 383]);
+        planner.encode(&mut request).unwrap();
+        assert_eq!(request.header.flags & cuteafd_transport::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG, 0);
     }
 
     #[test]

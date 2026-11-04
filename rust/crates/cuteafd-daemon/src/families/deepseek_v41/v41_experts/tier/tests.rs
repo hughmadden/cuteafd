@@ -126,3 +126,33 @@ fn tier_halves_push_byte_exact_on_two_gpus() -> Result<()> {
     }
     Ok(())
 }
+
+/// The host masks and the `slot_of` tables are one view of the set: a slot
+/// exists exactly for a resident expert, and slot `i` names `ids[i]`.
+#[test]
+fn residency_masks_and_slot_tables_name_the_same_experts() -> Result<()> {
+    let residency = TierResidency::new(384, vec![vec![], vec![3, 9, 383], vec![0]])?;
+    assert_eq!((residency.layers(), residency.total()), (3, 4));
+    assert_eq!(residency.resident_layers(), vec![1, 2]);
+    for layer in 0..3 {
+        let table = residency.slot_of(layer);
+        assert_eq!(table.len(), 384);
+        for (expert, &slot) in table.iter().enumerate() {
+            assert_eq!(slot != NOT_RESIDENT, residency.contains(layer, expert), "layer {layer} expert {expert}");
+            if slot != NOT_RESIDENT {
+                assert_eq!(usize::from(residency.ids(layer)[slot as usize]), expert);
+            }
+        }
+        assert_eq!(residency.mask(layer).unwrap().iter().collect::<Vec<_>>(),
+            residency.ids(layer).iter().map(|&id| usize::from(id)).collect::<Vec<_>>());
+    }
+    let tables = residency.slot_tables();
+    assert_eq!(tables.len(), 3 * 384);
+    assert_eq!(&tables[384..768], residency.slot_of(1).as_slice());
+    // Past the described layers nothing is resident.
+    assert!(residency.ids(7).is_empty() && !residency.contains(7, 0) && residency.mask(7).is_none());
+    for bad in [vec![vec![5u16, 3]], vec![vec![3, 3]], vec![vec![384]]] {
+        assert!(TierResidency::new(384, bad).is_err());
+    }
+    Ok(())
+}

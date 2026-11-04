@@ -10,9 +10,83 @@
 use super::{ExpertLayer, ExpertWeights};
 use crate::shared::memory::device::{Device, DeviceOwner};
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::ExpertResidencySet;
 use cuteafd_loader::OfficialV41Catalog;
 #[cfg(test)]
 mod tests;
+
+/// `slot_of` entry of an expert the tier does not hold: the expert kernel's
+/// route plan drops a route whose id is outside `0..experts` (its inverse is
+/// -1 and its plane zero), so the route reads no weights.
+pub(crate) const NOT_RESIDENT: i32 = -1;
+
+/// The GPU expert tier's resident set, fixed for the server's lifetime (the
+/// planner's `ExpertTierPlacement::resident`): per backbone layer, the
+/// ascending expert ids the coordinator GPUs hold, slot `i` holding `ids[i]`.
+///
+/// It is the one source of both views of the set: the host's per-layer masks,
+/// which mark the routes a Spark request leaves to the coordinator, and the
+/// GPUs' `slot_of` tables, which turn the router's expert ids into compact
+/// slots (or [`NOT_RESIDENT`]) for the tier's expert kernel. The startup check
+/// ([`TierTables::verify`]) proves the GPU copies agree with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TierResidency {
+    experts: usize,
+    resident: Vec<Vec<u16>>,
+    masks: Vec<ExpertResidencySet>,
+}
+
+impl TierResidency {
+    /// `resident[layer]` for every backbone layer (empty: none resident),
+    /// each ascending and distinct below `experts`.
+    pub(crate) fn new(experts: usize, resident: Vec<Vec<u16>>) -> Result<Self> {
+        ensure!(experts > 0 && experts <= i32::MAX as usize, "invalid routed expert count {experts}");
+        let masks = resident.iter().enumerate().map(|(layer, ids)| {
+            ensure!(ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "tier layer {layer}: resident experts must be ascending and distinct");
+            ExpertResidencySet::from_ids(experts, ids.iter().map(|&id| usize::from(id)))
+                .map_err(|error| anyhow::anyhow!("tier layer {layer}: {error}"))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { experts, resident, masks })
+    }
+
+    /// Routed experts per layer (the `slot_of` tables' width).
+    pub(crate) fn experts(&self) -> usize { self.experts }
+    /// Backbone layers the set describes.
+    pub(crate) fn layers(&self) -> usize { self.resident.len() }
+    /// Layer `layer`'s resident ids, ascending (empty past the described layers).
+    pub(crate) fn ids(&self, layer: usize) -> &[u16] {
+        self.resident.get(layer).map_or(&[], Vec::as_slice)
+    }
+    /// Every layer's resident ids, in layer order (`tier::load_halves`' input).
+    pub(crate) fn resident(&self) -> &[Vec<u16>] { &self.resident }
+    /// Backbone layers holding at least one resident expert, ascending.
+    pub(crate) fn resident_layers(&self) -> Vec<usize> {
+        self.resident.iter().enumerate().filter(|(_, ids)| !ids.is_empty()).map(|(layer, _)| layer).collect()
+    }
+    /// Resident experts over all layers.
+    pub(crate) fn total(&self) -> usize { self.resident.iter().map(Vec::len).sum() }
+    /// Layer `layer`'s host mask, or `None` past the described layers.
+    pub(crate) fn mask(&self, layer: usize) -> Option<&ExpertResidencySet> { self.masks.get(layer) }
+    /// Whether the coordinator holds `expert` of `layer`.
+    pub(crate) fn contains(&self, layer: usize, expert: usize) -> bool {
+        self.masks.get(layer).is_some_and(|mask| mask.contains(expert))
+    }
+    /// Layer `layer`'s `slot_of` table: the compact slot of each resident
+    /// expert, [`NOT_RESIDENT`] for the rest.
+    pub(crate) fn slot_of(&self, layer: usize) -> Vec<i32> {
+        let mut table = vec![NOT_RESIDENT; self.experts];
+        for (slot, &id) in self.ids(layer).iter().enumerate() {
+            table[usize::from(id)] = slot as i32;
+        }
+        table
+    }
+    /// Every layer's `slot_of` table, row-major `[layers, experts]`: what each
+    /// GPU uploads once.
+    pub(crate) fn slot_tables(&self) -> Vec<i32> {
+        (0..self.layers()).flat_map(|layer| self.slot_of(layer)).collect()
+    }
+}
 
 /// One GPU's resident halves: per backbone layer with resident experts, in
 /// layer order, its layer index and the compact half.
