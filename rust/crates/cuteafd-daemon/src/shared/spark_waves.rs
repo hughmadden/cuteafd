@@ -1021,6 +1021,31 @@ impl StagingRoute {
     }
 }
 
+/// Whether prefill waves stage by copy engine on this host, decided once by
+/// the staging probe ([`slow_sm_staging`]). Prefill unit chains are
+/// device-ordered and queue a layer ahead of its predecessor's landing, so
+/// [`StagingRoute::copy_engine_now`] alone never lets their waves take the
+/// copy engine. Where SM stores into host memory are slow, prefill units are
+/// paced instead (each reply wait is queued only once the host saw the reply
+/// land), and a paced wave may stage by copy engine as soon as its slot's
+/// reuse wave landed: nothing unmet then sits ahead of the copy, so it cannot
+/// park. Hosts whose SM staging keeps up keep unpaced prefill units.
+static PREFILL_COPY_ENGINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether prefill unit chains should pace so their waves stage by copy engine.
+pub(crate) fn prefill_copy_engine() -> bool {
+    PREFILL_COPY_ENGINE.load(Ordering::Relaxed)
+}
+
+/// SM staging is slow when stream waits hold copy-engine work and the largest
+/// probed wave takes more than twice as long by SM as by copy engine (a 4090 D
+/// behind an EPYC root complex: 118 us against 23 us at 256 KiB).
+pub(crate) fn slow_sm_staging(probe: &cuteafd_ffi::peer_exchange::StagingProbe) -> bool {
+    let n = (probe.probes as usize).min(probe.bytes.len());
+    probe.copy_engine_held == 1 && n > 0 && probe.copy_engine_us[n - 1] > 0.0
+        && probe.sm_us[n - 1] > 2.0 * probe.copy_engine_us[n - 1]
+}
+
 /// `CUTEAFD_SPARK_STAGING`: `auto` (default; probe, copy engine from the
 /// measured crossover), `sm` (SM copies, no probe) or `copy-engine` (every
 /// wave, refused where stream waits don't hold the copy engine).
@@ -1076,10 +1101,12 @@ fn probe_staging_route(library: &NativeLibrary, arena: &StagingArena, alias: usi
         Err(error) => return Err(error),
     };
     let route = staging_route(mode, &probe)?;
+    let prefill = matches!(route, StagingRoute::CopyEngineFrom(_)) && slow_sm_staging(&probe);
+    if prefill { PREFILL_COPY_ENGINE.store(true, Ordering::Relaxed); }
     let table = (0..probe.probes as usize).map(|p| format!("{}K {:.1}/{:.1}", probe.bytes[p] >> 10,
         probe.sm_us[p], probe.copy_engine_us[p])).collect::<Vec<_>>().join(", ");
     tracing::info!(?route, copy_engine_held = probe.copy_engine_held == 1, crossover_bytes = probe.crossover_bytes,
-        "Spark staging route (us per wave, SM/copy engine: {table})");
+        prefill_copy_engine = prefill, "Spark staging route (us per wave, SM/copy engine: {table})");
     Ok(route)
 }
 
@@ -1500,7 +1527,15 @@ impl<'a> Waves<'a> {
             }).collect::<Result<_>>()?;
             unsafe {
                 let previous = staging_reuse(sequence, cut.waves);
-                let copy_engine = self.staging.copy_engine_now(layout.bytes, self.words.load(Counter::Landed), sequence);
+                let landed = self.words.load(Counter::Landed);
+                // A paced chain (prefill units on a host with slow SM staging,
+                // `prefill_copy_engine`) queues each reply wait only once the
+                // host saw it met, so once this slot's reuse wave landed the
+                // wait below is already met and nothing unmet sits ahead of a
+                // copy-engine copy: it cannot park.
+                let copy_engine = self.staging.copy_engine_now(layout.bytes, landed, sequence)
+                    || (crate::shared::memory::chain::paced() && self.staging.copy_engine(layout.bytes)
+                        && reached(landed, previous));
                 self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), previous)?;
                 if copy_engine {
                     self.library.copy_engine_regions(&regions, stream)?;

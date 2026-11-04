@@ -181,7 +181,13 @@ impl<'a, R> Pass<'a, R> {
     pub(super) fn unit_chain(&self) -> Result<crate::shared::memory::chain::ChainHandle<'a>> {
         let chain = self.chain.as_ref().context("prefill units need the stage chain (CUTEAFD_STAGE_CHAIN)")?;
         chain.set_device_order(true);
-        Ok(chain.handle())
+        // Where SM staging into host memory is slow (`spark_waves::prefill_copy_engine`),
+        // the unit paces, so its waves stage by copy engine; the flag is cleared again
+        // at once so no later handle inherits it.
+        chain.set_pacing(crate::shared::spark_waves::prefill_copy_engine());
+        let handle = chain.handle();
+        chain.set_pacing(false);
+        Ok(handle)
     }
     /// The pass's native library (its stage chain's).
     pub(super) fn library(&self) -> Result<&'a cuteafd_ffi::NativeLibrary> {

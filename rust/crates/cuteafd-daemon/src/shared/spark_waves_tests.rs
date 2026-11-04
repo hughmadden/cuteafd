@@ -1882,6 +1882,28 @@ fn staging_mode_parses_the_three_settings_and_refuses_others() {
 }
 
 #[test]
+fn slow_sm_staging_needs_held_copy_engine_work_and_a_slow_largest_wave() {
+    use cuteafd_ffi::peer_exchange::StagingProbe;
+    // A 4090 D behind an EPYC root complex (measured): 64/128/256 KiB, SM vs copy engine.
+    let mut slow_host = StagingProbe { copy_engine_held: 1, probes: 3, crossover_bytes: 32 << 10, ..Default::default() };
+    for (i, (bytes, sm, ce)) in [(64u64 << 10, 33.1f32, 14.1f32), (128 << 10, 61.6, 14.1), (256 << 10, 118.5, 22.8)]
+        .into_iter().enumerate() {
+        slow_host.bytes[i] = bytes; slow_host.sm_us[i] = sm; slow_host.copy_engine_us[i] = ce;
+    }
+    assert!(slow_sm_staging(&slow_host));
+    // SM keeps up at the largest wave (within 2x): prefill stays unpaced.
+    let mut fast = slow_host;
+    fast.sm_us[2] = 40.0;
+    assert!(!slow_sm_staging(&fast));
+    // Waits that don't hold copy-engine work, or no probe at all, never pace prefill.
+    assert!(!slow_sm_staging(&StagingProbe { copy_engine_held: 0, ..slow_host }));
+    assert!(!slow_sm_staging(&StagingProbe { probes: 0, ..slow_host }));
+    let mut unmeasured = slow_host;
+    unmeasured.copy_engine_us[2] = 0.0;
+    assert!(!slow_sm_staging(&unmeasured));
+}
+
+#[test]
 fn staging_route_uses_the_copy_engine_only_where_waits_hold_it() {
     use cuteafd_ffi::peer_exchange::StagingProbe;
     let held = StagingProbe { copy_engine_held: 1, probes: 9, crossover_bytes: 16 << 10, ..Default::default() };
