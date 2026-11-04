@@ -442,6 +442,13 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/nvfp4_payload.cu
     shared/cuda/nvfp4_scale.cu
   )
+  # SM89 (Ada) runs V4.1 split sparse attention above one wave of 16-head
+  # blocks as one block per (row, part) over a shared KV tile, bit-identical
+  # to the 16-head launch. SM120 and SM121 keep their kernels unchanged.
+  if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+    set_source_files_properties(families/deepseek_v41/cuda/v41_sparse_attention.cu PROPERTIES
+      COMPILE_DEFINITIONS CUTEAFD_V41_ATTENTION_SM89=1)
+  endif()
   # SM120 builds use the family-specific target (sm_120f); every live AOT
   # export and hand kernel is qualified with it.
   if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120")
