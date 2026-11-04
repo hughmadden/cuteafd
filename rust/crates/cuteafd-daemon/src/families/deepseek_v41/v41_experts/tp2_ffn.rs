@@ -141,6 +141,19 @@ impl<'a> Storage<'a> {
         Ok(Rc::new(Self { execution: tokio::sync::Mutex::new(execution), streams, rows, unit, layers, shared_layers,
             tier: std::cell::OnceCell::new() }))
     }
+    /// A TP2 FFN that runs the GPU expert tier in place of whole TP2 layers:
+    /// its routed owner pair is over the tier's `halves` (no whole layer), and
+    /// its tier lane turns the router's ids into their slots. Planes at
+    /// `rows`, scratch at `unit`. Without whole layers the reduce GPU's output
+    /// plane (otherwise their final sums) holds each slot's tier result, in
+    /// the slot's window, until its Spark reduce reads it.
+    pub(crate) fn tiered(halves: &super::tier::TierHalves<'a>, shared: [Rc<Vec<SharedWeights<'a>>>; 2],
+        rows: u32, unit: u32) -> Result<Rc<Self>> {
+        let storage = Self::new(halves.weights.clone(), shared, 0, rows, unit, [None, None])?;
+        storage.execution.try_lock().context("a new TP2 FFN is borrowed")?.install_tier(halves)?;
+        storage.tier.set(halves.residency.clone()).map_err(|_| anyhow::anyhow!("a new TP2 FFN holds a tier"))?;
+        Ok(storage)
+    }
 }
 pub(crate) struct Wave<'a> {
     storage: Rc<Storage<'a>>,
@@ -158,6 +171,11 @@ impl<'a> Wave<'a> {
         modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2]) -> Result<Self> {
         Ok(Self::on_storage(Storage::new(routed, shared, layers, capacity, capacity, modules)?))
     }
+    /// A decode lane's private TP2 FFN on the GPU expert tier ([`Storage::tiered`]).
+    pub(crate) fn tiered(halves: &super::tier::TierHalves<'a>, shared: [Rc<Vec<SharedWeights<'a>>>; 2],
+        capacity: u32) -> Result<Self> {
+        Ok(Self::on_storage(Storage::tiered(halves, shared, capacity, capacity)?))
+    }
     pub(crate) fn on_storage(storage: Rc<Storage<'a>>) -> Self {
         Self { storage, window: crate::shared::memory::row_window::RowWindow::NONE }
     }
@@ -169,17 +187,6 @@ impl<'a> Wave<'a> {
         self.window = window; Ok(())
     }
     pub(crate) fn contains(&self, layer: usize) -> bool { layer < self.storage.layers }
-    /// Runs the GPU expert tier on this wave's Spark layers: a lane of its
-    /// own over `halves` (shared weights) in this wave's execution arena. For
-    /// a decode lane's private wave; at rest, once.
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
-    pub(crate) fn install_tier(&self, halves: &super::tier::TierHalves<'a>) -> Result<()> {
-        ensure!(self.window.range().is_none(), "only a decode lane's private TP2 FFN runs the GPU expert tier");
-        let mut execution = self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?;
-        execution.install_tier(halves)?;
-        self.storage.tier.set(halves.residency.clone())
-            .map_err(|_| anyhow::anyhow!("the GPU expert tier is already installed on this TP2 FFN"))
-    }
     /// The GPU expert tier's set, when this wave runs one.
     pub(crate) fn tier(&self) -> Option<&std::sync::Arc<super::tier::TierResidency>> { self.storage.tier.get() }
     /// Whether this wave's tier holds experts of `layer`.
@@ -188,7 +195,6 @@ impl<'a> Wave<'a> {
     }
     /// Each GPU's tier slots for the router ids `probe` in `layer` (the
     /// startup check, at rest).
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
     pub(crate) fn probe_tier_slots(&self, layer: usize, probe: &[u32]) -> Result<[Vec<i32>; 2]> {
         let execution = self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?;
         execution.tier.as_ref().context("this TP2 FFN runs no GPU expert tier")?.probe_slots(layer, probe)
@@ -202,10 +208,6 @@ impl<'a> Wave<'a> {
     }
     pub(crate) fn release_shared_output(&self, destination: usize) -> Result<()> {
         self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?.release_shared_output(destination)
-    }
-    /// After the Spark reduce that read the GPU expert tier's result.
-    pub(crate) fn release_tier_scratch(&self) -> Result<()> {
-        self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?.release_tier_scratch()
     }
     /// Device-ordered passes of this decode lane push every transfer between
     /// the GPUs (`v41_peer_push`): routed partials, shared partials and the
@@ -232,10 +234,11 @@ impl<'a> Wave<'a> {
         unsafe { self.execution(rows).await?.execute_shared_on(layer, rows, values, destination).await }
     }
     /// A Spark layer's shared TP2 contribution and the GPU expert tier's
-    /// result for `layer` (both BF16 on `destination`, the Spark reduce's GPU).
+    /// result for `layer` (both BF16 on `destination`, the Spark reduce's GPU;
+    /// the tier's in this wave's window of that GPU's output plane).
     /// # Safety
-    /// Inputs are complete and retained until the enclosing chain drains; the
-    /// tier result stays unchanged until [`Self::release_tier_scratch`] after its reduce.
+    /// Inputs are complete and retained until the enclosing chain drains; both
+    /// results stay unchanged until this window's next execution.
     pub(crate) async unsafe fn execute_shared_and_tier_on(&mut self, layer: usize, rows: u32, values: CuteafdDeviceBuffer,
         wire: CuteafdDeviceBuffer, ids: CuteafdDeviceBuffer, routing: CuteafdDeviceBuffer, destination: usize)
         -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
@@ -273,8 +276,6 @@ struct Execution<'a> {
     flags: Option<crate::shared::peer_split::PeerExchange<'a>>,
     /// The GPU expert tier on this lane's Spark layers ([`Self::install_tier`]).
     tier: Option<super::tier::TierLane<'a>>,
-    /// The decode width pushes were enabled for (the tier's push follows it).
-    push_rows: Option<usize>,
 }
 /// Flag of the result a Spark layer's reduce GPU returns to its block's GPU.
 const RETURN: usize = 0;
@@ -400,8 +401,10 @@ impl<'a> Execution<'a> {
                 && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid TP2 FFN devices"
         );
+        // No whole layer (`layers` 0): the GPU expert tier's halves are the
+        // routed weights ([`Storage::tiered`]).
         ensure!(
-            (1..=40).contains(&layers) && (1..=4096).contains(&capacity),
+            layers <= 40 && (1..=4096).contains(&capacity),
             "invalid TP2 FFN layer count/capacity"
         );
         for rank in 0..2 {
@@ -444,20 +447,18 @@ impl<'a> Execution<'a> {
             released: crate::shared::memory::row_window::ScratchGuard::new(devices[0].library, &[0,1])?,
             flags: None,
             tier: None,
-            push_rows: None,
         })
     }
-    /// See [`Wave::install_tier`]. The tier's owner pair reduces its halves
-    /// like the routed TP2 layers' (pushed once this lane pushes).
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
+    /// See [`Storage::tiered`], whose routed pair is over `halves`: it
+    /// reduces the tier's halves like whole TP2 layers' (pushed once this
+    /// lane pushes).
     fn install_tier(&mut self, halves: &super::tier::TierHalves<'a>) -> Result<()> {
-        use crate::families::deepseek_v41::v41_peer_push::lane_bytes;
-        ensure!(self.tier.is_none(), "the GPU expert tier is already installed on this TP2 FFN");
-        ensure!(halves.weights.iter().enumerate().all(|(rank, weights)| weights.device().id == self.streams[rank].device.id),
+        ensure!(self.tier.is_none() && self.layers == 0,
+            "the GPU expert tier runs on a TP2 FFN over its halves, without whole TP2 layers");
+        let devices = [self.streams[0].device, self.streams[1].device];
+        ensure!(halves.weights.iter().zip(devices).all(|(weights, device)| weights.device().id == device.id),
             "the GPU expert tier's halves live on other GPUs than this TP2 FFN");
-        let mut tier = super::tier::TierLane::new(halves, self.capacity, std::env::var_os("CUTEAFD_TP2_TIMING").is_some())?;
-        if let Some(rows) = self.push_rows { tier.enable_push(lane_bytes(rows, tier.partial_row_bytes())?)?; }
-        self.tier = Some(tier);
+        self.tier = Some(super::tier::TierLane::new(halves.residency.clone(), devices, self.capacity)?);
         Ok(())
     }
     /// See [`Wave::enable_peer_push`].
@@ -469,8 +470,6 @@ impl<'a> Execution<'a> {
         let library = self.streams[0].device.library;
         self.flags = Some(crate::shared::peer_split::PeerExchange::new_flags(library, [0, 1], FLAGS,
             lane_bytes(rows, PeerInputs::allocation_sizes(1).iter().sum::<usize>())?)?);
-        if let Some(tier) = self.tier.as_mut() { tier.enable_push(lane_bytes(rows, tier.partial_row_bytes())?)?; }
-        self.push_rows = Some(rows);
         Ok(())
     }
     pub fn contains(&self, layer: usize) -> bool {
@@ -757,10 +756,11 @@ impl<'a> Execution<'a> {
     /// TP2 layer's do), each GPU turns the router's ids into its tier slots,
     /// and both halves run beside the shared halves.
     ///
-    /// The tier's arenas (slots, its owner pair's partials and result) and
-    /// the peer planes are this lane's scratch: under a device-ordered pass
-    /// that does not push, they are guarded through the Spark reduce, which
-    /// releases them ([`Wave::release_tier_scratch`]) once it read the result.
+    /// The tier's result lands in this window of `destination`'s output plane
+    /// (free in a tier FFN, which has no whole layer to sum there; see
+    /// [`Storage::tiered`]), so a prefill slot's result survives other slots'
+    /// units until its Spark reduce. The tier's slots and its owner pair's
+    /// arenas are unit scratch, guarded only through these executions.
     /// # Safety
     /// As [`Self::execute`]: the router's outputs are complete, immutable and
     /// retained until the enclosing chain drains (or the cancellation drain).
@@ -825,32 +825,33 @@ impl<'a> Execution<'a> {
         }
         let mut ranks = [inputs; 2];
         ranks[remote] = peer;
-        let tier = self.tier.as_mut().context("GPU expert tier missing")?;
+        let tier = self.tier.as_ref().context("GPU expert tier missing")?;
         // Each GPU's slots follow its copy of the router's ids on its stream.
         let slots = [0, 1].map(|rank| unsafe { tier.slot_routes(rank, layer, rows, ranks[rank][2], &self.streams[rank]) });
         let [first, second] = slots;
         let slots = [first?, second?];
+        // The routed pair is over the tier's halves (`Storage::tiered`); its
+        // result goes to this window of the reduce GPU's output plane.
+        let mut plane = self.window.apply(self.output[destination].buffer, 10240);
+        plane.bytes = rows as usize * 10240;
         let (shared, tiered) = tokio::try_join!(
             unsafe {
                 self.shared.execute(layer, rows, destination, [ranks[0][0], ranks[1][0]],
                     [&self.streams[0], &self.streams[1]], adopt)
             },
             unsafe {
-                tier.execute(layer, rows, destination, std::array::from_fn(|rank| OwnerInputs {
+                self.routed.execute_into(layer, rows, destination, std::array::from_fn(|rank| OwnerInputs {
                     input: ranks[rank][1], ids: slots[rank], weights: ranks[rank][3], producer: &self.streams[rank],
-                }))
+                }), Some(plane))
             }
         )?;
         guard.complete = true;
+        // The executions joined the chain head: the scratch is free for the
+        // next unit or layer (the result is in the output plane).
+        if !pushing_guards(&self.flags) { self.released.release()?; }
         Ok((shared, tiered))
     }
 
-    /// The Spark reduce that read the tier's result finished on the chain:
-    /// this lane's tier and peer scratch may be rewritten by its next layer.
-    pub(crate) fn release_tier_scratch(&self) -> Result<()> {
-        if !pushing_guards(&self.flags) { self.released.release()?; }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

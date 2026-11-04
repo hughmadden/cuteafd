@@ -600,7 +600,6 @@ pub(crate) struct ExpertWeights<'a> {
     raw_scales: RawScales<'a>,
     /// Expert ids by plane slot when the planes hold a subset of the layer
     /// (the GPU expert tier's resident set); `None`: slot `e` holds expert `e`.
-    #[allow(dead_code)] // read by the tier wave once serving wires it
     resident: Option<std::rc::Rc<[u16]>>,
 }
 
@@ -789,7 +788,6 @@ impl<'a> ExpertWeights<'a> {
     /// experts. Through the mount each selected expert is read alone; under a
     /// dense recording it records for the coordinator push group instead.
     /// The planes hold exactly `ids.len()` experts' resident bytes.
-    #[allow(dead_code)] // the tier wave loads through it once serving wires it
     pub fn load_resident(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

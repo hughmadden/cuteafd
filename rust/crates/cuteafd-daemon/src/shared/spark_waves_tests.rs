@@ -536,7 +536,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(), delay, stagger,
             slots, max_rows.div_ceil(2) * row_bytes)?;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows)?;
-        let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
+        let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -606,8 +606,11 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                     {bad} of {rows} rows");
             }
         }
-        let (echo, frames, _) = exchange.stop::<EchoWorld>()?;
-        assert!(frames.is_empty(), "a stopped exchange whose waves were all consumed holds no frames");
+        ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+            "the exchange closes at rest: every wave landed and was consumed");
+        let (echo, frames, result) = exchange.close::<EchoWorld>()?;
+        result?;
+        assert!(frames.is_empty(), "a closed exchange whose waves were all consumed holds no frames");
         if landing != (1 << ranks) - 1 {
             assert_eq!(echo.buffers.released.load(Ordering::SeqCst), 2 * total * (ranks - landing.count_ones() as usize),
                 "every pinned frame went back to its ring");
@@ -644,7 +647,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 0, ranges.iter().map(|range| range.ptr as usize).collect(),
         hosts, words.clone(), Duration::from_secs(1), Duration::ZERO, waves, rows * row_bytes)?;
     let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows)?;
-    let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
+    let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true };
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -1059,7 +1062,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         let buffers = echo.buffers.clone();
         echo.stagger = Duration::ZERO;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows)?;
-        let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
+        let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true };
         let stagger = Arc::new(AtomicUsize::new(0));
         let mut exchange = Waves::start(&library, intake, StaggerSwitch { echo, stagger: stagger.clone() }, Vec::new(),
             arenas, false)?;
@@ -1127,7 +1130,10 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         } else {
             ensure!(actual == expected, "the ordered pull's reduce differs from the reference");
         }
-        let (_, frames, _) = exchange.stop::<StaggerSwitch>()?;
+        ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+            "the exchange closes at rest: every wave landed and was consumed");
+        let (_, frames, result) = exchange.close::<StaggerSwitch>()?;
+        result?;
         drop(frames);
         stream.finish()?;
         // SAFETY: the event is idle (the stream drained).
@@ -1587,7 +1593,7 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
                 ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(),
                 Duration::ZERO, Duration::from_micros(stagger_us), slots, rows.div_ceil(2) * row_bytes)?;
             let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, rows)?;
-            let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
+            let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true };
             let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
             let _ = words.set(exchange.words());
             exchange.set_landing_route(route.clone());
@@ -1638,11 +1644,125 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
                 library.copy_d2h(&mut actual, output.buffer)?;
                 ensure!(actual == expected, "{route:?} ranks={ranks} landing={landing:#b} rows={rows} layer {layer} differs");
             }
-            let (_, frames, _) = exchange.stop::<EchoWorld>()?;
-            ensure!(frames.is_empty(), "a stopped exchange whose waves were all consumed holds no frames");
+            ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+                "the exchange closes at rest: every wave landed and was consumed");
+            let (_, frames, result) = exchange.close::<EchoWorld>()?;
+            result?;
+            ensure!(frames.is_empty(), "a closed exchange whose waves were all consumed holds no frames");
             eprintln!("host-ordered {route:?}: ranks={ranks} landing={landing:#b} slots={slots} rows={rows}: \
                 {total} layers byte-exact");
         }
+    }
+    Ok(())
+}
+
+/// Microseconds from the host storing a wave's landed word to the GPU
+/// holding `ranks` pinned frames of `frame_bytes` each, with the landing
+/// queued ahead behind a stream wait on that word (a device-ordered pass):
+/// `per_rank` launches one copy per rank (a wide wave's rank-by-rank
+/// landing), else one for all ranks. Median of `iterations`.
+fn device_ordered_landing_us(library: &NativeLibrary, ranks: usize, frame_bytes: usize, per_rank: bool,
+    route: &dyn Fn(&[*const cuteafd_ffi::peer_exchange::PullFrames], &[(*mut c_void, u64)],
+        &[(*mut c_void, *const c_void, u64)], *mut c_void) -> Result<()>, iterations: usize) -> Result<f64> {
+    use crate::shared::memory::DeviceAllocation;
+    use cuteafd_ffi::peer_exchange::{PullEntry, PullFrames};
+    let mut frames = (0..ranks).map(|_| HostAllocation::new(library, frame_bytes)).collect::<Result<Vec<_>>>()?;
+    for (rank, frame) in frames.iter_mut().enumerate() {
+        for (index, byte) in frame.bytes_mut().iter_mut().enumerate().step_by(4096) { *byte = (index + rank) as u8; }
+    }
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, frame_bytes)).collect::<Result<Vec<_>>>()?;
+    let mut block = HostAllocation::new(library, ranks * std::mem::size_of::<PullFrames>() + LINE)?;
+    let word = block.buffer.ptr.cast::<u8>().wrapping_add(ranks * std::mem::size_of::<PullFrames>()).cast::<u32>();
+    let replies: Vec<*const PullFrames> = (0..ranks).map(|rank|
+        block.buffer.ptr.cast::<PullFrames>().wrapping_add(rank).cast_const()).collect();
+    {
+        let descriptors = block.bytes_mut();
+        for (rank, frame) in frames.iter().enumerate() {
+            let mut reply = PullFrames { count: 1, ..Default::default() };
+            reply.frame[0] = PullEntry { source: frame.buffer.ptr as u64, offset: 0, bytes: frame_bytes as u64 };
+            // SAFETY: inside the descriptor block; PullFrames is plain old data.
+            unsafe { std::ptr::write_unaligned(descriptors[rank * std::mem::size_of::<PullFrames>()..].as_mut_ptr()
+                .cast::<PullFrames>(), reply) };
+        }
+    }
+    let targets: Vec<(*mut c_void, u64)> = planes.iter().map(|plane| (plane.buffer.ptr, frame_bytes as u64)).collect();
+    let regions: Vec<(*mut c_void, *const c_void, u64)> = planes.iter().zip(&frames)
+        .map(|(plane, frame)| (plane.buffer.ptr, frame.buffer.ptr.cast_const(), frame_bytes as u64)).collect();
+    let stream = crate::shared::spark_intake::WarmStream::new(library)?;
+    let done = library.cuda_event_create()?;
+    let mut samples = Vec::with_capacity(iterations);
+    for iteration in 0..iterations + 3 {
+        let sequence = iteration as u32 + 1;
+        // SAFETY: the word and descriptors live in the mapped block, frames and
+        // planes until the event completes, which each iteration waits for.
+        unsafe {
+            library.cuda_stream_wait_value32(stream.raw(), word, sequence)?;
+            if per_rank {
+                for rank in 0..ranks {
+                    route(&replies[rank..rank + 1], &targets[rank..rank + 1], &regions[rank..rank + 1], stream.raw())?;
+                }
+            } else {
+                route(&replies, &targets, &regions, stream.raw())?;
+            }
+            library.cuda_event_record(done, stream.raw())?;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+        let started = Instant::now();
+        // SAFETY: an aligned word of the mapped block, read by the queued wait.
+        unsafe { std::ptr::write_volatile(word, sequence) };
+        // SAFETY: a live event recorded above.
+        while !unsafe { library.cuda_event_query(done)? } { std::hint::spin_loop(); }
+        if iteration >= 3 { samples.push(started.elapsed().as_secs_f64() * 1e6); }
+        if iteration == 0 {
+            for (plane, frame) in planes.iter().zip(&frames) {
+                let mut landed = vec![0u8; frame_bytes];
+                library.copy_d2h(&mut landed, plane.buffer)?;
+                ensure!(landed == frame.bytes()[..frame_bytes], "a device-ordered landing route landed other bytes");
+                library.cuda_zero_bytes(plane.buffer, frame_bytes)?;
+            }
+        }
+    }
+    // SAFETY: idle; every record completed.
+    unsafe { library.cuda_event_destroy(done)?; }
+    stream.finish()?;
+    samples.sort_by(f64::total_cmp);
+    Ok(samples[samples.len() / 2])
+}
+
+/// Device-ordered landings on this host: the SM pull (each block reads its
+/// rank's descriptor once) against an SM copy of the frames with their
+/// addresses as kernel arguments (no descriptor reads: the ceiling), both
+/// queued behind the wait a device-ordered pass queues. Decode and verify
+/// waves land every rank in one launch; a prefill unit's wide wave lands rank
+/// by rank (one launch each).
+#[test]
+#[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY); measures this host's device-ordered landings"]
+fn device_ordered_landing_on_this_host() -> Result<()> {
+    let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
+    // SAFETY: the opt-in path names the built native library for this GPU.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    library.peer_exchange_initialize()?;
+    let pull = |replies: &[*const cuteafd_ffi::peer_exchange::PullFrames], targets: &[(*mut c_void, u64)],
+        _: &[(*mut c_void, *const c_void, u64)], stream: *mut c_void| unsafe { library.pull_frames(replies, targets, stream) };
+    let by_value = |_: &[*const cuteafd_ffi::peer_exchange::PullFrames], _: &[(*mut c_void, u64)],
+        regions: &[(*mut c_void, *const c_void, u64)], stream: *mut c_void| -> Result<()> {
+        for chunk in regions.chunks(4) { unsafe { library.sm_copy_regions(chunk, stream)?; } }
+        Ok(())
+    };
+    eprintln!("| Wave | Landing | SM pull us | By-value SM copy us |\n|---|---|---:|---:|");
+    for rows in [1usize, 6, 8, 24] {
+        let bytes = rows * 10240;
+        let (a, b) = (device_ordered_landing_us(&library, 4, bytes, false, &pull, 100)?,
+            device_ordered_landing_us(&library, 4, bytes, false, &by_value, 100)?);
+        eprintln!("| {} KiB ({rows} rows x 4 ranks) | one launch | {a:.1} | {b:.1} |", bytes * 4 >> 10);
+    }
+    for rows in [256usize, 2752] {
+        let bytes = rows * 10240;
+        let (a, b) = (device_ordered_landing_us(&library, 4, bytes, true, &pull, 12)?,
+            device_ordered_landing_us(&library, 4, bytes, true, &by_value, 12)?);
+        eprintln!("| {:.1} MiB ({rows} rows x 4 ranks) | rank by rank | {a:.1} ({:.1} GB/s) | {b:.1} ({:.1} GB/s) |",
+            (bytes * 4) as f64 / (1 << 20) as f64, (bytes * 4) as f64 / a / 1e3, (bytes * 4) as f64 / b / 1e3);
     }
     Ok(())
 }

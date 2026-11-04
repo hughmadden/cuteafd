@@ -1,4 +1,5 @@
-"""An sm_89 coordinator slot carries DeepSeek V4.1's SM89 exports, made on an SM89 GPU."""
+"""An sm_89 coordinator slot carries DeepSeek V4.1's SM89 exports, compiled offline
+on the build host with no GPU; SM120 exports keep their GPU turn."""
 import os
 import subprocess
 from pathlib import Path
@@ -37,24 +38,22 @@ def test_unknown_coordinator_arch_is_refused_before_any_operation():
     assert 'echo "  coordinator arch: sm_$wip_coordinator_arch"' in WIP
 
 
-def _tools(tmp_path, caps=None):
-    """docker records its calls; ssh answers nvidia-smi with CAPS (exit 255 when None)."""
+def _tools(tmp_path):
+    """docker and ssh record their calls; nothing here may reach an export host."""
     tools = tmp_path / 'tools'
     tools.mkdir()
-    ssh = ('printf "ssh %s\\n" "$*" >> "$TRACE"\n'
-           + ('exit 255\n' if caps is None else f'printf "{caps}"\n'))
     for name, body in {'docker': 'printf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
-                       'ssh': ssh}.items():
+                       'ssh': 'printf "ssh %s\\n" "$*" >> "$TRACE"\nexit 255\n'}.items():
         (tools / name).write_text('#!/bin/sh\n' + body)
         (tools / name).chmod(0o755)
     return {'PATH': f'{tools}:{os.environ["PATH"]}', 'TRACE': str(tmp_path / 'trace')}
 
 
 def _modes():
-    return WIP[WIP.index('# wip_export_host_is_sm89 HOST'):WIP.index('\n# wip_remote_export:')]
+    return WIP[WIP.index('# Try a configured remote exporter first'):WIP.index('\n# wip_remote_export:')]
 
 
-def _build_coordinator(tmp_path, arch, host='', caps=None):
+def _build_coordinator(tmp_path, arch, **env):
     function = WIP[WIP.index('build_coordinator() {'):WIP.index('\nbuild_expert() (')]
     script = f'''set -euo pipefail
 repo_root={str(ROOT)!r}
@@ -66,18 +65,23 @@ native_store_has() {{ return 1; }}
 wip_capped_export() {{ printf "capped %s\\n" "$*" >> "$TRACE"; }}
 wip_remote_export() {{ printf "remote\\n" >> "$TRACE"; return 75; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-wip_export_locks=on wip_coordinator_arch={arch} CUTEAFD_EXPORT_HOST={host}
+wip_export_locks=on wip_coordinator_arch={arch}
 ''' + _modes() + function + '\nbuild_coordinator\n'
-    env = _tools(tmp_path, caps)
-    result = _run(script, env)
+    tools = _tools(tmp_path)
+    defaults = {'CUTEAFD_EXPORT_HOST': '', 'CUTEAFD_WIP_COORDINATOR_EXPORT': 'auto', 'CUTEAFD_WIP_BUILD_SLOT': 'off'}
+    result = _run(script, {**tools, **defaults, **env})
     assert result.returncode == 0, result.stdout + result.stderr
-    return result, Path(env['TRACE']).read_text().splitlines()
+    return result, Path(tools['TRACE']).read_text().splitlines()
 
 
-@pytest.mark.parametrize('arch', ['120', '89'])
-def test_native_phase_takes_the_export_gpu_turn_for_its_own_arch(tmp_path, arch):
-    result, lines = _build_coordinator(tmp_path, arch)
-    command = f'/wip/source/scripts/build/build-wip-artifacts.sh /wip/source coordinator {arch} /wip/build/coordinator /wip/output/coordinator'
+def _command(arch):
+    return (f'/wip/source/scripts/build/build-wip-artifacts.sh /wip/source coordinator {arch} '
+            '/wip/build/coordinator /wip/output/coordinator')
+
+
+def test_sm120_native_phase_takes_the_export_gpu_turn(tmp_path):
+    result, lines = _build_coordinator(tmp_path, '120')
+    command = _command('120')
     rust = next(line for line in lines if line.startswith('docker exec') and line.endswith(command + ' rust'))
     assert 'CUTEAFD_WIP_EXPORT_LOCKS=off' in rust
     # The native phase runs only inside the capped GPU turn, with this arch's command.
@@ -87,33 +91,40 @@ def test_native_phase_takes_the_export_gpu_turn_for_its_own_arch(tmp_path, arch)
     assert 'done by capped' in result.stdout and not any(line.startswith('ssh ') for line in lines)
 
 
-@pytest.mark.parametrize('caps,remote', [('12.0\\n', False), (None, False), ('8.9\\n12.0\\n', False),
-                                         ('8.9\\n8.9\\n', True)])
-def test_sm89_export_uses_a_remote_host_only_when_it_is_sm89(tmp_path, caps, remote):
-    result, lines = _build_coordinator(tmp_path, '89', host='maxq', caps=caps)
-    assert any(line.startswith('ssh ') and 'compute_cap' in line for line in lines)
-    assert ('remote' in lines) == remote
-    assert ('not an SM89 export host' in result.stderr) != remote
-    assert 'done by capped' in result.stdout
-
-
 def test_sm120_export_host_is_used_without_an_arch_probe(tmp_path):
-    result, lines = _build_coordinator(tmp_path, '120', host='maxq', caps='12.0\\n')
+    result, lines = _build_coordinator(tmp_path, '120', CUTEAFD_EXPORT_HOST='maxq')
     assert lines.count('remote') == 1 and not any(line.startswith('ssh ') for line in lines)
     assert 'done by capped' in result.stdout
 
 
-@pytest.mark.parametrize('arch,host,caps,refused', [
-    ('89', '', None, True), ('89', 'maxq', '12.0\\n', True), ('89', 'ada', '8.9\\n', False),
-    ('120', '', None, False)])
-def test_remote_only_mode_needs_an_sm89_host_for_sm89(tmp_path, arch, host, caps, refused):
-    script = ('release_die() { echo "DIE $*"; exit 9; }\n' + _modes()
-              + f'\nCUTEAFD_WIP_COORDINATOR_EXPORT=remote CUTEAFD_EXPORT_HOST={host} wip_coordinator_export_modes {arch}\n')
-    result = _run(script, _tools(tmp_path, caps))
-    if refused:
-        assert result.returncode == 9 and 'needs an SM89 export host' in result.stdout
-    else:
-        assert result.returncode == 0 and result.stdout.split() == ['remote', 'wait-remote']
+@pytest.mark.parametrize('setting,host', [('auto', ''), ('auto', 'maxq'), ('capped', 'maxq'),
+                                          ('remote', 'maxq'), ('remote', '')])
+def test_sm89_native_phase_compiles_here_with_no_gpu_turn_or_export_host(tmp_path, setting, host):
+    result, lines = _build_coordinator(tmp_path, '89', CUTEAFD_WIP_COORDINATOR_EXPORT=setting,
+                                       CUTEAFD_EXPORT_HOST=host)
+    command = _command('89')
+    # Offline exports need no GPU: the native phase runs in the WIP container like
+    # the Rust phase, never in a capped GPU turn, a remote export or a host probe.
+    native = [line for line in lines if line.endswith(command + ' native')]
+    assert len(native) == 1 and native[0].startswith('docker exec ') and 'NATIVE_REQUIRE_HIT' not in native[0]
+    assert 'CUTEAFD_WIP_EXPORT_LOCKS=off' in native[0]
+    assert not any(line.startswith(('capped', 'remote', 'ssh ')) for line in lines), lines
+    assert 'sm_89 compiles offline here, no GPU turn' in result.stdout and 'done by' not in result.stdout
+
+
+def test_sm89_native_phase_takes_a_build_slot_when_asked(tmp_path):
+    # The real scripts/build/build-slot.sh, on the session's private lock directory.
+    assert os.environ['CUTEAFD_LOCK_DIR'] != str(Path.home() / '.cache/cuteafd')
+    result, lines = _build_coordinator(tmp_path, '89', CUTEAFD_WIP_BUILD_SLOT='on')
+    slotted = [line for line in result.stderr.splitlines() if line.startswith('build slot ')]
+    assert [line.rsplit(' ', 1)[1] for line in slotted] == ['rust', 'native'], result.stderr
+    assert sum(line.endswith(_command('89') + ' native') for line in lines) == 1
+    assert not any(line.startswith(('capped', 'remote', 'ssh ')) for line in lines)
+
+
+def test_no_export_routing_probes_for_sm89_hosts():
+    assert 'compute_cap' not in WIP and 'wip_export_host_is_sm89' not in WIP
+    assert 'for mode in $(wip_coordinator_export_modes); do' in WIP
 
 
 SWITCHES = ['v41_candidate_aot', 'exl3_aot', 'nvfp4_aot', 'audio_aot', 'exlr8_aot']

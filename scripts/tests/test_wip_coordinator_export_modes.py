@@ -95,7 +95,9 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     assert 'sm-check' not in remote and 'sm-check' not in (ROOT / 'scripts/build/export-placement.py').read_text()
 
 
-@pytest.mark.parametrize('arch', ['120', '89'])
+# SM120 only: an sm_89 build takes no GPU turn and no remote export
+# (test_wip_coordinator_arch.py).
+@pytest.mark.parametrize('arch', ['120'])
 def test_capped_export_runs_the_native_phase_in_a_one_off_container_on_the_held_gpu(tmp_path, arch):
     trace = tmp_path / 'trace'
     locks = tmp_path / 'locks'
@@ -135,7 +137,7 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     assert 'capped on gpu1' in result.stdout
 
 
-@pytest.mark.parametrize('arch', ['120', '89'])
+@pytest.mark.parametrize('arch', ['120'])
 def test_remote_export_exports_the_keys_architecture(tmp_path, arch):
     repo = tmp_path / 'repo'
     (repo / 'scripts/build').mkdir(parents=True)

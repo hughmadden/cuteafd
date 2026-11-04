@@ -812,8 +812,6 @@ pub(crate) struct Intake {
     /// ([`cuteafd_transport::DeviceLanding::placed`]). False keeps a legacy
     /// rotating landing.
     pub placed: bool,
-    /// The slot the transport's next wave lands in (a rotating landing's phase).
-    pub next_slot: usize,
 }
 
 impl Intake {
@@ -1239,7 +1237,7 @@ impl<'a> Waves<'a> {
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, staging, landing,
             _pull_block: pull_block, pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
-            next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
+            next_slot: 0, geometry: intake.geometry, sequence: 0,
             outstanding: VecDeque::new(), grouping })
     }
 
@@ -1593,21 +1591,6 @@ impl<'a> Waves<'a> {
 
     /// Return slots of the current cut.
     pub(crate) fn waves(&self) -> usize { self.geometry.cut().waves }
-
-    /// Stops the worker and returns the transport (after a failure, with its
-    /// waves abandoned) and the slot its next wave lands in. Every sent wave
-    /// must have been landed and consumed, and the consuming streams drained.
-    pub(crate) fn stop<T: Transport>(mut self) -> Result<(T, Vec<T::Frame>, usize)> {
-        ensure!(self.outstanding.is_empty() && self.unread.iter().all(|unread| !unread),
-            "Spark exchange stopped with waves not landed and consumed");
-        drop(self.jobs.take());
-        let worker = self.worker.take().context("Spark exchange already stopped")?;
-        let (transport, result) = worker.join().map_err(|_| anyhow::anyhow!("Spark exchange worker panicked"))?;
-        result?;
-        let (transport, frames) = *transport.downcast::<(T, Vec<T::Frame>)>()
-            .map_err(|_| anyhow::anyhow!("Spark exchange transport type differs"))?;
-        Ok((transport, frames, self.next_slot))
-    }
 
     /// Terminal teardown (#784): closes the worker and returns its transport
     /// whatever state the exchange is in (at rest, failed, or with waves the

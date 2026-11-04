@@ -183,8 +183,9 @@ if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" == on ]]; then
   # lease and Cargo build slot have been released.
 fi
 # The coordinator's CUDA architecture: 120 (RTX 5090, RTX PRO 6000; default) or
-# 89 (RTX 4090 class), whose slot carries DeepSeek V4.1's SM89 exports. Exports
-# compile for the GPU they run on: a local SM89 card, or an SM89 export host.
+# 89 (RTX 4090 class), whose slot carries DeepSeek V4.1's SM89 exports. SM120
+# exports compile for the GPU they run on; SM89 exports compile on b12x's
+# offline SM89 target, on this host with no GPU.
 wip_coordinator_arch="${CUTEAFD_WIP_COORDINATOR_ARCH:-120}"
 [[ "$wip_coordinator_arch" == 120 || "$wip_coordinator_arch" == 89 ]] ||
   release_die "CUTEAFD_WIP_COORDINATOR_ARCH must be 120 or 89"
@@ -1200,32 +1201,14 @@ native_store_has() {
 wip_seed_lock() {
   case "$1" in rhea|moa) printf '%s\n' "$1" ;; *) release_is_lan_seed "$1" && printf '%s\n' "$1" || printf 'sparks\n' ;; esac
 }
-# wip_export_host_is_sm89 HOST: HOST reports GPUs and every one is compute 8.9;
-# a host that cannot be asked is not one.
-wip_export_host_is_sm89() {
-  local caps
-  caps="$(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" \
-    nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' \r')" || return 1
-  [[ -n "$caps" ]] && ! grep -qvx '8\.9' <<<"$caps"
-}
 # Try a configured remote exporter first, then queue one capped local turn.
 # Dispatch runs only after the Spark lease and Cargo build slot are released.
-# ARCH (default 120) is the coordinator's. Exports compile for the GPU they run
-# on and export hosts are SM120, so an sm_89 export goes remote only to a host
-# whose GPUs are all SM89.
+# SM120 only: an sm_89 export needs no GPU and compiles here (build_coordinator).
 wip_coordinator_export_modes() {
-  local arch="${1:-120}" host="${CUTEAFD_EXPORT_HOST:-}"
-  if [[ "$arch" == 89 && -n "$host" ]] && ! wip_export_host_is_sm89 "$host"; then
-    echo "WIP coordinator export: $host is not an SM89 export host; the sm_89 export stays local" >&2
-    host=
-  fi
   case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
-    auto) [[ -z "$host" ]] || printf 'remote ' ; printf 'capped\n' ;;
-    capped) [[ -z "$host" ]] || printf 'remote ' ; printf 'capped\n' ;;
-    remote)
-      [[ "$arch" != 89 || -n "$host" ]] ||
-        release_die "CUTEAFD_WIP_COORDINATOR_EXPORT=remote needs an SM89 export host for an sm_89 coordinator"
-      printf 'remote wait-remote\n' ;;
+    auto) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
+    capped) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
+    remote) printf 'remote wait-remote\n' ;;
     *) release_die "CUTEAFD_WIP_COORDINATOR_EXPORT must be auto, remote or capped" ;;
   esac
 }
@@ -1326,7 +1309,7 @@ wip_capped_export_on() (
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   # The coordinator's CUDA architecture (CUTEAFD_WIP_COORDINATOR_ARCH, validated
-  # at startup): its native phase exports for that GPU.
+  # at startup): its native phase exports for it, SM120 on a GPU, sm_89 offline.
   local phase="${1:-all}" coordinator_arch="${wip_coordinator_arch:-120}"
   [[ "$phase" == native ]] || sync_local_source
   local image_id image_layers
@@ -1381,8 +1364,8 @@ build_coordinator() {
   # Cargo first, holding no hardware; then the bounded native/AOT export.
   # A native-cache hit restores verified outputs without touching a GPU.
   # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
-  # build.lock) only while Cargo runs, when the caller asks (wip-cards does);
-  # the GPU export, reuse and staging hold none.
+  # build.lock) only while Cargo or an sm_89 native phase runs, when the caller
+  # asks (wip-cards does); the SM120 GPU export, reuse and staging hold none.
   local rust_status=0 attempt
   # One retry: a coordinator Rust exec has twice reported 127 although the phase
   # inside the container completed (open issue). The phase is idempotent and a
@@ -1411,11 +1394,23 @@ build_coordinator() {
     # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
     docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
+  elif [[ "$coordinator_arch" == 89 ]]; then
+    # sm_89 exports compile on b12x's offline SM89 target with CUDA hidden
+    # (native/CMakeLists.txt): a compile like Cargo's, in this WIP container,
+    # with no GPU lock, GPU turn or export host.
+    echo "WIP coordinator export: sm_89 compiles offline here, no GPU turn"
+    local native_status=0
+    if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
+      "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" native || native_status=$?
+    else
+      "${coordinator_build[@]}" native || native_status=$?
+    fi
+    ((native_status == 0)) || release_die "coordinator WIP native phase failed (exit $native_status)"
   else
     # Remote first when configured; otherwise take one bounded fair GPU turn.
     # The seed lease and Cargo slot are already released before this phase.
     local mode exported=0
-    for mode in $(wip_coordinator_export_modes "$coordinator_arch"); do
+    for mode in $(wip_coordinator_export_modes); do
       case "$mode" in
         remote) wip_remote_export && exported=1 ;;
         capped) wip_capped_export "${coordinator_build[@]}" && exported=1 ;;
