@@ -476,6 +476,7 @@ pub(super) fn resolve(
 
 /// `startup` contains full sequential peaks above `memory`, never staging-only
 /// deltas. Draft owners supplied separately must not also appear in `owners`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_with_owners(
     args: &crate::cli::NativeServeArgs,
     memory: &[(usize, usize)],
@@ -486,6 +487,46 @@ pub(super) fn resolve_with_owners(
     owners: &[Demand],
     startup: &[Demand],
     draft: Option<&families::deepseek_v41::DraftInventory>,
+) -> Result<Admitted> {
+    resolve_tiered(args, memory, experts, workspace, deferred, minimum, owners, startup, draft, None)
+}
+
+/// `--gpu-expert-tier` as serving asks the solver for it: the planner's own
+/// [`families::deepseek_v41::TierChoice`] over the checkpoint's routed shape,
+/// so serving admits the resident set `cuteafd plan --layout` shows.
+pub(crate) struct TierAsk {
+    choice: families::deepseek_v41::TierChoice,
+    inputs: families::deepseek_v41::TierInputs,
+    experts: usize,
+}
+
+impl TierAsk {
+    /// `None` when the tier is off (a profile without one is refused).
+    pub(crate) fn of(args: &crate::cli::NativeServeArgs, catalog: &cuteafd_loader::OfficialV41Catalog)
+        -> Result<Option<Self>> {
+        let choice = families::deepseek_v41::TierChoice { setting: args.gpu_expert_tier,
+            profile: args.gpu_expert_tier_profile.clone(), model: TierStepModel::default() };
+        let routed = catalog.routed_experts();
+        Ok(choice.inputs(routed.routed_layers(), routed.experts, routed.topk as u32)?
+            .map(|inputs| Self { choice, inputs, experts: routed.experts }))
+    }
+}
+
+/// [`resolve_with_owners`], with the GPU expert tier `tier` in place of
+/// whole-layer onboarding (its TP2 halves on both GPUs, admitted after the
+/// pool as `cuteafd plan` admits them); `minimum` is then 0.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_tiered(
+    args: &crate::cli::NativeServeArgs,
+    memory: &[(usize, usize)],
+    experts: Vec<ExpertCost>,
+    workspace: u64,
+    deferred: &[u64],
+    minimum: usize,
+    owners: &[Demand],
+    startup: &[Demand],
+    draft: Option<&families::deepseek_v41::DraftInventory>,
+    tier: Option<&TierAsk>,
 ) -> Result<Admitted> {
     use cuteafd_core::memory_layout::{Basis, Category};
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
@@ -599,6 +640,11 @@ pub(super) fn resolve_with_owners(
         req.movables.push(families::deepseek_v41::drafter(draft, ranks)?);
     }
     req.minimum_expert_layers = minimum;
+    if let Some(tier) = tier {
+        ensure!(ranks == 2 && minimum == 0,
+            "the GPU expert tier runs TP2 halves on two RTX GPUs, with no mandatory whole-layer prefix");
+        tier.choice.apply(&mut req, &tier.inputs, Some(onboard), tier.experts)?;
+    }
     let config = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
     families::deepseek_v41::cache_demands(
         &mut req,
@@ -613,6 +659,13 @@ pub(super) fn resolve_with_owners(
         placement.onboard_layers >= minimum,
         "mandatory V4.1 expert prefix does not fit"
     );
+    if tier.is_some() {
+        // The tier's arena also holds the TP2 FFN workspace: an empty tier
+        // would leave it unadmitted.
+        ensure!(placement.expert_tier.as_ref().is_some_and(|placed| placed.experts > 0
+                && placed.shard == ExpertTierShard::Tp2 && placement.onboard_layers == 0),
+            "the GPU expert tier admitted no experts beside the pool: lower the pool or use --gpu-expert-tier off");
+    }
     let groups = usize::try_from(placement.pool_tokens.div_ceil(512) + tails)?;
     let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
         &config,
@@ -919,6 +972,75 @@ mod admission_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// `--gpu-expert-tier` admits what `cuteafd plan --layout
+    /// --gpu-expert-tier` plans (one shared request): at an exact size the
+    /// same resident experts per layer at the same bytes per GPU, in place of
+    /// whole layers, its arena holding the TP2 FFN workspace, both decode
+    /// lanes' slot tables and one expert's staging; automatic tiers are
+    /// prefixes of one order; `--rtx-expert-layers N` pins N whole layers in
+    /// it. It refuses one RTX, a mandatory prefix and a tier that fits nothing.
+    #[test]
+    fn gpu_expert_tier_admits_the_plans_resident_set() -> Result<()> {
+        use crate::shared::experts::layer::tp2_half_tests::{expert_fixture, planned_bytes};
+        use cuteafd_core::memory_layout::Category;
+        use families::deepseek_v41::{expert_inventory, owners::DECODE_LANE_ROWS, tier_lane_bytes};
+        let (_dir, catalog) = expert_fixture()?;
+        let snapshot = catalog.snapshot().to_path_buf();
+        let (experts, ffn) = expert_inventory(&catalog, &snapshot.join("share/PROGRAMS.json"), 256, 2, 128, 2, 512,
+            DECODE_LANE_ROWS)?;
+        let workspace = ffn + 2 * tier_lane_bytes(40, 384, DECODE_LANE_ROWS);
+        let card = ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89) as usize;
+        let memory = vec![(card - (4 << 30), card); 2];
+        let serve = |tier: &str, layers: &str, memory: &[(usize, usize)], experts: Vec<ExpertCost>, minimum: usize|
+            -> Result<Admitted> {
+            let mut args = args(&snapshot);
+            args.peers = vec![args.peers[0].clone(); 4];
+            args.rtx_gpus = memory.len() as u32;
+            args.max_context_tokens = 262_144;
+            args.gpu_expert_tier = tier.parse().map_err(anyhow::Error::msg)?;
+            args.rtx_expert_layers = layers.parse()?;
+            let ask = TierAsk::of(&args, &catalog)?.context("the tier is on")?;
+            resolve_tiered(&args, memory, experts, workspace, &vec![0; memory.len()], minimum, &[], &[], None, Some(&ask))
+        };
+        let planned = |setting| -> Result<ExpertTierPlacement> {
+            planned_bytes(&snapshot, false, setting)?.solver_placement.and_then(|placement| placement.expert_tier)
+                .context("the plan admitted no tier")
+        };
+        let exact = serve("6", "auto", &memory, experts.clone(), 0)?;
+        let tier = exact.placement.expert_tier.as_ref().context("serve admitted no tier")?;
+        let plan = planned(ExpertTierSetting::PerLayer(6))?;
+        assert_eq!((tier.experts, tier.shard, exact.placement.onboard_layers), (240, ExpertTierShard::Tp2, 0));
+        assert!(exact.placement.tp2.is_none());
+        assert_eq!(tier.resident, plan.resident, "serve and plan admit different experts");
+        assert_eq!(tier.resident_bytes, plan.resident_bytes);
+        for gpu in 0..2 {
+            let staging = experts.iter().zip(&tier.resident).filter(|(_, ids)| !ids.is_empty())
+                .map(|(cost, _)| cost.half[gpu].staging).max().unwrap_or(0);
+            assert_eq!(tier.peak_bytes[gpu], workspace + tier.resident_bytes[gpu] + staging, "GPU {gpu} tier arena");
+            assert_eq!(exact.placement.items[gpu].iter().filter(|item| item.category == Category::Experts)
+                .map(|item| item.bytes).sum::<u64>(), tier.peak_bytes[gpu], "GPU {gpu} charges the tier arena alone");
+        }
+        // Automatic tiers are prefixes of one ranked order.
+        let auto = serve("auto", "auto", &memory, experts.clone(), 0)?.placement.expert_tier.context("auto tier")?;
+        let plan = planned(ExpertTierSetting::Auto)?;
+        let (small, large) = if auto.experts <= plan.experts { (&auto, &plan) } else { (&plan, &auto) };
+        assert!(small.experts > 0 && small.resident.iter().zip(&large.resident)
+            .all(|(a, b)| a.iter().all(|id| b.contains(id))), "automatic tiers are not prefixes of one order");
+        // Pinned whole layers lead the tier.
+        let pinned = serve("40", "2", &memory, experts.clone(), 0)?.placement;
+        let pinned = pinned.expert_tier.context("pinned tier")?;
+        assert_eq!((pinned.resident[0].len(), pinned.resident[1].len(), pinned.whole_layers), (384, 384, 2));
+        // Refused: one RTX, a mandatory prefix, a tier that fits no expert.
+        let one = serve("6", "auto", &memory[..1], experts.clone(), 0).map(|_| ()).unwrap_err().to_string();
+        assert!(one.contains("two RTX"), "{one}");
+        assert!(serve("6", "auto", &memory, experts.clone(), 1).is_err());
+        let huge = experts.iter().map(|cost| ExpertCost { half: cost.half.map(|half|
+            Bytes2 { resident: 384 * (64 << 30), ..half }), ..*cost }).collect();
+        let empty = serve("auto", "auto", &memory, huge, 0).map(|_| ()).unwrap_err().to_string();
+        assert!(empty.contains("admitted no experts"), "{empty}");
         Ok(())
     }
 

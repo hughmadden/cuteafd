@@ -297,6 +297,18 @@ fn spread_residency() -> Result<TierResidency> {
         else { (0..384u16).filter(|expert| (expert + layer) % 7 == 0).collect() }).collect())
 }
 
+/// A lane's tables and slots are what the planner charges per lane
+/// (`tier_lane_bytes`), at every width the lanes run.
+#[test]
+fn tier_lane_allocations_are_the_planned_lane_bytes() -> Result<()> {
+    let residency = spread_residency()?;
+    for rows in [1u32, 6, 64, 2752, 4096] {
+        assert_eq!(TierLane::table_bytes(&residency, rows) as u64,
+            cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(40, 384, u64::from(rows)));
+    }
+    Ok(())
+}
+
 fn tiered_planner(residency: &Arc<TierResidency>)
     -> Result<std::sync::Mutex<super::super::coordinator::ReplicatedGroupPlanner>> {
     let mut planner = super::super::coordinator::ReplicatedGroupPlanner::new(
