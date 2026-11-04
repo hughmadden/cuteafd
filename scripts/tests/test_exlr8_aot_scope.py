@@ -185,12 +185,7 @@ def test_cmake_spark_programs_are_the_union_of_the_enabled_spark_needs():
     assert 'SM121 builds only the Spark programs' in cmake
     assert '--exlr8-family "${exlr8_families}")' in cmake
     top = (ROOT / 'native/CMakeLists.txt').read_text()
-    # Expert AOT builds the table for its reply codecs, except on an sm_89
-    # coordinator (V4.1 only), which has no exporter for it.
-    gate = ('CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR '
-            'CUTEAFD_PARTIAL_REPLY_PROGRAMS OR ((CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR '
-            'CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES) AND NOT '
-            'CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89"))')
+    gate = 'CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)'
     assert top.count(gate) == 2  # include + link
     assert 'set(CUTEAFD_PARTIAL_REPLY_FAMILIES muse)' in top
     assert 'CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
@@ -245,6 +240,15 @@ def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_KIMIK3_AOT='ON', CUTEAFD_ENABLE_GLM_AOT='ON')
     assert fields['GEOMETRY'] == 'glm,glm2,kimik3,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
+    # An sm_89 coordinator (V4.1) builds only the Spark reply reducers; table
+    # families, EXLR8 and partial replies stay SM120's.
+    fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89', CUTEAFD_ENABLE_V41_EXPERT_AOT='ON')
+    assert fields['GEOMETRY'] == 'expert_reply' and fields['ROLE'] == 'coordinator'
+    for flag in ('CUTEAFD_ENABLE_DSV4_AOT', 'CUTEAFD_ENABLE_GLM_AOT', 'CUTEAFD_ENABLE_EXLR8_AOT',
+                 'CUTEAFD_PARTIAL_REPLY_PROGRAMS'):
+        fields, error = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89',
+                                          CUTEAFD_ENABLE_V41_EXPERT_AOT='ON', **{flag: 'ON'})
+        assert fields is None and 'an sm_89 coordinator only the Spark reply reducers' in ' '.join(error.split()), flag
 
 
 def test_exporter_forwards_role_to_the_fork_and_appends_last():

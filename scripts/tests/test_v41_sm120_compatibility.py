@@ -186,6 +186,7 @@ inline void runtime_launch(void** args, int count) {
  assert(count==5); recorded_sms=*static_cast<int32_t*>(args[2]);
  *static_cast<int32_t*>(args[4])=0;
 }
+#define CUTEAFD_DSV4_CC_MAJOR 12
 #define CUTEAFD_DSV4_CC_MINOR 0
 #define CUTEAFD_DSV4_PROGRAMS \
  {"flash",counted_init,load,noop,1,"i",188}, \
@@ -244,6 +245,10 @@ int main() {
  attribute_error=0;
  override_sms=0; minor=1;
  assert(cuteafd_dsv4_program_load(5)==cudaErrorNoKernelImageForDevice);
+ // The table's major is checked too (an sm_89 table on SM120, or the reverse).
+ minor=0; major=8;
+ assert(cuteafd_dsv4_program_load(5)==cudaErrorNoKernelImageForDevice);
+ major=12;
 }
 '''.replace("SOURCE", str(ROOT / "native/shared/src/dsv4_programs.cc")))
         subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),

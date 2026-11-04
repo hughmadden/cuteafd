@@ -58,13 +58,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         ensure!(topology.is_some(), "--gpu-expert-tier needs an owned Spark topology: pass --spark-tp and --spark-ep");
         ensure!(catalog.nvfp4().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none(),
             "the GPU expert tier holds native MXFP4 expert halves");
-        // The tier's result is one more BF16 plane in the reply reduction,
-        // which only the native BF16 reducer takes; compressed replies reduce
-        // in the fused codec (`spark_waves::ReplyReduction::launch_with`).
-        ensure!(cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
-            == cuteafd_core::SparkReplyFormat::Bf16,
-            "--gpu-expert-tier needs BF16 Spark replies (SPARK_REPLY_FORMAT=bf16): compressed replies reduce in \
-            the fused reply codec, which has no GPU expert tier plane");
     }
     crate::shared::spark_topology::require_world(spark_world, &catalog,
         &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;

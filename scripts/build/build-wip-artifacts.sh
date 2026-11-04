@@ -99,7 +99,9 @@ v41_hc_lagged_aot="$coordinator_aot"
 # scheduling is unqualified on SM89) except the lagged mHC export, which SM89
 # lists in its manifest but does not serve (its own boundary is native), NVFP4
 # W4A4 experts (FP4 MMA is SM120), and every other family's programs and expert
-# packages, EXL3, EXLR8, vision and audio, which have no SM89 exporters.
+# packages, EXL3, EXLR8, vision and audio, which have no SM89 exporters. Its
+# coordinator program table (PROGRAMS.json) holds only the Spark reply reducers
+# (`expert_reply`), for compressed SPARK_REPLY_FORMAT replies.
 # `cuteafd plan --coordinator-arch sm_89` names what is missing.
 if [[ "$role" == coordinator && "$cuda_arch" == 89 ]]; then
   v41_candidate_aot=OFF exl3_aot=OFF nvfp4_aot=OFF audio_aot=OFF exlr8_aot=OFF

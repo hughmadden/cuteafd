@@ -64,9 +64,10 @@ V41_CAPACITIES = ",".join(map(str, _v41.TARGET_CAPACITIES))
 # The groups an sm_89 coordinator build exports (native CMake with
 # CUTEAFD_CUDA_ARCHITECTURES=89). Its narrow FP8 plans stay off; the lagged mHC
 # begin is exported for the manifest's inventory (build-wip-artifacts.sh's
-# v41_hc_lagged_aot). The target is every supported SM89 card.
+# v41_hc_lagged_aot), and its program table holds only the Spark reply
+# reducers (expert-reply). The target is every supported SM89 card.
 SM89_GROUPS = ("v41-fp8", "v41-experts", "v41-index", "v41-router",
-               "v41-slices-rtx_backbone", "v41-slices-rtx_tp2", "v41-slices-dspark_tp2")
+               "v41-slices-rtx_backbone", "v41-slices-rtx_tp2", "v41-slices-dspark_tp2", "expert-reply")
 ARCHES = {"sm120": {"sms": (188, 170)}, "sm89": {"sms": (128, 114), "capability": [8, 9]}}
 SM89_VARIATION = ROOT / "scripts/build/sm89-export-variation.json"
 SUPPORTED_CAPABILITIES = ([12, 0], [12, 1], [8, 9])

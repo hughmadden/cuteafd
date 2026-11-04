@@ -126,6 +126,26 @@ pub(crate) fn single_reply_eligible(rows: usize, kind: cuteafd_transport::Expert
 
 fn compressed_reduction(eligible: bool, available: bool) -> bool { eligible && available }
 
+/// The fused compressed-reply reducers: `expert_reply_reduce` decodes each
+/// rank's wire plane, rounds it to BF16, and sums the ranks in order in FP32
+/// with shared, rounded once; `expert_reply_reduce_tier` adds one more BF16
+/// plane, a GPU expert tier's result, after the ranks and before shared, as
+/// the BF16 reducer does.
+pub(crate) struct FusedReplyReduce<'a> {
+    ranks: cuteafd_ffi::programs::BoundProgram<'a>,
+    tier: cuteafd_ffi::programs::BoundProgram<'a>,
+}
+impl<'a> FusedReplyReduce<'a> {
+    pub(crate) fn bind(library: &'a NativeLibrary) -> Result<Self> {
+        let programs = library.programs()?;
+        const PLANES: [&str; MAX_INTAKE_RANKS] = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"];
+        Ok(Self {
+            ranks: programs.bound("expert_reply_reduce", &[&PLANES[..], &["shared", "out", "mode"]].concat())?,
+            tier: programs.bound("expert_reply_reduce_tier", &[&PLANES[..], &["tier", "shared", "out", "mode"]].concat())?,
+        })
+    }
+}
+
 /// Slot-owned reply reduction binding, never a raw-BF16 plane view. The
 /// owner retains the planes and mode word through stream/graph drainage.
 #[derive(Clone)]
@@ -134,7 +154,7 @@ pub(crate) struct ReplyReduction<'a> {
     ranks: u32,
     hidden: usize,
     capacity: usize,
-    fused: Option<std::rc::Rc<cuteafd_ffi::programs::BoundProgram<'a>>>,
+    fused: Option<std::rc::Rc<FusedReplyReduce<'a>>>,
     mode: *mut u32,
 }
 
@@ -155,10 +175,9 @@ impl ReplyReduction<'_> {
     /// [`Self::launch`] with one more BF16 `[rows, hidden]` plane summed after
     /// the ranks' (the GPU expert tier's result for the experts the request
     /// left to the coordinator), in FP32 in plane order before `shared`,
-    /// rounded once to BF16. Only the native BF16 reducer takes it: the fused
-    /// codec decodes every plane in the slot's wire format, so a compressed
-    /// reply binding refuses one (serving refuses the tier with compressed
-    /// replies at startup).
+    /// rounded once to BF16: by the native BF16 reducer as one more plane, or
+    /// by the fused codec's tier variant, which decodes only the ranks' planes
+    /// in the slot's wire format.
     ///
     /// # Safety
     /// As [`Self::launch`]; `extra` (when given) is a live BF16 `[rows,
@@ -166,23 +185,32 @@ impl ReplyReduction<'_> {
     pub(crate) unsafe fn launch_with(&self, library: &NativeLibrary, extra: Option<*const u16>,
         shared: *const u16, output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
         ensure!(rows <= self.capacity, "reply reduction rows exceed slot capacity");
-        if let Some(program) = &self.fused {
-            ensure!(extra.is_none(), "a compressed Spark reply reduction has no GPU expert tier plane");
+        ensure!(extra.is_none_or(|extra| !extra.is_null()), "the GPU expert tier's plane is null");
+        if let Some(fused) = &self.fused {
             use cuteafd_ffi::programs::Scalar;
-            let mut pointers = [std::ptr::null_mut(); MAX_INTAKE_RANKS + 3];
+            // The rank planes, the tier's plane when given, then shared, output, mode.
+            let mut pointers = [std::ptr::null_mut(); MAX_INTAKE_RANKS + 4];
             for (pointer, plane) in pointers.iter_mut().zip(self.planes) { *pointer = plane.cast_mut().cast(); }
-            pointers[MAX_INTAKE_RANKS] = shared.cast_mut().cast();
-            pointers[MAX_INTAKE_RANKS + 1] = output.cast();
-            pointers[MAX_INTAKE_RANKS + 2] = self.mode.cast();
-            // SAFETY: live slot planes/mode and disjoint output, retained through drainage.
-            unsafe { program.launch(&pointers, &[Scalar::I32(i32::try_from(rows)?),
+            let (program, mut next) = match extra {
+                Some(extra) => {
+                    pointers[MAX_INTAKE_RANKS] = extra.cast_mut().cast();
+                    (&fused.tier, MAX_INTAKE_RANKS + 1)
+                }
+                None => (&fused.ranks, MAX_INTAKE_RANKS),
+            };
+            for pointer in [shared.cast_mut().cast(), output.cast(), self.mode.cast()] {
+                pointers[next] = pointer;
+                next += 1;
+            }
+            // SAFETY: live slot planes/mode, the caller's tier plane and a
+            // disjoint output, retained through drainage.
+            unsafe { program.launch(&pointers[..next], &[Scalar::I32(i32::try_from(rows)?),
                 Scalar::I32(i32::try_from(self.hidden)?), Scalar::I32(i32::try_from(self.ranks)?),
                 Scalar::I32(i32::from(!shared.is_null())), Scalar::I32(-1)], stream) }
         } else {
             let (mut planes, mut count) = (self.planes, self.ranks as usize);
             if let Some(extra) = extra {
-                ensure!(!extra.is_null() && count < MAX_INTAKE_RANKS,
-                    "a {count}-rank wave has no room for the GPU expert tier's plane");
+                ensure!(count < MAX_INTAKE_RANKS, "a {count}-rank wave has no room for the GPU expert tier's plane");
                 planes[count] = extra;
                 count += 1;
             }
@@ -1307,7 +1335,7 @@ fn probe_landing_route(library: &NativeLibrary, ranks: usize, row_bytes: usize, 
 pub(crate) struct ExchangeStorage<'a> {
     control: HostAllocation<'a>,
     pull_block: Option<HostAllocation<'a>>,
-    reply_reduce: Option<std::rc::Rc<cuteafd_ffi::programs::BoundProgram<'a>>>,
+    reply_reduce: Option<std::rc::Rc<FusedReplyReduce<'a>>>,
     geometry: SlotGeometry,
     prefill: bool,
     format: cuteafd_core::SparkReplyFormat,
@@ -1326,8 +1354,7 @@ impl<'a> ExchangeStorage<'a> {
                 "mapped pinned memory is not device-visible at its host address (no unified addressing)");
         }
         let reply_reduce = if combined_codec_enabled(intake, format) {
-            Some(std::rc::Rc::new(library.programs()?.bound("expert_reply_reduce",
-                &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "shared", "out", "mode"])?))
+            Some(std::rc::Rc::new(FusedReplyReduce::bind(library)?))
         } else { None };
         Ok(Self { control, pull_block, reply_reduce, geometry: intake.geometry.clone(), prefill: intake.prefill, format })
     }
