@@ -414,13 +414,21 @@ cudaError_t select_radix(const float* scores,const uint64_t* positions,uint64_t*
   if(total<=9*kSelectThreads)return launch_radix<K,Limit,9>(scores,positions,carry,output,queries,candidates,reset,stream);
   return launch_radix<K,Limit,Widest>(scores,positions,carry,output,queries,candidates,reset,stream);
 }
-// CUTEAFD_V41_INDEX_TOPK=merge selects the original sort-and-merge path (A/B).
-bool merge_path() {
-  static const bool merge=[] {
+// The default path is fixed per build: sm_89 builds define
+// CUTEAFD_V41_INDEX_TOPK_RADIX=1 and select radix; others keep the merge path
+// until it is measured on their cards. CUTEAFD_V41_INDEX_TOPK=radix or =merge
+// overrides the default in either direction at run time (read once).
+#ifndef CUTEAFD_V41_INDEX_TOPK_RADIX
+#define CUTEAFD_V41_INDEX_TOPK_RADIX 0
+#endif
+bool radix_path() {
+  static const bool radix=[] {
     const char* v=getenv("CUTEAFD_V41_INDEX_TOPK");
-    return v && strcmp(v,"merge")==0;
+    if(v && strcmp(v,"radix")==0)return true;
+    if(v && strcmp(v,"merge")==0)return false;
+    return CUTEAFD_V41_INDEX_TOPK_RADIX!=0;
   }();
-  return merge;
+  return radix;
 }
 }
 template<int K,uint64_t Limit>
@@ -439,7 +447,7 @@ static int32_t select(const float* scores,const uint64_t* positions,
     for(int j=0;j<i;++j)if(!disjoint(ptrs[i],bytes[i],ptrs[j],bytes[j]))return cudaErrorInvalidValue;
   }
   auto cuda_stream=reinterpret_cast<cudaStream_t>(stream);
-  if(path<0)path=merge_path()?0:1;
+  if(path<0)path=radix_path()?1:0;
   if(path==1)return select_radix<K,Limit>(scores,positions,carry,output,queries,candidates,reset,cuda_stream);
   auto* a=static_cast<uint64_t*>(scratch);auto* b=a+half;
   tiles<K,Limit><<<dim3(blocks,queries),256,0,cuda_stream>>>(scores,positions,a,candidates,blocks);

@@ -454,6 +454,12 @@ if(CUTEAFD_ENABLE_CUDA)
   if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
     set_source_files_properties(families/deepseek_v41/cuda/v41_sparse_attention.cu PROPERTIES
       COMPILE_DEFINITIONS CUTEAFD_V41_ATTENTION_SM89=1)
+    # V4.1 index top-k defaults to the radix select on SM89, bit-identical to
+    # the sort-and-merge path and measured on SM89. SM120 and SM121 keep the
+    # merge default until it is measured there; CUTEAFD_V41_INDEX_TOPK=radix
+    # or =merge overrides either default at run time.
+    set_source_files_properties(families/deepseek_v41/cuda/v41_index_topk.cu PROPERTIES
+      COMPILE_DEFINITIONS CUTEAFD_V41_INDEX_TOPK_RADIX=1)
   endif()
   # SM120 builds use the family-specific target (sm_120f); every live AOT
   # export and hand kernel is qualified with it.

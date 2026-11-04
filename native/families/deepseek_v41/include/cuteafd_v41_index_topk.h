@@ -11,10 +11,11 @@ extern "C" {
 // Output I32 [queries,512] is in ascending position order, trailing -1 padding.
 // Carry is request/wave-owned state, not persistent model cache. Keep it private
 // to one selection and reset when its query bindings change.
-// Two bit-identical paths: radix select (default, one launch) and the original
-// sort-and-merge (CUTEAFD_V41_INDEX_TOPK=merge, read once per process). Each
-// orders the carry its own way and reads a carry as a set of keys, so either
-// accepts the other's. Scratch is validated for both and used only by merge.
+// Two bit-identical paths: radix select (one launch; the sm_89 default) and
+// sort-and-merge (the default elsewhere). CUTEAFD_V41_INDEX_TOPK=radix|merge
+// overrides the default, read once per process. Each orders the carry its own
+// way and reads a carry as a set of keys, so either accepts the other's.
+// Scratch is validated for both and used only by merge.
 // Scratch bytes = queries * ceil(candidates/1024) * 512 * 8 * 2.
 // All five buffer spans are disjoint; current stream device owns each span.
 int32_t cuteafd_v41_index_top512(const float* scores,const uint64_t* positions,
