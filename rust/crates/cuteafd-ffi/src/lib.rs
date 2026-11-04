@@ -24,7 +24,7 @@ pub use families::deepseek_v41::v41_dspark_cache::{V41DsparkCache, V41KvWrite};
 pub use shared::v41_router::V41Router;
 pub use shared::route_census::{route_histogram, RouteCensusInput, RouteCensusKernels, RouteCensusShape};
 pub use shared::tier_slots::{tier_slots, TierSlotKernel, TierSlotShape};
-pub use families::deepseek_v41::v41_hc::V41Hc;
+pub use families::deepseek_v41::v41_hc::{HcBoundary, V41Hc, HC_BOUNDARY_SWITCH};
 pub use families::deepseek_v41::v41_dspark::{V41DraftStep, V41DsparkConfidence, V41VocabularyProjection};
 pub use families::deepseek_v41::v41_fp8::{V41Fp8Info, V41Fp8Kernel, V41SharedSwiGlu};
 pub use families::deepseek_v41::v41_fp8_plan::{V41Fp8Plan, V41Fp8PlanInfo};

@@ -136,7 +136,9 @@ def dispatch_header(output: Path, manifest: dict) -> None:
     lines.append('#define CUTEAFD_V41_HC_PROJECT_MODULE {' + ','.join((
         prefix + '_cuda_init', prefix + '_cuda_load_to_device',
         manifest['hc_project']['abi']['symbol'])) + '}')
-    if 'hc_lagged' in manifest:
+    # SM89 serves its own boundary (native v41_hc_sm89.cu, the same begin ABI):
+    # its lagged export is manifest inventory only, so it is not wired here.
+    if 'hc_lagged' in manifest and not plain:
         lines.append('#include "v41_hc_lagged.h"')
         prefix = '_mlir_cuteafd_v41_hc_lagged'
         lines.append('#define CUTEAFD_V41_HC_LAGGED_MODULE {' + ','.join((prefix + '_cuda_init', prefix + '_cuda_load_to_device', manifest['hc_lagged']['abi']['symbol'])) + '}')

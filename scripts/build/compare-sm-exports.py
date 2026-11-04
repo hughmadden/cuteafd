@@ -62,8 +62,9 @@ _v41 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_v41)
 V41_CAPACITIES = ",".join(map(str, _v41.TARGET_CAPACITIES))
 # The groups an sm_89 coordinator build exports (native CMake with
-# CUTEAFD_CUDA_ARCHITECTURES=89). Its SM120-only candidates (lagged mHC, narrow
-# FP8 plans) stay off, and the target is every supported SM89 card.
+# CUTEAFD_CUDA_ARCHITECTURES=89). Its narrow FP8 plans stay off; the lagged mHC
+# begin is exported for the manifest's inventory (build-wip-artifacts.sh's
+# v41_hc_lagged_aot). The target is every supported SM89 card.
 SM89_GROUPS = ("v41-fp8", "v41-experts", "v41-index", "v41-router",
                "v41-slices-rtx_backbone", "v41-slices-rtx_tp2", "v41-slices-dspark_tp2")
 ARCHES = {"sm120": {"sms": (188, 170)}, "sm89": {"sms": (128, 114), "capability": [8, 9]}}
@@ -616,7 +617,7 @@ def worker(payload):
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
     candidates = payload.get("candidates", "1")
     os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = candidates
-    os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = candidates
+    os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = payload.get("hc_lagged", candidates)
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
@@ -1031,7 +1032,7 @@ def main():
                 context_args.append("--source-package-layouts")
             payload = dict(sms=sms, exporter=exporter, args=context_args, output=str(directory))
             if "capability" in target:
-                payload.update(capability=target["capability"], candidates="0")
+                payload.update(capability=target["capability"], candidates="0", hc_lagged="1")
             print(f"export {name} SMs={sms}", flush=True)
             env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(source),
                        CUTEAFD_SPARKINFER_SOURCE_DIR=str(source / "third_party/sparkinfer"),

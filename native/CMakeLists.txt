@@ -460,6 +460,10 @@ if(CUTEAFD_ENABLE_CUDA)
     # or =merge overrides either default at run time.
     set_source_files_properties(families/deepseek_v41/cuda/v41_index_topk.cu PROPERTIES
       COMPILE_DEFINITIONS CUTEAFD_V41_INDEX_TOPK_RADIX=1)
+    # SM89 runs V4.1's mHC boundary as one begin launch with the finish folded
+    # into post, in today's decode arithmetic (cuteafd_v41_hc_begin and
+    # cuteafd_v41_hc_post_finish). SM120 and SM121 builds never compile it.
+    list(APPEND CUTEAFD_NATIVE_SOURCES families/deepseek_v41/cuda/v41_hc_sm89.cu)
   endif()
   # SM120 builds use the family-specific target (sm_120f); every live AOT
   # export and hand kernel is qualified with it.

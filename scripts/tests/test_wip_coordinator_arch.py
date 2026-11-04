@@ -128,6 +128,8 @@ def test_no_export_routing_probes_for_sm89_hosts():
 
 
 SWITCHES = ['v41_candidate_aot', 'exl3_aot', 'nvfp4_aot', 'audio_aot', 'exlr8_aot']
+# Follows coordinator_aot on every architecture, sm_89 included.
+KEPT_SWITCHES = ['v41_hc_lagged_aot']
 FAMILY_SWITCHES = ['DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'ML4',
                    'VISION_ATTENTION']
 
@@ -140,7 +142,7 @@ def test_sm89_coordinator_keeps_the_v41_exports_and_turns_the_rest_off(role, arc
     preset = ' '.join(f'{name}=ON' for name in SWITCHES if name != 'v41_candidate_aot')
     preset += ' ' + ' '.join(f'CUTEAFD_WIP_{name}_AOT=ON' for name in FAMILY_SWITCHES)
     report = 'printf "<%s> <%s> %s" "$expert_families" "$bf16_families" "$coordinator_aot"\n'
-    report += ''.join(f'printf " %s" "${name}"\n' for name in SWITCHES)
+    report += ''.join(f'printf " %s" "${name}"\n' for name in SWITCHES + KEPT_SWITCHES)
     report += ''.join(f'printf " %s" "$CUTEAFD_WIP_{name}_AOT"\n' for name in FAMILY_SWITCHES)
     script = (f'set -u\nrole={role} cuda_arch={arch} coordinator_aot={coordinator_aot} '
               f'expert_families=dsv4f:fp8 bf16_families=glm {preset}\n' + ARTIFACTS[start:end] + report)
@@ -153,7 +155,12 @@ def test_sm89_coordinator_keeps_the_v41_exports_and_turns_the_rest_off(role, arc
     # TP2 experts follow coordinator_aot, which an sm_89 coordinator keeps ON.
     assert words[2] == coordinator_aot
     expected = 'OFF' if sm89 else 'ON'
-    assert words[3:] == [coordinator_aot if not sm89 else 'OFF'] + [expected] * (len(SWITCHES) - 1 + len(FAMILY_SWITCHES))
+    switches = words[3:3 + len(SWITCHES)]
+    kept = words[3 + len(SWITCHES):3 + len(SWITCHES) + len(KEPT_SWITCHES)]
+    families = words[3 + len(SWITCHES) + len(KEPT_SWITCHES):]
+    assert switches == [coordinator_aot if not sm89 else 'OFF'] + [expected] * (len(SWITCHES) - 1)
+    assert kept == [coordinator_aot] * len(KEPT_SWITCHES)
+    assert families == [expected] * len(FAMILY_SWITCHES)
     assert ('DeepSeek V4.1 exports only' in result.stderr) == sm89
 
 
@@ -161,8 +168,9 @@ def test_v41_switches_reach_cmake():
     cmake = ARTIFACTS[ARTIFACTS.index('\ncmake \\\n'):ARTIFACTS.index('-DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"')]
     for flag in ('V41_FP8_AOT', 'V41_LOCAL_EXPERT_AOT', 'V41_TP2_EXPERT_AOT'):
         assert f'-DCUTEAFD_ENABLE_{flag}="$coordinator_aot"' in cmake, flag
-    for flag in ('V41_ATTENTION_AOT', 'V41_HC_LAGGED_AOT', 'V41_NARROW_AOT'):
+    for flag in ('V41_ATTENTION_AOT', 'V41_NARROW_AOT'):
         assert f'-DCUTEAFD_ENABLE_{flag}="$v41_candidate_aot"' in cmake, flag
+    assert '-DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$v41_hc_lagged_aot"' in cmake
     assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON' in cmake
     assert '-DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot"' in cmake
     # Every slot ships the exported dSpark coordinator manifest; there is no disabled form.
