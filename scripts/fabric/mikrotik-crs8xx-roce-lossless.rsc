@@ -1,6 +1,6 @@
 # TJ applies only with serving stopped; RouterOS 7.24.5 / CRS804-4DDQ.
 # Baseline 2026-10-25 after TJ disabled ECN/WRED on all eight queues.
-# PFC-only: traffic byte 104 is Not-ECT; ECN cannot help it. Never enable WRED.
+# PFC + ECN on TC3: mlx5 DCQCN sends RoCE as ECT, so switch marks drive CNPs. Never enable WRED.
 # QoS offload already enabled; v7.23+ sizes lossless buffers automatically.
 # Manual IP-only maps avoid promoting unrelated PCP-tagged TCP into TC3/TC6.
 # Run once against the captured baseline; duplicate names intentionally fail on repeat.
@@ -30,3 +30,5 @@
 /interface ethernet switch qos port set qsfp56-dd-4-5 pfc=cuteafd-pfc3 trust-l2=keep trust-l3=keep egress-rate-queue3=100.0Gbps
 # All other queues/profiles/ports, including default lossy TC1, stay unchanged.
 # Do not set use-shared-buffers: CRS8xx v7.23+ manages buffers automatically.
+# ECN-mark TC3 under congestion (A/B 2026-11-04: marks + CNPs, 0 retransmits, no cost).
+/interface ethernet switch qos tx-manager queue set [find traffic-class=3] ecn=yes wred=no

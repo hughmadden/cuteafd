@@ -4,6 +4,44 @@
 
 #include "../../../../../native/shared/cuda/fp8_load_quant.h"
 
+#include <cmath>
+
+// Preserve the warp's accumulation/reduction order for deferred-load tests.
+static int32_t markov_norms(const void* source, void* output, int32_t rows, int32_t cols, bool slack) {
+  if (!source || !output || rows < 1 || cols != (slack ? 512 : 256)) return 1;
+  const auto* values = static_cast<const uint16_t*>(source);
+  for (int32_t r = 0; r < rows; ++r) {
+    float lanes[32] = {};
+    for (int32_t lane = 0; lane < 32; ++lane)
+      for (int32_t c = lane; c < cols; c += 32) {
+        const uint32_t bits = uint32_t(values[int64_t(r) * cols + c]) << 16;
+        float value;
+        memcpy(&value, &bits, sizeof(value));
+        lanes[lane] = std::fma(value, value, lanes[lane]);
+      }
+    for (int32_t offset = 16; offset; offset >>= 1) {
+      float next[32];
+      for (int32_t lane = 0; lane < 32; ++lane) next[lane] = lanes[lane] + lanes[lane ^ offset];
+      memcpy(lanes, next, sizeof(lanes));
+    }
+    const float norm = std::sqrt(lanes[0]);
+    static_cast<float*>(output)[r] = slack ? std::fma(norm, 1.0001f, 1e-6f) : norm;
+  }
+  return 0;
+}
+
+extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* source, void* output, int32_t rows,
+                                                  int32_t cols, void* stream) {
+  (void)stream;
+  return markov_norms(source, output, rows, cols, false);
+}
+
+extern "C" int32_t cuteafd_ml4_dspark_markov_norms(const void* source, void* output, int32_t rows,
+                                                 int32_t cols, void* stream) {
+  (void)stream;
+  return markov_norms(source, output, rows, cols, true);
+}
+
 // A synthetic device count keeps owner construction CPU-only.
 extern "C" int32_t cuteafd_sm_count() { return 1; }
 

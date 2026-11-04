@@ -52,8 +52,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Sequences decoding at once (at most the decode programs' 64 rows).
-    #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES)]
-    pub max_sequences: usize,
+    #[arg(long)]
+    pub max_sequences: Option<usize>,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
@@ -70,6 +70,8 @@ pub(crate) struct ServeArgs {
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
+    #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
@@ -110,9 +112,11 @@ fn chat_encoding(snapshot: &std::path::Path, thinking_off: GlmThinkingOff) -> Re
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    let max_sequences = crate::shared::memory::budget::serving_concurrency(
+        args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
-    cuteafd_core::concurrency::validate(cfg.family_id(), args.max_sequences as u64)?;
-    args.prefix.resolve_entries(args.max_sequences);
+    cuteafd_core::concurrency::validate(cfg.family_id(), max_sequences as u64)?;
+    args.prefix.resolve_entries(max_sequences);
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
         super::native_activation(&args.engine, cfg.first_moe_layer, cfg.layers, true)?;
     }
@@ -122,27 +126,31 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         chat_encoding(&snapshot, args.thinking_off)?,
     );
-    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
+    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     if engine_args.draft_context_slots.is_none() {
         engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
-            engine_args.draft_sequences, args.max_sequences, None));
+            engine_args.draft_sequences, max_sequences, None));
+    }
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
     }
     let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
-    size_draft_window_marks(&mut engine_args, &args.prefix, args.max_sequences)?;
-    let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
+    size_draft_window_marks(&mut engine_args, &args.prefix, max_sequences)?;
+    let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
     let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg)));
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg, max_sequences)));
     let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
     let remote = crate::families::glm5_flash::media::RemoteVision::from_parts(args.vision, args.vision_peers.as_deref(),
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes,
-            remote));
+            remote, args.loop_abort.config()));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
     let mut profile = profile;
     if let Some((preparer, health)) = media {
@@ -181,7 +189,7 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
 }
 
 /// What the live console shows for GLM 5.3.
-fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig, max_sequences: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -192,7 +200,7 @@ fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families:
             .unwrap_or(cuteafd_loader::placement::AttentionPlacement::Context);
         format!("{resolved} split")
     });
-    layout.concurrency = args.max_sequences;
+    layout.concurrency = max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
     layout.speculator = (args.engine.draft.is_some() || args.engine.dspark).then(|| console::Speculator {
         name: if args.engine.dspark { "dSpark" } else { "DFlash2" }.into(),
@@ -225,7 +233,8 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>,
-    remote: Option<crate::families::glm5_flash::media::RemoteVision>) -> Result<()> {
+    remote: Option<crate::families::glm5_flash::media::RemoteVision>,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let args = &resolved.args;
     let opened = match open(args) {
         Ok(opened) => opened,
@@ -252,7 +261,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
-            ranks, &prefix, args.token_io.token_select, &mut media, expander.as_ref(), || {
+            ranks, &prefix, loop_abort, args.token_io.token_select, &mut media, expander.as_ref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }
@@ -339,6 +348,10 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: crate::shared::loop_abort::LoopAbort,
+    /// The last emitted token tripped the loop guard (suppresses turn retention).
+    looped: bool,
 }
 
 /// Stops censor an unjudged continuation, never a disagreeing draft token.
@@ -395,6 +408,7 @@ impl Active<'_> {
         crate::shared::probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
+        self.looped = self.loop_abort.push(token);
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
         let stop = self.job.stop_token_ids.contains(&token)
@@ -407,7 +421,7 @@ impl Active<'_> {
         }
         let finish = if stop {
             Some(InferenceFinishReason::Stop)
-        } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
+        } else if self.looped || self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
@@ -608,7 +622,8 @@ fn draft_seed() -> cuteafd_core::PolicySeed {
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement,
+    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig, select: SelectPlacement,
     media: &mut MediaAdmission<ml4_media::Prompt, ml4_media::Encoder>,
     expander: Option<&cuteafd_loader::media::MistralSpanExpander>, ready: impl FnOnce()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
@@ -671,6 +686,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 cuteafd_engine::prefix::AdmissionPoll::Ready(admit) => admit,
                 cuteafd_engine::prefix::AdmissionPoll::Empty => match media.poll(|prompt| prompt.job.events.is_closed()) {
                     MediaPoll::Ready(ready) => {
+                        if let Some(probe) = &ready.job().job.probe {
+                            let (encoded, ms) = ready.encoding();
+                            probe.encoding(encoded, ms);
+                        }
                         let (prompt, request_media) = ready.into_parts();
                         Admit { prompt, media: request_media, constraint: None }
                     }
@@ -970,6 +989,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 };
                 let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
+                    let loop_abort = loop_abort.guard(p.job.finish_detail.clone(), p.id);
                     let mut request = Active {
                         spans: spans.clone(),
                         id: p.id,
@@ -988,6 +1008,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         }, turn: None,
                         capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
+                        loop_abort,
+                        looped: false,
                     };
                     request.next = match (p.first, &logits) {
                         (Some(first), _) => first,
@@ -1077,7 +1099,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 plan_ms = per_step(host[1]), embed_ms = per_step(host[2]), verify_ms = per_step(host[3]),
                 select_ms = per_step(host[4]), update_ms = per_step(host[5]),
                 "host step phases since the last completed request (ms per step)");
-            if let Some(row) = &request.turn {
+            if let Some(row) = request.turn.as_ref().filter(|_| !request.looped) {
                 // The conversation so far: every committed row (the last token is not in it).
                 // Keyed like its prompt: image rows by their image identity.
                 let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, &request.spans)?;
@@ -1288,7 +1310,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                     if done {
                         // A normal finish (the client took the last chunk): the row that
                         // produced the last token follows the turn snapshot.
-                        if retain_turn && !probe::cold(&request.job.probe) {
+                        if retain_turn && !request.looped && !probe::cold(&request.job.probe) {
                             request.turn = logits.row_host(&opened.library, offset + j)
                                 .inspect_err(|error| tracing::warn!("turn logits: {error:#}")).ok();
                         }
@@ -1452,7 +1474,7 @@ mod draft_tests {
             let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", "/unused", "--split-device", "1",
                 "--attention-placement", placement, "--dspark"])?.args;
-            let layout = console_layout(&args, "ml4", &cfg);
+            let layout = console_layout(&args, "ml4", &cfg, 16);
             assert_eq!(layout.split.as_deref(), Some(expected));
             let spec = layout.speculator.unwrap();
             assert_eq!(spec.name, "dSpark");
@@ -1481,14 +1503,14 @@ mod draft_tests {
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
                 "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16"])?.args;
-            args.prefix.resolve_entries(args.max_sequences);
+            args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
             assert_eq!(resolved.args.max_context, 1_048_576);
             assert_eq!(resolved.automatic_context, context == 0);
             assert_eq!(args.engine.max_context, context, "CLI auto policy must remain intact");
             // Removing the manifest after resolution proves sizing does not resolve it again.
             std::fs::remove_file(&manifest)?;
-            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences)?;
+            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
             assert!(resolved.args.draft_window_marks > 0);
             census.push((resolved.args.max_context, resolved.args.draft_window_marks));
             let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
@@ -1509,7 +1531,7 @@ mod draft_tests {
         for c in [1usize, 4, 16, 17, 32, 64, 65] {
             let mut args = Cli::try_parse_from(["test", "--snapshot", "/absent", "--native-lib", "/absent",
                 "--max-sequences", &c.to_string()]).unwrap().args;
-            let admission = cuteafd_core::concurrency::validate("mistral_large4", args.max_sequences as u64);
+            let admission = cuteafd_core::concurrency::validate("mistral_large4", args.max_sequences.unwrap() as u64);
             if c > DECODE_ROWS {
                 let error = admission.unwrap_err().to_string();
                 assert!(error.contains("mistral_large4") && error.contains("decode program capacity 64"));

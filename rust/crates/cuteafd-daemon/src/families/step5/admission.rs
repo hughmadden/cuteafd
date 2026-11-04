@@ -269,7 +269,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let mut inputs = RuntimeInputs {
+            let mut inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format,
                 inventory: Inventory {
                     gpus,

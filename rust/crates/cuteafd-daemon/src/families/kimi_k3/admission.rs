@@ -13,6 +13,9 @@ use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, p
 
 const EXECUTOR: ExecutorModes = families::KIMI_K3;
 const MODES: &[LayerMode] = EXECUTOR.modes;
+const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+const SINGLE: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: &[WHOLE],
+    hops: false, attention: AttentionPlacement::Layers };
 const DRAFT_MARKS: &str = "Kimi exact draft windows";
 
 fn push_resident_budgets(peaks: [usize; 2], workspace: usize) -> Result<[usize; 2]> {
@@ -39,12 +42,12 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// All demands are still future to the two post-module CUDA samples. The
 /// engine supplies its native programs' lane extents, exchange, graphs and
 /// page tables; global weights, token IO and state banks add their own demands.
-pub(crate) struct Inputs<'a> {
+pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub cfg: &'a KimiK3Config,
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
-    pub gpus: [GpuBudget; 2],
-    pub devices: [i32; 2],
+    pub gpus: [GpuBudget; RANKS],
+    pub devices: [i32; RANKS],
     pub peer_access: bool,
     pub spark_ranks: usize,
     pub attention: Option<AttentionPlacement>,
@@ -58,7 +61,7 @@ pub(crate) struct Inputs<'a> {
     pub waves: usize,
     /// Explicit unit rows (else `rows / waves`).
     pub unit_rows: Option<usize>,
-    pub lane_layouts: Vec<[LaneLayout; 2]>,
+    pub lane_layouts: Vec<[LaneLayout; RANKS]>,
     pub fixed: Vec<Demand>,
     pub startup: Vec<Demand>,
     pub pool_bounded: Vec<BoundedDemand>,
@@ -72,25 +75,31 @@ pub(crate) struct Inputs<'a> {
 /// CPU-planned native residency; no backend owner allocates before solve.
 pub(crate) struct RtxInventory {
     pub package: std::path::PathBuf,
-    pub costs: Vec<[Bytes2; 2]>,
+    pub costs: Vec<Vec<Bytes2>>,
     pub workspace: usize,
     pub layers: Onboard,
 }
 
 pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41Catalog,
     package: std::path::PathBuf, rows: usize, layers: usize) -> Result<RtxInventory> {
+    plan_rtx_for_ranks(cfg, catalog, package, rows, layers, 2)
+}
+
+pub(crate) fn plan_rtx_for_ranks(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41Catalog,
+    package: std::path::PathBuf, rows: usize, layers: usize, ranks: usize) -> Result<RtxInventory> {
     use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer};
-    ensure!(layers > 0 && layers <= cfg.dense.iter().filter(|dense| !**dense).count(),
-        "Kimi TP2 expert count outside routed inventory");
-    let workspace = usize::try_from(cuteafd_loader::families::kimi_k3::allocation::expert_workspace(&package, rows)?)?;
+    ensure!(matches!(ranks, 1 | 2) && layers > 0 && layers <= cfg.dense.iter().filter(|dense| !**dense).count(),
+        "Kimi expert count or physical owners outside routed inventory");
+    let workspace = usize::try_from(cuteafd_loader::families::kimi_k3::allocation::expert_workspace_for_ranks(
+        &package, rows, ranks)?)?;
     let costs = cfg.dense.iter().enumerate().map(|(layer, dense)| {
-        if *dense { return Ok([Bytes2::default(); 2]); }
-        let mut costs = [Bytes2::default(); 2];
-        for (rank, cost) in costs.iter_mut().enumerate() {
-            let plan = Exl3Weights::plan(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
-            *cost = Bytes2 { resident: plan.resident_bytes as u64, staging: plan.device_staging_bytes as u64 };
-        }
-        Ok(costs)
+        (0..ranks).map(|rank| {
+            if *dense { return Ok(Bytes2::default()); }
+            let selection = if ranks == 1 { ExpertLayer::BackboneFull { layer } }
+                else { ExpertLayer::BackboneTp2 { layer, rank } };
+            let plan = Exl3Weights::plan(catalog, selection)?;
+            Ok(Bytes2 { resident: plan.resident_bytes as u64, staging: plan.device_staging_bytes as u64 })
+        }).collect::<Result<Vec<_>>>()
     }).collect::<Result<Vec<_>>>()?;
     Ok(RtxInventory { package, costs, workspace, layers: Onboard::Layers(layers) })
 }
@@ -106,36 +115,36 @@ pub(crate) struct Admission<'a> {
     draft: Option<MlaDraftRuntimeLayout>,
     draft_allocated: bool,
     draft_marks_allocated: bool,
-    layouts: Vec<[LayerLayout; 2]>,
-    layer_owners: Vec<[Weak<LayerWeights<'a>>; 2]>,
-    layer_uploaded: Vec<[bool; 2]>,
-    local_bound: Vec<[bool; 2]>,
-    devices: [i32; 2],
+    layouts: Vec<Vec<LayerLayout>>,
+    layer_owners: Vec<Vec<Weak<LayerWeights<'a>>>>,
+    layer_uploaded: Vec<Vec<bool>>,
+    local_bound: Vec<Vec<bool>>,
+    devices: Vec<i32>,
     lanes: u64,
     spark_ranks: usize,
     waves: usize,
     unit_rows: usize,
-    lane_layouts: Vec<[LaneLayout; 2]>,
-    lane_allocated: Vec<[bool; 2]>,
-    lane_readers: Vec<[Weak<Stream<'a>>; 2]>,
+    lane_layouts: Vec<Vec<LaneLayout>>,
+    lane_allocated: Vec<Vec<bool>>,
+    lane_readers: Vec<Vec<Weak<Stream<'a>>>>,
     kda_layout: KdaLayout,
-    kda_allocated: [bool; 2],
-    kda_owners: [Weak<KdaBank<'a>>; 2],
-    mla_layouts: [CacheLayout; 2],
-    mla_allocated: [bool; 2],
-    mla_owners: [Weak<CacheBank<'a>>; 2],
-    global_layouts: [GlobalLayout; 2],
-    global_uploaded: [bool; 2],
-    global_owners: [Weak<GlobalWeights<'a>>; 2],
-    io_layouts: [IoLayout; 2],
-    io_allocated: Vec<[bool; 2]>,
+    kda_allocated: Vec<bool>,
+    kda_owners: Vec<Weak<KdaBank<'a>>>,
+    mla_layouts: Vec<CacheLayout>,
+    mla_allocated: Vec<bool>,
+    mla_owners: Vec<Weak<CacheBank<'a>>>,
+    global_layouts: Vec<GlobalLayout>,
+    global_uploaded: Vec<bool>,
+    global_owners: Vec<Weak<GlobalWeights<'a>>>,
+    io_layouts: Vec<IoLayout>,
+    io_allocated: Vec<Vec<bool>>,
     spark_connected: Vec<bool>,
 }
 
 /// Startup retains these until persistent local lanes acquire the same owners.
 pub(crate) struct LoadedWeights<'a> {
-    pub global: [Rc<GlobalWeights<'a>>; 2],
-    pub layers: Vec<[Rc<LayerWeights<'a>>; 2]>,
+    pub global: Vec<Rc<GlobalWeights<'a>>>,
+    pub layers: Vec<Vec<Rc<LayerWeights<'a>>>>,
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
@@ -156,23 +165,26 @@ impl<'a> Admission<'a> {
     }
 
     fn check_draft(&self, device: i32) -> Result<&MlaDraftRuntimeLayout> {
-        ensure!(device == self.devices[1] && !self.draft_allocated,
+        let head = self.devices.len() - 1;
+        ensure!(device == self.devices[head] && !self.draft_allocated,
             "Kimi draft allocation differs from admitted rank or was already attempted");
-        ensure!(!self.rtx_loaded && self.global_uploaded == [false; 2]
-            && self.layer_uploaded.iter().all(|pair| *pair == [false; 2])
-            && self.lane_allocated.iter().all(|pair| *pair == [false; 2])
-            && self.io_allocated.iter().all(|pair| *pair == [false; 2])
-            && self.kda_allocated == [false; 2] && self.mla_allocated == [false; 2],
+        ensure!(!self.rtx_loaded && !self.global_uploaded.iter().any(|uploaded| *uploaded)
+            && !self.layer_uploaded.iter().flatten().any(|uploaded| *uploaded)
+            && !self.lane_allocated.iter().flatten().any(|allocated| *allocated)
+            && !self.io_allocated.iter().flatten().any(|allocated| *allocated)
+            && !self.kda_allocated.iter().any(|allocated| *allocated)
+            && !self.mla_allocated.iter().any(|allocated| *allocated),
             "Kimi drafter startup peak requires allocation before target residency");
         let layout = self.draft.as_ref().context("Kimi drafter was not admitted")?;
-        ensure!(draft::home(&self.placement) == Some(1), "Kimi drafter must stay on target rank 1");
-        let (demand, _) = layout.demands(1)?;
+        ensure!(draft::home(&self.placement) == Some(head as u8), "Kimi drafter must stay on target head owner");
+        let (demand, _) = layout.demands(head as u8)?;
         for demand in demand.owned {
-            let charges = self.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            let charges = self.placement.items[head].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             ensure!(charges.len() == 1 && charges[0].category == demand.category
                 && charges[0].basis == demand.basis && charges[0].bytes == demand.bytes,
                 "Kimi draft allocation differs from accepted {} charge", demand.group);
-            ensure!(!self.placement.items[0].iter().any(|item| item.group == demand.group),
+            ensure!(!self.placement.items.iter().enumerate().filter(|(rank, _)| *rank != head)
+                .any(|(_, items)| items.iter().any(|item| item.group == demand.group)),
                 "Kimi draft allocation has an unexecutable remote charge");
         }
         Ok(layout)
@@ -186,11 +198,12 @@ impl<'a> Admission<'a> {
         allocate(layout)
     }
     pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Option<Rc<crate::shared::memory::device::Allocation<'a>>>> {
-        ensure!(device.id == self.devices[1] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
+        let head = self.devices.len() - 1;
+        ensure!(device.id == self.devices[head] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
         let layout = self.draft.as_ref().context("Kimi draft marks without admitted draft")?;
         let bytes = layout.window_mark_bytes()?.checked_mul(usize::try_from(self.mark_selection.slots)?)
             .context("Kimi draft mark arena overflow")?;
-        ensure!(self.placement.items[1].iter().filter(|item| item.group == DRAFT_MARKS)
+        ensure!(self.placement.items[head].iter().filter(|item| item.group == DRAFT_MARKS)
             .map(|item| item.bytes).collect::<Vec<_>>() == vec![bytes as u64], "Kimi draft mark charge differs from arena");
         self.draft_marks_allocated = true;
         (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes).map(Rc::new)).transpose()
@@ -199,13 +212,13 @@ impl<'a> Admission<'a> {
 
     /// Hops, the peer exchange and Spark waves serve one prefill unit.
     pub(crate) fn execution_plan(&self) -> Result<LayerExecutionPlan> {
-        Ok(LayerExecutionPlan::new(&self.placement, hop_spec(self.cfg.hidden,
-            self.unit_rows, self.lanes as usize))?)
+        Ok(LayerExecutionPlan::new(&self.placement, hop_spec_for_ranks(self.cfg.hidden,
+            self.unit_rows, self.lanes as usize, self.devices.len()))?)
     }
 
     pub(crate) fn working_set(&self) -> SparkWorkingSet {
         SparkWorkingSet { rtx_layers: self.placement.layers.iter().enumerate()
-            .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::RtxTp2).then_some(layer)).collect(), spark_layers: self.placement.layers.iter().enumerate()
+            .filter_map(|(layer, assignment)| matches!(assignment.experts, ExpertHome::RtxTp2 | ExpertHome::RtxWhole { .. }).then_some(layer)).collect(), spark_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::Spark).then_some(layer)).collect(),
             spark_ranks: self.spark_ranks, prefill_lanes: self.lanes }
     }
@@ -234,7 +247,7 @@ impl<'a> Admission<'a> {
     fn check_spark(&self, lane: usize) -> Result<Rc<Stream<'a>>> {
         ensure!(lane < self.spark_connected.len() && !self.spark_connected[lane],
             "Kimi Spark lane already connected or outside admission");
-        self.lane_readers[lane][1].upgrade().context("Kimi Spark requires admitted GPU1 intake stream")
+        self.lane_readers[lane][self.devices.len() - 1].upgrade().context("Kimi Spark requires admitted GPU1 intake stream")
     }
 
     /// Starts the Spark admission and loads every coordinator weight inside it:
@@ -243,26 +256,27 @@ impl<'a> Admission<'a> {
     /// pushes, planned from headers before membership (a planning error offers
     /// no coordinator ranks: the Sparks still push, the coordinator mounts).
     /// Returns the pending admission with the loaded owners.
-    pub(crate) fn start_and_load(&mut self, spark: crate::shared::placement::SparkAdmission,
-        peers: &[std::net::SocketAddr], devices: [Device<'a>; 2], checkpoint: &cuteafd_loader::plan::Checkpoint,
-        catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; 2])
+    pub(crate) fn start_and_load<const RANKS: usize>(&mut self, spark: crate::shared::placement::SparkAdmission,
+        peers: &[std::net::SocketAddr], devices: [Device<'a>; RANKS], checkpoint: &cuteafd_loader::plan::Checkpoint,
+        catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; RANKS])
         -> Result<(crate::shared::placement::PendingSparkAdmission,
-            [Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>; 2], LoadedWeights<'a>)> {
+            Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>>, LoadedWeights<'a>)> {
         use crate::shared::experts::rtx::{dense::{self, DenseLoad}, push::{CoordinatorExperts, CoordinatorPush}};
+        ensure!(RANKS == self.devices.len(), "Kimi load physical rank inventory differs");
         check_prefix(&KimiK3Config::from_hf(&checkpoint.config)?, &self.cfg)?;
-        for rank in 0..2 {
+        for rank in 0..RANKS {
             ensure!(devices[rank].id == self.devices[rank], "Kimi load device differs from admission");
             self.check_global(rank, devices[rank].id)?;
             for layer in 0..self.cfg.layers { self.check_layer(rank, layer, devices[rank].id)?; }
         }
-        let streams = [(devices[0].id, streams[0]), (devices[1].id, streams[1])];
-        let rtx = self.rtx_plan(devices)?;
+        let streams = devices.iter().zip(streams).map(|(device, stream)| (device.id, stream)).collect::<Vec<_>>();
+        let rtx = self.rtx_plan(&devices)?;
         let load = DenseLoad::push(devices[0].library);
         // Dense owners and records, planned before membership.
         let policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?;
         let planned = policy.plan(|| -> Result<_> {
             ensure!(spark.coordinator_pushes(), "Kimi Spark admission did not select required push");
-            let owners = self.record(devices, checkpoint, &load, streams)?;
+            let owners = self.record(&devices, checkpoint, &load, &streams)?;
             let records = load.sink.as_ref().context("push sink")?.take_all();
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
@@ -270,10 +284,16 @@ impl<'a> Admission<'a> {
             let dense = dense::plan_records(&checkpoint.snapshot, records.clone(), &devices, peers.len())?;
             let experts = rtx.as_ref().map(|(layers, budgets, _)| -> Result<_> {
                 let workspace = self.rtx.as_ref().context("Kimi missing TP2 inventory")?.workspace;
-                Ok(CoordinatorExperts::Tp2 { layers: layers.clone(),
-                    budgets: push_resident_budgets(*budgets, workspace)?.to_vec() })
+                let budgets = budgets.iter().map(|budget| budget.checked_sub(workspace)
+                    .context("Kimi pushed expert payload cannot spend workspace")).collect::<Result<Vec<_>>>()?;
+                Ok(if RANKS == 1 {
+                    CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner {
+                        rank: 0, selections: layers.iter().map(|&layer|
+                            crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(),
+                        budget: budgets[0] }] }
+                } else { CoordinatorExperts::Tp2 { layers: layers.clone(), budgets } })
             }).transpose()?;
-            let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), 2, experts)?;
+            let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), RANKS, experts)?;
             Ok((prepared, owners, records, dense))
         })?;
         let (planned, ranks) = match planned {
@@ -292,100 +312,122 @@ impl<'a> Admission<'a> {
             }
             None => {
                 let mount = DenseLoad::mount(devices[0].library);
-                let owners = self.record(devices, checkpoint, &mount, streams)?;
+                let owners = self.record(&devices, checkpoint, &mount, &streams)?;
                 mount.release();
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Kimi coordinator dense operands mounted");
                 (owners, None)
             }
         };
-        let experts = self.finish_rtx(devices, catalog, rtx, pushed)?;
-        Ok((pending, experts, self.register(devices, weights)?))
+        let experts = self.finish_rtx(&devices, catalog, rtx, pushed)?;
+        Ok((pending, experts, self.register(&devices, weights)?))
     }
 
-    /// The admitted TP2 expert layers and binder peaks (one lane's workspace
-    /// retained), or none. Push offers subtract that final workspace separately.
+    /// Binder peaks retain one lane workspace; other lanes allocate only execution scratch.
     #[allow(clippy::type_complexity)]
-    fn rtx_plan(&self, devices: [Device<'a>; 2]) -> Result<Option<(Vec<usize>, [usize; 2], std::path::PathBuf)>> {
+    fn rtx_plan(&self, devices: &[Device<'a>]) -> Result<Option<(Vec<usize>, Vec<usize>, std::path::PathBuf)>> {
         let Some(inventory) = &self.rtx else { return Ok(None) };
         let layers = self.working_set().rtx_layers;
         if layers.is_empty() { return Ok(None); }
-        let mut budgets = [0; 2];
-        for rank in 0..2 {
-            ensure!(devices[rank].id == self.devices[rank], "Kimi TP2 expert device differs from admission");
-            let charged = usize::try_from(self.placement.tp2.as_ref()
-                .context("Kimi missing admitted TP2 arena")?.peak_bytes[rank])?;
+        ensure!(devices.len() == self.devices.len(), "Kimi expert physical inventory differs");
+        let mut budgets = Vec::new();
+        for (rank, device) in devices.iter().enumerate() {
+            ensure!(device.id == self.devices[rank], "Kimi expert device differs from admission");
+            let charged = if devices.len() == 1 {
+                self.placement.expert_ranges[rank].peak_bytes
+            } else { self.placement.tp2.as_ref().context("Kimi missing admitted TP2 arena")?.peak_bytes[rank] };
             let other_lanes = inventory.workspace.checked_mul(self.lanes as usize - 1)
-                .context("Kimi TP2 lane workspace overflow")?;
-            budgets[rank] = charged.checked_sub(other_lanes).context("Kimi TP2 workspace exceeds charge")?;
+                .context("Kimi expert lane workspace overflow")?;
+            budgets.push(usize::try_from(charged)?.checked_sub(other_lanes)
+                .context("Kimi expert workspace exceeds charge")?);
         }
         Ok(Some((layers, budgets, inventory.package.clone())))
     }
 
-    /// Publishes the pushed TP2 halves, or loads them through the mount.
+    /// Publish committed payloads or mount the identical actual-owner slices.
     #[allow(clippy::type_complexity)]
-    fn finish_rtx(&mut self, devices: [Device<'a>; 2], catalog: &cuteafd_loader::OfficialV41Catalog,
-        rtx: Option<(Vec<usize>, [usize; 2], std::path::PathBuf)>,
+    fn finish_rtx(&mut self, devices: &[Device<'a>], catalog: &cuteafd_loader::OfficialV41Catalog,
+        rtx: Option<(Vec<usize>, Vec<usize>, std::path::PathBuf)>,
         pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)
-        -> Result<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>; 2]> {
+        -> Result<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>>> {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        ensure!(!self.rtx_loaded, "Kimi TP2 experts already loaded");
+        ensure!(!self.rtx_loaded && devices.len() == self.devices.len(), "Kimi experts already loaded or wrong owners");
         self.rtx_loaded = true;
-        let Some((layers, budgets, package)) = rtx else { return Ok([None, None]) };
-        // A TP2 FFN completes inside one unit's hook.
+        let Some((layers, budgets, package)) = rtx else { return Ok(devices.iter().map(|_| None).collect()) };
         let rows = self.unit_rows;
+        let selection = RtxSelectionPolicy::FirstCapacity;
         let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
-        let pair = match pushed {
+        let pushed = pushed.map(|ranks| ranks.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()).transpose()?;
+        if devices.len() == 1 {
+            let weights = match pushed {
+                Some(mut ranks) => {
+                    ensure!(ranks.len() == 1, "Kimi whole pushed physical rank count");
+                    Exl3Tp2::pushed_whole_weights(devices[0], catalog, &package, layers, rows, budgets[0], selection,
+                        ranks.pop().unwrap())?
+                }
+                None => Exl3Tp2::load_whole_weights(devices[0], catalog, &package, layers, rows, budgets[0], selection)?,
+            };
+            return Ok(vec![Some(weights)]);
+        }
+        let pair = [devices[0], devices[1]];
+        let budgets = [budgets[0], budgets[1]];
+        let weights = match pushed {
             Some(ranks) => {
-                let ranks = ranks.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()?;
-                let pushed: [_; 2] = ranks.try_into().map_err(|_| anyhow::anyhow!("two coordinator GPUs"))?;
-                Exl3Tp2::pushed_pair_weights(devices, catalog, geometry, [&package, &package], layers, rows, budgets,
-                    RtxSelectionPolicy::FirstCapacity, pushed)?
+                let pushed = ranks.try_into().map_err(|_| anyhow::anyhow!("Kimi pushed pair rank count"))?;
+                Exl3Tp2::pushed_pair_weights(pair, catalog, geometry, [&package, &package], layers, rows, budgets, selection, pushed)?
             }
-            None => Exl3Tp2::load_pair_weights(devices, catalog, geometry, [&package, &package], layers, rows, budgets,
-                RtxSelectionPolicy::FirstCapacity)?,
+            None => Exl3Tp2::load_pair_weights(pair, catalog, geometry, [&package, &package], layers, rows, budgets, selection)?,
         };
-        Ok(pair.map(Some))
+        Ok(weights.into_iter().map(Some).collect())
     }
 
     /// Every global and layer owner through the shared records on `load`.
     #[allow(clippy::type_complexity)]
-    fn record(&self, devices: [Device<'a>; 2], checkpoint: &cuteafd_loader::plan::Checkpoint,
-        load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: [(i32, *mut std::ffi::c_void); 2])
-        -> Result<([GlobalWeights<'a>; 2], Vec<[LayerWeights<'a>; 2]>)> {
+    fn record(&self, devices: &[Device<'a>], checkpoint: &cuteafd_loader::plan::Checkpoint,
+        load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: &[(i32, *mut std::ffi::c_void)])
+        -> Result<(Vec<GlobalWeights<'a>>, Vec<Vec<LayerWeights<'a>>>)> {
+        ensure!(devices.len() == self.devices.len() && streams.len() == devices.len(),
+            "Kimi dense records physical inventory differs from admission");
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-        let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core, dense: load, streams };
-        let global = [records.global(devices[0], &self.global_layouts[0])?, records.global(devices[1], &self.global_layouts[1])?];
-        let layers = (0..self.cfg.layers).map(|layer| records.layer(devices, layer, &self.layouts[layer]))
+        let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core,
+            dense: load, streams: streams.to_vec() };
+        let global = devices.iter().zip(&self.global_layouts).map(|(&device, layout)| records.global(device, layout))
+            .collect::<Result<Vec<_>>>()?;
+        let layers = (0..self.cfg.layers).map(|layer| records.layer_ranks(devices, layer, &self.layouts[layer]))
             .collect::<Result<Vec<_>>>()?;
         Ok((global, layers))
     }
 
-    /// Registers loaded owners once, as the host-pack uploads do.
-    fn register(&mut self, devices: [Device<'a>; 2], (global, layers): ([GlobalWeights<'a>; 2], Vec<[LayerWeights<'a>; 2]>))
+    /// Validate every owner before publishing any weak registry entry.
+    #[allow(clippy::type_complexity)]
+    fn register(&mut self, devices: &[Device<'a>], (global, layers): (Vec<GlobalWeights<'a>>, Vec<Vec<LayerWeights<'a>>>))
         -> Result<LoadedWeights<'a>> {
-        let mut out = Vec::new();
-        for (rank, weights) in global.into_iter().enumerate() {
+        let ranks = self.devices.len();
+        ensure!(devices.len() == ranks && global.len() == ranks && layers.len() == self.cfg.layers
+            && layers.iter().all(|owners| owners.len() == ranks), "Kimi registered physical owner inventory differs");
+        for rank in 0..ranks {
             self.check_global(rank, devices[rank].id)?;
-            let weights = Rc::new(weights);
-            self.global_owners[rank] = Rc::downgrade(&weights);
-            self.global_uploaded[rank] = true;
-            out.push(weights);
-        }
-        let mut owned = Vec::new();
-        for (layer, pair) in layers.into_iter().enumerate() {
-            let pair = pair.map(Rc::new);
-            for rank in 0..2 {
+            global[rank].check_device(devices[rank])?;
+            for (layer, owners) in layers.iter().enumerate() {
                 self.check_layer(rank, layer, devices[rank].id)?;
-                self.layer_owners[layer][rank] = Rc::downgrade(&pair[rank]);
+                owners[rank].check_device(devices[rank])?;
+            }
+        }
+        let global = global.into_iter().map(Rc::new).collect::<Vec<_>>();
+        let layers = layers.into_iter().map(|owners| owners.into_iter().map(Rc::new).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for rank in 0..ranks {
+            self.global_owners[rank] = Rc::downgrade(&global[rank]);
+            self.global_uploaded[rank] = true;
+            for (layer, owners) in layers.iter().enumerate() {
+                self.layer_owners[layer][rank] = Rc::downgrade(&owners[rank]);
                 self.layer_uploaded[layer][rank] = true;
             }
-            owned.push(pair);
         }
-        Ok(LoadedWeights { global: out.try_into().map_err(|_| anyhow::anyhow!("Kimi global rank count"))?, layers: owned })
+        Ok(LoadedWeights { global, layers })
     }
 
     fn check_layer(&self, rank: usize, layer: usize, device: i32) -> Result<&LayerLayout> {
-        ensure!(rank < 2 && device == self.devices[rank], "Kimi upload device differs from admitted rank");
+        ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi upload device differs from admitted rank");
         let layout = &self.layouts.get(layer).context("Kimi upload layer outside admission")?[rank];
         ensure!(!self.layer_uploaded[layer][rank], "Kimi layer weights already uploaded");
         Ok(layout)
@@ -394,7 +436,7 @@ impl<'a> Admission<'a> {
     /// Bind once for the engine lifetime. No layer/step method drains this lane.
     pub(crate) fn bind_local(&mut self, rank: usize, lane: usize, allocated: Lane<'a>,
         programs: Rc<NativePrograms<'a>>) -> Result<LocalLane<'a>> {
-        ensure!(rank < 2 && lane < self.lanes as usize && !self.local_bound[lane][rank],
+        ensure!(rank < self.devices.len() && lane < self.lanes as usize && !self.local_bound[lane][rank],
             "Kimi local lane already bound or outside admission");
         programs.check_inventory(&self.cfg)?;
         let expected = self.lane_readers[lane][rank].upgrade().context("Kimi local binding requires admitted lane")?;
@@ -420,7 +462,7 @@ impl<'a> Admission<'a> {
     }
 
     fn check_io(&self, rank: usize, lane: usize, device: i32) -> Result<&IoLayout> {
-        ensure!(rank < 2 && device == self.devices[rank] && lane < self.lanes as usize,
+        ensure!(rank < self.devices.len() && device == self.devices[rank] && lane < self.lanes as usize,
             "Kimi IO allocation differs from admitted rank/device/lane");
         ensure!(!self.io_allocated[lane][rank], "Kimi token IO already allocated");
         let layout = &self.io_layouts[rank];
@@ -437,7 +479,7 @@ impl<'a> Admission<'a> {
     }
 
     fn check_global(&self, rank: usize, device: i32) -> Result<&GlobalLayout> {
-        ensure!(rank < 2 && device == self.devices[rank], "Kimi global upload differs from admitted device");
+        ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi global upload differs from admitted device");
         ensure!(!self.global_uploaded[rank], "Kimi global weights already uploaded");
         let layout = &self.global_layouts[rank];
         let demand = layout.demand()?;
@@ -486,7 +528,7 @@ impl<'a> Admission<'a> {
     }
 
     fn check_mla(&self, rank: usize, device: i32) -> Result<&CacheLayout> {
-        ensure!(rank < 2 && device == self.devices[rank], "Kimi MLA allocation differs from admitted device");
+        ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi MLA allocation differs from admitted device");
         ensure!(!self.mla_allocated[rank], "Kimi MLA bank already allocated");
         let layout = &self.mla_layouts[rank];
         let charges = self.placement.items[rank].iter().filter(|item| item.group == "records").collect::<Vec<_>>();
@@ -498,7 +540,7 @@ impl<'a> Admission<'a> {
     }
 
     fn check_kda(&self, rank: usize, device: i32) -> Result<()> {
-        ensure!(rank < 2 && device == self.devices[rank], "Kimi KDA allocation differs from admitted device");
+        ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi KDA allocation differs from admitted device");
         ensure!(!self.kda_allocated[rank], "Kimi KDA bank already allocated");
         for demand in self.kda_layout.demands(rank as u8)? {
             let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
@@ -510,7 +552,7 @@ impl<'a> Admission<'a> {
     }
 
     fn check_lane(&self, rank: usize, lane: usize, device: i32) -> Result<&LaneLayout> {
-        ensure!(rank < 2 && device == self.devices[rank] && lane < self.lanes as usize,
+        ensure!(rank < self.devices.len() && device == self.devices[rank] && lane < self.lanes as usize,
             "Kimi lane allocation differs from admitted rank/device/index");
         ensure!(!self.lane_allocated[lane][rank], "Kimi admitted lane already allocated");
         let layout = &self.lane_layouts[lane][rank];
@@ -523,7 +565,8 @@ impl<'a> Admission<'a> {
     }
 }
 
-pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
+pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Result<Admission<'a>> {
+    ensure!(matches!(RANKS, 1 | 2), "Kimi admission physical rank count");
     let cfg = inputs.cfg;
     let cache_format = inputs.cache_format;
     inputs.core.validate_runtime_groups(cfg)?;
@@ -534,14 +577,15 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let spark_ranks = inputs.spark_ranks;
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
-    let lane_layouts = inputs.lane_layouts.clone();
+    let lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
-    let one_mark = KdaLayout::new(cfg, state_slots, 1, inputs.lanes)?;
-    let mut mark_demands = (0..2).map(|rank| one_mark.demands(rank).map(|demands| demands[2].clone()))
+    let one_mark = KdaLayout::for_ranks(cfg, state_slots, 1, inputs.lanes, RANKS)?;
+    let mut mark_demands = (0..RANKS).map(|rank| one_mark.demands(rank as u8).map(|demands| demands[2].clone()))
         .collect::<Result<Vec<_>>>()?;
-    let global_layouts = GlobalLayout::pair_with_core(cfg,&core)?;
-    let io_layouts = [IoLayout::with_core(cfg, 0, inputs.rows, &core)?, IoLayout::with_core(cfg, 1, inputs.rows, &core)?];
+    let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?;
+    let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks(cfg, rank, inputs.rows, &core, devices.len()))
+        .collect::<Result<Vec<_>>>()?;
     let rtx = inputs.rtx.take();
     let spark_budget = inputs.spark_budget.take();
     let draft = inputs.draft.clone();
@@ -551,7 +595,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let graph_verify = inputs.verify_rows;
     let mut request = request(inputs)?;
     if let Some(layout) = &draft {
-        let demand = Demand::new(1, Category::Prefix, DRAFT_MARKS, layout.window_mark_bytes()? as u64, Basis::Exact);
+        let demand = Demand::new((RANKS - 1) as u8, Category::Prefix, DRAFT_MARKS, layout.window_mark_bytes()? as u64, Basis::Exact);
         if demand.bytes > 0 {
             let mut total = demand.clone();
             total.bytes = total.bytes.checked_mul(legacy_marks as u64).context("Kimi draft window marks overflow")?;
@@ -560,19 +604,24 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
         }
     }
     if let Some(inventory) = &rtx {
-        ensure!(inventory.costs.len() == cfg.layers, "Kimi TP2 expert inventory extent");
+        ensure!(inventory.costs.len() == cfg.layers && inventory.costs.iter().all(|cost| cost.len() == RANKS),
+            "Kimi expert inventory physical extent");
         for (layer, cost) in request.layers.iter_mut().zip(&inventory.costs) {
-            if let Some(experts) = &mut layer.experts { experts.half = *cost; experts.tp2 = true; }
+            if let Some(experts) = &mut layer.experts {
+                if RANKS == 1 { experts.whole = cost[0]; }
+                else { experts.half = [cost[0], cost[1]]; experts.tp2 = true; }
+            }
         }
         let workspace = (inventory.workspace as u64).checked_mul(lanes).context("Kimi TP2 workspace overflow")?;
-        request.tp2_workspace = [workspace; 2];
+        if RANKS == 1 { request.expert_workspace = workspace; }
+        else { request.tp2_workspace = [workspace; 2]; }
         request.onboard = inventory.layers;
-        request.expert_gpus = 2;
+        request.expert_gpus = RANKS;
         request.policy.expert_ownership = ExpertOwnership::Contiguous;
     }
     if let Some(budget) = &spark_budget { budget.constrain(&mut request)?; }
     let groups = request.layers.iter().map(|layer|
-        (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
+        (RANKS == 2 && layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
         .collect::<Vec<_>>();
     let (placement, (mark_selection, graph_set, draft)) = attention::solve_owners(&groups,
         LayerOwnership::Ranges, request.layers_first_gpu, |owners| -> Result<_> {
@@ -580,11 +629,11 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
             for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
                 if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
             }
-            let graphs = graph_reserve.then(|| super::graphs::inventory(cfg, lanes as usize, graph_rows,
-                graph_slots, graph_verify, |rank, layer| !groups[layer].0 || usize::from(owners[layer]) == rank)).transpose()?;
+            let graphs = graph_reserve.then(|| super::graphs::inventory_for_ranks(cfg, lanes as usize, graph_rows,
+                graph_slots, graph_verify, RANKS, |rank, layer| !groups[layer].0 || usize::from(owners[layer]) == rank)).transpose()?;
             candidate.fixed.retain(|d| d.group != super::graphs::RESERVE);
             if let Some(graphs) = &graphs {
-                candidate.fixed.extend((0..2).map(|rank| super::graphs::demand(&graphs.inventory, rank)));
+                candidate.fixed.extend((0..RANKS).map(|rank| super::graphs::demand(&graphs.inventory, rank)));
             }
             let admit_marks = |trial: &PlacementRequest| -> Result<_> {
                 if legacy_marks == 0 {
@@ -596,8 +645,8 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
                 settle_pool((initial, ()), |tokens, _| -> Result<_> {
                     let mut trial = candidate.clone();
                     let layout = layout.with_pool_tokens(usize::try_from(tokens)?)?;
-                    let (demand, peak) = layout.demands(1)?;
-                    trial.movables = vec![demand.movable(2)?];
+                    let (demand, peak) = layout.demands((RANKS - 1) as u8)?;
+                    trial.movables = vec![demand.movable(RANKS)?];
                     trial.startup.retain(|d| d.group != peak.group);
                     trial.startup.push(peak);
                     trial.pool.target = trial.pool.target.min(tokens);
@@ -609,7 +658,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
                 let (placed, marks) = admit_marks(&candidate)?;
                 (placed, marks, None)
             };
-            if let Some(graphs) = &graphs { super::graphs::check_placement(cfg, &placed, &graphs.keys)?; }
+            if let Some(graphs) = &graphs { super::graphs::check_placement_for_ranks(cfg, &placed, &graphs.keys, RANKS)?; }
             Ok((placed, (marks, graphs, layout)))
         })?;
     if let Some(budget) = &spark_budget {
@@ -620,12 +669,12 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
                 reserve = "estimated; pending load/steady census", "Kimi Spark budget selection");
         }
     }
-    let kda_layout = KdaLayout::new(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize)?;
+    let kda_layout = KdaLayout::for_ranks(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize, RANKS)?;
     tracing::info!(selection = %mark_selection.summary(), "Kimi retained mark admission");
-    EXECUTOR.check(&placement)?;
+    if RANKS == 1 { SINGLE.check(&placement)?; } else { EXECUTOR.check(&placement)?; }
     let layouts = placement.layers.iter().enumerate().map(|(layer, assignment)|
-        LayerLayout::pair_with_core(cfg, layer, assignment.mode, &core)).collect::<Result<Vec<_>>>()?;
-    for rank in 0..2 {
+        LayerLayout::ranks_with_core(cfg, layer, assignment.mode, &core, devices.len())).collect::<Result<Vec<_>>>()?;
+    for rank in 0..RANKS {
         let native = layouts.iter().try_fold(0u64, |sum, pair| sum.checked_add(pair[rank].bytes()? as u64)
             .context("Kimi admitted native weight sum overflow"))?;
         let charged = placement.items[rank].iter().filter(|item|
@@ -633,41 +682,48 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
             .try_fold(0u64, |sum, item| sum.checked_add(item.bytes).context("Kimi weight charge overflow"))?;
         ensure!(native == charged, "Kimi rank {rank} native weights differ from shared admission: {native} != {charged}");
     }
-    let layer_owners = (0..layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
-    let layer_uploaded = vec![[false; 2]; layouts.len()];
-    let local_bound = vec![[false; 2]; lane_layouts.len()];
-    let lane_allocated = vec![[false; 2]; lane_layouts.len()];
-    let io_allocated = vec![[false; 2]; lane_layouts.len()];
-    let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
-    let mla_layouts = [CacheLayout::new(cfg, &placement, 0, cache_format)?, CacheLayout::new(cfg, &placement, 1, cache_format)?];
+    let layer_owners = vec![vec![Weak::new(); devices.len()]; layouts.len()];
+    let layer_uploaded = vec![vec![false; devices.len()]; layouts.len()];
+    let local_bound = vec![vec![false; devices.len()]; lane_layouts.len()];
+    let lane_allocated = vec![vec![false; devices.len()]; lane_layouts.len()];
+    let io_allocated = vec![vec![false; devices.len()]; lane_layouts.len()];
+    let lane_readers = vec![vec![Weak::new(); devices.len()]; lane_layouts.len()];
+    let mla_layouts = (0..devices.len()).map(|rank| CacheLayout::for_ranks(cfg, &placement, rank, cache_format, devices.len()))
+        .collect::<Result<Vec<_>>>()?;
     let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
-        devices, lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
-        kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
-        mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
-        global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
+        devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
+        kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
+        mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
+        global_layouts, global_uploaded: vec![false; devices.len()], global_owners: vec![Weak::new(); devices.len()],
         io_layouts, io_allocated, spark_connected: vec![false; lanes as usize] };
-    for rank in 0..2 {
+    for rank in 0..RANKS {
         admission.check_kda(rank, devices[rank])?;
         admission.check_mla(rank, devices[rank])?;
         admission.check_global(rank, devices[rank])?;
         for lane in 0..lanes as usize { admission.check_io(rank, lane, devices[rank])?; }
     }
-    if admission.draft.is_some() { admission.check_draft(devices[1])?; }
+    if admission.draft.is_some() { admission.check_draft(devices[RANKS - 1])?; }
     Ok(admission)
 }
 
 fn hop_spec(hidden: usize, rows: usize, lanes: usize) -> HopSpec {
-    HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (hidden * 2) as u64,
-        rows: rows as u64, lanes: lanes as u64, entry_gpu: 0, head_gpu: 1,
-        terminal: TerminalHome::Replicated }
+    hop_spec_for_ranks(hidden, rows, lanes, 2)
 }
 
-fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
+fn hop_spec_for_ranks(hidden: usize, rows: usize, lanes: usize, ranks: usize) -> HopSpec {
+    HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (hidden * 2) as u64,
+        rows: rows as u64, lanes: lanes as u64, entry_gpu: 0, head_gpu: (ranks - 1) as u8,
+        terminal: if ranks == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } }
+}
+
+fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest> {
+    ensure!(matches!(RANKS, 1 | 2), "Kimi request physical rank count");
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
         "Kimi admission layer inventory differs from checkpoint");
-    ensure!((1..=8).contains(&i.spark_ranks) && i.peer_access, "Kimi native admission requires TP2 peer access and 1..8 Spark ranks");
-    ensure!(i.devices.iter().all(|device| *device >= 0) && i.devices[0] != i.devices[1],
+    ensure!((1..=8).contains(&i.spark_ranks) && (RANKS == 1 || i.peer_access),
+        "Kimi native admission requires 1..8 Spark ranks and peer access for a pair");
+    ensure!(i.devices.iter().all(|device| *device >= 0) && (RANKS == 1 || i.devices[0] != i.devices[1]),
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.attention != Some(AttentionPlacement::Context), "Kimi context attention has no query/LSE exchange ABI");
     ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&i.state_slots)
@@ -681,11 +737,11 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         "Kimi runtime admission needs post-module CUDA samples");
     // Only startup graphs carry a temporary estimate pending the first serving
     // census. No weight, workspace, fixed or pool charge inherits this exception.
-    ensure!(i.fixed.iter().all(|d| d.gpu < 2 && d.basis != Basis::Estimated)
-        && i.startup.iter().all(|d| d.gpu < 2 && (d.basis != Basis::Estimated
+    ensure!(i.fixed.iter().all(|d| (d.gpu as usize) < RANKS && d.basis != Basis::Estimated)
+        && i.startup.iter().all(|d| (d.gpu as usize) < RANKS && (d.basis != Basis::Estimated
             || (d.group == super::graphs::RESERVE && d.category == Category::Runtime
                 && d.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident)))
-        && i.pool_bounded.iter().all(|d| d.gpu < 2 && d.basis != Basis::Estimated),
+        && i.pool_bounded.iter().all(|d| (d.gpu as usize) < RANKS && d.basis != Basis::Estimated),
         "Kimi runtime admission allows estimates only for its named startup graph reserve");
     ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten()
         .all(|layout| layout.rows() == i.rows && layout.unit == unit),
@@ -714,7 +770,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             "Kimi startup graph reserve supplied twice");
         fixed.push(graph);
     }
-    for layout in GlobalLayout::pair_with_core(cfg,&i.core)? {
+    for layout in GlobalLayout::ranks_with_core(cfg, &i.core, RANKS)? {
         let demand = layout.demand()?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi global weight charge supplied twice");
@@ -729,13 +785,14 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
     }
     for lane in 0..i.lanes {
-        let demand = super::spark::admitted_demand(i.waves, unit, lane, i.spark_ranks)?;
+        let demand = super::spark::admitted_demand_on(i.waves, unit, lane, i.spark_ranks, RANKS - 1,
+            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi Spark intake charge supplied twice");
         fixed.push(demand);
     }
-    for rank in 0..2 {
-        let layout = IoLayout::with_core(cfg, rank, i.rows, &i.core)?;
+    for rank in 0..RANKS {
+        let layout = IoLayout::for_ranks(cfg, rank, i.rows, &i.core, RANKS)?;
         for lane in 0..i.lanes {
             let demand = layout.demand(lane)?;
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
@@ -743,9 +800,9 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             fixed.push(demand);
         }
     }
-    let kda = KdaLayout::new(cfg, i.state_slots, i.prefix_marks, i.lanes)?;
-    for rank in 0..2 {
-        for demand in kda.demands(rank)? {
+    let kda = KdaLayout::for_ranks(cfg, i.state_slots, i.prefix_marks, i.lanes, RANKS)?;
+    for rank in 0..RANKS {
+        for demand in kda.demands(rank as u8)? {
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
                 "Kimi KDA pool charge supplied twice");
             fixed.push(demand);
@@ -753,28 +810,33 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     }
     let mut movables = Vec::new();
     if let Some(layout) = &i.draft {
-        let (demand, peak) = layout.demands(1)?;
+        let (demand, peak) = layout.demands((RANKS - 1) as u8)?;
         ensure!(demand.owned.iter().chain(std::iter::once(&peak)).all(|draft|
             !fixed.iter().chain(&startup).any(|item| item.group == draft.group)),
             "Kimi drafter charge supplied twice");
-        movables.push(demand.movable(2)?);
+        movables.push(demand.movable(RANKS)?);
         startup.push(peak);
     }
     let mut layers = Vec::with_capacity(cfg.layers);
     for layer in 0..cfg.layers {
-        let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, &i.core)?;
-        let mut split_attention = [0; 2];
-        // Whole describes attention residency, not the split FFN's residency.
-        // Keep these always-resident native operands on both ranks, as GLM's
-        // existing fixed target-weight inventory does for the same mode.
-        for rank in 0..2 {
-            let attention = split[rank].attention_bytes()?;
-            split_attention[rank] = attention as u64;
-            fixed.push(Demand::new(rank as u8, Category::Weights, format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                (split[rank].bytes()? - attention) as u64, Basis::Exact));
-        }
         let mla = cfg.attention[layer] == KimiAttention::Mla;
-        let whole = if mla { LayerLayout::pair_with_core(cfg, layer, MODES[1], &i.core)?[0].attention_bytes()? as u64 } else { 0 };
+        let (whole, split_attention) = if RANKS == 1 {
+            let layouts = LayerLayout::ranks_with_core(cfg, layer, WHOLE, &i.core, 1)?;
+            (layouts[0].bytes()? as u64, [0; 2])
+        } else {
+            let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, &i.core)?;
+            let mut attention = [0; 2];
+            for rank in 0..2 {
+                attention[rank] = split[rank].attention_bytes()? as u64;
+                fixed.push(Demand::new(rank as u8, Category::Weights,
+                    format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
+                    split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+            }
+            let whole = if mla {
+                LayerLayout::pair_with_core(cfg, layer, MODES[1], &i.core)?[0].attention_bytes()? as u64
+            } else { 0 };
+            (whole, attention)
+        };
         let unit = if mla { (MLA_PAGE_ROWS * i.cache_format.record_bytes()) as u64 } else { 0 };
         layers.push(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
             weights: ModeBytes { whole, split: split_attention },
@@ -783,22 +845,22 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             // admit() installs the checkpoint's TP2 rank-slice costs before solve.
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
                 half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
-            modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
+            modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
     let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
         i.requested_pool, MLA_PAGE_ROWS as u64, true);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
     Ok(PlacementRequest { expert_tier: None, inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables,
+        pool, layers, pool_overhead: vec![0; RANKS], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges,
+        policy: LayerPolicy { default: if RANKS == 1 { vec![WHOLE] } else { vec![LayerMode::HeadSplit] }, ownership: LayerOwnership::Ranges,
             attention: [(KimiAttention::Mla, AttentionClass::Mla, AttentionPlacement::Layers),
-                (KimiAttention::Kda, AttentionClass::Kda, AttentionPlacement::Heads)].into_iter()
+                (KimiAttention::Kda, AttentionClass::Kda, if RANKS == 1 { AttentionPlacement::Layers } else { AttentionPlacement::Heads })].into_iter()
                 .filter(|(kind, _, _)| cfg.attention.contains(kind))
                 .map(|(_, class, placement)| (class, placement)).collect(),
             ..Default::default() },
-        hops: hop_spec(cfg.hidden, unit, i.lanes), executor: EXECUTOR })
+        hops: hop_spec_for_ranks(cfg.hidden, unit, i.lanes, RANKS), executor: if RANKS == 1 { SINGLE } else { EXECUTOR } })
 }
 
 #[cfg(test)]
@@ -839,7 +901,7 @@ pub(super) mod tests {
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
-            cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, 4096)?)?;
+            cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, 4096)?)?;
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
         let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
@@ -884,7 +946,10 @@ pub(super) mod tests {
             if enabled { req.fixed.push(Demand::new(1, Category::Prefix, DRAFT_MARKS,
                 draft.window_mark_bytes()? as u64, Basis::Exact)); }
             for (layer, cost) in req.layers.iter_mut().zip(&rtx.costs) {
-                if let Some(experts) = &mut layer.experts { experts.half = *cost; experts.tp2 = true; }
+                if let Some(experts) = &mut layer.experts {
+                    experts.half = [cost[0], cost[1]];
+                    experts.tp2 = true;
+                }
             }
             req.tp2_workspace = [rtx.workspace as u64; 2]; req.onboard = rtx.layers; req.expert_gpus = 2;
             req.policy.expert_ownership = ExpertOwnership::Contiguous;
@@ -963,14 +1028,74 @@ pub(super) mod tests {
     }
 
     pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
+        inputs_for_ranks::<2>(cfg)
+    }
+
+    fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
         Inputs { cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
-            baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
+            baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
-            lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
+            lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
-                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
-            fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, RANKS).unwrap()); 2],
+            fixed: (0..RANKS).map(|rank| Demand::new(rank as u8, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
             startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None, verify_rows: 0 }
+    }
+
+    #[test]
+    fn single_owner_admits_full_state_whole_experts_and_no_peer_hops() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.rtx = Some(RtxInventory { package: Default::default(),
+            costs: cfg.dense.iter().map(|dense| vec![if *dense { Bytes2::default() }
+                else { Bytes2 { resident: 1 << 20, staging: 4096 } }]).collect(),
+            workspace: 8192, layers: Onboard::Layers(1) });
+        let admitted = admit(i)?;
+        assert_eq!(admitted.devices, [0]);
+        assert_eq!(admitted.global_layouts.len(), 1);
+        assert_eq!(admitted.mla_layouts.len(), 1);
+        assert!(admitted.layouts.iter().all(|owners| owners.len() == 1));
+        assert!(admitted.placement.layers.iter().all(|layer| layer.mode == WHOLE));
+        assert_eq!(admitted.placement.onboard_layers, 1);
+        let working = admitted.working_set();
+        assert_eq!(working.rtx_layers.len(), 1);
+        assert_eq!(working.spark_layers.len(), cfg.layers - 2);
+        assert!(admitted.placement.layers.iter().filter(|layer| layer.experts != ExpertHome::Dense)
+            .all(|layer| matches!(layer.experts, ExpertHome::RtxWhole { gpu: 0 } | ExpertHome::Spark)));
+        let full_state = KdaLayout::for_ranks(&cfg, 2, admitted.mark_selection.slots as usize, 2, 1)?;
+        assert_eq!(admitted.kda_layout, full_state);
+        let plan = admitted.execution_plan()?;
+        assert_eq!((plan.spec().entry_gpu, plan.spec().head_gpu), (0, 0));
+        assert!(plan.hops().is_empty());
+        assert!(admitted.placement.items[0].iter().all(|item|
+            !item.group.contains("peer exchange") && !item.group.contains("hop link")));
+        assert!(admitted.check_kda(1, 1).is_err());
+        assert!(admitted.check_global(1, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_draft_is_head_local_and_allocation_is_once_only() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1_048_576));
+        let mut admitted = admit(i)?;
+        assert!(admitted.check_draft(1).is_err());
+        let expected = admitted.check_draft(0)?.clone();
+        assert_eq!(draft::home(&admitted.placement), Some(0));
+        assert!(admitted.placement.items[0].iter().any(|item| item.group == DRAFT_MARKS));
+        admitted.allocate_draft_with(0, |layout| { assert_eq!(layout, expected); Ok(()) })?;
+        assert!(admitted.allocate_draft_with(0, |_| Ok(())).is_err());
+        let mut bad = inputs_for_ranks::<1>(&cfg);
+        bad.fixed.push(Demand::new(1, Category::Workspace, "foreign owner", 1, Basis::Exact));
+        assert!(request(bad).is_err());
+        let mut bad = inputs_for_ranks::<1>(&cfg);
+        bad.unit_rows = Some(4096);
+        assert!(request(bad).is_err());
+        let mut bad = inputs_for_ranks::<1>(&cfg);
+        bad.devices[0] = -1;
+        assert!(request(bad).is_err());
+        Ok(())
     }
 
     fn draft_layout(slots: usize, sequences: usize, context: usize) -> MlaDraftRuntimeLayout {
@@ -1101,7 +1226,7 @@ pub(super) mod tests {
     fn tp2_rank_slices_are_admitted_on_both_gpus_and_removed_from_spark_selection() -> Result<()> {
         let cfg = cfg();
         let mut i = inputs(&cfg);
-        i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![[Bytes2 {
+        i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![vec![Bytes2 {
             resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: Onboard::Layers(3) });
         let admitted = admit(i)?;
         let local = admitted.working_set();
@@ -1119,7 +1244,7 @@ pub(super) mod tests {
         let cfg = cfg();
         let make = |selection| {
             let mut i = inputs(&cfg);
-            i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![[Bytes2 {
+            i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![vec![Bytes2 {
                 resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: selection });
             i.spark_budget = Some(SparkBudgetInventory { layers: vec![1, 2, 3, 4],
                 resident: vec![vec![100; 4]; 6], overhead: vec![50; 6], budget: 250 });
@@ -1155,6 +1280,87 @@ pub(super) mod tests {
         i.lane_layouts[1][1] = LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), 524_288,
             super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
         assert!(request(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn installed_single_owner_planner_and_runtime_remaining_kv_match() -> Result<()> {
+        use cuteafd_loader::{families::kimi_k3::allocation, plan::{layout::LayoutOptions,
+            testing, ExpertPlacement, PlanOptions}};
+        use cuteafd_core::memory_layout::DeviceKind;
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let plan_input = testing::BudgetedPlanInput::open(snapshot.path())?;
+        let package_root = tempfile::tempdir()?;
+        let path = testing::write_kimi_installed_inventory(package_root.path(), false);
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
+        // BF16 headers isolate owner accounting; the real 96-GiB card uses K6.
+        let capacity = 192 << 30;
+        let context = 1_048_576;
+        let (unit, waves, slots, marks) = (1024, 3, 2, 2);
+        let rows = unit * waves;
+        let spark_bytes = 110 << 30;
+        let report = plan_input.plan(&PlanOptions {
+            placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
+                state_slots: Some(slots as u64), prefix_slots: Some(marks as u64),
+                host_cache_bytes: Some(0), context_tokens: context as u64,
+                prefill_rows: unit as u64, prefill_lanes: waves as u64,
+                workspace_manifest: Some(path.clone()), onboard: Some(OnboardSetting::Auto),
+                spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }),
+            ..Default::default()
+        })?;
+        ensure!(report.fits && report.placement_supported && report.executable(), "{:?}", report.hints);
+        let catalog = plan_input.expert_catalog()?;
+        let mut rtx = plan_rtx_for_ranks(&cfg, &catalog,
+            allocation::expert_package_for_ranks(&path, 1)?, unit, 92, 1)?;
+        rtx.layers = Onboard::Auto;
+        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
+            spark_ranks: 6, prefill_lanes: 1 };
+        let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
+        let spark = SparkBudgetInventory::exl3(&catalog, &working,
+            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32,
+                ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
+            cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
+                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
+            cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
+        let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
+        let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
+            "kimik3", "exl3", false, 0, arch, Some(&programs));
+        let resident = code.bytes - arch.cublas_bytes;
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
+        i.lanes = 1; i.state_slots = slots; i.prefix_marks = marks;
+        i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+        i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, rows, unit, context,
+            allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
+        i.fixed = vec![allocation::code_demand_for_ranks(0,
+            code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
+        i.startup = vec![super::super::graphs::demand(
+            &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
+        i.gpus[0] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+            baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+        i.rtx = Some(rtx); i.spark_budget = Some(spark);
+        let admitted = admit(i)?;
+        let memory = report.memory_layout.context("single-owner installed ledger")?;
+        assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+        assert_eq!(admitted.devices, [0]);
+        assert!(admitted.placement.layers.iter().all(|layer| layer.mode == WHOLE));
+        let devices = memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).collect::<Vec<_>>();
+        assert_eq!(devices.len(), 1);
+        let planned = devices[0];
+        assert_eq!(planned.index, 0);
+        let non_pool = planned.items.iter().filter(|item| item.group != "records")
+            .map(|item| item.bytes).sum::<u64>();
+        assert_eq!(capacity - arch.context_bytes - non_pool,
+            admitted.placement.pool_limits.0[0].available_bytes);
+        let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
+        assert_eq!(planned.items.iter().filter(|item| item.category == Category::Prefix)
+            .map(|item| item.bytes).sum::<u64>(), mark_bytes * marks as u64);
+        assert!(!planned.items.iter().any(|item| item.group == "Kimi peer/abort/hop controls"));
         Ok(())
     }
 
@@ -1249,7 +1455,7 @@ pub(super) mod tests {
                 &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
                 cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
-                cuteafd_loader::families::kimi_k3::spark_reserve_bytes(waves as u64, unit as u64)?)?;
+                cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
             let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
             let mut i = inputs(&cfg);
@@ -1801,7 +2007,7 @@ pub(super) mod tests {
         let waves = admitted.waves;
         let unit = admitted.unit_rows;
         for lane in 0..lanes {
-            let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks)?;
+            let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks, cuteafd_core::SparkReplyFormat::Bf16)?;
             let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].bytes, ranks as u64
@@ -1812,7 +2018,7 @@ pub(super) mod tests {
             assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));
         }
         let mut duplicate = inputs(&cfg);
-        duplicate.fixed.push(super::super::spark::admitted_demand(waves, unit, 0, ranks)?);
+        duplicate.fixed.push(super::super::spark::admitted_demand(waves, unit, 0, ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
         assert!(admit(duplicate).is_err());
         Ok(())
     }

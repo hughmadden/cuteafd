@@ -39,11 +39,19 @@ struct PendingDraft<'a> {
     armed: bool,
     library: &'a cuteafd_ffi::NativeLibrary,
     stream: *mut c_void,
+    peers: [Option<std::rc::Rc<crate::shared::memory::device::Stream<'a>>>; 3],
 }
 impl Drop for PendingDraft<'_> {
     fn drop(&mut self) {
         if self.armed {
-            fatal_drain(unsafe { self.library.cuda_stream_synchronize(self.stream) }, "pending draft readers");
+            // A partial enqueue may fail before the root joins the peer. Drain
+            // every peer even when root synchronization reports an error.
+            let mut drained = unsafe { self.library.cuda_stream_synchronize(self.stream) };
+            for peer in self.peers.iter().flatten() {
+                let result = peer.drain();
+                drained = drained.and(result);
+            }
+            fatal_drain(drained, "pending draft readers");
         }
     }
 }
@@ -224,7 +232,12 @@ impl DsparkChain<'_, '_> {
         }
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        let mut drained = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) };
+        for stage in &self.stages {
+            let result = stage.synchronize();
+            drained = drained.and(result);
+        }
+        drained
     }
     fn prepare(
         &mut self,
@@ -448,7 +461,8 @@ impl DsparkChain<'_, '_> {
         }
         self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         let pending = PendingDraft { count, reads, warming: !self.has_graph(count), armed: true,
-            library: self.stream.library, stream: self.stream.raw };
+            library: self.stream.library, stream: self.stream.raw,
+            peers: self.stages.each_ref().map(DsparkStage::peer_stream) };
         // The local guard already owns reservations before any partial upload.
         unsafe {
             self.stream.library.copy_h2d_async(self.tokens.buffer,

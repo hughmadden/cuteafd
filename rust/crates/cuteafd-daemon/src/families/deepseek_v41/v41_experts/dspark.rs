@@ -148,6 +148,30 @@ pub(crate) struct DsparkWeights<'library> {
     grouped_output_scales: [crate::shared::memory::DeviceAllocation<'library>; 3],
     projection_scales: [crate::shared::memory::DeviceAllocation<'library>; 13],
 }
+pub(crate) struct PreparedDspark<'a> {
+    library: &'a NativeLibrary,
+    draft_width: usize,
+    auxiliary: NativeRtxTensors<'a>,
+    budget: DsparkBudget,
+    shared_scales: [crate::shared::memory::DeviceAllocation<'a>; 9],
+    grouped_output_scales: [crate::shared::memory::DeviceAllocation<'a>; 3],
+    projection_scales: [crate::shared::memory::DeviceAllocation<'a>; 13],
+}
+impl<'a> PreparedDspark<'a> {
+    fn finish(self, experts: ExpertStages<'a>) -> DsparkWeights<'a> {
+        DsparkWeights { library: self.library, draft_width: self.draft_width, auxiliary: self.auxiliary,
+            budget: self.budget, shared_scales: self.shared_scales, grouped_output_scales: self.grouped_output_scales,
+            projection_scales: self.projection_scales, experts }
+    }
+    pub fn expert_resident_bytes(&self) -> usize { self.budget.expert_resident_bytes }
+    pub fn install(self, stages: [Vec<ExpertWeights<'a>>; 2]) -> Result<DsparkWeights<'a>> {
+        let devices = [crate::shared::memory::device::Device { library: self.library, id: 0 },
+            crate::shared::memory::device::Device { library: self.library, id: 1 }];
+        let pair = tp2::Weights::from_push(devices, stages, [self.budget.expert_resident_bytes; 2], tp2::LAYOUT)?;
+        Ok(self.finish(ExpertStages::Tp2(pair)))
+    }
+}
+
 impl<'library> DsparkWeights<'library> {
     fn full_expert(&self, stage: usize) -> Option<&ExpertWeights<'library>> {
         match &self.experts { ExpertStages::Full(weights) => weights.get(stage), ExpertStages::Tp2(_) => None }
@@ -290,6 +314,11 @@ impl<'library> DsparkWeights<'library> {
         };
         // Lane chains and terminals per GPU, as DistributedDsparkChain::device_bytes.
         let mut lane = DistributedDsparkTerminal::device_bytes_with_width(lane_requests as usize, split, width)?;
+        // The terminal binds each vocabulary shard's head-copy scratch after construction.
+        for (bytes, scratch) in lane.iter_mut().zip(DistributedDsparkTerminal::head_scratch_bytes(
+            library, lane_requests as usize * width, split)?) {
+            *bytes = bytes.checked_add(scratch).context("draft head scratch overflow")?;
+        }
         lane[0] = lane[0].checked_add(shape.peer_chain_bytes(lane_requests)?).context("draft peer lane overflow")?;
         lane[1] = lane[1].checked_add(shape.chain_bytes(lane_requests)?).context("draft lane overflow")?;
         let mut main = DsparkMainContext::device_bytes(library, context_capacity)?;
@@ -368,6 +397,15 @@ impl<'library> DsparkWeights<'library> {
     /// Both ranks are admitted before loading any checkpoint payload.
     pub fn load_tp2_with_width(library:&'library NativeLibrary,catalog:&OfficialV41Catalog,
         capacity:u32,waves:usize,budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
+        let (budget, _) = Self::tp2_budget(library, catalog, capacity, budgets, width)?;
+        let devices = [crate::shared::memory::device::Device { library, id: 0 },
+            crate::shared::memory::device::Device { library, id: 1 }];
+        let weights=tp2::Weights::load_pair(devices,catalog,budgets,tp2::LAYOUT)?;
+        Self::load_with_experts(library,catalog,capacity,waves,budgets[1],pinned_staging_bytes,width,Some((weights,budget)))
+    }
+
+    fn tp2_budget(library: &NativeLibrary, catalog: &OfficialV41Catalog, capacity: u32,
+        budgets: [usize; 2], width: usize) -> Result<(DsparkBudget, [usize; 2])> {
         ensure!(library.cuda_get_device()?==1,"TP2 dSpark transformer belongs on RTX1");
         let devices=[crate::shared::memory::device::Device {library,id:0},crate::shared::memory::device::Device {library,id:1}];
         let mut budget=Self::plan_with_width(library,catalog,capacity,width)?;
@@ -381,13 +419,23 @@ impl<'library> DsparkWeights<'library> {
         budget.expert_resident_bytes=resident[1];
         budget.load_staging_bytes=budget.load_staging_bytes.max(staging[1]);
         budget.execution_bytes_per_wave=workspace[1].checked_mul(3).context("draft TP2 workspace overflow")?;
-        let _ = (workspace, waves);
+
         let root_peak=budget.load_bound()?;
         let peer_peak=resident[0].checked_add(staging[0]).context("draft TP2 peer budget overflow")?;
         ensure!(peer_peak<=budgets[0] && root_peak<=budgets[1],
             "draft TP2 needs GPU0/GPU1 bytes {peer_peak}/{root_peak}, budgets are {}/{}",budgets[0],budgets[1]);
-        let weights=tp2::Weights::load_pair(devices,catalog,budgets,tp2::LAYOUT)?;
-        Self::load_with_experts(library,catalog,capacity,waves,budgets[1],pinned_staging_bytes,width,Some((weights,budget)))
+        Ok((budget, resident))
+    }
+
+    /// Record only auxiliary tensors before push. Expert views are installed
+    /// from the committed mixed backbone/draft arena, never recorded as dense.
+    pub fn prepare_serving_tp2(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
+        requests: u32, budgets: [usize; 2], pinned_staging_bytes: usize, width: usize)
+        -> Result<PreparedDspark<'library>> {
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(
+            requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
+        let (budget, resident) = Self::tp2_budget(library, catalog, capacity, budgets, width)?;
+        Self::prepare_auxiliary(library, catalog, budgets[1], pinned_staging_bytes, width, budget, resident[1])
     }
 
     /// Admit all three stages and the requested expert wave workspaces before
@@ -434,6 +482,14 @@ impl<'library> DsparkWeights<'library> {
             }
             ExpertStages::Full(weights.try_into().ok().context("dSpark requires three stages")?)
         };
+        Self::prepare_auxiliary(library, catalog, device_budget, pinned_staging_bytes, width, budget, resident)
+            .map(|prepared| prepared.finish(experts))
+    }
+    fn prepare_auxiliary(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
+        device_budget: usize, pinned_staging_bytes: usize, width: usize, budget: DsparkBudget,
+        resident: usize) -> Result<PreparedDspark<'library>> {
+        ensure!(budget.load_bound()? <= device_budget, "dSpark auxiliary preparation exceeds load admission");
+        ensure!((1..=64 * 1024 * 1024).contains(&pinned_staging_bytes), "invalid dSpark auxiliary staging");
         let auxiliary = NativeRtxTensors::load(
             library,
             catalog,
@@ -446,13 +502,12 @@ impl<'library> DsparkWeights<'library> {
         let shared_scales = shared::pack_scales(library, &auxiliary)?;
         let projection_scales = projection::pack_scales(library, &auxiliary)?;
         let grouped_output_scales = attention_output::pack_grouped_scales(library, &auxiliary)?;
-        Ok(Self {
+        Ok(PreparedDspark {
             library,
             draft_width: width,
             grouped_output_scales,
             shared_scales,
             projection_scales,
-            experts,
             auxiliary,
             budget,
         })

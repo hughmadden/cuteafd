@@ -888,6 +888,43 @@
       }
     },
     {
+      "name": "kimi-k3-min",
+      "family": "kimi_k3",
+      "config": "examples/configs/kimi-k3-exl3-k6-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8898",
+        "EXPERT_PORT": "21960",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "0",
+        "SPARK_COUNT": "6",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc",
+        "SPARK_DEVICE_BUDGET_BYTES": "118111600640"
+      }
+    },
+    {
       "name": "kimi-k3-max",
       "family": "kimi_k3",
       "config": "examples/configs/kimi-k3-exl3-k6-max.config",
@@ -1460,6 +1497,48 @@
       "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
       "release": "v3.0.0-rc5",
       "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "glm53-nvfp4-min",
+      "config": "examples/configs/glm53-nvfp4-min.config",
+      "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-nvfp4-min",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-nvfp4-5090",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-tr3-min",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min",
+      "release": "v4.1.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
+    },
+    {
+      "name": "glm53f-tr3-5090",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090",
+      "release": "v4.1.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
+    },
+    {
+      "name": "step5-nvfp4-min",
+      "config": "examples/configs/step5-nvfp4-min.config",
+      "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
+      "release": "v4.0.0-rc2",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     }
   ]
 }

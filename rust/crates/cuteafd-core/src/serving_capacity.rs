@@ -16,6 +16,11 @@ pub const PREFILL_MAX_WAVES: u64 = 4;
 /// hosts). cudaMalloc can suballocate at sub-page bases: overallocate one
 /// page, then register the aligned interior range, retaining the raw owner.
 pub const SPARK_INTAKE_EXPORT_ALIGNMENT: u64 = 4096;
+/// Pinned intake retains at most one small wave of shared upload staging.
+pub const SPARK_INTAKE_SMALL_WAVE_BYTES: u64 = 1 << 20;
+pub const SPARK_INTAKE_MAX_RANKS: usize = 8;
+pub const SPARK_WAVE_CONTROL_LINE_BYTES: usize = 64;
+pub const SPARK_WAVE_PULL_STRIDE_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SparkIntakeAllocationError {

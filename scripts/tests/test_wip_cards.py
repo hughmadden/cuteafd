@@ -966,6 +966,26 @@ def test_arm_config_edits_apply_after_generation(entry, tmp_path, monkeypatch):
             assert settings['COORDINATOR_GPUS'] == '1' and 'COORDINATOR_GPU' not in settings
 
 
+@pytest.mark.parametrize('key', ['MEDIA_FEATURES_DIR', 'AUDIO_FEATURES_DIR'])
+def test_reference_feature_directory_is_an_isolated_arm_setting(entry, tmp_path, monkeypatch, key):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    features = tmp_path / 'sealed-features'
+    features.mkdir()
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'native=b:s', '--arm', 'reference=c:s',
+        '--arm-wip', 'native=shared', '--arm-wip', 'reference=shared', '--state', str(state),
+        '--arm-set', f'reference:{key}={features}', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        settings = job['entry']['set']
+        assert cards.config(Path(job['state']) / 'base.config') == settings
+        if job['arm'] == 'reference':
+            assert settings[key] == str(features)
+        else:
+            assert key not in settings
+
+
 @pytest.mark.parametrize('extra,match', [
     (['--arm-set', 'foreign:MODEL_ID=x'], 'unknown override arm'),
     (['--arm-unset', 'foreign:MODEL_ID'], 'unknown override arm'),
@@ -1384,6 +1404,14 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
     assert scopes['CUTEAFD_WIP_AUDIO_AOT'] == 'ON'
     assert cards.slot_needs(card) == {'coordinator': ['fp8/fp8-mimof'], 'spark': ['fp8/fp8-mimof'], 'audio': True,
                                       'tp_role': None, 'nvfp4': False}
+
+
+def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
+    card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6'
+    assert values['MODEL_REVISION'] == '5a4e83a09a11f3145332ed632d28a9894ea88225'
+    assert card['gpus'] == [0, 1] and len(card['sparks']) == 6
 
 
 def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():

@@ -183,6 +183,8 @@ pub(crate) enum Finish {
     /// One plane of a native expert packed from its landed raw image (the
     /// scale planes: their raw bytes sit apart from the weights in the file).
     NativePlane { intermediate: u32, plane: u32, source: CuteafdDeviceBuffer, dst: CuteafdDeviceBuffer },
+    /// Native conservative row-norm bounds of a landed BF16 Markov projection.
+    RowNorms { source: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, rows: usize, cols: usize },
     /// Per-row scales gathered from a landed `grid` [*, grid_cols] (columns
     /// `col0..col0 + kb` of row `index[r]`, zero for `u32::MAX`) into
     /// `row_major` [rows, kb] and/or `k_major` [kb, rows].
@@ -193,7 +195,8 @@ pub(crate) enum Finish {
 impl Finish {
     pub fn device(&self) -> i32 {
         match self { Finish::V41Scales { packed, .. } | Finish::NativePlane { dst: packed, .. } => packed.device_id,
-            Finish::ScaleGather { grid, .. } => grid.device_id }
+            Finish::ScaleGather { grid, .. } => grid.device_id,
+            Finish::RowNorms { norms, .. } => norms.device_id }
     }
 
     /// [`Self::run`], then drained; a failed drain quarantines the module so
@@ -225,6 +228,18 @@ impl Finish {
                 // device; the native entry point checks extents, the caller drains.
                 unsafe { library.v41_pack_plane_async(source, dst, intermediate, plane, stream) }
             }
+            Finish::RowNorms { source, norms, rows, cols } => {
+                validate_row_norms(source, norms, rows, cols)?;
+                // SAFETY: checked BF16 source and FP32 output extents share the
+                // current GPU; owners survive the caller's completion drain.
+                unsafe {
+                    match cols {
+                        256 => library.glmf_dspark_markov_norms(source.ptr, norms.ptr, rows, cols, stream),
+                        512 => library.ml4_dspark_markov_norms(source.ptr, norms.ptr, rows, cols, stream),
+                        _ => unreachable!("checked native row width"),
+                    }
+                }
+            }
             Finish::ScaleGather { grid, ref index, kb, grid_cols, col0, row_major, k_major } => {
                 let rows = index.len();
                 ensure!(col0 + kb <= grid_cols && rows > 0
@@ -244,6 +259,53 @@ impl Finish {
                 }
             }
         }
+    }
+}
+
+fn validate_row_norms(source: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, rows: usize, cols: usize) -> Result<()> {
+    let source_bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("row norms source overflow")?;
+    let output_bytes = rows.checked_mul(4).context("row norms output overflow")?;
+    let source_end = (source.ptr as usize).checked_add(source_bytes).context("row norms source pointer overflow")?;
+    let output_end = (norms.ptr as usize).checked_add(output_bytes).context("row norms output pointer overflow")?;
+    ensure!(rows > 0 && matches!(cols, 256 | 512) && source_bytes <= source.bytes && output_bytes <= norms.bytes
+        && source.device_id == norms.device_id && !source.ptr.is_null() && !norms.ptr.is_null()
+        && ((norms.ptr as usize) >= source_end || (source.ptr as usize) >= output_end),
+        "row norms outside their operands, overlapping, or unsupported width");
+    Ok(())
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    #[test]
+    fn row_norm_finish_records_destination_device_and_checks_native_extents() -> Result<()> {
+        let mut source_bytes = vec![0u16; 2 * 512];
+        let mut output = vec![0f32; 2];
+        let source = CuteafdDeviceBuffer { ptr: source_bytes.as_mut_ptr().cast(), bytes: source_bytes.len() * 2, device_id: 3, ..Default::default() };
+        let norms = CuteafdDeviceBuffer { ptr: output.as_mut_ptr().cast(), bytes: output.len() * 4, device_id: 3, ..Default::default() };
+        for cols in [256, 512] {
+            validate_row_norms(source, norms, 2, cols)?;
+            let (_, records) = recording(|| {
+                assert!(recorded(|r| r.finishes.push(Finish::RowNorms { source, norms, rows: 2, cols })));
+                Ok(())
+            })?;
+            assert_eq!(records.summary(), (0, 0, 0, 0, 0, 1));
+            assert_eq!(records.finishes[0].device(), 3);
+            assert!(matches!(records.finishes[0], Finish::RowNorms { rows: 2, cols: c, .. } if c == cols));
+            assert_eq!(output, [0., 0.]);
+        }
+        for (source, norms, rows, cols) in [
+            (source, norms, 0, 256), (source, norms, 2, 128), (source, norms, 3, 512),
+            (source, CuteafdDeviceBuffer { bytes: 4, ..norms }, 2, 256),
+            (source, CuteafdDeviceBuffer { device_id: 2, ..norms }, 2, 256),
+            (source, CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..norms }, 2, 256),
+            (source, CuteafdDeviceBuffer { ptr: source.ptr, ..norms }, 2, 256),
+            (source, norms, usize::MAX, 512),
+        ] {
+            assert!(validate_row_norms(source, norms, rows, cols).is_err());
+        }
+        Ok(())
     }
 }
 

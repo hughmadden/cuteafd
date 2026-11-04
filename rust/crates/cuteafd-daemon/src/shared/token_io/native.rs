@@ -7,7 +7,7 @@ use cuteafd_ffi::native_dense::{DenseEmbedding, DenseLinear};
 use cuteafd_ffi::programs::Programs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::dense::{
-    DenseEncoding, DensePlan, DenseRecord, DenseSelection, DenseSlice, ShardSide,
+    DenseEncoding, DensePlan, DenseRange, DenseRecord, DenseSelection, DenseSlice, ShardSide,
 };
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
@@ -128,10 +128,22 @@ impl VocabularyPlan {
         device_reserved: usize,
         host_reserved: usize,
     ) -> Result<()> {
-        let device = self
-            .resident_bytes()
+        self.admit_devices(device_available, None, host_available, device_reserved, host_reserved)
+    }
+
+    fn admit_devices(&self, head_available: usize, embedding_available: Option<usize>,
+        host_available: usize, device_reserved: usize, host_reserved: usize) -> Result<()> {
+        let resident = if let Some(available) = embedding_available {
+            let embedding = self.dense.tensors.first().context("native vocabulary embedding missing")?
+                .components.iter().try_fold(0usize, |sum, c| sum.checked_add(c.source.bytes)
+                    .context("native embedding admission overflow"))?;
+            ensure!(embedding <= available, "native vocabulary embedding device admission needs {embedding}, available {available}");
+            self.resident_bytes().checked_sub(embedding).context("native vocabulary owner partition")?
+        } else { self.resident_bytes() };
+        let device = resident
             .checked_add(device_reserved)
             .context("native vocabulary device admission overflow")?;
+        let device_available = head_available;
         ensure!(
             device <= device_available,
             "native vocabulary device admission needs {device}, available {device_available}"
@@ -147,6 +159,7 @@ impl VocabularyPlan {
 pub(crate) struct RowFp8Weights<'a> {
     payload: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
+    source: [DenseRange; 2],
 }
 
 /// One named table's residency, independent of the shared vocabulary lifetime owner.
@@ -173,10 +186,50 @@ impl RowFp8Weights<'_> {
     pub(crate) fn scales(&self) -> CuteafdDeviceBuffer {
         self.scales.buffer
     }
+
+    pub(crate) fn host_row(&self, library: &NativeLibrary, token: usize, hidden: usize,
+        output: &mut [u8]) -> Result<()> {
+        ensure!(hidden.checked_mul(2) == Some(output.len()), "native vocabulary BF16 row width");
+        let mut bytes = vec![0u8; hidden];
+        let mut scale = [0u8; 4];
+        if dense::is_recording() {
+            // Recorded destinations have not landed. Only the requested row
+            // comes from storage, with the same native decode as the mount.
+            read_source_row(&self.source, token, hidden, &mut bytes, &mut scale)?;
+        } else {
+            let first = token.checked_mul(hidden).context("native vocabulary row offset overflow")?;
+            let scale_first = token.checked_mul(4).context("native vocabulary scale offset overflow")?;
+            library.copy_d2h(&mut bytes, view(self.payload(), first, hidden)?)?;
+            library.copy_d2h(&mut scale, view(self.scales(), scale_first, 4)?)?;
+        }
+        let scale = f32::from_le_bytes(scale);
+        for (out, &b) in output.chunks_exact_mut(2).zip(&bytes) {
+            out.copy_from_slice(&super::bf16_rne(super::e4m3_to_f32(b) * scale).to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+fn read_source_row(source: &[DenseRange; 2], token: usize, hidden: usize,
+    payload: &mut [u8], scale: &mut [u8; 4]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    ensure!(hidden > 0 && payload.len() == hidden, "native vocabulary row width");
+    for (range, width, output) in [(&source[0], hidden, payload), (&source[1], 4, scale.as_mut_slice())] {
+        let first = token.checked_mul(width).context("native vocabulary row offset overflow")?;
+        ensure!(first.checked_add(width).is_some_and(|end| end <= range.bytes),
+            "native vocabulary row outside source");
+        let offset = range.offset.checked_add(u64::try_from(first)?)
+            .context("native vocabulary source offset overflow")?;
+        std::fs::File::open(&range.path)
+            .with_context(|| format!("opening {}", range.path.display()))?
+            .read_exact_at(output, offset)?;
+    }
+    Ok(())
 }
 
 /// Owns immutable native bytes. Callers must drain all users before releasing this owner.
-/// Binding is done before allocation; rank 1 owns no vocabulary or gather/head binding.
+/// Binding is done before allocation; the head stays on rank 0 while the
+/// embedding may reside on a peer selected by admission.
 pub(crate) struct NativeVocabulary<'a> {
     pub(crate) embedding: RowFp8Weights<'a>,
     pub(crate) head: RowFp8Weights<'a>,
@@ -193,6 +246,15 @@ impl<'a> NativeVocabulary<'a> {
         device_reserved: usize,
         host_reserved: usize,
     ) -> Result<Option<Self>> {
+        Self::load_with_embedding_device(library, programs, plan, host_available,
+            device_reserved, host_reserved, library.cuda_get_device()?)
+    }
+
+    pub(crate) fn load_with_embedding_device(
+        library: &'a NativeLibrary, programs: &'a Programs<'a>, plan: VocabularyPlan,
+        host_available: usize, device_reserved: usize, host_reserved: usize, embedding_device: i32,
+    ) -> Result<Option<Self>> {
+        use crate::shared::memory::device::Device;
         ensure!(
             std::ptr::eq(library, programs.library()),
             "native vocabulary library mismatch"
@@ -227,15 +289,16 @@ impl<'a> NativeVocabulary<'a> {
             );
         }
         let host_available = cuteafd_ffi::cgroup_memory_headroom(host_available)?;
-        plan.admit(
-            library.cuda_memory_info()?.0,
-            host_available,
-            device_reserved,
-            host_reserved,
-        )?;
+        let head_device = library.cuda_get_device()?;
+        let embedding_available = if embedding_device == head_device { None } else {
+            Some(Device { library, id: embedding_device }.run(|| library.cuda_memory_info())?.0)
+        };
+        plan.admit_devices(library.cuda_memory_info()?.0, embedding_available,
+            host_available, device_reserved, host_reserved)?;
         let mut staging =
             HostAllocation::named(library, plan.staging_bytes(), "native-vocabulary-staging")?;
-        let embedding = load_rows(library, &plan.dense.tensors[0], &mut staging)?;
+        let embedding = Device { library, id: embedding_device }
+            .run(|| load_rows(library, &plan.dense.tensors[0], &mut staging))?;
         let head = load_rows(library, &plan.dense.tensors[1], &mut staging)?;
         Ok(Some(Self {
             embedding,
@@ -351,6 +414,7 @@ fn load_rows<'a>(
             slice.components[1].source.bytes,
             "native-vocabulary-scales",
         )?,
+        source: [slice.components[0].source.clone(), slice.components[1].source.clone()],
     };
     if dense::is_recording() {
         let load = DenseLoad::mount(library);
@@ -471,6 +535,22 @@ mod tests {
     }
 
     #[test]
+    fn split_vocabulary_admission_charges_each_table_once() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let records = [record(root.path(), EMBEDDING), record(root.path(), HEAD)];
+        let plan = VocabularyPlan::new(&records, &selection(false), 2, 0, 8, 256)?;
+        let table = plan.resident_bytes() / 2;
+        let host = plan.staging_bytes() + 17;
+        plan.admit_devices(table + 23, Some(table), host, 23, 17)?;
+        assert!(plan.admit_devices(table + 22, Some(table), host, 23, 17).is_err());
+        assert!(plan.admit_devices(table + 23, Some(table - 1), host, 23, 17).is_err());
+        assert!(plan.admit_devices(table + 23, Some(table), host - 1, 23, 17).is_err());
+        assert!(plan.admit_devices(table + 23, None, host, 23, 17).is_err());
+        plan.admit_devices(2 * table + 23, None, host, 23, 17)?;
+        Ok(())
+    }
+
+    #[test]
     fn native_vocabulary_recording_replays_exact_mount_components() -> Result<()> {
         let root = tempfile::tempdir()?;
         for flash in [false, true] {
@@ -512,6 +592,84 @@ mod tests {
                 record_rows(&absent, buffers, |operand| sink.operand(operand))?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_mask_rows_match_mount_stream_with_separate_component_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut item = record(root.path(), EMBEDDING);
+        let payload = (0..256 * 8).map(|i| i as u8).collect::<Vec<_>>();
+        let scales = (0..256).flat_map(|i| [0.5f32, 1.0, 1.00390625, 0.0, -2.0][i % 5].to_le_bytes())
+            .collect::<Vec<_>>();
+        for (i, bytes) in [&payload, &scales].into_iter().enumerate() {
+            let prefix = 13 + i * 7;
+            let path = root.path().join(format!("component-{i}"));
+            std::fs::write(&path, [vec![0xa5; prefix], bytes.clone()].concat())?;
+            item.components[i].source = DenseRange { path, offset: prefix as u64, bytes: bytes.len() };
+        }
+        let slice = item.slice(0, 256)?;
+        let source = [slice.components[0].source.clone(), slice.components[1].source.clone()];
+        let mut mounted = [vec![0; payload.len()], vec![0; scales.len()]];
+        stream_rows(&slice, &mut vec![0; 1536], |i, at, bytes| {
+            mounted[i][at..at + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })?;
+        for token in 0..256 {
+            let mut row = [0u8; 8];
+            let mut scale = [0u8; 4];
+            read_source_row(&source, token, 8, &mut row, &mut scale)?;
+            assert_eq!(row, mounted[0][token * 8..(token + 1) * 8]);
+            assert_eq!(scale, mounted[1][token * 4..(token + 1) * 4]);
+            let decode = |bytes: &[u8], scale: &[u8]| {
+                let scale = f32::from_le_bytes(scale.try_into().unwrap());
+                bytes.iter().flat_map(|&b| super::super::bf16_rne(
+                    super::super::e4m3_to_f32(b) * scale).to_le_bytes()).collect::<Vec<_>>()
+            };
+            assert_eq!(decode(&row, &scale), decode(&mounted[0][token * 8..(token + 1) * 8],
+                &mounted[1][token * 4..(token + 1) * 4]));
+        }
+        assert!(read_source_row(&source, 256, 8, &mut [0; 8], &mut [0; 4]).is_err());
+        assert!(read_source_row(&source, usize::MAX, 8, &mut [0; 8], &mut [0; 4]).is_err());
+        assert!(read_source_row(&source, 0, 8, &mut [0; 7], &mut [0; 4]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn recorded_mask_row_matches_mounted_device_without_reading_unlanded_bytes() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let item = record(root.path(), EMBEDDING);
+        let mut bytes = (0..256 * 8).map(|i| i as u8).collect::<Vec<_>>();
+        bytes.extend((0..256).flat_map(|i| [0.5f32, 1.00390625, -2.0][i % 3].to_le_bytes()));
+        std::fs::write(&item.components[0].source.path, &bytes)?;
+        let slice = item.slice(0, 256)?;
+        let mut staging = HostAllocation::named(&library, 1536, "mask-row-test")?;
+        let mounted = load_rows(&library, &slice, &mut staging)?;
+        let ((recorded, rows), records) = dense::recording(|| {
+            let recorded = load_rows(&library, &slice, &mut staging)?;
+            // Poison both device tables: recording must use storage, not these.
+            library.copy_h2d(recorded.payload(), &vec![0x7f; 256 * 8])?;
+            library.copy_h2d(recorded.scales(), &vec![0xff; 256 * 4])?;
+            let mut rows = Vec::new();
+            for token in 0..256 {
+                let mut row = vec![0; 16];
+                recorded.host_row(&library, token, 8, &mut row)?;
+                rows.push(row);
+            }
+            Ok((recorded, rows))
+        })?;
+        assert_eq!(records.operands.len(), 2);
+        for (token, expected) in rows.into_iter().enumerate() {
+            let mut actual = vec![0; 16];
+            mounted.host_row(&library, token, 8, &mut actual)?;
+            assert_eq!(actual, expected, "mask token {token}");
+        }
+        drop(recorded);
         Ok(())
     }
 
@@ -757,6 +915,43 @@ mod tests {
                 .chunks_exact(4)
                 .all(|b| f32::from_le_bytes(b.try_into().unwrap()) == 3072.0)
         );
+        drop(owner);
+        let stream = crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &library, id: 0 })?;
+        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2)?;
+        for embedding_device in [0, 1] {
+            if embedding_device == 1 {
+                stream.device.run(|| library.cuda_enable_peer(1))?;
+            }
+            let vocabulary = std::rc::Rc::new(NativeVocabulary::load_with_embedding_device(
+                &library, &programs, VocabularyPlan::new(&records, &selection(false), 2, 0, K, N)?,
+                32 << 20, 0, 0, embedding_device)?.context("capture vocabulary")?);
+            let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&library, crate::shared::token_io::EmbedSource {
+                path: records[0].components[0].source.path.clone(), offset: 0, vocab: N, hidden: K,
+                snapshot: None, tensor_name: EMBEDDING.into(),
+            }, vocabulary)?;
+            embedding.validate_residency(embedding_device, (N * K + N * 4) as u64)?;
+            // SAFETY: all buffers and the table survive capture, replay and the stream drain.
+            unsafe {
+                library.cuda_graph_begin_capture(stream.raw)?;
+                let gathered = embedding.gather(ids.buffer.ptr, std::ptr::null(), 5, 4,
+                    std::ptr::null(), expanded.buffer.ptr, Some(output.buffer),
+                    crate::shared::peer_split::RankDevice { device: stream.device.id, stream: stream.raw });
+                let graph = library.cuda_graph_end_capture(stream.raw)?;
+                gathered?;
+                let replayed = library.cuda_graph_launch(graph, stream.raw);
+                let drained = stream.drain();
+                library.cuda_graph_exec_destroy(graph)?;
+                replayed?;
+                drained?;
+            }
+            let mut copied = vec![0; expanded.buffer.bytes];
+            library.copy_d2h(&mut copied, expanded.buffer)?;
+            for (row, bytes) in copied.chunks_exact(4 * K * 2).enumerate() {
+                let expected = if row < 3 { 0x3f00u16 } else { 0 };
+                assert!(bytes.chunks_exact(2).all(|b| u16::from_le_bytes(b.try_into().unwrap()) == expected));
+            }
+        }
         Ok(())
     }
 

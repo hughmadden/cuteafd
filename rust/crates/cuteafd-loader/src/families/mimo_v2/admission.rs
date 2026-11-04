@@ -371,7 +371,7 @@ pub fn spark_endpoints(rows: usize, input: super::MimoExpertInput) -> Result<[cu
 }
 
 pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
-    rows: usize, lanes: usize, spark_ranks: usize) -> Result<Vec<MemoryReservation>> {
+    rows: usize, lanes: usize, spark_ranks: usize, format: cuteafd_core::SparkReplyFormat) -> Result<Vec<MemoryReservation>> {
     let mut costs = Vec::new();
     if ranks == 2 {
         costs.push(MemoryReservation { name: "transport.peer_receive_slots".into(),
@@ -380,9 +380,12 @@ pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
         costs.push(MemoryReservation { name: "transport.peer_control".into(), bytes: ((peer_slots(lanes) + 1) * 16).max(256) as u64 + 256 });
     }
     if rank == 0 && spark_ranks > 0 {
+        use crate::serving_capacity::{prefill_return_bytes_with_format, spark_intake_bytes};
         costs.push(MemoryReservation { name: "transport.spark_intake_planes".into(),
-            bytes: tensor_bytes("MiMo prefill intake planes", &[lanes, spark_ranks, rows.max(super::decode_graph::MIMO_DECODE_ROWS), cfg.hidden, 2])?
-                .checked_add(tensor_bytes("MiMo decode intake planes", &[super::decode_graph::MIMO_DECODE_ROWS, spark_ranks, cfg.hidden, 2])?)
+            bytes: prefill_return_bytes_with_format(lanes as u64, rows.max(super::decode_graph::MIMO_DECODE_ROWS) as u64,
+                spark_ranks as u64, cfg.hidden as u64, format)?
+                .checked_add(spark_intake_bytes(1, spark_ranks as u64,
+                    super::decode_graph::MIMO_DECODE_ROWS as u64, cfg.hidden as u64))
                 .context("MiMo intake planes overflow")? });
     }
     Ok(costs)

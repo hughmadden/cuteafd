@@ -1416,6 +1416,8 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let layout = RouteStaging::new(self.rows(), 8, ffn.wire_row_bytes())?;
                         let dtype = ffn.wire_dtype();
                         let descriptors = self.step.expert_rows(self.kind)?;
+                        let combined_reply = crate::shared::spark_waves::combined_reply_eligible(descriptors.iter().map(|row|
+                            (row.source_request_id, row.source_kind == ExpertV2SourceKind::Prefill)));
                         let ordinal = execution.requests.get();
                         let identity = request_identity(ordinal)?;
                         execution.requests.set(identity);
@@ -1430,7 +1432,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                             let [ids, weights, input] = ffn.wave_inputs();
                             // SAFETY: the routed front end wrote these rows on
                             // this lane stream; the copies read them in order.
-                            unsafe { exchange.send(rows, exchange.compact_payload(rows), layout, [ids, weights, input], meta.stream.raw,
+                            unsafe { exchange.send(rows, exchange.compact_payload(rows), layout, [ids, weights, input], meta.stream.raw, combined_reply,
                                 Box::new(move |routes, wire| expert_request(identity, placement_version, layer,
                                     dtype, descriptors, routes, wire))) }
                         }))?;

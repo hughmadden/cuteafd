@@ -34,16 +34,33 @@ struct ScaleOutput {
 impl ScalePlan {
     pub fn new(catalog: &OfficialV41Catalog,
         layers: impl IntoIterator<Item = (usize, NativePlanes, usize)>, world: usize, rank: usize) -> Result<Self> {
-        use crate::shared::experts::rtx::dense::{Rect, STEP_BYTES};
+        use crate::shared::experts::layer::ExpertLayer;
+        Self::selected(catalog, layers.into_iter().map(|(layer, planes, base)| {
+            let selection = if world == 1 { ExpertLayer::BackboneFull { layer } }
+                else { ExpertLayer::BackboneReplicatedTp { layer, world, rank } };
+            (selection, planes, base)
+        }))
+    }
+    pub fn selected(catalog: &OfficialV41Catalog,
+        layers: impl IntoIterator<Item = (crate::shared::experts::layer::ExpertLayer, NativePlanes, usize)>) -> Result<Self> {
+        use crate::shared::experts::{layer::ExpertLayer, rtx::dense::{Rect, STEP_BYTES}};
         let mut plan = Self::default();
-        for (layer, planes, base) in layers {
+        for (selection, planes, base) in layers {
             if !planes.scale_codes { continue; }
             let geometry = catalog.routed_experts();
-            let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate, world);
+            let (layer, world, rank) = match selection {
+                ExpertLayer::BackboneFull { layer } => (layer, 1, 0),
+                ExpertLayer::BackboneTp2 { layer, rank } => (layer, 2, rank),
+                ExpertLayer::BackboneReplicatedTp { layer, world, rank } => (layer, world, rank),
+                ExpertLayer::DsparkTp2 { stage, rank } => (stage, 2, rank),
+                _ => anyhow::bail!("unsupported native scale selection {selection:?}"),
+            };
+            let unit = if matches!(selection, ExpertLayer::DsparkTp2 { .. }) { geometry.intermediate / 2 }
+                else { cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate, world) };
             let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, unit, layer, world, rank)?;
             ensure!(shard.width == planes.intermediate, "native scale shard differs from resident planes");
             for expert in 0..planes.experts {
-                let (names, _) = names(catalog, layer, expert, world, rank)?;
+                let names = catalog.expert_staging(selection.expert(expert))?.tensor_names().to_vec();
                 // A step must complete within one source tensor: projections
                 // need not be adjacent in safetensors file order.
                 for slot in [4, 3, 5] {

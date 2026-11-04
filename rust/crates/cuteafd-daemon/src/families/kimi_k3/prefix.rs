@@ -33,8 +33,8 @@ pub(crate) struct SnapshotMeta {
 struct Frontier { units: Vec<u32>, len: usize }
 
 struct Inner<'a> {
-    kda: [Rc<KdaBank<'a>>; 2],
-    mla: [Rc<CacheBank<'a>>; 2],
+    kda: Vec<Rc<KdaBank<'a>>>,
+    mla: Vec<Rc<CacheBank<'a>>>,
     cfg: KimiK3Config,
     context: usize,
     layout: FamilyLayout,
@@ -59,14 +59,23 @@ pub(crate) struct KimiPrefix<'a>(Rc<Inner<'a>>);
 impl<'a> KimiPrefix<'a> {
     pub(crate) fn new(cfg: &KimiK3Config, context: usize,
         kda: [Rc<KdaBank<'a>>; 2], mla: [Rc<CacheBank<'a>>; 2]) -> Result<Self> {
-        ensure!((1..=1_048_576).contains(&context) && kda[0].slots() == kda[1].slots()
-            && kda[0].marks() == kda[1].marks() && mla[0].pages() == mla[1].pages() && mla[0].format() == mla[1].format(),
+        Self::from_ranks(cfg, context, kda.into(), mla.into())
+    }
+
+    pub(crate) fn from_ranks(cfg: &KimiK3Config, context: usize,
+        kda: Vec<Rc<KdaBank<'a>>>, mla: Vec<Rc<CacheBank<'a>>>) -> Result<Self> {
+        ensure!(matches!(kda.len(), 1 | 2) && mla.len() == kda.len(), "Kimi prefix physical rank count");
+        ensure!((1..=1_048_576).contains(&context) && kda.iter().all(|bank|
+            bank.slots() == kda[0].slots() && bank.marks() == kda[0].marks()
+                && bank.heads() == cfg.kda_heads / kda.len())
+            && mla.iter().all(|bank| bank.pages() == mla[0].pages() && bank.format() == mla[0].format()),
             "Kimi prefix bank/context extents differ");
-        ensure!(kda[0].stream.device.id != kda[1].stream.device.id
-            && std::ptr::eq(kda[0].stream.device.library, kda[1].stream.device.library),
-            "Kimi prefix requires exact TP2 native owners");
-        let mut resident = [0; 2];
-        for rank in 0..2 {
+        let mut devices = std::collections::BTreeSet::new();
+        ensure!(kda.iter().all(|bank| devices.insert(bank.stream.device.id)
+            && std::ptr::eq(bank.stream.device.library, kda[0].stream.device.library)),
+            "Kimi prefix requires distinct physical native owners");
+        let mut resident = vec![0; kda.len()];
+        for rank in 0..kda.len() {
             ensure!(kda[rank].stream.device.id == mla[rank].stream.device.id
                 && std::ptr::eq(kda[rank].stream.device.library, mla[rank].stream.device.library),
                 "Kimi prefix KDA/MLA device owners differ");
@@ -76,10 +85,10 @@ impl<'a> KimiPrefix<'a> {
                 else if mla[rank].layer(layer).is_ok() { resident[rank] += 1; }
             }
         }
-        let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry(cfg, resident, mla[0].format())?;
+        let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, mla[0].format())?;
         let page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
-        ensure!(mark_bytes == kda[0].mark_bytes() + kda[1].mark_bytes(), "Kimi prefix KDA shard geometry differs");
+        ensure!(mark_bytes == kda.iter().map(|bank| bank.mark_bytes()).sum::<usize>(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
         let copies = PrefixCopies::new(kda[0].stream.device.library, kda.iter().map(|bank| bank.readers().iter()
             .map(|reader| Reader { device: reader.device.id, stream: reader.raw }).collect()).collect())?;
@@ -157,7 +166,7 @@ impl<'a> KimiPrefix<'a> {
         use sha2::{Digest, Sha256};
         self.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut digest = Sha256::new();
-        for rank in 0..2 {
+        for rank in 0..self.0.kda.len() {
             let device = self.0.kda[rank].stream.device;
             let mut buffers = self.state_buffers(rank, placement.slot)?;
             for (index, &page) in placement.units.iter().enumerate() {
@@ -194,7 +203,7 @@ impl<'a> KimiPrefix<'a> {
     }
 
     fn move_mark(&self, mark: MarkSlot, slot: usize, capture: bool) -> Result<()> {
-        let plans = (0..2).map(|rank| Ok((self.state_buffers(rank, slot)?, self.mark_buffers(rank, mark)?)))
+        let plans = (0..self.0.kda.len()).map(|rank| Ok((self.state_buffers(rank, slot)?, self.mark_buffers(rank, mark)?)))
             .collect::<Result<Vec<_>>>()?;
         let copies: Vec<_> = plans.into_iter().enumerate().flat_map(|(rank, (state, marks))| state.into_iter()
             .zip(marks).map(move |(live, saved)| if capture { (rank, saved, live) } else { (rank, live, saved) }))
@@ -299,7 +308,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
         self.validate(placement, 0)?;
         // The scheduler recycles slots only after releasing/draining their pages.
-        for rank in 0..2 {
+        for rank in 0..self.0.kda.len() {
             let regions = self.state_buffers(rank, placement.slot)?;
             let library = self.0.kda[rank].stream.device.library;
             self.0.copies.ordered(rank, |stream| {
@@ -349,7 +358,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         if copy.owner.is_some() || copy.from == copy.to {
             return Err("Kimi prefix COW requires distinct uniform pages".into());
         }
-        let plans = (0..2).map(|rank| Ok((self.page_buffers(rank, copy.from, copy.rows)?,
+        let plans = (0..self.0.kda.len()).map(|rank| Ok((self.page_buffers(rank, copy.from, copy.rows)?,
             self.page_buffers(rank, copy.to, copy.rows)?))).collect::<Result<Vec<_>>>()?;
         let copies: Vec<_> = plans.into_iter().enumerate().flat_map(|(rank, (source, destination))|
             source.into_iter().zip(destination).map(move |(src, dst)| (rank, dst, src))).collect();
@@ -361,10 +370,10 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         Ok(self.0.copies.drain()?)
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        (0..2).flat_map(|rank| self.page_buffers(rank, page, MLA_PAGE_ROWS).unwrap_or_default()).map(range).collect()
+        (0..self.0.kda.len()).flat_map(|rank| self.page_buffers(rank, page, MLA_PAGE_ROWS).unwrap_or_default()).map(range).collect()
     }
     fn mark_segments(&self, mark: MarkSlot) -> Vec<DeviceRange> {
-        (0..2).flat_map(|rank| self.mark_buffers(rank, mark).unwrap_or_default())
+        (0..self.0.kda.len()).flat_map(|rank| self.mark_buffers(rank, mark).unwrap_or_default())
             .chain(self.0.draft.iter().flat_map(|draft| draft.mark_segments(mark.0 as usize).unwrap_or_default()))
             .map(range).collect()
     }
@@ -425,9 +434,9 @@ mod tests {
         use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
         use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
 
-        for (heads, context, cache_format) in [(false, 262_144), (true, 524_288)].into_iter()
-            .flat_map(|(heads, context)| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
-                .map(|format| (heads, context, format))) {
+        for (ranks, heads, context, cache_format) in [(1, false, 262_144), (2, false, 262_144), (2, true, 524_288)].into_iter()
+            .flat_map(|(ranks, heads, context)| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
+                .map(|format| (ranks, heads, context, format))) {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
             fixture.immediate_copies(&library)?;
@@ -447,16 +456,22 @@ mod tests {
             }
             let mut placement = super::super::admission::admit(inputs)?.placement;
             placement.pool_tokens = 512;
+            if ranks == 1 {
+                for layer in &mut placement.layers {
+                    layer.mode = cuteafd_loader::placement::LayerMode::Whole {
+                        gpu: 0, ffn: cuteafd_loader::placement::FfnMode::Owner };
+                }
+            }
             let bank = |rank| -> Result<_> {
                 let device = Device { library: &library, id: rank as i32 };
                 let readers = (0..2).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()?;
-                let kda = super::super::state::KdaLayout::new(&cfg, 2, 1, 2)?.allocate(device, readers.clone())?;
-                let mla = super::super::mla::CacheLayout::new(&cfg, &placement, rank, cache_format)?.allocate(device, readers)?;
+                let kda = super::super::state::KdaLayout::for_ranks(&cfg, 2, 1, 2, ranks)?.allocate(device, readers.clone())?;
+                let mla = super::super::mla::CacheLayout::for_ranks(&cfg, &placement, rank, cache_format, ranks)?.allocate(device, readers)?;
                 Ok((Rc::new(kda), Rc::new(mla)))
             };
-            let (k0, m0) = bank(0)?;
-            let (k1, m1) = bank(1)?;
-            let family = KimiPrefix::new(&cfg, context, [k0, k1], [m0, m1])?;
+            let (kda, mla) = (0..ranks).map(bank).collect::<Result<Vec<_>>>()?
+                .into_iter().unzip();
+            let family = KimiPrefix::from_ranks(&cfg, context, kda, mla)?;
             let boxed = |error: BoxError| anyhow::anyhow!("Kimi host fixture: {error}");
             let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
                 let mut bytes = vec![0; buffer.bytes];
@@ -469,11 +484,11 @@ mod tests {
                 Ok(bytes)
             };
             let state = |slot| -> Result<Vec<Vec<u8>>> {
-                (0..2).flat_map(|rank| family.state_buffers(rank, slot).unwrap()).map(read).collect()
+                (0..ranks).flat_map(|rank| family.state_buffers(rank, slot).unwrap()).map(read).collect()
             };
             let pages = |p: &Placement| -> Result<Vec<Vec<u8>>> {
                 let mut result = Vec::new();
-                for rank in 0..2 {
+                for rank in 0..ranks {
                     for (index, &page) in p.units.iter().take(p.len.div_ceil(64)).enumerate() {
                         let rows = (p.len - index * 64).min(64);
                         for buffer in family.page_buffers(rank, page, rows)? { result.push(read(buffer)?); }
@@ -501,7 +516,7 @@ mod tests {
             let mut expected = Vec::new();
             for (end, kind) in [(65, SnapshotKind::Prompt), (130, SnapshotKind::Turn)] {
                 let start = original.len;
-                for rank in 0..2 {
+                for rank in 0..ranks {
                     for (i, buffer) in family.state_buffers(rank, 0)?.into_iter().enumerate() {
                         fill(buffer, end + rank * 47 + i)?;
                     }
@@ -529,7 +544,7 @@ mod tests {
             cache.release(&family, &original.units)?;
             cache.clear(&family)?;
             // Every former device byte is poisoned before either host restore.
-            for rank in 0..2 {
+            for rank in 0..ranks {
                 for buffer in family.state_buffers(rank, 0)?.into_iter()
                     .chain(family.mark_buffers(rank, MarkSlot(0))?) { fill(buffer, 249)?; }
                 for page in 0..family.layout().pages as u32 {
@@ -542,10 +557,10 @@ mod tests {
                 assert!(hit.source.as_ref().is_some_and(|source| source.host));
                 let mut restored = hit.placement;
                 family.drain().map_err(boxed)?;
-                assert_eq!(state(1)?, expected_state, "both TP2 state/conv shards at {end}");
+                assert_eq!(state(1)?, expected_state, "all {ranks} physical state/conv owners at {end}");
                 assert_eq!(pages(&restored)?, expected_pages, "owned/split MLA prefix and partial tail at {end}");
                 family.check_append(&restored, 1)?;
-                for rank in 0..2 {
+                for rank in 0..ranks {
                     for buffer in family.state_buffers(rank, 1)? { fill(buffer, 243)?; }
                     for buffer in family.page_buffers(rank, restored.units[end / 64], 64)? {
                         fill(crate::shared::prefix::view(buffer, (end % 64) * cache_format.record_bytes(),
@@ -572,7 +587,7 @@ mod tests {
             let mut cache = make_cache()?;
             let tokens = (500..564).collect::<Vec<u32>>();
             let mut original = cache.admit(&family, &tokens, 65, false, build(0))?.placement;
-            for rank in 0..2 {
+            for rank in 0..ranks {
                 for buffer in family.state_buffers(rank, 0)? { fill(buffer, rank + 41)?; }
                 for buffer in family.page_buffers(rank, original.units[0], 64)? { fill(buffer, rank + 81)?; }
             }
@@ -582,7 +597,7 @@ mod tests {
             assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &original,
                 After::from_logits(&[3.0, 1.0], true))?);
             finish_store(&mut cache)?;
-            for rank in 0..2 {
+            for rank in 0..ranks {
                 for buffer in family.state_buffers(rank, 0)? { fill(buffer, 247)?; }
             }
             let hit = cache.admit(&family, &tokens, 65, false, build(1))?;

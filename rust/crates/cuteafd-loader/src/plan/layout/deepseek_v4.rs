@@ -30,14 +30,14 @@ use crate::plan::Checkpoint;
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
-    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_waves: if report.spark_ranks == 0 { 1 } else { crate::serving_capacity::prefill_waves::MAX_WAVES }, ..crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V4)
         }) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
     };
-    let mut shape = Shape::resolve(report, model, options,
+    let mut shape = Shape::resolve(input, report, model, options,
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });
     shape.prefill_rows = prefill.unit_rows;
     report.prefill_span_rows = Some(prefill.span_rows);
@@ -70,7 +70,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     let id = if model.spec().hidden == 4096 { "dsv4f" } else { "dsv4p" };
     let workspace = (|| {
-        let manifest = shape.manifest.as_ref()?;
+        let manifest = shape.manifest.as_deref()?;
         let cfg = DeepseekV4Config::read(&checkpoint.snapshot, shape.native_layers).ok()?;
         let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, split,
             shape.prefill_rows, shape.decode_rows).ok()?;
@@ -83,7 +83,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     // V4's coordinator always holds dSpark (and any RTX layers) in the catalog's package.
     let package = if report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) { "exl3" } else { "*" };
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
-        device.items.push(runtime_item(shape.manifest.as_ref(), &program_families(id, split), package, split,
+        device.items.push(runtime_item(shape.manifest.as_deref(), &program_families(id, split), package, split,
             index, options.coordinator_arch, options.rtx_bytes[index]));
     }
     let mut spark_working = crate::placement::SparkWorkingSet {
@@ -201,7 +201,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(device, &total)|
         (total, Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect();
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let context = shape.manifest.as_ref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows));
+    let context = shape.manifest.as_deref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows));
     let attention = report.requested_attention.unwrap_or(if devices.len() == 2 && context.is_some() {
         crate::placement::AttentionPlacement::Context
     } else { crate::placement::AttentionPlacement::Heads });
@@ -219,7 +219,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
     }
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let inputs = v4::V4Inputs { automatic_context: options.context_tokens == 0, cfg: &cfg,
+    let inputs = v4::V4Inputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, cfg: &cfg,
         weights: crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, devices.len(),
             shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?,
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,

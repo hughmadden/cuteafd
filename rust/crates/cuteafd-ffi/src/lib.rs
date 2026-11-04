@@ -3,7 +3,7 @@ mod shared;
 pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
-    KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
+    KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit, KimiKdaGeometry,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 pub use families::kimi_k3_split::{KimiSplitError, KimiMlaSplit, KimiMlaRankBatch,
     KimiKdaCore, KimiKdaCoreWeights, KimiKdaCoreBatch};
@@ -41,6 +41,7 @@ pub mod host_isa;
 pub mod memory_ledger;
 pub mod synchronized_load;
 pub mod push_ring;
+pub mod event_waiters;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());
@@ -1680,6 +1681,7 @@ native_symbols! {
     cuteafd_cuda_enable_peer: unsafe extern "C" fn(i32) -> CuteafdStatus,
     cuteafd_copy_peer_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, *mut c_void) -> CuteafdStatus,
     cuteafd_copy_device_rows_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, usize, usize, usize, *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_dmabuf_allocation_granularity: unsafe extern "C" fn(*mut usize) -> CuteafdStatus,
     cuteafd_alloc_device_buffer: AllocDeviceBufferFn,
     cuteafd_alloc_managed_device_buffer: AllocManagedDeviceBufferFn,
     cuteafd_free_device_buffer: FreeDeviceBufferFn,
@@ -1763,6 +1765,7 @@ native_symbols! {
     cuteafd_rdma_rc_endpoint_poll: RdmaRcEndpointPollFn,
     cuteafd_rdma_rc_endpoint_copy_recv: RdmaRcEndpointCopyRecvFn,
     cuteafd_rdma_rc_endpoint_copy_recv_at: RdmaRcEndpointCopyRecvAtFn,
+    cuteafd_rdma_rc_endpoint_register_device_region: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_register_region: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_post_send_slot_region: unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, u64) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_destroy: RdmaRcEndpointDestroyFn,
@@ -2530,6 +2533,16 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_copy_device_rows_async", unsafe {
             call(dst, src, width, rows, dst_pitch, src_pitch, stream)
         })
+    }
+
+    pub fn dmabuf_allocation_granularity(&self) -> Result<usize> {
+        let call = self.cuteafd_cuda_dmabuf_allocation_granularity()?;
+        let mut bytes = 0;
+        // SAFETY: native writes one size_t while this DSO remains loaded.
+        let status = unsafe { call(&mut bytes) };
+        self.status_to_result("cuteafd_cuda_dmabuf_allocation_granularity", status)?;
+        anyhow::ensure!(bytes > 0, "device dma-buf allocation granularity is zero");
+        Ok(bytes)
     }
 
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -4934,6 +4947,21 @@ impl NativeLibrary {
         let mut region = 0;
         let status = unsafe { register(handle, ptr, bytes, &mut region) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_register_region", status)?;
+        Ok(region)
+    }
+
+    /// Registers page-aligned CUDA device storage through dma-buf.
+    ///
+    /// # Safety
+    /// The allocation must remain live until endpoint destruction completes.
+    pub unsafe fn rdma_rc_endpoint_register_device_region(
+        &self, handle: *mut c_void, ptr: *mut c_void, bytes: usize,
+    ) -> Result<u32> {
+        let register = self.cuteafd_rdma_rc_endpoint_register_device_region()?;
+        let mut region = 0;
+        // SAFETY: the caller retains the allocation for the endpoint's lifetime.
+        let status = unsafe { register(handle, ptr, bytes, &mut region) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_register_device_region", status)?;
         Ok(region)
     }
 

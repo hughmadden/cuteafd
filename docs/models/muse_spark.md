@@ -52,7 +52,7 @@ region addresses (`rank_regions`).
 
 Replies are BF16 for a step's narrow segments (up to
 `--expert-partial-bf16-max-rows`, 64 by default: decode and verify stay
-lossless) and NVFP4 (or FP8, `--expert-partial-wide-format`) for wider
+lossless) and NVFP4 by default (or FP8/BF16 via the shared `--spark-reply-format`) for wider
 prefill segments. Each endpoint's frame is sized from the admitted worst
 reply (NVFP4 91.5 MiB, FP8 117.8 MiB per frame).
 
@@ -132,6 +132,22 @@ their own charged scratch, and a drafter trained against another softcap or
 multiplier is refused. Taps are the target's hidden rows after the tapped
 layers; a prefill call commits its last 2048 rows (the drafter's window) as
 context.
+
+## Media
+
+The starting configs serve the checkpoint's bundled vision and PCM audio
+towers (`VISION=auto`, `AUDIO=auto`); set either to `off` to drop it. Both
+place on Sparks by default (min: vision on rank 0, 4,860,356,960 B; audio on
+rank 1, 246,586,368 B), never on the RTX. Qualification is on #923:
+
+- **Vision:** byte-exact metadata and the FP32 yardstick (public RMS ratio
+  0.990); prompt and turn prefix-cache restores exact.
+- **Audio:** the native tower drives the same LM to the official BF16 tower's
+  output within KL 0.006–0.010 and top-1 96.9–97.9% on silence, one sample,
+  a 30 s signal and speech (512 generated rows each); restores exact. Its
+  cumulative tower-level silence check stays open (RMS ratio 1.65 against
+  the official BF16 error); it does not show in served output.
+- **Latency (min, first use):** image 5.86 s, speech 11–15 ms.
 
 ## Numerics references
 

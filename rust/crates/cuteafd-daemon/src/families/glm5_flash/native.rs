@@ -31,6 +31,14 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
 }
 
+pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)> {
+    vec![("kda-output-shard", args.kda_output_shard.to_string()),
+        ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),
+        ("kda-fp32-partials", args.kda_fp32_partials.to_string()),
+        ("fp8-head", args.fp8_head.to_string()), ("kda-fp8", "off".into()),
+        ("fp8-prefill", "none".into())]
+}
+
 pub(super) fn validate_headers(format: CheckpointFormat, legacy: impl FnOnce() -> Result<()>) -> Result<()> {
     if format == CheckpointFormat::Exlr8 { Ok(()) } else { legacy() }
 }
@@ -120,7 +128,7 @@ impl Admission {
 
     pub(super) fn load<'a>(&self, library: &'a cuteafd_ffi::NativeLibrary,
         programs: &'a cuteafd_ffi::programs::Programs<'a>, loader: &super::weights::GlmfLoader<'a>,
-        cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan)
+        cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan, embedding_device: i32)
         -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
             (super::weights::GlmfWeights<'a>, Vec<Vec<super::weights::GlmfLayer<'a>>>))> {
         use crate::shared::token_io::{native::NativeVocabulary, TokenEmbedding};
@@ -131,7 +139,8 @@ impl Admission {
         ensure!(peak <= available, "native Flash dense loading peak {peak} exceeds host availability {available}");
         let plan = VocabularyPlan::new(&self.facts.records, &self.facts.selection, self.dense.len(), 0,
             cfg.hidden, cfg.vocab_size)?;
-        let vocabulary = std::rc::Rc::new(NativeVocabulary::load(library, programs, plan, available, 0, peak)?
+        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_with_embedding_device(
+            library, programs, plan, available, 0, peak, embedding_device)?
             .context("native Flash rank0 owns vocabulary")?);
         let source = embedding_source(&self.facts.records, &self.facts.selection, cfg.hidden, cfg.vocab_size)?;
         let embedding = TokenEmbedding::row_fp8(library, source, vocabulary.clone())?;

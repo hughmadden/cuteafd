@@ -53,7 +53,7 @@ fn openai_requests_render_the_golden_prompts() {
 }
 
 #[test]
-fn efforts_map_onto_the_template_and_thinking_off_refuses() {
+fn efforts_map_onto_the_template_and_thinking_off_prefills_user() {
     let encoding = encoding();
     let render = |extra: Value| {
         let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
@@ -65,10 +65,55 @@ fn efforts_map_onto_the_template_and_thinking_off_refuses() {
     assert!(render(json!({"reasoning_effort": "MEDIUM"})).unwrap().contains("Reasoning strength: 32."));
     assert!(render(json!({"reasoning_effort": "max"})).unwrap().contains("Reasoning strength: 512."));
     assert!(render(json!({"reasoning_effort": "bogus"})).unwrap_err().contains("not one of"));
-    assert!(render(json!({"reasoning_effort": "none"})).unwrap_err().contains("disabling thinking"));
-    assert!(render(json!({"enable_thinking": false})).unwrap_err().contains("disabling thinking"));
+    for extra in [json!({"thinking":"disabled"}), json!({"thinking":{"type":"disabled"}}),
+        json!({"reasoning_effort":"none"}), json!({"enable_thinking":false})] {
+        assert!(render(extra).unwrap().ends_with("<|start|>assistant to=user<|message|>"));
+    }
     let prompt = render(json!({})).unwrap();
     assert!(prompt.starts_with("<|begin_of_text|><|start|>system<|message|>") && prompt.ends_with("<|start|>assistant"));
+}
+
+#[test]
+fn thinking_off_ignores_effort_and_refuses_an_unexpected_generation_header() {
+    let request = |extra: Value| {
+        let mut body = json!({"messages":[{"role":"user","content":"Hi"}], "thinking":{"type":"disabled"}});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let plain = request(json!({}));
+    let expected = encoding().render(&plain, &options(&plain)).unwrap();
+    for extra in [json!({"reasoning_effort":"low"}), json!({"reasoning_effort":"high"}),
+        json!({"chat_template_kwargs":{"reasoning_effort":"medium"}})] {
+        let body = request(extra);
+        assert_eq!(encoding().render(&body, &options(&body)).unwrap(), expected);
+    }
+    let changed = MuseEncoding::new("{{ bos_token }}<|start|>assistant changed",
+        encoding().tokens().clone(), "<|begin_of_text|>".into()).unwrap();
+    assert_eq!(changed.render(&plain, &options(&plain)).unwrap_err(),
+        "Muse chat template did not leave an assistant generation header to pre-fill");
+}
+
+#[test]
+fn thinking_off_rendered_prefix_matches_final_history_and_parses_split_text() {
+    let body = json!({"messages":[{"role":"user","content":"Hi"}], "thinking":{"type":"disabled"}});
+    let prompt = encoding().render(&body, &options(&body)).unwrap();
+    assert!(prompt.ends_with("<|start|>assistant to=user<|message|>"));
+    let history = json!({"messages":[{"role":"user","content":"Hi"},
+        {"role":"assistant","content":"Hello!"}, {"role":"user","content":"Again"}]});
+    assert!(encoding().render(&history, &options(&history)).unwrap()
+        .contains("<|start|>assistant to=user<|message|>Hello!<|eot|>"));
+    for width in [1, 2, 7, 100] {
+        let mut parser = MuseOutputParser::new(MuseParserOptions { prefilled_user: true,
+            ..Default::default() });
+        let chars: Vec<char> = "Hello!<|eot|>ignored".chars().collect();
+        let mut output = Vec::new();
+        for part in chars.chunks(width) { output.extend(parser.push(&part.iter().collect::<String>())); }
+        output.extend(parser.finish());
+        let result = project(output, &parser);
+        assert_eq!(result.content, "Hello!");
+        assert!(result.reasoning.is_empty() && result.calls.is_empty());
+        assert_eq!(result.stop, Some(GlmStop::Marker(END_OF_TURN.into())));
+    }
 }
 
 #[test]
@@ -142,7 +187,7 @@ fn project(chunks: Vec<OutputChunk>, parser: &MuseOutputParser) -> Projection {
 
 /// Every split of the text (whole, per char, and in pairs) parses the same.
 fn parse(text: &str, tools: Option<Vec<ToolDefinition>>, stops: &[&str]) -> Projection {
-    let make = || MuseOutputParser::new(MuseParserOptions { tools: tools.clone(),
+    let make = || MuseOutputParser::new(MuseParserOptions { tools: tools.clone(), prefilled_user: false,
         stop_sequences: stops.iter().map(|s| s.to_string()).collect() });
     let mut whole = make();
     let mut chunks = whole.push(text);

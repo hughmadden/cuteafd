@@ -610,3 +610,79 @@ fn coordinator_coded_scales_and_family_dense_staging_are_independent_host_owners
     }
     Ok(())
 }
+
+#[test]
+fn coordinator_mixed_native_backbone_and_dspark_tp2_preserves_sources() -> Result<()> {
+    use crate::shared::{experts::layer::ExpertLayer, memory::push_coordinator::CoordinatorExpertPlan};
+    let root = tempfile::tempdir()?;
+    cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+    let catalog = cuteafd_loader::read_official_v41_catalog(root.path())?;
+    for gpu in 0..2 {
+        let selections = std::iter::once(ExpertLayer::BackboneTp2 { layer: 0, rank: gpu })
+            .chain((0..3).map(|stage| ExpertLayer::DsparkTp2 { stage, rank: gpu })).collect::<Vec<_>>();
+        let plan = CoordinatorExpertPlan::native_selected(&catalog, &selections, gpu, usize::MAX)?;
+        assert_eq!(plan.native_layers, selections);
+        assert_eq!(plan.native.iter().map(|p| p.experts).collect::<Vec<_>>(), [384, 128, 128, 128]);
+        let bytes = plan.layout.bytes();
+        assert_eq!(CoordinatorExpertPlan::native_selected(&catalog, &selections, gpu, bytes)?.layout.bytes(), bytes);
+        assert!(CoordinatorExpertPlan::native_selected(&catalog, &selections, gpu, bytes - 1).is_err());
+        assert!(CoordinatorExpertPlan::native_selected(&catalog, &selections, 1 - gpu, bytes).is_err());
+        let checked = plan.checked(&catalog, root.path(), 8, 6 + gpu)?;
+        checked.plan.check(&checked.file_sizes, &checked.arenas)?;
+        let mut steps = plan.scales.steps.iter();
+        for (region, (&selection, planes)) in selections.iter().zip(&plan.native).enumerate() {
+            assert_eq!((planes.hidden, planes.intermediate, planes.kernel_intermediate), (5120, 1152, 1152));
+            for expert in 0..planes.experts {
+                let staging = catalog.expert_staging(selection.expert(expert))?;
+                for slot in [4, 3, 5] {
+                    let (_, step) = steps.next().context("missing selected scale step")?;
+                    let rect = &step.rects[0];
+                    assert_eq!(rect.name, staging.tensor_names()[slot]);
+                    assert_eq!(rect.rows, if slot == 5 { 0..5120 } else { gpu * 1152..(gpu + 1) * 1152 });
+                    assert_eq!(rect.cols, if slot == 5 { gpu * 36..(gpu + 1) * 36 } else { 0..160 });
+                    let output = &step.outputs[0];
+                    let (offset, bytes) = planes.expert_plane(if slot == 5 { 3 } else { 1 }, expert)?;
+                    assert_eq!((output.offset, output.bytes), (plan.layout.region(region)?.start + offset, bytes));
+                }
+            }
+        }
+        assert!(steps.next().is_none());
+        // Check every directly delivered row against the selection's own
+        // staging ranges, including W2 column slices on the draft stages.
+        for (region, (&selection, planes)) in selections.iter().zip(&plan.native).enumerate() {
+            let base = plan.layout.region(region)?.start as u64;
+            for expert in [0, planes.experts - 1] {
+                let staging = catalog.expert_staging(selection.expert(expert))?;
+                for (slot, plane, half) in [(0, 0, true), (1, 0, false), (2, 2, false)] {
+                    let name = &staging.tensor_names()[slot];
+                    let tensor = catalog.tensor(name)?;
+                    let file = checked.plan.files.iter().position(|path| root.path().join(path) == catalog.snapshot().join(&tensor.shard))
+                        .context("selected weight source missing")? as u32;
+                    let (offset, bytes) = planes.expert_plane(plane, expert)?;
+                    let start = base + (offset + if half { bytes / 2 } else { 0 }) as u64;
+                    let end = start + (if plane == 0 { planes.intermediate * planes.hidden / 2 }
+                        else { planes.hidden * planes.intermediate / 2 }) as u64;
+                    let mut copied = 0u64;
+                    for entry in checked.plan.entries.iter().filter(|entry| entry.file == file && entry.dst_base >= start && entry.dst_base < end) {
+                        let pattern = &checked.plan.patterns[entry.pattern as usize];
+                        for (source, destination) in pattern.runs() {
+                            let destination = entry.dst_base + destination;
+                            assert!(destination >= start && destination + pattern.run as u64 <= end);
+                            let relative = destination - start;
+                            let (pitch, row, col) = if slot == 2 { (1152usize, relative as usize / 576, relative as usize % 576) }
+                                else { (2560usize, relative as usize / 2560, relative as usize % 2560) };
+                            let first = if slot == 2 { gpu * 576 } else { gpu * 1152 * pitch };
+                            assert_eq!(entry.src_base + source, tensor.metadata.byte_offset + (first + row * pitch + col) as u64);
+                            copied += pattern.run as u64;
+                        }
+                    }
+                    assert_eq!(copied, end - start, "selected projection {name} coverage");
+                }
+            }
+        }
+        let mut duplicate = selections.clone();
+        duplicate.push(selections[0]);
+        assert!(CoordinatorExpertPlan::native_selected(&catalog, &duplicate, gpu, usize::MAX).is_err());
+    }
+    Ok(())
+}

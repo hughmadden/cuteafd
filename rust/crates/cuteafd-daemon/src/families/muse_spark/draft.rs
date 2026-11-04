@@ -47,8 +47,10 @@ impl<'a> MuseDraft<'a> {
         let config = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(config.hidden == cfg.hidden && config.vocab == cfg.vocab_size && config.block == admitted.block
             && config.taps.iter().all(|&tap| tap < cfg.layers), "Muse drafter does not fit the admitted target");
-        let file = crate::shared::speculation::dflash::prefetch(snapshot).join()
-            .map_err(|_| anyhow::anyhow!("Muse drafter read panicked"))??;
+        let file = if crate::shared::experts::rtx::dense::is_recording() { Vec::new() } else {
+            crate::shared::speculation::dflash::prefetch(snapshot).join()
+                .map_err(|_| anyhow::anyhow!("Muse drafter read panicked"))??
+        };
         let mask = table.host_rows(&[config.mask_token])?;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let drafter = device.run(|| DflashDrafter::load(device.library, programs, snapshot, file, stream, admitted.context_slots,

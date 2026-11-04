@@ -316,19 +316,23 @@ impl FamilyModel for Model {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
     fn native_serving_admission(&self) -> bool { true }
+    fn default_context_tokens(&self) -> Option<u64> {
+        Some(crate::families::kimi_k3::default_context(&self.core) as u64)
+    }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::{placement::AttentionPlacement, serving_capacity::CacheGeometryError};
-        if options.coordinator_ranks != 2 || options.attention_placement == Some(AttentionPlacement::Context) {
-            return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "requires TP2 owned or head-split MLA" });
+        if !matches!(options.coordinator_ranks, 1 | 2) || options.attention_placement == Some(AttentionPlacement::Context) {
+            return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "requires one owner or TP2 owned/head-split MLA" });
         }
         let layers = self.cfg.mla_layers();
-        let resident = if options.attention_placement == Some(AttentionPlacement::Heads) { [layers; 2] }
-            else { [layers.div_ceil(2), layers / 2] };
-        crate::families::kimi_k3::kda::cache_geometry(&self.cfg, resident, options.mla_kv).map(Some)
+        let resident = if options.coordinator_ranks == 1 { vec![layers] }
+            else if options.attention_placement == Some(AttentionPlacement::Heads) { vec![layers; 2] }
+            else { vec![layers.div_ceil(2), layers / 2] };
+        crate::families::kimi_k3::kda::cache_geometry_for_ranks(&self.cfg, &resident, options.mla_kv).map(Some)
     }
     fn spark_budget_bytes(&self) -> u64 { SPARK_BUDGET_BYTES }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {

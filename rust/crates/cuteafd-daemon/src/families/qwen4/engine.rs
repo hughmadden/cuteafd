@@ -2174,7 +2174,8 @@ impl<'a> Qwen4Engine<'a> {
         if !defer_gather {
             // SAFETY: the ids are staged on this stream; `out` holds the rows.
             unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), tokens.len(), copies,
-                std::ptr::null(), w.live(out, copies * self.cfg.hidden * 2), None, self.execution_stream())? };
+                std::ptr::null(), w.live(out, copies * self.cfg.hidden * 2), None, crate::shared::peer_split::RankDevice {
+                    device: self.gdn_banks[self.active_owner.get()].device.id, stream: self.execution_stream() })? };
         }
         Ok(())
     }
@@ -3206,7 +3207,8 @@ impl<'a> Qwen4Engine<'a> {
                     if index == 0 && self.embedding.device_gather() {
                         // SAFETY: staged token ids and persistent root streams cover this graph bucket.
                         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC,
-                            std::ptr::null(), w.live(&w.streams[0], HC * self.cfg.hidden * 2), None, self.execution_stream())?; }
+                            std::ptr::null(), w.live(&w.streams[0], HC * self.cfg.hidden * 2), None, crate::shared::peer_split::RankDevice {
+                                device: self.gdn_banks[self.active_owner.get()].device.id, stream: self.execution_stream() })?; }
                     }
                     if index == 0 || boundary {
                         self.enter(w, &mut c, None, layer, index, rows, tables.spec)?;
@@ -3384,7 +3386,8 @@ impl<'a> Qwen4Engine<'a> {
                 if index == 0 && gather {
                     // SAFETY: the step's ids are staged before the replay; the streams hold its rows.
                     unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-                        w.live(&w.streams[0], HC * self.cfg.hidden * 2), None, self.execution_stream())? };
+                        w.live(&w.streams[0], HC * self.cfg.hidden * 2), None, crate::shared::peer_split::RankDevice {
+                            device: self.gdn_banks[self.active_owner.get()].device.id, stream: self.execution_stream() })? };
                 }
                 if index == 0 {
                     self.enter(w, &mut c, None, layer, index, rows, spec)?;
@@ -3789,7 +3792,7 @@ impl<'a> Qwen4Engine<'a> {
                 if index < self.cfg.layers {
                     let mut link = transport.borrow_mut();
                     let exchange = link.exchange()?;
-                    let wave = self.wave_send(w, index, t, rows, decode, exchange)?;
+                    let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
                     return self.wave_land(w, t, wave, exchange);
                 }
                 ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
@@ -3830,7 +3833,7 @@ impl<'a> Qwen4Engine<'a> {
     /// posts the request once the copies complete. This thread does not wait
     /// for the GPU. Complete with [`Self::wave_land`].
     fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
-        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
@@ -3842,10 +3845,12 @@ impl<'a> Qwen4Engine<'a> {
         let position = w.position.get();
         // SAFETY: ids, weights and input rows hold this wave's `t` rows in
         // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
         let ticket = unsafe {
             exchange.send(t, exchange.compact_payload(t), layout, [sized(w.route_ids.buffer, layout.route_bytes),
                 sized(w.route_weights.buffer, layout.route_bytes), sized(input, layout.wire_bytes)],
-                self.execution_stream(), Box::new(move |routes, wire| {
+                self.execution_stream(), combined_reply, Box::new(move |routes, wire| {
                     let mut request = ExpertProtocolV2Request::new_bytes(request_id, 17, index as u32, h as u32,
                         if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
                         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
@@ -3854,6 +3859,7 @@ impl<'a> Qwen4Engine<'a> {
                             route_count: topk as u32,
                         }).collect(),
                         routes, wire)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
                     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                     Ok(request)
                 }))?
@@ -3954,7 +3960,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '
         let rows = Scalar::I32(unit.rows.len() as i32);
         self.engine.moe_front(self.w, index, &self.engine.weights.layers[index], unit.rows.len(), rows)?;
         self.engine.wave_send(self.w, index, unit.rows.len(), rows, false,
-            self.transport.as_mut().context("packed Spark exchange")?)
+            self.transport.as_mut().context("packed Spark exchange")?, unit.reply_origins()?)
     }
     fn land_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
         self.engine.wave_land(self.w, unit.rows.len(), ticket, self.transport.as_mut().context("packed Spark exchange")?)?;
@@ -4069,7 +4075,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         let rows = Scalar::I32(unit.rows.len() as i32);
         self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
         let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
-        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport)
+        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport, unit.reply_origins()?)
     }
 
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket)

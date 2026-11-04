@@ -1,5 +1,5 @@
 use super::bench_rdma_reduce::{run_reduction_follower, run_reduction_root};
-use crate::cli::BenchRdmaRingArgs;
+use crate::cli::{BenchRdmaRingArgs, RdmaSendMemory};
 use anyhow::{bail, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, CuteafdRouteShardReductionBuffers, NativeLibrary, CUTEAFD_ROUTE_SHARD_LOCAL_F32,
@@ -32,11 +32,19 @@ struct MappedRdmaRingReport {
     depth: usize,
     window: usize,
     gpu_echo: bool,
+    send_memory_requested: String,
+    send_memory_actual: String,
+    send_memory_fallback: Option<String>,
+    send_sges: usize,
+    full_payloads_verified: usize,
     warmup_iterations: usize,
     iterations: usize,
     elapsed_ms: f64,
     roundtrips_per_second: f64,
     bidirectional_payload_gbps: f64,
+    response_payload_gbps: f64,
+    request_bytes: usize,
+    response_bytes: usize,
     amortized_roundtrip_us: Option<f64>,
     estimated_one_way_latency_us: Option<f64>,
     p50_roundtrip_us: Option<f64>,
@@ -192,6 +200,17 @@ pub(crate) fn run_bench_rdma_ring(args: BenchRdmaRingArgs) -> Result<()> {
             args.iterations >= args.depth.saturating_mul(2),
             "timeline iterations must cover at least two ring generations"
         );
+    }
+    if matches!(args.mode.as_str(), "client" | "server") {
+        for bytes in [args.request_bytes.unwrap_or(args.slot_bytes), args.response_bytes.unwrap_or(args.slot_bytes)] {
+            anyhow::ensure!(bytes > 8 && bytes <= args.slot_bytes, "basic frame bytes must be in 9..=slot-bytes");
+        }
+        anyhow::ensure!(!args.gpu_echo || args.request_bytes == args.response_bytes,
+            "--gpu-echo requires equal request and response sizes");
+    }
+    if args.send_memory == RdmaSendMemory::Device {
+        anyhow::ensure!(matches!(args.mode.as_str(), "client" | "server") && !args.gpu_echo,
+            "device SEND memory requires basic client/server mode without --gpu-echo");
     }
     let ring_config = VerbsHostMappedRdmaRingConfig::new(args.slot_bytes, args.depth)?;
     let transport = TcpTransportConfig { timing: false,
@@ -1166,6 +1185,30 @@ fn elapsed_thread_cpu_ms(started: Option<Duration>) -> Option<f64> {
     Some(thread_cpu_time()?.checked_sub(started)?.as_secs_f64() * 1e3)
 }
 
+fn initialize_send_payload(ring: &mut VerbsHostMappedRdmaRing, args: &BenchRdmaRingArgs, bytes: usize) -> Result<Option<String>> {
+    anyhow::ensure!(args.slot_bytes > 8, "gathered SEND benchmark needs a header and payload");
+    let payload = (0..bytes - 8).map(|index| timeline_payload_byte(0x1166, index)).collect::<Vec<_>>();
+    ring.initialize_benchmark_payload(8, &payload, args.send_memory == RdmaSendMemory::Device)
+}
+
+fn verify_send_payload(slot: VerbsHostMappedRdmaSlot, bytes: usize) -> Result<()> {
+    // SAFETY: the receive completion makes this live slot available until release.
+    let payload = unsafe { std::slice::from_raw_parts(slot.host_ptr.add(8), bytes - 8) };
+    for (index, byte) in payload.iter().enumerate() {
+        anyhow::ensure!(*byte == timeline_payload_byte(0x1166, index),
+            "SEND payload mismatch at byte {index}");
+    }
+    Ok(())
+}
+
+fn post_benchmark_send(ring: &mut VerbsHostMappedRdmaRing, bytes: usize, gpu_echo: bool) -> Result<()> {
+    if gpu_echo { ring.post_reserved_send(bytes) } else { ring.post_reserved_benchmark_payload() }
+}
+
+fn send_memory_name(memory: RdmaSendMemory) -> String {
+    match memory { RdmaSendMemory::Pinned => "pinned", RdmaSendMemory::Device => "device" }.to_owned()
+}
+
 fn run_server(args: &BenchRdmaRingArgs, transport: &TcpTransportConfig) -> Result<()> {
     let listener = TcpListener::bind(&args.listen)
         .with_context(|| format!("binding mapped RDMA ring benchmark to {}", args.listen))?;
@@ -1173,36 +1216,41 @@ fn run_server(args: &BenchRdmaRingArgs, transport: &TcpTransportConfig) -> Resul
         .accept()
         .context("accepting mapped RDMA ring benchmark client")?;
     let mut ring = VerbsHostMappedRdmaRing::accept(stream, transport)?;
+    let request_bytes = args.request_bytes.unwrap_or(args.slot_bytes);
+    let response_bytes = args.response_bytes.unwrap_or(args.slot_bytes);
+    let fallback = initialize_send_payload(&mut ring, args, response_bytes)?;
     let native = args
         .gpu_echo
         .then(|| load_native_library(args.native_lib.as_deref()))
         .transpose()?;
-    let total = args
+    let validation_iterations = args.depth;
+    let total = validation_iterations.checked_add(args
         .warmup_iterations
-        .checked_add(args.iterations)
-        .context("mapped RDMA ring benchmark iteration count overflow")?;
+        .checked_add(args.iterations).context("mapped RDMA ring benchmark iteration count overflow")?)
+        .context("mapped RDMA ring validation count overflow")?;
     let started = Instant::now();
-    for _ in 0..total {
+    for iteration in 0..total {
         let received = ring.wait_recv_slot()?;
-        ring.record_received_bytes(args.slot_bytes);
+        if iteration < validation_iterations { verify_send_payload(received, request_bytes)?; }
+        ring.record_received_bytes(request_bytes);
         let send = ring.reserve_send_slot()?;
         if let Some(native) = &native {
             unsafe {
                 native.copy_d2d_async(
                     send.device_buffer,
                     received.device_buffer,
-                    args.slot_bytes,
+                    response_bytes,
                     std::ptr::null_mut(),
                 )?;
                 native.cuda_stream_synchronize(std::ptr::null_mut())?;
             }
         } else {
             unsafe {
-                std::ptr::copy_nonoverlapping(received.host_ptr, send.host_ptr, args.slot_bytes);
+                std::ptr::copy_nonoverlapping(received.host_ptr, send.host_ptr, 8);
             }
         }
         ring.release_recv_slot(received.sequence)?;
-        ring.post_reserved_send(args.slot_bytes)?;
+        post_benchmark_send(&mut ring, response_bytes, args.gpu_echo)?;
     }
     ring.flush_sends()?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1215,11 +1263,17 @@ fn run_server(args: &BenchRdmaRingArgs, transport: &TcpTransportConfig) -> Resul
             depth: args.depth,
             window: args.window,
             gpu_echo: args.gpu_echo,
+            send_memory_requested: send_memory_name(args.send_memory),
+            send_memory_actual: send_memory_name(if fallback.is_some() { RdmaSendMemory::Pinned } else { args.send_memory }),
+            send_memory_fallback: fallback,
+            send_sges: if args.gpu_echo { 1 } else { 2 },
+            full_payloads_verified: validation_iterations,
             warmup_iterations: args.warmup_iterations,
             iterations: args.iterations,
             elapsed_ms,
             roundtrips_per_second: 0.0,
             bidirectional_payload_gbps: 0.0,
+            response_payload_gbps: 0.0, request_bytes, response_bytes,
             amortized_roundtrip_us: None,
             estimated_one_way_latency_us: None,
             p50_roundtrip_us: None,
@@ -1240,23 +1294,28 @@ fn run_client(
         .as_deref()
         .context("mapped RDMA ring client requires --peer HOST:PORT")?;
     let mut ring = VerbsHostMappedRdmaRing::connect(peer, transport, config)?;
+    let request_bytes = args.request_bytes.unwrap_or(args.slot_bytes);
+    let response_bytes = args.response_bytes.unwrap_or(args.slot_bytes);
+    let fallback = initialize_send_payload(&mut ring, args, request_bytes)?;
+    let validation_iterations = args.depth;
+    run_client_phase(&mut ring, request_bytes, response_bytes, args.window, 0, validation_iterations, false, args.gpu_echo, true)?;
     run_client_phase(
         &mut ring,
-        args.slot_bytes,
+        request_bytes, response_bytes,
         args.window,
         0,
         args.warmup_iterations,
-        false,
+        false, args.gpu_echo, false,
     )?;
     let marker_base = args.warmup_iterations as u64;
     let started = Instant::now();
     let latencies = run_client_phase(
         &mut ring,
-        args.slot_bytes,
+        request_bytes, response_bytes,
         args.window,
         marker_base,
         args.iterations,
-        args.window == 1,
+        args.window == 1, args.gpu_echo, false,
     )?;
     let elapsed = started.elapsed();
     ring.flush_sends()?;
@@ -1264,7 +1323,7 @@ fn run_client(
     let elapsed_ms = elapsed_seconds * 1000.0;
     let roundtrips_per_second = args.iterations as f64 / elapsed_seconds;
     let bidirectional_payload_gbps =
-        args.iterations as f64 * args.slot_bytes as f64 * 2.0 * 8.0 / elapsed_seconds / 1e9;
+        args.iterations as f64 * (request_bytes + response_bytes) as f64 * 8.0 / elapsed_seconds / 1e9;
     let amortized_roundtrip_us = elapsed_seconds * 1e6 / args.iterations as f64;
     let (p50, p95, p99) = latency_percentiles(latencies);
     println!(
@@ -1276,11 +1335,18 @@ fn run_client(
             depth: args.depth,
             window: args.window,
             gpu_echo: args.gpu_echo,
+            send_memory_requested: send_memory_name(args.send_memory),
+            send_memory_actual: send_memory_name(if fallback.is_some() { RdmaSendMemory::Pinned } else { args.send_memory }),
+            send_memory_fallback: fallback,
+            send_sges: if args.gpu_echo { 1 } else { 2 },
+            full_payloads_verified: validation_iterations,
             warmup_iterations: args.warmup_iterations,
             iterations: args.iterations,
             elapsed_ms,
             roundtrips_per_second,
             bidirectional_payload_gbps,
+            response_payload_gbps: args.iterations as f64 * (response_bytes - 8) as f64 * 8.0 / elapsed_seconds / 1e9,
+            request_bytes, response_bytes,
             amortized_roundtrip_us: Some(amortized_roundtrip_us),
             estimated_one_way_latency_us: (args.window == 1)
                 .then_some(amortized_roundtrip_us * 0.5),
@@ -1292,13 +1358,17 @@ fn run_client(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_client_phase(
     ring: &mut VerbsHostMappedRdmaRing,
-    slot_bytes: usize,
+    request_bytes: usize,
+    response_bytes: usize,
     window: usize,
     marker_base: u64,
     iterations: usize,
     record_latency: bool,
+    gpu_echo: bool,
+    full_validation: bool,
 ) -> Result<Vec<f64>> {
     let mut sent = 0_usize;
     let mut received = 0_usize;
@@ -1318,11 +1388,12 @@ fn run_client_phase(
             if record_latency {
                 send_started.push(Instant::now());
             }
-            ring.post_reserved_send(slot_bytes)?;
+            post_benchmark_send(ring, request_bytes, gpu_echo)?;
             sent += 1;
         }
         let slot = ring.wait_recv_slot()?;
-        ring.record_received_bytes(slot_bytes);
+        ring.record_received_bytes(response_bytes);
+        if full_validation { verify_send_payload(slot, response_bytes)?; }
         let mut marker_bytes = [0_u8; std::mem::size_of::<u64>()];
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1374,6 +1445,21 @@ fn load_native_library(path: Option<&Path>) -> Result<NativeLibrary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_payload_validation_checks_every_byte() -> Result<()> {
+        let mut bytes = vec![0u8; 32768];
+        for (index, byte) in bytes[8..].iter_mut().enumerate() {
+            *byte = timeline_payload_byte(0x1166, index);
+        }
+        let slot = VerbsHostMappedRdmaSlot { sequence: 0, slot_index: 0,
+            capacity_bytes: bytes.len(), host_ptr: bytes.as_mut_ptr(),
+            device_buffer: CuteafdDeviceBuffer::default() };
+        verify_send_payload(slot, bytes.len())?;
+        bytes[17391] ^= 1;
+        assert!(verify_send_payload(slot, bytes.len()).is_err());
+        Ok(())
+    }
 
     #[test]
     fn timeline_frame_roundtrips_across_ring_generations() -> Result<()> {

@@ -1,9 +1,8 @@
 //! OpenAI requests mapped to the Muse checkpoint's own template context.
 //!
 //! The template takes `reasoning_effort` in {low, medium, high, xhigh}
-//! (default xhigh) and always reasons privately (`to=self`); there is no
-//! thinking-off form, so such requests are refused rather than rendered under
-//! another family's convention. Tool-call arguments become mappings (the
+//! (default xhigh). Thinking off pre-fills the template's final-answer recipient
+//! (`to=user`) instead of opening private reasoning. Tool-call arguments become mappings (the
 //! template's sandbox has no JSON parser), `current_date` is the server's.
 use serde_json::{json, Value};
 use crate::openai::chat::glm5::prompt::{reasoning_effort, response_format_instruction, template_message};
@@ -17,15 +16,6 @@ pub struct MusePromptOptions {
     pub tool_names: Vec<String>,
     pub tool_choice: MuseToolChoice,
     pub response_format: Option<Value>,
-}
-
-/// The template always opens private reasoning; refuse an off request.
-pub fn validate_thinking(body: &Value) -> Result<(), String> {
-    if !crate::openai::chat::glm5::prompt::resolve_thinking(body)? {
-        return Err("Muse checkpoint template does not support disabling thinking; \
-            use reasoning_effort low for the shortest reasoning".into());
-    }
-    Ok(())
 }
 
 /// The request's effort mapped onto the template's names: `minimal` reads as
@@ -44,7 +34,10 @@ pub fn template_effort(body: &Value) -> Result<Option<String>, String> {
 }
 
 pub fn template_context(body: &Value, options: &MusePromptOptions, bos: &str) -> Result<Value, String> {
-    validate_thinking(body)?;
+    let thinking = crate::openai::chat::glm5::prompt::resolve_thinking(body)?;
+    if !thinking && !options.tool_names.is_empty() {
+        return Err("Muse thinking off pre-fills a final answer to the user and cannot be combined with tools".into());
+    }
     let raw = body.get("messages").and_then(Value::as_array).ok_or("messages must be an array")?;
     if raw.is_empty() { return Err("messages must not be empty".into()); }
     let mut messages = raw.iter().enumerate().map(|(index, message)| {
@@ -85,6 +78,9 @@ pub fn template_context(body: &Value, options: &MusePromptOptions, bos: &str) ->
         context["tools"] = Value::Array(tools.iter().filter(|tool| tool["function"]["name"].as_str()
             .is_some_and(|name| options.tool_names.iter().any(|wanted| wanted == name))).cloned().collect());
     }
-    if let Some(effort) = template_effort(body)? { context["reasoning_effort"] = Value::String(effort); }
+    // A final-answer prefill bypasses reasoning, so effort is ignored when thinking is off.
+    if thinking {
+        if let Some(effort) = template_effort(body)? { context["reasoning_effort"] = Value::String(effort); }
+    }
     Ok(context)
 }

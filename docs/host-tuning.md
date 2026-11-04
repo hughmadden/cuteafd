@@ -194,15 +194,26 @@ packets. It reduces retransmits and their goodput cost, not numerical errors:
 Consider it when retransmits exceed about 0.5% of packets under sustained load
 (at least 2 GB moved per measured port). Go-back-N resends recover the data but
 may lower throughput. Check cabling and link errors too. Pause counts alone do
-not establish a pause storm; zero ECN marking is normal for Not-ECT/PFC traffic.
+not establish a pause storm. With switch ECN on, ECN marks and CNPs under load are
+normal congestion signalling, not errors; judge health by retransmits and sequence errors.
 See [#759](https://github.com/tpurtell/cuteafd/pull/759) for this cluster's
 DSCP 26 / priority 3 switch and NIC configuration and measured evidence.
 
+## Kernel logs on headless Sparks
+
+A Spark that boots from USB, with no BMC or serial console, leaves no evidence of a hard
+lockup unless its logs leave the box first. JigglypAI's recipe on
+[#948](https://github.com/tpurtell/cuteafd/issues/948#issuecomment-6605321994)
+combines three sinks: persistent journald bind-mounted onto NVMe, netconsole over UDP
+with a pinned receiver MAC, and a 1 s host-state sampler. It also covers running the
+container log driver as non-blocking `json-file`, so a journald stall on a slow root
+cannot freeze the engine's stdout.
+
 ## MikroTik CRS8xx lossless RoCE
 
-**Prepared, not applied. Do not merge until TJ applies and measures.** Stop all
-serving before changing the fabric. The baseline is TJ's 2026-10-25 post-06:54Z
-configuration: all eight queues have `ecn=no wred=no`. Never turn either on.
+Applied on this cluster (PFC since 2026-10-25, TC3 ECN since 2026-11-04). Stop all
+serving before changing the fabric. The rollback baseline is TJ's 2026-10-25
+post-06:54Z configuration: all eight queues have `ecn=no wred=no`. Never turn on WRED.
 The rollback was generated from a fresh read-only verbose QoS export, not
 inferred defaults. It restores every exported field and removes only our named
 profiles/maps. Do not import over unrelated subsequent QoS changes.
@@ -218,9 +229,21 @@ observed wire speeds (required to interpret received pause time); check them
 again before import. RouterOS >=7.23 automatically sizes lossless/shared
 buffers; do not copy legacy `use-shared-buffers` settings into this export.
 
-This is **PFC-only**, not a DCQCN experiment. The manual's ECN example is for
-ECT-capable traffic; byte104 has ECN bits00 (Not-ECT). ECN/WRED stay off, including
-TC3. CNP classification does not turn on ECN or change NIC congestion controls.
+TC3 also runs **ECN** (`ecn=yes wred=no`). The engine's GRH byte 106 sets ECT(0),
+and mlx5 DCQCN (on by default) also sends RoCE data as ECT, so the switch marks
+congested TC3 packets, receivers send CNPs (DSCP 48, strict TC6) and senders back
+off before PFC has to pause. (The A/B below ran with byte 104, ECN bits 00: DCQCN
+alone produced the marks.) SparkNest's class 2 (`pfc-2-3` lossless) runs ECN on
+queue 2 the same way; its policy belongs to SparkNest. WRED stays off everywhere.
+
+Muse max card A/B (2× RTX + 6 Sparks, sealed slot, one launch per arm, 2026-11-04),
+q3 ECN off → on: readiness 57.23 → 55.49 s, 8K prefill 3,314 → 3,292 tok/s,
+C1 54.35 → 51.93, C4 87.34 → 90.76, C8 114.47 → 106.93, C16 129.22 → 130.71 tok/s
+(decode deltas inside the card's single-launch spread; C1 ranged 48.9–55.9 within the
+off arm), KL/top-1 identical, 0 retransmits both arms. Off: every ECN/CNP counter 0.
+On: raptor marked 101.9M packets and sent 2.38M CNPs (87% in the many-to-one
+shared-prefix phase), Sparks handled ~400K CNPs each, 0 ignored CNPs, 0 slow
+restarts, 0 sequence errors.
 PFC prevents avoidable congestion loss only when every hop and endpoint agrees;
 it adds no sink capacity and can introduce head-of-line blocking or pause storms.
 No losslessness or speedup is claimed before counters and warmed runs prove it.
@@ -281,12 +304,60 @@ priority3. Existing receive headroom is split equally into lossy buffer0 and
 lossless buffer1, with priority3 alone in buffer1. The mlx5 driver computes
 speed/MTU/cable XOFF and rejects insufficient headroom; no guessed thresholds or
 shared-memory expansion. Verify headroom/pause counts before loading models.
-These are runtime settings, not a new boot service; rollback/reapply after NIC
-reset rather than silently overwriting the saved original state.
 
-The engine always marks its RoCE QPs DSCP 26 (GRH traffic class 104) with SL 3,
+### Persist across reboot (TJ only)
+
+On fabrics running SparkNest's QoS, SparkNest owns the NIC policy; cuteafd's
+`apply` and `reapply` refuse its backed-up NICs, while `check` accepts the extra
+lossless class 2 and reports the owner. The boot unit below is for deployments
+without SparkNest-managed QoS.
+
+Raptor's 2026-10-31 reboot silently reset its NIC policy. After the first reviewed
+`apply`, install the script and enable the boot unit below; `persist` only prints
+instructions and a unit, installing nothing. Run the privileged commands as root
+on each host (schedule daemon-reload outside GPU runs):
+
+```bash
+# Coordinator: stage the unit from the reviewed checkout, then install as root.
+scripts/host/tune.sh fabric-lossless persist --role coordinator > fabric-lossless.service
+install -d -o root -g root -m 0755 /usr/local/lib/cuteafd
+install -o root -g root -m 0755 scripts/host/fabric-lossless.py /usr/local/lib/cuteafd/fabric-lossless.py
+install -o root -g root -m 0644 fabric-lossless.service /etc/systemd/system/cuteafd-fabric-lossless.service
+systemctl daemon-reload && systemctl enable --now cuteafd-fabric-lossless.service
+```
+
+For each Spark, stage the script and a `--role spark` unit, then run the same
+install commands as root there (use the staged paths):
+
+```bash
+scripts/host/tune.sh fabric-lossless persist --role spark > fabric-lossless.service
+for host in ostrich dodo emu kiwi rhea moa; do
+  scp scripts/host/fabric-lossless.py fabric-lossless.service "$host":/home/tj/.cache/cuteafd/fabric-lossless/
+done
+# On each Spark, as root:
+cd /home/tj/.cache/cuteafd/fabric-lossless
+install -d -o root -g root -m 0755 /usr/local/lib/cuteafd
+install -o root -g root -m 0755 fabric-lossless.py /usr/local/lib/cuteafd/fabric-lossless.py
+install -o root -g root -m 0644 fabric-lossless.service /etc/systemd/system/cuteafd-fabric-lossless.service
+systemctl daemon-reload && systemctl enable --now cuteafd-fabric-lossless.service
+```
+
+The root unit runs only the root-owned installed copy, never code under `/home`.
+`reapply` waits up to 60 s for the saved fabric ports and addresses. It requires
+pending original-state backups, does nothing if already applied, and reapplies
+only from the exact saved original state, without changing backups. Unknown
+states refuse with a per-field diff for operator review. Manual NIC-reset recovery
+uses `fabric-lossless reapply --role ROLE` too; unprivileged `--dry-run` reports
+permission denied if the root-only backups cannot be read, never guesses.
+Verify after boot with `scripts/host/tune.sh fabric-lossless check --role coordinator`
+(or `--role spark` on a Spark); the installed script also accepts `check --role ROLE`.
+Before deliberate rollback, disable this unit so a later boot cannot reapply.
+
+### Traffic marking and verification
+
+The engine always marks its RoCE QPs DSCP 26, ECN ECT(0) (GRH traffic class 106), with SL 3,
 the byte's class selector, so priority-3 PFC also stops transmit QPs; startup
-fabric logs show `rdma_tc=104 dscp=26`. There is no launch key: an untuned fabric
+fabric logs show `rdma_tc=106 dscp=26`. There is no launch key: an untuned fabric
 ignores the mark (switch trust `ignore`, NIC trust `pcp` on an untagged link),
 so the same run commands work whether or not the fabric is tuned.
 
@@ -310,7 +381,8 @@ stop bars from [#733](https://github.com/tpurtell/cuteafd/pull/733).
 ### Roll back (TJ only)
 
 Stop serving. Import the reviewed switch rollback, then restore each host's
-captured NIC state. It deliberately leaves every switch queue's ECN/WRED off.
+captured NIC state. It restores the captured baseline, so every switch queue's
+ECN/WRED ends up off (including SparkNest's queue 2; tell SparkNest first).
 
 ```bash
 ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-rollback.rsc verbose=yes'

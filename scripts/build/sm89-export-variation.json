@@ -11,6 +11,7 @@
     "v41-fp8/v41_index_q_fp8_m80_sm128_gemm",
     "v41-fp8/v41_main_fp8_m64_gemm",
     "v41-fp8/v41_o_a_fp8_m256_sm114_gemm",
+    "v41-fp8/v41_o_b_tp2_fp8_m256_gemm",
     "v41-fp8/v41_q_b_fp8_m256_sm114_gemm",
     "v41-fp8/v41_q_b_tp2_fp8_m256_sm114_gemm",
     "v41-fp8/v41_q_b_tp2_fp8_m64_sm128_gemm",

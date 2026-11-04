@@ -14,16 +14,16 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let local = report.placement == ExpertPlacement::Local;
-    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
         crate::families::qwen4::prefill_limits(local)) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
     };
-    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    let shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
     report.prefill_span_rows = Some(prefill.span_rows);
     if options.rtx_bytes.len() == 2 && options.head_split && local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
-            shape.context_tokens, shape.native_layers > 0, shape.manifest.as_ref());
+            shape.context_tokens, shape.native_layers > 0, shape.manifest.as_deref());
     }
     single_layout(report, model, input, options, shape)
 }
@@ -139,7 +139,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     if options.drafter_bytes > 0 {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, basis));
     }
-    devices[0].items.push(runtime_item(shape.manifest.as_ref(), &program_families("qwen4", false),
+    devices[0].items.push(runtime_item(shape.manifest.as_deref(), &program_families("qwen4", false),
         local_package(report), false, 0, options.coordinator_arch, options.rtx_bytes[0]));
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
@@ -159,7 +159,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         resolve_encoder(report, &qwen_towers(report), &mut devices, &mut sparks, &[per_token * target], options, &mut notes);
     }
     let mut pool_tokens = 0;
-    match placement(input, report, options, &mut devices[0], shape.manifest.as_ref(),
+    match placement(input, report, options, &mut devices[0], shape.manifest.as_deref(),
         PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp }) {
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
@@ -219,7 +219,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
+    let inputs = crate::placement::families::qwen4::QwenInputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },

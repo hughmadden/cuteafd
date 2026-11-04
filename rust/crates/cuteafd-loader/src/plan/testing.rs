@@ -379,6 +379,55 @@ pub fn glm5_tensors(expert: impl Fn(&str, usize, usize) -> Vec<Tensor>) -> Vec<T
     out
 }
 
+/// Compact, constructor-valid GLM weight geometry for CPU allocation tests.
+/// Payloads remain sparse zeros until a test explicitly fills them.
+pub fn glm5_compact_weights() -> (Value, Vec<Tensor>) {
+    let mut config = glm5_config();
+    for (key, value) in [("hidden_size", 256), ("num_attention_heads", 2),
+        ("q_lora_rank", 256), ("kv_lora_rank", 128), ("qk_nope_head_dim", 64),
+        ("v_head_dim", 128), ("index_n_heads", 2), ("intermediate_size", 512),
+        ("n_routed_experts", 2), ("num_experts_per_tok", 2), ("moe_intermediate_size", 256)] {
+        config[key] = json!(value);
+    }
+    let mut tensors = vec![t("lm_head.weight", "BF16", &[64, 256]),
+        t("model.embed_tokens.weight", "BF16", &[64, 256]), t("model.norm.weight", "BF16", &[256])];
+    for layer in 0..2 {
+        let root = format!("model.layers.{layer}");
+        for (leaf, width) in [("input_layernorm.weight", 256), ("post_attention_layernorm.weight", 256),
+            ("self_attn.q_a_layernorm.weight", 256), ("self_attn.kv_a_layernorm.weight", 128)] {
+            tensors.push(t(format!("{root}.{leaf}"), "BF16", &[width]));
+        }
+        for (leaf, n, k) in [("q_a_proj", 256, 256), ("kv_a_proj_with_mqa", 192, 256),
+            ("q_b_proj", 256, 256), ("kv_b_proj", 384, 128), ("o_proj", 256, 256)] {
+            tensors.extend(fp8(&format!("{root}.self_attn.{leaf}"), n, k, None));
+        }
+        if layer == 0 {
+            tensors.extend(fp8(&format!("{root}.self_attn.indexer.wq_b"), 256, 256, None));
+            tensors.extend(fp8(&format!("{root}.self_attn.indexer.wk"), 128, 256, None));
+            tensors.push(t(format!("{root}.self_attn.indexer.weights_proj.weight"), "BF16", &[2, 256]));
+            for leaf in ["weight", "bias"] {
+                tensors.push(t(format!("{root}.self_attn.indexer.k_norm.{leaf}"), "BF16", &[128]));
+            }
+        } else {
+            tensors.push(t(format!("{root}.mlp.gate.weight"), "BF16", &[2, 256]));
+            tensors.push(t(format!("{root}.mlp.gate.e_score_correction_bias"), "F32", &[2]));
+        }
+        let (mlp, intermediate) = if layer == 0 { ("mlp", 512) } else { ("mlp.shared_experts", 256) };
+        for (leaf, n, k) in [("gate_proj", intermediate, 256), ("up_proj", intermediate, 256),
+            ("down_proj", 256, intermediate)] {
+            tensors.extend(fp8(&format!("{root}.{mlp}.{leaf}"), n, k, None));
+        }
+        if layer == 1 {
+            for expert in 0..2 {
+                for leaf in ["gate_proj", "up_proj", "down_proj"] {
+                    tensors.extend(fp8(&format!("{root}.mlp.experts.{expert}.{leaf}"), 256, 256, None));
+                }
+            }
+        }
+    }
+    (config, tensors)
+}
+
 /// PROGRAMS.json entries (256-byte scratch each) for a GLM 5.3 native plan: the context split's
 /// programs and the decode/prefill producers, attention, o_proj and dense/MoE FFNs of both shares.
 pub fn glm5_native_programs() -> Value {
@@ -875,6 +924,12 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
             "intermediate":2304,"kernel_intermediate":2304,"experts":128,"topk":3},
         "variants":([16,40,80,256].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*7})))
     })).unwrap()).unwrap();
+    // `--tp2-dspark-experts` charges the dSpark TP2 role's own workspaces.
+    fs::write(share.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"), serde_json::to_vec(&json!({
+        "role":"dspark_tp2","input_format":"fp8_k32","geometry":{"hidden":5120,
+            "intermediate":1152,"kernel_intermediate":1152,"experts":128,"topk":3},
+        "variants":([1,16,40,80,256,1024,4096].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*11})))
+    })).unwrap()).unwrap();
     programs
 }
 
@@ -1067,7 +1122,8 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
     }
     if !spark {
-        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064)] {
+        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064),
+            ("kda_fused_h96_m64", 17_330_176), ("kda_fused_h96_m4096", 1_182_153_728)] {
             programs.push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
         }
         for (suffix, producer, output, attention) in [("",92_798_976,100_663_296,50_528_256),

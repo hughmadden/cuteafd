@@ -486,6 +486,14 @@ fn native_local_layers(experts: &dyn RtxExpertLayer, device: i32) -> Result<Vec<
     Ok(experts.layers().to_vec())
 }
 
+fn tp2_input(experts: &dyn RtxExpertLayer, wire: *mut c_void, hidden: *mut c_void) -> ExpertInput {
+    if experts.uses_fp8_input() { ExpertInput::Fp8K32(wire) } else { ExpertInput::Bf16(hidden) }
+}
+
+fn tp2_weight_read_bytes(ranks: [&dyn RtxExpertLayer; 2]) -> Result<usize> {
+    ranks.into_iter().try_fold(0, |largest, rank| Ok(largest.max(rank.weight_read_bytes()?)))
+}
+
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
 /// every launch, read back by [`GlmfEngine::op_profile`].
 #[derive(Default)]
@@ -2153,15 +2161,15 @@ impl<'a> GlmfEngine<'a> {
             let layer = tp2.layers[0];
             self.on(rank, || {
                 let mut experts = tp2.ranks[rank].borrow_mut();
-                let input = if experts.partial() == PartialDtype::F32 {
+                if experts.uses_fp8_input() {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
                     // SAFETY: the scale section follows the FP8 values in the admitted wire buffer.
                     self.run_on(rank, false, "expert_input_quant", &[("source_ptr", w.x.buffer.ptr),
                         ("values_ptr", w.wire.buffer.ptr), ("scale_rows_ptr", unsafe {
                             w.wire.buffer.ptr.cast::<u8>().add(self.cfg.hidden).cast() }),
                         ("scale_mma_ptr", w.scratch.buffer.ptr)], &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
-                    ExpertInput::Fp8K32(w.wire.buffer.ptr)
-                } else { ExpertInput::Bf16(w.x.buffer.ptr) };
+                }
+                let input = tp2_input(experts.as_ref(), w.wire.buffer.ptr, w.x.buffer.ptr);
                 let routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
                 // SAFETY: valid maximum-capacity startup input/routes stay live through the synchronization.
                 unsafe {
@@ -2382,7 +2390,11 @@ impl<'a> GlmfEngine<'a> {
             };
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+            let slice_bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                let left = tp2.ranks[0].borrow();
+                let right = tp2.ranks[1].borrow();
+                tp2_weight_read_bytes([left.as_ref(), right.as_ref()])? as f64
+            } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
                 match self.routed_experts(layer) {
                     Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes()? as f64,
                     Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)? as f64,
@@ -2390,14 +2402,11 @@ impl<'a> GlmfEngine<'a> {
                 }
             } else { match (catalog.fp8(), catalog.exl3()) {
                 (Some(_), _) => {
-                    let bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                        tp2.ranks.iter().map(|rank| rank.borrow().weight_read_bytes())
-                            .collect::<Result<Vec<_>>>()?.into_iter().max().context("GLM Flash installed TP2 ranks missing")?
-                    } else { match self.routed_experts(layer) {
+                    let bytes = match self.routed_experts(layer) {
                         Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
                         Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)?,
                         _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    }};
+                    };
                     bytes as f64
                 }
                 (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
@@ -2676,7 +2685,7 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             let mut experts = tp2.ranks[rank].borrow_mut();
-            let input = if experts.partial() == PartialDtype::F32 {
+            if experts.uses_fp8_input() {
                 if rank == 1 {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
                     // SAFETY: scale rows start after the FP8 values in each wire row.
@@ -2685,8 +2694,8 @@ impl<'a> GlmfEngine<'a> {
                             .add(self.cfg.hidden).cast() }), ("scale_mma_ptr", w.scratch.buffer.ptr)],
                         &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
                 }
-                ExpertInput::Fp8K32(w.wire.buffer.ptr)
-            } else { ExpertInput::Bf16(w.x.buffer.ptr) };
+            }
+            let input = tp2_input(experts.as_ref(), w.wire.buffer.ptr, w.x.buffer.ptr);
             // SAFETY: input/routes and expert scratch are rank-local and serialized on one stream.
             unsafe { experts.enqueue(layer, rows, input, routes, self.stream_of(rank),
                 &mut || self.abort_tp2_or_terminate())?; }
@@ -3340,7 +3349,7 @@ impl<'a> GlmfEngine<'a> {
     fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
         // SAFETY: the ids upload precedes this gather on the same stream; streams hold t x 4 rows.
         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-            w.streams[0].buffer.ptr, Some(w.streams[1].buffer), self.stream) }
+            w.streams[0].buffer.ptr, Some(w.streams[1].buffer), RankDevice { device: self.device, stream: self.stream }) }
     }
 
     fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables,
@@ -5247,7 +5256,7 @@ impl<'a> GlmfEngine<'a> {
                 // The compact reducer adds the shared expert plane to the rank partials.
                 let mut transport = transport.borrow_mut();
                 let exchange = transport.exchange()?;
-                let wave = self.spark_send(w, index, t, decode, exchange, shared)?;
+                let wave = self.spark_send(w, index, t, decode, exchange, None, shared)?;
                 return self.spark_land(w, t, exchange, wave);
             }
         }
@@ -5318,7 +5327,7 @@ impl<'a> GlmfEngine<'a> {
     /// and the ranks compute. This thread never waits for the GPU. Complete
     /// with [`Self::spark_land`].
     fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool,
-        exchange: &mut crate::shared::spark_waves::Waves<'_>, shared: impl FnOnce() -> Result<()>)
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>, shared: impl FnOnce() -> Result<()>)
         -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
@@ -5327,10 +5336,13 @@ impl<'a> GlmfEngine<'a> {
         let audit = self.split_audit && !decode && t >= 256;
         // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
         let ticket = unsafe {
             exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
-                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
-                    let request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, combined_reply, Box::new(move |routes, wire| {
+                    let mut request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
                     if audit {
                         let counts = audit_route_counts(&request.routes);
                         tracing::info!(layer = index, rows = t, distinct = counts.len(),
@@ -5461,6 +5473,15 @@ mod tp2_tests {
         }
         let valid = || Rank { shard: RtxShard::Whole, partial: PartialDtype::Bf16, fp8: true, device: 4 };
         assert_eq!(native_local_layers(&valid(), 4).unwrap(), [3, 7]);
+        let wire = 0x1000usize as *mut c_void;
+        let hidden = 0x2000usize as *mut c_void;
+        for (partial, fp8) in [(PartialDtype::Bf16, true), (PartialDtype::F32, true), (PartialDtype::Bf16, false)] {
+            let rank = Rank { shard: RtxShard::Tp2 { rank: 0 }, partial, fp8, device: 4 };
+            match tp2_input(&rank, wire, hidden) {
+                ExpertInput::Fp8K32(pointer) => { assert!(fp8); assert_eq!(pointer, wire); }
+                ExpertInput::Bf16(pointer) => { assert!(!fp8); assert_eq!(pointer, hidden); }
+            }
+        }
         let mut wrong = valid(); wrong.shard = RtxShard::Tp2 { rank: 0 };
         assert!(native_local_layers(&wrong, 4).is_err());
         let mut wrong = valid(); wrong.partial = PartialDtype::F32;
@@ -5469,6 +5490,27 @@ mod tp2_tests {
         assert!(native_local_layers(&wrong, 4).is_err());
         assert!(native_local_layers(&valid(), 0).is_err());
     }
+    #[test]
+    fn draft_geometry_prices_installed_tp2_owners_and_propagates_errors() {
+        struct Rank(Option<usize>);
+        impl RtxExpertLayer for Rank {
+            fn shard(&self) -> crate::shared::experts::rtx::RtxShard { unreachable!() }
+            fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+            fn uses_fp8_input(&self) -> bool { true }
+            fn layers(&self) -> &[usize] { &[3] }
+            fn device(&self) -> i32 { 0 }
+            fn workspace_bytes(&self) -> usize { 0 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            fn weight_read_bytes(&self) -> Result<usize> { self.0.context("installed descriptor missing") }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        assert_eq!(tp2_weight_read_bytes([&Rank(Some(123)), &Rank(Some(456))]).unwrap(), 456);
+        assert_eq!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(Some(123))]).unwrap(), 456);
+        assert!(tp2_weight_read_bytes([&Rank(None), &Rank(Some(456))]).is_err());
+        assert!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(None)]).is_err());
+    }
+
     #[test]
     fn kda_only_owner_has_no_compact_index_storage() {
         for index in [IndexCache::Keys, IndexCache::Compact] {

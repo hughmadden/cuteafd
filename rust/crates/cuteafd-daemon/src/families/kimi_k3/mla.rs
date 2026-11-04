@@ -59,13 +59,25 @@ pub(crate) struct CacheLayout {
 
 impl CacheLayout {
     pub(crate) fn new(cfg: &KimiK3Config, placement: &Placement, rank: usize, format: MlaCacheFormat) -> Result<Self> {
-        ensure!(rank < 2 && placement.layers.len() == cfg.layers && cfg.attention.len() == cfg.layers,
+        Self::for_ranks(cfg, placement, rank, format, 2)
+    }
+
+    pub(crate) fn for_ranks(cfg: &KimiK3Config, placement: &Placement, rank: usize,
+        format: MlaCacheFormat, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2) && rank < ranks
+            && placement.layers.len() == cfg.layers && cfg.attention.len() == cfg.layers,
             "Kimi MLA cache placement inventory/rank");
         ensure!(cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi MLA cache record geometry");
-        ensure!(cfg.attention.iter().zip(&placement.layers).all(|(kind, assignment)| match kind {
-            KimiAttention::Mla => matches!(assignment.mode, LayerMode::HeadSplit
-                | LayerMode::Whole { gpu: 0 | 1, ffn: FfnMode::Split }),
-            KimiAttention::Kda => assignment.mode == LayerMode::HeadSplit,
+        ensure!(cfg.attention.iter().zip(&placement.layers).all(|(kind, assignment)| {
+            if ranks == 1 {
+                assignment.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }
+            } else {
+                match kind {
+                    KimiAttention::Mla => matches!(assignment.mode, LayerMode::HeadSplit
+                        | LayerMode::Whole { gpu: 0 | 1, ffn: FfnMode::Split }),
+                    KimiAttention::Kda => assignment.mode == LayerMode::HeadSplit,
+                }
+            }
         }), "Kimi MLA cache placement has no executable attention mode");
         let tokens = usize::try_from(placement.pool_tokens)?;
         ensure!(tokens > 0 && tokens % MLA_PAGE_ROWS == 0, "Kimi MLA cache pool is not whole pages");
@@ -74,7 +86,7 @@ impl CacheLayout {
         let layer_bytes = tokens.checked_mul(format.record_bytes()).context("Kimi MLA cache extent overflow")?;
         let layers = cfg.attention.iter().zip(&placement.layers).map(|(kind, assignment)| -> Result<_> {
             if *kind != KimiAttention::Mla { return Ok(None); }
-            let share = AttentionShare::bind(assignment.mode, 2)?[rank];
+            let share = AttentionShare::bind(assignment.mode, ranks)?[rank];
             Ok(share.present().then_some(share))
         }).collect::<Result<Vec<_>>>()?;
         let bytes = layer_bytes.checked_mul(layers.iter().flatten().count()).context("Kimi MLA cache total overflow")?;

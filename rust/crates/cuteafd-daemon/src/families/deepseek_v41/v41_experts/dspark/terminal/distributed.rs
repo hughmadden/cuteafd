@@ -3,6 +3,7 @@ use super::*;
 use crate::shared::memory::device::{Device, DeviceOwner};
 use crate::families::deepseek_v41::v41_target_head::distributed::DistributedVocabularyWave;
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
+use cuteafd_ffi::NativeLibrary;
 
 #[derive(Clone, Copy)]
 enum Phase { Normalize, Project, Assemble, Sample }
@@ -24,6 +25,19 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let mut bytes = DistributedVocabularyWave::device_bytes(capacity * width, split)?;
         bytes[1] += terminal;
         Ok(bytes)
+    }
+    pub fn head_scratch_bytes(library: &NativeLibrary, rows: usize, split: usize) -> Result<[usize; 2]> {
+        ensure!((1..129280).contains(&split), "invalid draft head split");
+        let scratch = |tokens| -> Result<usize> {
+            Ok(match crate::families::deepseek_v41::v41_tensors::fp8_head() {
+                crate::families::deepseek_v41::v41_tensors::Fp8Head::Off => 0,
+                crate::families::deepseek_v41::v41_tensors::Fp8Head::Packed =>
+                    library.packed_head_workspace(rows, 5120, tokens)?.max(256),
+                _ => library.fp8_w8a16_workspace(rows, 5120, tokens)?.max(256),
+            })
+        };
+        let [left, right] = [split, 129280 - split].map(scratch);
+        Ok([left?, right?])
     }
     pub fn new(devices: [Device<'a>; 2], weights: &'w DsparkWeights<'a>,
         shards: [&'w VocabularyShard<'a>; 2], capacity: usize, budgets: [usize; 2]) -> Result<Self> {
@@ -119,7 +133,10 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             let terminal = self.terminal.get_mut();
             terminal.upload_sampling_on(terminal.stream.raw)
         }).and_then(|_| unsafe { self.enqueue_stage(requests, false) });
-        if queued.is_err() { self.cancel(); }
+        if let Err(error) = &queued {
+            tracing::error!(%error, "distributed terminal submission failed before cancellation drain");
+            self.cancel();
+        }
         queued
     }
     pub fn poll(&mut self) -> Result<bool> {
@@ -161,7 +178,10 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                 }
             }
         })();
-        if result.is_err() { self.cancel(); }
+        if let Err(error) = &result {
+            tracing::error!(%error, "distributed terminal failed before cancellation drain");
+            self.cancel();
+        }
         result
     }
     pub fn cancel(&mut self) {

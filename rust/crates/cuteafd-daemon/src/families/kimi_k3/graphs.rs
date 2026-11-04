@@ -23,10 +23,15 @@ use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_row
 /// with its speculative single-sequence attention, the C1 verify shape.
 pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
-    ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "Kimi graph lane/row capacity");
+    inventory_for_ranks(cfg, lanes, capacity, slots, verify, 2, resident)
+}
+
+pub(crate) fn inventory_for_ranks(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
+    ranks: usize, resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
+    ensure!(matches!(ranks, 1 | 2) && (1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "Kimi graph lane/row capacity");
     let mut keys = Vec::new();
     for lane in 0..lanes {
-        for rank in 0..2 {
+        for rank in 0..ranks {
             for rows in graph_rows(verify, capacity) {
                 for layer in 0..cfg.layers {
                     keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Attention(layer)) });
@@ -44,11 +49,11 @@ pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots
                         }
                     }
                 }
-                if rank == 1 { keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Output) }); }
+                if rank == ranks - 1 { keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Output) }); }
             }
         }
     }
-    cuteafd_loader::families::kimi_k3::allocation::graphs(cfg, lanes, capacity, slots, verify, resident)?
+    cuteafd_loader::families::kimi_k3::allocation::graphs_for_ranks(cfg, lanes, capacity, slots, verify, ranks, resident)?
         .startup(keys).map_err(anyhow::Error::msg)
 }
 
@@ -64,7 +69,14 @@ pub(crate) fn owned_inventory(cfg: &KimiK3Config, lanes: usize, rows: usize, slo
 
 pub(crate) fn check_placement(cfg: &KimiK3Config, placement: &cuteafd_loader::placement::Placement,
     keys: &[Key]) -> Result<()> {
+    check_placement_for_ranks(cfg, placement, keys, 2)
+}
+
+pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_loader::placement::Placement,
+    keys: &[Key], ranks: usize) -> Result<()> {
     use cuteafd_loader::placement::LayerMode;
+    ensure!(matches!(ranks, 1 | 2) && keys.iter().all(|key| key.rank < ranks),
+        "Kimi graph physical rank count");
     ensure!(placement.layers.len() == cfg.layers, "Kimi graph placement layer count");
     for key in keys {
         if let Op::Attention { layer, .. } = key.op {
@@ -75,7 +87,9 @@ pub(crate) fn check_placement(cfg: &KimiK3Config, placement: &cuteafd_loader::pl
         }
     }
     for (layer, assignment) in placement.layers.iter().enumerate() {
-        for rank in 0..2 {
+        ensure!(ranks == 2 || matches!(assignment.mode, LayerMode::Whole { gpu: 0, .. }),
+            "Kimi single-owner graphs require whole attention residency");
+        for rank in 0..ranks {
             let resident = matches!(assignment.mode, LayerMode::HeadSplit)
                 || matches!(assignment.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank);
             ensure!(keys.iter().any(|key| key.rank == rank && matches!(key.op,
@@ -148,6 +162,27 @@ pub(crate) fn check_captures(startup: u64, current: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_owner_keys_capture_output_without_a_shadow_rank() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        for capacity in [64, 2752, 4096] {
+            let set = inventory_for_ranks(&cfg, 2, capacity, 16, 8, 1, |rank, _| rank == 0)?;
+            assert_eq!(set.inventory.ranks.len(), 1);
+            assert!(set.keys.iter().all(|key| key.rank == 0));
+            assert_eq!(set.inventory.ranks[0].executables, set.keys.len() as u64);
+            let unique = set.keys.iter().collect::<std::collections::HashSet<_>>();
+            assert_eq!(unique.len(), set.keys.len());
+            for lane in 0..2 { for rows in graph_rows(8, capacity) {
+                assert!(unique.contains(&Key { lane, rank: 0, rows, op: Op::Residual(MixSite::Output) }));
+            }}
+            let pair = inventory(&cfg, 2, capacity, 16, 8, |_, _| true)?;
+            let output = set.keys.iter().filter(|key| key.op == Op::Residual(MixSite::Output)).count();
+            assert_eq!(pair.keys.len(), 2 * set.keys.len() - output);
+        }
+        assert!(inventory_for_ranks(&cfg, 1, 64, 16, 8, 0, |_, _| true).is_err());
+        Ok(())
+    }
 
     #[test]
     fn owned_keys_match_shared_admission_and_reject_wrong_residency() -> Result<()> {

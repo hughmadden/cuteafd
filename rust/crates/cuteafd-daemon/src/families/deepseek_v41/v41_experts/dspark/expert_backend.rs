@@ -9,7 +9,13 @@ pub(super) enum DraftExperts<'w, 'a> {
     Tp2(super::tp2::RoutedWave<'w, 'a>),
     Full(ExpertExecution<'w, 'a>),
 }
-impl DraftExperts<'_, '_> {
+impl<'a> DraftExperts<'_, 'a> {
+    pub fn peer_stream(&self) -> Option<std::rc::Rc<crate::shared::memory::device::Stream<'a>>> {
+        match self {
+            Self::Full(_) => None,
+            Self::Tp2(v) => Some(v.peer_stream()),
+        }
+    }
     pub fn stream(&self) -> *mut c_void {
         match self {
             Self::Full(v) => v.stream(),

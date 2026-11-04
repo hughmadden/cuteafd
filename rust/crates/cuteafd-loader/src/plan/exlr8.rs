@@ -139,7 +139,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
     if family.id() == "glm5" {
-        super::layout::resolve_prefill(&mut report, &mut resolved_layout, world, family.prefill_limits())?;
+        super::layout::resolve_prefill(input, &mut report, &mut resolved_layout, world, family.prefill_limits())?;
     }
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
@@ -252,7 +252,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.solver_placement = Some(placement);
     {
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
-        super::layout::charge_host(&mut report, layout, checkpoint, true)?;
+        super::layout::charge_host(&mut report, layout, input, true)?;
     }
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })

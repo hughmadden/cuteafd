@@ -11,6 +11,8 @@ pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;
 pub mod expert_geometry;
 pub mod spark_executions;
+pub mod spark_reply;
+pub use spark_reply::SparkReplyFormat;
 pub use spark_executions::{covering_export, DecodeExecution, ExecutionAdmissionError, ExecutionOwner,
     OwnerBytes, OwnerExtent, PrefillExecution, SparkExecutions, MAX_BUFFERED_PREFILL_UNITS, MAX_SPARK_DECODE_LANES};
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy, EXL3_CAPACITIES,
@@ -26,7 +28,7 @@ mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};
 mod target_sampling;
 pub use target_sampling::{
-    device_bytes as target_sampler_device_bytes,
+    allocations as target_sampler_allocations, device_bytes as target_sampler_device_bytes, SamplerAllocation,
     TargetSamplingError, TargetSamplingParams, GREEDY_TEMPERATURE_EPS, MAX_TARGET_TEMPERATURE,
 };
 mod dspark_verify;

@@ -25,7 +25,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
     let auto_vision_retry = (report.spark_ranks == 0 && report.vision == super::super::MediaMode::Auto)
         .then(|| (report.clone(), options.clone()));
-    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_waves: if report.spark_ranks == 0 { 1 }
                 else if report.requested_attention == Some(placement::AttentionPlacement::Layers) {
@@ -35,8 +35,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
     };
-    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
-    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
+    let shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
+    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_deref(), shape.prefill_rows,
         shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
     let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
@@ -59,10 +59,40 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let lanes = prefill.waves;
         let decode_rows = options.glmf_decode_rows;
         anyhow::ensure!(ranks == 1 || decode_rows == 64, "a head split takes --decode-rows 64");
-        // The MLA placement (auto: context where the build carries its programs on two GPUs); context
-        // keeps the compact index cache, heads on two GPUs the token keys.
-        let attention = glmf::resolve_attention(report.requested_attention, ranks,
-            manifest.and_then(glmf::manifest_context))?;
+        let draft_config = if options.glmf_drafter_disabled || options.drafter_bytes > 0 { None } else {
+            let path = options.glmf_drafter_snapshot.clone().or_else(|| {
+                let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
+                crate::resolve_snapshot_at_revision("incoai/GLM-5.3-Flash-DFlash2", Some(&home), None)
+                    .ok().and_then(|r| r.snapshot_path)
+            }).context("DFlash2 config missing: provide --glmf-drafter-snapshot or disable the drafter")?;
+            let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
+            let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
+                usize::try_from(sequences)?, usize::try_from(options.glm_draft_sequences())?,
+                options.draft_context_slots.map(usize::try_from).transpose()?);
+            let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch)?;
+            Some((config, capacity))
+        };
+        let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+            64, draft_config.as_ref().map(|(_, capacity)| capacity.block_rows / capacity.max_batch_sequences - 1),
+            options.glm5_attention_plan_rows)?;
+        let sms = options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.coordinator_arch, options.rtx_bytes[0], None).sms);
+        let selected_manifest = manifest.map(|manifest| -> anyhow::Result<_> {
+            let mut selected = manifest.clone();
+            cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sms)?;
+            cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
+                |name| (name.starts_with("glmf_") && (decode_rows > 64 || !name.ends_with("_m128")))
+                    || (ranks == 2 && name.starts_with("glmf2_")))?;
+            Ok(selected)
+        }).transpose()?;
+        let manifest = selected_manifest.as_ref();
+        // Context and step admission use the same boot-time numerical recipe as serving.
+        let context_programs = if ranks == 2 && !matches!(report.requested_attention,
+            Some(placement::AttentionPlacement::Heads | placement::AttentionPlacement::Layers)) {
+            manifest.map(|m| glmf::manifest_context_for_plan(
+                m, cfg.heads, sms as usize, &attention_plan)).transpose()?.flatten()
+        } else { manifest.and_then(glmf::manifest_context) };
+        let attention = glmf::resolve_attention(report.requested_attention, ranks, context_programs)?;
         let lanes = glmf::admitted_prefill_waves(attention.mode, lanes)?;
         report.attention_placement = attention.mode;
         let index = match attention.mode {
@@ -147,7 +177,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded && !native_kda,
-                exlr8.is_none() && available.is_some() && (ranks == 2 || catalog.fp8().is_some()),
+                available.is_some() && (ranks == 2 || (exlr8.is_none() && catalog.fp8().is_some())),
                 options.glmf_kda_fp32_partials && !native_kda, state, Some(native_mask)));
         let mut workspace = step_workspace(&report.placement, lanes);
         let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes);
@@ -185,19 +215,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 anyhow::ensure!(!native, "native K6 drafter head requires its actual DFlash2 config, not a bytes-only override");
                 (options.drafter_bytes, vec![0; ranks], None)
             } else {
-            let path = options.glmf_drafter_snapshot.clone().or_else(|| {
-                let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
-                crate::resolve_snapshot_at_revision("incoai/GLM-5.3-Flash-DFlash2", Some(&home), None).ok().and_then(|r| r.snapshot_path)
-            });
-            let path = path.ok_or_else(|| anyhow::anyhow!("DFlash2 config missing: provide --glmf-drafter-snapshot or disable the drafter"))?;
-            let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
-            let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
-                usize::try_from(sequences)?, usize::try_from(options.glm_draft_sequences())?,
-                options.draft_context_slots.map(usize::try_from).transpose()?);
-            let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch)?;
+            let (config, capacity) = draft_config.as_ref().context("resolved Flash drafter config")?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
             draft_rows = Some(capacity.block_rows);
-            let (bytes, scratch) = glmf::drafter_inventory(&config, slots, batch,
+            let (bytes, scratch) = glmf::drafter_inventory(config, slots, batch,
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
@@ -278,7 +299,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or_else(|| placement::ArchContext::for_device(options.coordinator_arch, u64::MAX).sms) as usize));
-        let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
+        let inputs = glmf::GlmfInputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
@@ -420,4 +441,83 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens: pool, waste, notes }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, select_attention_plans, select_card_plans};
+    use crate::serving_capacity::{GlmfCoreScratch, GlmfScratchOptions, GlmfStepShape,
+        glmf_core_step_scratch, glmf_manifest_scratch, glmf_step_workspaces, glmf_table_pages};
+
+    #[test]
+    fn native_tp2_step_and_context_admission_match_selected_runtime_recipes() {
+        let config = crate::plan::testing::glm5_flash_config(45);
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_safetensors(&dir.path().join("model.safetensors"), &[]);
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+        let mut names = vec!["glmf_mhc_pre".to_string()];
+        for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+            for stem in ["mhc_post_pre", "kda", "mla_producer", "o", "ffn_i2048", "ffn_i12288",
+                "index_producer", "index_producer_c"] {
+                names.push(format!("glmf_{stem}_{cap}"));
+            }
+            names.push(format!("glmf_sparse_mla_{mode}_{cap}"));
+            names.push(format!("glmf_index_topk_{mode}_{cap}"));
+        }
+        names.extend(glmf::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()));
+        names.push("glmf2_kda_commit_c".into());
+        let mut programs: Vec<_> = names.into_iter().map(|name| serde_json::json!({
+            "name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect();
+        for begin in [0, 32] {
+            for (split, cap, scratch) in [(1, 8, 4096), (9, 64, 65_536)] {
+                programs.push(serde_json::json!({"name": format!("glmf_sparse_mla_partial_h{begin}_s{split}_m64"),
+                    "params": {"row_caps": {"170": [cap], "188": [cap]}},
+                    "scratch_bytes_at_capacity": {"scratch": scratch}}));
+            }
+        }
+        let sparse = programs.iter_mut().find(|p| p["name"] == "glmf_sparse_mla_decode_m64").unwrap();
+        sparse["geometry"] = serde_json::json!({"attention_plan_capacity_rows":64,
+            "attention_plan_scratch":[{"rows_cap":8,"scratch":8192},{"rows_cap":64,"scratch":131072}]});
+        sparse["scratch_bytes_at_capacity"]["scratch"] = 131072.into();
+        let raw = serde_json::json!({"programs":programs});
+        let native = GlmfCoreScratch { kda: true, mla: true, ffn: true };
+        for sms in [170, 188] {
+            for (drafts, expected_context) in [(Some(7), 4096), (None, 4096), (Some(15), 65_536)] {
+                let plan = AttentionReductionPlan::new(64, drafts, None).unwrap();
+                let mut selected = raw.clone();
+                select_card_plans(&mut selected, sms).unwrap();
+                select_attention_plans(&mut selected, plan, |name| name.starts_with("glmf")).unwrap();
+                let context = glmf::manifest_context_for_plan(&selected, cfg.heads, sms as usize, &plan).unwrap().unwrap();
+                assert_eq!(context.partial_scratch, expected_context);
+                let planned = glmf_step_workspace(&selected, &checkpoint, &ExpertPlacement::Local, 1,
+                    4096, 1 << 20, 64, 0, true, true,
+                    resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false }, false, true, false,
+                    crate::serving_capacity::GlmfKdaState::F32, Some(native)).unwrap();
+                // Runtime narrows individual specs, independently of the planner's manifest adapter.
+                let lookup = |name: &str| {
+                    let entry = raw["programs"].as_array()?.iter().find(|p| p["name"] == name)?;
+                    let mut scratch = serde_json::from_value(entry["scratch_bytes_at_capacity"].clone()).unwrap();
+                    cuteafd_core::coordinator_programs::select_attention_scratch(&entry["geometry"], &mut scratch, plan).unwrap();
+                    scratch.get("scratch").copied()
+                };
+                let options = GlmfScratchOptions { split: true, index_compact: true, ..Default::default() };
+                let decode = glmf_core_step_scratch(lookup, &cfg, options, 64, true, native).unwrap();
+                let prefill = glmf_core_step_scratch(lookup, &cfg, options, 4096, false, native).unwrap();
+                let (table_pages, table_pool_pages) = glmf_table_pages(1 << 20);
+                for rank in 0..2 {
+                    let shape = GlmfStepShape { lead: rank == 0, split: true, local_experts: false,
+                        tp2_experts: true, spark: false, partial_bytes: 2, output_shard: false,
+                        full_prefill_logits: false, table_pages, table_pool_pages };
+                    let allocated = glmf_step_workspaces(&cfg, 1, 4096, 64, &shape, decode, prefill).device_bytes();
+                    let charged = planned.iter().filter(|d| d.demand.gpu as usize == rank)
+                        .map(|d| d.demand.bytes).sum::<u64>();
+                    assert_eq!(charged, allocated, "SM{sms} rank{rank} drafts={drafts:?}");
+                }
+                assert_eq!(glmf_manifest_scratch(&selected)("glmf_sparse_mla_decode_m64"), Some(decode.programs));
+            }
+        }
+    }
 }

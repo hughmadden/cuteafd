@@ -83,6 +83,9 @@ pub trait FamilyModel: Send + Sync {
         Ok(None)
     }
 
+    /// A checkpoint-derived API context cap when the operator leaves it automatic.
+    fn default_context_tokens(&self) -> Option<u64> { None }
+
     /// Routed-expert weight bytes one Spark rank may hold when the operator
     /// sets no `--spark-budget-gib`. Families whose release needs more state
     /// the measured reason with their override.
@@ -236,9 +239,10 @@ mod exlr8_execution_tests {
         for onboarded in [false, true] {
             assert!(GLM5.exlr8_execution().check(2, onboarded).is_ok());
             assert!(GLM5_FLASH.exlr8_execution().check(1, onboarded).is_ok());
-            let error = GLM5_FLASH.exlr8_execution().check(2, onboarded).unwrap_err();
+            assert!(GLM5_FLASH.exlr8_execution().check(2, onboarded).is_ok());
+            let error = GLM5_FLASH.exlr8_execution().check(3, onboarded).unwrap_err();
             assert_eq!(error.operation, "dense execution");
-            assert_eq!(error.supported, &[1]);
+            assert_eq!(error.supported, &[1, 2]);
         }
         assert!(Exlr8Execution::default().check(1, false).is_err());
     }

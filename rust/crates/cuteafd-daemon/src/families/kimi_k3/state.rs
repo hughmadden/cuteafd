@@ -3,7 +3,9 @@
 use crate::shared::{memory::device::{Allocation, Device, Stream}, prefix::view};
 use anyhow::{ensure, Context, Result};
 
-use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKda};
+use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaGeometry};
+#[cfg(test)]
+use cuteafd_ffi::KimiKda;
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::Demand};
 use std::rc::Rc;
 
@@ -78,6 +80,7 @@ impl Provisional {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KdaLayout {
+    geometry: KimiKdaGeometry,
     ordinals: Vec<Option<usize>>,
     layers: usize,
     slots: usize,
@@ -91,6 +94,12 @@ pub(crate) struct KdaLayout {
 
 impl KdaLayout {
     pub(crate) fn new(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize) -> Result<Self> {
+        Self::for_ranks(cfg, slots, marks, lanes, 2)
+    }
+
+    pub(crate) fn for_ranks(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi KDA physical rank count");
+        let geometry = KimiKdaGeometry::new(cfg.kda_heads / ranks)?;
         ensure!(cfg.layers == cfg.attention.len() && cfg.kda_heads == 96
             && cfg.kda_head_dim == 128 && cfg.kda_conv == 4,
             "Kimi KDA state layout differs from native geometry");
@@ -103,12 +112,12 @@ impl KdaLayout {
             Some(ordinal)
         } else { None }).collect();
         ensure!((1..=69).contains(&layers), "Kimi KDA state layer count");
-        let state = KimiKda::state_bytes(slots)?;
-        let conv = KimiKda::conv_state_bytes(slots)?;
-        let replay = KimiKda::replay_bytes();
-        let mark = KimiKda::state_bytes(1)?.checked_add(KimiKda::conv_state_bytes(1)?)
+        let state = geometry.state_bytes(slots)?;
+        let conv = geometry.conv_state_bytes(slots)?;
+        let replay = geometry.replay_bytes();
+        let mark = geometry.state_bytes(1)?.checked_add(geometry.conv_state_bytes(1)?)
             .and_then(|bytes| bytes.checked_mul(layers)).context("Kimi KDA mark extent overflow")?;
-        let layout = Self { ordinals, layers, slots, marks, lanes, state, conv, replay, mark };
+        let layout = Self { geometry, ordinals, layers, slots, marks, lanes, state, conv, replay, mark };
         layout.extents()?;
         Ok(layout)
     }
@@ -126,8 +135,8 @@ impl KdaLayout {
 
     pub(crate) fn demands(&self, rank: u8) -> Result<[Demand; 4]> {
         let [state, conv, replay, marks] = self.extents()?;
-        let demands = cuteafd_loader::families::kimi_k3::allocation::kda_demands_for_layers(
-            self.layers, self.slots, self.marks, self.lanes, rank)?;
+        let demands = cuteafd_loader::families::kimi_k3::allocation::kda_demands_for_heads(
+            self.layers, self.slots, self.marks, self.lanes, rank, self.geometry.heads())?;
         ensure!(demands.iter().map(|d| d.bytes).collect::<Vec<_>>() ==
             vec![(state + conv) as u64, (replay * self.lanes) as u64, marks as u64,
                 (self.lanes * self.slots * 3 * 4) as u64], "Kimi state owner differs from shared admission");
@@ -162,15 +171,15 @@ impl KdaLayout {
     fn slot_ranges(&self, layer: usize, slot: usize) -> Result<[(usize, usize); 2]> {
         ensure!(slot < self.slots, "Kimi KDA state slot outside admission");
         let record = self.ordinal(layer)? * self.slots + slot;
-        let state = KimiKda::state_bytes(1)?;
-        let conv = KimiKda::conv_state_bytes(1)?;
+        let state = self.geometry.state_bytes(1)?;
+        let conv = self.geometry.conv_state_bytes(1)?;
         Ok([(record * state, state), (record * conv, conv)])
     }
 
     fn mark_ranges(&self, layer: usize, mark: usize) -> Result<[(usize, usize); 2]> {
         ensure!(mark < self.marks, "Kimi KDA prefix mark outside admission");
-        let state = KimiKda::state_bytes(1)?;
-        let conv = KimiKda::conv_state_bytes(1)?;
+        let state = self.geometry.state_bytes(1)?;
+        let conv = self.geometry.conv_state_bytes(1)?;
         let offset = mark * self.mark + self.ordinal(layer)? * (state + conv);
         Ok([(offset, state), (offset + state, conv)])
     }
@@ -235,6 +244,7 @@ impl Drop for KdaBank<'_> {
 }
 
 impl<'a> KdaBank<'a> {
+    pub(super) fn heads(&self) -> usize { self.layout.geometry.heads() }
     pub(super) fn slots(&self) -> usize { self.layout.slots }
     pub(super) fn marks(&self) -> usize { self.layout.marks }
     pub(super) fn mark_bytes(&self) -> usize { self.layout.mark }
@@ -445,6 +455,25 @@ mod tests {
         assert!(layout.lane_inputs(2, &replays, &tables).is_err());
         let overlap = [tables[0], buffer(base + 16, 24)];
         assert!(layout.lane_inputs(0, &replays, &overlap).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_state_slots_and_marks_cover_full_head_geometry() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let single = KdaLayout::for_ranks(&cfg, 4, 2, 1, 1)?;
+        let pair = KdaLayout::new(&cfg, 4, 2, 1)?;
+        assert_eq!(single.extents()?, pair.extents()?.map(|bytes| bytes * 2));
+        for layer in 0..cfg.layers {
+            if cfg.attention[layer] != KimiAttention::Kda { continue; }
+            assert_eq!(single.slot_ranges(layer, 3)?, pair.slot_ranges(layer, 3)?.map(|(a, n)| (2*a, 2*n)));
+            assert_eq!(single.mark_ranges(layer, 1)?, pair.mark_ranges(layer, 1)?.map(|(a, n)| (2*a, 2*n)));
+        }
+        let single_demands = single.demands(0)?;
+        let pair_demands = pair.demands(0)?;
+        for i in 0..3 { assert_eq!(single_demands[i].bytes, 2 * pair_demands[i].bytes); }
+        assert_eq!(single_demands[3].bytes, pair_demands[3].bytes);
+        assert!(KdaLayout::for_ranks(&cfg, 4, 2, 1, 0).is_err());
         Ok(())
     }
 

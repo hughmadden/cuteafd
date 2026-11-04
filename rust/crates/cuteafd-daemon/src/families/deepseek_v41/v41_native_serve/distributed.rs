@@ -58,6 +58,13 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         ensure!(topology.is_some(), "--gpu-expert-tier needs an owned Spark topology: pass --spark-tp and --spark-ep");
         ensure!(catalog.nvfp4().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none(),
             "the GPU expert tier holds native MXFP4 expert halves");
+        // The tier's result is one more BF16 plane in the reply reduction,
+        // which only the native BF16 reducer takes; compressed replies reduce
+        // in the fused codec (`spark_waves::ReplyReduction::launch_with`).
+        ensure!(cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
+            == cuteafd_core::SparkReplyFormat::Bf16,
+            "--gpu-expert-tier needs BF16 Spark replies (SPARK_REPLY_FORMAT=bf16): compressed replies reduce in \
+            the fused reply codec, which has no GPU expert tier plane");
     }
     crate::shared::spark_topology::require_world(spark_world, &catalog,
         &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
@@ -400,7 +407,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots)?)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -417,7 +424,12 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 dSpark must be placed beside the decoder head");
     }
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
-    let draft_weights = if args.dspark {
+    let prepared_draft = if args.dspark && args.tp2_dspark_experts && records.is_some() {
+        Some(devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::prepare_serving_tp2(
+            &lib, &catalog, args.concurrency, [draft_budgets(0), draft_budgets(1)], 16 << 20, draft_width))?)
+    } else { None };
+    let draft_expert_bytes = prepared_draft.as_ref().map_or(0, |draft| draft.expert_resident_bytes());
+    let mut draft_weights = if args.dspark && prepared_draft.is_none() {
         Some(if args.tp2_dspark_experts {
             devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
                 capacity,args.concurrency,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
@@ -426,30 +438,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     } else { None };
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
-    if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
-        // The loaded weights size their lane chains through the same shape the
-        // pre-load inventory used; any divergence is an accounting defect.
-        let lane_requests = args.concurrency.div_ceil(if args.concurrency == 1 { 1 } else { 2 });
-        let lanes = if args.concurrency == 1 { 1 } else { 2 };
-        let loaded = devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain::device_bytes(
-            weights, lane_requests, 64640))?;
-        for (gpu, bytes) in loaded.iter().enumerate() {
-            let admitted = inventory.runtime.iter().filter(|d| usize::from(d.gpu) == gpu && d.group == "dSpark request lanes")
-                .map(|d| d.bytes as usize).sum::<usize>();
-            ensure!(bytes * lanes == admitted, "V4.1 dSpark lanes on GPU {gpu}: loaded {} B, admitted {admitted} B", bytes * lanes);
-        }
-    }
-    let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
-        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
-    if let Some(draft) = &mut draft {
-        draft.set_draft_limit(args.dspark_draft_limit)?;
-        draft.set_fixed(args.dspark_fixed);
-    }
-    attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
-    tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
-        "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
-    let prefix_arenas = match &draft { Some(draft) => prefix_arenas.with_draft(draft.mark_device())?, None => prefix_arenas };
-    memory_checkpoint("draft runtime and marks")?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
     for slot in &mut slot_passes { slot.bind_execution_plan(&pool.placement)?; }
@@ -493,7 +481,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         ensure!(spark_plan.as_ref().is_some_and(|spark| spark.coordinator_pushes()),
             "V4.1 Spark admission did not select required push");
         let records = records.as_ref().context("V4.1 required dense push records")?;
-        super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets,
+        super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets, draft_expert_bytes,
             args.peers.len())
     })?;
     let (coordinator, ranks) = match coordinator {
@@ -507,6 +495,16 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         None => None,
     };
     if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    // TP2 dSpark under push: its stages follow the backbone layers in the
+    // committed native arena; their views become the drafter's halves.
+    let pushed = if let Some(prepared) = prepared_draft {
+        let [left, right] = pushed.context("V4.1 TP2 dSpark requires committed push")?;
+        let mut weights = [left.native()?, right.native()?];
+        ensure!(weights.iter().all(|rank| rank.len() == expert_layers + 3), "mixed draft inventory differs from admission");
+        let stages = weights.each_mut().map(|rank| rank.split_off(expert_layers));
+        draft_weights = Some(devices[1].own(|| prepared.into_inner().install(stages))?);
+        Some(weights.map(crate::shared::experts::rtx::push::PushedExperts::Native))
+    } else { pushed };
     // The GPU expert tier's halves are the routed weights of a tier layout
     // (no whole TP2 layer), delivered with the dense owners above.
     let tier_halves = tier_loaded.map(|(residency, halves)|
@@ -535,6 +533,30 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         for weights in shards.iter().flatten() { weights.release_raw_scales(); }
     }
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
+    if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
+        // The loaded weights size their lane chains through the same shape the
+        // pre-load inventory used; any divergence is an accounting defect.
+        let lane_requests = args.concurrency.div_ceil(if args.concurrency == 1 { 1 } else { 2 });
+        let lanes = if args.concurrency == 1 { 1 } else { 2 };
+        let loaded = devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain::device_bytes(
+            weights, lane_requests, 64640))?;
+        for (gpu, bytes) in loaded.iter().enumerate() {
+            let admitted = inventory.runtime.iter().filter(|d| usize::from(d.gpu) == gpu && d.group == "dSpark request lanes")
+                .map(|d| d.bytes as usize).sum::<usize>();
+            ensure!(bytes * lanes == admitted, "V4.1 dSpark lanes on GPU {gpu}: loaded {} B, admitted {admitted} B", bytes * lanes);
+        }
+    }
+    let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
+        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
+    if let Some(draft) = &mut draft {
+        draft.set_draft_limit(args.dspark_draft_limit)?;
+        draft.set_fixed(args.dspark_fixed);
+    }
+    attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
+    tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
+        "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
+    let prefix_arenas = match &draft { Some(draft) => prefix_arenas.with_draft(draft.mark_device())?, None => prefix_arenas };
+    memory_checkpoint("draft runtime and marks")?;
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let lanes = crate::shared::serve::lanes::LaneSet::default();
@@ -610,7 +632,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     for (slot, _) in &mut prefill_slots.slots { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
-    crate::shared::memory_report::release_load_staging(&lib);
+    crate::shared::memory_report::release_load_staging(&lib)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
@@ -648,7 +670,7 @@ mod tests {
         } else { "What is two plus two? Answer briefly.".into() };
         for text in [arithmetic.as_str(), "Write a Python function that adds two numbers.", arithmetic.as_str()] {
             let (events, output) = mpsc::unbounded_channel();
-            send.blocking_send(NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
+            send.blocking_send(NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
                 constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 8, sampling: Default::default(), stop_token_ids: vec![cuteafd_api::openai::DEEPSEEK_EOS_TOKEN_ID], events, usage: None, probe: None })?;
             outputs.push(output);
         }

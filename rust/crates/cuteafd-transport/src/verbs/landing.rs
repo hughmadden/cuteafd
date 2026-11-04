@@ -141,6 +141,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let mut completed = pending.pop_front()
             .context("persistent verbs-host response arrived without a pending request")?;
         completed.assembler.accept_landed(&completed.request, &header)?;
+        trace_arrival(config.timing, self.execution_lane, completed.stream_id, &header);
         completed.chunk_tx.send(VerbsHostProtocolV2ResponseChunk {
             stream_id: completed.stream_id,
             header,
@@ -158,6 +159,16 @@ impl VerbsHostProtocolV2PersistentClientSession {
             response_executor_id,
         }));
         Ok(())
+    }
+}
+
+fn trace_arrival(timing: bool, lane: u32, rank: usize, header: &ExpertProtocolV2ResponseHeader) {
+    if timing {
+        // This is host-observed CQ readiness, not the NIC's wire timestamp.
+        tracing::info!(target: "cuteafd::timing", request_id = header.request_id,
+            layer_id = header.layer_id, execution_lane = lane, rank, rows = header.row_count,
+            payload_bytes = header.output_payload_bytes, landing = "device",
+            "spark exchange rank arrived");
     }
 }
 
@@ -211,6 +222,39 @@ pub fn gpu_landing_probe(library: &NativeLibrary, rdma: &crate::fabric::RdmaSele
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_arrival_timing_emits_join_keys_only_when_enabled() {
+        use std::sync::{Arc, Mutex};
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let header = ExpertProtocolV2ResponseHeader {
+            request_id: 42, placement_version: 1, layer_id: 7, row_count: 16,
+            output_dim: 4, output_dtype: ExpertV2Dtype::Bf16, output_row_stride_bytes: 8,
+            output_payload_bytes: 128, status: ExpertProtocolV2Status::Ok,
+            flags: 0, executor_id: 0, pace: None,
+        };
+        for timing in [false, true] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = bytes.clone();
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_writer(move || Writer(writer.clone())).finish();
+            tracing::subscriber::with_default(subscriber, || trace_arrival(timing, 3, 2, &header));
+            let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            if timing {
+                for field in ["spark exchange rank arrived", "request_id=42", "layer_id=7",
+                    "execution_lane=3", "rank=2", "rows=16", "payload_bytes=128"] {
+                    assert!(output.contains(field), "missing {field}: {output}");
+                }
+            } else { assert!(output.is_empty(), "{output}"); }
+        }
+    }
 
     #[test]
     fn selected_gpu_registration_failure_is_typed_and_never_becomes_pinned() {

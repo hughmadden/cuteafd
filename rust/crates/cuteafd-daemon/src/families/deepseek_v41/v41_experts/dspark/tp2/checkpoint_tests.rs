@@ -15,6 +15,56 @@ fn values(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Published CPU allocation manifests must agree with the serving owners,
+/// including both ranks' fork/join scratch and sequential weight-load peaks.
+#[test]
+#[ignore = "requires native AOT, checkpoint and two CUDA GPUs; metadata only"]
+fn cuda_dspark_tp2_planner_matches_serving_inventory() -> Result<()> {
+    use cuteafd_loader::placement::families::deepseek_v41::{owners, resident};
+    let path = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIB")?);
+    // SAFETY: the explicitly supplied WIP native library is trusted.
+    let lib = unsafe { NativeLibrary::load(&path)? };
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+        &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+    let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
+    let fp8 = owners::native_manifest(&path, "V41_FP8_AOT.json")?;
+    let full = owners::native_manifest(&path, "V41_EXPERT_AOT.json")?;
+    let halves = owners::native_manifest(&path, "V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json")?;
+    let programs = owners::NativePrograms::new(&fp8, u32::try_from(lib.sm_count()?)?)?;
+    let weights = resident::resident_headers(&config,
+        catalog.tensors().iter().map(|t| &t.metadata), 2, true)
+        .ok_or_else(|| anyhow::anyhow!("unsupported draft resident headers"))?;
+    let all = weights.iter().flatten().filter(|i| i.category == cuteafd_core::memory_layout::Category::Drafter)
+        .map(|i| i.bytes).sum::<u64>();
+    let half = 3 * resident::native_expert_bytes(128, 5120, 1152);
+    let home = all - 3 * resident::native_expert_bytes(128, 5120, 2304) + half;
+    for requests in [1, 2, 16, 32, 64] {
+        for width in [5, 7] {
+            let actual = super::DsparkWeights::distributed_inventory(&lib, &catalog, 256,
+                requests, width, true, 64640, 0)?;
+            let planned = programs.dspark_tp2(&full, &halves, 256, u64::from(requests),
+                width as u64, resident::Fp8Head::configured())?;
+            for demand in &actual.runtime {
+                let expected = planned.iter().find(|d| d.gpu == demand.gpu && d.group == demand.group)
+                    .ok_or_else(|| anyhow::anyhow!("missing planner owner {}", demand.group))?;
+                assert_eq!(demand.bytes, expected.bytes,
+                    "C{requests} width={width} GPU{} {}", demand.gpu, demand.group);
+            }
+            assert_eq!(actual.runtime.len(), planned.len());
+            assert_eq!((actual.resident, actual.peer_half), (home, half));
+            assert_eq!(actual.loading_experts, [half; 2]);
+            for (index, rank) in [1, 0].into_iter().enumerate() {
+                let stage = catalog.expert_staging(cuteafd_loader::V41ExpertSelection::DsparkTp2 {
+                    stage: 0, expert: 0, rank })?.staging_bytes() as u64;
+                assert!(actual.staging[index] >= stage);
+                assert_eq!(actual.loader_peak[index], (half + actual.staging[index])
+                    .max(if index == 0 { home } else { half }));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires checkpoint, both RTX GPUs and about 7 GiB free on RTX1"]
 fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
@@ -44,7 +94,7 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
             ExpertWeights::load(&lib, &catalog, ExpertLayer::Dspark { stage }, 8usize << 30)
         })?;
         let mut reference = owner.own(|| full.execution(256, 256, 2usize << 30))?;
-        for (rows, include_shared) in [1u32, 7, 16, 65, 112, 1]
+        for (rows, include_shared) in [1u32, 7, 16, 40, 65, 112, 1]
             .into_iter()
             .flat_map(|rows| [false, true].map(|shared| (rows, shared)))
         {
@@ -112,12 +162,22 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
                         reference.launch(rows, include_shared)?;
                         reference.synchronize()
                     })?;
+                    // Compare capture/replay with the identical eager TP2 route
+                    // before comparing against the unsplit checkpoint kernel.
+                    owner.run(|| unsafe {
+                        pair.enqueue(stage, rows, inputs, include_shared.then_some(shared), root.raw)
+                    })?;
+                    root.drain()?;
+                    let mut eager = vec![0; rows as usize * 10240];
+                    owner.run(|| lib.copy_d2h(&mut eager, pair.output()))?;
                     owner.run(|| unsafe { lib.cuda_graph_launch(graph, root.raw) })?;
                     root.drain()?;
-                    pair.drain_peer()?;
+                    ensure!(unsafe { lib.cuda_stream_query(pair.peer_stream().raw)? },
+                        "root completion did not cover the producer's route write");
                     let mut actual = vec![0; rows as usize * 10240];
                     let mut expected = actual.clone();
                     owner.run(|| lib.copy_d2h(&mut actual, pair.output()))?;
+                    assert_eq!(actual, eager, "draft TP2 eager/replay bytes differ at stage={stage} rows={rows} shared={include_shared} seed={seed}");
                     owner.run(|| lib.copy_d2h(&mut expected, reference.output().unwrap()))?;
                     let (actual, expected) = (values(&actual), values(&expected));
                     let mut error = 0f64;

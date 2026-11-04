@@ -1,5 +1,5 @@
 //! Already-projected Kimi seams. The original fused BF16 bindings are unchanged.
-use super::kimi_k3::{KimiKda, MLA_PAGE_ROWS};
+use super::kimi_k3::{KimiKdaGeometry, MLA_PAGE_ROWS};
 use cuteafd_core::MlaCacheFormat;
 use crate::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDeviceBuffer as Buffer};
 use std::ffi::c_void;
@@ -107,12 +107,12 @@ pub struct KimiKdaCoreBatch {
     pub conv_state: Buffer, pub state: Buffer, pub slots: Buffer, pub first: Buffer,
     pub output: Buffer, pub replay: Buffer, pub scratch: Buffer,
 }
-pub struct KimiKdaCore<'a> { program: Program<'a>, rows: usize, decode: bool, scratch: usize }
+pub struct KimiKdaCore<'a> { program: Program<'a>, geometry: KimiKdaGeometry, rows: usize, decode: bool, scratch: usize }
 impl<'a> KimiKdaCore<'a> {
     pub fn load(programs: &'a Programs<'a>, name: &str, rows: usize, decode: bool) -> Result<Self> {
-        let scratch = validate_kda(programs.spec(name)?, rows, decode)?;
+        let (geometry, scratch) = validate_kda(programs.spec(name)?, rows, decode)?;
         let program = programs.program(name, KDA)?;
-        Ok(Self { program, rows, decode, scratch })
+        Ok(Self { program, geometry, rows, decode, scratch })
     }
     pub fn scratch_bytes(&self) -> usize { self.scratch }
     pub fn launch(&self, w: KimiKdaCoreWeights, b: KimiKdaCoreBatch, stream: *mut c_void) -> Result<()> {
@@ -120,13 +120,14 @@ impl<'a> KimiKdaCore<'a> {
             || b.sequences > b.state_slots || (!self.decode && (b.speculative || (b.rows > 64 && b.sequences != 1))) {
             return Err(KimiSplitError::Invalid("KDA batch/replay geometry"));
         }
-        checked(&[(b.input,b.rows*7168*2),(b.q,b.rows*6144*2),(b.k,b.rows*6144*2),
-            (b.v,b.rows*6144*2),(b.gate,b.rows*6144*2),(w.fab,176*7168*2),(w.forget,6144*128*2),
-            (w.convolution,3*6144*4*4),(w.a_log,48*4),(w.dt_bias,6144*4),(w.norm,128*4),
-            (b.conv_state,KimiKda::conv_state_bytes(b.state_slots).map_err(|_|KimiSplitError::Invalid("KDA conv slots"))?),
-            (b.state,KimiKda::state_bytes(b.state_slots).map_err(|_|KimiSplitError::Invalid("KDA state slots"))?),
-            (b.slots,b.rows*4),(b.first,b.rows*4),(b.output,b.rows*6144*2),
-            (b.replay,KimiKda::replay_bytes()),(b.scratch,self.scratch)], &[11,12,15,16,17])?;
+        let g = self.geometry;
+        checked(&[(b.input,b.rows*7168*2),(b.q,b.rows*g.width()*2),(b.k,b.rows*g.width()*2),
+            (b.v,b.rows*g.width()*2),(b.gate,b.rows*g.width()*2),(w.fab,g.aux_width()*7168*2),(w.forget,g.width()*128*2),
+            (w.convolution,3*g.width()*4*4),(w.a_log,g.heads()*4),(w.dt_bias,g.width()*4),(w.norm,128*4),
+            (b.conv_state,g.conv_state_bytes(b.state_slots).map_err(|_|KimiSplitError::Invalid("KDA conv slots"))?),
+            (b.state,g.state_bytes(b.state_slots).map_err(|_|KimiSplitError::Invalid("KDA state slots"))?),
+            (b.slots,b.rows*4),(b.first,b.rows*4),(b.output,b.rows*g.width()*2),
+            (b.replay,g.replay_bytes()),(b.scratch,self.scratch)], &[11,12,15,16,17])?;
         // SAFETY: all operand/state/replay extents checked with disjoint writes;
         // the engine owns valid sequence metadata and graph-safe lifetimes.
         unsafe { self.program.launch(&[b.input.ptr,b.q.ptr,b.k.ptr,b.v.ptr,b.gate.ptr,w.fab.ptr,w.forget.ptr,
@@ -165,11 +166,14 @@ fn validate_mla(specs: [&ProgramSpec;3], heads: usize, rows: usize, kv_stride: u
     }
     Ok(bytes)
 }
-fn validate_kda(spec: &ProgramSpec, rows: usize, decode: bool) -> Result<usize> {
+fn validate_kda(spec: &ProgramSpec, rows: usize, decode: bool) -> Result<(KimiKdaGeometry, usize)> {
     schema(spec,KDA,b"ii",rows)?;
     let g = &spec.geometry;
+    let heads = g["kda_heads"].as_u64().and_then(|n| usize::try_from(n).ok())
+        .ok_or(KimiSplitError::Invalid("KDA manifest heads"))?;
+    let geometry = KimiKdaGeometry::new(heads).map_err(|_|KimiSplitError::Invalid("KDA manifest heads"))?;
     if rows != if decode {64} else {4096}
-        || [("hidden",7168),("kda_heads",48),("kda_head_dim",128),("conv_kernel",4)]
+        || [("hidden",7168),("kda_head_dim",128),("conv_kernel",4)]
             .iter().any(|&(key,value)|g[key].as_u64()!=Some(value as u64))
         || g["gate_lower_bound"].as_f64()!=Some(-5.) || g["norm_eps"].as_f64()!=Some(1e-5)
         || g["output_gate"].as_str()!=Some("full_rank") || g["o_norm_dtype"].as_str()!=Some("float32")
@@ -182,12 +186,13 @@ fn validate_kda(spec: &ProgramSpec, rows: usize, decode: bool) -> Result<usize> 
     let fab = g["fab_offset"].as_u64().and_then(|v|usize::try_from(v).ok())
         .ok_or(KimiSplitError::Invalid("KDA manifest fab offset"))?;
     let align = |v: usize|v.div_ceil(1024)*1024;
-    let min = align(rows*24752*2)+align(rows*2*6144*2)+align(rows*3*6144*2)+2*align(rows*6144*2);
+    let d = geometry.width();
+    let min = align(rows*geometry.input_width()*2)+align(rows*2*d*2)+align(rows*3*d*2)+2*align(rows*d*2);
     if fab < min || fab%1024!=0 || (decode && fab!=min) || (!decode && fab==min)
-        || fab.checked_add(align(rows*176*2))!=Some(base) || spec.scratch.len()!=1 {
+        || fab.checked_add(align(rows*geometry.aux_width()*2))!=Some(base) || spec.scratch.len()!=1 {
         return Err(KimiSplitError::Invalid("KDA manifest scratch layout"));
     }
-    Ok(base)
+    Ok((geometry, base))
 }
 fn checked(items: &[(Buffer,usize)], writers: &[usize]) -> Result<()> {
     let device = items[0].0.device_id;
@@ -234,6 +239,29 @@ mod tests {
         a.pointers.swap(0,1);
         assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Fp8).is_err());
     }
+    #[test]
+    fn whole_kda_manifest_requires_full_width_scratch() {
+        let g = KimiKdaGeometry::new(96).unwrap();
+        for (rows, decode) in [(64, true), (4096, false)] {
+            let align = |v: usize| v.div_ceil(1024)*1024;
+            let d = g.width();
+            let fab = align(rows*g.input_width()*2)+align(rows*2*d*2)
+                +align(rows*3*d*2)+2*align(rows*d*2)+if decode {0} else {1024};
+            let scratch = fab+align(rows*g.aux_width()*2);
+            let mut a = spec(KDA, rows);
+            a.scalar_kinds = b"ii".to_vec();
+            a.geometry = json!({"hidden":7168,"kda_heads":96,"kda_head_dim":128,"conv_kernel":4,
+                "gate_lower_bound":-5.,"norm_eps":1e-5,"output_gate":"full_rank","o_norm_dtype":"float32",
+                "output_kind":"norm","decode":decode,"max_rows":rows,"fab_offset":fab});
+            a.scratch.insert("scratch".into(), scratch as u64);
+            assert_eq!(validate_kda(&a, rows, decode).unwrap(), (g, scratch));
+            a.geometry["kda_heads"] = json!(48);
+            assert!(validate_kda(&a, rows, decode).is_err());
+            a.geometry["kda_heads"] = json!(24);
+            assert!(validate_kda(&a, rows, decode).is_err());
+        }
+    }
+
     #[test]
     fn kda_rejects_different_state_and_scratch_arithmetic() {
         let mut a=spec(KDA,64);

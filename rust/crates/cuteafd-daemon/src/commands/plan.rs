@@ -79,7 +79,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 onboard: args.rtx_expert_layers,
                 expert_tier: args.gpu_expert_tier,
                 expert_tier_profile: args.gpu_expert_tier_profile.clone(),
-                tp2_dspark_experts: args.tp2_dspark_experts,
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
@@ -102,6 +101,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
                 dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
+                tp2_dspark_experts: args.tp2_dspark_experts,
                 state_slots: args.state_slots,
                 glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
@@ -129,7 +129,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 kimi_drafter_snapshot: None,
                 muse_drafter_snapshot: None,
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
-                muse_partial_wide_format: args.expert_partial_wide_format,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
                 kimi_draft_fp8: args.draft_fp8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
@@ -166,7 +165,7 @@ pub(crate) fn v41_report_for_test(mut args: PlanArgs) -> Result<cuteafd_loader::
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         v41_layout(layout, &args);
         layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?;
-        if cfg.get("TP2_DSPARK_EXPERTS").is_some_and(|value| value == "on") { layout.tp2_dspark_experts = true; }
+        layout.tp2_dspark_experts = v41_tp2_dspark_experts(&args, family, &cfg)?;
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
     Ok(input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?)
@@ -179,6 +178,20 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
         else if args.prefill_rows <= 256 { 256 }
         else if args.prefill_rows <= 1024 { 1024 }
         else { 4096 };
+}
+
+fn v41_tp2_dspark_experts(args: &PlanArgs, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
+    let applicable = args.layout && family == "deepseek_v41" && args.rtx == 2 && args.speculator == "dspark";
+    let enabled = args.tp2_dspark_experts || match cfg.get("TP2_DSPARK_EXPERTS").map(String::as_str) {
+        None | Some("") => applicable,
+        Some("off") => false,
+        Some("on") => true,
+        Some(_) => anyhow::bail!("TP2_DSPARK_EXPERTS must be on or off"),
+    };
+    anyhow::ensure!(!enabled || applicable,
+        "--tp2-dspark-experts requires V4.1, --layout, --rtx 2 and dSpark");
+    Ok(enabled)
 }
 
 fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<u8> {
@@ -307,8 +320,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    let tp2_dspark_experts = v41_tp2_dspark_experts(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
+        layout.tp2_dspark_experts = tp2_dspark_experts;
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
@@ -334,7 +349,6 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
         if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
-        if v41 && cfg.get("TP2_DSPARK_EXPERTS").is_some_and(|value| value == "on") { layout.tp2_dspark_experts = true; }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
@@ -926,6 +940,39 @@ mod tests {
     }
 
     #[test]
+    fn v41_tp2_dspark_cli_and_config_resolve_before_layout() {
+        use clap::Parser;
+        let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dspark"];
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else { panic!("expected plan") };
+        for (configured, expected) in [(None, true), (Some(""), true), (Some("off"), false), (Some("on"), true)] {
+            let cfg = configured.map(|value| [("TP2_DSPARK_EXPERTS".into(), value.into())].into()).unwrap_or_default();
+            assert_eq!(v41_tp2_dspark_experts(&request, "deepseek_v41", &cfg).unwrap(), expected);
+        }
+        let cfg = [("TP2_DSPARK_EXPERTS".into(), "on".into())].into();
+        for (family, rtx, layout, speculator) in [("glm5_flash", 2, true, "dspark"),
+            ("deepseek_v41", 1, true, "dspark"), ("deepseek_v41", 2, false, "dspark"),
+            ("deepseek_v41", 2, true, "off")] {
+            request.rtx = rtx;
+            request.layout = layout;
+            request.speculator = speculator.into();
+            assert!(!v41_tp2_dspark_experts(&request, family, &Default::default()).unwrap());
+            let off = [("TP2_DSPARK_EXPERTS".into(), "off".into())].into();
+            assert!(!v41_tp2_dspark_experts(&request, family, &off).unwrap());
+            assert!(v41_tp2_dspark_experts(&request, family, &cfg).is_err());
+        }
+        let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
+            argv.into_iter().chain(["--tp2-dspark-experts"])).unwrap().command else { panic!("expected plan") };
+        assert!(options(&request).unwrap().layout.unwrap().tp2_dspark_experts);
+        assert!(v41_tp2_dspark_experts(&request, "deepseek_v41", &Default::default()).unwrap());
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "model", "--tp2-dspark-experts"]).is_err());
+        let mut request = request;
+        request.tp2_dspark_experts = false;
+        let invalid = [("TP2_DSPARK_EXPERTS".into(), "invalid".into())].into();
+        assert!(v41_tp2_dspark_experts(&request, "deepseek_v41", &invalid).is_err());
+    }
+
+    #[test]
     fn v41_configured_draft_limit_matches_serving_width() {
         let mut request = args(std::path::Path::new("/not-read"), 3, false);
         for (configured, expected) in [(None, 5), (Some(""), 5), (Some("5"), 5), (Some("6"), 6), (Some("7"), 7)] {
@@ -948,7 +995,6 @@ mod tests {
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-            expert_partial_wide_format: Default::default(),
             exlr8_manifest: None,
             exlr8_prefill_activations: None,
             mapped_scale_preload_gib: 0.0,
@@ -986,7 +1032,6 @@ mod tests {
             rtx_expert_layers: None,
             gpu_expert_tier: Default::default(),
             gpu_expert_tier_profile: None,
-            tp2_dspark_experts: false,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),
@@ -1001,6 +1046,7 @@ mod tests {
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
             dspark_draft_limit: None,
+            tp2_dspark_experts: false,
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,
@@ -1343,7 +1389,7 @@ mod tests {
             "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
                 "selector_rank":256, "block_size":8}});
         for command in ["serve-glmf", "serve-glm", "serve-mimo"] {
-            for concurrency in [0usize, 1, 16, 32] {
+            for concurrency in [0usize, 1, 8, 16, 32, 64] {
                 for extra in [vec![], vec!["--draft-sequences", "8"],
                     vec!["--draft-sequences", "8", "--draft-context-slots", "40"]] {
                     let count = concurrency.to_string();
@@ -1358,37 +1404,54 @@ mod tests {
                     if concurrency > 0 { argv.extend(["--max-sequences", &count]); }
                     let serving = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
                     let (planned, started) = match serving.command {
-                        crate::cli::Commands::ServeGlmf(args) => {
+                        crate::cli::Commands::ServeGlmf(mut args) => {
                             let (slots, batch) = glm::flash_serving_draft_limits(resolved,
                                 layout.glm_draft_sequences() as usize, layout.draft_context_slots.map(|n| n as usize));
                             let planned = glm::flash_draft_capacity(&config, slots, batch).unwrap();
-                            assert_eq!(resolved, args.max_sequences);
+                            let concurrency = crate::shared::memory::budget::resolve_serving_concurrency(
+                                args.max_sequences, || Ok(layout.rtx_bytes[0])).unwrap();
+                            assert_eq!(resolved, concurrency);
+                            args.prefix.resolve_entries(concurrency);
+                            assert_eq!(layout.resolved_state_slots(family),
+                                cuteafd_core::concurrency::state_slots(concurrency as u64));
+                            let marks = args.prefix.mark_rule(concurrency);
+                            assert_eq!(marks.entries as u64, layout.prefix_entries(family));
+                            for mark_bytes in [1024, 1 << 20, 32 << 20] {
+                                assert_eq!(marks.slots(mark_bytes) as u64,
+                                    cuteafd_core::prefix::mark_slots_with_host(resolved as u64,
+                                        layout.prefix_entries(family), mark_bytes as u64,
+                                        marks.budget_bytes, marks.host));
+                            }
                             let (slots, batch) = crate::families::glm5_flash::serve::draft_capacity(
-                                args.max_sequences, args.engine.draft_sequences, args.engine.draft_context_slots);
+                                concurrency, args.engine.draft_sequences, args.engine.draft_context_slots);
                             let started = glm::flash_draft_capacity(&config, slots, batch).unwrap();
                             assert_eq!(planned, started);
                             (planned.block_rows, started.block_rows)
                         }
                         crate::cli::Commands::ServeGlm(args) => {
-                            assert_eq!(resolved, args.max_sequences);
+                            let concurrency = crate::shared::memory::budget::resolve_serving_concurrency(
+                                args.max_sequences, || Ok(layout.rtx_bytes[0])).unwrap();
+                            assert_eq!(resolved, concurrency);
                             let batch = layout.glm_draft_sequences() as usize;
                             let slots = glm::serving_draft_context_slots(batch, resolved,
                                 layout.draft_context_slots.map(|n| n as usize));
                             let startup_slots = glm::serving_draft_context_slots(args.engine.draft_sequences,
-                                args.max_sequences, args.engine.draft_context_slots);
+                                concurrency, args.engine.draft_context_slots);
                             let planned = glm::GlmDraftCapacity::new(slots, batch, 8).unwrap();
                             let started = glm::GlmDraftCapacity::new(startup_slots, args.engine.draft_sequences, 8).unwrap();
                             assert_eq!(planned, started);
                             (planned.block_rows, started.block_rows)
                         }
                         crate::cli::Commands::ServeMimo(args) => {
-                            assert_eq!(resolved, args.max_sequences);
+                            let concurrency = crate::shared::memory::budget::resolve_serving_concurrency(
+                                args.max_sequences, || Ok(layout.rtx_bytes[0])).unwrap();
+                            assert_eq!(resolved, concurrency);
                             let batch = layout.mimo_draft_sequences().max(resolved as u64);
                             let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings(),
                                 layout.draft_context_slots);
-                            let startup_batch = args.engine.draft_sequences.max(args.max_sequences);
+                            let startup_batch = args.engine.draft_sequences.max(concurrency);
                             let startup_slots = mimo::mimo_draft_context_slots(startup_batch as u64,
-                                cuteafd_core::concurrency::request_slots(args.max_sequences as u64, args.engine.rings as u64),
+                                cuteafd_core::concurrency::request_slots(concurrency as u64, args.engine.rings as u64),
                                 args.engine.draft_context_slots.map(|n| n as u64));
                             let planned = mimo::MimoDraftCapacity::new(slots as usize, batch as usize, 8).unwrap();
                             let started = mimo::MimoDraftCapacity::new(startup_slots as usize, startup_batch, 8).unwrap();
@@ -1861,7 +1924,7 @@ mod tests {
             assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
                 (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
         }
-        let default_sequences = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64;
+        let default_sequences = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY;
         assert_eq!(planned(&[]), served(default_sequences, 20, 2048));
         // Host-off retention remains budgeted separately from the C active state slots.
         assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (cuteafd_core::prefix::mark_slots_for(16, 20, mark, 2048 << 20) * mark, state(16)));

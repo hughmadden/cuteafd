@@ -24,12 +24,13 @@ pub mod tier_cache;
 pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
+pub mod planner;
 mod pool;
 pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
@@ -41,6 +42,19 @@ pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, K
 pub use expert_tier::{ExpertActivation, ExpertRouteCensus, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest,
     ExpertTierSetting, ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
 pub use route_trace::{RouteTrace, RouteTraceLine, RouteTraceSession, RouteWindow};
+
+/// Weight residency is independent of future allocation bytes and CUDA baselines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentWeights(pub u64);
+
+impl ResidentWeights {
+    pub const DEFAULT_LIMIT: Self = Self(80 << 30);
+
+    pub fn checked_add(self, other: Self) -> Result<Self, PlacementError> {
+        self.0.checked_add(other.0).map(Self)
+            .ok_or(PlacementError::Overflow("resident weights"))
+    }
+}
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.

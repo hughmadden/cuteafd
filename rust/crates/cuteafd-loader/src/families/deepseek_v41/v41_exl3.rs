@@ -202,6 +202,7 @@ pub struct V41Exl3Manifest {
     pub(crate) decoder_tiers: Vec<usize>,
     /// Where the storage layout was read from (always checked against the headers).
     pub storage: Exl3StorageSource,
+    pub(crate) resident_bytes: super::v41_exl3_residency::ResidentBytesCache,
 }
 
 impl V41Exl3Manifest {
@@ -499,6 +500,7 @@ fn build_deepseek_v4_manifest(
         decoder_tiers: decoder_family_preferring(&projections, tiers)?,
         projections,
         storage,
+        resident_bytes: Default::default(),
     })
 }
 

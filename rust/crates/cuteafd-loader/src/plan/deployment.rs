@@ -333,8 +333,7 @@ mod tests {
                     k1_workspace: "checked_by_worker_live_admission" } };
             let options = DeploymentOptions { rtx_gpus: gpus, speculator: "off".into(), ..Default::default() };
             let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
-            assert_eq!(deployment.wip_launchable, gpus == 1);
-            if gpus == 2 { assert!(!deployment.executable); }
+            assert!(deployment.wip_launchable);
             assert_eq!(deployment.exlr8.unwrap().manifest, "k4");
             assert_eq!(deployment.memory_layout, native.report.memory_layout.as_ref().unwrap());
             native.report.experts.as_mut().unwrap().package = "glm:exlr8".into();

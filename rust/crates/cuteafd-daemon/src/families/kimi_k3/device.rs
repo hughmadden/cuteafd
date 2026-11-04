@@ -61,6 +61,12 @@ pub(crate) struct W8<'a> {
 }
 impl<'a> W8<'a> {
     pub(crate) fn load(cfg: &KimiK3Config, programs: &'a Programs<'a>, mode: cuteafd_ffi::KimiFfnMode) -> Result<Self> {
+        Self::load_for_ranks(cfg, programs, mode, 2)
+    }
+
+    pub(crate) fn load_for_ranks(cfg: &KimiK3Config, programs: &'a Programs<'a>,
+        mode: cuteafd_ffi::KimiFfnMode, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi W8 physical rank count");
         ensure!(cfg.hidden == 7168 && cfg.dense_intermediate == 33792
             && cfg.moe_intermediate * cfg.shared_experts == 6144,
             "unsupported Kimi W8 hidden/dense/shared geometry");
@@ -72,8 +78,8 @@ impl<'a> W8<'a> {
                 residuals.push((key, KimiResidual::load(programs, key)?));
             }
         }
-        Ok(Self { residuals, dense: KimiFfn::load(programs, cfg.dense_intermediate / 2, mode)?,
-            shared: KimiFfn::load(programs, cfg.moe_intermediate * cfg.shared_experts / 2, mode)?, cfg: cfg.clone() })
+        Ok(Self { residuals, dense: KimiFfn::load(programs, cfg.dense_intermediate / ranks, mode)?,
+            shared: KimiFfn::load(programs, cfg.moe_intermediate * cfg.shared_experts / ranks, mode)?, cfg: cfg.clone() })
     }
 
     pub(crate) fn residual(&self, site: MixSite, batch: KimiResidualBatch,
@@ -104,7 +110,8 @@ fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, cr
         }
         Ok(())
     };
-    for name in ["kimik3_kda_commit", "kimik3_kda_m64", "kimik3_kda_m4096"] {
+    for name in ["kimik3_kda_commit", "kimik3_kda_m64", "kimik3_kda_m4096",
+        "kda_commit_h96", "kda_fused_h96_m64", "kda_fused_h96_m4096", "kda_output_h96"] {
         add(name.into(), SequenceLocal)?;
     }
     for heads in [48, 96] {
@@ -168,7 +175,8 @@ fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, cr
 }
 
 fn packing_program(name: &str, core: bool) -> bool {
-    name.starts_with("kimik3_") || core && (name.starts_with("kda_core_")
+    name.starts_with("kimik3_") || name.starts_with("kda_fused_")
+        || matches!(name, "kda_commit_h96" | "kda_output_h96") || core && (name.starts_with("kda_core_")
         || name.starts_with("mla_rank_norm_") || name.starts_with("mla_query_")
         || name.starts_with("mla_gate_output_") || name.starts_with("dense_trellis_k6_"))
 }
@@ -205,6 +213,7 @@ pub(crate) struct NativePrograms<'a> {
     pub add: Bf16Add<'a>,
     pub core:Option<super::core_runtime::CorePrograms<'a>>,
     pub(crate) packing_cap: usize,
+    ranks: usize,
     scratch: NativeScratch,
     wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
 }
@@ -227,11 +236,20 @@ impl<'a> NativePrograms<'a> {
     pub(crate) fn load_with_core(device: Device<'a>, cfg: &KimiK3Config, programs: &'a Programs<'a>,
         ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat,
         inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize) -> Result<Self> {
+        Self::load_for_ranks(device, cfg, programs, ffn_mode, cache_format, inventory, rows, 2)
+    }
+
+    pub(crate) fn load_for_ranks(device: Device<'a>, cfg: &KimiK3Config, programs: &'a Programs<'a>,
+        ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat,
+        inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi native program physical rank count");
         ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
             "Kimi programs and device must share their native library");
         let packing_cap = coordinator_packing_cap(programs, !inventory.projections.is_empty(), rows)?;
         device.run(|| {
-            let kda = [KimiKda::load(programs, 64, true)?, KimiKda::load(programs, 4096, false)?];
+            let heads = cfg.kda_heads / ranks;
+            let kda = [KimiKda::load_heads(programs, 64, true, heads)?,
+                KimiKda::load_heads(programs, 4096, false, heads)?];
             // Admission can select owned MLA or explicit head split. Resolve
             // both before its measured baseline, never lazily after admission.
             let load_mla = |heads| -> Result<MlaPrograms<'a>> {
@@ -244,10 +262,10 @@ impl<'a> NativePrograms<'a> {
             let mla = [load_mla(48)?, load_mla(96)?];
             let scratch = NativeScratch::combine(kda.each_ref().map(|p| p.scratch_bytes()),
                 mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()]))?;
-            Ok(Self { device, w8: W8::load(cfg, programs, ffn_mode)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
-                kda, commit: KimiKdaCommit::load(programs)?, mla, latent: KimiLatent::load(programs)?,
+            Ok(Self { device, w8: W8::load_for_ranks(cfg, programs, ffn_mode, ranks)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
+                kda, commit: KimiKdaCommit::load_heads(programs, heads)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
-                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load(programs,cfg,inventory,rows,cache_format)?, packing_cap, scratch,
+                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load_for_ranks(programs,cfg,inventory,rows,cache_format,ranks)?, packing_cap, ranks, scratch,
                 wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
     }
@@ -266,18 +284,19 @@ impl<'a> NativePrograms<'a> {
     /// `rows` lane rows of units of at most `unit` rows (the programs' launch capacity).
     pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rank: usize, rows: usize, unit: usize, max_context: usize) -> Result<LaneLayout> {
         self.check_config(cfg)?;
-        ensure!(rank < 2, "Kimi lane logical rank outside TP2");
+        ensure!(rank < self.ranks, "Kimi lane rank outside physical owners");
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
-        let mut layout=LaneLayout::new(cfg, rows, unit, max_context, self.scratch)?;
+        let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
+            cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
         if let Some(core)=&self.core {
             layout.core=core.layouts[rank].clone();
             // Split producers consume the same named scratch planes as fused
             // producers; admission retains the larger exact requirement.
             let kda=core.kda.iter().map(|p|p.scratch_bytes()).max().unwrap_or(0);
             let mla=core.mla.values().map(|p|p.scratch_bytes()).max().unwrap_or(0);
-            let stages = cuteafd_loader::families::kimi_k3::core::lane_extents(rows, unit,
-                layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla)?;
+            let stages = cuteafd_loader::families::kimi_k3::core::lane_extents_for_ranks(rows, unit,
+                layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla,self.ranks)?;
             layout.base = layout.base.with_core_stages(stages)?;
             layout.bytes()?;
         }
@@ -305,8 +324,13 @@ impl std::ops::DerefMut for LaneLayout {
 impl LaneLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
-        Ok(Self { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(
-            cfg, rows, unit, max_context, scratch)?, core: None })
+        Self::for_ranks(cfg, rows, unit, max_context, scratch, 2)
+    }
+
+    pub(crate) fn for_ranks(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
+        scratch: NativeScratch, ranks: usize) -> Result<Self> {
+        Ok(Self { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
+            cfg, rows, unit, max_context, scratch, ranks)?, core: None })
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
@@ -466,7 +490,8 @@ impl<'a> LocalLane<'a> {
     pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>, cfg: KimiK3Config,
         layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>,
         lane_index: usize, rank: usize, kda: Rc<super::state::KdaBank<'a>>, mla: Rc<super::mla::CacheBank<'a>>) -> Result<Self> {
-        ensure!(rank < 2, "Kimi local rank outside TP2 admission");
+        ensure!(rank < programs.ranks && kda.heads() == cfg.kda_heads / programs.ranks,
+            "Kimi local rank/state outside physical admission");
         let device = lane.stream.device;
         ensure!(programs.device.id == device.id && std::ptr::eq(programs.device.library, device.library),
             "Kimi local programs differ from admitted lane device");
@@ -757,8 +782,8 @@ impl<'a> LocalLane<'a> {
             view(self.lane.buffer("K6 attention partial")?,0,rows*7168*2)
         } else {self.plane("attention output",rows,7168)}
     }
-    fn ffn_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
-        if self.native_ffn(layer)? {view(self.lane.buffer("K6 FFN partial")?,0,rows*7168*2)}
+    pub(super) fn ffn_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
+        if self.native_ffn(layer)? && self.kda.heads() == 48 {view(self.lane.buffer("K6 FFN partial")?,0,rows*7168*2)}
         else {self.plane("ffn output",rows,7168)}
     }
     fn attention_core(&self,layer:usize,rows:usize,speculative:bool)->Result<CuteafdDeviceBuffer> {
@@ -842,7 +867,14 @@ impl<'a> LocalLane<'a> {
             let partial=super::core_runtime::ffn_projected(projected("ffn.gate")?,projected("ffn.up")?,projected("ffn.down")?,
                 &programs.situ,&programs.copy,rows,self.plane("normalized",rows,7168)?,self.lane.buffer("K6 FFN gate")?,
                 self.lane.buffer("K6 FFN up")?,self.lane.buffer("gate-up")?,self.lane.buffer("activated")?,self.stream().raw)?;
-            crate::shared::dense_trellis::retain_partial(&programs.narrow,partial,output,rows*7168,self.stream().raw)?;
+            if self.kda.heads() == 96 {
+                let down = weights.core("ffn.down")?;
+                let projection = programs.projection(down)?;
+                ensure!(projection.program.policy().side == 1, "whole Kimi FFN must have native local egress");
+                projection.program.output(rows, partial, down.svh.buffer, output, self.stream().raw)?;
+            } else {
+                crate::shared::dense_trellis::retain_partial(&programs.narrow,partial,output,rows*7168,self.stream().raw)?;
+            }
             Ok(output)
         })
     }
@@ -1130,6 +1162,7 @@ impl AttentionRows {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IoLayout {
     rank: usize,
+    ranks: usize,
     rows: usize,
     hidden: usize,
     vocab: usize,
@@ -1138,22 +1171,27 @@ pub(crate) struct IoLayout {
 
 impl IoLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rank: usize, rows: usize) -> Result<Self> {
+        Self::for_ranks(cfg, rank, rows, &Default::default(), 2)
+    }
+
+    pub(crate) fn for_ranks(cfg: &KimiK3Config, rank: usize, rows: usize,
+        core: &cuteafd_loader::families::kimi_k3::core::CoreInventory, ranks: usize) -> Result<Self> {
         ensure!(cfg.hidden == 7168 && cfg.vocab_size == 163840, "Kimi native IO hidden/vocabulary geometry");
-        ensure!(rank < 2 && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows),
+        ensure!(matches!(ranks, 1 | 2) && rank < ranks
+            && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows),
             "Kimi IO rank/row geometry");
-        Ok(Self { rank, rows, hidden: cfg.hidden, vocab: cfg.vocab_size, core_head:false })
+        Ok(Self { rank, ranks, rows, hidden: cfg.hidden, vocab: cfg.vocab_size,
+            core_head: rank == ranks - 1 && core.get_weight("language_model.lm_head").is_some() })
     }
 
     pub(crate) fn with_core(cfg:&KimiK3Config,rank:usize,rows:usize,
         core:&cuteafd_loader::families::kimi_k3::core::CoreInventory)->Result<Self> {
-        let mut layout=Self::new(cfg,rank,rows)?;
-        layout.core_head=rank==1 && core.get_weight("language_model.lm_head").is_some();
-        Ok(layout)
+        Self::for_ranks(cfg, rank, rows, core, 2)
     }
 
     fn extents(&self) -> [usize; 3] {
-        cuteafd_loader::families::kimi_k3::allocation::io_extents(
-            self.vocab, self.rank, self.rows, self.core_head)
+        cuteafd_loader::families::kimi_k3::allocation::io_extents_for_ranks(
+            self.vocab, self.rank, self.rows, self.core_head, self.ranks).expect("validated token IO owners")
     }
 
     pub(crate) fn demand(&self, lane: usize) -> Result<Demand> {
@@ -1168,7 +1206,8 @@ impl IoLayout {
             "Kimi IO stream differs from admitted lane device");
         weights.check_device(device)?;
         ensure!(weights.core_head.is_some()==self.core_head,"Kimi head storage differs from admitted IO format");
-        if !self.core_head {weights.buffer(if self.rank == 0 { "embedding" } else { "head" })?;}
+        if self.rank == 0 { weights.buffer("embedding")?; }
+        if self.rank == self.ranks - 1 && !self.core_head { weights.buffer("head")?; }
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi token IO");
         let [ids, logits, workspace] = self.extents();
         let allocate = |bytes| -> Result<Option<Allocation<'a>>> {
@@ -1236,9 +1275,9 @@ impl TokenIo<'_> {
     /// Reuses at most 64 logits rows. Callers consume/download each span before
     /// the next projection; wide prefill never allocates a full-context logit tensor.
     pub(crate) fn project(&self, input: CuteafdDeviceBuffer, rows: usize, local:&LocalLane<'_>) -> Result<CuteafdDeviceBuffer> {
-        ensure!(self.layout.rank == 1 && (1..=self.layout.rows.min(64)).contains(&rows),
+        ensure!(self.layout.rank == self.layout.ranks - 1 && (1..=self.layout.rows.min(64)).contains(&rows),
             "Kimi head rows exceed admitted IO capacity");
-        self.check_lane(local,1)?;
+        self.check_lane(local,self.layout.rank)?;
         if let Some(weight)=&self.weights.core_head {
             let programs=local.programs.core.as_ref().context("K6 head programs not resolved")?;
             let scratch=local.lane.core.as_ref().context("K6 head scratch not admitted")?;
@@ -1716,7 +1755,7 @@ mod tests {
         let weights = Rc::new(layout[0].upload(device, packed)?);
         let weak = Rc::downgrade(&weights);
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
-        let io = IoLayout { rank: 0, rows: 16, hidden: 4, vocab: 8, core_head:false }
+        let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false }
             .allocate(device, stream.clone(), weights.clone())?;
         drop(weights);
         drop(stream);
@@ -1788,6 +1827,32 @@ mod tests {
             assert_eq!(native.extents(),[0,rows.min(64)*cfg.vocab_size*4,0]);
             assert_eq!(IoLayout::new(&cfg,1,rows)?.demand(0)?.bytes-native.demand(0)?.bytes,
                 VOCABULARY_HEAD_WORKSPACE as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_token_io_combines_entry_and_terminal_extents() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::core::{CoreInventory, CoreProjection, CoreSplit};
+        use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let stem = "language_model.lm_head".to_owned();
+        let core = CoreInventory { projections: BTreeMap::from([(stem.clone(), CoreProjection {
+            stem, bits: 6, codebook: Exl3Codebook::Mcg, shape: [cfg.vocab_size, cfg.hidden],
+            stored_outputs: cfg.vocab_size, source_bytes: 0, split: CoreSplit::Whole })]) };
+        for rows in [1, 64, 8256] {
+            for inventory in [&CoreInventory::default(), &core] {
+                let whole = IoLayout::for_ranks(&cfg, 0, rows, inventory, 1)?;
+                let pair = [IoLayout::with_core(&cfg, 0, rows, inventory)?,
+                    IoLayout::with_core(&cfg, 1, rows, inventory)?];
+                assert_eq!(whole.extents(), [rows * 4, rows.min(64) * cfg.vocab_size * 4,
+                    if inventory.projections.is_empty() { VOCABULARY_HEAD_WORKSPACE } else { 0 }]);
+                assert_eq!(whole.demand(0)?.gpu, 0);
+                assert_eq!(whole.demand(0)?.bytes, pair.iter().map(|io| io.demand(0).unwrap().bytes).sum::<u64>());
+            }
+        }
+        for (rank, ranks) in [(1, 1), (0, 0), (0, 3)] {
+            assert!(IoLayout::for_ranks(&cfg, rank, 64, &core, ranks).is_err());
         }
         Ok(())
     }

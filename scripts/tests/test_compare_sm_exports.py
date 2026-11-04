@@ -1256,3 +1256,77 @@ def test_malformed_variation_is_refused(tmp_path, record):
     path.write_text(json.dumps(record))
     with pytest.raises(ValueError, match="recorded variation"):
         compare_sm.read_variation(path)
+def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizing():
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(path.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "exl3_reply_programs")
+    shapes = next(ast.literal_eval(node.value) for node in function.body
+                  if isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "shapes" for t in node.targets))
+    assert set(shapes) == {(2560, 10), (3584, 16), (4096, 6), (4096, 8),
+                           (5120, 6), (6144, 4), (6144, 8), (7168, 6)}
+    assert len(shapes) == len(set(shapes))
+    source = ast.get_source_segment(path.read_text(), function)
+    assert "sm_count" not in source and "multi_processor_count" not in source
+    assert 'Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")' in source
+    worker = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exl3/worker.rs").read_text()
+    assert "(Some(output), None) if compressed" in worker
+    assert "self.reply_fused.launch(request, sources, inputs, output" in worker
+    assert "reply_codec" not in worker
+
+
+def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
+    exporter = compare_sm.load_file("test_reply_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    def record(*args, **kwargs):
+        return SimpleNamespace(args=args, **kwargs)
+    def operand(name, dtype, shape, role="in", align=16):
+        return SimpleNamespace(name=name, dtype=dtype, shape=shape, role=role, align=align)
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._common",
+                        SimpleNamespace(Operand=operand, Scalar=lambda name: name,
+                                        compile_program=lambda kernel, **kw: record(kernel, **kw)))
+    monkeypatch.setitem(sys.modules, "b12x.moe._shared.kernels.w4a16.kernel",
+                        SimpleNamespace(W4A16TopKSumKernel=lambda **kw: record(**kw)))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        float16="fp16", uint8="u8", float32="fp32", int32="i32"))
+    jobs = exporter.exl3_reply_programs(8256)
+    assert len(jobs) == 16
+    for suffix, op, params, thunk in jobs:
+        program = thunk()
+        kernel, = program.args
+        width, topk, format = program.key
+        row_bytes = width * 33 // 32 if format == 1 else width * 9 // 16
+        assert program.name == "expert_reply_" + suffix
+        assert op == "expert_reply_exl3" and params == {"max_rows": 8256}
+        assert [p.name for p in program.operands] == ["fc2_ptr", "output_ptr",
+            "topk_weights_ptr", "route_expert_ids_ptr", "expert_map_ptr", "svh_ptr"]
+        assert [p.dtype for p in program.operands] == ["fp16", "u8", "fp32", "i32", "i32", "fp16"]
+        assert program.operands[1].role == "out"
+        assert program.operands[1].shape == f"[rows,{row_bytes}]"
+        assert program.scalars == ("weight_num_experts", "route_num_experts", "active_m")
+        assert kernel.full_rotation and kernel.use_expert_map
+        assert kernel.full_rotation_output_dtype == "bf16"
+        assert kernel.element_dtype == "fp16" and kernel.reply_format == format
+
+
+def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
+    source = (ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/w4a16/expert_reply.py").read_text()
+    tree = ast.parse(source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "compile_expert_reply_reduce_aot")
+    record = lambda *args, **kwargs: SimpleNamespace(args=args, **kwargs)
+    namespace = dict(compile_program=record, ExpertReplyReduce=lambda: "kernel",
+                     Operand=record, Scalar=lambda name: name,
+                     torch=SimpleNamespace(uint8="u8", bfloat16="bf16", uint32="u32"))
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
+    program = namespace[function.name]()
+    assert program.name == "expert_reply_reduce" and program.key == ()
+    assert [operand.args[0] for operand in program.operands] == [
+        *(f"p{rank}" for rank in range(8)), "shared", "out", "mode"]
+    assert program.scalars == ("rows", "width", "ranks", "has_shared", "format")
+    assert program.geometry == dict(max_ranks=8, fp8_block=32, nvfp4_block=16,
+                                    rank_rounding="bf16", accumulation="ordered_fp32")
+    assert "scratch" not in vars(program)
+    exporter = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
+    assert 'work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},' in exporter
+    assert "compile_expert_reply_reduce_aot))" in exporter

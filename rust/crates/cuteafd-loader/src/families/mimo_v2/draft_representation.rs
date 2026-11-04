@@ -5,8 +5,6 @@ use thiserror::Error;
 /// Serving and standalone admission use the same drafter batch default.
 pub const DEFAULT_DRAFT_SEQUENCES: usize = 4;
 
-/// Default scheduler concurrency, shared with standalone admission.
-pub const DEFAULT_MAX_SEQUENCES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoDraftRepresentation {

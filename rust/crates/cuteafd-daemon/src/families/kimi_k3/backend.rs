@@ -562,8 +562,9 @@ mod tests {
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         let prefill = args.prefill()?;
+        let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;
         let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
-            super::super::startup::Options { cache_format: args.kv_cache, devices: [args.device, args.split_device],
+            super::super::startup::Options { cache_format: args.kv_cache, devices: [args.device, peer],
                 native_lib: &args.native_lib, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 spark_budget_gib: args.spark_budget_gib, rows: usize::try_from(prefill.span_rows)?,
                 waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
@@ -575,7 +576,7 @@ mod tests {
                     fp8: args.draft_fp8, cache_format: args.kv_cache }), verify_rows: 0 })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
-        library.cuda_set_device(args.split_device)?;
+        library.cuda_set_device(peer)?;
         let mut pool = RefPagePool::new(engine.prefix_family()?.layout().pages, 64);
         if std::env::var("CUTEAFD_KIMI_PACK_GATE_ROUTE64").as_deref() == Ok("1") {
             // live_arm prefills private prefixes of 0/3/7 rows, leaving 64

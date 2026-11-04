@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include "../../../../../native/shared/cuda/expert_pack_layout.h"
 #include "cuteafd_mxfp4_layouts.h"
 
@@ -192,6 +195,11 @@ void fixture_configure_pack(int pack, int drain) {
 
 void fixture_configure_drain_after(int after) { drain_after = after; }
 
+int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
+    *out = 2 * 1024 * 1024;
+    return 0;
+}
+
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
     if (posix_memalign(&out->ptr, 256, bytes)) return 1;
     /* Zeroed so operand digests never read unspecified padding. */
@@ -251,8 +259,19 @@ int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
     return pack_status;
 }
 
-struct upload { void *dst; const void *src; size_t bytes; };
-struct upload_event { struct upload *copies; size_t count, fence; };
+struct upload { void *dst; const void *src; size_t bytes; void *stream; };
+struct upload_event { struct upload *copies; size_t count, fence; void *stream; };
+static pthread_mutex_t upload_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t upload_ready = PTHREAD_COND_INITIALIZER;
+static _Atomic size_t next_stream;
+static void *blocked_stream;
+static int block_first_stream;
+void fixture_block_first_stream(int block) {
+    pthread_mutex_lock(&upload_mutex);
+    block_first_stream = block;
+    pthread_cond_broadcast(&upload_ready);
+    pthread_mutex_unlock(&upload_mutex);
+}
 
 /* Opt-in stream interpreter: copies and fake expert reads execute only when
  * explicitly advanced, so tests can submit N+1 while N is still outstanding. */
@@ -335,7 +354,10 @@ int cuteafd_unregister_host_mapping(void *ptr) {
     event('g'); return 0;
 }
 int cuteafd_cuda_stream_create(void **out) {
-    *out = (void *)1;
+    *out = (void *)(uintptr_t)(atomic_fetch_add(&next_stream, 1) + 1);
+    pthread_mutex_lock(&upload_mutex);
+    if (!blocked_stream) blocked_stream = *out;
+    pthread_mutex_unlock(&upload_mutex);
     event('V'); return 0;
 }
 static void *upload_events[128];
@@ -345,9 +367,14 @@ int cuteafd_cuda_event_create_ordering(void **out) {
     if (upload_event_count == 128) return 1;
     *out = calloc(1, sizeof(struct upload_event));
     if (!*out) return 1;
+    pthread_mutex_lock(&upload_mutex);
     upload_events[upload_event_count++] = *out;
+    pthread_mutex_unlock(&upload_mutex);
     event('C');
     return 0;
+}
+int cuteafd_cuda_event_create_blocking(void **out) {
+    return cuteafd_cuda_event_create_ordering(out);
 }
 int cuteafd_cuda_event_create(void **out) {
     return cuteafd_cuda_event_create_ordering(out);
@@ -402,8 +429,10 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
         if (dst.device_id != current_device) return 1;
         memcpy(dst.ptr, source, bytes);
     } else {
-        if (pending_count == 65536) return 1;
-        pending_uploads[pending_count++] = (struct upload){dst.ptr, source, bytes};
+        pthread_mutex_lock(&upload_mutex);
+        if (pending_count == 65536) { pthread_mutex_unlock(&upload_mutex); return 1; }
+        pending_uploads[pending_count++] = (struct upload){dst.ptr, source, bytes, stream};
+        pthread_mutex_unlock(&upload_mutex);
     }
     event('Q');
     return 0;
@@ -419,18 +448,27 @@ int cuteafd_cuda_event_record(void *handle, void *stream) {
     (void)stream;
     struct upload_event *upload = handle;
     if (queued_experts) { upload->fence = queued_count; return 0; }
-    if (upload->count) return 1;
+    pthread_mutex_lock(&upload_mutex);
+    if (upload->count) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    upload->stream = stream;
     upload->copies = malloc(pending_count * sizeof(struct upload));
-    if (pending_count && !upload->copies) return 1;
-    if (pending_count) memcpy(upload->copies, pending_uploads, pending_count * sizeof(struct upload));
-    upload->count = pending_count;
-    pending_count = 0;
+    if (pending_count && !upload->copies) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    size_t retained = 0;
+    upload->count = 0;
+    for (size_t i = 0; i < pending_count; ++i) {
+        if (pending_uploads[i].stream == stream) upload->copies[upload->count++] = pending_uploads[i];
+        else pending_uploads[retained++] = pending_uploads[i];
+    }
+    pending_count = retained;
+    pthread_mutex_unlock(&upload_mutex);
     event('R');
     return 0;
 }
 int cuteafd_cuda_event_query(void *handle, int *ready) {
     struct upload_event *upload = handle;
+    pthread_mutex_lock(&upload_mutex);
     *ready = queued_experts ? queued_done >= upload->fence : upload->count == 0;
+    pthread_mutex_unlock(&upload_mutex);
     return 0;
 }
 int cuteafd_cuda_event_elapsed_ms(void *start, void *end, float *ms) {
@@ -441,21 +479,35 @@ int cuteafd_cuda_event_elapsed_ms(void *start, void *end, float *ms) {
 int cuteafd_cuda_event_synchronize(void *handle) {
     if (queued_experts) { advance_queue(((struct upload_event *)handle)->fence); return 0; }
     event('S');
-    int status = ++drain_calls > drain_after ? drain_status : 0;
-    if (status) return status;
-    for (size_t i = 0; i < upload_event_count; ++i) {
-        if (upload_events[i] == handle) {
-            struct upload_event *upload = handle;
-            finish_uploads(upload);
+    pthread_mutex_lock(&upload_mutex);
+    struct upload_event *upload = handle;
+    // Bound an injected stall even when a regression prevents the producer
+    // from returning its credit. The test still fails its release-order check.
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 5;
+    while (block_first_stream && upload->stream == blocked_stream) {
+        if (pthread_cond_timedwait(&upload_ready, &upload_mutex, &deadline)) {
+            block_first_stream = 0;
+            break;
         }
     }
+    int status = ++drain_calls > drain_after ? drain_status : 0;
+    if (!status) {
+        finish_uploads(upload);
+        event('L'); /* Successful event completion, after every retained copy. */
+    }
+    pthread_mutex_unlock(&upload_mutex);
+    if (status) return status;
     return 0;
 }
 
 int cuteafd_cuda_event_destroy(void *handle) {
+    pthread_mutex_lock(&upload_mutex);
     for (size_t i = 0; i < upload_event_count; ++i) {
         if (upload_events[i] == handle) { free(handle); upload_events[i] = NULL; }
     }
+    pthread_mutex_unlock(&upload_mutex);
     event('E');
     return 0;
 }
@@ -470,16 +522,21 @@ int cuteafd_cuda_stream_synchronize(void *stream) {
     (void)stream;
     if (queued_experts) { advance_queue(queued_count); return 0; }
     event('S');
+    pthread_mutex_lock(&upload_mutex);
     int status = ++drain_calls > drain_after ? drain_status : 0;
-    if (status) return status;
+    if (status) { pthread_mutex_unlock(&upload_mutex); return status; }
     for (size_t i = 0; i < upload_event_count; ++i) {
-        if (upload_events[i]) finish_uploads(upload_events[i]);
+        if (upload_events[i] && ((struct upload_event *)upload_events[i])->stream == stream)
+            finish_uploads(upload_events[i]);
     }
+    size_t retained = 0;
     for (size_t i = 0; i < pending_count; ++i) {
         struct upload *copy = &pending_uploads[i];
-        memcpy(copy->dst, copy->src, copy->bytes);
+        if (copy->stream == stream) memcpy(copy->dst, copy->src, copy->bytes);
+        else pending_uploads[retained++] = *copy;
     }
-    pending_count = 0;
+    pending_count = retained;
+    pthread_mutex_unlock(&upload_mutex);
     return 0;
 }
 
@@ -665,4 +722,25 @@ int cuteafd_exl3_wire_decode(void *handle, const uint8_t *input, uint64_t in_byt
                            uint16_t *output, uint64_t out_bytes, uint32_t rows, void *stream) {
     (void)handle; (void)input; (void)in_bytes; (void)output;
     (void)out_bytes; (void)rows; (void)stream; return 0;
+}
+
+/* Device SEND registration fails deliberately; the real ring must select and
+ * register its existing pinned payload slots, not retry device allocation. */
+int cuteafd_rdma_rc_endpoint_register_device_region(void *handle, void *ptr,
+        size_t bytes, uint32_t *region) {
+    (void)handle; (void)region;
+    if (!ptr || bytes != 2 * 1024 * 1024) return 1;
+    event('G');
+    return 7;
+}
+int cuteafd_rdma_rc_endpoint_register_region(void *handle, void *ptr,
+        size_t bytes, uint32_t *region) {
+    (void)handle;
+    if (!ptr || !bytes || !region) return 1;
+    event('H');
+    *region = 7;
+    return 0;
+}
+int cuteafd_rdma_rc_endpoint_destroy(void *handle) {
+    (void)handle; event('X'); return 0;
 }

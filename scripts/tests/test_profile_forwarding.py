@@ -192,6 +192,33 @@ def test_nsys_cpu_sampling_is_opt_in(monkeypatch):
     assert out.returncode != 0 and 'PROFILE_NSYS_CPU must be on or off' in out.stderr
 
 
+def test_nsys_graph_trace_defaults_to_nodes_and_accepts_graphs(monkeypatch):
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', raising=False)
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert '--cuda-graph-trace=node' in wrapper
+    for value in ('node', 'graph'):
+        monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', value)
+        out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+        assert out.returncode == 0, out.stderr
+        assert [arg for arg in wrapper if arg.startswith('--cuda-graph-trace=')] == [f'--cuda-graph-trace={value}']
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'maybe')
+    out, _, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode != 0 and 'PROFILE_NSYS_GRAPH_TRACE must be node or graph' in out.stderr
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'graph')
+    out, _, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
+    assert out.returncode != 0 and 'PROFILE_NSYS_GRAPH_TRACE needs PROFILE=nsys' in out.stderr
+
+
+def test_family_launch_forwards_nsys_graph_trace(tmp_path):
+    prof = tmp_path / 'prof'
+    out = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
+                               f'PROFILE=nsys\nPROFILE_DIR={prof}\nPROFILE_NSYS_GRAPH_TRACE=graph\n')
+    assert out.returncode == 0, out.stderr
+    assert '--cuda-graph-trace=graph' in out.stderr
+    assert '--cuda-graph-trace=node' not in out.stderr
+
+
 def test_nsys_gpu_metrics_samples_the_named_devices():
     out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', '0,1')
     assert out.returncode == 0, out.stderr

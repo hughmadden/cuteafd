@@ -38,6 +38,7 @@ KIMI_SHAPES = (
     ("mla_g_owned", 7168, 12288, 1),
     ("mla_o_owned", 12288, 7168, 1),
     ("lm_head", 7168, 163840, 1),
+    ("shared_down_owned", 6144, 7168, 1),
 )
 
 

@@ -3,6 +3,7 @@
 //! here. Startup graphs depend on the admitted pool, so resolve their shape
 //! before publishing the final placement, without taking another CUDA sample.
 use crate::families::qwen4::Qwen4Attention;
+use crate::serving_capacity::Exl3Epilogue;
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{qwen_admission, qwen_startup_graphs, QwenAdmissionInputs, QWEN_UNIT_ROWS};
 use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
@@ -23,6 +24,7 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub admission: QwenAdmissionInputs<'a>,
@@ -65,12 +67,12 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
     if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
         // Runtime creates SparkLink before sampling free memory. Only the
-        // header-only planner still needs to reserve its BF16 return planes.
+        // header-only planner still needs to reserve its return planes and codec.
         fixed.push(Demand::new(0, Category::Transport, "Spark intake planes",
-            inputs.admission.prefill_shape.map_or_else(|| crate::serving_capacity::spark_intake_bytes(1,
-                inputs.spark_ranks as u64, inputs.admission.prefill_rows.max(64), inputs.admission.cfg.hidden as u64),
-                |shape| crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows,
-                    inputs.spark_ranks as u64, inputs.admission.cfg.hidden as u64)), Basis::Formula));
+            crate::serving_capacity::prefill_return_bytes_with_format(
+                inputs.admission.prefill_shape.map_or(1, |shape| shape.waves),
+                inputs.admission.prefill_shape.map_or(inputs.admission.prefill_rows.max(64), |shape| shape.unit_rows),
+                inputs.spark_ranks as u64, inputs.admission.cfg.hidden as u64, inputs.spark_reply_format)?, Basis::Formula));
     }
     if inputs.pending_code_bytes > 0 {
         fixed.push(Demand::new(0, Category::Runtime, "loaded code", inputs.pending_code_bytes, Basis::Formula));
@@ -198,7 +200,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
                 && m["capacity"].as_u64() == Some(capacity), "Qwen MTP package geometry: {}", path.display());
             Ok(m)
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true)? + rows * shape.hidden as u64 * 2)
+        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + rows * shape.hidden as u64 * 2)
     } else {
         let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen MTP format unsupported"))?.for_layer(shape.layers)?;
         tensors.validate_layer(shape.layers)?;
@@ -263,7 +265,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
                     "Qwen EXL3 TP2 rank {rank} package geometry mismatch: {}", path.display());
                 Ok(value)
             }).collect::<anyhow::Result<Vec<_>>>()?;
-            crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+            crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
         } else {
             let tensors = catalog.fp8().unwrap();
             let parent = package.parent().ok_or_else(|| anyhow::anyhow!("Qwen TP2 package has no parent"))?;
@@ -618,7 +620,7 @@ mod tests {
         let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
             ple_table_bytes: 1 << 30, ..Default::default() };
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
-        let inputs = QwenInputs { automatic_context: false,
+        let inputs = QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
                 manifest: None, prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                 ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -988,7 +990,7 @@ mod tests {
                 for requested in [None, Some(32768), Some(2097152)] {
                     let context = requested.unwrap_or(131072).min(131072);
                     let context_bytes = 586_416_128;
-                    let inputs = |baseline| QwenInputs { automatic_context: false,
+                    let inputs = |baseline| QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                             prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                             ple: Some((160, true)), future_expert_bytes: 0, headroom: 3 << 30 },
@@ -1022,9 +1024,11 @@ mod tests {
     fn spark_intake_is_charged_once_across_planned_and_measured_baselines() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
         let (total, context_bytes, loaded_bytes) = (32_u64 << 30, 1_u64 << 30, 23_u64 << 30);
+        for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+            cuteafd_core::SparkReplyFormat::Nvfp4] {
         for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 }),
             Some(crate::serving_capacity::PrefillShape { unit_rows: 4096, waves: 2 })] {
-            let inputs = |baseline| QwenInputs { automatic_context: false,
+            let inputs = |baseline| QwenInputs { spark_reply_format: format, automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: shape, cfg: &cfg, layers: 48, mtp: false,
                     kv_format: Qwen4KvCache::Fp8, manifest: None,
                     prefill_rows: shape.map_or(4096, |s| s.slot_rows()), slots: 16,
@@ -1034,10 +1038,10 @@ mod tests {
                 requested_pool: None, spark_ranks: 4, startup_graph_modes: None };
             let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
             let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
-            // The checkpoint's hidden width is 2560, not 2048.
+            // Fused reduction reads packed replies in the BF16 fallback planes.
+            let rows = shape.map_or(4096, |s| s.slot_rows());
             assert_eq!(intake.bytes, 4
-                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                    shape.map_or(4096, |s| s.slot_rows()) * 2560 * 2).unwrap());
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 2560 * 2).unwrap());
             let measured = inputs(Baseline::Measured {
                 free_bytes: total - context_bytes - loaded_bytes - intake.bytes });
             let runtime = request(&measured, 0).unwrap();
@@ -1056,6 +1060,7 @@ mod tests {
             println!("Qwen Spark intake {:?}: {} bytes, pool {} -> {} (+{delta} tokens)",
                 shape, intake.bytes, old.pool_tokens, r.pool_tokens);
         }
+        }
     }
 
     #[test]
@@ -1065,7 +1070,7 @@ mod tests {
         let cfg = Qwen4Config::from_hf(&config).unwrap();
         for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (mtp, format))) {
-            let inputs = QwenInputs { automatic_context: false,
+            let inputs = QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 10 << 30, headroom: 3 << 30 },

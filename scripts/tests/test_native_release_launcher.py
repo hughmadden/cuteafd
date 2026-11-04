@@ -22,6 +22,42 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_v41_planner_receives_normalized_effective_config(self) -> None:
+        source = v41_source()
+        block = source[source.index('count_args='):source.index('if [[ -n "$wip_layout" ]]; then', source.index('count_args='))]
+        for requested, expected in [(None, 'on'), ('off', 'off')]:
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / 'sparse.config'
+                config.write_text('  SPECULATOR = "dspark" # draft mode\nDSPARK_DRAFT_LIMIT=\'7\' # width\n'
+                                  'SPARK_0_HOST="ostrich" # first\nSPARK_1_HOST=\'dodo\'\n'
+                                  'SPARK_0_LANE_A=10.55.0.1\nSPARK_1_LANE_A=10.55.0.2\n'
+                                  + (f'TP2_DSPARK_EXPERTS="{requested}" # explicit override\n' if requested else ''))
+                script = '''set -euo pipefail
+source scripts/lib/release-common.sh
+release_load_config "$1"
+release_resolve_tp2_dspark_experts deepseek_v41 2
+dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
+get() { printf '%s' "${2:-}"; }
+container_hf_home=/hf
+namespace_mount_args=()
+'''
+                result = subprocess.run(['bash', '-c', script + block + '''
+printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$dspark_draft_limit" "$RELEASE_AVAILABLE_SPARKS"
+cat "$count_config"
+printf 'arg=%s\\n' "${count_args[@]}"
+printf 'mount=%s\\n' "${count_mounts[@]}"
+''', 'test', str(config)], cwd=ROOT, env={**os.environ, 'HOME': str(root)}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
+                normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7',
+                    **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
+                self.assertIn('arg=--config', lines)
+                self.assertIn('arg=/run/cuteafd-plan.config', lines)
+                self.assertTrue(any(line.startswith('mount=') and line.endswith(':/run/cuteafd-plan.config:ro') for line in lines))
+
     def test_cuda_capacity_matches_uuid_not_cuda_ordinal_and_creates_no_context(self) -> None:
         import contextlib
         import ctypes
@@ -361,6 +397,23 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         environment.update(CUTEAFD_DIAG_V4_VERIFY='/tmp/x', CUTEAFD_DIAG_A='1', CUTEAFD_OTHER='no')
         result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
         self.assertEqual(result.stdout, b'before\0-e\0CUTEAFD_DIAG_A=1\0-e\0CUTEAFD_DIAG_V4_VERIFY=/tmp/x\0after\0')
+        # The launch-blocking diagnostic also sets CUDA's own variable for the coordinator.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        environment.update(CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING='1')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout,
+            b'before\0-e\0CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING=1\0-e\0CUDA_LAUNCH_BLOCKING=1\0after\0')
+        # The work-queue diagnostics set CUDA's own variables; out-of-range values refuse.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        environment.update(CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS='32', CUTEAFD_DIAG_CUDA_DEVICE_MAX_COPY_CONNECTIONS='16')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout,
+            b'before\0-e\0CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS=32\0-e\0CUTEAFD_DIAG_CUDA_DEVICE_MAX_COPY_CONNECTIONS=16'
+            b'\0-e\0CUDA_DEVICE_MAX_CONNECTIONS=32\0-e\0CUDA_DEVICE_MAX_COPY_CONNECTIONS=16\0after\0')
+        environment.update(CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS='64')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b'must be 1-32', result.stderr)
 
     def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
         source = FAMILY.read_text()

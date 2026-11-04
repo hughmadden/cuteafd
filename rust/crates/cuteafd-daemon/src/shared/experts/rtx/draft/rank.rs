@@ -60,6 +60,25 @@ impl<'a> Weights<'a> {
         }
         Ok(pair.map(Rc::new))
     }
+    pub fn from_push(devices: [Device<'a>; 2], stages: [Vec<ExpertWeights<'a>>; 2],
+        budgets: [usize; 2], layout: Layout) -> Result<[Rc<Self>; 2]> {
+        layout.validate()?;
+        ensure!(devices[0].id == 0 && devices[1].id == 1
+            && std::ptr::eq(devices[0].library, devices[1].library), "invalid pushed draft TP2 device pair");
+        let mut pair = Vec::with_capacity(2);
+        for (rank, weights) in stages.into_iter().enumerate() {
+            let stages = devices[rank].own(|| Ok(weights))?;
+            Self::validate_info(devices[rank].run(|| devices[rank].library.v41_dspark_tp2_expert_info(1))?, layout)?;
+            ensure!(stages.len() == layout.stages && stages.iter().enumerate().all(|(stage, weight)|
+                weight.layer == ExpertLayer::DsparkTp2 { stage, rank }), "pushed draft stages differ from selection");
+            let bytes = stages.iter().try_fold(0usize, |bytes, weight| bytes.checked_add(weight.budget().resident_bytes))
+                .context("pushed draft resident overflow")?;
+            ensure!(bytes <= budgets[rank], "pushed draft experts exceed admitted residency");
+            pair.push(Rc::new(Self { device: devices[rank], layout, stages }));
+        }
+        pair.try_into().map_err(|_| anyhow::anyhow!("draft TP2 requires two ranks"))
+    }
+
     /// Both ranks' halves of every stage as synthetic test weights
     /// ([`ExpertWeights::synthetic`]), without a checkpoint.
     #[cfg(test)]

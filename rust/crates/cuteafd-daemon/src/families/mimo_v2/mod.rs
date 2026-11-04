@@ -1053,16 +1053,15 @@ impl Opened {
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
         let mut pushed_experts = None;
+        let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
         let prepare_push = |sparks: usize| -> Result<_> {
             let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
                 .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
             let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
             let planning = weights::MimoLoader { dense: load.clone(), ..loader.clone() };
-            let model = {
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                planning.model(&self.cfg, layers)?
-            };
-            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let (loaded, mut records) = crate::shared::experts::rtx::dense::recording(||
+                planning.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement))?;
+            records.extend(load.sink.as_ref().context("push sink")?.take_all());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             let experts = if let Some(tp2) = preflight.placement.tp2 {
                 let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?;
@@ -1090,7 +1089,7 @@ impl Opened {
                 let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?;
                 (push, Some((streams, ranks)))
             };
-            Ok((prepared, (model, planning.transient.clone(), dense, devices)))
+            Ok((prepared, (loaded, planning.transient.clone(), dense, devices)))
         };
         let mut coordinator_push = None;
         let admission = if args.peers.is_some() {
@@ -1126,31 +1125,21 @@ impl Opened {
             }
             None
         };
-        let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
-        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
-            let Some((push, sparks, (model, transient, dense, devices))) = coordinator_push.take() else {
-                return crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement,
-                    || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) });
+        let (embedding, ((model, mut shares), mtp_weights)) = crate::shared::placement::load_while_admitting(admission, || {
+            let Some((push, sparks, (loaded, transient, dense, devices))) = coordinator_push.take() else {
+                return loader.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement);
             };
-            // The planned dense operands arrive in the group while the embedding loads beside.
             let split = crate::shared::memory::load_timing::Split::start();
-            let (pushed, embedding) = push.receive_with(devices, self.catalog.as_ref(), sparks, Some(Ok(dense)), || {
-                crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement, || Ok(()))
-            });
+            let (pushed, ()) = push.receive_with(devices, self.catalog.as_ref(), sparks, Some(Ok(dense)), || ());
             pushed_experts = push_policy.committed(pushed)?;
-            let (embedding, ()) = embedding?;
-            // Post-Done gathers completed before publishing the dense owners.
+            // Target, predictor and GPU embedding bytes all commit before their owners publish.
             transient.borrow_mut().clear();
-            split.log("mimo dense and onboarded expert push");
-            Ok((embedding, model))
+            split.log("mimo dense, MTP and onboarded expert push");
+            Ok(loaded)
         })?;
         loader.release_transient();
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
-            let available = self.checkpoint.tensor_names()
-                .filter(|name| name.starts_with("model.mtp.layers.") && name.ends_with(".eh_proj.weight"))
-                .count();
-            ensure!(args.mtp <= available, "--mtp {} but the checkpoint has {available} MTP layers", args.mtp);
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
                 let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -1158,9 +1147,9 @@ impl Opened {
             };
             let (h, record) = (self.cfg.hidden, self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding,
                 args.kv_formats()));
-            let stages = (0..args.mtp).map(|k| -> Result<mtp::MtpStage<'_>> {
-                let [eh, enorm, hnorm, final_norm] = loader.mtp_extras(k)?;
-                Ok(mtp::MtpStage { layer: loader.mtp_layer(&self.cfg, k)?, eh, enorm, hnorm, final_norm,
+            let stages = mtp_weights.into_iter().map(|weights| -> Result<mtp::MtpStage<'_>> {
+                let [eh, enorm, hnorm, final_norm] = weights.extras;
+                Ok(mtp::MtpStage { layer: weights.layer, eh, enorm, hnorm, final_norm,
                     ring: zeroed(args.rings * engine::RING_ROWS * record)? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
@@ -1406,10 +1395,15 @@ impl Opened {
             let capacity = endpoints[endpoint as usize].capacity;
             let label = format!("mimo/transport/endpoint-{endpoint}");
             let _owner = cuteafd_ffi::memory_ledger::owner(&label);
-            let mut link = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
-                capacity, cuteafd_transport::TcpTransportConfig { timing,
-                    timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-                self.cfg.hidden * 2, waves, capacity)?;
+            let config = cuteafd_transport::TcpTransportConfig { timing,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
+            let mut link = if endpoint == 0 {
+                crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
+                    capacity, config, self.cfg.hidden * 2)?
+            } else {
+                crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
+                    capacity, config, self.cfg.hidden * 2, waves, capacity)?
+            };
             link.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
             // Bootstrap with this endpoint's widest request, never prefill on decode.
@@ -1417,12 +1411,15 @@ impl Opened {
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
-            let planned = capacity as usize * waves * peers.len() * self.cfg.hidden * 2;
-            anyhow::ensure!(actual == planned,
+            let format = if endpoint == 0 { cuteafd_core::SparkReplyFormat::Bf16 }
+                else { cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false) };
+            let planned = cuteafd_loader::serving_capacity::prefill_return_bytes_with_format(
+                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64, format)?;
+            anyhow::ensure!(actual as u64 == planned,
                 "MiMo {label}: allocated {actual} device bytes != planned {planned}");
             Ok(link)
         };
-        crate::shared::memory_report::release_load_staging(&self.library);
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         // Decode keeps fixed graph-safe planes and the probed landing path;
         // only prefill owns overlapping waves and per-slot GPU landing planes.
         let mut decode = link(0, 1, &decode_warm)?;

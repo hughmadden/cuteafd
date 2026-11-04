@@ -70,6 +70,20 @@ fn openai_requests_render_the_golden_prompts() {
     }
 }
 
+#[test]
+fn string_thinking_off_matches_object_prompt() {
+    let encoding = encoding();
+    let request = |thinking| json!({"messages":[{"role":"user","content":"Hi"}], "thinking":thinking});
+    let string = request(json!("disabled"));
+    let object = request(json!({"type":"disabled"}));
+    let string_options = prompt_options(&string, encoding.thinking_off());
+    let object_options = prompt_options(&object, encoding.thinking_off());
+    assert!(!string_options.thinking);
+    assert_eq!(string_options.thinking, object_options.thinking);
+    assert_eq!(encoding.render(&string, &string_options).unwrap(),
+        encoding.render(&object, &object_options).unwrap());
+}
+
 /// Every way of turning thinking off: `thinking.type`, `enable_thinking`
 /// (top level or a template kwarg), the `thinking` kwarg, and the lowest
 /// effort's names.

@@ -122,6 +122,27 @@ impl FromStr for LocalLayers {
     }
 }
 
+/// Resolve one boot-time C before deriving queues, rings, marks or graph capacities.
+pub(crate) fn serving_concurrency(requested: Option<usize>, native_lib: &std::path::Path,
+    device: i32) -> Result<usize> {
+    let concurrency = resolve_serving_concurrency(requested, || {
+        if let Some(budget) = cuteafd_ffi::coordinator_gpu_budget() { return Ok(budget.0); }
+        // SAFETY: the library is retained through the device-info query; no device work is launched.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(native_lib) }?;
+        Ok(library.cuda_device_info(device)?.total_memory_bytes)
+    })?;
+    tracing::info!(concurrency, "resolved boot-time serving concurrency");
+    Ok(concurrency)
+}
+
+pub(crate) fn resolve_serving_concurrency(requested: Option<usize>, logical_bytes: impl FnOnce() -> Result<u64>)
+    -> Result<usize> {
+    match requested {
+        Some(value) => Ok(value),
+        None => Ok(cuteafd_core::serving_capacity::default_concurrency(logical_bytes()?) as usize),
+    }
+}
+
 /// Admit the complete future host working set once, before any allocation.
 /// Families supply table byte formulas summed across every local GPU, together
 /// with the full prefix-cache quota (zero when disabled) and deferred logits.
@@ -194,6 +215,21 @@ fn host_admission((total, available): (u64, u64),
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
+
+    #[test]
+    fn boot_concurrency_uses_logical_capacity_only_when_unset() -> Result<()> {
+        for bytes in [30 << 30, 32 << 30, (32 << 30) + 1, 96 << 30] {
+            assert_eq!(resolve_serving_concurrency(None, || Ok(bytes))?,
+                cuteafd_core::serving_capacity::default_concurrency(bytes) as usize);
+        }
+        for requested in [0, 4, 8, 16, 65] {
+            assert_eq!(resolve_serving_concurrency(Some(requested), || panic!("explicit C must not query CUDA"))?,
+                requested, "family admission validates the resolved value");
+        }
+        assert!(resolve_serving_concurrency(None, || anyhow::bail!("device query failed"))
+            .unwrap_err().to_string().contains("device query failed"));
+        Ok(())
+    }
 
     #[test]
     fn reactor_reservation_is_once_per_process_not_per_table() -> Result<()> {

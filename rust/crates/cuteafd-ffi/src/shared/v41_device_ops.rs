@@ -276,7 +276,8 @@ impl V41PeerCopy<'_> {
         Ok(())
     }
     /// # Safety
-    /// Destination is on the current stream device; source peer access is enabled.
+    /// One buffer is on the current stream device; access to the other peer is
+    /// enabled. Either destination-issued reads or source-issued writes are valid.
     /// Producers precede this stream, buffers are disjoint and live through
     /// completion, and no conflicting access occurs. Initialize before capture.
     pub unsafe fn launch(&self,destination: CuteafdDeviceBuffer,source: CuteafdDeviceBuffer,

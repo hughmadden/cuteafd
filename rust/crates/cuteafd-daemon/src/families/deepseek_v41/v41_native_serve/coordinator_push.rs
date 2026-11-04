@@ -30,12 +30,18 @@ pub(super) struct Planned<'a> {
 
 #[allow(clippy::type_complexity)]
 pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog, devices: [Device<'a>; 2],
-    records: &Records, tp2_layers: usize, tp2_budgets: [usize; 2], sparks: usize)
+    records: &Records, tp2_layers: usize, tp2_budgets: [usize; 2], draft_expert_bytes: usize, sparks: usize)
     -> Result<(Planned<'a>, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
     let dense = dense::plan_records(snapshot, records.clone(), &devices, sparks)?;
-    let layers = (0..tp2_layers).collect::<Vec<_>>();
+    use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, WholeOwner}};
+    let owners = (0..2).map(|rank| {
+        let mut selections = (0..tp2_layers).map(|layer| ExpertLayer::BackboneTp2 { layer, rank }).collect::<Vec<_>>();
+        if draft_expert_bytes > 0 { selections.extend((0..3).map(|stage| ExpertLayer::DsparkTp2 { stage, rank })); }
+        Ok(WholeOwner { rank, selections, budget: tp2_budgets[rank].checked_add(draft_expert_bytes)
+            .context("V4.1 mixed expert admission overflow")? })
+    }).collect::<Result<Vec<_>>>()?;
     let (push, streams, ranks) = CoordinatorPush::prepare(snapshot, Some(catalog), 2,
-        (tp2_layers > 0).then(|| crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets: tp2_budgets.to_vec() }))?;
+        (tp2_layers > 0 || draft_expert_bytes > 0).then_some(CoordinatorExperts::Native { owners }))?;
     Ok((Planned { push, dense: Some(dense), sparks }, streams, ranks))
 }
 

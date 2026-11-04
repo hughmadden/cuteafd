@@ -15,9 +15,10 @@ mod deepseek;
 pub mod step5;
 mod spark_intake;
 pub mod prefill_waves;
-pub use spark_intake::{prefill_return_bytes, spark_intake_bytes, PrefillShape};
+pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};
 mod exl3_workspace;
-pub use exl3_workspace::exl3_workspace_bytes;
+pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
+pub use exl3_workspace::{exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;
@@ -1377,7 +1378,7 @@ mod tests {
         assert_eq!(requirements.requested_kv_floor_tokens, Some(2 << 20));
         assert_eq!(
             (requirements.concurrency, requirements.state_slots),
-            (4, 4)
+            (16, 16)
         );
         assert!(!requirements.compiled_index_extent_required);
         assert_eq!(requirements.target_only_layouts.len(), 2);

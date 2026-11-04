@@ -4,7 +4,8 @@ use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxSelectionPolic
 use crate::shared::experts::{
     exl3::{
         execution::{
-            Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace,
+            Exl3Epilogue, Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy,
+            Exl3Workspace,
         },
         Exl3Weights,
     },
@@ -256,7 +257,7 @@ impl<'a> Exl3Tp2<'a> {
         if selection == RtxSelectionPolicy::CanonicalDecode {
             Exl3ReductionPlan::new(&paths)?;
         }
-        Ok([Exl3Workspace::plan(&paths, Self::INPUT_FORMAT)?,
+        Ok([Exl3Workspace::plan(&paths, Self::INPUT_FORMAT, Exl3Epilogue::Sum)?,
             max_rows.checked_mul(hidden).and_then(|n| n.checked_mul(4))
                 .context("EXL3 TP2 output overflow")?])
     }
@@ -632,7 +633,7 @@ impl<'a> Exl3Tp2<'a> {
             self.selection,
         )?;
         self.executions = Some(self.device.own(|| {
-            let arena = Exl3Workspace::new(self.device.library, &paths)?;
+            let arena = Exl3Workspace::new(self.device.library, &paths, Exl3Epilogue::Sum)?;
             let modules = match modules {
                 Some(modules) => modules,
                 None => paths.iter().map(|path| {
@@ -654,6 +655,7 @@ impl<'a> Exl3Tp2<'a> {
                             self.device.library,
                             self.weights.get().clone(),
                             modules,
+                            Exl3Epilogue::Sum,
                             Some(arena.clone()),
                         )?
                     };

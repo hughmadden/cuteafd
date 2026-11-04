@@ -7,8 +7,13 @@
 //! ([`GlmContext`]); owned attention follows the shared prefill wave policy.
 use crate::families::glm5::{names::Operand, GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
-use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
+use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance, Exl3Epilogue};
 use cuteafd_core::memory_layout::{Basis, Category};
+
+pub mod buffers;
+pub mod exchanges;
+pub mod hooks;
+pub mod weights;
 
 pub const PAGE_ROWS: u64 = 64;
 pub const DECODE_ROWS: u64 = 64;
@@ -279,6 +284,7 @@ pub fn slot_views(unit_rows: u64, slots: u64) -> Vec<std::ops::Range<u64>> {
 /// weights and already-loaded code belong to the caller's baseline, not layers.
 #[derive(Debug, Clone)]
 pub struct GlmInputs<'a> {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub cfg: &'a GlmDsaConfig,
     pub layers: usize,
     pub gpus: Vec<(u64, Baseline)>,
@@ -435,9 +441,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             if inputs.spark_ranks > 0 {
                 // Decode owns only decode-width planes; every Spark layout
                 // has separate prefill return slots, including pinned one-wave.
-                let prefill = crate::serving_capacity::prefill_return_bytes(1,
+                let prefill = crate::serving_capacity::prefill_return_bytes_with_format(1,
                     prefill_span(inputs.prefill_rows, inputs.prefill_lanes),
-                    inputs.spark_ranks as u64, cfg.hidden as u64);
+                    inputs.spark_ranks as u64, cfg.hidden as u64, inputs.spark_reply_format)
+                    .map_err(|_| PlacementError::Inventory("GLM Spark reply width or allocation overflow"))?;
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
                     crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64,
                         DECODE_ROWS, cfg.hidden as u64) + prefill, Basis::Formula)));
@@ -945,7 +952,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
         // Runtime separately attests ELF geometry and LUT hashes before execution.
         Ok(value)
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    let backend_workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+    let backend_workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
         + max_rows * shape.hidden as u64 * 4;
     let mut experts = Vec::new();
     for layer in shape.first_layer..selected_layers {
@@ -1154,7 +1161,7 @@ mod tests {
     }
 
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
-        GlmInputs { cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
+        GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
             headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, native_dense: Vec::new(), native_head: false, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, automatic_context: true, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),
@@ -1207,6 +1214,35 @@ mod tests {
         assert!(exlr8_expert_costs(root.path(), "missing", 3, 4, &records).is_err());
         assert_eq!(crate::plan::exlr8::spark_resident_bytes(root.path(), "up1", &[], 0).unwrap(), Vec::<u64>::new());
         assert!(crate::plan::exlr8::spark_resident_bytes(root.path(), "up1", &[], 2).is_err());
+    }
+
+    #[test]
+    fn combined_reply_formats_reuse_bf16_capacity_for_glm_and_ml4() {
+        let glm = config();
+        let ml4 = GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap();
+        for cfg in [&glm, &ml4] {
+            for gpus in [1, 2] {
+                let mut input = inputs(cfg, &vec![96 * GIB; gpus]);
+                for lanes in 1..=4 {
+                    input.prefill_lanes = lanes;
+                    input.prefill_rows = 2752;
+                    let h = cfg.hidden as u64;
+                    let rows = lanes * input.prefill_rows;
+                    for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
+                        input.spark_reply_format = format;
+                        let request = request(&input).unwrap();
+                        let intake = request.fixed.iter().filter(|d| d.group == "Spark intake planes")
+                            .collect::<Vec<_>>();
+                        assert_eq!(intake.len(), 1);
+                        assert_eq!(intake[0].gpu, 0);
+                        assert_eq!(intake[0].bytes, 4 * (
+                            cuteafd_core::serving_capacity::spark_intake_allocation_bytes(DECODE_ROWS * h * 2).unwrap()
+                            + cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * h * 2).unwrap()));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

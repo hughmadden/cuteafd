@@ -50,6 +50,8 @@ const MAX_HEADER: usize = 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct MuseParserOptions {
+    /// The prompt already contains the final user recipient and message marker.
+    pub prefilled_user: bool,
     /// Declared tools; `None` makes a tool-addressed message end the output.
     pub tools: Option<Vec<ToolDefinition>>,
     /// Client stop sequences, matched in visible content only.
@@ -82,7 +84,8 @@ pub struct MuseOutputParser {
 impl MuseOutputParser {
     pub fn new(mut options: MuseParserOptions) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
-        Self { options, mode: Mode::Header, pending: String::new(), recipient: Recipient::Visible, body: String::new(),
+        let mode = if options.prefilled_user { Mode::Body } else { Mode::Header };
+        Self { options, mode, pending: String::new(), recipient: Recipient::Visible, body: String::new(),
             calls: 0, content_started: false, held_whitespace: String::new(), stop: None }
     }
 

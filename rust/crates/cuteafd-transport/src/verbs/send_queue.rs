@@ -84,7 +84,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             self.response_capacity_wire_bytes.min(config.max_frame_bytes));
         let encode_ms = elapsed_ms_optional(total_started);
         if let Some(slice) = landing {
-            self.post_placed_receive(slice, expected_response, request.header.row_count as usize)?;
+            self.post_placed_receive(slice, request)?;
         }
         // Source slot: the SEND that used it last has completed.
         while self.request_sends.in_flight() >= self.request_ring.depth {
@@ -133,14 +133,33 @@ impl VerbsHostProtocolV2PersistentClientSession {
     }
 }
 
-/// The most payload bytes a GPU-landed reply carries. A landed reply is one
-/// unindexed plane (`parse_landed_header` refuses row indices), so the ring's
-/// conservative bound minus its header and row-index prefix: rows x output
-/// row bytes.
-fn landed_payload_bound(expected_response: usize, rows: usize) -> Result<usize> {
-    let row_indices = rows.checked_mul(std::mem::size_of::<u32>()).context("reply row-index bytes overflow")?;
-    expected_response.checked_sub(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + row_indices)
-        .context("expected reply is shorter than its header")
+/// A placed receive uses this request's negotiated plane, not the reusable
+/// ring's BF16 capacity bound. Fallback requests have their compressed flags cleared.
+fn landed_payload_bytes(request: &ExpertProtocolV2Request) -> Result<usize> {
+    let rows = request.header.row_count as usize;
+    if let Some(plan) = &request.partial {
+        anyhow::ensure!(rows > 0 && request.header.route_count as usize % rows == 0,
+            "GPU-landed partial reply needs a uniform top-k per row");
+        return Ok(plan.payload(request.header.route_count as usize / rows,
+            request.header.hidden_dim as usize)?.3);
+    }
+    let hidden = request.header.hidden_dim as usize;
+    let row_bytes = if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
+        ExpertV2Dtype::Nvfp4E2m1Fp8E4m3.row_bytes(hidden)?
+    } else if request.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32 != 0 {
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32.row_bytes(hidden)?
+    } else {
+        // Packed ingress may still produce BF16 output without reply compression.
+        (request.header.hidden_row_stride_bytes as usize).max(ExpertV2Dtype::Bf16.row_bytes(hidden)?)
+    };
+    rows.checked_mul(row_bytes).context("GPU-landed reply payload byte count overflow")
+}
+
+fn validate_placed_payload(request: &ExpertProtocolV2Request, slice: LandingSlice) -> Result<()> {
+    let payload = landed_payload_bytes(request)?;
+    anyhow::ensure!(payload <= slice.bytes,
+        "a reply of {payload} payload bytes exceeds its {}-byte landing slice", slice.bytes);
+    Ok(())
 }
 
 impl VerbsHostProtocolV2PersistentClientSession {
@@ -148,13 +167,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
     /// of the response ring (replies complete in post order on this QP), its
     /// payload into `slice` of the registered landing range. At most a ring of
     /// replies may be outstanding, so header slots are never reused early.
-    fn post_placed_receive(&mut self, slice: LandingSlice, expected_response: usize, rows: usize) -> Result<()> {
+    fn post_placed_receive(&mut self, slice: LandingSlice, request: &ExpertProtocolV2Request) -> Result<()> {
         let outstanding = self.response_post_sequence.wrapping_sub(self.response_recv_sequence);
         anyhow::ensure!(outstanding < self.response_ring.depth,
             "placed GPU landing has {outstanding} replies outstanding, its header ring holds {}", self.response_ring.depth);
-        let payload = landed_payload_bound(expected_response, rows)?;
-        anyhow::ensure!(payload <= slice.bytes,
-            "a reply of {payload} payload bytes exceeds its {}-byte landing slice", slice.bytes);
+        validate_placed_payload(request, slice)?;
         let sequence = self.response_post_sequence;
         let wr_id = VERBS_HOST_RECV_WR_ID + (sequence % self.response_ring.depth) as u64;
         // SAFETY: the range was registered at connect and is kept allocated by
@@ -204,9 +221,86 @@ mod tests {
             (0..rows).map(|row| crate::ExpertProtocolV2RowDescriptor { row_id: row as u64,
                 source_kind: crate::ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row as u64,
                 route_offset: 0, route_count: 0 }).collect(), vec![], bytes::Bytes::from(vec![0u8; rows * hidden as usize * 2]))?;
-        let expected = verbs_host_expected_response_wire_bytes(&request)?;
-        assert_eq!(landed_payload_bound(expected, rows)?, rows * hidden as usize * 2);
-        assert!(landed_payload_bound(10, rows).is_err());
+        let payload = rows * hidden as usize * 2;
+        assert_eq!(landed_payload_bytes(&request)?, payload);
+        validate_placed_payload(&request, LandingSlice { offset: 0, bytes: payload })?;
+        assert!(validate_placed_payload(&request, LandingSlice { offset: 0, bytes: payload - 1 }).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_warmup_placed_landing_matches_worker_reply_and_fallback() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_TEST_HYBRID_REPLY_LANDING";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "verbs::send_queue::tests::hybrid_warmup_placed_landing_matches_worker_reply_and_fallback", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            anyhow::ensure!(status.success(), "GLM Flash hybrid landing child failed");
+            return Ok(());
+        }
+        use crate::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
+            ExpertV2SourceKind::{Decode, MtpVerify, Prefill}};
+        use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
+        let geometry = cuteafd_core::ExpertGeometry::GLM5_FLASH;
+        cuteafd_core::set_expert_geometry(geometry).unwrap();
+        let onboarded = 3..24;
+        let spark_layers = 24..45;
+        assert!(onboarded.end == spark_layers.start && spark_layers.end == geometry.layers);
+        for selected in [Bf16, Fp8, Nvfp4] {
+            for (sources, eligible) in [
+                (vec![(2752, Prefill)], true),
+                (vec![(65, Prefill)], true),
+                (vec![(64, Prefill)], false),
+                (vec![(65, Prefill), (64, Prefill)], false),
+                (vec![(65, Prefill), (1, Decode)], false),
+                (vec![(65, Prefill), (1, MtpVerify)], false),
+            ] {
+                let origins: Vec<_> = sources.iter().enumerate().flat_map(|(id, &(rows, kind))|
+                    std::iter::repeat_n((id as u64 + 1, kind), rows)).collect();
+                let rows = origins.len();
+                let mut request = ExpertProtocolV2Request::new_bytes(1, 1, spark_layers.start,
+                    geometry.hidden, ExpertV2Dtype::Bf16,
+                    origins.iter().enumerate().map(|(row, &(source_request_id, source_kind))|
+                        ExpertProtocolV2RowDescriptor { row_id: row as u64, source_kind, source_request_id,
+                            token_position: row as u64, route_offset: row as u32 * geometry.topk,
+                            route_count: geometry.topk }).collect(),
+                    (0..rows as u32 * geometry.topk).map(|route| ExpertProtocolV2RouteEntry {
+                        row_index: route / geometry.topk, expert_id: route % geometry.topk,
+                        gate_weight: 1.0 / geometry.topk as f32 }).collect(),
+                    bytes::Bytes::from(vec![0; rows * geometry.row_bytes() as usize]))?;
+                request.header.flags |= crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                let format = if eligible { selected } else { Bf16 };
+                assert_eq!(request.select_combined_reply(selected)?.format, format);
+                let encoded = request.encode()?;
+                let worker = crate::expert::BackboneRequest::parse(&encoded, 2752)?;
+                assert!(spark_layers.contains(&worker.layer()) && !onboarded.contains(&worker.layer()));
+                let payload_bytes = rows * format.row_bytes(geometry.hidden as usize).unwrap();
+                assert_eq!(worker.plane_bytes()?, payload_bytes);
+                assert_eq!(landed_payload_bytes(&request)?, payload_bytes);
+                let slice = LandingSlice { offset: 2 * 2752 * geometry.row_bytes() as usize,
+                    bytes: payload_bytes };
+                validate_placed_payload(&request, slice)?;
+                assert!(validate_placed_payload(&request, LandingSlice { bytes: payload_bytes - 1, ..slice }).is_err());
+                // The session still reserves enough for a later BF16 fallback.
+                let ring_bound = verbs_host_expected_response_wire_bytes(&request)?;
+                assert_eq!(ring_bound, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
+                    + rows * (4 + geometry.row_bytes() as usize));
+                if !eligible && selected != Bf16 {
+                    let compressed_bytes = rows * selected.row_bytes(geometry.hidden as usize).unwrap();
+                    assert!(validate_placed_payload(&request, LandingSlice { bytes: compressed_bytes, ..slice }).is_err());
+                }
+                let payload = vec![0; payload_bytes];
+                let response = worker.response(11, &payload)?;
+                let mut frame = ExpertProtocolV2FrameBuffer::default();
+                let prefix = frame.encode_borrowed_response_prefix(&response)?;
+                let header = ExpertProtocolV2ResponseView::parse_landed_header(prefix)?;
+                assert_eq!(header.output_payload_bytes as usize, slice.bytes);
+                let mut assembler = ProtocolV2ResponseChunkAssembler::validation_only(&request);
+                assembler.accept_landed(&request, &header)?;
+                assembler.finish_validation()?;
+                assert_eq!(landed_payload_bytes(&request.clone().with_debug_checksum())?, payload_bytes);
+            }
+        }
         Ok(())
     }
 

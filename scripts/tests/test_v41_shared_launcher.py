@@ -10,6 +10,7 @@ their defaults, with no V4.1 code.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from v41_launch_capture import CASES, FIXTURES, KIT_CARDS, ROOT, capture, parse_run, namespace_launch_contract  # noqa: E402
+from v41_launch_capture import CASES, FIXTURES, HOSTS, KIT_CARDS, ROOT, capture, parse_run, namespace_launch_contract  # noqa: E402
 
 # Environment the shared launcher adds, by role, at its default values. Each
 # comes from a shared helper in scripts/launch/run-family.sh:
@@ -129,6 +130,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
+        if role == "coordinator" and value("--rtx-gpus") == "2" and "--dspark" in expected_command:
+            expected_command.append("--tp2-dspark-experts")
         if role == "worker":
             # Old captures confused the weight ceiling (100 GiB) with the
             # planner's automatic CUDA allocation ceiling (108 GiB).
@@ -171,7 +174,16 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                       "--deployment-peers", command[command.index("--peers") + 1]]
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
-        expected[index:index] = ["--mapped-scale-preload-gib", "0"]
+        expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config"]
+        enabled = command[command.index("--rtx-gpus") + 1] == "2" and "--dspark" in command
+        draft_limit = command[command.index("--dspark-draft-limit") + 1] if "--dspark-draft-limit" in command else ""
+        available = int(expected[expected.index("--available-sparks") + 1])
+        normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
+                      f"DSPARK_DRAFT_LIMIT={draft_limit}\n"
+                      + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
+        digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+        mount_index = expected.index("-v") + 2
+        expected[mount_index:mount_index] = ["-v", f"<root>/hosts/raptor/.cache/cuteafd/run-config/plan-{digest}.config:/run/cuteafd-plan.config:ro"]
         expected = [value.replace("/hf/hub/", "<root>/hf/hub/").replace("HF_HOME=/hf", "HF_HOME=/mnt/sparknest/hf-home") for value in expected]
         expected = ["/mnt/sparknest:/mnt/sparknest:ro" if value.endswith(":/hf/hub:ro") else value for value in expected]
         expected_plans.append(expected)
@@ -327,6 +339,50 @@ def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> No
         assert worker["CUTEAFD_THERMAL"] == "off"
         assert worker["CUTEAFD_EXPERT_TIMING"] == "1"
         assert worker["CUTEAFD_PROFILE_HOST"] == container["host"]
+
+
+@pytest.mark.parametrize("keys", [(), ("MEDIA_FEATURES_DIR",), ("AUDIO_FEATURES_DIR",),
+                                 ("MEDIA_FEATURES_DIR", "AUDIO_FEATURES_DIR")])
+def test_reference_features_mount_read_only_only_when_set(tmp_root, monkeypatch, keys) -> None:
+    import v41_launch_capture as capture_module
+
+    roots = {key: tmp_root / key.lower()
+             for key in ("MEDIA_FEATURES_DIR", "AUDIO_FEATURES_DIR")}
+    for root in roots.values():
+        root.mkdir(exist_ok=True)
+    original = capture_module.example_config
+
+    def with_keys(name, directory):
+        return capture_module.append_config(original(name, directory),
+            "".join(f"{key}={roots[key]}\n" for key in keys))
+
+    monkeypatch.setattr(capture_module, "example_config", with_keys)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    for container in result["containers"]:
+        run = parse_run(container["argv"])
+        for key, root in roots.items():
+            enabled = key in keys and container["host"] == "raptor"
+            assert run["env"].get("CUTEAFD_" + key) == (str(root) if enabled else None)
+            assert (f"{root}:{root}:ro" in run["mounts"]) == enabled
+            assert f"{root}:{root}" not in run["mounts"]
+
+
+@pytest.mark.parametrize("key", ["MEDIA_FEATURES_DIR", "AUDIO_FEATURES_DIR"])
+@pytest.mark.parametrize("invalid", ["relative", "missing", "file"])
+def test_reference_features_reject_invalid_directory(tmp_root, monkeypatch, key, invalid) -> None:
+    import v41_launch_capture as capture_module
+
+    value = {"relative": "relative", "missing": str(tmp_root / "missing"),
+             "file": str(tmp_root / "not-directory")}[invalid]
+    (tmp_root / "not-directory").write_text("not a directory")
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        return capture_module.append_config(original(name, directory), f"{key}={value}\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    with pytest.raises(RuntimeError, match=f"{key} must be an existing absolute directory"):
+        capture_module.capture(ROOT, "deepseek-v41-mxfp4-max", dry_run=True)
 
 
 def test_serving_containers_keep_namespace_paths_and_host_identity() -> None:

@@ -105,11 +105,12 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
 /// the `slots` prefill slots' reduce output at the unit `rows` (slot 0's FFN
 /// owner also holds the link), and the one prefill link's intake: every
 /// rank's partial-sum plane over its `slots` return slots.
-pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize) -> Result<u64> {
+pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize,
+    format: cuteafd_core::SparkReplyFormat) -> Result<u64> {
     ensure!((1..=4).contains(&slots), "invalid V4.1 prefill slots");
     let lanes = 2 * transport_bytes(decode_rows, ranks)?;
     let outputs = slots as u64 * rows * 5120 * 2;
-    Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes(slots as u64, rows, ranks as u64, 5120))
+    Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes_with_format(slots as u64, rows, ranks as u64, 5120, format)?)
 }
 
 /// Full vocabulary packing peak above the pre-weight sample: the resident
@@ -431,7 +432,16 @@ impl<'a> NativePrograms<'a> {
             ("kernel_intermediate", 2304), ("experts", 128), ("topk", 3)] {
             ensure!(experts["geometry"][key].as_u64() == Some(expected), "dSpark expert geometry mismatch: {key}");
         }
-        let DsparkWave { lanes, members, live, capacity, expert } = DsparkWave::new(experts, requests, width)?;
+        let lanes = if requests == 1 { 1 } else { 2 };
+        let members = requests.div_ceil(lanes);
+        let live = members * width;
+        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
+        let variants = experts["variants"].as_array().context("missing dSpark expert variants")?;
+        let matching: Vec<_> = variants.iter().filter(|v|
+            v.get("requested_rows").unwrap_or(&v["capacity_rows"]).as_u64() == Some(capacity)).collect();
+        ensure!(matching.len() == 1, "missing or duplicate dSpark expert capacity {capacity}");
+        let expert = matching[0]["core_scratch_nbytes"].as_u64().context("missing dSpark expert scratch")?
+            + capacity * (10240 + 3 * 8 + 2 * 10240);
         let output = self.projection(capacity, 8192, 5120)?
             + self.scratch(capacity, 32768, 8192)? + 4 + capacity * (65536 + 256);
         let attention = live * (1024 + 8) + cuteafd_core::V41_READ_DESCRIPTOR_BYTES as u64 + output
@@ -463,39 +473,45 @@ impl<'a> NativePrograms<'a> {
         Ok(out)
     }
 
-    /// `--tp2-dspark-experts`: the peer GPU's expert waves, one per stage and
-    /// lane. Bounded by the whole-width coordinator wave until the dSpark TP2
-    /// role publishes its own workspace manifest (`dspark` keeps charging the
-    /// whole-width waves on the decoder, also a bound for its half).
-    pub fn dspark_tp2_expert_waves(&self, experts: &Value, requests: u64, width: u64) -> Result<u64> {
-        let wave = DsparkWave::new(experts, requests, width)?;
-        wave.lanes.checked_mul(3).and_then(|n| n.checked_mul(wave.expert)).context("dSpark TP2 expert waves overflow")
-    }
-}
-
-/// One dSpark request lane's expert wave at its compiled capacity.
-struct DsparkWave {
-    lanes: u64,
-    members: u64,
-    live: u64,
-    capacity: u64,
-    /// One stage's coordinator expert wave: core scratch plus its row planes.
-    expert: u64,
-}
-
-impl DsparkWave {
-    fn new(experts: &Value, requests: u64, width: u64) -> Result<Self> {
+    /// Replace each full draft FFN by its native TP2 fork/join owners. The
+    /// scratch maximum covers every installed variant the runtime retains.
+    pub fn dspark_tp2(&self, experts: &Value, halves: &Value, rows: u64, requests: u64,
+        width: u64, head_mode: Fp8Head) -> Result<Vec<Demand>> {
+        let mut out = self.dspark(experts, rows, requests, width, 2, head_mode)?;
+        ensure!(halves["role"] == "dspark_tp2" && halves["input_format"] == "fp8_k32",
+            "invalid V4.1 TP2 draft expert manifest role/input");
+        for (key, expected) in [("hidden", 5120), ("intermediate", 1152),
+            ("kernel_intermediate", 1152), ("experts", 128), ("topk", 3)] {
+            ensure!(halves["geometry"][key].as_u64() == Some(expected),
+                "V4.1 TP2 draft expert geometry mismatch: {key}");
+        }
         let lanes = if requests == 1 { 1 } else { 2 };
-        let members = requests.div_ceil(lanes);
-        let live = members * width;
-        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
+        let live = requests.div_ceil(lanes) * width;
+        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 }
+            else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 }
+            else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
+        let cover = [1u64, 16, 80, 256, 1024, 4096].into_iter().find(|&c| c >= capacity)
+            .context("V4.1 TP2 draft capacity out of range")?;
+        let variants = halves["variants"].as_array().context("missing V4.1 TP2 draft variants")?;
+        let mut scratch = 0;
+        for cap in [1, 16, 80, 256, 1024, 4096].into_iter().filter(|&c| c <= cover) {
+            let matching: Vec<_> = variants.iter().filter(|v| v["capacity_rows"].as_u64() == Some(cap)).collect();
+            ensure!(matching.len() == 1, "missing or duplicate V4.1 TP2 draft capacity {cap}");
+            scratch = scratch.max(matching[0]["core_scratch_nbytes"].as_u64()
+                .context("missing V4.1 TP2 draft scratch")?);
+        }
         let variants = experts["variants"].as_array().context("missing dSpark expert variants")?;
-        let matching: Vec<_> = variants.iter().filter(|v|
-            v.get("requested_rows").unwrap_or(&v["capacity_rows"]).as_u64() == Some(capacity)).collect();
-        ensure!(matching.len() == 1, "missing or duplicate dSpark expert capacity {capacity}");
-        let expert = matching[0]["core_scratch_nbytes"].as_u64().context("missing dSpark expert scratch")?
-            + capacity * (10240 + 3 * 8 + 2 * 10240);
-        Ok(Self { lanes, members, live, capacity, expert })
+        let full = variants.iter().find(|v| v.get("requested_rows").unwrap_or(&v["capacity_rows"]).as_u64() == Some(capacity))
+            .context("missing full dSpark capacity")?["core_scratch_nbytes"].as_u64()
+            .context("missing full dSpark scratch")? + capacity * (10240 + 3 * 8 + 2 * 10240);
+        let peer = scratch + capacity * (5280 + 12 + 12);
+        let home = scratch + capacity * (5280 + 3 * 5120 * 4 + 10240 + 2 * 10240 + 24);
+        for demand in out.iter_mut().filter(|d| d.group == "dSpark request lanes") {
+            demand.bytes = if demand.gpu == 0 { demand.bytes + lanes * 3 * peer }
+                else { demand.bytes.checked_sub(lanes * 3 * full).context("V4.1 full draft owner underflow")?
+                    + lanes * 3 * home };
+        }
+        Ok(out)
     }
 }
 
@@ -563,7 +579,7 @@ mod tests {
                     + decode_rows * 20480;
                 assert_eq!(transport_bytes(decode_rows, ranks)?, decode);
                 let outputs = 3 * 2752 * 10240;
-                assert_eq!(transports_bytes(decode_rows, 2752, ranks, 3)?,
+                assert_eq!(transports_bytes(decode_rows, 2752, ranks, 3, cuteafd_core::SparkReplyFormat::Bf16)?,
                     2 * decode + outputs + ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * 2752 * 10240)?);
             }
         }
@@ -816,6 +832,38 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tp2_draft_owners_charge_each_stage_fork_join_at_the_covering_capacity() -> Result<()> {
+        let fp8 = manifest();
+        let programs = NativePrograms::new(&fp8, 188)?;
+        let experts = experts();
+        let mut halves = json!({"role":"dspark_tp2", "input_format":"fp8_k32", "geometry":{
+            "hidden":5120, "intermediate":1152, "kernel_intermediate":1152, "experts":128, "topk":3},
+            "variants": ([1, 16, 80, 256].map(|rows| json!({"capacity_rows":rows, "core_scratch_nbytes":rows * 11}))) });
+        for requests in [1u64, 2, 16, 32, 64] {
+            for width in [5, 7] {
+                let lanes = if requests == 1 { 1 } else { 2 };
+                let live = requests.div_ceil(lanes) * width;
+                let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= 80 { 80 } else { 256 };
+                let cover = if capacity <= 16 { 16 } else if capacity <= 80 { 80 } else { 256 };
+                let full = programs.dspark(&experts, 1024, requests, width, 2, Fp8Head::All)?;
+                let split = programs.dspark_tp2(&experts, &halves, 1024, requests, width, Fp8Head::All)?;
+                let scratch = cover * 11;
+                assert_eq!(owner(&split, 0, "dSpark request lanes") - owner(&full, 0, "dSpark request lanes"),
+                    lanes * 3 * (scratch + capacity * 5304));
+                assert_eq!(owner(&split, 1, "dSpark request lanes"),
+                    owner(&full, 1, "dSpark request lanes") - lanes * 3 * capacity * (7 + 30744)
+                        + lanes * 3 * (scratch + capacity * 97464));
+                for group in ["dSpark main context", "dSpark windows"] {
+                    assert_eq!(owner(&split, 1, group), owner(&full, 1, group));
+                }
+            }
+        }
+        halves["variants"].as_array_mut().unwrap().remove(1);
+        assert!(programs.dspark_tp2(&experts, &halves, 1024, 1, 5, Fp8Head::All).is_err());
         Ok(())
     }
 

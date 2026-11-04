@@ -106,6 +106,38 @@ def test_flash_native_published_manifest_reaches_plan_coordinator_and_workers(tm
         assert "--exlr8-prefill-activations a16" in line
 
 
+@pytest.mark.parametrize("attention", ["auto", "heads", "context"])
+@pytest.mark.parametrize("wip", [False, True])
+def test_flash_native_tp2_without_sparks_leaves_attention_to_planner(tmp_path, attention, wip):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = ("EXLR8_MANIFEST=k4\nEXLR8_PREFILL_ACTIVATIONS=a16\nSPARK_COUNT=0\nRTX_GPUS=2\n"
+            "COORDINATOR_GPUS=0,1\nEXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            f"ATTENTION_PLACEMENT={attention}\n")
+    result = _family_launch_result(tmp_path, config, "test/flash-exlr8-tp2", keys,
+                                  extra_args=("--wip", "native-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    coordinators = [line for line in result.stderr.splitlines() if "cuteafd serve-glmf --snapshot" in line]
+    assert plans and coordinators, result.stderr
+    assert not any("cuteafd expertd-native" in line for line in result.stderr.splitlines())
+    for line in plans:
+        argv = shlex.split(line)
+        assert argv[argv.index("--attention-placement") + 1] == attention
+    assert f"CUTEAFD_ATTENTION_PLACEMENT={attention}" in coordinators[0]
+    assert "--split-device 1" in coordinators[0]
+
+
+def test_glm_native_without_sparks_still_refuses(tmp_path):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = ("EXLR8_MANIFEST=up1\nSPARK_COUNT=0\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\n"
+            "EXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/glm-exlr8-local", keys)
+    assert result.returncode != 0
+    assert "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks" in result.stderr
+
+
 @pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
 def test_native_manifest_rejects_paths_and_shell_syntax(tmp_path, manifest):
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
@@ -1054,8 +1086,8 @@ def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     """Inspect actual launcher validation for declared native coordinator worlds."""
     deployment = json.loads(deployment_path.read_text())
     assert deployment["family"] == "glm5_flash"
-    admitted = deployment["rtx_gpus"] == 1
-    assert deployment["wip_launchable"] == admitted
+    assert deployment["rtx_gpus"] in (1, 2)
+    assert deployment["wip_launchable"] is True
     source = (ROOT / "scripts/launch/run-family.sh").read_text()
     functions = []
     for name in ("release_spark_worker_budget", "release_validate_deployment"):
@@ -1069,17 +1101,12 @@ plan="$(cat "$1")"
 release_spark_worker_budget "$plan" "$2"
 release_validate_deployment "$plan" glm5_flash
 '''
-    result = subprocess.run(["bash", "-euc", script, "pending-native", str(deployment_path),
+    result = subprocess.run(["bash", "-euc", script, "native-capability", str(deployment_path),
                              str(deployment["spark_ranks"])], capture_output=True, text=True)
     devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
     assert len(devices) == deployment["spark_ranks"]
     assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
-    if admitted:
-        assert result.returncode == 0, result.stderr
-    else:
-        assert result.returncode != 0
-        assert "EXLR8 native dense execution is unsupported for 2 coordinator GPUs" in result.stderr
-        assert "invalid deployment specification" in result.stderr
+    assert result.returncode == 0, result.stderr
 
 
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
@@ -1306,21 +1333,22 @@ def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, bu
     ("32.001", 98304, "", 16), ("96", 32768, "", 8),
     ("32", 98304, "config", 4), ("", 98304, "set", 4),
 ])
-def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, budget, total, override, expected):
+@pytest.mark.parametrize("rtx_gpus", [1, 2])
+def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, budget, total, override, expected, rtx_gpus):
     config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
               if family == "glm5" else {"model_type": "deepseek_v4"}
               if family == "deepseek_v4" else {"model_type": "deepseek_v41"}
               if family == "deepseek_v41" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
-    keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\n"
+    keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS={rtx_gpus}\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
     if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
     if override:
         keys += f"CONCURRENCY={4 if override == 'config' else 7}\n"
-    result = _family_launch_result(tmp_path, config, model, keys, gpu_total_mib=total,
-                                   gpu_free_mib=total - 1024,
+    result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=tuple(range(rtx_gpus)),
+                                   gpu_total_mib=total, gpu_free_mib=total - 1024,
                                    extra_args=("--set", "CONCURRENCY=4") if override == "set" else ())
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
@@ -3749,18 +3777,20 @@ def test_glmf_draft_defaults_apply_only_to_the_fp8_drafter(tmp_path, fp8):
     assert ("--draft-linear w8a8" in serve) == (fp8 != "off")
 
 
-def test_glmf_plan_counts_follow_serve_glmf_formulas():
-    """State and mark lanes derive from admitted concurrency, without launcher duplicates."""
-    glmf = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
-    serving, engine_args, engine = ((glmf / name).read_text() for name in ("serve.rs", "mod.rs", "engine.rs"))
-    assert "engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;" in serving
-    assert "    let lanes = max_sequences;" in serving
-    assert "PrefixMarks::Arena => super::prefix::ArenaMarks::Rule(prefix.mark_rule(lanes))," in serving
-    assert "    #[arg(long, default_value_t = 8)]\n    pub slots: usize,\n" in engine_args
-    assert "pub(crate) const DECODE_ROWS: usize = 64;" in engine
-    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert '--state-slots "$((glmf_sequences' not in launcher
-    assert '--mark-lanes "$((glmf_sequences' not in launcher
+@pytest.mark.parametrize("concurrency", [1, 8, 16, 32, 64])
+def test_glmf_plan_counts_follow_serve_glmf_formulas(tmp_path, concurrency):
+    """Only boot concurrency is forwarded; native serve derives state/mark capacity.
+
+    Rust's planner_and_serving_share_draft_head_capacity_and_charge exercises
+    the real planner, serve capacity and prefix-mark functions for these counts.
+    """
+    result = _family_launch_result(tmp_path, _GLMF, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=1\nSPECULATOR=off\nCONCURRENCY={concurrency}\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    argv = shlex.split(serve)
+    assert argv[argv.index("--max-sequences") + 1] == str(concurrency)
+    assert not {"--state-slots", "--mark-lanes", "--slots"}.intersection(argv)
 
 
 @pytest.mark.parametrize("value", ["0", "eight", "-4"])

@@ -359,6 +359,10 @@ if [[ "$coordinator_aot" == ON ]]; then
         "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
     fi
   done
+  if [[ -f "$build_root/native/v41_dspark_tp2_experts/v41_experts.json" ]]; then
+    install -m 0644 "$build_root/native/v41_dspark_tp2_experts/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"
+  fi
 fi
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is
@@ -385,8 +389,9 @@ PY_CHECK
 else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
 fi
-# DeepSeek V4 coordinator program manifest (an empty table when not built).
-if [[ -s "$build_root/native/dsv4_programs/dsv4_programs.json" ]]; then
+# Every expert release enables native V4.1 and EXL3 packages, so its codec
+# table must exist. Do not silently publish an empty manifest on build failure.
+if [[ "$role" == expert || -s "$build_root/native/dsv4_programs/dsv4_programs.json" ]]; then
   install -m 0644 "$build_root/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"

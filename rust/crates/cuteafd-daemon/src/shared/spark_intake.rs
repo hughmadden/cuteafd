@@ -331,6 +331,8 @@ pub(crate) struct SparkIntake<'a> {
     row_bytes: usize,
     /// One allocation per rank holding its whole reserve range.
     planes: Vec<IntakePlane<'a>>,
+    /// The exchange's storage, retained past its close ([`Self::exchange_storage`]).
+    exchange_storage: RefCell<Option<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>>>,
     /// Admitted return slots.
     waves: usize,
     geometry: RefCell<SlotGeometry>,
@@ -394,7 +396,7 @@ impl<'a> SparkIntake<'a> {
         let copy_stream = library.cuda_stream_create()?;
         Ok(Self {
             library, mode, ranks, row_bytes, planes, waves, geometry: RefCell::new(geometry), staging, copy_stream,
-            held: RefCell::new(Vec::new()),
+            exchange_storage: RefCell::new(None), held: RefCell::new(Vec::new()),
         })
     }
 
@@ -514,6 +516,24 @@ impl<'a> SparkIntake<'a> {
 
     pub(crate) fn terminal_release_payloads(&self) {
         self.held.borrow_mut().clear();
+        self.exchange_storage.borrow_mut().take();
+    }
+
+    /// The exchange's control words, pull descriptors and reply codec, held
+    /// here past a consuming [`crate::shared::spark_waves::Waves::close`]
+    /// until terminal consumer drainage: called initially or after the link's
+    /// reset proved consumer drainage.
+    pub(crate) fn exchange_storage(&self, geometry: &crate::shared::spark_waves::Intake)
+        -> Result<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>> {
+        let mut retained = self.exchange_storage.borrow_mut();
+        if let Some(storage) = retained.as_ref() {
+            ensure!(storage.matches(geometry), "exchange storage geometry changed across reset");
+            ensure!(std::rc::Rc::strong_count(storage) == 1, "previous exchange still owns its storage");
+            storage.reset_drained();
+        } else {
+            *retained = Some(std::rc::Rc::new(crate::shared::spark_waves::ExchangeStorage::new(self.library, geometry)?));
+        }
+        Ok(retained.as_ref().unwrap().clone())
     }
 
     fn upload_staging(&self, landed: u8, plane_bytes: usize, stream: *mut c_void) -> Result<()> {
@@ -839,6 +859,7 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
 
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
+    prefill: bool,
     intake: std::rc::Rc<SparkIntake<'a>>,
     /// Bytes of the transport's egress buffer (0: none).
     egress_bytes: usize,
@@ -867,7 +888,9 @@ impl<'a> SparkLink<'a> {
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
-        Self::new_waves(library, world, peers, capacity, config, row_bytes, 1, capacity)
+        let timing = config.timing;
+        let transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        Self::with_egress_waves(library, transport, row_bytes, true, false, 1, capacity, timing)
     }
 
     /// A link admitting `waves` outstanding waves of up to `capacity` rows,
@@ -882,7 +905,7 @@ impl<'a> SparkLink<'a> {
         let timing = config.timing;
         let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
         transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, true, waves, wave_rows, timing)
+        Self::with_egress_waves(library, transport, row_bytes, true, true, waves, wave_rows, timing)
     }
 
     /// Return slots.
@@ -899,7 +922,7 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn from_transport(library: &'a NativeLibrary, transport: SparkExperts,
         row_bytes: usize, timing: bool) -> Result<Self> {
         let capacity = transport.capacity();
-        Self::with_egress_waves(library, transport, row_bytes, false, 1, capacity, timing)
+        Self::with_egress_waves(library, transport, row_bytes, false, false, 1, capacity, timing)
     }
 
     /// [`Self::from_transport`] with `waves` outstanding waves of `wave_rows`
@@ -908,11 +931,12 @@ impl<'a> SparkLink<'a> {
         row_bytes: usize, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
         ensure!((1..=transport.capacity()).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, false, waves, wave_rows, timing)
+        Self::with_egress_waves(library, transport, row_bytes, false, true, waves, wave_rows, timing)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
-        row_bytes: usize, enable_egress: bool, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
+        row_bytes: usize, enable_egress: bool, prefill: bool, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let ranks = transport.world_size();
         let capacity = transport.capacity();
@@ -926,7 +950,7 @@ impl<'a> SparkLink<'a> {
         // and its consume, both ordered by the exchange.
         unsafe { intake.attach(&mut transport)? };
         log_transfer_plan(mode, ranks);
-        Ok(Self { intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
+        Ok(Self { prefill, intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
             staging_bytes: 0, bootstrap: None, timing, world_size: ranks, capacity })
     }
@@ -1001,13 +1025,17 @@ impl<'a> SparkLink<'a> {
         tracing::info!(slots, bytes, registered, "Spark exchange staging");
         let landing = transport.gpu_landing_ranks().iter().enumerate()
             .fold(0u8, |bits, (rank, &landed)| if landed { bits | 1 << rank } else { bits });
-        let geometry = crate::shared::spark_waves::Intake { ranks: intake.ranks(), row_bytes: intake.row_bytes(),
+        let geometry = crate::shared::spark_waves::Intake { prefill: self.prefill, ranks: intake.ranks(), row_bytes: intake.row_bytes(),
             ranges: intake.ranges(), geometry: intake.geometry(),
             landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, placed: intake.placed() };
         // Read-only worker metadata, kept so callers need not reach the transport.
         let grouping = transport.installed_grouping().unwrap_or_default();
+        let storage = match intake.exchange_storage(&geometry) {
+            Ok(storage) => storage,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
-            arenas, self.timing)?);
+            arenas, self.timing, storage)?);
         Ok(())
     }
 
@@ -1111,6 +1139,49 @@ impl Drop for SparkLink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn mimo_endpoint_reservation_matches_allocated_backing() -> Result<()> {
+        use cuteafd_loader::families::mimo_v2::{admission, MimoExpertInput, MimoV2Config};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        for hidden in [17, 6144] {
+            let cfg = MimoV2Config::from_hf(&serde_json::json!({
+                "model_type": "mimo_v2", "num_hidden_layers": 1, "hidden_size": hidden,
+                "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 128,
+                "v_head_dim": 128, "rope_theta": 10000.0, "swa_rope_theta": 10000.0,
+                "sliding_window": 128, "vocab_size": 256, "intermediate_size": 256,
+                "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 128,
+            }))?;
+            for ranks in [1, 2, 6] { for rows in [1, 64, 256] { for waves in [1, 3, 4] {
+                // Reload resets the fake DSO's bounded, lifetime-wide event registry.
+                let library = fixture.load()?;
+                let endpoints = admission::spark_endpoints(rows, MimoExpertInput::Fp8)?;
+                let reservation = admission::transport_reservations(&cfg, 1, 0, rows, waves, ranks, cuteafd_core::SparkReplyFormat::Bf16)?;
+                let planned = reservation.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap().bytes;
+                let owner = "test/mimo-endpoint-reservation";
+                let _owner = cuteafd_ffi::memory_ledger::owner(owner);
+                let decode = SparkIntake::with_waves(&library, IntakeMode::Gpu, ranks,
+                    endpoints[0].capacity as usize, hidden * 2, 1)?;
+                let prefill = SparkIntake::with_waves(&library, IntakeMode::Gpu, ranks,
+                    endpoints[1].capacity as usize, hidden * 2, waves)?;
+                for (intake, slots) in [(&decode, 1), (&prefill, waves)] {
+                    let backing: u64 = intake.planes.iter().map(|plane| plane._allocation.buffer.bytes as u64).sum();
+                    assert_eq!(backing, cuteafd_loader::serving_capacity::prefill_return_bytes(
+                        slots as u64, intake.rows() as u64, ranks as u64, hidden as u64));
+                }
+                let actual = cuteafd_ffi::memory_ledger::snapshot()
+                    .by_owner(cuteafd_ffi::memory_ledger::Space::Device, library.cuda_get_device()?)
+                    .get(owner).copied().unwrap_or(0);
+                assert_eq!(planned, actual as u64, "hidden={hidden} ranks={ranks} rows={rows} waves={waves}");
+                drop((decode, prefill));
+                assert_eq!(cuteafd_ffi::memory_ledger::snapshot()
+                    .by_owner(cuteafd_ffi::memory_ledger::Space::Device, library.cuda_get_device()?)
+                    .get(owner).copied().unwrap_or(0), 0);
+            } } }
+        }
+        Ok(())
+    }
 
     #[test]
     fn padded_partial_reserve_keeps_logical_wave_offsets_and_plan_charge() -> Result<()> {

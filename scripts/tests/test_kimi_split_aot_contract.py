@@ -15,6 +15,8 @@ def test_split_catalog_covers_whole_and_head_split(monkeypatch):
     for module, names in (
         ("_kda_contract", ("KDAGeometry",)),
         ("kimi_mla", ()),
+        ("glmf", ("compile_glmf_kda_aot", "compile_glmf_kda_commit_aot")),
+        ("pointwise", ("compile_bf16_projection_aot",)),
         ("kimi_split", ("compile_kimi_kda_core_aot", "compile_kimi_mla_rank_norm_aot",
                         "compile_kimi_mla_query_aot", "compile_kimi_mla_gate_output_aot"))):
         fake = types.ModuleType("b12x.integration.cuteafd." + module)
@@ -27,19 +29,28 @@ def test_split_catalog_covers_whole_and_head_split(monkeypatch):
     exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef)],
                            type_ignores=[]), str(path), "exec"), namespace)
     entries = namespace["programs"]()
-    assert len(entries) == 28
-    assert len({name for name, _, _ in entries}) == 28
+    assert len(entries) == 32
+    assert len({name for name, _, _ in entries}) == 32
     for heads in (48, 96):
         for rows in (64, 4096):
             selected = {name: thunk for name, thunk, capacity in entries
                         if f"h{heads}_" in name and capacity == rows}
-            assert len(selected) == 7
+            assert len(selected) == (8 if heads == 96 else 7)
+            if heads == 96:
+                args, kw = selected[f"kda_fused_h96_m{rows}"]()
+                assert args[0][1] == {"hidden": 7168, "kda_heads": 96}
+                assert kw == {"max_rows": rows, "output_kind": "norm", "decode": rows == 64}
             assert selected[f"kda_core_h{heads}_m{rows}"]()[1] == {
                 "max_rows": rows, "decode": rows == 64}
             for stride in (576, 640):
                 for cache, suffix in (("bf16", ""), ("fp8", "_fp8")):
                     args, kw = selected[f"mla_rank_norm_h{heads}_kv{stride}{suffix}_m{rows}"]()
                     assert kw["kv_stride"] == stride and args[0] == {"heads": heads, "kv_cache": cache}
+
+    catalogue = {name: thunk for name, thunk, _ in entries}
+    args, kw = catalogue["kda_commit_h96"]()
+    assert args[0][1] == {"hidden": 7168, "kda_heads": 96} and not kw
+    assert catalogue["kda_output_h96"]() == ((), {"width": 12288, "outputs": 7168})
 
 
 def test_split_has_dedicated_sm_comparison_group():

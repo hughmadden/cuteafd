@@ -162,6 +162,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
 pub struct RuntimeInputs {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
     /// Span rows: every per-call plane's rows (`waves` units).
@@ -614,8 +615,8 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                         Category::Transport,
                         "Step-5 Spark intake planes",
                         // One reserve range per rank every admitted depth is cut from (#762).
-                        crate::serving_capacity::prefill_return_bytes(1, inputs.rows as u64,
-                            inputs.inventory.spark_ranks as u64, 4096)
+                        crate::serving_capacity::prefill_return_bytes_with_format(1, inputs.rows as u64,
+                            inputs.inventory.spark_ranks as u64, 4096, inputs.spark_reply_format)?
                             .max(256 * inputs.inventory.spark_ranks as u64),
                     );
                     add(Category::Workspace, "Step-5 routed reply", (inputs.rows as u64 * 4096 * 2).max(256));
@@ -820,7 +821,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs {
+        RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
             inventory: Inventory {
@@ -915,6 +916,28 @@ mod tests {
         assert_eq!(old.marks, new.marks);
         assert_eq!(old.reservations, new.reservations);
         assert_eq!(old.fixed, new.fixed);
+        Ok(())
+    }
+
+    #[test]
+    fn combined_reply_formats_reuse_bf16_capacity_on_the_entry_gpu() -> Result<()> {
+        for ranks in [1, 2] {
+            for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
+                let mut input = inputs(ranks);
+                input.spark_reply_format = format;
+                input.rows = 3 * 2752;
+                input.waves = 3;
+                input.unit = 2752;
+                let admission = run(&input)?;
+                let intake = admission.fixed.iter().filter(|d| d.group == "Step-5 Spark intake planes")
+                    .collect::<Vec<_>>();
+                assert_eq!(intake.len(), 1);
+                assert_eq!(intake[0].gpu, admission.ownership.execution().spec().entry_gpu);
+                assert_eq!(intake[0].bytes, 4
+                    * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.rows as u64 * 4096 * 2)?);
+            }
+        }
         Ok(())
     }
 

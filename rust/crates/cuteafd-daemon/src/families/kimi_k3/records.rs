@@ -22,7 +22,7 @@ pub(crate) struct KimiRecords<'l, 'a> {
     pub core: &'l CoreInventory,
     pub dense: &'l DenseLoad<'a>,
     /// (device, load stream) of each coordinator GPU.
-    pub streams: [(i32, *mut std::ffi::c_void); 2],
+    pub streams: Vec<(i32, *mut std::ffi::c_void)>,
 }
 
 /// Rows `rows` and byte columns `cols` of a checkpoint tensor (rows of the
@@ -138,17 +138,23 @@ impl<'a> KimiRecords<'_, 'a> {
 
     /// One rank's global weights, allocated from `layout`.
     pub fn global(&self, device: Device<'a>, layout: &GlobalLayout) -> Result<GlobalWeights<'a>> {
+        let ranks = self.streams.len();
+        ensure!(matches!(ranks, 1 | 2) && layout.rank < ranks
+            && (ranks == 1 || self.streams[0].0 != self.streams[1].0)
+            && self.streams[layout.rank].0 == device.id,
+            "Kimi global physical owner inventory");
+        let expected = GlobalLayout::ranks_with_core(self.cfg, self.core, ranks)?;
+        ensure!(expected[layout.rank] == *layout, "Kimi recorded global differs from admitted geometry");
         let mut operands = BTreeMap::new();
         let [vocab, hidden] = [layout.vocab, layout.hidden];
-        let core_head = if let Some(head) = &layout.core_head {
-            Some(self.core(device, head)?)
-        } else {
-            let (name, key) = if layout.rank == 0 { ("language_model.model.embed_tokens.weight", "embedding") }
-                else { ("language_model.lm_head.weight", "head") };
-            operands.insert(key, self.whole(device, name, DType::Bf16, &[vocab, hidden])?);
-            None
-        };
-        if layout.rank == 1 {
+        let core_head = layout.core_head.as_ref().map(|head| self.core(device, head)).transpose()?;
+        for (key, name) in [("embedding", "language_model.model.embed_tokens.weight"),
+            ("head", "language_model.lm_head.weight")] {
+            if layout.operands.contains_key(key) {
+                operands.insert(key, self.whole(device, name, DType::Bf16, &[vocab, hidden])?);
+            }
+        }
+        if layout.operands.contains_key("output.norm") {
             let (score, norm) = self.residual(device, "language_model.model", "output_attn_res", "norm")?;
             operands.insert("output.score", score);
             operands.insert("output.norm", norm);
@@ -163,11 +169,33 @@ impl<'a> KimiRecords<'_, 'a> {
     /// accepted admission extents), as `PackedLayer::pair_with_core` packs them.
     pub fn layer(&self, devices: [Device<'a>; 2], layer: usize, layouts: &[LayerLayout; 2])
         -> Result<[LayerWeights<'a>; 2]> {
+        self.layer_ranks(&devices, layer, layouts)?.try_into().map_err(|_| anyhow::anyhow!("Kimi pair records"))
+    }
+
+    pub fn layer_ranks(&self, devices: &[Device<'a>], layer: usize, layouts: &[LayerLayout])
+        -> Result<Vec<LayerWeights<'a>>> {
+        let ranks = devices.len();
+        ensure!(matches!(ranks, 1 | 2) && layouts.len() == ranks
+            && self.streams.len() == ranks && (ranks == 1 || devices[0].id != devices[1].id),
+            "Kimi recorded physical owner inventory");
+        ensure!(devices.iter().zip(&self.streams).all(|(device, (id, _))| device.id == *id),
+            "Kimi recorded load streams differ from physical owners");
         let cfg = self.cfg;
-        let mut ops: [BTreeMap<&'static str, Allocation<'a>>; 2] = Default::default();
-        let mut core: [BTreeMap<&'static str, CoreWeights<'a>>; 2] = Default::default();
+        let mode = if ranks == 1 {
+            LayerMode::Whole { gpu: 0, ffn: cuteafd_loader::placement::FfnMode::Owner }
+        } else if layouts.iter().all(|layout| layout.attention == AttentionShare::Split) {
+            LayerMode::HeadSplit
+        } else {
+            let owner = layouts.iter().position(|layout| layout.attention == AttentionShare::Whole)
+                .context("Kimi recorded layer lacks whole attention owner")?;
+            LayerMode::Whole { gpu: owner as u8, ffn: cuteafd_loader::placement::FfnMode::Split }
+        };
+        ensure!(LayerLayout::ranks_with_core(cfg, layer, mode, self.core, ranks)? == layouts,
+            "Kimi recorded layers differ from admitted geometry");
+        let mut ops: Vec<BTreeMap<&'static str, Allocation<'a>>> = (0..ranks).map(|_| BTreeMap::new()).collect();
+        let mut core: Vec<BTreeMap<&'static str, CoreWeights<'a>>> = (0..ranks).map(|_| BTreeMap::new()).collect();
         let base = format!("language_model.model.layers.{layer}");
-        for rank in 0..2 {
+        for rank in 0..ranks {
             for (score, norm, residual, following) in [("attention.score", "attention.norm", "self_attention_res", "input_layernorm"),
                 ("ffn.score", "ffn.norm", "mlp_res", "post_attention_layernorm")] {
                 let (s, n) = self.residual(devices[rank], &base, residual, following)?;
@@ -180,8 +208,8 @@ impl<'a> KimiRecords<'_, 'a> {
             let dense = cfg.dense[layer];
             let width = if dense { cfg.dense_intermediate } else { cfg.moe_intermediate * cfg.shared_experts };
             let prefix = if dense { format!("{base}.mlp") } else { format!("{base}.block_sparse_moe.shared_experts") };
-            for rank in 0..2 {
-                let rows = rank * width / 2..(rank + 1) * width / 2;
+            for rank in 0..ranks {
+                let rows = rank * width / ranks..(rank + 1) * width / ranks;
                 let mut lands = Vec::new();
                 let mut at = 0;
                 for leaf in ["gate", "up"] {
@@ -194,7 +222,7 @@ impl<'a> KimiRecords<'_, 'a> {
                 }
                 ops[rank].insert("ffn.gate_up", self.landed(devices[rank], lands, at)?);
                 ops[rank].insert("ffn.down", self.bf16_share(devices[rank], &format!("{prefix}.down_proj.weight"),
-                    [cfg.hidden, width], TrellisSide::Input, 2, rank)?);
+                    [cfg.hidden, width], TrellisSide::Input, ranks, rank)?);
             }
         } else {
             let root = format!("{base}.block_sparse_moe.shared_experts");
@@ -202,11 +230,11 @@ impl<'a> KimiRecords<'_, 'a> {
             for (name, leaf, shape, side) in [("ffn.gate", "gate_proj", [width, cfg.hidden], TrellisSide::Output),
                 ("ffn.up", "up_proj", [width, cfg.hidden], TrellisSide::Output),
                 ("ffn.down", "down_proj", [cfg.hidden, width], TrellisSide::Input)] {
-                self.projection(devices, layouts, &mut ops, &mut core, name, &format!("{root}.{leaf}"), shape, side, &[0, 1])?;
+                self.projection(devices, layouts, &mut ops, &mut core, name, &format!("{root}.{leaf}"), shape, side, &(0..ranks).collect::<Vec<_>>())?;
             }
         }
         if !cfg.dense[layer] {
-            let owner = routed_owner(cfg, layer)?;
+            let owner = cuteafd_loader::families::kimi_k3::weight_layout::routed_owner_for(cfg, layer, ranks)?;
             let device = devices[owner];
             let root = format!("{base}.block_sparse_moe");
             if layouts[owner].core.contains_key("latent.down") {
@@ -228,24 +256,22 @@ impl<'a> KimiRecords<'_, 'a> {
             ops[owner].insert("router.bias", self.whole(device, &format!("{root}.gate.e_score_correction_bias"),
                 DType::F32, &[cfg.experts])?);
         }
-        let shares = layouts.each_ref().map(|layout| layout.attention);
+        let shares = layouts.iter().map(|layout| layout.attention).collect::<Vec<_>>();
         match cfg.attention[layer] {
             KimiAttention::Kda => self.kda(devices, layer, layouts, &mut ops, &mut core)?,
             KimiAttention::Mla => self.mla(devices, layer, layouts, &shares, &mut ops, &mut core)?,
         }
-        let [o0, o1] = ops;
-        let [c0, c1] = core;
-        let pair = [LayerWeights { operands: o0, attention: shares[0], core: c0 },
-            LayerWeights { operands: o1, attention: shares[1], core: c1 }];
-        for (layout, weights) in layouts.iter().zip(&pair) { layout.check_owned(weights)?; }
-        Ok(pair)
+        let weights = ops.into_iter().zip(core).zip(shares).map(|((operands, core), attention)|
+            LayerWeights { operands, attention, core }).collect::<Vec<_>>();
+        for (layout, weights) in layouts.iter().zip(&weights) { layout.check_owned(weights)?; }
+        Ok(weights)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn projection(&self, devices: [Device<'a>; 2], layouts: &[LayerLayout; 2],
-        ops: &mut [BTreeMap<&'static str, Allocation<'a>>; 2], core: &mut [BTreeMap<&'static str, CoreWeights<'a>>; 2],
+    fn projection(&self, devices: &[Device<'a>], layouts: &[LayerLayout],
+        ops: &mut [BTreeMap<&'static str, Allocation<'a>>], core: &mut [BTreeMap<&'static str, CoreWeights<'a>>],
         name: &'static str, stem: &str, shape: [usize; 2], side: TrellisSide, owners: &[usize]) -> Result<()> {
-        ensure!(!owners.is_empty() && owners.iter().all(|&r| r < 2), "Kimi projection owners");
+        ensure!(!owners.is_empty() && owners.iter().all(|&r| r < devices.len()), "Kimi projection owners");
         if layouts[owners[0]].core.contains_key(name) {
             for &owner in owners {
                 let layout = layouts[owner].core.get(name).context("Kimi K6 owner layout")?;
@@ -262,11 +288,11 @@ impl<'a> KimiRecords<'_, 'a> {
 
     /// A KDA operand from the shared plan: pieces land unchanged; A_log's
     /// raw vector is staged whole, checked, and its active heads uploaded.
-    fn kda_operand(&self, devices: [Device<'a>; 2], layer: usize, operand: cuteafd_loader::kda::KdaOperand)
-        -> Result<[Allocation<'a>; 2]> {
+    fn kda_operand(&self, devices: &[Device<'a>], layer: usize, operand: cuteafd_loader::kda::KdaOperand)
+        -> Result<Vec<Allocation<'a>>> {
         use cuteafd_loader::kda::{KdaError, KdaRole};
         let name = |role: KdaRole| kda::tensor_name(layer, role).context("Kimi KDA role absent");
-        let plan = kda::geometry(self.cfg).plan(operand, 2, |role| {
+        let plan = kda::geometry(self.cfg).plan(operand, devices.len(), |role| {
             let tensor = meta(self.checkpoint, &name(role).map_err(|e| KdaError::Source(e.to_string()))?)
                 .map_err(|e| KdaError::Source(e.to_string()))?;
             Ok((tensor.dtype.clone(), tensor.shape.clone()))
@@ -299,21 +325,22 @@ impl<'a> KimiRecords<'_, 'a> {
             }
             out.push(self.landed(devices[rank], lands, bytes)?);
         }
-        <[_; 2]>::try_from(out).map_err(|_| anyhow::anyhow!("Kimi KDA ranks"))
+        Ok(out)
     }
 
-    fn kda(&self, devices: [Device<'a>; 2], layer: usize, layouts: &[LayerLayout; 2],
-        ops: &mut [BTreeMap<&'static str, Allocation<'a>>; 2], core: &mut [BTreeMap<&'static str, CoreWeights<'a>>; 2])
+    fn kda(&self, devices: &[Device<'a>], layer: usize, layouts: &[LayerLayout],
+        ops: &mut [BTreeMap<&'static str, Allocation<'a>>], core: &mut [BTreeMap<&'static str, CoreWeights<'a>>])
         -> Result<()> {
         use cuteafd_loader::kda::KdaOperand;
+        let ranks = devices.len();
         let fused = layouts[0].operands.contains_key("kda.input");
         for (operand, name) in [(KdaOperand::WIn, "kda.input"), (KdaOperand::WFg, "kda.forget"),
             (KdaOperand::ConvW, "kda.conv"), (KdaOperand::ALog, "kda.a_log"), (KdaOperand::DtBias, "kda.dt_bias"),
             (KdaOperand::ONorm, "kda.norm"), (KdaOperand::WO, "kda.output")] {
             if !layouts[0].operands.contains_key(name) || (operand == KdaOperand::WO && !fused) { continue; }
-            let [a, b] = self.kda_operand(devices, layer, operand)?;
-            ops[0].insert(name, a);
-            ops[1].insert(name, b);
+            for (rank, allocation) in self.kda_operand(devices, layer, operand)?.into_iter().enumerate() {
+                ops[rank].insert(name, allocation);
+            }
         }
         if !fused {
             let root = format!("language_model.model.layers.{layer}.self_attn");
@@ -323,9 +350,9 @@ impl<'a> KimiRecords<'_, 'a> {
             let beta = format!("{root}.b_proj.weight");
             expect(self.checkpoint, &fa, DType::Bf16, &[cfg.kda_head_dim, cfg.hidden])?;
             expect(self.checkpoint, &beta, DType::Bf16, &[cfg.kda_heads, cfg.hidden])?;
-            for rank in 0..2 {
+            for rank in 0..ranks {
                 let a = rect(self.checkpoint, &fa, None, None)?;
-                let b = rect(self.checkpoint, &beta, Some(rank * cfg.kda_heads / 2..(rank + 1) * cfg.kda_heads / 2), None)?;
+                let b = rect(self.checkpoint, &beta, Some(rank * cfg.kda_heads / ranks..(rank + 1) * cfg.kda_heads / ranks), None)?;
                 let (at, bytes) = (a.bytes(), a.bytes() + b.bytes());
                 ops[rank].insert("kda.fab", self.landed(devices[rank], vec![(a, 0), (b, at)], bytes)?);
             }
@@ -334,17 +361,17 @@ impl<'a> KimiRecords<'_, 'a> {
                 ("kda.v", "v_proj", [width, cfg.hidden], TrellisSide::Output),
                 ("kda.gate", "g_proj", [width, cfg.hidden], TrellisSide::Output),
                 ("kda.output", "o_proj", [cfg.hidden, width], TrellisSide::Input)] {
-                self.projection(devices, layouts, ops, core, name, &format!("{root}.{leaf}"), shape, side, &[0, 1])?;
+                self.projection(devices, layouts, ops, core, name, &format!("{root}.{leaf}"), shape, side, &(0..ranks).collect::<Vec<_>>())?;
             }
         }
         Ok(())
     }
 
-    fn mla(&self, devices: [Device<'a>; 2], layer: usize, layouts: &[LayerLayout; 2], shares: &[AttentionShare; 2],
-        ops: &mut [BTreeMap<&'static str, Allocation<'a>>; 2], core: &mut [BTreeMap<&'static str, CoreWeights<'a>>; 2])
+    fn mla(&self, devices: &[Device<'a>], layer: usize, layouts: &[LayerLayout], shares: &[AttentionShare],
+        ops: &mut [BTreeMap<&'static str, Allocation<'a>>], core: &mut [BTreeMap<&'static str, CoreWeights<'a>>])
         -> Result<()> {
         let cfg = self.cfg;
-        let owners: Vec<usize> = (0..2).filter(|&r| shares[r].present()).collect();
+        let owners: Vec<usize> = (0..devices.len()).filter(|&r| shares[r].present()).collect();
         ensure!(!owners.is_empty(), "Kimi MLA layer without an owner");
         let root = format!("language_model.model.layers.{layer}.self_attn");
         let fused = layouts[owners[0]].operands.contains_key("mla.qkv_a");

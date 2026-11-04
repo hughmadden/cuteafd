@@ -97,6 +97,26 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
 }
 
 #[test]
+fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
+    use crate::placement::{ExpertHome, FfnMode, LayerMode};
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = with_layout(6, Some(110 << 30));
+    let layout = options.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![192 << 30];
+    layout.head_split = false;
+    let report = input.plan(&options).unwrap();
+    let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+    assert_eq!(placed.items.len(), 1);
+    assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }));
+    assert!(placed.layers.iter().all(|layer| matches!(layer.experts,
+        ExpertHome::Dense | ExpertHome::Spark | ExpertHome::RtxWhole { gpu: 0 })));
+    assert!(placed.tp2.is_none());
+    assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count(), 1);
+}
+
+#[test]
 fn planner_refuses_shapes_outside_shared_live_reserve() {
     let dir = snapshot(false);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
@@ -254,8 +274,8 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
     // Serving status does not make the default single-GPU header plan fit.
     assert!(!report.executable());
-    assert!(report.hints.iter().any(|hint| hint.what.contains("requires TP2")
-        || hint.what.contains("targets two coordinator GPUs")));
+    assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
+        "{:?}", report.hints);
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
@@ -450,12 +470,17 @@ fn mounted_release_plan_is_manifest_independent_and_serving() -> anyhow::Result<
 }
 
 #[test]
-fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
+fn cache_geometry_preserves_actual_physical_owners_and_mla_copies() {
     use crate::{placement::AttentionPlacement, serving_capacity::{CacheOptions, KvPlacement}};
     let dir = snapshot(false);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let model = KIMI_K3.open(&checkpoint).unwrap();
-    assert!(model.cache_geometry(CacheOptions::default()).is_err());
+    let single = model.cache_geometry(CacheOptions { coordinator_ranks: 1, ..Default::default() }).unwrap().unwrap();
+    assert_eq!(single.ranks.len(), 1);
+    assert_eq!(single.ranks[0].retained_mark_bytes, 2 * 224_686_080);
+    assert_eq!(single.ranks[0].persistent_unit_bytes,
+        (24 * 64 * CacheOptions::default().mla_kv.record_bytes()) as u64);
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 3, ..Default::default() }).is_err());
     for (attention, format) in [AttentionPlacement::Layers, AttentionPlacement::Heads].into_iter()
         .flat_map(|attention| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
             .map(|format| (attention, format))) {

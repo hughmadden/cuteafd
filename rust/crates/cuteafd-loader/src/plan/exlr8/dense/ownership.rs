@@ -132,6 +132,29 @@ pub enum VocabularyRole { Embedding, Head }
 pub enum DenseRole { Backbone, Vocabulary(VocabularyRole), Excluded }
 
 impl DenseSelection {
+    /// Native reader and physical-owner names, independent of the family root.
+    pub const PROJECTIONS: [(&'static str, &'static str); 19] = [
+        ("q_a", "self_attn.q_a_proj"),
+        ("kv_a", "self_attn.kv_a_proj_with_mqa"),
+        ("q_b", "self_attn.q_b_proj"),
+        ("o", "self_attn.o_proj"),
+        ("index_q", "self_attn.indexer.wq_b"),
+        ("index_k", "self_attn.indexer.wk"),
+        ("index_w", "self_attn.indexer.weights_proj"),
+        ("gate", "mlp.gate_proj"),
+        ("up", "mlp.up_proj"),
+        ("down", "mlp.down_proj"),
+        ("router", "mlp.gate"),
+        ("q", "self_attn.q_proj"),
+        ("k", "self_attn.k_proj"),
+        ("v", "self_attn.v_proj"),
+        ("beta", "self_attn.b_proj"),
+        ("f_a", "self_attn.f_a_proj"),
+        ("g_a", "self_attn.g_a_proj"),
+        ("f_b", "self_attn.f_b_proj"),
+        ("g_b", "self_attn.g_b_proj"),
+    ];
+
     pub fn from_hf(config: &serde_json::Value) -> anyhow::Result<Self> {
         Ok(match DenseFamily::from_hf(config)? {
             DenseFamily::Glm(cfg) => Self { prefix: "model.", layers: cfg.layers },

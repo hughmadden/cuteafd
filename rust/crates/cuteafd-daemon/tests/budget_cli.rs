@@ -29,6 +29,29 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 }
 
 #[test]
+fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
+    for family in ["serve-glmf", "serve-glm", "serve-mimo"] {
+        for gib in [30u64, 32, 96] {
+            let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
+            for explicit in [None, Some(expected), Some(4)] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+                command.args([family, "--snapshot", "/direct-cli-missing-snapshot", "--native-lib", "/unused",
+                    "--coordinator-gpu-budget-gib", &gib.to_string(), "--vision", "off", "--audio", "off"]);
+                if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
+                let output = command.env("RUST_LOG", "info")
+                    .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+                assert!(!output.status.success());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let resolved = stderr.lines().find(|line| line.contains("resolved boot-time serving concurrency"))
+                    .unwrap_or_else(|| panic!("{family} at {gib} GiB: {stderr}"));
+                assert!(resolved.contains(&format!("concurrency={}", explicit.unwrap_or(expected))), "{resolved}");
+                assert!(!stderr.contains("/unused"), "explicit logical budget must not load CUDA: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
 fn plan_json_keeps_info_tracing_on_stderr() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), br#"{"model_type":"unknown"}"#).unwrap();
@@ -362,10 +385,9 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
             let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(deployment["family"], "glm5_flash");
             assert_eq!(deployment["exlr8"]["manifest"], "k4");
-            let admitted = gpus == "1";
-            assert_eq!(deployment["wip_launchable"], admitted);
-            assert_eq!(deployment["report"]["runtime"], if admitted { "serving" } else { "planned" });
-            assert_eq!(deployment["report"]["placement_supported"], admitted);
+            assert_eq!(deployment["wip_launchable"], true);
+            assert_eq!(deployment["report"]["runtime"], "serving");
+            assert_eq!(deployment["report"]["placement_supported"], true);
             assert_eq!(deployment["spark_ranks"], ranks);
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
                 .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
@@ -409,21 +431,19 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-#[should_panic(expected = "https://github.com/tpurtell/cuteafd/issues/776: automatic zero-Spark pool must stop at 2M")]
-fn installed_flash_exlr8_automatic_zero_spark_pool_exact_2m_xfail_776() {
+fn installed_flash_exlr8_automatic_zero_spark_pool_stops_at_2m() {
     let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
     let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 2);
     for device in devices {
-        // Remove should_panic when #776 lands: an unexpected pass must demand that cleanup.
         assert_eq!(device["kv_tokens"], 2_097_152,
-            "https://github.com/tpurtell/cuteafd/issues/776: automatic zero-Spark pool must stop at 2M");
+            "automatic zero-Spark pool must stop at its 2M target when capacity permits");
     }
 }
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
+fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
     // A requested Spark ceiling must not attach idle workers when all routed layers fit locally.
     for ranks in ["0", "6"] {
         let deployment = installed_flash_exlr8_automatic_tp2_plan(ranks);
@@ -432,17 +452,16 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
         assert_eq!(deployment["spark_ranks"], 0);
         assert_eq!(deployment["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([]));
         assert_eq!(deployment["report"]["fits"], true);
-        assert_eq!(deployment["report"]["runtime"], "planned");
-        assert_eq!(deployment["report"]["placement_supported"], false);
-        assert_eq!(deployment["executable"], false);
-        assert_eq!(deployment["wip_launchable"], false);
+        assert_eq!(deployment["report"]["runtime"], "serving");
+        assert_eq!(deployment["report"]["placement_supported"], true);
+        assert_eq!(deployment["executable"], true);
+        assert_eq!(deployment["wip_launchable"], true);
         let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            // Explicit zero-Spark pool policy is covered by the exact-2M xfail above.
-            if ranks == "6" { assert_eq!(device["kv_tokens"], 2_097_152); }
+            assert_eq!(device["kv_tokens"], 2_097_152);
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
                 .expect("all 42 routed layer halves must be resident on each RTX");
@@ -648,4 +667,37 @@ fn bench_panels_json_cli_matches_fixture_and_selectable_panel_ids() {
         include_str!("../../../../scripts/bench/fixtures/bench-panels-v1.json")).unwrap();
     assert_eq!(actual, fixture);
     assert!(actual.iter().any(|id| id == "shared_prefix"));
+}
+
+#[test]
+#[ignore = "requires real CUTEAFD_KIMI_SNAPSHOT, CUTEAFD_KIMI_DRAFTER and CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_kimi_tp1_automatic_plan_finishes_within_ten_seconds() {
+    let required = |key| std::env::var_os(key).unwrap_or_else(|| panic!("{key} required"));
+    let start = std::time::Instant::now();
+    let output = Command::new("timeout")
+        .args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(required("CUTEAFD_KIMI_SNAPSHOT"))
+        .args(["--deployment", "--rtx", "1", "--spark-ranks", "6", "--spark-budget-gib", "110",
+            "--speculator", "dflash2", "--drafter-snapshot"])
+        .arg(required("CUTEAFD_KIMI_DRAFTER"))
+        .args(["--vision", "off", "--audio", "off", "--workspace-manifest"])
+        .arg(required("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"))
+        .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+    let elapsed = start.elapsed();
+    assert!(output.status.success(), "{elapsed:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(elapsed <= std::time::Duration::from_secs(10), "TP1 plan took {elapsed:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["rtx_gpus"], 1);
+    assert_eq!(plan["spark_ranks"], 6);
+    assert_eq!(plan["speculator"], "dflash2");
+    assert_eq!(plan["executable"], true, "{plan}");
+    let placement = &plan["estimated_placement"];
+    assert_eq!(placement["items"].as_array().unwrap().len(), 1);
+    assert!(placement["hops"].as_array().unwrap().is_empty());
+    for layer in placement["layers"].as_array().unwrap() {
+        assert_eq!(layer["mode"]["mode"], "whole");
+        assert_eq!(layer["mode"]["gpu"], 0);
+        assert_eq!(layer["mode"]["ffn"], "owner");
+    }
+    eprintln!("real K6 TP1 automatic plan: {elapsed:?}");
 }

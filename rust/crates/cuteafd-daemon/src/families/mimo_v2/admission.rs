@@ -377,14 +377,14 @@ fn preflight_shape(
         let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
         let mut additional = vec![cublas.clone()];
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-            cfg, ranks, rank, args.prefill_rows, transport_lanes, 0)?);
+            cfg, ranks, rank, args.prefill_rows, transport_lanes, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
         // Only modules and the already-attached peer are live before drafter
         // packing. Spark transport, samplers, marks, graphs and reusable target
         // workspaces are constructed later and do not consume this phase.
         post_kv_loading_additional.push(additional.clone());
         if rank == 0 {
             additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                cfg, 1, 0, args.prefill_rows, transport_lanes, spark_ranks)?);
+                cfg, 1, 0, args.prefill_rows, transport_lanes, spark_ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
             if serving.is_some() {
                 additional.extend(cuteafd_loader::families::mimo_v2::admission::sampling_reservations(cfg.vocab_size)?);
             }
@@ -438,7 +438,7 @@ fn preflight_shape(
         for (rank, costs) in selected_runtime.iter_mut().enumerate() {
             costs.additional.retain(|cost| !cost.name.starts_with("transport."));
             costs.additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks)?);
+                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
             costs.workspaces = workspace_options(cfg, args, programs, ranks, rank, lanes,
                 selected_spark_ranks > 0, VOCABULARY_HEAD_WORKSPACE as u64, prefill_output,
                 opened.weight_formats.any_fp8_output())?;
@@ -506,7 +506,7 @@ fn preflight_shape(
     for (rank, costs) in post_kv_loading_additional.iter_mut().enumerate() {
         costs.retain(|cost| !cost.name.starts_with("transport."));
         costs.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-            cfg, ranks, rank, args.prefill_rows, solution.working_set.prefill_lanes as usize, 0)?);
+            cfg, ranks, rank, args.prefill_rows, solution.working_set.prefill_lanes as usize, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
     }
     let report = reservation_report(&profiles.steady, &memory, policy)?;
     tracing::info!(reservations = %report, working_set = ?solution.working_set,

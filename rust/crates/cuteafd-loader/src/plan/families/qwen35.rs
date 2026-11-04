@@ -127,7 +127,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(options.drafter_bytes == 0 && !(options.dense_qwen_mtp && options.dense_qwen_drafter_snapshot.is_some()),
         "dense native planner requires one checkpoint-native drafter admission");
     let rows = PREFILL_ROWS as u64;
-    let prefill = crate::plan::layout::resolve_prefill(report, options, 0,
+    let prefill = crate::plan::layout::resolve_prefill(input, report, options, 0,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_unit_rows: rows, max_span_rows: rows, max_waves: 1, ..Default::default()
         })?;

@@ -246,6 +246,7 @@ if [[ -z "$rtx_gpus" ]]; then
 fi
 [[ "$rtx_gpus" == 1 || "$rtx_gpus" == 2 ]] ||
   release_die "set --rtx-gpus 1|2, or RTX_GPUS=1|2 in $config"
+release_resolve_tp2_dspark_experts deepseek_v41 "$rtx_gpus"
 # dSpark draft limit is a coordinator-only flag; 7 is the dual-RTX corpus value
 # and 5 the single-RTX one. It is passed explicitly so the arm cannot silently
 # run the daemon default and drift from the qualified metadata.

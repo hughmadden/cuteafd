@@ -110,11 +110,13 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
     fn post(&mut self, layer: usize, unit: &Unit, ranks: usize, slot: Option<usize>) -> Result<()> {
         let e = self.engine;
         let rows = Scalar::I32(unit.rows.len() as i32);
-        let planes = match (self.transport.as_ref(), slot) {
-            (Some(transport), Some(slot)) => transport.planes(slot),
-            _ => [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS],
-        };
-        e.post_layer(self.w, &self.w.slots[unit.slot], unit.slot, ranks, planes, rows, layer)?;
+        if let Some(slot) = slot {
+            let lane = &self.w.slots[unit.slot];
+            // SAFETY: the wave landed on the engine stream; the unit owns these workspace views.
+            unsafe { self.transport.as_mut().context("Spark link")?.reduce(slot, lane.shared.buffer.ptr.cast(),
+                self.w.delta.buffer.ptr.cast(), unit.rows.len(), e.stream)?; }
+        }
+        e.post_layer(self.w, &self.w.slots[unit.slot], unit.slot, ranks, None, rows, layer)?;
         if let Some(w1) = self.w1 {
             e.peer_post(layer, &w1.slots[unit.slot], unit.slot, w1, rows)?;
         }
@@ -122,9 +124,6 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
             for member in members { e.tap(self.w, &member.views[0], layer, member.segment.rows)?; }
         } else if retains_draft_rows(&unit.rows, self.tokens.len()) {
             e.tap(self.w, &self.w.slots[unit.slot], layer, unit.rows.len())?;
-        }
-        if let Some(slot) = slot {
-            self.transport.as_mut().context("Spark link")?.consumed(slot, e.stream)?;
         }
         if let Some(callback) = self.on_layer.as_mut() {
             callback(layer, &e.download(&self.w.slots[unit.slot].stream_a,

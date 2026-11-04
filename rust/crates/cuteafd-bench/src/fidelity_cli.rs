@@ -34,11 +34,14 @@ pub enum Action {
         out: Option<PathBuf>,
         /// Pair two quants of one reference root (same pinned set, reference and build);
         /// the checkpoints and a closed list of quant-selection settings may differ.
-        #[arg(long, conflicts_with = "code_ab")]
+        #[arg(long, conflicts_with_all = ["code_ab", "layout_ab"])]
         cross_checkpoint: bool,
         /// Pair two builds of the same checkpoint and server settings (a code A/B).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "layout_ab")]
         code_ab: bool,
+        /// Pair explicit layouts, preserving all differences; precision and speculation stay fixed.
+        #[arg(long)]
+        layout_ab: bool,
     },
     /// Compare candidate A to checkpoint-precision baseline B, paired by position.
     Compare {
@@ -59,11 +62,14 @@ pub enum Action {
         out: Option<PathBuf>,
         /// Pair two quants of one reference root (same pinned set, reference and build);
         /// the checkpoints and a closed list of quant-selection settings may differ.
-        #[arg(long, conflicts_with = "code_ab")]
+        #[arg(long, conflicts_with_all = ["code_ab", "layout_ab"])]
         cross_checkpoint: bool,
         /// Pair two builds of the same checkpoint and server settings (a code A/B).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "layout_ab")]
         code_ab: bool,
+        /// Pair explicit layouts, preserving all differences; precision and speculation stay fixed.
+        #[arg(long)]
+        layout_ab: bool,
     },
 }
 #[derive(Debug, Clone, clap::Args)]
@@ -471,8 +477,9 @@ fn run_pass(run: &Run) -> bool {
     crate::fidelity::verdict(run).pass
 }
 
-fn pairing(cross_checkpoint: bool, code_ab: bool, hub: &std::path::Path) -> Pairing<'_> {
+fn pairing(cross_checkpoint: bool, code_ab: bool, layout_ab: bool, hub: &std::path::Path) -> Pairing<'_> {
     if cross_checkpoint { Pairing::CrossCheckpoint { hub } }
+    else if layout_ab { Pairing::LayoutChange }
     else if code_ab { Pairing::CodeChange } else { Pairing::SameCheckpoint }
 }
 
@@ -495,13 +502,13 @@ pub fn execute(args: Args) -> Result<bool> {
             }
             Ok(runs.iter().all(run_pass))
         }
-        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out, cross_checkpoint, code_ab } => {
+        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out, cross_checkpoint, code_ab, layout_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
                 Ok(cuteafd_loader::read_json_file(&path)?)
             };
             let hub = crate::fidelity_match::hub();
             let comparison = compare_full_paired(&load(a_decode)?, &load(b_decode)?,
-                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed, pairing(cross_checkpoint, code_ab, &hub))?;
+                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed, pairing(cross_checkpoint, code_ab, layout_ab, &hub))?;
             let text = serde_json::to_string_pretty(&comparison)?;
             if let Some(path) = out { std::fs::write(path, &text)?; }
             println!("{text}");
@@ -509,7 +516,7 @@ pub fn execute(args: Args) -> Result<bool> {
             eprintln!("Both full-tier statistical paths checked; separate agentic replay remains required.");
             Ok(comparison.pass)
         }
-        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out, cross_checkpoint, code_ab } => {
+        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out, cross_checkpoint, code_ab, layout_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
                 let value: Value = cuteafd_loader::read_json_file(&path)?;
                 let value = if value["schema"] == "cuteafd.fidelity.run/2" { value } else { value[&score_path].clone() };
@@ -520,7 +527,7 @@ pub fn execute(args: Args) -> Result<bool> {
             let margin = if a.tier == "quick" { 0.01 } else { 0.005 };
             let hub = crate::fidelity_match::hub();
             let comparison = compare_paired(&a, &b, top1_margin.unwrap_or(margin), kl_margin.unwrap_or(margin),
-                bootstrap, seed, pairing(cross_checkpoint, code_ab, &hub))?;
+                bootstrap, seed, pairing(cross_checkpoint, code_ab, layout_ab, &hub))?;
             let text = serde_json::to_string_pretty(&comparison)?;
             if let Some(path) = out { std::fs::write(path, &text)?; }
             println!("{text}");

@@ -28,7 +28,7 @@ else:
 '''
 
 class PlacementHandoffTest(unittest.TestCase):
-    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None):
+    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None, dspark_experts=None):
         source=(ROOT/'scripts/launch/run-family.sh').read_text()
         block=source[source.index('# Workers bootstrap first;'):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
@@ -75,7 +75,8 @@ dspark_draft_limit=
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
-TP2_DSPARK_EXPERTS=off
+TP2_DSPARK_EXPERTS=
+release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 topology_explicit=0
 spark_ep=1
 spark_admission=not-applicable
@@ -118,6 +119,8 @@ resolved_decode_lanes=2
             if spark_count == 2:
                 setup+='MEMORY_RESERVATION=32GiB\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
             setup+=''.join(f'\nTP2_{option}=on\n' for option in options)
+            if dspark_experts is not None:
+                setup+=f'\nTP2_DSPARK_EXPERTS={dspark_experts}\n'
             count_plan = {**(encoder or {}), "spark_admission": "coordinator_authoritative"}
             setup += "\ncount_plan=" + __import__("shlex").quote(json.dumps(count_plan)) + "\n"
             result=subprocess.run(['bash','-c',setup+block,'test',str(gpus)],env=env,cwd=ROOT,capture_output=True,text=True,timeout=10)
@@ -248,7 +251,14 @@ resolved_decode_lanes=2
                 self.assertEqual(result.returncode,0,result.stderr)
                 args=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
                 for option,flag in zip(options,flags):
-                    self.assertEqual(flag in args,option in enabled)
+                    self.assertEqual(flag in args,option in enabled or option == 'DSPARK_EXPERTS')
+
+    def test_explicit_dspark_experts_off_reaches_coordinator(self):
+        result,events=self.run_startup(2,{},dspark_experts='off')
+        self.assertEqual(result.returncode,0,result.stderr)
+        args=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
+        self.assertNotIn('--tp2-dspark-experts',args)
+        self.assertEqual(args[args.index('--rtx-gpus')+1],'2')
 
     def test_filesystem_plan_is_not_a_startup_input(self):
         # A stale/invalid filesystem payload is ignored; the daemon validates

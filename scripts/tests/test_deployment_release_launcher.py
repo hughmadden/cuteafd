@@ -124,6 +124,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             # Serve's unit is the planner's: a third of the reserve with Sparks.
             if waves == "3":
                 before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"
+            if before["command"][before["command"].index("--rtx-gpus") + 1] == "2" and "--dspark" in before["command"]:
+                before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
 
         if old["host"] == "coordinator" and entry["family"] != "deepseek_v41":
             # Every family's coordinator now takes its GPUs as V4.1's always did: CDI by

@@ -3,7 +3,8 @@ use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, HeadLaunch
     TAP_ROWS};
 use crate::shared::speculation::dflash::DraftHead;
 use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
-use crate::shared::fp8_linear::{self, Fp8Weight};
+use crate::shared::fp8_linear;
+use crate::shared::speculation::weights::{Load, Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
@@ -172,12 +173,6 @@ fn validate_target_taps(taps: &[super::target::HiddenTap], layers: &[usize], hid
             .and_then(|v| v.checked_mul(2)).context("target tap byte span overflow")?;
     }
     Ok(())
-}
-
-/// Exactly one resident representation of a GEMM weight.
-enum Weight<'a> {
-    Bf16(Dev<'a>),
-    Fp8(Fp8Weight<'a>),
 }
 
 struct DraftLayer<'a> {
@@ -399,14 +394,7 @@ impl<'a> DsparkDrafter<'a> {
             context_capacity, target_tokens, kv_cache)?;
         tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
-        let path = snapshot.join("model.safetensors");
-        let shapes: HashMap<String, Vec<usize>> = read_safetensors_metadata(&path)?.into_iter()
-            .filter(|t| t.dtype == cuteafd_core::DType::Bf16).map(|t| (t.name, t.shape)).collect();
-        let bytes = |name: &str, shape: &[usize]| -> Result<&[u8]> {
-            let found = shapes.get(name).with_context(|| format!("dSpark checkpoint has no BF16 {name}"))?;
-            ensure!(found == shape, "{name}: shape {found:?}, expected {shape:?}");
-            tensors.get(name).map(Vec::as_slice).with_context(|| format!("{name} was not read"))
-        };
+        let load = Load::with_tensors(library, snapshot, tensors)?;
         let upload = |data: &[u8]| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, data.len().max(256))?;
             library.copy_h2d(allocation.buffer, data)?;
@@ -418,50 +406,23 @@ impl<'a> DsparkDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let tensor = |name: &str, shape: &[usize]| bytes(name, shape).and_then(upload);
-        let matrix = |source: Dev<'a>, n: usize, k: usize| -> Result<Weight<'a>> {
-            match representation {
-                GlmDraftRepresentation::Bf16Only => Ok(Weight::Bf16(source)),
-                GlmDraftRepresentation::Fp8Only => {
-                    let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
-                    // SAFETY: the packing kernel reads `source`: drain it before the source drops.
-                    if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
-                        std::mem::forget(source);
-                        if let Ok(weight) = packed { weight.quarantine(); }
-                        return Err(error.context("dSpark packing owners quarantined after a failed drain"));
-                    }
-                    let packed = packed?;
-                    drop(source);
-                    Ok(Weight::Fp8(packed))
-                }
-            }
-        };
-        let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
-            let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
-            let allocation = DeviceAllocation::new(library, total)?;
-            let mut offset = 0;
-            for (name, rows) in parts {
-                let data = bytes(name, &[*rows, cols])?;
-                library.copy_h2d(CuteafdDeviceBuffer { ptr: at(&allocation, offset), bytes: data.len(),
-                    ..allocation.buffer }, data)?;
-                offset += data.len();
-            }
-            Ok(allocation)
-        };
+        let tensor = |name: &str, shape: &[usize]| load.tensor(name, shape);
+        let matrix = |parts: &[(&str, usize)], cols: usize| load.matrix(parts, cols,
+            representation == GlmDraftRepresentation::Fp8Only, scales, stream);
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.q_width()), (&format!("{a}.k_proj.weight"), kv),
-                    (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
+                qkv: matrix(&[(&format!("{a}.q_proj.weight"), cfg.q_width()), (&format!("{a}.k_proj.weight"), kv),
+                    (&format!("{a}.v_proj.weight"), kv)], h)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.q_width()])?, h, cfg.q_width())?,
-                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
-                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
+                o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.q_width())?,
+                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
+                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
                 k_ring: zeroed(cache_rows * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 v_ring: zeroed(cache_rows * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
             })
@@ -477,9 +438,7 @@ impl<'a> DsparkDrafter<'a> {
         };
         let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
         let markov_norms = DeviceAllocation::new(library, cfg.vocab * 4)?;
-        // SAFETY: both buffers hold `vocab` rows; the stream orders the kernel before any draft.
-        unsafe { library.glmf_dspark_markov_norms(markov_w2.buffer.ptr, markov_norms.buffer.ptr, cfg.vocab, cfg.rank,
-            stream)? };
+        load.row_norms(markov_w2.buffer, markov_norms.buffer, cfg.vocab, cfg.rank, stream)?;
         Ok(Self {
             kv_cache,
             library,
@@ -501,7 +460,7 @@ impl<'a> DsparkDrafter<'a> {
                     layout: cache_layout, state: RefCell::new(state) })
             } else { None },
             inv_freq: cfg.rotary.as_ref().map(|plan| upload(bytes_of(&plan.inv_freq))).transpose()?,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
+            fc: matrix(&[("fc.weight", h)], taps)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             markov_w1: tensor("markov_head.markov_w1.weight", &[cfg.vocab, cfg.rank])?,

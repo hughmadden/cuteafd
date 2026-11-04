@@ -34,6 +34,7 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
 pub struct V4Inputs<'a> {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub cfg: &'a DeepseekV4Config,
@@ -202,8 +203,9 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
-            crate::serving_capacity::prefill_return_bytes(inputs.prefill_waves, inputs.prefill_rows,
-                inputs.spark_ranks as u64, hidden)
+            crate::serving_capacity::prefill_return_bytes_with_format(inputs.prefill_waves, inputs.prefill_rows,
+                inputs.spark_ranks as u64, hidden, inputs.spark_reply_format)
+                .map_err(|_| PlacementError::Inventory("V4 Spark reply width or allocation overflow"))?
                 + crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64, inputs.decode_rows, hidden)
         } else { 0 };
         let exchange = if gpus == 2 {
@@ -375,6 +377,43 @@ mod default_tests {
             "compress_rope_theta":160000,"compress_ratios":(0..43).map(|i|
                 if i < 2 { 0 } else if i % 2 == 0 { 4 } else { 128 }).collect::<Vec<_>>()
         }), 0).unwrap()
+    }
+
+    #[test]
+    fn combined_reply_formats_reuse_bf16_capacity_for_flash_and_pro() {
+        for (hidden, heads, topk) in [(4096, 64, 512), (7168, 128, 1024)] {
+            let mut cfg = context_cfg();
+            cfg.dim = hidden;
+            cfg.n_heads = heads;
+            cfg.index_topk = topk;
+            for gpus in [1, 2] {
+                let mut input = V4Inputs {
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+                    cfg: &cfg, weights: crate::families::deepseek_v4::resident::WeightInventory {
+                        c4_attention: Vec::new(), fixed: Vec::new() },
+                    cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
+                        context_bytes: 0, loaded_bytes: 0 }); gpus], headroom_floor: 0,
+                    spark_ranks: 6, sequences: 16, prefill_rows: 2752, prefill_waves: 3,
+                    decode_rows: 64, max_context: 262144, reserve_bytes: 3 << 30, mark_slots: 0,
+                    workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
+                    tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
+                    first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
+                    full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
+                };
+                let baseline = fixed_demands(&input).unwrap().0;
+                for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
+                    input.spark_reply_format = format;
+                    let fixed = fixed_demands(&input).unwrap().0;
+                    for rank in 0..gpus {
+                        let steps = |items: &[Demand]| items.iter().find(|d|
+                            d.gpu == rank as u8 && d.group == "steps").unwrap().bytes;
+                        assert_eq!(steps(&fixed) - steps(&baseline),
+                            0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

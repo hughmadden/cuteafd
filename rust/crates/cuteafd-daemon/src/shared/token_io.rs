@@ -11,6 +11,7 @@
 //! must reproduce (token-identical for greedy rows).
 use crate::shared::memory::{DeviceAllocation, HostAllocation, ResidentWeight};
 use crate::shared::sampler::{TargetSamplingRowRequest, TargetSamplingWave, SAMPLING_MAX_RETAINED};
+use crate::shared::peer_split::RankDevice;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{TargetSamplingError, TargetSamplingParams};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdV41SamplerRow, NativeLibrary};
@@ -213,24 +214,8 @@ impl<'a> TokenEmbedding<'a> {
         let row = self.source.hidden * 2;
         let mut out = vec![0u8; tokens.len() * row];
         if let Some(owner) = &self.row_fp8 {
-            // The gather's exact rule: bf16(f32(e4m3) * scale), round to nearest even.
-            let hidden = self.source.hidden;
-            let mut bytes = vec![0u8; hidden];
-            let mut scale = [0u8; 4];
             for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
-                let token = token as usize;
-                let payload = owner.embedding.payload();
-                let scales = owner.embedding.scales();
-                self.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: hidden,
-                    // SAFETY: row `token` lies inside the [vocab, hidden] payload.
-                    ptr: unsafe { payload.ptr.cast::<u8>().add(token * hidden) }.cast(), ..payload })?;
-                self.library.copy_d2h(&mut scale, CuteafdDeviceBuffer { bytes: 4,
-                    // SAFETY: entry `token` lies inside the [vocab] scales.
-                    ptr: unsafe { scales.ptr.cast::<u8>().add(token * 4) }.cast(), ..scales })?;
-                let scale = f32::from_le_bytes(scale);
-                for (out, &b) in slot.chunks_exact_mut(2).zip(&bytes) {
-                    out.copy_from_slice(&bf16_rne(e4m3_to_f32(b) * scale).to_le_bytes());
-                }
+                owner.embedding.host_row(self.library, token as usize, self.source.hidden, slot)?;
             }
             return Ok(out);
         }
@@ -274,7 +259,8 @@ impl<'a> TokenEmbedding<'a> {
         // pinned input live and orders replacement after previous consumers.
         unsafe { self.library.copy_h2d_ordered(ids, &bytes, stream)?; }
         // SAFETY: `ids` becomes initialized before the gather on this stream; out holds the rows.
-        unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, None, stream) }
+        unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, None,
+            RankDevice { device: ids.device_id, stream }) }
     }
 
     /// Gathers the rows of `rows` device-resident ids (`ids[index[r]]` with a
@@ -282,21 +268,22 @@ impl<'a> TokenEmbedding<'a> {
     /// zeros) into `out` on `stream`.
     ///
     /// # Safety
-    /// `ids` (and `index`) hold the ids (indices) once `stream` reaches the
-    /// gather; `out` is a live `[rows * copies, hidden]` BF16 buffer and
-    /// `fallback` is null or a live row, all on the stream's device. A BF16
-    /// table may live on a peer with peer access enabled from this device;
+    /// `producer.device` owns its live stream. `ids` (and `index`) hold the ids
+    /// (indices) once that stream reaches the gather; `out` is a live
+    /// `[rows * copies, hidden]` BF16 buffer and `fallback` is null or a live
+    /// row, all on the producer's device. The table may live on a peer with
+    /// peer access enabled from this device;
     /// its upload must finish before gathering and its lifetime spans the work.
     /// Row-FP8 with multiple copies requires disjoint caller scratch of at least
     /// `[rows, hidden]` BF16 on this device, live until the same stream drains.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
         fallback: *const c_void, out: *mut c_void, scratch: Option<CuteafdDeviceBuffer>,
-        stream: *mut c_void) -> Result<()> {
+        producer: RankDevice) -> Result<()> {
+        let RankDevice { device, stream } = producer;
         if let Some(owner) = &self.row_fp8 {
             ensure!(index.is_null() && fallback.is_null(),
                 "the row-FP8 embedding gathers plain ids (no index or fallback)");
-            let device = owner.embedding.residency().device;
             return gather_row_fp8_copies(rows, self.source.hidden, copies, out, scratch, device, |op| {
                 match op {
                     // SAFETY: the caller retains ids, output and optional scratch through this stream.
@@ -327,7 +314,8 @@ impl<'a> TokenEmbedding<'a> {
         let index_ptr = index.map_or(std::ptr::null(), |(device, _)| device);
         let fallback = fallback.map_or(std::ptr::null(), |(device, _)| device);
         // SAFETY: both placements expose a stable device-visible table; caller owns the stream and outputs.
-        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, None, stream) }
+        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, None,
+            RankDevice { device: ids.device_id, stream }) }
     }
 
     /// Compares every byte of the resident table with the shard (the
@@ -1089,6 +1077,42 @@ mod tests {
             launches += 1; anyhow::bail!("injected gather failure")
         }).is_err());
         assert_eq!(launches, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn row_fp8_peer_table_copies_use_the_producing_stream_device() -> Result<()> {
+        // Every family's row-FP8 gather goes through this shared entry point.
+        let source = include_str!("token_io.rs").split("#[cfg(test)]").next().unwrap();
+        let gather = source.split("pub unsafe fn gather(").nth(1).unwrap()
+            .split("let table = self.table.buffer();").next().unwrap();
+        assert!(gather.contains("let RankDevice { device, stream } = producer;"));
+        assert!(!gather.contains("cuda_stream_device"), "stream queries invalidate graph capture");
+        assert!(!gather.contains("cuda_get_device"));
+        assert!(!gather.contains("embedding.residency().device"));
+        for (table_device, stream_device) in [(0, 1), (1, 0)] {
+            let mut output = [0u8; 64];
+            let mut scratch = [0u8; 16];
+            let src = CuteafdDeviceBuffer { ptr: scratch.as_mut_ptr().cast(), bytes: scratch.len(),
+                device_id: stream_device, flags: 0 };
+            let mut copies = 0;
+            gather_row_fp8_copies(2, 4, 4, output.as_mut_ptr().cast(), Some(src), stream_device, |op| {
+                match op {
+                    EmbeddingOp::Gather(ptr) => assert_eq!(ptr, src.ptr),
+                    EmbeddingOp::Copy { dst, src, .. } => {
+                        assert_eq!(dst.device_id, stream_device);
+                        assert_eq!(src.device_id, stream_device);
+                        assert_ne!(dst.device_id, table_device);
+                        copies += 1;
+                    }
+                }
+                Ok(())
+            })?;
+            assert_eq!(copies, 4);
+            assert!(gather_row_fp8_copies(2, 4, 4, output.as_mut_ptr().cast(),
+                Some(CuteafdDeviceBuffer { device_id: table_device, ..src }), stream_device,
+                |_| panic!("peer-device scratch must fail before launch")).is_err());
+        }
         Ok(())
     }
 

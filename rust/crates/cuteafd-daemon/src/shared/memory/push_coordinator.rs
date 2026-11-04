@@ -17,6 +17,7 @@ pub(crate) struct CoordinatorExpertPlan {
     pub exlr8: Vec<cuteafd_loader::plan::exlr8::residency::Residency>,
     /// Native planes per layer (empty for EXL3).
     pub native: Vec<cuteafd_loader::push_load::native::NativePlanes>,
+    pub native_layers: Vec<crate::shared::experts::layer::ExpertLayer>,
     pub fp8: Option<super::push_fp8::RankPlan>,
     pub layers: Vec<usize>,
     pub gpu: usize,
@@ -42,7 +43,7 @@ impl CoordinatorExpertPlan {
             && layers.windows(2).all(|ids| ids[0] < ids[1]), "EXLR8 RTX needs ordered layers on one or two GPUs");
         let plan = super::push_exlr8::RankPlan::new(catalog.snapshot(), manifest, layers, world, gpu, admitted)?;
         let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
-        Ok(Self { residencies: Vec::new(), exlr8: plan.residencies, native: Vec::new(), fp8: None,
+        Ok(Self { residencies: Vec::new(), exlr8: plan.residencies, native: Vec::new(), native_layers: Vec::new(), fp8: None,
             layers: layers.to_vec(), gpu, world, layout: plan.layout, validation, scales: Default::default() })
     }
 
@@ -69,7 +70,7 @@ impl CoordinatorExpertPlan {
         let validation = ValidationLayout::exl3(&residencies, layout.bytes() as u64, usize::MAX)?;
         let layout = layout.with_validation(validation.bytes(), validation.bytes())?;
         let world = residencies.first().map_or(1, |r| r.world);
-        Ok(Self { residencies, exlr8: Vec::new(), native: Vec::new(), fp8: None, layers, gpu, world,
+        Ok(Self { residencies, exlr8: Vec::new(), native: Vec::new(), native_layers: Vec::new(), fp8: None, layers, gpu, world,
             layout, validation, scales: Default::default() })
     }
 
@@ -83,30 +84,55 @@ impl CoordinatorExpertPlan {
             let selected = layers.iter().map(|&layer| (layer, tensors.exact_slicing(world))).collect::<Vec<_>>();
             let plan = super::push_fp8::RankPlan::from_tensors(&tensors, &selected, world, gpu, admitted)?;
             let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
-            return Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native: Vec::new(),
+            return Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native: Vec::new(), native_layers: Vec::new(),
                 layers: layers.to_vec(), gpu, world, layout: plan.layout.clone(), validation,
                 scales: Default::default(), fp8: Some(plan) });
         }
-        ensure!(catalog.fp8().is_none() && catalog.nvfp4().is_none(),
-            "coordinator native TP2 push takes MXFP4 checkpoints");
-        let geometry = catalog.routed_experts();
-        ensure!(geometry.intermediate % world == 0, "native TP2 halves need an even intermediate");
-        let width = geometry.intermediate / world;
-        let planes = cuteafd_loader::push_load::native::NativePlanes::with_scale_codes(geometry.hidden as usize, width,
-            width.div_ceil(128) * 128, geometry.experts as usize, false, catalog.mxfp4_scale_codes())?;
-        let native = layers.iter().map(|_| planes.clone()).collect::<Vec<_>>();
+        use crate::shared::experts::layer::ExpertLayer;
+        let selections = layers.iter().map(|&layer| if world == 1 { ExpertLayer::BackboneFull { layer } }
+            else { ExpertLayer::BackboneTp2 { layer, rank: gpu } }).collect::<Vec<_>>();
+        let mut plan = Self::native_selected(catalog, &selections, gpu, admitted)?;
+        plan.layers = layers.to_vec();
+        plan.world = world;
+        Ok(plan)
+    }
+
+    pub fn native_selected(catalog: &OfficialV41Catalog,
+        selections: &[crate::shared::experts::layer::ExpertLayer], gpu: usize, admitted: usize) -> Result<Self> {
+        use crate::shared::experts::layer::ExpertLayer;
+        ensure!(!selections.is_empty() && catalog.exl3().is_none() && catalog.fp8().is_none()
+            && catalog.nvfp4().is_none(), "coordinator native push takes MXFP4 selections");
+        let mut seen = Vec::new();
+        let native = selections.iter().map(|&selection| {
+            ensure!(!seen.contains(&selection), "duplicate coordinator native selection");
+            seen.push(selection);
+            let experts = match selection {
+                ExpertLayer::BackboneFull { .. } => catalog.routed_experts().experts,
+                ExpertLayer::BackboneTp2 { rank, .. } | ExpertLayer::DsparkTp2 { rank, .. } => {
+                    ensure!(rank == gpu && gpu < 2, "native TP2 selection differs from GPU");
+                    if matches!(selection, ExpertLayer::DsparkTp2 { .. }) { catalog.routed_experts().draft_experts }
+                    else { catalog.routed_experts().experts }
+                }
+                _ => anyhow::bail!("unsupported coordinator native selection {selection:?}"),
+            };
+            let staging = catalog.expert_staging(selection.expert(0))?;
+            let width = staging.intermediate_size();
+            cuteafd_loader::push_load::native::NativePlanes::with_scale_codes(catalog.routed_experts().hidden,
+                width, width.div_ceil(128) * 128, experts, false, catalog.mxfp4_scale_codes())
+        }).collect::<Result<Vec<_>>>()?;
         let layout = ArenaLayout::new(native.iter().map(|p| p.bytes), admitted)?;
         let validation = ValidationLayout::exl3(&[], layout.bytes() as u64, usize::MAX)?;
         let mut generated = Vec::new();
         let mut scale_layers = Vec::new();
-        for (region, (&layer, planes)) in layers.iter().zip(&native).enumerate() {
+        for (region, (&selection, planes)) in selections.iter().zip(&native).enumerate() {
             let base = layout.region(region)?.start;
             generated.extend(planes.generated_ranges().into_iter().map(|r| base + r.start..base + r.end));
-            scale_layers.push((layer, planes.clone(), base));
+            scale_layers.push((selection, planes.clone(), base));
         }
         let layout = layout.with_generated(generated)?;
-        let scales = super::push_native::ScalePlan::new(catalog, scale_layers, world, gpu)?;
-        Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native, fp8: None, layers: layers.to_vec(), gpu, world, layout, validation, scales })
+        let scales = super::push_native::ScalePlan::selected(catalog, scale_layers)?;
+        Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native, native_layers: selections.to_vec(),
+            fp8: None, layers: Vec::new(), gpu, world: 1, layout, validation, scales })
     }
 
     /// EXLR8 keeps its source/index metadata through serving and constructs one
@@ -175,15 +201,14 @@ impl CoordinatorExpertPlan {
             return Ok(());
         }
         if !self.native.is_empty() {
-            for (index, (planes, &layer)) in self.native.iter().zip(&self.layers).enumerate() {
+            for (index, (planes, &selection)) in self.native.iter().zip(&self.native_layers).enumerate() {
                 let range = self.layout.region(index)?;
                 let destination = Destination { rank, offset: base + range.start as u64, bytes: range.len() as u64 };
                 for expert in 0..planes.experts {
-                    let selection = if self.world == 1 {
-                        cuteafd_loader::V41ExpertSelection::BackboneFull { layer, expert }
-                    } else { cuteafd_loader::V41ExpertSelection::BackboneTp2 { layer, expert, rank: self.gpu } };
-                    let names = catalog.expert_staging(selection)?.tensor_names().to_vec();
-                    builder.v41_resident(catalog, &names, planes, expert, u32::try_from(self.world)?, self.gpu as u32, destination, None)?;
+                    let world = if matches!(selection, crate::shared::experts::layer::ExpertLayer::BackboneFull { .. }) { 1 } else { 2 };
+                    let checkpoint_rank = if world == 1 { 0 } else { self.gpu };
+                    let names = catalog.expert_staging(selection.expert(expert))?.tensor_names().to_vec();
+                    builder.v41_resident(catalog, &names, planes, expert, world, checkpoint_rank as u32, destination, None)?;
                 }
             }
             self.scales.append(builder, rank, base + self.scales.base(&self.layout))?;

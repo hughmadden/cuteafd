@@ -14,7 +14,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
-    #[arg(long, default_value_t = 1)] pub split_device: i32,
+    /// Optional distinct physical peer; absent serves the full model on --device.
+    #[arg(long)] pub split_device: Option<i32>,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
@@ -47,6 +48,7 @@ pub(crate) struct ServeArgs {
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
+    #[command(flatten)] pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
     #[command(flatten)] pub api: crate::shared::api::ApiArgs,
 }
@@ -71,8 +73,8 @@ impl ServeArgs {
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(self.device >= 0 && self.split_device >= 0 && self.device != self.split_device,
-            "Kimi serving requires two distinct coordinator devices");
+        ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
+            "Kimi serving requires one device or two distinct coordinator devices");
         ensure!((1..=8).contains(&self.peers.len()) && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
             "Kimi serving requires 1..8 distinct real Spark endpoints");
         ensure!(self.max_context.is_none_or(|context| (1..=COMPILED_CONTEXT).contains(&context)),
@@ -86,6 +88,26 @@ impl ServeArgs {
             "Kimi serving admits GPU token embeddings only");
         Ok(())
     }
+}
+
+fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
+    library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    checkpoint: &cuteafd_loader::plan::Checkpoint,
+    cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config, devices: [i32; RANKS],
+    slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
+    -> Result<startup::Loaded<'a>> {
+    let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
+        snapshot: snapshot.clone(), fp8: args.draft_fp8, cache_format: args.kv_cache });
+    startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
+        cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
+        peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
+        spark_budget_gib: args.spark_budget_gib,
+        rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
+        prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
+        max_context: args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?),
+        pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
+        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
+    })
 }
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
@@ -118,33 +140,27 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;
-            let mark_bytes = super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes()
-                .checked_mul(2).context("Kimi TP2 prefix mark extent overflow")?;
+            let physical_ranks = 1 + usize::from(worker_args.split_device.is_some());
+            let mark_bytes = super::state::KdaLayout::for_ranks(&cfg, slots, 1, 1, physical_ranks)?.mark_bytes()
+                .checked_mul(physical_ranks).context("Kimi prefix mark extent overflow")?;
             let marks = worker_args.prefix.mark_rule(concurrency).slots(mark_bytes);
             startup::preflight(&worker_args.manifest, &worker_args.native_lib)?;
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
-            let draft = worker_args.draft.as_ref().map(|snapshot| super::draft::Options {
-                snapshot: snapshot.clone(), fp8: worker_args.draft_fp8, cache_format: worker_args.kv_cache });
-            let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
-                cache_format: worker_args.kv_cache,
-                devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
-                peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
-                spark_budget_gib: worker_args.spark_budget_gib,
-                rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
-                prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
-                slots, marks,
-                max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
-                pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
-                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
-            })?;
-            crate::shared::memory_report::release_load_staging(&library);
+            let loaded = match worker_args.split_device {
+                Some(peer) => load_target(&worker_args, &library, &programs, &checkpoint, &cfg,
+                    [worker_args.device, peer], slots, marks, prefill)?,
+                None => load_target(&worker_args, &library, &programs, &checkpoint, &cfg,
+                    [worker_args.device], slots, marks, prefill)?,
+            };
+            let physical_devices = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
+            crate::shared::memory_report::release_load_staging(&library)?;
             loaded.engine.configure_packing(worker_args.prefill_packing)?;
             let backend = KimiBackend::new(&loaded.engine)?;
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
-            library.cuda_set_device(worker_args.split_device)?;
+            library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, concurrency,
                 match loaded.engine.native_draft() {
                     Some(draft) => scheduler::Drafts::Neural {
@@ -152,10 +168,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         fixed: worker_args.draft_fixed.is_some() },
                     None => scheduler::Drafts::None,
                 }, eos, worker_args.decode_share, &worker_args.prefix,
-                worker_args.token_io.token_select, &mut super::super::qwen3_5::serve::text_media(), None, || {
+                worker_args.loop_abort.config(), worker_args.token_io.token_select,
+                &mut super::super::qwen3_5::serve::text_media(), None, || {
                     loaded.engine.require_live()?;
                     crate::shared::inventory::RuntimeInventory::measure(&library,
-                        &[worker_args.device, worker_args.split_device],
+                        &physical_devices,
                         crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?
                         .record("kimi_k3-serving-loaded", &loaded.admission_free);
                     if let Some(ready) = ready.take() {

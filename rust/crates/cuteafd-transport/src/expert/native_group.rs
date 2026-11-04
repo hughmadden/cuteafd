@@ -66,8 +66,9 @@ pub const V41_NATIVE_INACTIVE_OWNER: u8 = u8::MAX;
 /// coordinator, and every Spark group skips them. Only valid together with
 /// [`V41_NATIVE_GROUP_REQUEST_FLAG`]; request-only, never in a response. Set
 /// on every request of a link with a tier, whether or not a batch marks any
-/// route.
-pub const V41_NATIVE_COORDINATOR_REQUEST_FLAG: u32 = 1 << 21;
+/// route. Bit 30 stays clear of the protocol's flags, which are allocated
+/// upward from bit 16 (bit 21 is the FP8 K32 combined-reply format).
+pub const V41_NATIVE_COORDINATOR_REQUEST_FLAG: u32 = 1 << 30;
 
 /// Owner index of a route the coordinator's GPU expert tier runs: wire bit
 /// `9 + 3 = 12`, the next bit of the one-hot owner field, legal only under

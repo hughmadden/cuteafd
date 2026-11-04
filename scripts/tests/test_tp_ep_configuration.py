@@ -59,6 +59,33 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
+    def test_shipped_config_defaults_dual_rtx_dspark_experts_on(self) -> None:
+        result = load_file(CONFIG, 'release_resolve_tp2_dspark_experts deepseek_v41 2; '
+                           'printf "%s\\n" "$TP2_DSPARK_EXPERTS"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'on')
+
+    def test_tp2_dspark_default_follows_resolved_layout(self) -> None:
+        for family, gpus, speculator in [('deepseek_v41', 2, 'dspark'),
+                                         ('deepseek_v41', 1, 'dspark'),
+                                         ('deepseek_v41', 2, 'off'),
+                                         ('glm5', 2, 'dspark')]:
+            eligible = family == 'deepseek_v41' and gpus == 2 and speculator == 'dspark'
+            for requested in ['', 'off', 'on']:
+                with self.subTest(family=family, gpus=gpus, speculator=speculator, requested=requested):
+                    result = load(f'SPECULATOR={speculator}\nTP2_DSPARK_EXPERTS={requested}',
+                                  f'release_resolve_tp2_dspark_experts {family} {gpus}; '
+                                  'printf "%s\\n" "$TP2_DSPARK_EXPERTS"')
+                    if requested == 'on' and not eligible:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('requires V4.1, two selected RTX GPUs and dSpark', result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), 'on' if eligible and requested != 'off' else 'off')
+        result = load('TP2_DSPARK_EXPERTS=invalid')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TP2_DSPARK_EXPERTS must be on or off', result.stderr)
+
     def test_native_layer_bytes_follow_shared_artifact_geometry(self) -> None:
         import importlib.util
         path = ROOT / "python/tools/lib/spark_packages.py"
@@ -393,7 +420,8 @@ dspark_draft_limit=
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
-TP2_DSPARK_EXPERTS=off
+TP2_DSPARK_EXPERTS=
+release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 topology_explicit={topology_explicit}
 spark_tp={spark_tp}
 spark_ep={spark_ep}

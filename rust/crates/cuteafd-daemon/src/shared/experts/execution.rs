@@ -146,6 +146,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
+    reply_codec: Option<super::reply::ReplyCodec<'library>>,
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
@@ -345,6 +346,7 @@ impl<'library> ExpertWeights<'library> {
         let small = prepare_small(grouped, budget.small_scratch_bytes)?;
         let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
             budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
+        let reply_codec = if compact_output_role(kernel.info().role) { Some(super::reply::ReplyCodec::load(library)?) } else { None };
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -359,6 +361,7 @@ impl<'library> ExpertWeights<'library> {
             worker_timing: None,
             compact_reducer,
             compact_output,
+            reply_codec,
             scratch,
             hidden,
             ids,
@@ -637,12 +640,34 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         include_shared: bool,
         stream: *mut c_void,
     ) -> Result<()> {
+        unsafe { self.launch_hidden_on(rows, include_shared, stream, None) }
+    }
+    /// Launch with the rows already in the transport's mapped request frame
+    /// instead of this execution's resident input buffer.
+    /// # Safety
+    /// Same contract as `launch`: `hidden` addresses `rows * row_bytes`
+    /// initialized wire rows on this execution's device, and the transport
+    /// retains that storage until the stream work that reads it completes.
+    pub(crate) unsafe fn launch_hidden(&mut self, rows: u32, hidden: *mut c_void) -> Result<()> {
+        unsafe { self.launch_hidden_on(rows, false, self.stream.raw, Some(hidden)) }
+    }
+    unsafe fn launch_hidden_on(
+        &mut self,
+        rows: u32,
+        include_shared: bool,
+        stream: *mut c_void,
+        hidden: Option<*mut c_void>,
+    ) -> Result<()> {
         ensure!(
             !include_shared || self.shared.is_some(),
             "shared output belongs on coordinator RTX"
         );
         let (kernel, slots, _) = self.execution_state(rows)?;
-        let args = V41ExpertLaunchArgs::new(kernel.info(), *slots, rows, stream)?;
+        let mut pointers = *slots;
+        if let Some(hidden) = hidden {
+            pointers[0] = hidden;
+        }
+        let args = V41ExpertLaunchArgs::new(kernel.info(), pointers, rows, stream)?;
         unsafe {
             kernel.launch(&args)?;
         }
@@ -906,10 +931,19 @@ impl ExpertExecution<'_, '_> {
                     std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4));
             }
         }
+        let device = self.hidden.buffer.device_id;
+        let mut in_frame = None;
         let uploaded = (|| -> Result<()> { unsafe {
             // The unit's pace starts before its input copies (#762).
             self.pending.arrive(self.stream.raw)?;
             match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+                // The kernel reads the rows from its input pointer exactly as
+                // it would read the resident copy, and the transport retains
+                // the frame until this unit's fence, so an aligned same-device
+                // view is input storage: read it where it landed and skip the
+                // LPDDR-to-LPDDR copy pass.
+                Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device =>
+                    in_frame = Some(view.ptr),
                 Some(view) => self.library.copy_d2d_async(self.hidden.buffer,
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
                 None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
@@ -932,14 +966,19 @@ impl ExpertExecution<'_, '_> {
         // SAFETY: this worker retains events, inputs and stream through the barrier below.
         unsafe {
             if let Some(timing) = &self.worker_timing { timing.record(0, self.stream.raw)?; }
-            self.launch(request.rows(), false)?;
+            match in_frame {
+                Some(hidden) => self.launch_hidden(request.rows(), hidden)?,
+                None => self.launch(request.rows(), false)?,
+            }
         }
         if let Some(timing) = &self.timing {
             unsafe {
                 timing.record(1, self.stream.raw)?;
             }
         }
-        let output = destination.unwrap_or(self
+        let compressed = request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16;
+        ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
+        let output = destination.filter(|_| !compressed).unwrap_or(self
             .compact_output
             .as_ref()
             .context("missing compact output")?
@@ -956,6 +995,11 @@ impl ExpertExecution<'_, '_> {
                     reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
                         output.ptr.cast(), request.rows(), self.stream.raw)?,
             }
+        }
+        if compressed {
+            // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
+            unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
+                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream.raw)?; }
         }
         if let Some(timing) = &self.timing {
             unsafe {

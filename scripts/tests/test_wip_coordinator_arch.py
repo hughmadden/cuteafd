@@ -171,7 +171,9 @@ def test_v41_switches_reach_cmake():
     for flag in ('V41_ATTENTION_AOT', 'V41_NARROW_AOT'):
         assert f'-DCUTEAFD_ENABLE_{flag}="$v41_candidate_aot"' in cmake, flag
     assert '-DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$v41_hc_lagged_aot"' in cmake
-    assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON' in cmake
+    # The dSpark coordinator experts are always built (upstream names the switch).
+    assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT="$v41_expert_aot"' in cmake
+    assert '\nv41_expert_aot=ON\n' in ARTIFACTS
     assert '-DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot"' in cmake
     # Every slot ships the exported dSpark coordinator manifest; there is no disabled form.
     assert 'install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"' in ARTIFACTS

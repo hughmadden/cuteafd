@@ -158,8 +158,8 @@ pub fn discover() -> Result<FabricReport> {
     Ok(FabricReport { ports, rails, rdma_traffic_class: RDMA_TRAFFIC_CLASS })
 }
 
-/// GRH traffic class the native layer sets on every RC QP (`rdma_traffic_class.h`): DSCP 26.
-pub const RDMA_TRAFFIC_CLASS: u8 = 26 << 2;
+/// GRH traffic class the native layer sets on every RC QP (`rdma_traffic_class.h`): DSCP 26, ECT(0).
+pub const RDMA_TRAFFIC_CLASS: u8 = 26 << 2 | 0b10;
 
 fn read_device(path: &Path, addresses: &[(String, Ipv4Addr, u8)]) -> Result<Vec<RdmaPort>> {
     let device = path.file_name().context("RDMA device name")?.to_string_lossy().into_owned();
@@ -356,9 +356,9 @@ mod tests {
 
     #[test]
     fn rdma_marking_is_dscp_26_and_logged() {
-        assert_eq!(RDMA_TRAFFIC_CLASS, 104);
+        assert_eq!(RDMA_TRAFFIC_CLASS, 106);
         let report = FabricReport { ports: vec![], rails: plan_rails(&[]), rdma_traffic_class: RDMA_TRAFFIC_CLASS };
-        assert!(report.summary().contains("rdma_tc=104 dscp=26"));
+        assert!(report.summary().contains("rdma_tc=106 dscp=26"));
     }
 
 

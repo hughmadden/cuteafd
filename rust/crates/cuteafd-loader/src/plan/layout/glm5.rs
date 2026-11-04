@@ -29,11 +29,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             else if layers { crate::placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
         ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)
     };
-    let prefill = match super::resolve_prefill(report, options, spark_ranks, limits) {
+    let prefill = match super::resolve_prefill(input, report, options, spark_ranks, limits) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
     };
-    let mut shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    let mut shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
     report.prefill_span_rows = Some(prefill.span_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
@@ -82,17 +82,17 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             "native K6 drafter head needs its actual DFlash config, not a bytes-only override");
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
             ranks, owners.as_deref(), shape.prefill_rows as usize, prefill.waves as usize, draft_rows,
-            shape.manifest.as_ref().context("GLM K6 requires PROGRAMS.json with native exports")?)?))
+            shape.manifest.as_deref().context("GLM K6 requires PROGRAMS.json with native exports")?)?))
     })();
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
-        let item = match (core.as_ref().ok().and_then(Option::as_ref), shape.manifest.as_ref()) {
+        let item = match (core.as_ref().ok().and_then(Option::as_ref), shape.manifest.as_deref()) {
             (Some(core), Some(manifest)) => {
                 let arch = crate::placement::ArchContext::coordinator(options.coordinator_arch, options.rtx_bytes[index], None);
                 let allowance = crate::placement::inventory::loaded_code_allowance(&format!("{program_family}-k6"), local_package(report), split,
                     index as u8, &arch, Some(&core.program_set(manifest, split)));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
             }
-            _ => runtime_item(shape.manifest.as_ref(), &program_families(program_family, split),
+            _ => runtime_item(shape.manifest.as_deref(), &program_families(program_family, split),
                 local_package(report), split, index, options.coordinator_arch, options.rtx_bytes[index]),
         };
         device.items.push(item);
@@ -113,7 +113,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let mut pool_tokens = 0;
     let mut local_layers = 0;
-    match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(),
+    match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_deref(),
         shape.prefill_rows, shape.context_tokens, core.as_ref())) {
         Ok((placement, selected)) => {
             report.solver_placement = Some(placement.clone());
@@ -458,7 +458,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         rows, lanes, exchange_f32, onboard, false, None)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
-    let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+    let inputs = glm::GlmInputs { spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers, gpus,
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0,
         native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(),
         native_head: core.is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
@@ -562,7 +562,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     } else { None };
     let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));
-    let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers,
+    let inputs = glm::GlmInputs { spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers,
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
@@ -738,7 +738,7 @@ mod tests {
                 let exl3 = input.plan(&plan_options).unwrap();
                 let mut native = crate::plan::empty_report(&input, &plan_options).unwrap();
                 let mut options = options;
-                let shape = crate::plan::layout::resolve_prefill(&mut native, &mut options, sparks,
+                let shape = crate::plan::layout::resolve_prefill(&input, &mut native, &mut options, sparks,
                     crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)).unwrap();
                 native.family = exl3.family.clone();
                 native.spec = exl3.spec.clone();
@@ -746,7 +746,7 @@ mod tests {
                 native.spark_ranks = sparks;
                 native.memory_layout = Some(native_layout(input.checkpoint(), &options,
                     &vec![256; gpus], 256, sparks, &manifest, None).unwrap().0);
-                charge_host(&mut native, &options, input.checkpoint(), true).unwrap();
+                charge_host(&mut native, &options, &input, true).unwrap();
                 let geometry = |r: &PlanReport| (r.prefill_unit_rows, r.prefill_waves,
                     r.prefill_span_rows, r.prefill_transports);
                 // Unpinned, the fixed depth (3 x 2752 with Sparks, one unit

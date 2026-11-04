@@ -30,6 +30,10 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Spark prefill expert replies; decode/verify and <=64-row requests stay BF16.
+    /// Omission keeps BF16 combined replies and Muse's NVFP4 partial replies.
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_FORMAT")]
+    pub(crate) spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
     #[arg(long, global = true, env = "VISION")]
     pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
     #[arg(long, global = true, env = "AUDIO")]
@@ -399,11 +403,6 @@ pub(crate) struct PlanArgs {
     /// rank the GPU expert tier's resident set; uniform without one.
     #[arg(long, requires = "gpu_expert_tier")]
     pub(crate) gpu_expert_tier_profile: Option<PathBuf>,
-    /// V4.1 with --rtx 2: plan dSpark's routed draft experts as TP2 halves on
-    /// both GPUs, as serving's --tp2-dspark-experts loads them
-    /// (TP2_DSPARK_EXPERTS=on in --config), instead of whole on the drafter's GPU.
-    #[arg(long)]
-    pub(crate) tp2_dspark_experts: bool,
     /// Removed whole-layer GPU1 placement flag.
     #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
     pub(crate) deprecated_peer_expert_ranges: bool,
@@ -454,6 +453,9 @@ pub(crate) struct PlanArgs {
     /// V4.1 proposal limit for --layout (otherwise DSPARK_DRAFT_LIMIT or five).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
     pub(crate) dspark_draft_limit: Option<u8>,
+    /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
+    #[arg(long, requires = "layout")]
+    pub(crate) tp2_dspark_experts: bool,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
@@ -497,9 +499,6 @@ pub(crate) struct PlanArgs {
     /// Muse Spark partial replies (serve-muse's flags): the per-request BF16 row cutoff.
     #[arg(long, default_value_t = cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)]
     pub(crate) expert_partial_bf16_max_rows: usize,
-    /// Muse Spark partial replies: the format of segments above the cutoff (nvfp4 or fp8).
-    #[arg(long, default_value = "nvfp4")]
-    pub(crate) expert_partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
@@ -633,6 +632,9 @@ pub(crate) struct BenchRdmaArgs {
     pub(crate) duration_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum RdmaSendMemory { Pinned, Device }
+
 #[derive(Debug, Args)]
 pub(crate) struct BenchRdmaRingArgs {
     #[arg(long, default_value = "server")]
@@ -663,6 +665,9 @@ pub(crate) struct BenchRdmaRingArgs {
     pub(crate) network_label: String,
     #[arg(long, default_value_t = false)]
     pub(crate) gpu_echo: bool,
+    /// SEND payload storage for the basic client/server diagnostic.
+    #[arg(long, value_enum, default_value = "pinned")]
+    pub(crate) send_memory: RdmaSendMemory,
     #[arg(long, default_value = "fp8")]
     pub(crate) wire_codec: String,
     #[arg(long, default_value_t = 1)]
@@ -812,6 +817,68 @@ mod tests {
             "--mapped-scale-preload-gib", "0"]).unwrap().command
             else { panic!("expected native serve"); };
         assert_eq!(args.mapped_scale_preload_gib, 0.0);
+    }
+
+    /// LD-01: the loop-abort run defaults to 512 (ON by default; the
+    /// upstream-sync divergence is recorded in the slice RESULT).
+    #[test]
+    fn loop_abort_run_defaults_to_512() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.loop_abort.loop_abort_run, 512);
+        assert_eq!(args.loop_abort.loop_abort_copies, 8);
+        assert_eq!(args.loop_abort.loop_fast_span, 1024);
+        assert_eq!(args.loop_abort.loop_fast_copies, 8);
+    }
+
+    /// LD-01/N4: `--loop-abort-run 0` disables rule R only; rule F is gated by
+    /// `--loop-fast-span` independently. The full kill switch is both knobs at
+    /// zero. The range is 0..=65536.
+    #[test]
+    fn loop_abort_run_zero_disables_rule_r_only() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0"].iter())).unwrap().command else {
+            panic!("expected native serving") };
+        assert_eq!(args.loop_abort.loop_abort_run, 0);
+        assert_eq!(args.loop_abort.loop_fast_span, 1024, "rule F stays on");
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "65537"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-copies", "1"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-fast-copies", "65"].iter())).is_err());
+    }
+
+    /// LD-01/N4: the full kill switch is both rule knobs at zero.
+    #[test]
+    fn loop_abort_both_rules_zero_is_the_kill_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0", "--loop-fast-span", "0"].iter()))
+            .unwrap().command else { panic!("expected native serving") };
+        let config = args.loop_abort.config();
+        assert_eq!(config.run, 0);
+        assert_eq!(config.fast_span, 0);
+        let super::Commands::ServeNative(enabled_args) = super::Cli::try_parse_from(base)
+            .unwrap().command else { panic!("expected native serving") };
+        for period in [1, 300] {
+            let detail = cuteafd_api::openai::FinishDetail::default();
+            let mut abort = config.guard(detail.clone(), 1);
+            let mut enabled = enabled_args.loop_abort.config()
+                .guard(cuteafd_api::openai::FinishDetail::default(), 2);
+            let mut enabled_aborted = false;
+            for token in (0..if period == 1 { 2_000 } else { 3_000 }).map(|i| i % period) {
+                assert!(!abort.push(token), "the disabled detector never aborts");
+                if !enabled_aborted { enabled_aborted = enabled.push(token); }
+            }
+            assert!(enabled_aborted, "CLI defaults must abort period {period}");
+            assert_eq!(detail.name(), None);
+        }
     }
 
     #[test]
@@ -1096,6 +1163,20 @@ mod tests {
     }
 
     #[test]
+    fn rdma_send_memory_parses_and_rejects_unknown_backing() {
+        use super::RdmaSendMemory;
+        for (flags, expected) in [(vec![], RdmaSendMemory::Pinned),
+            (vec!["--send-memory", "pinned"], RdmaSendMemory::Pinned),
+            (vec!["--send-memory", "device"], RdmaSendMemory::Device)] {
+            let Commands::BenchRdmaRing(args) = Cli::try_parse_from(
+                ["cuteafd", "bench-rdma-ring"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected ring benchmark"); };
+            assert_eq!(args.send_memory, expected);
+        }
+        assert!(Cli::try_parse_from(["cuteafd", "bench-rdma-ring", "--send-memory", "managed"]).is_err());
+    }
+
+    #[test]
     fn transport_benchmark_defaults_use_flash_geometry() {
         let cli = Cli::try_parse_from(["cuteafd", "bench-rdma-ring"]).unwrap();
         let Commands::BenchRdmaRing(args) = cli.command else {
@@ -1259,6 +1340,9 @@ pub(crate) struct NativeServeArgs {
     /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
     #[command(flatten)]
     pub reserve: crate::shared::kv_reserve::ReserveArgs,
+
+    #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]

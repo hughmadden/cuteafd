@@ -285,7 +285,7 @@ pub(super) fn admit_startup(
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes)?, slots)?;
+        owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?, slots)?;
     let draft = if args.dspark {
         let mut draft =
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
@@ -906,13 +906,18 @@ mod admission_tests {
     fn transport_charge_equals_serve_allocation() -> anyhow::Result<()> {
         use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, V41Link};
         for (rows, ranks) in [(1024u32, 3usize), (1408, 3), (2752, 4), (2752, 6), (4096, 4)] {
-            for slots in 2..=4usize {
-                let reserve = slots as u64 * u64::from(rows);
-                let runtime = 2 * NativeTp4Wave::device_bytes_for(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS, ranks)?
-                    + slots * rows as usize * 5120 * 2
-                    + V41Link::prefill_device_bytes(reserve as usize, ranks)?;
-                assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS), u64::from(rows), ranks, slots)?, runtime as u64,
-                    "{slots} x {rows} rows on {ranks} ranks");
+            for slots in 1..=4usize {
+                for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
+                    let reserve = slots as u64 * u64::from(rows);
+                    let prefill = V41Link::prefill_device_bytes(reserve as usize, ranks, format)?;
+                    assert_eq!(prefill as u64, ranks as u64
+                        * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(reserve * 5120 * 2)?);
+                    let runtime = 2 * NativeTp4Wave::device_bytes_for(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS, ranks)?
+                        + slots * rows as usize * 5120 * 2 + prefill;
+                    assert_eq!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS), u64::from(rows), ranks, slots, format)?, runtime as u64,
+                        "{format}: {slots} x {rows} rows on {ranks} ranks");
+                }
             }
         }
         Ok(())

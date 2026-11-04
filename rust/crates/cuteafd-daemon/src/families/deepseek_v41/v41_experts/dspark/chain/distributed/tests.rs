@@ -192,6 +192,35 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
     assert!(lanes[0].output().is_err());
     runtime.block_on(unsafe { lanes[0].execute([&windows[0], &windows[1], &windows[2]], refs) })?;
     assert!(lanes[0].output().is_ok());
+    if tp2 {
+        devices[1].run(|| {
+            let chain = lanes[0].chain.get_mut();
+            let reads = chain.prepare([&windows[0], &windows[1], &windows[2]], refs)?;
+            let pending = PendingDraft { count: 3, reads, warming: false, armed: true,
+                library: &lib, stream: chain.stream.raw,
+                peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };
+            let peer = pending.peers[0].as_ref().unwrap().clone();
+            let source = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20)?;
+            let destination = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20)?;
+            peer.device.run(|| {
+                // Model a partial submission: peer work exists, but no root
+                // wait on its completion was installed before an error.
+                for _ in 0..128 {
+                    // SAFETY: both allocations and the peer owner outlive the guard drain.
+                    unsafe { lib.copy_d2d_async(destination.buffer, source.buffer, 1 << 20, peer.raw)?; }
+                }
+                Ok(())
+            })?;
+            drop(pending);
+            peer.device.run(|| {
+                // SAFETY: the retained peer stream is still live on its owning device.
+                ensure!(unsafe { lib.cuda_stream_query(peer.raw)? }, "pending guard released readers before peer completion");
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        eprintln!("PASS partial-submission reader guard drains unjoined peer work");
+    }
     devices[1].run(|| {
         for stage in 0..3 { for lease in &leases[stage] { windows[stage].release(*lease)?; } }
         Ok(())

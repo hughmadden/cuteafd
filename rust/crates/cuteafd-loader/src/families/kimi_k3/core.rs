@@ -30,9 +30,14 @@ pub fn split(stem: &str) -> Option<CoreSplit> {
 /// Arena stages live within one unit's hook (`unit` rows); the peer meet
 /// planes are row planes of the whole call (`rows`, windowed per unit).
 pub fn intermediate_extents(rows: usize, unit: usize) -> Result<BTreeMap<&'static str, usize>> {
-    [("K6 q",6144,2),("K6 k",6144,2),("K6 v",6144,2),("K6 gate",12288,2),
+    intermediate_extents_for_ranks(rows, unit, 2)
+}
+
+pub fn intermediate_extents_for_ranks(rows: usize, unit: usize, ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
+    ensure!(matches!(ranks, 1 | 2), "Kimi K6 physical rank count");
+    [("K6 q",12288/ranks,2),("K6 k",12288/ranks,2),("K6 v",12288/ranks,2),("K6 gate",12288,2),
         ("K6 q_a",1536,2),("K6 kv_a",640,2),("K6 q_b",18432,2),("K6 normalized",12288,2),
-        ("K6 FFN gate",3072,2),("K6 FFN up",3072,2),("K6 attention partial",7168,2),
+        ("K6 FFN gate",6144/ranks,2),("K6 FFN up",6144/ranks,2),("K6 attention partial",7168,2),
         ("K6 FFN partial",7168,2),("K6 reduced",7168,4)].into_iter()
         .map(|(name,width,element)| {
             let rows = if super::allocation::CORE_MEET_PLANES.contains(&name) { rows } else { unit };
@@ -44,7 +49,12 @@ pub fn intermediate_extents(rows: usize, unit: usize) -> Result<BTreeMap<&'stati
 /// Split entrypoints can need separate scratch larger than the fused plane.
 pub fn lane_extents(rows: usize, unit: usize, base_kda: usize, base_mla: usize,
     split_kda: usize, split_mla: usize) -> Result<BTreeMap<&'static str, usize>> {
-    let mut extents=intermediate_extents(rows, unit)?;
+    lane_extents_for_ranks(rows, unit, base_kda, base_mla, split_kda, split_mla, 2)
+}
+
+pub fn lane_extents_for_ranks(rows: usize, unit: usize, base_kda: usize, base_mla: usize,
+    split_kda: usize, split_mla: usize, ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
+    let mut extents=intermediate_extents_for_ranks(rows, unit, ranks)?;
     if split_kda>base_kda {extents.insert("K6 KDA scratch",split_kda);}
     if split_mla>base_mla {extents.insert("K6 MLA scratch",split_mla);}
     Ok(extents)
@@ -52,6 +62,12 @@ pub fn lane_extents(rows: usize, unit: usize, base_kda: usize, base_mla: usize,
 
 /// Inert installed-package inspection, with no CUDA load or payload read.
 pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usize) -> Result<BTreeMap<&'static str,usize>> {
+    package_lane_extents_for_ranks(manifest, rows, unit, 2)
+}
+
+pub fn package_lane_extents_for_ranks(manifest: &serde_json::Value, rows: usize, unit: usize,
+    ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
+    ensure!(matches!(ranks, 1 | 2), "Kimi K6 package physical rank count");
     let programs=manifest["programs"].as_array().context("Kimi K6 package program list")?;
     let scratch=|name: &str| -> Result<usize> {
         let entries=programs.iter().filter(|p|p["name"]==name).collect::<Vec<_>>();
@@ -62,8 +78,9 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usi
     };
     let mut base_kda=0;let mut split_kda=0;let mut base_mla=0;let mut split_mla=0;
     for capacity in [64,4096] {
-        base_kda=base_kda.max(scratch(&format!("kimik3_kda_m{capacity}"))?);
-        split_kda=split_kda.max(scratch(&format!("kda_core_h48_m{capacity}"))?);
+        let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik3_kda" };
+        base_kda=base_kda.max(scratch(&format!("{prefix}_m{capacity}"))?);
+        split_kda=split_kda.max(scratch(&format!("kda_core_h{}_m{capacity}", 96 / ranks))?);
         for heads in [48,96] {
             let suffix=if heads==48 {""}else{"_h96"};
             base_mla=base_mla.max(scratch(&format!("kimik3_mla_producer{suffix}_m{capacity}"))?);
@@ -72,7 +89,7 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usi
             }}
         }
     }
-    lane_extents(rows,unit,base_kda,base_mla,split_kda,split_mla)
+    lane_extents_for_ranks(rows,unit,base_kda,base_mla,split_kda,split_mla,ranks)
 }
 
 pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
@@ -82,7 +99,7 @@ pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct CoreCharges {
-    pub projection: [Option<ProjectionScratchLayout>; 2],
+    pub projection: Vec<Option<ProjectionScratchLayout>>,
     pub stages: BTreeMap<&'static str,usize>,
     pub stage_bytes: usize,
     pub receive: usize,
@@ -92,47 +109,65 @@ impl CoreCharges {
     /// receive serve one unit's launch; meet planes span the lane.
     pub fn from_package(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
         manifest: &serde_json::Value) -> Result<Self> {
-        let stages = if core.projections.is_empty() { BTreeMap::new() } else { package_lane_extents(manifest,rows,unit)? };
+        Self::from_package_for_ranks(cfg, core, rows, unit, manifest, 2)
+    }
+
+    pub fn from_package_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
+        manifest: &serde_json::Value, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
+        let stages = if core.projections.is_empty() { BTreeMap::new() }
+            else { package_lane_extents_for_ranks(manifest,rows,unit,ranks)? };
         let stage_bytes = if stages.is_empty() { 0 } else {
-            let base = super::allocation::NativeLaneLayout::new(cfg, rows, unit, super::COMPILED_CONTEXT,
-                super::allocation::NativeScratch::from_manifest(manifest)?)?;
+            let base = super::allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, super::COMPILED_CONTEXT,
+                super::allocation::NativeScratch::from_manifest_for_ranks(manifest, ranks)?, ranks)?;
             base.clone().with_core_stages(stages.clone())?.bytes()?.checked_sub(base.bytes()?)
                 .context("Kimi core stage charge underflow")?
         };
         Ok(Self {
-            projection: projection_scratch(cfg,core,unit,&manifest["families"]["dense_trellis_k6"] )?,
+            projection: projection_scratch_for_ranks(cfg,core,unit,&manifest["families"]["dense_trellis_k6"],ranks)?,
             stages, stage_bytes,
-            receive: exchange_recv_bytes(unit)?,
+            receive: if ranks == 2 { exchange_recv_bytes(unit)? } else { 0 },
         })
     }
     pub fn demands(&self) -> Result<Vec<crate::placement::Demand>> {
         use cuteafd_core::memory_layout::{Basis,Category};
-        let projection=[self.projection[0].as_ref().map_or(Ok(0),|layout|layout.bytes())?,
-            self.projection[1].as_ref().map_or(Ok(0),|layout|layout.bytes())?];
-        let stages=self.stage_bytes;
-        Ok((0..2).flat_map(|gpu|[
-            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 projection scratch",projection[gpu as usize] as u64,Basis::Exact),
-            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 split-stage operands",stages as u64,Basis::Exact),
-            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 peer receive",self.receive as u64,Basis::Exact),
-        ]).collect())
+        let mut demands = Vec::new();
+        for (gpu, projection) in self.projection.iter().enumerate() {
+            demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
+                "Kimi K6 projection scratch",projection.as_ref().map_or(Ok(0),|layout|layout.bytes())? as u64,Basis::Exact));
+            demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
+                "Kimi K6 split-stage operands",self.stage_bytes as u64,Basis::Exact));
+            if self.receive != 0 {
+                demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
+                    "Kimi K6 peer receive",self.receive as u64,Basis::Exact));
+            }
+        }
+        Ok(demands)
     }
 }
 
 /// The package selects native projection geometry. Headers select projections; no second export table.
 pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
     metadata: &serde_json::Value) -> Result<[Option<ProjectionScratchLayout>; 2]> {
-    if core.projections.is_empty() { return Ok([None, None]); }
+    let layouts = projection_scratch_for_ranks(cfg, core, rows, metadata, 2)?;
+    Ok(layouts.try_into().expect("validated pair scratch inventory"))
+}
+
+pub fn projection_scratch_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
+    metadata: &serde_json::Value, ranks: usize) -> Result<Vec<Option<ProjectionScratchLayout>>> {
+    ensure!(matches!(ranks, 1 | 2), "Kimi K6 physical rank count");
+    if core.projections.is_empty() { return Ok(vec![None; ranks]); }
     core.validate_runtime_groups(cfg)?;
     ensure!(metadata["abi_version"] == 1, "Kimi K6 row-policy ABI");
     let policies = metadata["row_policies"].as_array().context("Kimi K6 row-policy list")?;
-    let mut combined: [Option<ProjectionScratchLayout>; 2] = [None, None];
+    let mut combined: Vec<Option<ProjectionScratchLayout>> = vec![None; ranks];
     for projection in core.projections.values() {
         let head = projection.stem == "language_model.lm_head";
         let mla = projection.stem.contains(".self_attn.") && projection.stem
             .strip_prefix("language_model.model.layers.").and_then(|s| s.split_once('.'))
             .and_then(|(layer,_)| layer.parse::<usize>().ok()).is_some_and(|layer|
                 cfg.attention[layer] == super::config::KimiAttention::Mla);
-        let worlds: &[usize] = if projection.split == CoreSplit::Whole { &[1] }
+        let worlds: &[usize] = if ranks == 1 || projection.split == CoreSplit::Whole { &[1] }
             else if mla { &[1,2] } else { &[2] };
         for &world in worlds {
             let (mut n, mut k) = (projection.stored_outputs, projection.shape[1]);
@@ -153,8 +188,8 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
                     .context("Kimi K6 grouped row-policy groups")?;
                 layout.merge(&ProjectionScratchLayout::grouped(k, n, rows, groups)?)?;
             }
-            // Only GPU1 projects the vocabulary; body projections run on both ranks.
-            for target in combined.iter_mut().skip(if head { 1 } else { 0 }) {
+            // The last physical owner projects vocabulary; body projections run on every owner.
+            for target in combined.iter_mut().skip(if head { ranks - 1 } else { 0 }) {
                 if let Some(combined) = target {
                     if !head { combined.rows = rows; }
                     let mut required = layout.clone();
@@ -338,6 +373,30 @@ mod scratch_admission_tests {
         }
         Ok(())
     }
+    #[test]
+    fn whole_lane_retains_full_kda_and_shared_ffn_operands() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config())?;
+        let scratch = super::super::allocation::NativeScratch { kda: 1024, mla: [4096; 3] };
+        for (rows, unit) in [(64, 64), (8256, 2752)] {
+            let stages = intermediate_extents_for_ranks(rows, unit, 1)?;
+            for name in ["K6 q", "K6 k", "K6 v"] { assert_eq!(stages[name], unit * 12288 * 2); }
+            assert_eq!(stages["K6 FFN gate"], unit * 6144 * 2);
+            let whole = super::super::allocation::NativeLaneLayout::for_ranks(&cfg, rows, unit,
+                1_048_576, scratch, 1)?;
+            let half = super::super::allocation::NativeLaneLayout::new(&cfg, rows, unit, 1_048_576, scratch)?;
+            assert_eq!(whole.operands["KDA normalized"], 2 * half.operands["KDA normalized"]);
+            assert_eq!(whole.operands["gate-up"], 2 * half.operands["gate-up"]);
+            assert_eq!(whole.operands["activated"], 2 * half.operands["activated"]);
+            let native = whole.with_core_stages(stages)?;
+            assert!(native.bytes()? > half.bytes()?);
+            assert!(native.core_phases().iter().flatten().all(|name| native.operands.contains_key(name)));
+        }
+        assert!(intermediate_extents_for_ranks(64, 64, 0).is_err());
+        assert!(super::super::allocation::NativeLaneLayout::for_ranks(&cfg, 64, 64,
+            1_048_576, scratch, 3).is_err());
+        Ok(())
+    }
+
     #[test]
     fn retained_partials_are_bf16_but_meet_accumulates_f32() -> Result<()> {
         for (rows,unit) in [(1,1),(64,64),(4096,4096),(8192,4096),(8256,2752)] {

@@ -45,7 +45,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, requires = "nll")] save_logits: Option<PathBuf>,
     #[arg(long, value_delimiter = ',')] peers: Vec<SocketAddr>,
     #[arg(long, default_value_t = 0)] device: i32,
-    #[arg(long, default_value_t = 1)] split_device: i32,
+    /// Optional distinct physical peer; absent scores on the primary device alone.
+    #[arg(long)] split_device: Option<i32>,
     #[arg(long)] check_headers: bool,
     /// Routed layers split across both coordinator GPUs (rtx-tp2).
     #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
@@ -359,7 +360,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
             let rows = &window.tokens[first..(first + verify).min(end)];
             let start = placement.len;
             let logits = engine.verify_device(&mut [(&mut placement, rows)], pool, graphs)?;
-            library.cuda_set_device(args.split_device)?;
+            library.cuda_set_device(args.split_device.unwrap_or(args.device))?;
             let values = logits.to_host(library)?;
             for (row, logits) in values.chunks_exact(163840).enumerate() {
                 let position = first + row + 1;
@@ -406,6 +407,24 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
     Ok(())
 }
 
+fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cuteafd_ffi::NativeLibrary>,
+    programs: &'a cuteafd_ffi::programs::Programs<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
+    full: &KimiK3Config, cfg: &KimiK3Config, devices: [i32; RANKS],
+    prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan, graphs: bool, verify: usize)
+    -> Result<super::startup::Loaded<'a>> {
+    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options {
+        cache_format: args.kv_cache, devices,
+        native_lib: args.native_lib.as_deref().context("--native-lib required")?,
+        peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(args.rtx_expert_layers),
+        spark_budget_gib: args.spark_budget_gib,
+        rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
+        prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
+        slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
+        pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
+        hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?), verify_rows: verify,
+    })
+}
+
 fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     full: &KimiK3Config, cfg: &KimiK3Config, reference: Reference,
     scoring: Option<&[cuteafd_bench::reference::Window]>) -> Result<()> {
@@ -423,22 +442,20 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);
     let graphs = verify.is_some() && args.graphs == "on";
-    let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
-        &library, &programs, checkpoint, full, cfg, super::startup::Options {
-            cache_format: args.kv_cache,
-            devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
-            peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(args.rtx_expert_layers),
-            spark_budget_gib: args.spark_budget_gib,
-            rows, waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
-            slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,
-            draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
-            verify_rows: verify.unwrap_or(0),
-        })?;
+    ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
+        "Kimi golden devices must name distinct physical owners");
+    let super::startup::Loaded { engine, admission_free, admitted_bytes } = match args.split_device {
+        Some(peer) => load_target(args, &library, &programs, checkpoint, full, cfg,
+            [args.device, peer], prefill, graphs, verify.unwrap_or(0))?,
+        None => load_target(args, &library, &programs, checkpoint, full, cfg,
+            [args.device], prefill, graphs, verify.unwrap_or(0))?,
+    };
+    let devices = std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>();
     // Diagnostic A/B: the four standalone launches; refused once graphs are captured.
     if args.grouped_kda == "off" { engine.set_grouped_kda(false)?; }
     use cuteafd_engine::prefix::PrefixFamily;
     let pages = engine.prefix_family()?.layout().pages;
-    let loaded = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PostLoad, |_| Ok(()))?;
+    let loaded = RuntimeInventory::measure(&library, &devices, InventoryPhase::PostLoad, |_| Ok(()))?;
     loaded.record(if scoring.is_some() { "kimi_k3-full-loaded" } else { "kimi_k3-prefix-loaded" }, &admission_free);
     for (rank, sample) in loaded.gpus.iter().enumerate() {
         tracing::info!(rank, device = sample.device, admitted_bytes = admitted_bytes[rank],
@@ -457,7 +474,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         let allocated = pool.alloc(rows.div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
         Some(engine.prefix_residual(&reference.tokens, &allocated, &pool)?)
     };
-    let steady = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PostLoad, |_| Ok(()))?;
+    let steady = RuntimeInventory::measure(&library, &devices, InventoryPhase::PostLoad, |_| Ok(()))?;
     steady.record(if scoring.is_some() { "kimi_k3-full-steady" } else { "kimi_k3-prefix-steady" }, &admission_free);
     for (rank, sample) in steady.gpus.iter().enumerate() {
         tracing::info!(rank, device = sample.device, admitted_bytes = admitted_bytes[rank],
@@ -564,6 +581,10 @@ mod tests {
         let crate::cli::Commands::KimiGolden(parsed) = parsed.command else { panic!("Kimi command"); };
         assert_eq!(parsed.last_layer, Some(3));
         assert_eq!(parsed.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
+        assert_eq!(parsed.split_device, None);
+        let crate::cli::Commands::KimiGolden(pair) = crate::cli::Cli::try_parse_from(
+            args.into_iter().chain(["--device", "0", "--split-device", "1"]))?.command else { panic!("Kimi command"); };
+        assert_eq!((pair.device, pair.split_device), (0, Some(1)));
         let crate::cli::Commands::KimiGolden(bf16) = crate::cli::Cli::try_parse_from(
             args.into_iter().chain(["--kv-cache", "bf16"]))?.command else { panic!("Kimi command"); };
         assert_eq!(bf16.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
@@ -798,7 +819,7 @@ mod tests {
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
-            cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?)?;
+            cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
         let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
@@ -823,7 +844,7 @@ mod tests {
         eprintln!("Kimi CPU host forecast concurrency={slots} context=1048576 mark_bytes={mark_bytes} page_bytes={page_bytes} chunk={chunk} required={required} resolved={host_bytes} marks={} legacy_marks={marks}", admitted.mark_selection.slots);
         for rank in 0..6 {
             eprintln!("Kimi CPU Spark forecast rank={rank} retained={} budget={} reserve={} estimated_until_W9_census=true",
-                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?);
+                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?);
         }
         for rank in 0..2 {
             let items = &admitted.placement.items[rank];

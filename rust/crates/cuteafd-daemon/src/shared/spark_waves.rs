@@ -114,6 +114,85 @@ fn validate_payload(payload_bytes: usize, capacity: usize) -> Result<()> {
     Ok(())
 }
 
+/// Eligibility is format-independent and known before asynchronous request staging.
+pub(crate) fn combined_reply_eligible(rows: impl IntoIterator<Item = (u64, bool)>) -> bool {
+    use cuteafd_core::SparkReplyFormat;
+    SparkReplyFormat::Fp8.combined(rows).format != SparkReplyFormat::Bf16
+}
+
+pub(crate) fn single_reply_eligible(rows: usize, kind: cuteafd_transport::ExpertV2SourceKind) -> bool {
+    combined_reply_eligible((0..rows).map(|_| (1, kind == cuteafd_transport::ExpertV2SourceKind::Prefill)))
+}
+
+fn compressed_reduction(eligible: bool, available: bool) -> bool { eligible && available }
+
+/// Slot-owned reply reduction binding, never a raw-BF16 plane view. The
+/// owner retains the planes and mode word through stream/graph drainage.
+#[derive(Clone)]
+pub(crate) struct ReplyReduction<'a> {
+    planes: [*const u16; MAX_INTAKE_RANKS],
+    ranks: u32,
+    hidden: usize,
+    capacity: usize,
+    fused: Option<std::rc::Rc<cuteafd_ffi::programs::BoundProgram<'a>>>,
+    mode: *mut u32,
+}
+
+impl ReplyReduction<'_> {
+    /// Launches the same reduction used by `Waves::reduce`, without consuming
+    /// the slot. Captured decode publishes consumption after each replay.
+    ///
+    /// # Safety
+    /// The owner and its unchanged slot cut outlive stream completion and all
+    /// graph replays. `land` precedes every execution; shared/output are live
+    /// BF16 [rows, hidden] views on this device, with no plane/output overlap.
+    pub(crate) unsafe fn launch(&self, library: &NativeLibrary, shared: *const u16,
+        output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.launch_with(library, None, shared, output, rows, stream) }
+    }
+
+    /// [`Self::launch`] with one more BF16 `[rows, hidden]` plane summed after
+    /// the ranks' (the GPU expert tier's result for the experts the request
+    /// left to the coordinator), in FP32 in plane order before `shared`,
+    /// rounded once to BF16. Only the native BF16 reducer takes it: the fused
+    /// codec decodes every plane in the slot's wire format, so a compressed
+    /// reply binding refuses one (serving refuses the tier with compressed
+    /// replies at startup).
+    ///
+    /// # Safety
+    /// As [`Self::launch`]; `extra` (when given) is a live BF16 `[rows,
+    /// hidden]` view on this device, complete in `stream` order.
+    pub(crate) unsafe fn launch_with(&self, library: &NativeLibrary, extra: Option<*const u16>,
+        shared: *const u16, output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(rows <= self.capacity, "reply reduction rows exceed slot capacity");
+        if let Some(program) = &self.fused {
+            ensure!(extra.is_none(), "a compressed Spark reply reduction has no GPU expert tier plane");
+            use cuteafd_ffi::programs::Scalar;
+            let mut pointers = [std::ptr::null_mut(); MAX_INTAKE_RANKS + 3];
+            for (pointer, plane) in pointers.iter_mut().zip(self.planes) { *pointer = plane.cast_mut().cast(); }
+            pointers[MAX_INTAKE_RANKS] = shared.cast_mut().cast();
+            pointers[MAX_INTAKE_RANKS + 1] = output.cast();
+            pointers[MAX_INTAKE_RANKS + 2] = self.mode.cast();
+            // SAFETY: live slot planes/mode and disjoint output, retained through drainage.
+            unsafe { program.launch(&pointers, &[Scalar::I32(i32::try_from(rows)?),
+                Scalar::I32(i32::try_from(self.hidden)?), Scalar::I32(i32::try_from(self.ranks)?),
+                Scalar::I32(i32::from(!shared.is_null())), Scalar::I32(-1)], stream) }
+        } else {
+            let (mut planes, mut count) = (self.planes, self.ranks as usize);
+            if let Some(extra) = extra {
+                ensure!(!extra.is_null() && count < MAX_INTAKE_RANKS,
+                    "a {count}-rank wave has no room for the GPU expert tier's plane");
+                planes[count] = extra;
+                count += 1;
+            }
+            // SAFETY: this binding only selects the native reducer for BF16 units.
+            unsafe { library.v41_compact_reducer()?.reduce_planes(planes, count as u32, shared,
+                output, u32::try_from(rows)?, stream) }
+        }
+    }
+}
+
 /// A wave handed to the worker; land it with [`Waves::land`], oldest first.
 #[derive(Debug)]
 #[must_use = "every sent wave must be landed in dispatch order"]
@@ -122,6 +201,7 @@ pub(crate) struct WaveTicket {
     slot: usize,
     rows: usize,
     payload_bytes: usize,
+    combined_reply: bool,
 }
 
 impl WaveTicket {
@@ -185,7 +265,7 @@ const PULL_PER_RANK_BYTES: usize = 1 << 20;
 
 /// A counter word of the control block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Counter { Landed, Staged(usize), Consumed(usize), Arrived(usize) }
+pub(crate) enum Counter { Landed, Staged(usize), Consumed(usize), Arrived(usize), ReplyFormat(usize) }
 
 impl Counter {
     fn index(self, slots: usize) -> usize {
@@ -193,10 +273,11 @@ impl Counter {
             Self::Landed => 0,
             Self::Staged(slot) => { assert!(slot < slots, "staged counter of slot {slot} past {slots}"); 1 + 2 * slot }
             Self::Consumed(slot) => { assert!(slot < slots, "consumed counter of slot {slot} past {slots}"); 2 + 2 * slot }
+            Self::ReplyFormat(slot) => { assert!(slot < slots); 1 + 2 * slots + MAX_INTAKE_RANKS + slot }
             Self::Arrived(rank) => { assert!(rank < MAX_INTAKE_RANKS, "arrived counter of rank {rank}"); 1 + 2 * slots + rank }
         }
     }
-    fn words(slots: usize) -> usize { 1 + 2 * slots + MAX_INTAKE_RANKS }
+    fn words(slots: usize) -> usize { 1 + 3 * slots + MAX_INTAKE_RANKS }
 }
 
 /// The control block's words as raw addresses: pinned, device-mapped host
@@ -222,7 +303,7 @@ impl Words {
 /// Where a wave's request comes from.
 pub(crate) enum Source {
     /// Staged by the engine stream into the slot's arena; built on the worker.
-    Staged { layout: RouteStaging, build: BuildRequest },
+    Staged { layout: RouteStaging, build: BuildRequest, combined_reply: bool },
     /// Built on the host already (warm-ups, gates): posted as is.
     Built(ExpertProtocolV2Request),
 }
@@ -290,6 +371,7 @@ pub(crate) trait Backend {
     /// retained until the wave's `release`). `true` once every rank's rows
     /// are in place.
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool>;
+    fn payload_bytes(&self, _slot: usize, admitted: usize) -> usize { admitted }
     /// Stores `landed = sequence`.
     fn publish(&mut self, sequence: u32);
     /// Returns retained reply frames whose wave's reduce was consumed; true
@@ -424,12 +506,13 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     // post finds their receives (counters only grow).
                     backend.release_consumed();
                     let job = queued.pop_front().expect("front job");
-                    let info = WaveInfo { sequence: job.sequence, slot: job.slot, rows: job.rows, payload_bytes: job.payload_bytes, slice: job.slice,
+                    let mut info = WaveInfo { sequence: job.sequence, slot: job.slot, rows: job.rows, payload_bytes: job.payload_bytes, slice: job.slice,
                         release: job.release };
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
                     Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
                     let started = Instant::now();
                     let wave = backend.post(job)?;
+                    info.payload_bytes = backend.payload_bytes(info.slot, info.payload_bytes);
                     times.posted = started.elapsed().as_secs_f64();
                     inflight.push_back(Inflight { info, wave, posted: Instant::now(), times });
                     progressed = true;
@@ -667,6 +750,12 @@ struct Retained<F> {
 /// the pull descriptors, the retained reply frames and the control counters.
 struct Native<T: Transport> {
     transport: T,
+    reply_format: cuteafd_core::SparkReplyFormat,
+    reply_payloads: Vec<usize>,
+    prefill_rows: u64,
+    compressed_prefill_rows: u64,
+    mixed_fallback_rows: u64,
+    timing: bool,
     arenas: Vec<StagingArena>,
     words: Words,
     pulls: Pulls,
@@ -701,9 +790,13 @@ impl<T: Transport> Backend for Native<T> {
     fn counter(&self, counter: Counter) -> u32 { self.words.load(counter) }
 
     fn post(&mut self, job: Job) -> Result<Self::Wave> {
-        let request = match job.source {
+        let expected_reply = match &job.source {
+            Source::Staged { combined_reply, .. } => Some(*combined_reply),
+            Source::Built(_) => None,
+        };
+        let mut request = match job.source {
             Source::Built(request) => request,
-            Source::Staged { layout, build } => {
+            Source::Staged { layout, build, .. } => {
                 let arena = &self.arenas[job.slot];
                 // The slot's previous request was released when its wave landed.
                 ensure!(arena.writable(), "staging arena {} is still viewed by an unfinished request", job.slot);
@@ -716,18 +809,58 @@ impl<T: Transport> Backend for Native<T> {
                 build(routes, wire)?
             }
         };
-        validate_payload(job.payload_bytes, job.slice.1)?;
+        if let Some(expected) = expected_reply {
+            let actual = request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0
+                && combined_reply_eligible(request.rows.iter().map(|row|
+                (row.source_request_id, row.source_kind == cuteafd_transport::ExpertV2SourceKind::Prefill)));
+            ensure!(expected == actual, "Spark host reply eligibility differs from built request");
+        }
+        let mut payload_bytes = job.payload_bytes;
+        if self.reply_format != cuteafd_core::SparkReplyFormat::Bf16
+            && request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0 {
+            let decision = request.select_combined_reply(self.reply_format)?;
+            self.prefill_rows += decision.prefill_rows as u64;
+            self.mixed_fallback_rows += decision.mixed_fallback_rows as u64;
+            if decision.format != cuteafd_core::SparkReplyFormat::Bf16 {
+                self.compressed_prefill_rows += decision.prefill_rows as u64;
+            }
+            payload_bytes = job.rows * decision.format.row_bytes(request.header.hidden_dim as usize)
+                .context("invalid combined reply width")?;
+            self.words.store(Counter::ReplyFormat(job.slot), match decision.format {
+                cuteafd_core::SparkReplyFormat::Bf16 => 0,
+                cuteafd_core::SparkReplyFormat::Fp8 => 1,
+                cuteafd_core::SparkReplyFormat::Nvfp4 => 2,
+            });
+            if decision.prefill_rows != 0 {
+                tracing::info!(target: "cuteafd::spark_reply", sequence = job.sequence, format = %decision.format,
+                    prefill_rows = self.prefill_rows, compressed_prefill_rows = self.compressed_prefill_rows,
+                    mixed_fallback_rows = self.mixed_fallback_rows,
+                    mixed_fallback_fraction = self.mixed_fallback_rows as f64 / self.prefill_rows as f64,
+                    "Spark reply prefill rows (cumulative per link)");
+            }
+        }
+        self.reply_payloads[job.slot] = payload_bytes;
+        validate_payload(payload_bytes, job.slice.1)?;
         ensure!(request.header.row_count as usize == job.rows, "wave request rows differ from admission");
         let slices = (self.placed && self.landing != 0).then(|| vec![cuteafd_transport::LandingSlice {
-            offset: job.slice.0, bytes: job.payload_bytes }; self.ranks]);
-        self.transport.dispatch(&request, slices.as_deref())
+            offset: job.slice.0, bytes: payload_bytes }; self.ranks]);
+        let wave = self.transport.dispatch(&request, slices.as_deref())?;
+        if self.timing {
+            tracing::info!(target: "cuteafd::timing", sequence = job.sequence, slot = job.slot,
+                rows = job.rows, request_id = request.header.request_id, layer_id = request.header.layer_id,
+                payload_bytes, "spark exchange wave posted");
+        }
+        Ok(wave)
     }
+
+    fn payload_bytes(&self, slot: usize, _admitted: usize) -> usize { self.reply_payloads[slot] }
 
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool> {
         let (ranks, row_bytes, landing, words, pulls) = (self.ranks, self.row_bytes, self.landing, self.words, self.pulls);
         let plane_bytes = info.payload_bytes;
         validate_payload(plane_bytes, info.slice.1)?;
         let receiving = &mut self.receiving;
+        let timing = self.timing;
         let done = self.transport.poll(wave, &mut |rank, first, frame| {
             ensure!(rank < ranks && landing & (1 << rank) == 0,
                 "rank {rank} arrived in host memory but its link lands it in device memory");
@@ -744,6 +877,11 @@ impl<T: Transport> Backend for Native<T> {
             frames.push(frame);
             *received += bytes;
             if *received == plane_bytes {
+                if timing {
+                    tracing::info!(target: "cuteafd::timing", sequence = info.sequence, slot = info.slot,
+                        rows = info.rows, rank, payload_bytes = plane_bytes, frames = entries.len(),
+                        "spark exchange rank arrived");
+                }
                 // The rank's rows are all in: its pull may run now. The
                 // frames stay in their receive slots until the reduce.
                 pulls.write(info.slot, rank, entries);
@@ -801,6 +939,8 @@ impl<T: Transport> Backend for Native<T> {
 /// What a link hands its exchange: each rank's reserve range and the
 /// admitted/current cut of it ([`SlotGeometry`]) the worker lands in.
 pub(crate) struct Intake {
+    /// Physical link can carry prefill; dedicated decode/verify links are false.
+    pub prefill: bool,
     pub ranks: usize,
     pub row_bytes: usize,
     /// Per rank: the device range every return slot is a slice of.
@@ -815,6 +955,17 @@ pub(crate) struct Intake {
 }
 
 impl Intake {
+    fn reply_format(&self) -> cuteafd_core::SparkReplyFormat {
+        if self.prefill {
+            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
+        } else { cuteafd_core::SparkReplyFormat::Bf16 }
+    }
+
+    fn pinned(&self) -> u8 {
+        let all = if self.ranks == 8 { u8::MAX } else { (1u8 << self.ranks) - 1 };
+        all & !self.landing
+    }
+
     /// Rank planes of `slot` under the current cut, in rank order.
     pub(crate) fn slot_planes(&self, slot: usize) -> Vec<CuteafdDeviceBuffer> {
         let (offset, bytes) = self.geometry.slice(slot, self.row_bytes);
@@ -1124,14 +1275,67 @@ fn probe_landing_route(library: &NativeLibrary, ranks: usize, row_bytes: usize, 
     Ok(landing_route(mode, &samples))
 }
 
+/// Inputs and scratch of queued waits, pulls and codec kernels. The intake retains this
+/// owner beyond a consuming Waves::close until terminal consumer drainage.
+pub(crate) struct ExchangeStorage<'a> {
+    control: HostAllocation<'a>,
+    pull_block: Option<HostAllocation<'a>>,
+    reply_reduce: Option<std::rc::Rc<cuteafd_ffi::programs::BoundProgram<'a>>>,
+    geometry: SlotGeometry,
+    prefill: bool,
+    format: cuteafd_core::SparkReplyFormat,
+}
+impl<'a> ExchangeStorage<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, intake: &Intake) -> Result<Self> {
+        let slots = intake.geometry.slots();
+        let pinned = intake.pinned() != 0;
+        let format = intake.reply_format();
+        let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
+        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
+        let pull_block = pinned.then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
+        if let Some(block) = &pull_block {
+            let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
+            ensure!(alias.ptr == block.buffer.ptr,
+                "mapped pinned memory is not device-visible at its host address (no unified addressing)");
+        }
+        let reply_reduce = if combined_codec_enabled(intake, format) {
+            Some(std::rc::Rc::new(library.programs()?.bound("expert_reply_reduce",
+                &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "shared", "out", "mode"])?))
+        } else { None };
+        Ok(Self { control, pull_block, reply_reduce, geometry: intake.geometry.clone(), prefill: intake.prefill, format })
+    }
+
+    pub(crate) fn matches(&self, intake: &Intake) -> bool {
+        self.geometry == intake.geometry && self.prefill == intake.prefill
+            && self.format == intake.reply_format() && self.pull_block.is_some() == (intake.pinned() != 0)
+    }
+
+    /// Only after the previous worker joined and every consumer drained.
+    pub(crate) fn reset_drained(&self) {
+        // SAFETY: the sole intake owner calls this before handing a clone to
+        // a new Waves; its old worker and consumer streams have drained.
+        unsafe {
+            std::ptr::write_bytes(self.control.buffer.ptr.cast::<u8>(), 0, self.control.buffer.bytes);
+            if let Some(block) = &self.pull_block {
+                std::ptr::write_bytes(block.buffer.ptr.cast::<u8>(), 0, block.buffer.bytes);
+            }
+        }
+    }
+}
+
+fn combined_codec_enabled(intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> bool {
+    intake.prefill && format != cuteafd_core::SparkReplyFormat::Bf16
+        && !cuteafd_core::expert_geometry().partial_replies()
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
     /// Dropped first: closing it ends the worker, joined in `Drop`.
     jobs: Option<mpsc::Sender<Command>>,
     worker: Option<std::thread::JoinHandle<(Box<dyn std::any::Any + Send>, Result<()>)>>,
-    /// Owns the counters; freed only after the worker joined.
-    _control: HostAllocation<'a>,
+    /// Also retained by SparkIntake until all consumer streams drained.
+    _storage: std::rc::Rc<ExchangeStorage<'a>>,
     words: Words,
     arenas: Vec<StagingArena>,
     /// Per slot: the request arena's device alias (mapped pinned memory).
@@ -1139,10 +1343,6 @@ pub(crate) struct Waves<'a> {
     staging: StagingRoute,
     /// How pinned ranks land once the host saw their wave in ([`LandingRoute`]).
     landing: LandingRoute,
-    /// Owns the pull descriptors of the ranks that arrive in host memory
-    /// (mapped; written by the worker, read by pull kernels); freed only after
-    /// the worker joined.
-    _pull_block: Option<HostAllocation<'a>>,
     pulls: Option<Pulls>,
     /// Bit r: rank r's rows arrive in pinned host memory and are pulled.
     pinned: u8,
@@ -1153,6 +1353,7 @@ pub(crate) struct Waves<'a> {
     layouts: Vec<Option<RouteStaging>>,
     /// Per slot: landed and not yet marked consumed.
     unread: Vec<bool>,
+    compressed: Vec<bool>,
     /// Per slot: waves consumed from it (the worker posts the slot's next
     /// wave once `consumed[slot]` reaches this).
     uses: Vec<u32>,
@@ -1172,29 +1373,19 @@ impl<'a> Waves<'a> {
     /// `intake`'s slots, staging each wave's request in `arenas` (one per slot).
     pub(crate) fn start<T: Transport>(library: &'a NativeLibrary, intake: Intake, transport: T,
         grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
-        arenas: Vec<StagingArena>, timing: bool) -> Result<Self> {
+        arenas: Vec<StagingArena>, timing: bool, storage: std::rc::Rc<ExchangeStorage<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let slots = intake.geometry.slots();
         let range_bytes = intake.geometry.reserve_rows() * intake.row_bytes;
         ensure!(arenas.len() == slots, "one staging arena per admitted slot");
         ensure!(intake.ranges.len() == intake.ranks && intake.ranges.iter().all(|range| range.bytes >= range_bytes),
             "one reserve range of {range_bytes} bytes per rank");
-        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
-        let words = Words { base: control.buffer.ptr as usize, slots };
+        let words = Words { base: storage.control.buffer.ptr as usize, slots };
         let all = if intake.ranks == 8 { u8::MAX } else { (1u8 << intake.ranks) - 1 };
         let pinned = all & !intake.landing;
         check_reply_ring(&transport.retained_reply_slots(), pinned, slots)?;
-        // Pinned ranks reach the planes by SM pulls on the consuming stream
-        // straight from their receive slots; the kernels read the frames'
-        // host addresses, so mapped pinned memory must be device-visible at
-        // its host address (UVA).
-        let pull_block = (pinned != 0).then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
-        if let Some(block) = &pull_block {
-            let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
-            ensure!(alias.ptr == block.buffer.ptr,
-                "mapped pinned memory is not device-visible at its host address (no unified addressing)");
-        }
-        let pulls = pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
+        ensure!(storage.matches(&intake), "exchange storage differs from link geometry");
+        let pulls = storage.pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
         // Every registered native kernel loads now, with nothing pending: a
@@ -1215,7 +1406,11 @@ impl<'a> Waves<'a> {
             ranks => probe_landing_route(library, ranks, intake.row_bytes, intake.geometry.cut().rows)?,
         };
         let timeout = transport.timeout();
-        let mut native = Native { transport, arenas: arenas.clone(), words,
+        let reply_format = intake.reply_format();
+        ensure!(storage.reply_reduce.is_some() == combined_codec_enabled(&intake, reply_format),
+            "reply reducer does not match physical link policy");
+        let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
+            prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
             landing: intake.landing, placed: intake.placed,
             receiving: (0..intake.ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() };
@@ -1237,10 +1432,10 @@ impl<'a> Waves<'a> {
             let frames = native.frames();
             (Box::new((native.transport, frames)) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, staging, landing,
-            _pull_block: pull_block, pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
-            unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
-            next_slot: 0, geometry: intake.geometry, sequence: 0,
+        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
+            staging, landing, pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
+            unread: vec![false; slots], compressed: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks,
+            row_bytes: intake.row_bytes, next_slot: 0, geometry: intake.geometry, sequence: 0,
             outstanding: VecDeque::new(), grouping })
     }
 
@@ -1264,6 +1459,12 @@ impl<'a> Waves<'a> {
 
     fn submit(&mut self, rows: usize, payload_bytes: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
         [CuteafdDeviceBuffer; 3])>) -> Result<WaveTicket> {
+        let combined_reply = match &source {
+            Source::Staged { combined_reply, .. } => *combined_reply,
+            Source::Built(request) => request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0
+                && combined_reply_eligible(request.rows.iter().map(|row|
+                (row.source_request_id, row.source_kind == cuteafd_transport::ExpertV2SourceKind::Prefill))),
+        };
         let cut = self.geometry.cut();
         ensure!(self.outstanding.len() < cut.waves, WaveError::Admission(self.outstanding.len()));
         ensure!(rows > 0 && rows <= cut.rows, WaveError::Rows { rows, capacity: cut.rows });
@@ -1322,7 +1523,7 @@ impl<'a> Waves<'a> {
         self.sequence = sequence;
         self.outstanding.push_back((sequence, slot, 0));
         self.next_slot = (slot + 1) % cut.waves;
-        Ok(WaveTicket { sequence, slot, rows, payload_bytes })
+        Ok(WaveTicket { sequence, slot, rows, payload_bytes, combined_reply })
     }
 
     /// Queues a `rows`-row wave with exactly `payload_bytes` per rank into the next return slot: its route ids, gate
@@ -1334,9 +1535,11 @@ impl<'a> Waves<'a> {
     /// `sources` are live device buffers of `layout`'s extents on `stream`'s
     /// device, written in `stream` order before this call (the copies read
     /// them in stream order, so later stream work may rewrite them).
+    /// `combined_reply` must equal the shared policy on the built row origins;
+    /// partial-reply requests always pass false. The worker checks this agreement.
     pub(crate) unsafe fn send(&mut self, rows: usize, payload_bytes: usize, layout: RouteStaging, sources: [CuteafdDeviceBuffer; 3],
-        stream: *mut c_void, build: BuildRequest) -> Result<WaveTicket> {
-        self.submit(rows, payload_bytes, Source::Staged { layout, build }, Some((stream, layout, sources)))
+        stream: *mut c_void, combined_reply: bool, build: BuildRequest) -> Result<WaveTicket> {
+        self.submit(rows, payload_bytes, Source::Staged { layout, build, combined_reply }, Some((stream, layout, sources)))
     }
 
     /// Queues a wave whose request the host already built (warm-ups, gates):
@@ -1364,7 +1567,7 @@ impl<'a> Waves<'a> {
         let rest = self.pinned & !pulled;
         // A wave the host already saw land (a host-ordered collect) may land
         // by copy engine: its frames are final and every wait below is met.
-        let copied = rest != 0 && self.copies(ticket.payload_bytes, rest, stream)? && self.landed(&ticket);
+        let copied = rest != 0 && self.copies(&ticket, rest, stream)? && self.landed(&ticket);
         if rest != 0 && !copied && self.wide(ticket.payload_bytes, rest) {
             for rank in (0..self.ranks).filter(|rank| rest & (1 << rank) != 0) {
                 // SAFETY: as `pull`'s contract; the wait precedes the pull.
@@ -1381,21 +1584,25 @@ impl<'a> Waves<'a> {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
+        self.compressed[slot] = compressed_reduction(ticket.combined_reply, self._storage.reply_reduce.is_some());
         self.unread[slot] = true;
         Ok(())
     }
 
-    /// Whether `ranks`' frames of a `payload_bytes`-per-rank wave land by copy
-    /// engine on `stream` once their arrival is met ([`LandingRoute`], by the
-    /// frame size): only in a collect the host orders (a host-ordered or
-    /// paced pass, which waits for the reply before landing it; a
-    /// device-ordered pass queues its landing ahead and keeps the pull), on a
-    /// healthy wire (a failed one clears the descriptors and releases every
-    /// wait, which the pull meets by copying nothing), and never while
-    /// `stream` captures a graph.
-    fn copies(&self, payload_bytes: usize, ranks: u8, stream: *mut c_void) -> Result<bool> {
+    /// Whether `ranks`' frames of `ticket`'s wave land by copy engine on
+    /// `stream` once their arrival is met ([`LandingRoute`], by the frame
+    /// size): only in a collect the host orders (a host-ordered or paced pass,
+    /// which waits for the reply before landing it; a device-ordered pass
+    /// queues its landing ahead and keeps the pull), on a healthy wire (a
+    /// failed one clears the descriptors and releases every wait, which the
+    /// pull meets by copying nothing), never while `stream` captures a graph,
+    /// and only for a BF16 wire: a wave that may carry compressed replies
+    /// keeps the pull, which lands whatever frames the descriptors publish.
+    fn copies(&self, ticket: &WaveTicket, ranks: u8, stream: *mut c_void) -> Result<bool> {
         use crate::shared::memory::chain;
-        Ok(ranks != 0 && self.landing.copy_engine(payload_bytes) && (!chain::deferred() || chain::paced())
+        let compressible = compressed_reduction(ticket.combined_reply, self._storage.reply_reduce.is_some());
+        Ok(ranks != 0 && !compressible && self.landing.copy_engine(ticket.payload_bytes)
+            && (!chain::deferred() || chain::paced())
             && healthy().is_ok() && !self.library.cuda_stream_capturing(stream)?)
     }
 
@@ -1457,7 +1664,7 @@ impl<'a> Waves<'a> {
         }
         if arrived == 0 { return Ok(()); }
         front.2 |= arrived;
-        if self.copies(ticket.payload_bytes, self.pinned, stream)? {
+        if self.copies(ticket, self.pinned, stream)? {
             for rank in (0..self.ranks).filter(|rank| arrived & (1 << rank) != 0) {
                 // SAFETY: as `copy_frames`' contract; the rank's arrival is
                 // published, so the wait queued first is met.
@@ -1517,11 +1724,23 @@ impl<'a> Waves<'a> {
         reached(self.words.load(Counter::Landed), ticket.sequence)
     }
 
-    /// Plane pointers of return slot `slot` (rank order), for the reduce.
-    pub(crate) fn planes(&self, slot: usize) -> [*const u16; MAX_INTAKE_RANKS] {
-        let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-        for (pointer, plane) in pointers.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
-        pointers
+    /// Opaque slot binding for a captured reduction. It exposes no BF16 view:
+    /// the slot may carry packed wire bytes, decoded only inside the reduction.
+    /// The owner must drain every graph using it before changing the slot cut.
+    pub(crate) fn reduction(&self, slot: usize) -> ReplyReduction<'a> {
+        let mut planes = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+        for (pointer, plane) in planes.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
+        ReplyReduction { planes, ranks: self.ranks as u32,
+            hidden: cuteafd_core::expert_geometry().hidden as usize, capacity: self.geometry.cut().rows,
+            fused: self.compressed[slot].then(|| self._storage.reply_reduce.as_ref().unwrap().clone()),
+            mode: self.words.ptr(Counter::ReplyFormat(slot)) }
+    }
+
+    /// Byte addresses for Muse's separate partial-wire region tables, not a
+    /// combined-reply BF16 view. Its combine kernel interprets each region.
+    pub(crate) fn partial_reply_addresses(&self, slot: usize) -> Result<Vec<u64>> {
+        ensure!(cuteafd_core::expert_geometry().partial_replies(), "partial reply addresses require partial-wire geometry");
+        Ok(self.slot_planes(slot).map(|plane| plane.ptr as u64).collect())
     }
 
     pub(crate) fn ranks(&self) -> usize { self.ranks }
@@ -1564,18 +1783,9 @@ impl<'a> Waves<'a> {
     /// hidden]` device buffer on `stream`'s device, complete in its order.
     pub(crate) unsafe fn reduce_with(&mut self, slot: usize, extra: Option<*const u16>, shared: *const u16,
         output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
-        let mut planes = self.planes(slot);
-        let mut count = self.ranks;
-        if let Some(extra) = extra {
-            ensure!(!extra.is_null() && count < MAX_INTAKE_RANKS,
-                "a {count}-rank wave has no room for the GPU expert tier's plane");
-            planes[count] = extra;
-            count += 1;
-        }
         // SAFETY: forwarded from this function's contract.
         unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(planes, count as u32, shared,
-                output, u32::try_from(rows)?, stream)?;
+            self.reduction(slot).launch_with(self.library, extra, shared, output, rows, stream)?;
         }
         self.consumed(slot, stream)
     }

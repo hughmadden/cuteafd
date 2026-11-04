@@ -29,7 +29,7 @@ impl ExecutionVariant {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionWorkspace {
     pub ranges: [(usize, usize); 11],
     pub bytes: usize,
@@ -42,6 +42,48 @@ pub struct ExecutionWorkspace {
     pub intermediate_bytes: usize,
     pub compact: bool,
     pub unit_tables: bool,
+}
+
+impl ExecutionWorkspace {
+    /// Physical arena and direct kernel bindings; no view is an allocation.
+    pub fn allocations(&self, prefix: &str, location: crate::placement::planner::Location,
+        lifetime: crate::placement::planner::Lifetime) -> Result<Vec<crate::placement::planner::Allocation>> {
+        use crate::placement::planner::{Allocation, Domain, View};
+        use cuteafd_core::memory_layout::Category;
+        ensure!(!prefix.is_empty() && location.domain == Domain::Device && self.bytes > 0,
+            "invalid EXLR8 workspace owner identity or extent");
+        let names = ["input", "ids", "route_weights", "output", "group_expert", "route_slots",
+            "route_group_lane", "group_count", "fc1", "intermediate_fc2", "rotated"];
+        let allocation = |name: &str, bytes: usize| -> Result<Allocation> {
+            let mut out = Allocation::buffer(format!("{prefix}.{name}"), location, u64::try_from(bytes)?,
+                lifetime, Category::Workspace, "EXLR8 expert workspace");
+            out.alignment = 256;
+            Ok(out)
+        };
+        let mut out = vec![allocation("arena", self.bytes)?];
+        let mut end = 0usize;
+        for (name, &(offset, bytes)) in names.iter().zip(&self.ranges) {
+            ensure!(bytes > 0 && offset % 256 == 0 && offset >= end,
+                "EXLR8 workspace bindings must be positive, aligned and disjoint");
+            end = offset.checked_add(bytes).context("EXLR8 workspace binding overflow")?;
+            ensure!(end <= self.bytes, "EXLR8 workspace binding exceeds arena");
+            let mut view = allocation(name, bytes)?;
+            view.view = Some(View { backing: format!("{prefix}.arena"), offset: u64::try_from(offset)? });
+            out.push(view);
+        }
+        ensure!(end == self.bytes, "EXLR8 workspace has an unaccounted arena tail");
+        let (offset, combined) = self.ranges[9];
+        ensure!(self.intermediate_bytes > 0 && self.intermediate_bytes < combined
+            && self.intermediate_bytes % 256 == 0, "invalid EXLR8 intermediate/FC2 split");
+        for (name, offset, bytes) in [("intermediate", offset, self.intermediate_bytes),
+            ("fc2", offset.checked_add(self.intermediate_bytes).context("EXLR8 FC2 offset overflow")?,
+                combined - self.intermediate_bytes)] {
+            let mut view = allocation(name, bytes)?;
+            view.view = Some(View { backing: format!("{prefix}.arena"), offset: u64::try_from(offset)? });
+            out.push(view);
+        }
+        Ok(out)
+    }
 }
 
 /// The only owned-unit scratch sizing rule. Compact FC1 uses owned units,
@@ -206,6 +248,71 @@ mod tests {
                 json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
             "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{}});
         json!({"programs":[core,group]})
+    }
+
+    #[test]
+    fn named_execution_owners_keep_full_scratch_and_direct_split_bindings() {
+        use crate::placement::planner::{Domain, Lifetime, Location};
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            for variant in [ExecutionVariant::SharedDecode, ExecutionVariant::DecodeCompact,
+                ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill] {
+                for activations in [PrefillActivations::A16, PrefillActivations::A8] {
+                    let mut value = if variant == ExecutionVariant::SharedDecode {
+                        shared_entries(family)["programs"][0].clone()
+                    } else { entry(variant, activations) };
+                    let h = family.geometry().hidden as u64;
+                    let g = value["geometry"]["max_groups"].as_u64().unwrap();
+                    value["name"] = json!(variant.program(family, activations));
+                    value["geometry"]["hidden"] = json!(h);
+                    value["geometry"]["fc1_splits"] = json!(h.div_ceil(1024));
+                    if family == KernelFamily::GlmFlash { value["geometry"]["swiglu_limit"] = json!(10.0); }
+                    value["scratch_bytes_at_capacity"] = json!({"fc1":g*16*2*h.div_ceil(1024)*16*128*4,
+                        "intermediate":g*16*16*128*2,"fc2":g*16*h*4});
+                    let manifest = json!({"programs":[value]});
+                    let spec = program_spec(&manifest, variant.program(family, activations)).unwrap();
+                    let set = if variant == ExecutionVariant::SharedDecode { ExpertSet::Shared } else { ExpertSet::Routed };
+                    let rows = if variant == ExecutionVariant::Prefill { 65 } else { 1 };
+                    let layout = execution_workspace(&spec, rows, set, variant, 3, activations).unwrap();
+                    let records = layout.allocations("test.execution", Location::coordinator(0), Lifetime::RESIDENT).unwrap();
+                    assert_eq!(records.len(), 14);
+                    let owner = &records[0];
+                    assert!(owner.view.is_none());
+                    assert_eq!(owner.bytes, layout.bytes as u64);
+                    assert_eq!(records.iter().filter(|r| r.view.is_none()).count(), 1);
+                    for binding in &records[1..] {
+                        let view = binding.view.as_ref().unwrap();
+                        assert_eq!(view.backing, owner.id);
+                        assert_eq!(view.offset % 256, 0);
+                        assert!(view.offset + binding.bytes <= owner.bytes);
+                    }
+                    let combined = records.iter().find(|r| r.id.ends_with(".intermediate_fc2")).unwrap();
+                    let intermediate = records.iter().find(|r| r.id.ends_with(".intermediate")).unwrap();
+                    let fc2 = records.iter().find(|r| r.id.ends_with(".fc2")).unwrap();
+                    assert_eq!(intermediate.bytes, layout.intermediate_bytes as u64);
+                    assert_eq!(intermediate.bytes + fc2.bytes, combined.bytes);
+                    assert_eq!(intermediate.view.as_ref().unwrap().offset, combined.view.as_ref().unwrap().offset);
+                    assert_eq!(fc2.view.as_ref().unwrap().offset,
+                        combined.view.as_ref().unwrap().offset + intermediate.bytes);
+                    assert!(layout.allocations("", Location::coordinator(0), Lifetime::RESIDENT).is_err());
+                    assert!(layout.allocations("test", Location { domain: Domain::Pinned,
+                        ..Location::coordinator(0) }, Lifetime::RESIDENT).is_err());
+                    for negative in 0..6 {
+                        let mut invalid = execution_workspace(&spec, rows, set, variant, 3, activations).unwrap();
+                        match negative {
+                            0 => invalid.ranges[1].0 += 1,
+                            1 => invalid.ranges[1].0 = invalid.ranges[0].0,
+                            2 => invalid.ranges[1].1 = 0,
+                            3 => invalid.ranges[10].1 = usize::MAX,
+                            4 => invalid.bytes += 256,
+                            5 => invalid.intermediate_bytes = invalid.ranges[9].1,
+                            _ => unreachable!(),
+                        }
+                        assert!(invalid.allocations("test", Location::coordinator(0), Lifetime::RESIDENT).is_err(),
+                            "{family:?} {variant:?} {negative}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

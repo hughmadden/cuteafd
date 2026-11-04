@@ -1,7 +1,7 @@
-//! Kimi's binding of the shared admitted MLA DFlash executor and remote bridge.
+//! Kimi's binding of the shared MLA DFlash executor to local or remote streams.
 use super::weights::GlobalWeights;
 use crate::shared::{draft::remote::{Prepared, RemoteBridge}, fp8_linear::{Fp8Rows, Fp8Scales},
-    memory::device::{Allocation, DeviceOwner, Stream}, peer_split::RankDevice,
+    memory::device::{Allocation, DeviceOwner, Stream}, peer_split::{RankDevice, TerminalState},
     speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
@@ -40,14 +40,84 @@ pub(crate) fn bridge_demands(layout: &MlaDraftRuntimeLayout, rows: usize) -> Res
 /// target weights, including on partial startup failure.
 struct Owners<D, T> { draft: D, target: T }
 
+/// Local drafting uses an ordinary retained stream, never a same-device peer exchange.
+enum Bridge<'a> {
+    Remote(RemoteBridge<'a>),
+    Local { stream: Stream<'a>, terminal: Cell<TerminalState> },
+}
+
+impl<'a> Bridge<'a> {
+    fn stream(&self) -> &Stream<'a> {
+        match self { Self::Remote(bridge) => &bridge.stream, Self::Local { stream, .. } => stream }
+    }
+    fn require_live(&self) -> Result<()> {
+        match self {
+            Self::Remote(bridge) => bridge.require_live(),
+            Self::Local { terminal, .. } => {
+                ensure!(terminal.get() == TerminalState::Active, "Kimi local draft is terminal ({:?})", terminal.get());
+                Ok(())
+            }
+        }
+    }
+    fn abort(&self) -> Result<()> {
+        match self {
+            Self::Remote(bridge) => bridge.publish_abort(),
+            Self::Local { terminal, .. } => {
+                if terminal.get() == TerminalState::Active { terminal.set(TerminalState::Aborting); }
+                Ok(())
+            }
+        }
+    }
+    fn finish_request(&self) -> Result<()> {
+        self.require_live()?;
+        match self { Self::Remote(bridge) => bridge.finish_request(), Self::Local { .. } => Ok(()) }
+    }
+    fn copy_local(&self, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer,
+        bytes: usize, producer: Option<&crate::shared::memory::device::Event<'a>>) -> Result<()> {
+        self.require_live()?;
+        let Self::Local { stream, .. } = self else { anyhow::bail!("Kimi local copy requires a local bridge") };
+        ensure!(source.device_id == stream.device.id && destination.device_id == stream.device.id
+            && bytes <= source.bytes && bytes <= destination.bytes,
+            "Kimi local draft copy exceeds actual device owners");
+        stream.device.run(|| {
+            // SAFETY: the adapter retains both buffers, the event and this stream
+            // through its terminal drain; readers follow this copy on the same stream.
+            unsafe {
+                if let Some(event) = producer { stream.device.library.cuda_stream_wait_event(stream.raw, event.raw)?; }
+                stream.device.library.copy_d2d_async(destination, source, bytes, stream.raw)
+            }
+        })
+    }
+    fn synchronize(&self) -> Result<()> {
+        match self { Self::Remote(bridge) => bridge.synchronize(), Self::Local { stream, .. } => stream.drain() }
+    }
+    fn finish_terminal(&self, drained: bool) {
+        match self {
+            Self::Remote(bridge) => bridge.finish_terminal(drained),
+            Self::Local { terminal, .. } if terminal.get() == TerminalState::Aborting => {
+                terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+            }
+            Self::Local { .. } => {}
+        }
+    }
+    fn checked<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.require_live()?;
+        let result = work();
+        if result.is_err() {
+            crate::shared::decode_graph::fatal_drain(self.abort(), "Kimi draft abort publication");
+        }
+        result
+    }
+}
+
 pub(crate) struct NativeDraft<'a> {
-    owners: Owners<DeviceOwner<'a, DflashDrafter<'a>>, Option<[Rc<GlobalWeights<'a>>; 2]>>,
+    owners: Owners<DeviceOwner<'a, DflashDrafter<'a>>, Option<Vec<Rc<GlobalWeights<'a>>>>>,
     taps: Allocation<'a>,
     ids: Allocation<'a>,
     input: Allocation<'a>,
     // Bridge controls and its stream outlive all common/target staging owners.
-    bridge: RemoteBridge<'a>,
-    target_streams: [Rc<Stream<'a>>; 2],
+    bridge: Bridge<'a>,
+    target_streams: Vec<Rc<Stream<'a>>>,
     producer: RefCell<crate::shared::memory::device::Event<'a>>,
     consumed: RefCell<crate::shared::memory::device::Event<'a>>,
     context_pending: Cell<bool>,
@@ -64,15 +134,31 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: [Rc<Stream<'a>>; 2],
         layout: &MlaDraftRuntimeLayout) -> Result<Self> {
+        Self::load_for_ranks(admission, programs, options, streams.to_vec(), layout)
+    }
+
+    pub(crate) fn load_for_ranks(admission: &mut super::admission::Admission<'a>,
+        programs: &'a Programs<'a>, options: &Options, streams: Vec<Rc<Stream<'a>>>,
+        layout: &MlaDraftRuntimeLayout) -> Result<Self> {
         ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
-        let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
+        ensure!(matches!(streams.len(), 1 | 2)
+            && (streams.len() == 1 || streams[0].device.id != streams[1].device.id),
+            "Kimi draft requires one or two distinct physical owners");
+        let head = streams.len() - 1;
+        let ranks = streams.iter().map(|s| RankDevice { device: s.device.id, stream: s.raw }).collect::<Vec<_>>();
         let library = streams[0].device.library;
-        let prepared = Prepared::new(library, ranks[0], ranks[1], 1, "kimi-remote-mla-dflash", crate::shared::draft::remote::decode_extent(
-            layout.capacity().block_rows, layout.target_hidden(), layout.target_vocab(), 1)?)?;
+        let bridge = if streams.len() == 1 {
+            Bridge::Local { stream: Stream::new(streams[0].device)?, terminal: Cell::new(TerminalState::Active) }
+        } else {
+            Bridge::Remote(RemoteBridge::new(Prepared::new(library, ranks[0], ranks[head], head,
+                "kimi-remote-mla-dflash", crate::shared::draft::remote::decode_extent(
+                    layout.capacity().block_rows, layout.target_hidden(), layout.target_vocab(), head)?)?))
+        };
         let file = std::fs::read(options.snapshot.join("model.safetensors"))?;
-        let draft = admission.allocate_draft(prepared.stream.device, programs, &options.snapshot, file,
-            prepared.stream.raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16)?;
-        let demands = bridge_demands(layout, admission.lane_rows())?;
+        let draft = admission.allocate_draft(bridge.stream().device, programs, &options.snapshot, file,
+            bridge.stream().raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16)?;
+        let demands = cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(
+            layout, admission.lane_rows(), streams.len())?;
         let device = streams[0].device;
         let allocate = |name| -> Result<Allocation<'a>> {
             let demand = demands.iter().find(|d| d.group == name).context("Kimi draft bridge inventory missing")?;
@@ -80,11 +166,11 @@ impl<'a> NativeDraft<'a> {
         };
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
-        let window_marks = admission.allocate_draft_marks(streams[1].device)?;
+        let window_marks = admission.allocate_draft_marks(streams[head].device)?;
         Ok(Self { window_marks, window_bytes, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
-            bridge: RemoteBridge::new(prepared), producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
-            consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[1].device)?),
+            bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
+            consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
             context_pending: Cell::new(false), target_streams: streams })
     }
 
@@ -94,25 +180,32 @@ impl<'a> NativeDraft<'a> {
     /// drafter projects through them into its own admitted head scratch.
     pub(crate) fn bind_target(&mut self, target: [Rc<GlobalWeights<'a>>; 2],
         head_programs: Rc<super::device::NativePrograms<'a>>) -> Result<()> {
-        ensure!(self.owners.target.is_none(), "Kimi draft target already bound");
+        self.bind_target_ranks(target.to_vec(), head_programs)
+    }
+
+    pub(crate) fn bind_target_ranks(&mut self, target: Vec<Rc<GlobalWeights<'a>>>,
+        head_programs: Rc<super::device::NativePrograms<'a>>) -> Result<()> {
+        ensure!(self.owners.target.is_none() && target.len() == self.target_streams.len(),
+            "Kimi draft target already bound or physical inventory differs");
+        let head = target.len() - 1;
         for (rank, owner) in target.iter().enumerate() { owner.check_device(self.target_streams[rank].device)?; }
         let cfg = &self.owners.draft.cfg;
         ensure!(target[0].buffer("embedding")?.bytes == cfg.vocab * cfg.hidden * 2,
             "Kimi draft target embedding differs from admitted BF16 geometry");
-        if let Some(head) = &target[1].core_head {
-            ensure!(head.shape == [cfg.vocab, cfg.hidden], "Kimi draft K6 target head geometry differs");
-            ensure!(head_programs.device.id == self.target_streams[1].device.id,
+        if let Some(weight) = &target[head].core_head {
+            ensure!(weight.shape == [cfg.vocab, cfg.hidden], "Kimi draft K6 target head geometry differs");
+            ensure!(head_programs.device.id == self.target_streams[head].device.id,
                 "Kimi draft K6 head programs are not on the head rank");
-            let projection = head_programs.core.as_ref().context("K6 head programs not resolved")?.projection(head)?;
+            let projection = head_programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
             let rows = self.owners.draft.max_batch_sequences() * cfg.block;
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
                 crate::shared::dense_trellis::ProjectionLayout::new(&projection.program, rows)?
-                    .allocate(self.target_streams[1].device)?
+                    .allocate(self.target_streams[head].device)?
             };
             self.k6_head = Some((head_programs, scratch));
         } else {
-            ensure!(target[1].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
+            ensure!(target[head].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
                 "Kimi draft target head differs from admitted BF16 geometry");
         }
         self.owners.target = Some(target);
@@ -123,6 +216,7 @@ impl<'a> NativeDraft<'a> {
             self.gather(&vec![cfg.mask_token; count * cfg.block])?;
         }
         self.target_streams[0].drain()?;
+        if matches!(self.bridge, Bridge::Local { .. }) { self.bridge.synchronize()?; }
         Ok(())
     }
 
@@ -135,12 +229,16 @@ impl<'a> NativeDraft<'a> {
         let ids = crate::shared::prefix::view(self.ids.buffer, 0, tokens.len() * 4)?;
         let output = crate::shared::prefix::view(self.input.buffer, 0, tokens.len() * draft.cfg.hidden * 2)?;
         let data = tokens.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>();
+        let stream = match &self.bridge {
+            Bridge::Remote(bridge) => bridge.exchange.stream(0),
+            Bridge::Local { stream, .. } => stream.raw,
+        };
         self.target_streams[0].device.run(|| {
             // SAFETY: all target operands and this exact stream survive the draft's drain.
             unsafe {
-                draft.device.library.copy_h2d_ordered(self.ids.buffer, &data, self.bridge.exchange.stream(0))?;
+                draft.device.library.copy_h2d_ordered(self.ids.buffer, &data, stream)?;
                 draft.device.library.cuda_embedding_lookup_bf16_async(table, ids, output, tokens.len(),
-                    draft.cfg.vocab, draft.cfg.hidden, self.bridge.exchange.stream(0))
+                    draft.cfg.vocab, draft.cfg.hidden, stream)
             }
         })
     }
@@ -198,22 +296,31 @@ impl<'a> NativeDraft<'a> {
         self.bridge.checked(|| draft.device.run(|| {
             draft.update_with(&rebased, || {
                 self.producer.borrow_mut().record(&self.target_streams[0])?;
-                self.bridge.exchange.on(0, || {
-                    // SAFETY: retained event joins this exact producer and consumer.
-                    unsafe { draft.device.library.cuda_stream_wait_event(self.bridge.exchange.stream(0),
-                        self.producer.borrow().raw) }
-                })?;
-                // SAFETY: checked source frontier and rebased destination fit their owners.
-                let plane = unsafe { cuteafd_ffi::peer_exchange::PeerPlane {
-                    source: self.taps.buffer.ptr.cast::<u8>().add(first * pitch).cast(),
-                    destination: draft.taps.buffer.ptr,
-                    rows: (last - first + 1) as u64, row_bytes: pitch as u64,
-                    source_pitch: pitch as u64, destination_pitch: pitch as u64,
-                } };
-                self.bridge.publish_context(&[plane])
+                match &self.bridge {
+                    Bridge::Remote(bridge) => {
+                        bridge.exchange.on(0, || {
+                            // SAFETY: retained event joins this exact producer and consumer.
+                            unsafe { draft.device.library.cuda_stream_wait_event(bridge.exchange.stream(0),
+                                self.producer.borrow().raw) }
+                        })?;
+                        // SAFETY: checked source frontier and rebased destination fit their owners.
+                        let plane = unsafe { cuteafd_ffi::peer_exchange::PeerPlane {
+                            source: self.taps.buffer.ptr.cast::<u8>().add(first * pitch).cast(),
+                            destination: draft.taps.buffer.ptr,
+                            rows: (last - first + 1) as u64, row_bytes: pitch as u64,
+                            source_pitch: pitch as u64, destination_pitch: pitch as u64,
+                        } };
+                        bridge.publish_context(&[plane])
+                    }
+                    Bridge::Local { .. } => {
+                        let bytes = (last - first + 1) * pitch;
+                        let source = crate::shared::prefix::view(self.taps.buffer, first * pitch, bytes)?;
+                        self.bridge.copy_local(draft.taps.buffer, source, bytes, Some(&self.producer.borrow()))
+                    }
+                }
             })?;
-            self.bridge.acknowledge_context()?;
-            self.consumed.borrow_mut().record(&self.bridge.stream)?;
+            if let Bridge::Remote(bridge) = &self.bridge { bridge.acknowledge_context()?; }
+            self.consumed.borrow_mut().record(self.bridge.stream())?;
             self.context_pending.set(true);
             Ok(())
         }))
@@ -257,30 +364,34 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn max_batch_sequences(&self) -> usize { self.owners.draft.max_batch_sequences() }
     pub(crate) fn drafts(&self) -> usize { self.owners.draft.cfg.drafts() }
     pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live() }
-    pub(crate) fn abort(&self) -> Result<()> { self.bridge.publish_abort() }
+    pub(crate) fn abort(&self) -> Result<()> { self.bridge.abort() }
     pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize() }
     pub(crate) fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained); }
 
     pub(crate) fn propose(&self, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
         let draft = &self.owners.draft;
         let target = self.owners.target.as_ref().context("Kimi draft target is not bound")?;
+        let head = target.len() - 1;
         // The reference is tied to this adapter's retained owner, not to a copied
         // buffer descriptor or a synthetic legacy allocation.
         self.bridge.checked(|| draft.device.run(|| {
             let input = |tokens: &[u32], output: CuteafdDeviceBuffer, stream| {
-                ensure!(stream == self.bridge.stream.raw, "Kimi draft input stream differs from bridge");
+                ensure!(stream == self.bridge.stream().raw, "Kimi draft input stream differs from bridge");
                 self.gather(tokens)?;
-                self.bridge.send_input(self.input.buffer.ptr.cast_const(), output.ptr,
-                    tokens.len() * draft.cfg.hidden * 2)
+                let bytes = tokens.len() * draft.cfg.hidden * 2;
+                match &self.bridge {
+                    Bridge::Remote(bridge) => bridge.send_input(self.input.buffer.ptr.cast_const(), output.ptr, bytes),
+                    Bridge::Local { .. } => self.bridge.copy_local(output, self.input.buffer, bytes, None),
+                }
             };
             let head = match &self.k6_head {
                 Some((programs, scratch)) => {
-                    let weight = target[1].core_head.as_ref().context("Kimi draft K6 target head absent")?;
+                    let weight = target[head].core_head.as_ref().context("Kimi draft K6 target head absent")?;
                     let projection = programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
-                    let device = self.target_streams[1].device.id;
+                    let device = self.target_streams[head].device.id;
                     let (hidden, vocab) = (draft.cfg.hidden, draft.cfg.vocab);
                     TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
-                        ensure!(stream == self.bridge.stream.raw, "Kimi draft K6 head stream differs from bridge");
+                        ensure!(stream == self.bridge.stream().raw, "Kimi draft K6 head stream differs from bridge");
                         let input = CuteafdDeviceBuffer { ptr: x.cast_mut(), bytes: rows * hidden * 2, device_id: device, flags: 0 };
                         let output = CuteafdDeviceBuffer { ptr: logits.cast(), bytes: rows * vocab * 4, device_id: device, flags: 0 };
                         // The drafter's own scratch, used only on this bridge stream; the
@@ -288,7 +399,7 @@ impl<'a> NativeDraft<'a> {
                         projection.local(rows, input, weight, scratch, output, stream)
                     }))
                 }
-                None => TargetHead::Bf16Buffer(target[1].borrowed_buffer("head")?),
+                None => TargetHead::Bf16Buffer(target[head].borrowed_buffer("head")?),
             };
             draft.draft_device_with(sequences, &input, head)
         }))
@@ -594,16 +705,51 @@ mod tests {
     }
 
     #[test]
-    fn k6_target_head_projects_through_draft_owned_scratch_not_a_bf16_borrow() {
-        let source = include_str!("draft.rs").split("\n#[cfg(test)]\nmod tests").next().unwrap();
-        let bind = source.split("pub(crate) fn bind_target").nth(1).unwrap().split("fn gather").next().unwrap();
-        // The BF16 head is required only when the target head is not K6.
-        let (k6, bf16) = bind.split_once("} else {").unwrap();
-        assert!(k6.contains("if let Some(head) = &target[1].core_head"));
-        assert!(!k6.contains("buffer(\"head\")") && bf16.contains("buffer(\"head\")"));
-        assert!(k6.contains("ProjectionLayout::new(&projection.program, rows)") && k6.contains(".allocate(self.target_streams[1].device)"));
-        let propose = source.split("pub(crate) fn propose").nth(1).unwrap().split("impl crate::shared").next().unwrap();
-        assert!(propose.contains("TargetHead::Launch") && propose.contains("stream == self.bridge.stream.raw"));
-        assert!(propose.contains("None => TargetHead::Bf16Buffer(target[1].borrowed_buffer(\"head\")?)"));
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn local_bridge_drains_without_peer_waits_and_closes_after_failure() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = crate::shared::memory::device::Device { library: &library, id: 0 };
+        fixture.immediate_copies(&library)?;
+        let bridge = Bridge::Local { stream: Stream::new(device)?, terminal: Cell::new(TerminalState::Active) };
+        let target = Stream::new(device)?;
+        let source = Allocation::new(device, 64)?;
+        let destination = Allocation::new(device, 32)?;
+        let bytes = (0u8..64).collect::<Vec<_>>();
+        device.run(|| library.copy_h2d(source.buffer, &bytes))?;
+        let mut producer = crate::shared::memory::device::Event::new(device)?;
+        let mut consumed = crate::shared::memory::device::Event::new(device)?;
+        let view = crate::shared::prefix::view(source.buffer, 16, 32)?;
+        let before = fixture.events()?.len();
+        producer.record(&target)?;
+        bridge.checked(|| bridge.copy_local(destination.buffer, view, 32, Some(&producer)))?;
+        consumed.record(bridge.stream())?;
+        device.run(|| {
+            // SAFETY: the test retains both streams and the ordering event through drain.
+            unsafe { library.cuda_stream_wait_event(target.raw, consumed.raw) }
+        })?;
+        assert_eq!(&fixture.events()?[before..], "RWCRW");
+        bridge.synchronize()?;
+        let mut actual = vec![0; 32];
+        device.run(|| library.copy_d2h(&mut actual, destination.buffer))?;
+        assert_eq!(actual, bytes[16..48]);
+        let before = fixture.events()?;
+        let foreign = CuteafdDeviceBuffer { device_id: 1, ..view };
+        assert!(bridge.copy_local(destination.buffer, foreign, 32, None).is_err());
+        assert!(bridge.copy_local(destination.buffer, view, 33, None).is_err());
+        assert_eq!(fixture.events()?, before, "invalid extents must not enqueue work");
+        bridge.checked(|| Ok(()))?;
+        bridge.finish_request()?;
+        assert_eq!(bridge.stream().device.id, 0);
+        let error: Result<()> = bridge.checked(|| anyhow::bail!("injected draft submission failure"));
+        assert!(error.is_err());
+        assert!(bridge.require_live().is_err());
+        bridge.synchronize()?;
+        bridge.finish_terminal(true);
+        assert!(matches!(&bridge, Bridge::Local { terminal, .. } if terminal.get() == TerminalState::Drained));
+        bridge.abort()?;
+        assert!(bridge.checked(|| Ok(())).is_err());
+        Ok(())
     }
 }

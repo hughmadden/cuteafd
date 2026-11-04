@@ -35,7 +35,7 @@ pub static GLM5: Glm =
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM5_FLASH: Glm =
     Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving, media_cache_headroom: true,
-        exlr8: Exlr8Execution { dense_worlds: &[1], onboard_worlds: &[1] },
+        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[1, 2] },
         decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "the second lane is not wired yet: only the Spark-bound min card (1 RTX + 2 Sparks) can hide a round trip, and it is the OneOrTwo candidate awaiting its A/B; the 0-Spark layout has no exchange to hide (#744)" } };

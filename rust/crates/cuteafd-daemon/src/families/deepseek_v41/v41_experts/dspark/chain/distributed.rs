@@ -18,6 +18,10 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
     pub fn device(&self) -> Device<'a> { self.chain.device }
     pub fn device_bytes(weights: &DsparkWeights<'a>, requests: u32, split: usize) -> Result<[usize; 2]> {
         let mut bytes = DistributedDsparkTerminal::device_bytes_with_width(requests as usize, split, weights.draft_width)?;
+        for (bytes, scratch) in bytes.iter_mut().zip(DistributedDsparkTerminal::head_scratch_bytes(
+            weights.library, requests as usize * weights.draft_width, split)?) {
+            *bytes = bytes.checked_add(scratch).context("distributed draft head scratch overflow")?;
+        }
         bytes[0] = bytes[0].checked_add(weights.peer_chain_bytes(requests)?).context("distributed draft peer budget overflow")?;
         bytes[1] = bytes[1].checked_add(weights.chain_bytes(requests)?).context("distributed draft budget overflow")?;
         Ok(bytes)
@@ -89,7 +93,8 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             ensure!(captured.pins == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
         }
         let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
-            library: chain.stream.library, stream: chain.stream.raw };
+            library: chain.stream.library, stream: chain.stream.raw,
+            peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };
         // The local guard drains partial submission failures under GPU1 before
         // releasing cache readers. Success transfers it into lane-owned state.
         unsafe {
@@ -113,7 +118,10 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
     fn poll_execute(&mut self) -> Result<bool> {
         let device = self.chain.device;
         let result = device.run(|| self.poll_on());
-        if result.is_err() { self.cancel(); }
+        if let Err(error) = &result {
+            tracing::error!(%error, "distributed draft failed before cancellation drain");
+            self.cancel();
+        }
         result
     }
     fn poll_on(&mut self) -> Result<bool> {

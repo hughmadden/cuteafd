@@ -113,16 +113,27 @@ pub(crate) fn installed(snapshot: &std::path::Path) -> Result<Installed> {
 
 /// Every golden operand through the coordinator loader, each owner on its GPU.
 pub(crate) fn mount(library: &NativeLibrary, model: &Installed, out: &mut Digests) -> Result<()> {
-    let devices = [0, 1].map(|id| Device { library, id });
+    mount_for_ranks(library, model, 2, out)
+}
+
+fn fixture_layers(cfg: &KimiK3Config, ranks: usize) -> Result<Vec<(usize, LayerMode)>> {
+    if ranks == 2 { return golden_layers(cfg); }
+    ensure!(ranks == 1, "Kimi fixture physical rank count");
+    Ok((0..cfg.layers).map(|layer| (layer,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner })).collect())
+}
+
+fn mount_for_ranks(library: &NativeLibrary, model: &Installed, ranks: usize, out: &mut Digests) -> Result<()> {
+    let devices = (0..ranks).map(|id| Device { library, id: id as i32 }).collect::<Vec<_>>();
     let read = |name: &str| read_tensor(&model.checkpoint, name);
-    let globals = GlobalLayout::pair_with_core(&model.cfg, &model.core)?;
+    let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
     for (rank, layout) in globals.iter().enumerate() {
         let weights = layout.upload(devices[rank], layout.pack(&model.cfg, read)?)?;
         global_digests(library, rank, &weights, out)?;
     }
-    for (layer, mode) in golden_layers(&model.cfg)? {
-        let layouts = LayerLayout::pair_with_core(&model.cfg, layer, mode, &model.core)?;
-        let packed = PackedLayer::pair_with_core(&model.cfg, layer, mode, &model.core, read)?;
+    for (layer, mode) in fixture_layers(&model.cfg, ranks)? {
+        let layouts = LayerLayout::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks)?;
+        let packed = PackedLayer::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks, read)?;
         for ((rank, packed), layout) in packed.into_iter().enumerate().zip(&layouts) {
             let weights = LayerWeights::upload(devices[rank], packed, layout, layout.bytes()?)?;
             layer_digests(library, &format!("layers.{layer}.{}.{rank}", mode_tag(mode)), &weights, out)?;
@@ -154,16 +165,22 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
 pub(crate) fn recorded<'a>(library: &'a NativeLibrary, model: &Installed,
     load: &crate::shared::experts::rtx::dense::DenseLoad<'a>)
     -> Result<(Vec<(usize, GlobalWeights<'a>)>, Vec<(String, usize, LayerWeights<'a>)>)> {
-    let devices = [0, 1].map(|id| Device { library, id });
+    recorded_for_ranks(library, model, load, 2)
+}
+
+fn recorded_for_ranks<'a>(library: &'a NativeLibrary, model: &Installed,
+    load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, ranks: usize)
+    -> Result<(Vec<(usize, GlobalWeights<'a>)>, Vec<(String, usize, LayerWeights<'a>)>)> {
+    let devices = (0..ranks).map(|id| Device { library, id: id as i32 }).collect::<Vec<_>>();
     let records = records::KimiRecords { checkpoint: &model.checkpoint, cfg: &model.cfg, core: &model.core, dense: load,
-        streams: [(0, std::ptr::null_mut()), (1, std::ptr::null_mut())] };
-    let globals = GlobalLayout::pair_with_core(&model.cfg, &model.core)?;
+        streams: devices.iter().map(|device| (device.id, std::ptr::null_mut())).collect() };
+    let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
     let mut global = Vec::new();
     for (rank, layout) in globals.iter().enumerate() { global.push((rank, records.global(devices[rank], layout)?)); }
     let mut layers = Vec::new();
-    for (layer, mode) in golden_layers(&model.cfg)? {
-        let layouts = LayerLayout::pair_with_core(&model.cfg, layer, mode, &model.core)?;
-        for (rank, weights) in records.layer(devices, layer, &layouts)?.into_iter().enumerate() {
+    for (layer, mode) in fixture_layers(&model.cfg, ranks)? {
+        let layouts = LayerLayout::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks)?;
+        for (rank, weights) in records.layer_ranks(&devices, layer, &layouts)?.into_iter().enumerate() {
             layers.push((format!("layers.{layer}.{}.{rank}", mode_tag(mode)), rank, weights));
         }
     }
@@ -350,52 +367,81 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
     let (cfg, core) = small_checkpoint(root.path())?;
     let checkpoint = Checkpoint::open(root.path())?;
     let model = Installed { checkpoint, cfg, core };
-    let mut expected = Digests::new();
-    mount(&library, &model, &mut expected)?;
-    ensure!(expected.keys().any(|k| k.ends_with("mla.uk")) && expected.keys().any(|k| k.contains("head.payload"))
-        && expected.keys().any(|k| k.ends_with("kda.a_log")) && expected.keys().any(|k| k.ends_with("ffn.down.payload")),
-        "fixture covers absorption, the K6 head, A_log and input-side K6");
-    // Mount fill of the records.
-    let load = DenseLoad::mount(&library);
-    let (global, layers) = recorded(&library, &model, &load)?;
-    load.release();
-    let mut actual = Digests::new();
-    recorded_digests(&library, &global, &layers, &mut actual)?;
-    ensure!(actual == expected, "records by mount differ: {:?}", actual.iter().filter(|(k, v)| expected.get(*k) != Some(v))
-        .map(|(k, _)| k).take(8).collect::<Vec<_>>());
-    drop((global, layers));
-    // The same records pushed through each GPU's rank.
-    let marker = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
-        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-        // SAFETY: both strings are NUL-terminated and live across the call; the
-        // value pointer and length describe one live buffer.
-        let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
-        ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
-        Ok(())
-    };
-    marker(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
-    for entry in std::fs::read_dir(root.path())? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "safetensors") { marker(&path, c"user.sparknest.hosts", b"coordinator")?; }
+    let rejected = DenseLoad::push(&library);
+    let records = records::KimiRecords { checkpoint: &model.checkpoint, cfg: &model.cfg,
+        core: &model.core, dense: &rejected, streams: vec![(0, std::ptr::null_mut())] };
+    let device = Device { library: &library, id: 0 };
+    let whole = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+    let mut invalid = LayerLayout::ranks_with_core(&model.cfg, 0, whole, &model.core, 1)?;
+    *invalid[0].operands.get_mut("attention.score").unwrap() -= 1;
+    *invalid[0].operands.get_mut("ffn.score").unwrap() += 1;
+    // The fake DSO creates its log lazily on the first native operation.
+    let _validation_stream = crate::shared::memory::device::Stream::new(device)?;
+    let before = fixture.events()?;
+    ensure!(records.layer_ranks(&[device], 0, &invalid).is_err(), "equal-total extent swap must fail");
+    let valid = LayerLayout::ranks_with_core(&model.cfg, 0, whole, &model.core, 1)?;
+    ensure!(records.layer_ranks(&[device], model.cfg.layers, &valid).is_err(), "out-of-range layer must fail");
+    ensure!(records.layer_ranks(&[device, device], 0, &valid).is_err(), "aliased physical ranks must fail");
+    let mut global = GlobalLayout::ranks_with_core(&model.cfg, &model.core, 1)?;
+    global[0].operands.remove("embedding");
+    ensure!(records.global(device, &global[0]).is_err(), "missing entry operand must fail");
+    ensure!(fixture.events()? == before, "rejected layouts must not allocate or submit work");
+    for ranks in [1, 2] {
+        let mut expected = Digests::new();
+        mount_for_ranks(&library, &model, ranks, &mut expected)?;
+        ensure!(expected.contains_key("global.0.embedding")
+            && expected.contains_key(&format!("global.{}.head.payload", ranks - 1))
+            && (ranks == 2 || !expected.keys().any(|key| key.starts_with("global.1."))),
+            "entry and terminal operands follow physical owners");
+        ensure!(expected.keys().any(|k| k.ends_with("mla.uk")) && expected.keys().any(|k| k.contains("head.payload"))
+            && expected.keys().any(|k| k.ends_with("kda.a_log")) && expected.keys().any(|k| k.ends_with("ffn.down.payload")),
+            "fixture covers absorption, the K6 head, A_log and input-side K6");
+        // Mount fill of the records.
+        let load = DenseLoad::mount(&library);
+        let (global, layers) = recorded_for_ranks(&library, &model, &load, ranks)?;
+        load.release();
+        let mut actual = Digests::new();
+        recorded_digests(&library, &global, &layers, &mut actual)?;
+        ensure!(actual == expected, "records by mount differ: {:?}", actual.iter().filter(|(k, v)| expected.get(*k) != Some(v))
+            .map(|(k, _)| k).take(8).collect::<Vec<_>>());
+        drop((global, layers));
+        // The same records pushed through each GPU's rank.
+        let marker = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+            // SAFETY: both strings are NUL-terminated and live across the call; the
+            // value pointer and length describe one live buffer.
+            let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+            Ok(())
+        };
+        marker(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+        for entry in std::fs::read_dir(root.path())? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "safetensors") { marker(&path, c"user.sparknest.hosts", b"coordinator")?; }
+        }
+        let load = DenseLoad::push(&library);
+        let (global, layers) = recorded_for_ranks(&library, &model, &load, ranks)?;
+        let records = load.sink.as_ref().context("push sink")?.take_all();
+        let (_, _, _, steps, largest, _) = records.summary();
+        ensure!(steps > 0 && largest <= STEP_BYTES, "a step stages {largest} bytes");
+        // Whole input-side weights copy directly; only TP2 slices gather tiles.
+        ensure!(ranks == 1 || records.steps.iter().any(|s| s.jobs.iter().any(|j|
+            matches!(j, crate::shared::experts::rtx::dense::Job::TrellisTiles { input: true, .. }))),
+            "split records exercise input-side tiles");
+        ensure!(records.steps.iter().any(|s| s.jobs.iter().any(|j|
+            matches!(j, crate::shared::experts::rtx::dense::Job::Product { .. }))),
+            "records exercise scale products");
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        for gpu in 0..ranks as i32 {
+            let mine = Records { operands: records.operands.iter().filter(|o| o.device == gpu).cloned().collect(),
+                steps: records.steps.iter().filter(|s| s.device == gpu).cloned().collect(), ..Default::default() };
+            crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu },
+                None, root.path(), sockets.path(), &mine, None, 0, gpu as usize)?;
+        }
+        let mut pushed = Digests::new();
+        recorded_digests(&library, &global, &layers, &mut pushed)?;
+        ensure!(pushed == expected, "records by push differ: {:?}", pushed.iter().filter(|(k, v)| expected.get(*k) != Some(v))
+            .map(|(k, _)| k).take(8).collect::<Vec<_>>());
     }
-    let load = DenseLoad::push(&library);
-    let (global, layers) = recorded(&library, &model, &load)?;
-    let records = load.sink.as_ref().context("push sink")?.take_all();
-    let (_, _, _, steps, largest, _) = records.summary();
-    ensure!(steps > 0 && largest <= STEP_BYTES, "a step stages {largest} bytes");
-    ensure!(records.steps.iter().any(|s| s.jobs.iter().any(|j| matches!(j, crate::shared::experts::rtx::dense::Job::TrellisTiles { input: true, .. })))
-        && records.steps.iter().any(|s| s.jobs.iter().any(|j| matches!(j, crate::shared::experts::rtx::dense::Job::Product { .. }))),
-        "records exercise input-side tiles and products");
-    let sockets = tempfile::tempdir_in(fixture.directory())?;
-    for gpu in 0..2 {
-        let mine = Records { operands: records.operands.iter().filter(|o| o.device == gpu).cloned().collect(),
-            steps: records.steps.iter().filter(|s| s.device == gpu).cloned().collect(), ..Default::default() };
-        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu },
-            None, root.path(), sockets.path(), &mine, None, 0, gpu as usize)?;
-    }
-    let mut pushed = Digests::new();
-    recorded_digests(&library, &global, &layers, &mut pushed)?;
-    ensure!(pushed == expected, "records by push differ: {:?}", pushed.iter().filter(|(k, v)| expected.get(*k) != Some(v))
-        .map(|(k, _)| k).take(8).collect::<Vec<_>>());
     Ok(())
 }

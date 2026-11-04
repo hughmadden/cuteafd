@@ -5,6 +5,7 @@ pub mod core;
 pub mod kda;
 pub mod mla;
 pub mod reference;
+pub mod spark;
 pub mod w8;
 pub mod weight_layout;
 
@@ -49,14 +50,53 @@ pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
 /// drafter consumes 2048-row slices.
 pub fn draft_bridge_demands(layout: &crate::formats::dflash::MlaDraftRuntimeLayout, rows: usize)
     -> anyhow::Result<Vec<crate::placement::Demand>> {
-    use anyhow::Context;
+    draft_bridge_demands_for_ranks(layout, rows, 2)
+}
+
+pub fn draft_bridge_demands_for_ranks(layout: &crate::formats::dflash::MlaDraftRuntimeLayout,
+    rows: usize, ranks: usize) -> anyhow::Result<Vec<crate::placement::Demand>> {
+    draft_bridge_inventory(layout.target_hidden() as u64, layout.target_vocab() as u64,
+        layout.target_taps().len() as u64, layout.capacity().block_rows as u64, rows, ranks)
+}
+
+fn draft_bridge_inventory(hidden: u64, vocab: u64, taps: u64, block_rows: u64, rows: usize,
+    ranks: usize) -> anyhow::Result<Vec<crate::placement::Demand>> {
+    use anyhow::{ensure, Context};
+    ensure!(matches!(ranks, 1 | 2) && rows > 0, "Kimi draft bridge physical rank/row geometry");
+    // Both routes stage the same inputs. Only the remote route owns exchange controls;
+    // the common drafter already owns its hidden/logit/head workspace on the head device.
     let mut demands = crate::placement::draft::remote_dflash_bridge_demands(
-        layout.target_hidden() as u64, layout.target_vocab() as u64,
-        layout.target_taps().len() as u64, layout.capacity().block_rows as u64, 1)?.demands;
-    let taps = demands.iter_mut().find(|d| d.group == "DFlash bridge taps")
-        .context("Kimi bridge tap inventory missing")?;
-    taps.bytes = (rows * layout.target_taps().len() * layout.target_hidden() * 2) as u64;
+        hidden, vocab, taps, block_rows, 1)?.demands;
+    if ranks == 1 { demands.retain(|d| d.group != "DFlash bridge exchange"); }
+    let tap_bytes = (rows as u64).checked_mul(taps).and_then(|n| n.checked_mul(hidden))
+        .and_then(|n| n.checked_mul(2)).context("Kimi bridge tap extent overflow")?;
+    demands.iter_mut().find(|d| d.group == "DFlash bridge taps")
+        .context("Kimi bridge tap inventory missing")?.bytes = tap_bytes.max(16);
     Ok(demands)
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn local_bridge_retains_only_actual_staging_owners() -> anyhow::Result<()> {
+        for (hidden, vocab, taps, block, rows) in [(7168, 163840, 5, 16, 8256), (16, 32, 2, 8, 64)] {
+            let remote = draft_bridge_inventory(hidden, vocab, taps, block, rows, 2)?;
+            let local = draft_bridge_inventory(hidden, vocab, taps, block, rows, 1)?;
+            assert_eq!(local.len(), 3);
+            assert!(local.iter().all(|d| d.gpu == 0));
+            assert_eq!(local, remote.iter().filter(|d| d.group != "DFlash bridge exchange")
+                .cloned().collect::<Vec<_>>());
+            assert_eq!(local.iter().find(|d| d.group == "DFlash bridge taps").unwrap().bytes,
+                rows as u64 * taps * hidden * 2);
+            assert_eq!(remote.iter().filter(|d| d.group == "DFlash bridge exchange").count(), 2);
+        }
+        for ranks in [0, 3] { assert!(draft_bridge_inventory(16, 32, 2, 8, 64, ranks).is_err()); }
+        assert!(draft_bridge_inventory(16, 32, 2, 8, 0, 1).is_err());
+        assert!(draft_bridge_inventory(16, 32, 2, 8, usize::MAX, 1).is_err());
+        Ok(())
+    }
 }
 
 /// The shared probe retains one GPU0 route arena; its pinned mirror is host memory.

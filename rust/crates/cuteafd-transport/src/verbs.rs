@@ -1809,6 +1809,7 @@ struct VerbsHostProtocolV2PersistentClientSession {
     _stream: TcpStream,
     expert_grouping: Option<crate::worker_selection::InstalledExpertGrouping>,
     addr: SocketAddr,
+    execution_lane: u32,
     endpoint: Arc<NativeRdmaEndpoint>,
     retained_response_ring: Option<RegisteredResponseRing>,
     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
@@ -2267,6 +2268,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             _stream: stream,
             expert_grouping: ready.expert_grouping,
             addr,
+            execution_lane,
             endpoint: Arc::new(endpoint),
             retained_response_ring,
             cq_waiter: cq_harvester
@@ -3799,11 +3801,81 @@ pub struct VerbsHostMappedRdmaRing {
     reserved_send_sequence: Option<u64>,
     recv_completion_sequence: u64,
     recv_release_sequence: u64,
+    benchmark_payload: Option<BenchmarkSendPayload>,
+}
+
+struct BenchmarkSendPayload {
+    allocation: Option<CuteafdDeviceBuffer>,
+    region: u32,
+    header_bytes: usize,
+    payload_bytes: usize,
 }
 
 // All endpoint operations require `&mut self`; the native QP and borrowed views
 // therefore retain single-threaded ownership when the ring moves to a worker.
 unsafe impl Send for VerbsHostMappedRdmaRing {}
+
+impl Drop for VerbsHostMappedRdmaRing {
+    fn drop(&mut self) {
+        if let Some(mut raw) = self.benchmark_payload.as_mut().and_then(|payload| payload.allocation.take()) {
+            let retired = self.endpoint.terminal_quiesce().and_then(|()|
+                self.endpoint.library.rdma_rc_endpoint_destroy(self.endpoint.info.handle));
+            match retired {
+                Ok(()) => {
+                    self.endpoint.info.handle = std::ptr::null_mut();
+                    if let Err(error) = self.endpoint.library.free_device_buffer(&mut raw) {
+                        tracing::error!(%error, "failed to free retired diagnostic device SEND ring");
+                    }
+                }
+                Err(error) => {
+                    // DMA may still read this allocation; leak it and its library.
+                    std::mem::forget(self.endpoint.library.clone());
+                    tracing::error!(%error, "retaining diagnostic device SEND storage after failed drain");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+#[ignore = "requires explicit NVMe native fixture directory"]
+fn device_send_registration_failure_uses_pinned_payload_without_reallocation() -> Result<()> {
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+    let library = Arc::new(fixture.load()?);
+    let config = VerbsHostMappedRdmaRingConfig::new(32768, 2)?;
+    let layout = config.layout()?;
+    let mut storage = vec![0u8; layout.registered_span_bytes];
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let stream = TcpStream::connect(listener.local_addr()?)?;
+    let (_peer, _) = listener.accept()?;
+    let endpoint = NativeRdmaEndpoint {
+        library, info: CuteafdRdmaRcEndpointInfo { handle: 1usize as *mut c_void, ..Default::default() },
+        terminal_owner: None, credits: EndpointCredits::default(),
+        traffic: crate::traffic::register("fixture", 1, "fixture", String::new(), 1024),
+    };
+    let view = CuteafdRdmaRcEndpointBufferView { host_ptr: storage.as_mut_ptr().cast(),
+        device_ptr: storage.as_mut_ptr().cast(), bytes: storage.len(), ..Default::default() };
+    let mut ring = VerbsHostMappedRdmaRing {
+        _control_stream: stream, endpoint, layout, send_view: view, recv_view: view,
+        send_sequence: 0, send_in_flight: 0, reserved_send_sequence: None,
+        recv_completion_sequence: 0, recv_release_sequence: 0, benchmark_payload: None,
+    };
+    let payload = vec![0xA7; 32768 - 8];
+    let fallback = ring.initialize_benchmark_payload(8, &payload, true)?;
+    assert!(fallback.unwrap().contains("injected CPU fixture failure"));
+    let selected = ring.benchmark_payload.as_ref().unwrap();
+    assert!(selected.allocation.is_none());
+    assert_eq!(selected.region, 7);
+    for slot in 0..layout.depth {
+        let offset = layout.slot_offset(slot) + 8;
+        assert_eq!(&storage[offset..offset + payload.len()], payload);
+    }
+    assert_eq!(fixture.events()?, "DGdH", "allocate, failed device MR, free, pinned MR");
+    drop(ring);
+    assert_eq!(fixture.events()?, "DGdHXU");
+    Ok(())
+}
 
 impl VerbsHostMappedRdmaRing {
     pub fn connect(
@@ -3837,7 +3909,7 @@ impl VerbsHostMappedRdmaRing {
         let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring_on_device(
             Arc::clone(&library), "client", layout.slot_capacity_bytes, layout.slot_capacity_bytes,
             layout.registered_span_bytes, layout.registered_span_bytes, next_local_psn("client"),
-            layout.depth, rdma_device, 1,
+            layout.depth, rdma_device, 2,
         )?;
         let mut reader = BufReader::new(stream.try_clone()?);
         write_control(
@@ -3906,7 +3978,7 @@ impl VerbsHostMappedRdmaRing {
             layout.registered_span_bytes,
             next_local_psn("server"),
             layout.depth,
-            rdma_device.as_ref(), 1,
+            rdma_device.as_ref(), 2,
         )?;
         endpoint.connect(&start.client_native_endpoint)?;
         for slot in 0..layout.depth {
@@ -3961,7 +4033,84 @@ impl VerbsHostMappedRdmaRing {
             reserved_send_sequence: None,
             recv_completion_sequence: 0,
             recv_release_sequence: 0,
+            benchmark_payload: None,
         })
+    }
+
+    /// Preinitializes immutable diagnostic payloads, outside all timed phases.
+    /// Returns a registration failure when a requested device ring fell back to
+    /// the existing pinned slots. Allocation/upload failures remain fatal.
+    pub fn initialize_benchmark_payload(
+        &mut self, header_bytes: usize, payload: &[u8], device: bool,
+    ) -> Result<Option<String>> {
+        anyhow::ensure!(self.send_sequence == 0 && self.benchmark_payload.is_none(),
+            "benchmark payload must be selected before sending");
+        anyhow::ensure!(header_bytes > 0 && !payload.is_empty()
+            && header_bytes.checked_add(payload.len()).is_some_and(|bytes| bytes <= self.layout.slot_capacity_bytes),
+            "benchmark header and payload must fit the slot");
+        let mut fallback = None;
+        if device {
+            // Export one whole allocation, not an interior suballocation. CUDA's
+            // recommended granularity also avoids small-allocation pooling on GB10.
+            let alignment = self.endpoint.library.dmabuf_allocation_granularity()?;
+            let bytes = self.layout.registered_span_bytes.checked_next_multiple_of(alignment)
+                .context("device SEND ring alignment overflow")?;
+            let mut raw = self.endpoint.library.alloc_device_buffer(bytes)?;
+            let view = raw;
+            tracing::info!(allocation_bytes = bytes, allocation_granularity = alignment,
+                "allocated whole device SEND ring");
+            // SAFETY: this ring retains raw storage through endpoint destruction.
+            let registered = unsafe { self.endpoint.library.rdma_rc_endpoint_register_device_region(
+                self.endpoint.info.handle, view.ptr, view.bytes) };
+            match registered {
+                Ok(value) => {
+                    // Retain ownership before any fallible upload.
+                    self.benchmark_payload = Some(BenchmarkSendPayload {
+                        allocation: Some(raw), region: value, header_bytes, payload_bytes: payload.len(),
+                    });
+                    for slot in 0..self.layout.depth {
+                        let offset = self.layout.slot_offset(slot) + header_bytes;
+                        // SAFETY: slot geometry bounds this slice inside view.
+                        let target = CuteafdDeviceBuffer { ptr: unsafe { view.ptr.cast::<u8>().add(offset).cast() },
+                            bytes: payload.len(), ..view };
+                        self.endpoint.library.copy_h2d(target, payload)?;
+                    }
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.endpoint.library.free_device_buffer(&mut raw)?;
+                    fallback = Some(error.to_string());
+                    tracing::warn!(%error, "device SEND registration failed; using pinned-host payloads");
+                }
+            }
+        }
+        for slot in 0..self.layout.depth {
+            // SAFETY: initialization precedes all SENDs and geometry bounds the slot.
+            unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),
+                self.send_view.host_ptr.cast::<u8>().add(self.layout.slot_offset(slot) + header_bytes), payload.len()); }
+        }
+        // SAFETY: endpoint-owned pinned send storage outlives all registered regions.
+        let region = unsafe { self.endpoint.library.rdma_rc_endpoint_register_region(
+            self.endpoint.info.handle, self.send_view.host_ptr, self.send_view.bytes)? };
+        self.benchmark_payload = Some(BenchmarkSendPayload { allocation: None,
+            region, header_bytes, payload_bytes: payload.len() });
+        Ok(fallback)
+    }
+
+    /// Posts the reserved host header and its preinitialized payload as two SGEs.
+    pub fn post_reserved_benchmark_payload(&mut self) -> Result<()> {
+        let sequence = self.reserved_send_sequence.context("no reserved benchmark send slot")?;
+        let payload = self.benchmark_payload.as_ref().context("benchmark payload is uninitialized")?;
+        let offset = self.layout.slot_offset(sequence as usize);
+        self.endpoint.library.rdma_rc_endpoint_post_send_slot_region(
+            self.endpoint.info.handle, offset, payload.header_bytes, payload.region,
+            offset + payload.header_bytes, payload.payload_bytes,
+            VERBS_HOST_SEND_WR_ID + sequence % self.layout.depth as u64)?;
+        self.endpoint.traffic.sent(payload.header_bytes + payload.payload_bytes);
+        self.reserved_send_sequence = None;
+        self.send_sequence = self.send_sequence.wrapping_add(1);
+        self.send_in_flight += 1;
+        Ok(())
     }
 
     pub fn config(&self) -> VerbsHostMappedRdmaRingConfig {
@@ -4258,6 +4407,8 @@ fn verbs_host_expected_response_wire_bytes(request: &ExpertProtocolV2Request) ->
     let bf16_row_bytes = ExpertV2Dtype::Bf16.row_bytes(hidden_dim)?;
     let negotiated_row_bytes = if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
         ExpertV2Dtype::Nvfp4E2m1Fp8E4m3.row_bytes(hidden_dim)?
+    } else if request.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32 != 0 {
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32.row_bytes(hidden_dim)?
     } else if request.fp8_e4m3_row_scaled_response_enabled() {
         ExpertV2Dtype::Fp8E4m3RowScaled.row_bytes(hidden_dim)?
     } else {

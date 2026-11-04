@@ -65,7 +65,6 @@ impl ModelEncoding {
     pub fn supports_thinking_off(&self) -> bool {
         match self {
             Self::Step5(encoding) => encoding.supports_thinking_off(),
-            Self::Muse(_) => false,
             Self::Mistral(encoding) => encoding.supports_thinking_off(),
             _ => true,
         }
@@ -298,6 +297,26 @@ impl PrefixCacheSource {
     }
 }
 
+/// Request-local finish detail, published with the terminal usage.
+///
+/// The engine sets `repetition` when the loop guard aborts a reply. The detail
+/// is additive: when unset, `usage.finish_detail` is absent, so every existing
+/// response stays byte-identical.
+#[derive(Clone, Debug, Default)]
+pub struct FinishDetail {
+    detail: Arc<std::sync::atomic::AtomicU8>,
+}
+impl FinishDetail {
+    /// Mark the reply as ended by the repetition guard.
+    pub fn set_repetition(&self) {
+        self.detail.store(1, std::sync::atomic::Ordering::Release);
+    }
+    /// The detail name, or `None` when no detail was set.
+    pub fn name(&self) -> Option<&'static str> {
+        match self.detail.load(std::sync::atomic::Ordering::Acquire) { 1 => Some("repetition"), _ => None }
+    }
+}
+
 pub struct NativeRequest {
     pub prompt: String,
     pub literal_spans: cuteafd_loader::LiteralSpans,
@@ -320,6 +339,8 @@ pub struct NativeRequest {
     pub probe: Option<Arc<probe::Probe>>,
     pub usage: Option<crate::usage::UsageHandle>,
     pub prefix_cache_source: PrefixCacheSource,
+    /// Set by the engine when the loop guard aborts the reply.
+    pub finish_detail: FinishDetail,
 }
 impl NativeRequest {
     /// The single encoding boundary for every family's rendered chat requests.
@@ -618,9 +639,9 @@ impl Templated {
                 Ok(glm5::GlmThinking { enabled: true, effort: None })
             }
             Self::Muse(_) => {
-                muse::prompt::validate_thinking(body)?;
-                muse::prompt::template_effort(body)?;
-                Ok(glm5::GlmThinking { enabled: true, effort: None })
+                let enabled = glm5::resolve_thinking(body)?;
+                if enabled { muse::prompt::template_effort(body)?; }
+                Ok(glm5::GlmThinking { enabled, effort: None })
             }
             // The template renders an effort, never thinking off; the model may still answer
             // without a `[THINK]` block, so output starts as content.
@@ -714,6 +735,8 @@ pub(crate) struct Built {
     /// Client stop strings (the parser ends on them; the gateway reports which).
     pub(crate) stop_sequences: Vec<String>,
     tap: Arc<Mutex<Tap>>,
+    /// The request-local finish detail, shared with the engine.
+    finish_detail: FinishDetail,
 }
 
 impl Built {
@@ -867,6 +890,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         if glm_request.is_none() { return Err(Rejection::bad("audio requires a checkpoint chat template")); }
         media::audio::strip_adapter_audio(&mut body);
     }
+    if matches!(&glm_request, Some((Templated::Muse(_), _, _))) {
+        if let Some(kind) = body.get("thinking").and_then(Value::as_str).map(str::to_owned) {
+            body["thinking"] = json!({"type": kind.to_ascii_lowercase()});
+        }
+    }
     let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
     let parallel = parsed.parallel_tool_calls.unwrap_or(true);
@@ -911,6 +939,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
     let constraint = match (&profile.encoding, profile.encoding.think_close_token_id()) {
+        (ModelEncoding::Muse(_), _) if !converted.conversation.thinking_mode =>
+            constraints::response_constraint(response_format.clone(), false, tool_constraints.as_ref(), 0),
         (ModelEncoding::Muse(_), _) => constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref()),
         (ModelEncoding::Mistral(encoding), _) => constraints::mistral_response_constraint(response_format.clone(),
             tool_constraints.as_ref(), encoding.tokens().think),
@@ -926,6 +956,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let stop_sequences = converted.parsing_options.stop_sequences.clone();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let tap = Arc::new(Mutex::new(Tap::default()));
+    // Created here so the engine and the response renderer share one handle.
+    let finish_detail = FinishDetail::default();
     let generator = Tapped { inner: ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage), tap: tap.clone() };
     let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty() || !p.spec.audio.is_empty());
@@ -982,7 +1014,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
         }
-        Some((Templated::Muse(encoding), raw, _thinking)) => {
+        Some((Templated::Muse(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
                 (Some(name), _) => muse::MuseToolChoice::Named(name.to_owned()),
                 (None, true) => muse::MuseToolChoice::Required,
@@ -995,6 +1027,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
             let parser = muse::MuseOutputParser::new(muse::MuseParserOptions {
+                prefilled_user: !thinking.enabled,
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
@@ -1063,7 +1096,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let (prompt, literal_spans) = shield.finish(prompt, matches!(profile.encoding, ModelEncoding::DeepseekV41));
     Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
         work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
-        probe, streaming, include_usage, id, model, stop_sequences, tap })
+        probe, streaming, include_usage, id, model, stop_sequences, tap, finish_detail })
 }
 
 /// Prepared media for one request (decoded on blocking threads).
@@ -1146,6 +1179,7 @@ pub(crate) struct Running {
     pub(crate) image_tokens: usize,
     pub(crate) audio_tokens: usize,
     prefix_cache_source: PrefixCacheSource,
+    finish_detail: FinishDetail,
     /// The prompt usage and matched client stop string, observed as the
     /// generator sees them.
     pub(crate) tap: Arc<Mutex<Tap>>,
@@ -1188,13 +1222,15 @@ impl Submitter {
     pub(crate) async fn submit(&self, profile: &ModelProfile, built: Built, usage: Option<crate::usage::UsageHandle>,
         chat_accounting: bool) -> Result<Running, Rejection> {
         let Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
-            streaming, include_usage, id, model, tap, .. } = built;
+            streaming, include_usage, id, model, tap, finish_detail, .. } = built;
         let queue_started = std::time::Instant::now();
         let permit = match self.admission.reserve(self.queue.clone()).await {
             Ok(permit) => permit,
             Err(admission::Rejected::Closed) => return Err(Rejection::new(StatusCode::SERVICE_UNAVAILABLE, "worker queue is closed")),
-            Err(admission::Rejected::Overloaded) =>
-                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue is full or its wait budget expired").retry()),
+            Err(admission::Rejected::Full) =>
+                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue is full").retry()),
+            Err(admission::Rejected::Timeout) =>
+                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue wait budget expired").retry()),
         };
         if let Some(scope) = &usage { scope.queued(queue_started.elapsed().as_secs_f64() * 1000.); }
         let prepared = prepare_media(profile, &self.images, work, probe.as_ref()).await?;
@@ -1204,8 +1240,10 @@ impl Submitter {
         // backlog is bounded by its own max_tokens.
         let (events, mut receive) = mpsc::unbounded_channel();
         let prefix_cache_source = PrefixCacheSource::default();
+        if let Some(scope) = &usage { scope.finish_detail(finish_detail.clone()); }
         let job = NativeRequest {
             prefix_cache_source: prefix_cache_source.clone(),
+            finish_detail: finish_detail.clone(),
             audio: prepared.audio,
             media: prepared.media,
             prompt,
@@ -1276,7 +1314,7 @@ impl Submitter {
                 }
             }
         };
-        Ok(Running { prefix_cache_source, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
+        Ok(Running { prefix_cache_source, finish_detail, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
     }
 }
 
@@ -1339,7 +1377,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
 
 /// Render an accepted request as Chat Completions SSE or JSON.
 async fn respond(running: Running) -> Response {
-    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, streaming, include_usage, id, model, .. } = running;
+    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, finish_detail, streaming, include_usage, id, model, .. } = running;
     if streaming {
         let stream = async_stream::stream! {
             let mut chunks = chunks;
@@ -1362,6 +1400,7 @@ async fn respond(running: Running) -> Response {
                         let mut value = serde_json::to_value(&chunk).unwrap();
                         add_media_usage(&mut value, image_tokens, audio_tokens);
                         add_prefix_source(&mut value, &prefix_cache_source);
+                        add_finish_detail(&mut value, &finish_detail);
                         if include_usage {
                             let taken = value.get_mut("usage").map(Value::take);
                             if let Some(usage) = taken.filter(Value::is_object) {
@@ -1381,7 +1420,8 @@ async fn respond(running: Running) -> Response {
             }
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed { yield Ok(sse_error(message)); return; }
-            if let Some(usage) = usage_chunk {
+            if let Some(mut usage) = usage_chunk {
+                add_finish_detail(&mut usage, &finish_detail);
                 yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
             }
             yield Ok("data: [DONE]\n\n".to_owned());
@@ -1417,6 +1457,7 @@ async fn respond(running: Running) -> Response {
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
     add_prefix_source(&mut value, &prefix_cache_source);
+    add_finish_detail(&mut value, &finish_detail);
     Json(value).into_response()
 }
 
@@ -1468,6 +1509,38 @@ fn prefix_source_is_request_local_and_additive_in_usage() {
         add_prefix_source(&mut delta, &source);
         assert!(delta.get("usage").is_none(), "stream deltas must not gain usage");
     }
+}
+
+/// Add `usage.finish_detail` only when the engine set one, so a normal finish
+/// keeps every existing golden byte-identical.
+fn add_finish_detail(response: &mut Value, detail: &FinishDetail) {
+    let Some(name) = detail.name() else { return };
+    if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+        usage.insert("finish_detail".into(), json!(name));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn finish_detail_is_additive_in_usage_and_absent_by_default() {
+    let detail = FinishDetail::default();
+    let other = FinishDetail::default();
+    // Unset: no key at all, so every existing golden stays byte-identical.
+    let mut value = json!({"usage": {"prompt_tokens": 12}, "choices": []});
+    add_finish_detail(&mut value, &detail);
+    assert!(value["usage"].get("finish_detail").is_none());
+    assert_eq!(value["usage"]["prompt_tokens"], 12);
+    // Set: additive, and request-local.
+    detail.set_repetition();
+    add_finish_detail(&mut value, &detail);
+    assert_eq!(value["usage"]["finish_detail"], "repetition");
+    assert_eq!(value["usage"]["prompt_tokens"], 12);
+    assert_eq!(detail.name(), Some("repetition"));
+    assert_eq!(other.name(), None);
+    // A stream delta without usage never gains one.
+    let mut delta = json!({"choices": []});
+    add_finish_detail(&mut delta, &detail);
+    assert!(delta.get("usage").is_none(), "stream deltas must not gain usage");
 }
 
 fn add_media_usage(response: &mut Value, image_tokens: usize, audio_tokens: usize) {
@@ -1535,6 +1608,8 @@ pub(crate) fn v41_set_effort_budget(prompt: String, budget: u8) -> String {
     format!("{}{budget}{}", &prompt[..start], &prompt[start + digits..])
 }
 
+#[cfg(test)]
+mod cancel_storm_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1719,6 +1794,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn muse_thinking_off_renders_and_streams_visible_content() {
+        for thinking in [json!("disabled"), json!({"type":"disabled"})] {
+            for streaming in [false, true] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    assert!(job.prompt.ends_with("<|start|>assistant to=user<|message|>"));
+                    for event in [
+                        InferenceChunk::Ready { system_fingerprint: None,
+                            prompt_usage: PromptUsage { prompt_tokens: 12, prompt_cache_hit_tokens: 0 } },
+                        InferenceChunk::Text { content: "Direct ".into(), content_tokens: 1 },
+                        InferenceChunk::Text { content: "answer".into(), content_tokens: 1 },
+                        InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                    ] { job.events.send(Ok(event)).unwrap(); }
+                });
+                let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
+                assert!(profile.encoding.supports_thinking_off());
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let mut body = json!({"model":"muse-test", "messages":[{"role":"user","content":"Hi"}],
+                    "thinking":thinking, "max_tokens":8, "stream":streaming});
+                if streaming { body["stream_options"] = json!({"include_usage":true}); }
+                let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let values: Vec<Value> = if streaming {
+                    std::str::from_utf8(&bytes).unwrap().lines().filter_map(|line| line.strip_prefix("data: "))
+                        .filter(|line| *line != "[DONE]").map(|line| serde_json::from_str(line).unwrap()).collect()
+                } else { vec![serde_json::from_slice(&bytes).unwrap()] };
+                let content: String = values.iter().filter_map(|v| {
+                    let message = if streaming { &v["choices"][0]["delta"] } else { &v["choices"][0]["message"] };
+                    assert!(message["reasoning_content"].as_str().is_none_or(str::is_empty));
+                    message["content"].as_str()
+                }).collect();
+                assert_eq!(content, "Direct answer");
+                let usage = values.iter().find_map(|v| v.get("usage").filter(|v| !v.is_null())).unwrap();
+                assert_eq!(usage["completion_tokens"], 2);
+                assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0), 0);
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn muse_thinking_off_refuses_tools_before_admission() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+        let body = json!({"model":"muse-test", "messages":[{"role":"user","content":"Weather?"}],
+            "thinking":{"type":"disabled"}, "tools":[{"type":"function","function":{"name":"weather",
+                "parameters":{"type":"object","properties":{}}}}]});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("cannot be combined with tools"));
+        assert!(rx.try_recv().is_err());
+    }
+
     /// Muse renders its own prompt, stops at its EOS ids and routes the
     /// recipient-addressed messages: reasoning, content and a released call.
     #[tokio::test]
@@ -1774,7 +1911,7 @@ mod tests {
     /// Constrained Muse requests carry the native recipient-turn grammar:
     /// strict or required tools (atem `muse_tool_schema` tags), assistance and
     /// structured response formats; unconstrained ones carry none. Thinking off
-    /// still refuses (the template always reasons).
+    /// starts directly in the constrained answer body.
     #[tokio::test]
     async fn muse_constrained_requests_carry_the_native_turn_grammar() {
         let weather = json!({"type": "function", "function": {"name": "get_weather",
@@ -1809,7 +1946,11 @@ mod tests {
         let (job, _) = send(json!({"tools": [weather]})).await;
         assert_eq!(job, Some(None), "plain auto tools stay unconstrained");
         let (job, status) = send(json!({"enable_thinking": false})).await;
-        assert!(job.is_none() && status == Some(StatusCode::BAD_REQUEST));
+        assert_eq!(job, Some(None), "thinking off is unconstrained without a response format: {status:?}");
+        let (job, _) = send(json!({"thinking":{"type":"disabled"}, "response_format":{"type":"json_object"}})).await;
+        let grammar: Value = serde_json::from_str(&job.flatten().expect("direct JSON constraint")).unwrap();
+        assert_eq!(grammar["format"]["type"], "ds41_json_schema");
+        assert_eq!(grammar["format"]["json_schema"]["type"], "object");
     }
 
     #[tokio::test]

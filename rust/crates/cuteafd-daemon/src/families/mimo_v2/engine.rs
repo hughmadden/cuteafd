@@ -720,7 +720,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let Some(Experts::Spark { prefill: transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
         let bf16 = e.expert_input.bf16(false);
         self.member_routes(0, w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
-        e.wave_send(w, layer, unit.rows.len(), ExpertV2SourceKind::Prefill, bf16, transport.borrow_mut().exchange()?)
+        e.wave_send(w, layer, unit.rows.len(), ExpertV2SourceKind::Prefill, bf16, transport.borrow_mut().exchange()?, unit.reply_origins()?)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: crate::shared::spark_waves::WaveTicket) -> Result<()> {
         let e = self.engine;
@@ -1114,7 +1114,7 @@ impl<'a> MimoEngine<'a> {
             let ledger = cuteafd_ffi::memory_ledger::snapshot();
             for (rank, gpu) in [self.device, device].into_iter().enumerate() {
                 let planned = cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                    &self.cfg, 2, rank, rows, prefill_lanes, 0)?.iter().map(|r| r.bytes).sum::<u64>();
+                    &self.cfg, 2, rank, rows, prefill_lanes, 0, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?.iter().map(|r| r.bytes).sum::<u64>();
                 let actual = ledger.by_owner(cuteafd_ffi::memory_ledger::Space::Device, gpu)
                     .get("mimo/transport/peer").copied().unwrap_or(0) as u64;
                 let diagnostics = if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
@@ -2070,13 +2070,13 @@ impl<'a> MimoEngine<'a> {
             Some(Experts::Spark { decode: transport, .. }) => Some(transport.borrow_mut()),
             _ => None,
         };
-        let planes = match link.as_mut() {
+        let reduction = match link.as_mut() {
             Some(link) => {
                 let exchange = link.exchange()?;
                 ensure!(exchange.waves() == 1, "MiMo decode graphs bake one return slot's planes");
-                exchange.planes(0)
+                Some(exchange.reduction(0))
             }
-            None => [std::ptr::null(); MAX_RANKS],
+            None => None,
         };
         let bf16_input = self.expert_bf16_input(true);
         // The previous layer's wave: landed (a device wait) before the segment
@@ -2096,7 +2096,7 @@ impl<'a> MimoEngine<'a> {
                 (None, _) => None,
             };
             self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
-                planes, bf16_input))?;
+                reduction.clone(), bf16_input))?;
             if let (Some(slot), Some(link)) = (landed, link.as_mut()) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
                 link.exchange()?.consumed(slot, self.stream)?;
@@ -2129,7 +2129,7 @@ impl<'a> MimoEngine<'a> {
                     // exchange worker; the next segment's land orders the reduce.
                     self.probe_ring(w, index, t)?;
                     pending = Some(self.wave_send(w, index, t, ExpertV2SourceKind::Decode, bf16_input,
-                        link.exchange()?)?);
+                        link.exchange()?, None)?);
                     if let Some(l2) = &self.l2 { l2.issue(self.library, index, self.stream)?; }
                 }
                 (Some(_), _) => self.moe_run(w, index, t, true)?,
@@ -2144,7 +2144,7 @@ impl<'a> MimoEngine<'a> {
     /// Rank 0's decode segment `index` (see [`Self::decode_layers`]).
     #[allow(clippy::too_many_arguments)]
     fn decode_segment(&self, index: usize, previous: Previous, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
-        tables: &StepTables, t: usize, gather: bool, head: bool, planes: [*const u16; MAX_RANKS], bf16_input: bool)
+        tables: &StepTables, t: usize, gather: bool, head: bool, reduction: Option<crate::shared::spark_waves::ReplyReduction<'_>>, bf16_input: bool)
         -> Result<()> {
         let layers = &self.weights.layers;
         let rows = Scalar::I32(t as i32);
@@ -2153,19 +2153,19 @@ impl<'a> MimoEngine<'a> {
             if gather {
                 // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
                 unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
-                    w.h.buffer.ptr, None, self.stream)? };
+                    w.h.buffer.ptr, None, crate::shared::peer_split::RankDevice { device: self.device, stream: self.stream })? };
             }
             if let Some(w1) = w1 {
                 // The embedded rows to the second GPU's residual stream.
                 self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
             }
         }
-        if let Previous::Planes(ranks) = previous {
+        if let Previous::Planes(_) = previous {
             // SAFETY: the decode transport's intake planes, the zero plane and delta are live
             // [t, h] BF16 buffers; the planes hold the wave's partials once the stream gets here.
             unsafe {
-                self.library.v41_compact_reducer()?.reduce_planes(planes, ranks as u32, w.zero_plane.buffer.ptr.cast(),
-                    w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
+                reduction.context("decode reply reduction")?.launch(self.library, w.zero_plane.buffer.ptr.cast(),
+                    w.delta.buffer.ptr.cast(), t, self.stream)?;
             }
         }
         // h += the previous layer's FFN output; x = this layer's input norm (or the final norm).
@@ -2993,7 +2993,7 @@ impl<'a> MimoEngine<'a> {
                 self.probe_ring(w, index, t)?;
                 let mut link = transport.borrow_mut();
                 let exchange = link.exchange()?;
-                let wave = self.wave_send(w, index, t, kind, bf16_input, exchange)?;
+                let wave = self.wave_send(w, index, t, kind, bf16_input, exchange, None)?;
                 if let Some(l2) = self.l2.as_ref().filter(|_| decode) { l2.issue(self.library, index, self.stream)?; }
                 self.wave_land(w, t, exchange, wave, forward)
             }
@@ -3061,7 +3061,7 @@ impl<'a> MimoEngine<'a> {
     /// posts the request once they complete. This thread does not wait for
     /// the GPU. Complete with [`Self::wave_land`].
     fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, kind: ExpertV2SourceKind, bf16_input: bool,
-        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
             if bf16_input { h * 2 } else { h + h / 32 })?;
@@ -3069,9 +3069,15 @@ impl<'a> MimoEngine<'a> {
         ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
         // SAFETY: ids, weights and input rows hold this wave's `t` rows in
         // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
         unsafe {
-            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
-                Box::new(move |routes, wire| mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)))
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream, combined_reply,
+                Box::new(move |routes, wire| {
+                    let mut request = mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
+                    Ok(request)
+                }))
         }
     }
 

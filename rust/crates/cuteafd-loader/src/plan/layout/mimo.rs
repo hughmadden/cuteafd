@@ -9,15 +9,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
     // MiMo's external chunk is independent of the shared live-slot arena.
     let external_span = options.prefill_span_rows.take().unwrap_or(16384);
-    let selected = super::resolve_prefill(report, options, spark_ranks,
+    let selected = super::resolve_prefill(input, report, options, spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits::default());
     options.prefill_span_rows = Some(external_span);
     if let Err(error) = selected { return unsupported_prefill(report, error); }
     report.prefill_span_rows = Some(external_span);
-    let shape = Shape::resolve(report, model, options,
+    let shape = Shape::resolve(input, report, model, options,
         ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
     let (concurrency, context, manifest) = (shape.concurrency, shape.context_tokens,
-        shape.manifest.as_ref());
+        shape.manifest.as_deref());
     let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let mut notes = vec![format!("resolved context {context} tokens"), "MiMo attention placement heads".into()];
@@ -256,7 +256,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let mut runtime = Vec::new();
     for rank in 0..ranks {
         let mut additional = Vec::new();
-        additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks)?);
+        additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks, options.resolved_spark_reply_format(false))?);
         if rank == 0 {
             additional.extend(sampling_reservations(cfg.vocab_size)?);
             if let Some(draft) = &draft {
@@ -488,7 +488,7 @@ mod tests {
                         let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.prefix_entries("mimo_v2"), mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
                         let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
                         let runtime = (0..ranks).map(|rank| {
-                            let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4).unwrap();
+                            let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4, cuteafd_core::SparkReplyFormat::Bf16).unwrap();
                             if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
                             additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
                                 decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());

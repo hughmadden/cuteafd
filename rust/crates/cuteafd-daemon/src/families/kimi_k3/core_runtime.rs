@@ -79,7 +79,7 @@ pub(crate) struct CorePrograms<'a> {
     grouped:BTreeMap<(usize,usize,usize,String),GroupedTrellis<'a>>,
     /// Diagnostic only: false forces the four standalone launches (bitwise A/B).
     grouped_enabled:std::cell::Cell<bool>,
-    pub layouts:[Option<ProjectionLayout>;2],
+    pub layouts:Vec<Option<ProjectionLayout>>,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
     pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,
@@ -90,18 +90,26 @@ impl<'a> CorePrograms<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
         inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize,
         cache_format:cuteafd_core::MlaCacheFormat)->Result<Option<Self>> {
+        Self::load_for_ranks(programs, cfg, inventory, rows, cache_format, 2)
+    }
+
+    pub(crate) fn load_for_ranks(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
+        inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize,
+        cache_format:cuteafd_core::MlaCacheFormat,ranks:usize)->Result<Option<Self>> {
         use cuteafd_loader::placement::{LayerMode,FfnMode};
+        ensure!(matches!(ranks,1|2),"Kimi K6 physical rank count");
         inventory.validate_runtime_groups(cfg)?;
         if inventory.projections.is_empty() {return Ok(None);}
         let mut projections=BTreeMap::new();
         let mut grouped=BTreeMap::new();
         let mut layout:Option<ProjectionLayout>=None;
         for layer in 0..cfg.layers {
-            let modes=if cfg.attention[layer]==cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
+            let modes=if ranks==1 {vec![LayerMode::Whole{gpu:0,ffn:FfnMode::Owner}]}
+            else if cfg.attention[layer]==cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
                 vec![LayerMode::HeadSplit,LayerMode::Whole{gpu:0,ffn:FfnMode::Split}]
             } else {vec![LayerMode::HeadSplit]};
             for mode in modes {
-                for rank in super::weights::LayerLayout::pair_with_core(cfg,layer,mode,inventory)? {
+                for rank in super::weights::LayerLayout::ranks_with_core(cfg,layer,mode,inventory,ranks)? {
                     for weight in rank.core_layouts() {
                         let key=projection_key(weight.shape,weight.side,weight.codebook);
                         if projections.contains_key(&key) {continue;}
@@ -119,29 +127,31 @@ impl<'a> CorePrograms<'a> {
                 }
             }
         }
-        let mut layouts=[layout.clone(),layout];
+        let mut layouts=vec![layout;ranks];
+        let head_rank=ranks-1;
         if let Some(head)=inventory.get_weight("language_model.lm_head") {
             let weight=CoreWeightLayout::new(head,
                 cuteafd_loader::formats::dense_trellis::TrellisSide::Output,0,1)?;
             let key=projection_key(weight.shape,weight.side,weight.codebook);
             let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows.min(64),TrellisDType::F32)?;
             let mut required=ProjectionLayout::new(&projection.program,rows.min(64))?;
-            if let Some(layout)=&mut layouts[1] {
+            if let Some(layout)=&mut layouts[head_rank] {
                 // Only a body owner also serves full-capacity layer projections.
                 required.rows=layout.rows;
                 layout.merge(&required)?;
-            }else{layouts[1]=Some(required);}
+            }else{layouts[head_rank]=Some(required);}
             projections.insert(key,projection);
         }
-        let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch(cfg,inventory,rows,
-            programs.family_metadata("dense_trellis_k6")?)?;
-        for rank in 0..2 {
+        let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch_for_ranks(cfg,inventory,rows,
+            programs.family_metadata("dense_trellis_k6")?,ranks)?;
+        for rank in 0..ranks {
             ensure!(layouts[rank].as_ref().map(|p|(&p.extents,p.rows))
                 ==planned[rank].as_ref().map(|p|(&p.extents,p.rows)),
                 "K6 runtime/planner rank {rank} scratch differs");
         }
-        let kda=[KimiKdaCore::load(programs,"kda_core_h48_m64",64,true)?,
-            KimiKdaCore::load(programs,"kda_core_h48_m4096",4096,false)?];
+        let heads=cfg.kda_heads/ranks;
+        let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m64"),64,true)?,
+            KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m4096"),4096,false)?];
         let mut mla=BTreeMap::new();
         for heads in [48,96] {for stride in [576,640] {for capacity in [64,4096] {
             let names=[format!("mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
@@ -149,7 +159,7 @@ impl<'a> CorePrograms<'a> {
             mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
-        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
+        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
             copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }
@@ -215,11 +225,14 @@ mod runtime_layout_tests {
         let checkpoint=Checkpoint::open(dir.path())?;
         let cfg=KimiK3Config::from_hf(&checkpoint.config)?;
         let inventory=cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?;
+        for ranks in [1, 2] {
         let mut geometries=BTreeMap::new();
         for layer in 0..cfg.layers {
-            for mode in [LayerMode::HeadSplit,LayerMode::Whole{gpu:0,ffn:FfnMode::Split}] {
-                if cfg.attention[layer]==KimiAttention::Kda && mode!=LayerMode::HeadSplit {continue;}
-                for rank in LayerLayout::pair_with_core(&cfg,layer,mode,&inventory)? {
+            let modes = if ranks == 1 { vec![LayerMode::Whole{gpu:0,ffn:FfnMode::Owner}] }
+                else { vec![LayerMode::HeadSplit,LayerMode::Whole{gpu:0,ffn:FfnMode::Split}] };
+            for mode in modes {
+                if ranks == 2 && cfg.attention[layer]==KimiAttention::Kda && mode!=LayerMode::HeadSplit {continue;}
+                for rank in LayerLayout::ranks_with_core(&cfg,layer,mode,&inventory,ranks)? {
                     for weight in rank.core_layouts() {
                         let projection=&inventory.projections[&weight.stem];
                         // Local native allocations contain only compressed payload and vectors.
@@ -239,7 +252,9 @@ mod runtime_layout_tests {
             "scratch_bytes_at_capacity":{"scratch":bytes}}));
         for capacity in [64,4096] {
             program(format!("kimik3_kda_m{capacity}"),1024);
+            program(format!("kda_fused_h96_m{capacity}"),1536);
             program(format!("kda_core_h48_m{capacity}"),2048);
+            program(format!("kda_core_h96_m{capacity}"),3072);
             for heads in [48,96] {
                 let suffix=if heads==48 {""}else{"_h96"};
                 program(format!("kimik3_mla_producer{suffix}_m{capacity}"),4096);
@@ -259,13 +274,13 @@ mod runtime_layout_tests {
             for on in [false,true] {
                 let empty=CoreInventory::default();
                 let core=if on {&inventory}else{&empty};
-                let charged=CoreCharges::from_package(&cfg,core,rows,unit,&manifest)?;
-                let expected_stages=if on {core::lane_extents(rows,unit,1024,4096,2048,2048)?}else{BTreeMap::new()};
-                for rank in 0..2 {
+                let charged=CoreCharges::from_package_for_ranks(&cfg,core,rows,unit,&manifest,ranks)?;
+                let expected_stages=if on {core::lane_extents_for_ranks(rows,unit,if ranks==1 {1536}else{1024},4096,if ranks==1 {3072}else{2048},2048,ranks)?}else{BTreeMap::new()};
+                for rank in 0..ranks {
                     let mut runtime:Option<ProjectionLayout>=None;
                     if on {
                         for ((k,n,side,_),()) in &geometries {
-                            if *n==cfg.vocab_size && rank==0 {continue;}
+                            if *n==cfg.vocab_size && rank!=ranks-1 {continue;}
                             let live=if *n==cfg.vocab_size {unit.min(64)}else{unit};
                             let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
                                 input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
@@ -276,16 +291,18 @@ mod runtime_layout_tests {
                         }
                     }
                     assert_eq!(charged.projection[rank].as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
-                    assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false)?[0].bytes as usize
-                        -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
+                    let receive = if ranks == 2 {core::exchange_recv_bytes(unit)?}else{0};
+                    assert_eq!(charged.receive, receive);
+                    assert!(charged.demands()?.iter().all(|d| usize::from(d.gpu)<ranks));
+                    assert_eq!(charged.projection.len(), ranks);
                     assert_eq!(charged.stages,expected_stages);
                     let sum=charged.demands()?.iter().filter(|d|usize::from(d.gpu)==rank).map(|d|d.bytes).sum::<u64>();
                     assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
                         +charged.stage_bytes as u64+charged.receive as u64);
                 }
                 if on {
-                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows, unit,
-                        1_048_576, cuteafd_loader::families::kimi_k3::allocation::NativeScratch::from_manifest(&manifest)?)?;
+                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(&cfg, rows, unit,
+                        1_048_576, cuteafd_loader::families::kimi_k3::allocation::NativeScratch::from_manifest_for_ranks(&manifest,ranks)?,ranks)?;
                     assert_eq!(charged.stage_bytes, base.clone().with_core_stages(expected_stages)?.bytes()? - base.bytes()?);
                 }
             }
@@ -294,7 +311,8 @@ mod runtime_layout_tests {
         let mut duplicate=manifest.clone();
         let first=duplicate["families"]["dense_trellis_k6"]["row_policies"][0].clone();
         duplicate["families"]["dense_trellis_k6"]["row_policies"].as_array_mut().unwrap().push(first);
-        assert!(CoreCharges::from_package(&cfg,&inventory,64,64,&duplicate).is_err());
+        assert!(CoreCharges::from_package_for_ranks(&cfg,&inventory,64,64,&duplicate,ranks).is_err());
+        }
         Ok(())
     }
 

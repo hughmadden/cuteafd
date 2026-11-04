@@ -48,6 +48,7 @@ impl<'w,'a> RoutedWave<'w,'a> {
             shared:Allocation::new(device,capacity as usize*10240)?,owner,stage,capacity})
     }
     pub fn stream(&self)->*mut c_void {self.stream.raw}
+    pub fn peer_stream(&self)->Rc<Stream<'a>> {self.pair.peer_stream()}
     pub fn synchronize(&self)->Result<()> {let root=self.stream.drain();let peer=self.pair.drain_peer();root.and(peer)}
     pub fn inputs(&self)->[CuteafdDeviceBuffer;3] {self.inputs.each_ref().map(|a|a.buffer)}
     pub fn output(&self)->CuteafdDeviceBuffer {self.pair.output()}

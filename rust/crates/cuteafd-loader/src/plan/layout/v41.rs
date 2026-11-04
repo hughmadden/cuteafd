@@ -22,8 +22,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // Units, waves and span come from the shared prefill policy and the
     // descriptor (two units in flight, one target pass per slot).
     let limits = crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41);
-    let prefill = super::resolve_prefill(report, options, report.placement.spark_ranks(), limits)?;
-    let mut shape = Shape::resolve(report, model, options, ShapePolicy {
+    let prefill = super::resolve_prefill(input, report, options, report.placement.spark_ranks(), limits)?;
+    let mut shape = Shape::resolve(input, report, model, options, ShapePolicy {
         context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
     });
     shape.prefill_rows = prefill.unit_rows;
@@ -40,6 +40,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let turns = if options.host_cache_bytes != Some(0) && marks > 0 { options.prefix_entries("deepseek_v41") }
         else { marks.saturating_sub(2) / 2 };
     let dspark = shape.native_layers > 0;
+    ensure!(!options.tp2_dspark_experts || (ranks == 2 && dspark),
+        "--tp2-dspark-experts requires two RTX GPUs and dSpark");
     ensure!(!dspark || shape.native_layers == 3, "V4.1 dSpark retains all three stages");
     let manifest = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
@@ -89,7 +91,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let spark_ranks = report.placement.spark_ranks();
     // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
-    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots)? } else { 0 };
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots, options.resolved_spark_reply_format(false))? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",
@@ -100,8 +102,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let catalog = input.expert_catalog()?;
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
         v41::owners::DECODE_LANE_ROWS)?;
-    ensure!(!options.tp2_dspark_experts || (dspark && ranks == 2),
-        "--tp2-dspark-experts needs the dSpark drafter and two RTX GPUs");
     let draft = if dspark {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
@@ -110,14 +110,29 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
         let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
-        let draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
+        let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
             loader_peak: [bytes, 0], ..Default::default() };
-        Some(if options.tp2_dspark_experts {
-            let waves = programs.dspark_tp2_expert_waves(&manifest, shape.concurrency, width)?;
-            tp2_dspark_experts(draft, catalog, waves)?
-        } else { draft })
+        if options.tp2_dspark_experts {
+            let halves = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"))
+                .context("missing V4.1 TP2 dSpark allocation manifest")?)?;
+            draft.runtime = programs.dspark_tp2(&manifest, &halves, rows, shape.concurrency, width, mode)?;
+            let resident = if catalog.mxfp4_scale_codes() {
+                native_expert_bytes(128, 5120, 1152)
+            } else { v41::resident_bytes(5120, 1152, 128, false)? } * 3;
+            let full = if catalog.mxfp4_scale_codes() {
+                native_expert_bytes(128, 5120, 2304)
+            } else { v41::resident_bytes(5120, 2304, 128, false)? } * 3;
+            draft.resident = bytes.checked_sub(full).context("V4.1 draft resident underflow")? + resident;
+            draft.peer_half = resident;
+            let peer_staging = catalog.expert_staging(crate::V41ExpertSelection::DsparkTp2 {
+                stage: 0, expert: 0, rank: 0 })?.staging_bytes() as u64;
+            draft.staging = [staging, peer_staging];
+            draft.loading_experts = [resident; 2];
+            draft.loader_peak = [draft.resident.max(resident + staging), resident + peer_staging];
+        }
+        Some(draft)
     } else { None };
     // `--pool-tokens` 0 or omitted: automatic (a 97% admission ceiling plus
     // the growth reserve), as the flag documents; only a positive count pins the pool.
@@ -151,6 +166,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let routed = catalog.routed_experts();
     let tier = v41::TierChoice { setting: options.expert_tier, profile: options.expert_tier_profile.clone(),
         model: options.expert_tier_model };
+    // Serving reduces the tier's result as one more BF16 plane, which the
+    // fused compressed-reply codec does not take.
+    ensure!(!options.expert_tier.enabled()
+        || options.resolved_spark_reply_format(false) == cuteafd_core::SparkReplyFormat::Bf16,
+        "--gpu-expert-tier needs BF16 Spark replies: the fused compressed-reply reduction has no GPU expert tier plane");
     let tier_inputs = tier.inputs(routed.routed_layers(), routed.experts, routed.topk as u32)?;
     let onboard = if spark_ranks == 0 { Onboard::Layers(routed.routed_layers()) } else {
         options.resolve_onboard(routed.routed_layers()).unwrap_or(Onboard::Auto)
@@ -261,25 +281,6 @@ fn solve_with_weight_limit(request: &placement::PlacementRequest, draft: Option<
     limit: u64) -> Result<placement::Placement> {
     let fixed = v41::fixed_weight_bytes(&request.fixed, draft, request.inventory.gpus.len())?;
     v41::solve_with_weight_limit(request, &fixed, limit)
-}
-
-/// `--tp2-dspark-experts`: dSpark's 3 x 128 routed experts as TP2 halves in the
-/// coded-scale layout. The drafter's GPU keeps one half beside its auxiliary
-/// weights, GPU0 holds the other with its own load staging and expert waves
-/// (`waves`), and each loads its half before anything else.
-fn tp2_dspark_experts(draft: DraftInventory, catalog: &crate::OfficialV41Catalog, waves: u64)
-    -> Result<DraftInventory> {
-    let whole = 3 * native_expert_bytes(128, 5120, 2304);
-    let half = 3 * native_expert_bytes(128, 5120, 2304 / 2);
-    let staging = |rank| (0..3).try_fold(0u64, |largest, stage| Ok::<_, anyhow::Error>(largest.max(catalog
-        .expert_staging(crate::V41ExpertSelection::DsparkTp2 { stage, expert: 0, rank })?.staging_bytes() as u64)));
-    let (home, peer) = (staging(1)?, staging(0)?);
-    let resident = draft.resident.checked_sub(whole).and_then(|bytes| bytes.checked_add(half))
-        .context("V4.1 dSpark TP2 residency")?;
-    let mut runtime = draft.runtime;
-    runtime.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert waves", waves, Basis::Estimated));
-    Ok(DraftInventory { resident, runtime, marks: draft.marks, peer_half: half, staging: [home, peer],
-        loading_experts: [half, half], loader_peak: [resident, half + peer] })
 }
 
 /// Plan notes: resident experts per routed layer, and the expert time the step

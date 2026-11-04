@@ -20,6 +20,8 @@ mod shared {
     pub(crate) mod packed_head;
     pub(crate) mod target_head;
     pub(crate) mod experts {
+        pub(crate) mod layer;
+        pub(crate) mod paired_load;
         pub(crate) mod rtx {
             pub(crate) mod dense;
             // The query fixture has no push receiver, only dense plan records.

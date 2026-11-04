@@ -115,6 +115,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)]
+    loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     token_io: TokenIoArgs,
     #[command(flatten)]
     api: crate::shared::api::ApiArgs,
@@ -295,7 +297,7 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
-    let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
+    let mut inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         full_prefill_logits: args.full_prefill_logits,
@@ -499,7 +501,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let drafts = if args.mtp == 0 { scheduler::Drafts::None }
             else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
         scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts,
-            eos, args.decode_share, &args.prefix, args.token_io.token_select, &mut text_media(), None,
+            eos, args.decode_share, &args.prefix, args.loop_abort.config(), args.token_io.token_select,
+            &mut text_media(), None,
             || initialized(backend.geometry().max_context))
     })
 }
@@ -700,7 +703,7 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs {
+        let mut inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },

@@ -1,7 +1,7 @@
 //! Muse Spark chat: the checkpoint's own template and its recipient-addressed
 //! message stream (`<|start|>assistant to=RECIPIENT<|message|>…<|eom|>`).
 //!
-//! The prompt ends at `<|start|>assistant`, so generation begins with the
+//! With thinking on the prompt ends at `<|start|>assistant`, so generation begins with the
 //! first message's ` to=RECIPIENT` header. Each message ends with `<|eom|>`
 //! (the turn continues: another header follows) or `<|eot|>` (the turn ends,
 //! a stop token). Recipients: `self` is private reasoning, `commentary` and
@@ -84,7 +84,15 @@ impl MuseEncoding {
 
     pub fn render(&self, body: &Value, options: &MusePromptOptions) -> Result<String, String> {
         let context = prompt::template_context(body, options, &self.bos_token)?;
-        self.template.render(&context).map_err(|error| format!("Muse chat template: {error:#}"))
+        let mut rendered = self.template.render(&context).map_err(|error| format!("Muse chat template: {error:#}"))?;
+        if !super::glm5::prompt::resolve_thinking(body)? {
+            if !rendered.ends_with("<|start|>assistant") {
+                return Err("Muse chat template did not leave an assistant generation header to pre-fill".into());
+            }
+            // Final assistant history uses to=user and ends in <|eot|> in the checkpoint.
+            rendered.push_str(" to=user<|message|>");
+        }
+        Ok(rendered)
     }
 
     /// The checkpoint's EOS ids (`<|eot|>` ends the assistant turn).

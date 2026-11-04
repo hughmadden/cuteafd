@@ -2,12 +2,12 @@
 //!
 //! The owner quantizes the rows once; both GPUs run their expert halves; the
 //! owner reduces. Rows cross between the GPUs in one of two ways:
-//! - pull (default): the peer's SMs read the owner's encoded inputs after a
-//!   cross-device event, and the owner's SMs read the peer's routes after
-//!   another;
-//! - push ([`Pair::enable_push`]): the GPU that produced the rows writes them
+//! - events (default): the peer's SMs read the owner's encoded inputs after a
+//!   cross-device event and write their routes into the owner's buffer; the
+//!   join event orders those writes before the owner's reduce;
+//! - push ([`Pair::enable_push`]): the GPU that produced each plane writes it
 //!   into the other GPU's buffer on its own stream and publishes a device
-//!   flag, which the consumer's stream waits on.
+//!   flag, which the consumer's stream waits on (no peer reads at all).
 //!
 //! Either way the events still fork the peer stream from the owner's and join
 //! it back, so a capture of the owner stream takes the peer branch with it.
@@ -41,7 +41,7 @@ pub(crate) fn padded(bytes: usize) -> usize { bytes.next_multiple_of(16) }
 pub(crate) struct Pair<'a> {
     // External root stream and its graphs must be drained/destroyed by caller
     // first. Our peer stream drains before any of its referenced allocations.
-    peer: Stream<'a>,
+    peer: Rc<Stream<'a>>,
     /// `enable_push`: flags of the pushed exchange (ranks [`OWNER`], [`PEER`]).
     push: Option<PeerExchange<'a>>,
     /// Set from a pushing enqueue's first push until its last wait is
@@ -55,7 +55,7 @@ pub(crate) struct Pair<'a> {
     peer_inputs: [Allocation<'a>; 3],
     peer_output: Allocation<'a>,
     output: Allocation<'a>,
-    copies: [V41PeerCopy<'a>; 2],
+    copy: V41PeerCopy<'a>,
     quantizer: V41ExpertInputQuantizer<'a>,
     reducer: V41RouteReducer<'a>,
     owner: Device<'a>,
@@ -93,10 +93,7 @@ impl<'a> Pair<'a> {
         for (rank, device) in devices.iter().enumerate() {
             device.run(|| device.library.cuda_enable_peer(devices[1 - rank].id))?;
         }
-        let copies = [
-            peer.run(|| owner.library.v41_peer_copy())?,
-            owner.run(|| owner.library.v41_peer_copy())?,
-        ];
+        let copy = peer.run(|| owner.library.v41_peer_copy())?;
         let quantizer = owner.run(|| owner.library.v41_expert_input_quantizer())?;
         let reducer = owner.library.v41_route_reducer()?;
         let [left, right] = weights;
@@ -104,7 +101,7 @@ impl<'a> Pair<'a> {
         let rows = capacity as usize;
         let [wire, ids, weights] = layout.input_bytes().map(|width| padded(rows * width));
         Ok(Self {
-            peer: Stream::new(peer)?,
+            peer: Rc::new(Stream::new(peer)?),
             push: None,
             unmatched: Cell::new(false),
             ready: Event::new(owner)?,
@@ -118,7 +115,7 @@ impl<'a> Pair<'a> {
             ],
             peer_output: Allocation::new(owner, rows * layout.route_bytes())?,
             output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize)?,
-            copies,
+            copy,
             quantizer,
             reducer,
             owner,
@@ -189,7 +186,7 @@ impl<'a> Pair<'a> {
             library.cuda_event_record(self.ready.raw, stream)
         })?;
         let encoded = [self.wire.buffer, inputs[1], inputs[2]];
-        let peer_result = self.peer.device.run(|| unsafe {
+        self.peer.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.peer.raw, self.ready.raw)?;
             for ((destination, source), width) in self
                 .peer_inputs
@@ -197,7 +194,7 @@ impl<'a> Pair<'a> {
                 .zip(encoded)
                 .zip(self.layout.input_bytes())
             {
-                self.copies[0].launch(
+                self.copy.launch(
                     destination.buffer,
                     source,
                     rows as usize * width,
@@ -210,18 +207,19 @@ impl<'a> Pair<'a> {
                 self.peer_inputs.each_ref().map(|v| v.buffer),
                 self.peer.raw,
             )?;
-            library.cuda_event_record(self.done.raw, self.peer.raw)?;
-            Ok(output)
+            // Push completed FP32 routes from their producer; the owner's join
+            // covers the peer write as well as its expert kernels.
+            self.copy.launch(
+                self.peer_output.buffer,
+                output,
+                rows as usize * self.layout.route_bytes(),
+                self.peer.raw,
+            )?;
+            library.cuda_event_record(self.done.raw, self.peer.raw)
         })?;
         self.owner.run(|| unsafe {
             let local = self.ranks[self.layout.owner].enqueue(stage, rows, encoded, stream)?;
             library.cuda_stream_wait_event(stream, self.done.raw)?;
-            self.copies[1].launch(
-                self.peer_output.buffer,
-                peer_result,
-                rows as usize * self.layout.route_bytes(),
-                stream,
-            )?;
             let mut planes = [std::ptr::null(); 4];
             planes[self.layout.owner] = local.ptr.cast();
             planes[1 - self.layout.owner] = self.peer_output.buffer.ptr.cast();
@@ -309,6 +307,10 @@ impl<'a> Pair<'a> {
             )?;
             library.cuda_stream_wait_event(stream, self.done.raw)
         })
+    }
+    /// Keep the peer alive in submission guards, including before a join exists.
+    pub fn peer_stream(&self) -> Rc<Stream<'a>> {
+        Rc::clone(&self.peer)
     }
     /// Used after ending a failed capture or after root completion on error.
     pub fn drain_peer(&self) -> Result<()> {

@@ -4,6 +4,7 @@
 //! its own adapter under `layout/` (`FamilyModel::placement`), solving the
 //! same placement request its runtime admits.
 use super::{Component, ExpertPlacement, Owner, PlanReport, Status};
+use crate::serving_capacity::Exl3Epilogue;
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
 
 pub(crate) mod deepseek_v4;
@@ -29,6 +30,8 @@ pub struct LayoutOptions {
     /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
     /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
+    /// Shared requested reply policy. Omission preserves Muse NVFP4/combined BF16.
+    pub spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
     /// None selects min(8 GiB, 5% host total) when a supported media tower is loaded.
     pub media_cache_bytes: Option<u64>,
     /// Deterministic host/cgroup sample for offline inventory tests.
@@ -120,10 +123,8 @@ pub struct LayoutOptions {
     pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
     /// Muse Spark's DFlash2 drafter (opt-in), charged from its own config on the head GPU.
     pub muse_drafter_snapshot: Option<std::path::PathBuf>,
-    /// Muse Spark's partial-reply cutoff and wide format (serve-muse's
-    /// `--expert-partial-bf16-max-rows` / `--expert-partial-wide-format`).
+    /// Muse Spark's lossless partial-reply cutoff (`--expert-partial-bf16-max-rows`).
     pub muse_partial_bf16_max_rows: usize,
-    pub muse_partial_wide_format: crate::families::muse_spark::replies::WideFormat,
     pub kimi_draft_fp8: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
@@ -152,6 +153,8 @@ pub struct LayoutOptions {
     pub draft_sequences: Option<u64>,
     /// V4.1 configured proposal limit; loaded neural width is five or seven.
     pub dspark_draft_limit: u8,
+    /// V4.1 native dSpark expert halves on both coordinator GPUs.
+    pub tp2_dspark_experts: bool,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -194,10 +197,6 @@ pub struct LayoutOptions {
     /// Per-layer pool rates the tier's residency minimises the predicted
     /// step time with (default: measured on a 48 GB pair and four Sparks).
     pub expert_tier_model: crate::placement::TierStepModel,
-    /// `--tp2-dspark-experts` (V4.1, two RTX): dSpark's routed draft experts as
-    /// TP2 halves on both GPUs, as serving's switch loads them, instead of
-    /// whole on the drafter's GPU.
-    pub tp2_dspark_experts: bool,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
     /// GLM Flash KDA partials and their peer payloads use FP32.
@@ -209,13 +208,13 @@ pub struct LayoutOptions {
 }
 
 impl LayoutOptions {
+    pub fn resolved_spark_reply_format(&self, partial: bool) -> cuteafd_core::SparkReplyFormat {
+        cuteafd_core::SparkReplyFormat::resolve(self.spark_reply_format, partial)
+    }
+
     pub fn resolved_concurrency(&self, family: &str) -> u64 {
         if self.concurrency > 0 { return self.concurrency; }
         match family {
-            "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
-            // Mistral Large 4 runs the GLM 5.3 engine.
-            "glm5" | "mistral_large4" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
-            "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "qwen3_5" => 4,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
@@ -255,6 +254,7 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             host_cache_bytes: None,
+            spark_reply_format: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,
             host_memory: None,
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
@@ -299,7 +299,6 @@ impl Default for LayoutOptions {
             kimi_drafter_snapshot: None,
             muse_drafter_snapshot: None,
             muse_partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-            muse_partial_wide_format: Default::default(),
             kimi_draft_fp8: false,
             mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
@@ -315,6 +314,7 @@ impl Default for LayoutOptions {
             mimo_expert_input: Default::default(),
             draft_sequences: None,
             dspark_draft_limit: 5,
+            tp2_dspark_experts: false,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,
@@ -334,7 +334,6 @@ impl Default for LayoutOptions {
             expert_tier: Default::default(),
             expert_tier_profile: None,
             expert_tier_model: crate::placement::TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS,
-            tp2_dspark_experts: false,
             exchange_f32: false,
             glmf_kda_fp32_partials: false,
             workspace_manifest: None,
@@ -561,7 +560,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 2560, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         let wire_routes = 4096 * (2560 + 2560 / 32 + 8 * 10);
         assert_eq!(retained + wire_routes, 674_287_636);
         for rows in [64, 2048, 2752, 4096] {
@@ -588,7 +587,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 4096, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         assert_eq!(retained, 567_814_976);
         let slot = retained + 4096 * (4096 + 4096 / 32 + 8 * 8);
         assert_eq!(slot, 585_378_624);
@@ -617,7 +616,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 3584, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         let slot = retained + 4096 * (3584 + 3584 / 32 + 8 * 16);
         assert_eq!(slot, 844_696_852);
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
@@ -724,14 +723,31 @@ mod draft_prefix_tests {
         let mut options = LayoutOptions { rtx_bytes: vec![96 << 30], prefill_rows: 2752,
             prefill_unit_rows: Some(2752), prefill_waves: 3, ..Default::default() };
         report.prefill_span_rows = Some(8256);
-        let shape = Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
+        let shape = Shape::resolve(&input, &mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(shape.prefill_rows, 2752);
         assert_eq!(report.prefill_span_rows, Some(8256));
         report.prefill_span_rows = None;
         options.prefill_rows = 4096;
-        Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
+        Shape::resolve(&input, &mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(report.prefill_span_rows, Some(4096));
         Ok(())
+    }
+
+    #[test]
+    fn shared_concurrency_matches_launcher_capacity_for_every_moe_family() {
+        for family in ["glm5_flash", "glm5", "mistral_large4", "mimo_v2", "deepseek_v4",
+            "deepseek_v41", "kimi_k3", "qwen4", "step5", "muse_spark"] {
+            for bytes in [30 << 30, 32 << 30, 96 << 30] {
+                let mut options = LayoutOptions { rtx_bytes: vec![bytes; 2], ..Default::default() };
+                let boot = cuteafd_core::serving_capacity::default_concurrency(bytes);
+                assert_eq!(options.resolved_concurrency(family), boot, "{family}");
+                assert_eq!(options.resolved_state_slots(family), cuteafd_core::concurrency::state_slots(boot));
+                assert_eq!(options.prefix_entries(family), cuteafd_core::concurrency::prefix_entries(boot));
+                options.concurrency = 32;
+                assert_eq!(options.resolved_concurrency(family), 32);
+                assert_eq!(options.resolved_state_slots(family), 32);
+            }
+        }
     }
 
     #[test]
@@ -761,7 +777,9 @@ mod draft_prefix_tests {
         use crate::plan::{self, testing, ExpertPlacement, PlanOptions};
         let target = tempfile::tempdir()?;
         testing::write_kimi_snapshot(target.path(), true);
-        let checkpoint = super::super::Checkpoint::open(target.path())?;
+        let input = super::super::PlanInput::open(target.path())?;
+        let checkpoint = input.checkpoint();
+        let model = input.family_model()?;
         let draft = tempfile::tempdir()?;
         let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
             "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
@@ -788,17 +806,17 @@ mod draft_prefix_tests {
                 placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
                 ..Default::default()
             })?;
-            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
             assert_eq!(context, crate::families::kimi_k3::DEFAULT_CONTEXT as u64);
             assert_eq!(concurrency, 2);
             assert_eq!(base.page_bytes, 24 * 64 * format.record_bytes() as u64);
             options.kimi_drafter_snapshot = Some(draft.path().to_path_buf());
-            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
             assert_eq!(with_draft.mark_bytes - base.mark_bytes, 4 * 4160 * format.record_bytes() as u64);
             assert_eq!(with_draft.page_bytes, base.page_bytes);
             for context in [262_144, 524_288, 1_048_576] {
                 options.context_tokens = context;
-                let (_, selected, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+                let (_, selected, _) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
                 assert_eq!(selected, context);
             }
         }
@@ -837,14 +855,14 @@ pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error)
 /// Resolve the shared topology policy before family memory admission. Resolved
 /// fields are written back once and then consumed by workspace and transport
 /// ledgers; the manifest's arena capacity is never an implicit row override.
-pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
+pub fn resolve_prefill(input: &super::PlanInput, report: &mut PlanReport, options: &mut LayoutOptions,
     spark_ranks: usize, mut limits: crate::serving_capacity::prefill_waves::PrefillLimits)
     -> anyhow::Result<crate::serving_capacity::prefill_waves::PrefillPlan> {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
     let manifest_path = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     if manifest_path.is_file() {
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        let manifest = input.manifest(manifest_path)?;
         if let Some(rows) = manifest["capacities"]["prefill_rows"].as_u64() {
             limits.max_unit_rows = limits.max_unit_rows.min(rows);
         }
@@ -891,7 +909,7 @@ impl ShapePolicy {
 #[derive(Debug, Clone)]
 pub struct Shape {
     /// The program manifest (`--workspace-manifest`, else the image's).
-    pub manifest: Option<serde_json::Value>,
+    pub manifest: Option<std::sync::Arc<serde_json::Value>>,
     pub prefill_rows: u64,
     pub decode_rows: u64,
     pub concurrency: u64,
@@ -903,7 +921,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn resolve(report: &mut PlanReport, model: &dyn super::FamilyModel, options: &mut LayoutOptions,
+    pub fn resolve(input: &super::PlanInput, report: &mut PlanReport, model: &dyn super::FamilyModel, options: &mut LayoutOptions,
         policy: ShapePolicy) -> Self {
         let discovered = match model.spec().speculator.as_ref() {
             Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
@@ -917,8 +935,7 @@ impl Shape {
         let manifest = options.workspace_manifest.as_deref().or_else(|| {
             let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
             path.is_file().then_some(path)
-        }).and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        }).and_then(|path| input.manifest(path).ok());
         let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
@@ -933,7 +950,7 @@ impl Shape {
         let checkpoint_context = report.cache_requirements.as_ref()
             .and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
         let context_tokens = resolved_context(policy.context, options.context_tokens, checkpoint_context,
-            manifest.as_ref());
+            manifest.as_deref());
         Self { manifest, prefill_rows, decode_rows, concurrency, checkpoint_context, context_tokens, native_layers }
     }
 
@@ -943,7 +960,7 @@ impl Shape {
         if let Some(manifest) = self.manifest.as_mut() {
             let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                 options.coordinator_arch, options.rtx_bytes[0]).sms);
-            if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(manifest, sms) {
+            if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(std::sync::Arc::make_mut(manifest), sms) {
                 report.placement_supported = false;
                 notes.push(error.to_string());
             }
@@ -1213,7 +1230,7 @@ pub(crate) fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyMod
     if manifests.iter().any(|m| m["hidden"].as_u64() != Some(model.spec().hidden as u64)
         || m["intermediate"].as_u64() != Some(moe.intermediate as u64)
         || m["experts"].as_u64() != Some(moe.experts as u64)) { return None; }
-    crate::serving_capacity::exl3_workspace_bytes(&manifests, true).ok()?
+    crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).ok()?
         .checked_add(maximum * model.spec().hidden as u64 * 2)
 }
 
@@ -1467,12 +1484,12 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
 }
 
 /// Resolve the serving representation, not the inventory's target-only defaults.
-fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
+fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint,
+    model: &dyn super::FamilyModel, input: &super::PlanInput)
     -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
     use anyhow::{Context, ensure};
     use crate::serving_capacity::{CacheOptions, KvPlacement};
     let family = super::family::detect(checkpoint).context("missing host cache family")?;
-    let model = family.open(checkpoint)?;
     let id = family.id();
     let policy = ShapePolicy {
         context: if matches!(id, "mimo_v2" | "deepseek_v41") { ContextPolicy::Checkpoint }
@@ -1481,7 +1498,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         all_native_stages: id == "deepseek_v4",
     };
     let admitted_rows = report.prefill_span_rows;
-    let shape = Shape::resolve(report, model.as_ref(), &mut options.clone(), policy);
+    let shape = Shape::resolve(input, report, model, &mut options.clone(), policy);
     report.prefill_span_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
@@ -1523,11 +1540,10 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
     let mut context = shape.context_tokens;
+    if options.context_tokens == 0 {
+        context = model.default_context_tokens().unwrap_or(context);
+    }
     if id == "kimi_k3" {
-        if options.context_tokens == 0 {
-            context = crate::families::kimi_k3::default_context(
-                &crate::plan::families::kimi::core_inventory(checkpoint)?) as u64;
-        }
         if let Some(snapshot) = &options.kimi_drafter_snapshot {
             let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;
             let windows = draft.paged_cache_layout(1, usize::try_from(context)?,
@@ -1576,7 +1592,8 @@ pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result
     Ok(bytes)
 }
 
-pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
+pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, input: &super::PlanInput, native: bool) -> anyhow::Result<()> {
+    let checkpoint = input.checkpoint();
     use anyhow::{Context, ensure};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
@@ -1648,7 +1665,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             let prefill = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves: options.prefill_waves,
                 span_rows: unit_rows * options.prefill_waves };
             let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(options.muse_partial_bf16_max_rows,
-                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.muse_partial_wide_format)?;
+                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.resolved_spark_reply_format(true).into())?;
             let sequences = usize::try_from(options.resolved_state_slots("muse_spark"))?;
             let host = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, sequences, ranks)?;
             push(Category::Transport, "transport/rdma-rings", "registered", host.rings, Basis::Exact);
@@ -1677,8 +1694,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 let decode = options.workspace_manifest.as_deref().or_else(|| {
                     let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
                     path.is_file().then_some(path)
-                }).and_then(|path| std::fs::read(path).ok())
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                }).and_then(|path| input.manifest(path).ok())
                     .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
                 let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
                     .context("V4 decode egress geometry overflow")?.0 as u64;
@@ -1807,7 +1823,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         && report.attention_placement == crate::placement::AttentionPlacement::Heads;
     let family = family.to_owned();
     let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {
-        let resolved = selected_host_geometry(report, options, checkpoint).and_then(|(geometry, context, concurrency)| {
+        let resolved = input.family_model().map_err(anyhow::Error::from).and_then(|model|
+            selected_host_geometry(report, options, checkpoint, model, input)).and_then(|(geometry, context, concurrency)| {
             let chunk = geometry.chunk_bytes();
             let bytes = geometry.resolve(options.host_cache_bytes, context, concurrency, total, chunk)
                 .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))?;

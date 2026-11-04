@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from test_run_family_dispatch import _family_launch_result, _snapshot
+from test_run_family_dispatch import _coordinator_gpus, _family_launch_result, _snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("wip_cards_new_families", ROOT / "scripts/bench/wip-cards.py")
@@ -84,6 +84,19 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert probe < lines.index(plan)
 
 
+@pytest.mark.parametrize("gpus,split", [(1, "auto"), (1, "off"), (2, "auto"), (2, "off")])
+def test_kimi_launch_uses_only_actual_physical_owners(tmp_path: Path, gpus: int, split: str) -> None:
+    result = _kimi(tmp_path, f"RTX_GPUS={gpus}\nCOORDINATOR_SPLIT={split}\n",
+                   physical_gpus=tuple(range(gpus)))
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    owners = gpus if split != "off" else 1
+    assert _coordinator_gpus(serve) == list(range(owners))
+    assert _flag(serve, "--split-device") == ("1" if owners == 2 else None)
+    if owners == 2:
+        assert _flag(serve, "--device") == "0"
+    assert _flag(_line(result, "cuteafd plan"), "--rtx") == str(owners)
+
+
 def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     serve = _line(_kimi(tmp_path, "RTX_EXPERT_LAYERS=5\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
                                   "CONCURRENCY=8\nSPARK_DEVICE_BUDGET_BYTES=107374182400\n"),
@@ -130,6 +143,11 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     result = _kimi(tmp_path, "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
     assert _flag(_line(result, "cuteafd plan"), "--spark-budget-gib") == "100.0"
     assert "--device-budget-bytes 107374182400 " in _line(result, "cuteafd expertd-native")
+    assert _flag(_line(result, "cuteafd serve-kimi --snapshot"), "--spark-budget-gib") == "100.0"
+
+
+def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Path) -> None:
+    assert "--spark-budget-gib" not in _line(_kimi(tmp_path, ""), "cuteafd serve-kimi --snapshot")
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
@@ -139,8 +157,6 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("ATTENTION_PLACEMENT=context\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
     ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
     ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
-    ("RTX_GPUS=1\n", "TP2 attention on two RTX GPUs"),
-    ("COORDINATOR_SPLIT=off\n", "TP2 attention on two RTX GPUs"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
     ("RTX_EXPERT_LAYERS=50%\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
@@ -243,11 +259,51 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
     assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
 
 
+@pytest.mark.parametrize("recipe", ["example", "release", "gate"])
+def test_kimi_min_recipe_launches_one_physical_owner_with_automatic_admission(tmp_path: Path, recipe: str) -> None:
+    path = ROOT / "examples/configs/kimi-k3-exl3-k6-min.config"
+    values = _keys(path)
+    if recipe != "example":
+        matrix_path = ("scripts/bench/release-smoke-v4.json" if recipe == "release"
+                       else "scripts/bench/kits/gate/matrix-gate.json")
+        matrix = json.loads((ROOT / matrix_path).read_text())
+        entry = next(entry for entry in matrix["entries"] if entry["name"] == "kimi-k3-min")
+        assert entry["config"] == str(path.relative_to(ROOT))
+        assert entry["family"] == "kimi_k3" and entry["gpus"] == [0]
+        assert len(entry["sparks"]) == 6
+        values.update(matrix.get("defaults", {}).get("set", {}))
+        values.update(entry["set"])
+    assert (values["MODEL_ID"], values["MODEL_REVISION"]) == (KIMI_K6_ID, "1a28050d2954426a43a3db705e53ca120e5f2b47")
+    assert (values["RTX_GPUS"], values["COORDINATOR_GPUS"], values["SPARK_COUNT"]) == ("1", "0", "6")
+    assert values["SPARK_DEVICE_BUDGET_BYTES"] == str(110 << 30)
+    assert values["POOL_TOKENS"] == "auto" and values["SPECULATOR"] == "dflash2"
+    assert not {"RTX_EXPERT_LAYERS", "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS",
+                "MAX_CONTEXT_TOKENS", "CONCURRENCY", "COORDINATOR_GPU_BUDGET_GIB"}.intersection(values)
+    draft = values["SPECULATOR_MODEL_ID"]
+    _snapshot(tmp_path / "hf", draft, {}, revision="e77935fb4804e17eb55085bffd045eae1d779769")
+    config = "".join(f"{key}={value}\n" for key, value in values.items()
+                     if key not in ("MODEL_ID", "MODEL_REVISION"))
+    result = _family_launch_result(tmp_path, KIMI, KIMI_K6_ID, config,
+                                   extra_args=("--wip", "k3"), physical_gpus=(0,),
+                                   encoder_plan={**PLANNED, "spark_budget_bytes": 110 << 30})
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    plan = _line(result, "cuteafd plan")
+    assert _coordinator_gpus(serve) == [0] and _flag(serve, "--split-device") is None
+    assert _flag(plan, "--rtx") == "1" and _flag(plan, "--spark-ranks") == "6"
+    assert _flag(plan, "--speculator") == "dflash2" and _flag(serve, "--draft") is not None
+    assert _flag(plan, "--spark-budget-gib") == _flag(serve, "--spark-budget-gib") == "110.0"
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 6 and all(f"--device-budget-bytes {110 << 30} " in worker for worker in workers)
+
+
 # --- the gate card -------------------------------------------------------------
 
-def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None:
-    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", ["kimi-k3-max"])[0]
-    assert card["family"] == "kimi_k3" and card["gpus"] == [0, 1]
+@pytest.mark.parametrize("size,gpus", [("min", [0]), ("max", [0, 1])])
+def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path, size: str, gpus: list[int]) -> None:
+    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [f"kimi-k3-{size}"])[0]
+    assert card["family"] == "kimi_k3" and card["gpus"] == gpus
     assert card["sparks"] == ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
     assert card["profile"] == "smoke"
     assert cards.config(card["config"])["MODEL_ID"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6"
@@ -258,7 +314,12 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None
     job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path, key, {}, {"fabric"}, None, 1)
     values = cards.config(Path(job["entry"]["config"]))
     assert job["entry"]["run_args"] == ["--wip", "s"]
-    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", "2", "dflash2")
+    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", str(len(gpus)), "dflash2")
+    assert values["COORDINATOR_GPUS"] == ",".join(map(str, gpus))
+    if size == "min":
+        assert values["SPARK_DEVICE_BUDGET_BYTES"] == str(110 << 30)
+    else:
+        assert "SPARK_DEVICE_BUDGET_BYTES" not in values
     assert not any(key.endswith("_LANE_B") for key in values)
 
 
@@ -501,7 +562,7 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
     for absent in ("--max-context", "--pool-tokens", "--draft", "--mtp", "--kv-cache",
-                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--expert-partial-wide-format"):
+                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--spark-reply-format"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 6 and all("--world 6 " in worker for worker in workers)
@@ -588,18 +649,18 @@ def test_muse_generic_media_plan_handoff(tmp_path: Path, vision: str, audio: str
 
 def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     result = _muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
-                             "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"
+                             "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nSPARK_REPLY_FORMAT=fp8\n"
                              "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
     serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
     # The planner admits the same partial-reply overrides the server runs with.
     assert _flag(plan, "--expert-partial-bf16-max-rows") == "128"
-    assert _flag(plan, "--expert-partial-wide-format") == "fp8"
+    assert _flag(plan, "--spark-reply-format") == "fp8"
     assert _flag(serve, "--rtx-expert-layers") == "3"
     assert _flag(serve, "--pool-tokens") == "1048576"
     assert _flag(serve, "--max-context") == "262144"
     assert _flag(serve, "--max-sequences") == "8"
     assert _flag(serve, "--expert-partial-bf16-max-rows") == "128"
-    assert _flag(serve, "--expert-partial-wide-format") == "fp8"
+    assert "CUTEAFD_SPARK_REPLY_FORMAT=fp8" in serve
     assert _flag(serve, "--spark-budget-gib") == "100.0"
 
 
@@ -656,7 +717,7 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
     assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["POOL_TOKENS"]) == (str(len(gpus)), str(ranks), "auto")
-    assert values["VISION"] == values["AUDIO"] == "off"
+    assert values["VISION"] == values["AUDIO"] == "auto"
     assert not any(key in values for key in ("MAX_CONTEXT_TOKENS", "RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_DEVICE_BUDGET_BYTES"))
     assert not any(needle in path.read_text().lower() for needle in PRIVATE)
     _snapshot(tmp_path / "hf", values["SPECULATOR_MODEL_ID"], {}, revision=values["SPECULATOR_MODEL_REVISION"])

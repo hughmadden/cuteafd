@@ -232,10 +232,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             let initialize = plan.native.iter().enumerate().map(|(region, layout)|
                 push_initialize::Layer::Native { region, layout, scalars: 0..0 }).collect::<Vec<_>>();
             let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, plan.scratch_bytes())?);
-            return plan.native.iter().zip(&plan.layers).enumerate().map(|(region, (layout, &layer))| {
-                let selection = if plan.world == 1 {
-                    crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }
-                } else { crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank: plan.gpu } };
+            return plan.native.iter().zip(&plan.native_layers).enumerate().map(|(region, (layout, &selection))| {
                 let budget = crate::shared::experts::layer::ExpertWeights::plan(library, catalog, selection)?;
                 crate::shared::experts::layer::ExpertWeights::from_push(library, ready.clone(), region, selection,
                     layout, budget)
@@ -307,6 +304,7 @@ pub(crate) enum CoordinatorExperts {
     Tp2 { layers: Vec<usize>, budgets: Vec<usize> },
     Exlr8 { manifest: String, layers: Vec<usize>, budgets: Vec<usize> },
     Whole { owners: Vec<WholeOwner> },
+    Native { owners: Vec<WholeOwner> },
 }
 
 impl CoordinatorExperts {
@@ -316,7 +314,7 @@ impl CoordinatorExperts {
                 "coordinator TP2 budgets require two ranks"),
             Self::Exlr8 { budgets, .. } => ensure!(budgets.len() == gpus,
                 "coordinator EXLR8 budgets differ from dense ranks"),
-            Self::Whole { owners } => {
+            Self::Whole { owners } | Self::Native { owners } => {
                 ensure!(!owners.is_empty(), "whole coordinator push needs expert owners");
                 let mut ranks = std::collections::BTreeSet::new();
                 for owner in owners {
@@ -336,9 +334,12 @@ impl CoordinatorExperts {
                 *budgets.get(gpu).context("coordinator EXLR8 TP2 budget per GPU")?)?,
             Self::Tp2 { layers, budgets } => CoordinatorExpertPlan::new(catalog, layers, gpu,
                 *budgets.get(gpu).context("coordinator TP2 budget per GPU")?)?,
-            Self::Whole { owners } => {
+            Self::Whole { owners } | Self::Native { owners } => {
                 let Some(WholeOwner { selections, budget, .. }) = owners.iter().find(|owner| owner.rank == gpu)
                     else { return Ok(None) };
+                if matches!(self, Self::Native { .. }) {
+                    return CoordinatorExpertPlan::native_selected(catalog, selections, gpu, *budget).map(Some);
+                }
                 use crate::shared::experts::layer::ExpertLayer;
                 ensure!(selections.iter().all(|s| matches!(s, ExpertLayer::BackboneFull { .. } | ExpertLayer::Dspark { .. })),
                     "a whole-layer coordinator plan takes full backbone layers and draft stages");
@@ -489,6 +490,13 @@ impl CoordinatorPush {
         })?;
         push.driver = Some(AloneDriver { cancel, thread: Some(thread) });
         Ok(push)
+    }
+
+    /// Test-only: publish a plan dump's finished dense plans to the group's
+    /// coordinator rows, as `receive_with` does before the offers are sent.
+    #[cfg(test)]
+    pub(crate) fn install_dense(&mut self, plans: Vec<DensePlan>) {
+        *self.dense.lock().expect("coordinator dense slot") = Some(plans);
     }
 
     /// Receives every coordinator GPU (two: each on its own thread) while

@@ -51,6 +51,37 @@ CHECKPOINT_CONTEXTS = {
 }
 
 
+def exl3_reply_programs(max_rows):
+    """Model-shaped fused sums; expert counts and row count remain runtime bounds."""
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16TopKSumKernel
+    import torch
+
+    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8),
+              (5120, 6), (6144, 4), (6144, 8), (7168, 6))
+
+    def compile_one(width, topk, format):
+        kernel = W4A16TopKSumKernel(topk=topk, hidden_size=width,
+            element_dtype="fp16", full_rotation=True,
+            full_rotation_output_dtype="bf16", num_experts=1,
+            route_num_experts=1, use_expert_map=True, reply_format=format)
+        row_bytes = width + width // 32 if format == 1 else width // 2 + width // 16
+        return compile_program(kernel, name=f"expert_reply_exl3_h{width}_k{topk}_{format}",
+            operands=(Operand("fc2_ptr", torch.float16, f"[rows,{topk},{width}]"),
+                      Operand("output_ptr", torch.uint8, f"[rows,{row_bytes}]", "out"),
+                      Operand("topk_weights_ptr", torch.float32, f"[rows,{topk}]", align=4),
+                      Operand("route_expert_ids_ptr", torch.int32, f"[rows,{topk}]", align=4),
+                      Operand("expert_map_ptr", torch.int32, "[experts]", align=4),
+                      Operand("svh_ptr", torch.float16, f"[local_experts,{width}]")),
+            scalars=tuple(Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")),
+            key=(width, topk, format), geometry=dict(width=width, topk=topk,
+                format=format, row_bytes=row_bytes))
+
+    return [(f"exl3_h{width}_k{topk}_{format}", "expert_reply_exl3", {"max_rows": max_rows},
+             lambda w=width, k=topk, f=format: compile_one(w, k, f))
+            for width, topk in shapes for format in (1, 2)]
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -1155,7 +1186,7 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
                          "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
@@ -1165,7 +1196,7 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries not in (["exlr8"], ["expert_partial"])):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply") for g in geometries)):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -1203,6 +1234,17 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "expert_reply":
+            from b12x.moe._shared.kernels.w4a16.expert_reply import (compile_expert_reply_aot,
+                compile_expert_reply_reduce_aot)
+            manifest["families"][name] = {"fp8_block": 32, "nvfp4_block": 16}
+            for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
+                work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
+                             lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
+            work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+            work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
+                         compile_expert_reply_reduce_aot))
             continue
         if name == "expert_partial":
             from export_b12x_expert_partial_aot import programs as partial_programs

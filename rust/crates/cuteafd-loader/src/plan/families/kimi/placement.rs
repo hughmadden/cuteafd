@@ -1,4 +1,4 @@
-//! Kimi TP2 admission with checkpoint residency and shared native allocation layouts.
+//! Kimi physical-owner admission with checkpoint residency and shared native allocation layouts.
 use super::Model;
 use anyhow::Context;
 use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
@@ -7,6 +7,7 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 const GIB: u64 = 1 << 30;
 const COMPILED_CAPACITY: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
 const PAGE: u64 = 64;
+const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
     LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
@@ -15,7 +16,7 @@ const LANES: u64 = 1;
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
-    let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), limits) {
+    let prefill = match crate::plan::layout::resolve_prefill(input, report, opts, requested.spark_ranks(), limits) {
         Ok(prefill) => prefill,
         Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
     };
@@ -57,11 +58,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let experts = *model.bytes.get(&Component::RoutedExpert).unwrap_or(&0);
     let routed_layers = cfg.dense.iter().filter(|d| !**d).count() as u64;
     let layer_bytes = experts / routed_layers;
-    if gpus != 2 || !opts.head_split {
-        refusal(report, "Kimi K3 targets two coordinator GPUs with split KDA and FFNs".into(),
-            "Use --rtx 2; one RTX cannot hold 105.7 GiB of BF16 text weights.");
+    if !matches!(gpus, 1 | 2) || (gpus == 2 && !opts.head_split) {
+        refusal(report, "Kimi K3 requires one owner or two GPUs with split KDA and FFNs".into(),
+            "Use --rtx 1 or --rtx 2 with head split enabled.");
         return memory;
     }
+    let head_rank = gpus - 1;
+    let modes = if gpus == 1 { &[WHOLE][..] } else { MODES };
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
     let target_pool = opts.target_pool_tokens.max(context);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
@@ -81,8 +84,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     // Header-only diagnostics remain available without installed artifacts. An
     // explicit package or a serving image must supply a complete allocation ledger.
     let manifest = if path.is_file() {
-        match std::fs::read(path).map_err(anyhow::Error::from)
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into)) {
+        match input.manifest(path) {
             Ok(value) => Some(value),
             Err(error) => { refusal(report, format!("Kimi package inventory refused: {error:#}"),
                 "Supply the matching PROGRAMS.json through --workspace-manifest."); return memory; }
@@ -91,12 +93,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         refusal(report, "Kimi explicit workspace manifest is missing".into(), "Supply the installed PROGRAMS.json.");
         return memory;
     } else { None };
-    let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
-    let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
+    let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / gpus as u64;
+    let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / gpus as u64;
     let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-        opts.resolved_concurrency("kimi_k3"), opts.prefix_entries("kimi_k3"), 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
+        opts.resolved_concurrency("kimi_k3"), opts.prefix_entries("kimi_k3"), gpus as u64 * mark_bytes, opts.mimo_prefix_mark_bytes,
         opts.host_cache_bytes != Some(0)));
-    let mut mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+    let mut mark_demands = (0..gpus).map(|gpu| Demand::new(gpu as u8, Category::Prefix,
         "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();
     let mut fixed = Vec::new();
     for demand in &mark_demands {
@@ -109,23 +111,23 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         fixed.push(demand);
     }
     let packed = manifest.as_ref().map(|_| &model.core);
-    let globals = packed.map(|core| crate::families::kimi_k3::weight_layout::GlobalLayout::pair_with_core(cfg, core)).transpose();
+    let globals = packed.map(|core| crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, core, gpus)).transpose();
     let globals = match globals { Ok(value) => value, Err(error) => {
         refusal(report, format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
     }};
-    for gpu in 0..2u8 {
+    for gpu in 0..gpus as u8 {
         if let Some(globals) = &globals {
             fixed.push(globals[usize::from(gpu)].demand().expect("validated global extent"));
         } else {
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / 2, Basis::Exact));
+        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / gpus as u64, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
-            residency.replicated - model.frontends[1 - gpu as usize], Basis::Exact));
-        fixed.push(Demand::new(gpu, if gpu == 0 { Category::Embedding } else { Category::Weights },
-            if gpu == 0 { "token embedding" } else { "lm head" }, if gpu == 0 { embedding } else { head }, Basis::Exact));
+            residency.replicated - if gpus == 2 { model.frontends[1 - gpu as usize] } else { 0 }, Basis::Exact));
+        if gpu == 0 { fixed.push(Demand::new(gpu, Category::Embedding, "token embedding", embedding, Basis::Exact)); }
+        if usize::from(gpu) == head_rank { fixed.push(Demand::new(gpu, Category::Weights, "lm head", head, Basis::Exact)); }
         }
-        fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, 48 heads"), state, Basis::Formula));
+        fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, {} heads", cfg.kda_heads / gpus), state, Basis::Formula));
     }
-    let mut baseline = [Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }; 2];
+    let mut baseline = vec![Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }; gpus];
     let mut tp2_workspace = [0; 2];
     if let Some(manifest) = &manifest {
         let extra = (|| -> anyhow::Result<_> {
@@ -134,25 +136,26 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
-            let mut demands = allocation::baseline_demands(cfg, manifest, rows, shape, context as usize,
-                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads), ranks)?;
+            let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
+                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads),
+                ranks, gpus, opts.resolved_spark_reply_format(false))?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
-            for rank in 0..2 {
+            for rank in 0..gpus {
                 let arch = ArchContext::for_device(opts.coordinator_arch, opts.rtx_bytes[rank]);
-                let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
+                let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", gpus == 2,
                     rank as u8, arch, Some(&programs));
                 baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };
-                demands.push(allocation::code_demand(rank, code.bytes, arch.cublas_bytes, 1)?);
+                demands.push(allocation::code_demand_for_ranks(rank, code.bytes, arch.cublas_bytes, 1, gpus)?);
             }
             if !model.core.projections.is_empty() {
                 // The baseline already includes the full peer receive allocation.
-                demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, unit, manifest)?.demands()?
+                demands.extend(core::CoreCharges::from_package_for_ranks(cfg, &model.core, rows, unit, manifest, gpus)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
             }
             if opts.onboard != Some(OnboardSetting::Layers(0)) {
-                let package = allocation::expert_package(path)?;
-                tp2_workspace = [allocation::expert_workspace(&package, unit)?; 2];
+                let package = allocation::expert_package_for_ranks(path, gpus)?;
+                tp2_workspace = [allocation::expert_workspace_for_ranks_with(&package, unit, gpus, |path| input.manifest(path))?; 2];
             }
             Ok(demands)
         })();
@@ -178,13 +181,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
-            crate::families::kimi_k3::spark_reserve_bytes(admitted.waves, admitted.unit_rows)?)?;
+            crate::families::kimi_k3::spark::reserve_bytes(ranks, admitted.waves, admitted.unit_rows)?)?;
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
         for &layer in &working.spark_layers {
-            for rank in 0..2 {
-                costs[layer][rank].resident = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, rank)?
-                    .device_arena_layout()?.1 as u64;
+            for rank in 0..gpus {
+                costs[layer][rank].resident = manifest.resident_arena_bytes(crate::V41Exl3Layer::Backbone(layer), gpus, rank, false)?;
             }
         }
         Ok((spark, costs))
@@ -207,17 +209,20 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
             usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or_else(|| ArchContext::for_device(opts.coordinator_arch, u64::MAX).sms) as usize, 0, opts.mla_kv)?;
-        fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout, rows)?);
+        fixed.extend(crate::families::kimi_k3::draft_bridge_demands_for_ranks(&layout, rows, gpus)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
         // a head-only K6 scratch on the head rank.
         if let Some(manifest) = &manifest {
-            fixed.extend(crate::families::kimi_k3::core::draft_head_demand(&model.core,
-                layout.capacity().block_rows, &manifest["families"]["dense_trellis_k6"])?);
+            if let Some(mut demand) = crate::families::kimi_k3::core::draft_head_demand(&model.core,
+                layout.capacity().block_rows, &manifest["families"]["dense_trellis_k6"])? {
+                demand.gpu = head_rank as u8;
+                fixed.push(demand);
+            }
         }
         let bytes = layout.window_mark_bytes()? as u64;
         if bytes > 0 && legacy_marks > 0 {
-            let per_mark = Demand::new(1, Category::Prefix, "Kimi exact draft windows", bytes, Basis::Exact);
+            let per_mark = Demand::new(head_rank as u8, Category::Prefix, "Kimi exact draft windows", bytes, Basis::Exact);
             let mut total = per_mark.clone();
             total.bytes = bytes.checked_mul(legacy_marks).context("Kimi draft mark overflow")?;
             fixed.push(total);
@@ -240,25 +245,30 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] };
         if let Some(core) = packed {
             use crate::families::kimi_k3::weight_layout::LayerLayout;
-            let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, core)?;
-            let mut attention = [0; 2];
-            for rank in 0..2 {
-                attention[rank] = split[rank].attention_bytes()? as u64;
-                fixed.push(Demand::new(rank as u8, Category::Weights,
-                    format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                    split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+            if gpus == 1 {
+                weights = ModeBytes { whole: LayerLayout::ranks_with_core(cfg, layer, WHOLE, core, 1)?[0].bytes()? as u64,
+                    split: [0; 2] };
+            } else {
+                let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, core)?;
+                let mut attention = [0; 2];
+                for rank in 0..gpus {
+                    attention[rank] = split[rank].attention_bytes()? as u64;
+                    fixed.push(Demand::new(rank as u8, Category::Weights,
+                        format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
+                        split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+                }
+                weights = ModeBytes { split: attention, whole: if mla {
+                    LayerLayout::pair_with_core(cfg, layer, MODES[1], core)?[0].attention_bytes()? as u64
+                } else { 0 } };
             }
-            weights = ModeBytes { split: attention, whole: if mla {
-                LayerLayout::pair_with_core(cfg, layer, MODES[1], core)?[0].attention_bytes()? as u64
-            } else { 0 } };
         }
         Ok(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
             weights,
             kv_unit: KvDemand { unit_bytes_whole: if mla { record } else { 0 }, unit_bytes_split: if mla { [record; 2] } else { [0; 2] },
                 unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
-                half: costs[layer], tp2: true, spark_ok: true }), modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
+            experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: if gpus == 1 { costs[layer][0] } else { Bytes2::default() },
+                half: costs[layer], tp2: gpus == 2, spark_ok: true }), modes: if gpus == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
     }).collect() })();
     let layers = match layers { Ok(value) => value, Err(error) => {
         refusal(report, format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
@@ -268,19 +278,19 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut request = PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
-            spark_ranks: ranks, peer_access: true },
+            spark_ranks: ranks, peer_access: gpus == 2 },
         attention_placement: report.requested_attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool: PoolPolicy { compiled_context: context,
             requested: requested_pool, target: target_pool, floor: context,
             ceiling: target_pool.max(requested_pool.unwrap_or(0)), unit_rows: PAGE },
-        layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
-        expert_workspace: 0, tp2_workspace, onboard, expert_gpus: 2, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
-            attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
+        layers, pool_overhead: vec![0; gpus], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
+        expert_workspace: if gpus == 1 { tp2_workspace[0] } else { 0 }, tp2_workspace: if gpus == 2 { tp2_workspace } else { [0; 2] }, onboard, expert_gpus: gpus, minimum_expert_layers: 0,
+        policy: LayerPolicy { default: if gpus == 1 { vec![WHOLE] } else { vec![LayerMode::HeadSplit] }, ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
+            attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, if gpus == 1 { AttentionPlacement::Layers } else { AttentionPlacement::Heads })],
             ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: if manifest.is_some() { unit as u64 } else { 0 }, lanes: if manifest.is_some() { LANES } else { 0 },
-            entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated },
-        executor: ExecutorModes { family: "kimi_k3", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
+            entry_gpu: 0, head_gpu: head_rank as u8, terminal: if gpus == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } },
+        executor: ExecutorModes { family: "kimi_k3", modes, hops: gpus == 2, attention: AttentionPlacement::Layers },
     };
     if let Err(error) = spark_budget.constrain(&mut request) {
         refusal(report, format!("Kimi joint admission refused: {error:#}"),
@@ -288,7 +298,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         return memory;
     }
     let groups = request.layers.iter().map(|layer|
-        (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
+        (gpus == 2 && layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
         .collect::<Vec<_>>();
     let selected = attention::solve_owners(&groups, LayerOwnership::Ranges, request.layers_first_gpu,
         |owners| -> anyhow::Result<_> {
@@ -305,8 +315,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 settle_pool((candidate.pool.requested.unwrap_or(candidate.pool.target), ()), |tokens, _| -> anyhow::Result<_> {
                     let mut trial = candidate.clone();
                     let layout = layout.with_pool_tokens(usize::try_from(tokens)?)?;
-                    let (demand, peak) = layout.demands(1)?;
-                    trial.movables = vec![demand.movable(2)?];
+                    let (demand, peak) = layout.demands(head_rank as u8)?;
+                    trial.movables = vec![demand.movable(gpus)?];
                     trial.startup = vec![peak];
                     trial.pool.target = trial.pool.target.min(tokens);
                     trial.pool.ceiling = trial.pool.ceiling.min(tokens);
@@ -321,7 +331,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, selection.slots));
             memory.pool_tokens = placed.pool_tokens;
             report.attention_placement = placed.attention_placement;
-            for gpu in 0..2 {
+            for gpu in 0..gpus {
                 let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu], worker_budget_bytes: 0,
                     items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
                 // The solver subtracts this guard from availability, not from its item ledger.
@@ -337,7 +347,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                     categories.get(&Category::Kv).unwrap_or(&0), device.used_bytes(), opts.headroom_bytes, device.free_bytes()));
                 memory.devices.push(device);
             }
-            memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs split TP2; \
+            memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs on {gpus} physical owner(s); \
                 pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", opts.mla_kv.record_bytes() * cfg.mla_layers(),
                 cfg.mla_layers(), placed.attention_placement, placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
             let onboarded = placed.onboard_layers;
@@ -376,6 +386,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
 /// Kimi's typed owners, the same sum its pre-placement reserve charges.
 fn kimi_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
-    crate::plan::layout::spark_slots::charge_owners(device,
-        &crate::families::kimi_k3::spark_executions(waves, unit_rows)?, crate::families::kimi_k3::spark_owner_bytes)
+    crate::families::kimi_k3::spark::charge(device, working.spark_ranks,
+        &crate::families::kimi_k3::spark_executions(waves, unit_rows)?)
 }

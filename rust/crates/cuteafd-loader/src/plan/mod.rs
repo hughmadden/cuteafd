@@ -23,7 +23,7 @@ pub mod testing;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
 pub use checkpoint::Checkpoint;
@@ -510,7 +510,9 @@ impl Drop for PhaseTimer<'_> {
 }
 
 /// A checkpoint opened once, with its routed-expert catalog initialized on first use.
-/// Reuse an input when evaluating multiple layouts over the same snapshot.
+/// Reuse an input when evaluating multiple layouts over the same snapshot and
+/// installed artifact set. Manifest paths are snapshotted on first read; create a
+/// new input after replacing artifacts, including after a WIP slot rebuild.
 pub struct PlanInput {
     checkpoint: Checkpoint,
     header_validation: Option<Result<(), String>>,
@@ -519,12 +521,40 @@ pub struct PlanInput {
     phases: PhaseCounters,
     /// The routed-expert catalog, read on first use.
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
+    manifests: ManifestCache,
     /// Source headers do not change when placement searches worlds or prefill shapes.
     native_spark_headers: OnceLock<Vec<OnceLock<Result<(), String>>>>,
     module_numerics: OnceLock<anyhow::Result<BTreeMap<String, checkpoint::ModuleNumerics>>>,
     modelopt: OnceLock<Result<Option<crate::formats::modelopt::ModelOpt>, crate::formats::modelopt::ModelOptError>>,
     model: OnceLock<Result<Box<dyn FamilyModel>, ConfigError>>,
     census: OnceLock<ReportCensus>,
+}
+
+/// Immutable installed artifacts are shared across every candidate of one input.
+#[derive(Default)]
+struct ManifestCache {
+    values: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<serde_json::Value>, String>>>,
+    #[cfg(test)]
+    parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
+}
+
+impl ManifestCache {
+    fn read(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+        use anyhow::Context;
+        let mut values = self.values.lock().expect("plan manifest cache poisoned");
+        match values.entry(path.to_path_buf()).or_insert_with(|| {
+            #[cfg(test)]
+            { *self.parses.lock().unwrap().entry(path.to_path_buf()).or_default() += 1; }
+            (|| -> anyhow::Result<_> {
+                let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+                Ok(Arc::new(serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {}", path.display()))?))
+            })().map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(value) => Ok(Arc::clone(value)),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
 }
 
 // Only checkpoint facts live here. Ownership, media policy and all admission
@@ -552,7 +582,7 @@ impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
         let start = Instant::now();
         let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
-        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(),
+        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
             modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() })
@@ -560,10 +590,14 @@ impl PlanInput {
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
-        Self { checkpoint, header_validation: None, catalog: OnceLock::new(),
+        Self { checkpoint, header_validation: None, catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
             modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() }
+    }
+
+    pub(crate) fn manifest(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+        self.manifests.read(path)
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {
@@ -621,6 +655,17 @@ impl PlanInput {
             total = total.checked_add(bytes).context("Spark resident sum overflow")?;
         }
         Ok(Some(total))
+    }
+
+    pub(crate) fn family_model(&self) -> Result<&dyn FamilyModel, ConfigError> {
+        let family = family::detect(&self.checkpoint).ok_or_else(|| ConfigError("missing model family".into()))?;
+        match self.model.get_or_init(|| family.open(&self.checkpoint).and_then(|mut model| {
+            model.configure()?;
+            Ok(model)
+        })) {
+            Ok(model) => Ok(model.as_ref()),
+            Err(error) => Err(error.clone()),
+        }
     }
 
     /// The plan for `options` over this checkpoint.
@@ -966,10 +1011,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             crate::media::ImageFamily::Mistral).ok().map(|config| config.max_image_tokens);
     }
     report.runtime = Some(family.runtime());
-    let model = match input.model.get_or_init(|| family.open(checkpoint).and_then(|mut model| {
-        model.configure()?;
-        Ok(model)
-    })) {
+    let model = match input.family_model() {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {
@@ -1028,7 +1070,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             .filter(|shard| !needed.contains(*shard)).cloned().collect();
         report.missing_shards.retain(|shard| needed.contains(shard));
     }
-    match crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config) {
+    match crate::serving_capacity::cache_requirements(model, &checkpoint.config) {
         Ok(requirements) => report.cache_requirements = requirements,
         Err(error) => report.hints.push(Hint {
             what: format!("cache capacity cannot be described: {error}"),
@@ -1037,7 +1079,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }),
     }
 
-    let census = input.census.get_or_init(|| report_census(checkpoint, family, model.as_ref(), modelopt));
+    let census = input.census.get_or_init(|| report_census(checkpoint, family, model, modelopt));
     report.unclassified = census.unclassified.clone();
     let ReportCensus { mapped_names, scales, scale_bytes, table_bytes, .. } = *census;
     let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
@@ -1108,12 +1150,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             rejections,
         });
     }
-    place(&mut report, options, spec, model.as_ref(), &census.routed_operands);
+    place(&mut report, options, spec, model, &census.routed_operands);
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let mut memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
+        let mut memory = family_layout(model, input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
         if family.id() == "deepseek_v41" && !memory.devices.is_empty() {
@@ -1156,7 +1198,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        if !refused { layout::charge_host(&mut report, &layout_options, checkpoint, false)?; }
+        if !refused { layout::charge_host(&mut report, &layout_options, input, false)?; }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -1181,7 +1223,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
     }

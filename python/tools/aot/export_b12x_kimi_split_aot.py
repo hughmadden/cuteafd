@@ -16,6 +16,8 @@ import _pinned_sparkinfer
 def programs():
     from b12x.integration.cuteafd._kda_contract import KDAGeometry
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry
+    from b12x.integration.cuteafd.glmf import compile_glmf_kda_aot, compile_glmf_kda_commit_aot
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
     from b12x.integration.cuteafd.kimi_split import (
         compile_kimi_kda_core_aot, compile_kimi_mla_rank_norm_aot,
         compile_kimi_mla_query_aot, compile_kimi_mla_gate_output_aot)
@@ -23,6 +25,13 @@ def programs():
     for heads in (48, 96):
         kg = KDAGeometry(hidden=7168, kda_heads=heads)
         mg = KimiMlaGeometry(heads=heads)
+        if heads == 96:
+            result.append(("kda_commit_h96", partial(compile_glmf_kda_commit_aot, kg), 64))
+            result.append(("kda_output_h96", partial(compile_bf16_projection_aot,
+                           width=12288, outputs=7168), 4096))
+            for rows in (64, 4096):
+                result.append((f"kda_fused_h96_m{rows}", partial(compile_glmf_kda_aot,
+                               kg, max_rows=rows, output_kind="norm", decode=rows == 64), rows))
         for rows in (64, 4096):
             params = dict(max_rows=rows, decode=rows == 64)
             result.append((f"kda_core_h{heads}_m{rows}",

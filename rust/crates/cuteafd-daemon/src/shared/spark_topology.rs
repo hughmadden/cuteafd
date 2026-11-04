@@ -300,7 +300,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             assert_eq!(intake, 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(waves * rows * hidden * 2)?, "{key}");
             if family == "v41" {
                 use cuteafd_loader::placement::families::deepseek_v41::owners;
-                let charged = owners::transports_bytes(64, rows, peers, waves as usize)?;
+                let charged = owners::transports_bytes(64, rows, peers, waves as usize, cuteafd_core::SparkReplyFormat::Bf16)?;
                 assert_eq!(charged, 2 * (8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * 5120 * 2)?
                     + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
                     + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
@@ -319,7 +319,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     };
                     let cutoff = Cutoff::with_wide(layout.muse_partial_bf16_max_rows,
                         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                        layout.muse_partial_wide_format)?;
+                        layout.resolved_spark_reply_format(true).into())?;
                     let transport = cuteafd_loader::placement::families::muse_spark::host_transport(
                         &cfg, prefill, cutoff, layout.resolved_state_slots("muse_spark") as usize, peers)?;
                     ("spark-intake", transport.intake)
@@ -333,7 +333,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 assert_eq!(charge[0].bytes, expected, "{key}: host intake omits a rank");
             }
             if family == "kimik3" {
-                let demand = crate::families::kimi_k3::spark::admitted_demand(waves as usize, rows as usize, 0, peers)?;
+                let demand = crate::families::kimi_k3::spark::admitted_demand(waves as usize, rows as usize, 0, peers, cuteafd_core::SparkReplyFormat::Bf16)?;
                 assert_eq!(demand.bytes, intake);
                 let charged = report.memory_layout.as_ref().unwrap().devices.iter().flat_map(|d| &d.items)
                     .filter(|item| item.group == demand.group).collect::<Vec<_>>();

@@ -174,7 +174,7 @@ impl SparkExperts for MuseSparkPath<'_> {
         let ticket = device.run(|| {
             // SAFETY: the lane retains these planes through teardown; the routes and
             // wire were written on this stream before this call (`RankDevice::layer_front`).
-            unsafe { link.exchange()?.send(rows, payload, layout, sources, stream, Box::new(move |routes, wire|
+            unsafe { link.exchange()?.send(rows, payload, layout, sources, stream, false, Box::new(move |routes, wire|
                 wave_request(layer, sequence, kind, &segments, cutoff, routes, wire))) }
         })?;
         self.sequence = sequence;
@@ -197,7 +197,7 @@ impl SparkExperts for MuseSparkPath<'_> {
             let exchange = link.exchange()?;
             exchange.land(ticket, stream)?;
             let ranks = exchange.ranks();
-            let planes: Vec<u64> = exchange.planes(slot)[..ranks].iter().map(|p| *p as u64).collect();
+            let planes = exchange.partial_reply_addresses(slot)?;
             // The wire layout (`PartialReplyPlan::payload`): the BF16 region, then the
             // wide region at the next region-aligned offset.
             let wide_at = wire_plan(&plan)?.payload(TOPK, WIDTH)?.1;

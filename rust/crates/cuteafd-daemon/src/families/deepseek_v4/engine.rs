@@ -1068,14 +1068,14 @@ impl<'a> Engine<'a> {
             // never move). A landed wave is consumed after the replay whose
             // post reduced it.
             let mut decode_link = transports.first_mut().filter(|_| !self.skip_routed);
-            let decode_planes = match decode_link.as_deref_mut() {
+            let decode_reduction = match decode_link.as_deref_mut() {
                 Some(link) => {
                     let exchange = link.exchange()?;
                     ensure!(exchange.waves() == 1, "V4 decode bakes one return slot's planes into its graphs");
-                    exchange.planes(0)
+                    Some(exchange.reduction(0))
                 }
                 None if self.skip_routed || self.local_layers() == self.weights.layers.len() =>
-                    [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS],
+                    None,
                 None => anyhow::bail!("no transport"),
             };
             let mut unread = false;
@@ -1096,7 +1096,7 @@ impl<'a> Engine<'a> {
                             t * 4 * h * 2)?;
                     }
                     if previous > 0 {
-                        self.post_layer(w, lane, 0, previous, decode_planes, rows, layer - 1)?;
+                        self.post_layer(w, lane, 0, previous, decode_reduction.clone(), rows, layer - 1)?;
                         self.tap(w, lane, layer - 1, t)?;
                     }
                     if w1.is_some() {
@@ -1150,7 +1150,7 @@ impl<'a> Engine<'a> {
                 table_stride: 0, previous: ranks, tp2_broadcast: false, exchange_f32: false };
             self.replay(key, || -> Result<()> {
                 if ranks > 0 {
-                    self.post_layer(w, lane, 0, ranks, decode_planes, rows, last)?;
+                    self.post_layer(w, lane, 0, ranks, decode_reduction.clone(), rows, last)?;
                     self.tap(w, lane, last, t)?;
                 }
                 self.write_draft_kv(w, lane, t, cap)?;
@@ -1169,7 +1169,7 @@ impl<'a> Engine<'a> {
         // SAFETY: the lane's token ids are copied in before the stream reaches
         // the gather; its streams hold [rows, 4, dim] BF16.
         unsafe { self.embedding.gather(lane.tokens.buffer.ptr, std::ptr::null(), rows, 4, std::ptr::null(),
-            lane.stream_a.buffer.ptr, None, self.stream) }
+            lane.stream_a.buffer.ptr, None, crate::shared::peer_split::RankDevice { device: self.device, stream: self.stream }) }
     }
 
     /// The first `rows` rows of the workspace's vocabulary logits.
@@ -1280,7 +1280,7 @@ impl<'a> Engine<'a> {
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
-    fn post(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, ranks: usize, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS], rows: Scalar,
+    fn post(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, ranks: usize, rows: Scalar,
         layer: usize) -> Result<()> {
         if ranks == SKIPPED_EXPERTS {
             return self.run("mhc_post", &[
@@ -1295,17 +1295,6 @@ impl<'a> Engine<'a> {
                 ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
             ], &[rows]);
         }
-        let Scalar::I32(count) = rows else { unreachable!() };
-        let reducer = self.library.v41_compact_reducer()?;
-        // SAFETY: the transport's intake planes, shared and delta are live
-        // [rows, h] BF16 buffers on this device, ordered after the wave's
-        // intake and the shared FFN. The next dispatch on that transport
-        // follows a full stream sync (`stage_request`).
-        unsafe {
-            reducer.reduce_planes(planes, ranks as u32, lane.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), count as u32, self.stream)
-                .with_context(|| format!("layer {layer} expert reduction"))?;
-        }
         self.run("mhc_post", &[
             ("x", w.delta.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
             ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
@@ -1314,12 +1303,18 @@ impl<'a> Engine<'a> {
 
     /// A backbone layer's [`Self::post`] for lane `index`: [`Self::post_split`] under a head split.
     #[allow(clippy::too_many_arguments)]
-    fn post_layer(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, index: usize, ranks: usize, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
-        rows: Scalar, layer: usize) -> Result<()> {
+    fn post_layer(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, index: usize, ranks: usize,
+        reduction: Option<crate::shared::spark_waves::ReplyReduction<'_>>, rows: Scalar, layer: usize) -> Result<()> {
+        if let Some(reduction) = reduction.filter(|_| !matches!(ranks, LOCAL_EXPERTS | SKIPPED_EXPERTS)) {
+            let Scalar::I32(count) = rows else { unreachable!() };
+            // SAFETY: the landed decode slot and workspace outlive this graph and every replay.
+            unsafe { reduction.launch(self.library, lane.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(),
+                count as usize, self.stream).with_context(|| format!("layer {layer} expert reduction"))?; }
+        }
         if self.peer.is_some() {
-            self.post_split(w, lane, index, ranks, planes, rows, layer)
+            self.post_split(w, lane, index, ranks, rows, layer)
         } else {
-            self.post(w, lane, ranks, planes, rows, layer)
+            self.post(w, lane, ranks, rows, layer)
         }
     }
 
@@ -1328,8 +1323,7 @@ impl<'a> Engine<'a> {
     /// half alone when routed experts are skipped), sent to rank 1 first (not after
     /// the last layer), plus rank 1's half, then mHC post.
     #[allow(clippy::too_many_arguments)]
-    fn post_split(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, index: usize, ranks: usize, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
-        rows: Scalar, layer: usize) -> Result<()> {
+    fn post_split(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, index: usize, ranks: usize, rows: Scalar, layer: usize) -> Result<()> {
         let Scalar::I32(count) = rows else { unreachable!() };
         if self.tp2_layer(layer) && ranks == LOCAL_EXPERTS {
             return self.tp2_post(0, layer, index, w, lane, count as usize);
@@ -1337,16 +1331,7 @@ impl<'a> Engine<'a> {
         let base = match ranks {
             SKIPPED_EXPERTS => lane.shared.buffer.ptr,
             LOCAL_EXPERTS => self.local_output(layer, index)?,
-            _ => {
-                let reducer = self.library.v41_compact_reducer()?;
-                // SAFETY: as in `post`.
-                unsafe {
-                    reducer.reduce_planes(planes, ranks as u32, lane.shared.buffer.ptr.cast(),
-                        w.delta.buffer.ptr.cast(), count as u32, self.stream)
-                        .with_context(|| format!("layer {layer} expert reduction"))?;
-                }
-                w.delta.buffer.ptr
-            }
+            _ => w.delta.buffer.ptr,
         };
         let (exchange, ffn) = (self.exchange()?, slot(layer, true, index));
         if layer + 1 < self.cfg.n_layers {
@@ -1920,12 +1905,15 @@ impl<'a> Engine<'a> {
     fn wave_send(&self, layer: usize, t: usize, w: &Workspace<'_>, first: u64,
         members: Vec<(usize, usize, usize, usize)>, transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
+        let combined_reply = if members.is_empty() { crate::shared::spark_waves::single_reply_eligible(t, ExpertV2SourceKind::Prefill) }
+            else { crate::shared::spark_waves::combined_reply_eligible(members.iter().flat_map(|&(_, rows, _, state)|
+                (0..rows).map(move |_| (state as u64 + 1, true)))) };
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
         let timer = Instant::now();
         // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream, combined_reply,
                 Box::new(move |routes, wire| {
                     let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
                     for row in &mut request.rows { row.token_position += first; }
@@ -1992,7 +1980,7 @@ impl<'a> Engine<'a> {
         // stream order (the segment's router ran before); the copies read
         // them before later stream work rewrites them.
         let ticket = unsafe {
-            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream, false,
                 Box::new(move |routes, wire| spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Decode)))?
         };
         self.profile.borrow_mut().add(Phase::Routing, timer);

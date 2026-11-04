@@ -20,6 +20,7 @@ pub(crate) struct Fp8Worker<'a> {
     library: &'a NativeLibrary,
     inputs: [DeviceAllocation<'a>; 3],
     output: DeviceAllocation<'a>,
+    reply_codec: super::super::reply::ReplyCodec<'a>,
     capacity: usize,
     layer: usize,
     executor_id: u64,
@@ -295,6 +296,7 @@ impl<'a> Fp8Worker<'a> {
             library,
             inputs,
             output,
+            reply_codec: super::super::reply::ReplyCodec::load(library)?,
             capacity,
             layer: 0,
             executor_id,
@@ -373,7 +375,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
         ensure!(executor_id == self.executor_id, "FP8 response executor identity mismatch");
-        if self.deferred {
+        if self.deferred && request.output_dtype() == ExpertV2Dtype::Bf16 {
             if let (Some(input), Some(output)) = (hidden_view, destination) {
                 if self.stage(request, input, output, executor_id)? { return Ok(output) }
             }
@@ -403,7 +405,15 @@ impl<'a> Fp8Worker<'a> {
         let hidden_bytes = request.hidden().len();
         // SAFETY: the owner stream outlives every queued unit (#762 pace).
         unsafe { self.pending.arrive(self.stream.raw)?; }
+        let device = self.inputs[0].buffer.device_id;
+        let mut hidden = self.inputs[0].buffer.ptr;
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+            // The kernel reads the rows from its input pointer exactly as it
+            // would read the resident copy, and the transport retains the
+            // mapped frame until this unit's fence, so an aligned same-device
+            // view is input storage: read it where it landed and skip the
+            // LPDDR-to-LPDDR copy pass.
+            Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device => hidden = view.ptr,
             // SAFETY: the view is device-visible request storage of at least
             // `hidden_bytes`, retained by the transport until this request's
             // response is emitted, which follows the stream synchronize below.
@@ -416,9 +426,11 @@ impl<'a> Fp8Worker<'a> {
         // SAFETY: this unit retains its packed slot through the FIFO completion fence.
         unsafe { self.route_staging.upload(stage, 0, routes, self.inputs[1].buffer,
             self.inputs[2].buffer, self.stream.raw)?; }
-        let output = match destination {
+        let compressed = request.output_dtype() != ExpertV2Dtype::Bf16;
+        ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
+        let output = match destination.filter(|_| !compressed) {
             Some(output) => output,
-            None => CuteafdDeviceBuffer { bytes, ..self.output.buffer },
+            None => self.output.buffer,
         };
         ensure!(output.bytes >= bytes, "FP8 response slot is too small");
         // SAFETY: inputs, output and the resident layer are live device memory of
@@ -426,13 +438,17 @@ impl<'a> Fp8Worker<'a> {
         unsafe {
             if let Some(timing) = &self.timing { timing.borrow().record(0, self.stream.raw)?; }
             if bf16 {
-                self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
+                self.experts.run_bf16(self.layer, rows, hidden, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             } else {
-                self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
+                self.experts.run(self.layer, rows, hidden, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
             if let Some(timing) = &self.timing { timing.borrow().record(1, self.stream.raw)?; }
+            if compressed {
+                self.reply_codec.quantize(request, output,
+                    destination.context("missing compressed reply slot")?, request.rows() as usize, self.stream.raw)?;
+            }
             // The transport holds both mapped slots until this unit's fence,
             // independent of later work queued on the owner's stream.
             if self.deferred && destination.is_some() {

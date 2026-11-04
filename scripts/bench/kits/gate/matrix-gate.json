@@ -260,7 +260,7 @@
   {
    "name": "glm53-exl3-max",
    "family": "glm5",
-   "config": "examples/configs/glm53-exl3-max.config",
+   "config": "examples/configs/glm53-exl3-k6core-max.config",
    "gpus": [
     0,
     1
@@ -383,6 +383,36 @@
     "SPARK_COUNT": "2",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo"
+   }
+  },
+  {
+   "name": "kimi-k3-min",
+   "family": "kimi_k3",
+   "config": "examples/configs/kimi-k3-exl3-k6-min.config",
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8749",
+    "EXPERT_PORT": "19849",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa",
+    "RTX_GPUS": "1",
+    "COORDINATOR_GPUS": "0",
+    "SPARK_DEVICE_BUDGET_BYTES": "118111600640"
    }
   },
   {
