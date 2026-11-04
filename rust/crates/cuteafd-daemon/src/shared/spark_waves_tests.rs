@@ -1720,12 +1720,12 @@ fn device_ordered_landing_us(library: &NativeLibrary, ranks: usize, frame_bytes:
     Ok(samples[samples.len() / 2])
 }
 
-/// Device-ordered landings on this host: the SM pull (descriptors read by
-/// every block) against an SM copy of the frames with their addresses as
-/// kernel arguments, the ceiling of a pull that reads the descriptors once,
-/// both queued behind the wait a device-ordered pass queues. Decode and
-/// verify waves land every rank in one launch; a prefill unit's wide wave
-/// lands rank by rank (one launch each).
+/// Device-ordered landings on this host: the SM pull (each block reads its
+/// rank's descriptor once) against an SM copy of the frames with their
+/// addresses as kernel arguments (no descriptor reads: the ceiling), both
+/// queued behind the wait a device-ordered pass queues. Decode and verify
+/// waves land every rank in one launch; a prefill unit's wide wave lands rank
+/// by rank (one launch each).
 #[test]
 #[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY); measures this host's device-ordered landings"]
 fn device_ordered_landing_on_this_host() -> Result<()> {
