@@ -1077,6 +1077,8 @@ release_resolve_coordinator_gpus "$COORDINATOR_GPUS" "$RTX_GPUS"
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
 profile="$(release_coordinator_profile "$profile_bytes" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
+# The deployment plan's weight cap: serving sheds the same optional experts.
+v41_weight_cap_args=(--coordinator-weight-budget-gib "$profile_gib")
 ((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY="$default_concurrency"
 [[ "$PREFIX_CACHE_ENTRIES" != auto ]] || PREFIX_CACHE_ENTRIES=$((CONCURRENCY <= 16 ? 20 : (5 * CONCURRENCY + 3) / 4))
 if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
@@ -1250,9 +1252,9 @@ case "$spark_wire" in
     ;;
   *) release_die "unsupported planner Spark wire: $spark_wire" ;;
 esac
+release_validate_spark_topology
 [[ "$v41_gpu_expert_tier" == off ]] || ((topology_explicit)) ||
   release_die "GPU_EXPERT_TIER needs an owned Spark topology, but the plan chose the canonical wire: set SPARK_TP and SPARK_EP (e.g. SPARK_TP=4 SPARK_EP=1)"
-release_validate_spark_topology
 spark_tp_roles_required="$(jq -r '.artifact_requirements.spark_tp_role // ""' <<<"$count_plan")"
 SPECULATOR="$(jq -er '.speculator' <<<"$count_plan")"
 KV_POOL_SIZE="$(jq -r '.admission.kv_pool_size // ""' <<<"$count_plan")"
@@ -1554,8 +1556,7 @@ args+=("${api_args[@]}")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 args+=(${v41_tier_args[@]+"${v41_tier_args[@]}"})
-# The deployment plan's weight cap: serving sheds the same optional experts.
-args+=(--coordinator-weight-budget-gib "$profile_gib")
+args+=(${v41_weight_cap_args[@]+"${v41_weight_cap_args[@]}"})
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
 [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
 if [[ -n "${POOL_TOKENS:-}" ]]; then
