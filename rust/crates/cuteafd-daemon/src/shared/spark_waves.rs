@@ -1386,9 +1386,16 @@ impl<'a> Waves<'a> {
 
     /// Whether `ranks`' frames of a `payload_bytes`-per-rank wave land by copy
     /// engine on `stream` once their arrival is met ([`LandingRoute`], by the
-    /// frame size): never while `stream` captures a graph.
+    /// frame size): only in a collect the host orders (a host-ordered or
+    /// paced pass, which waits for the reply before landing it; a
+    /// device-ordered pass queues its landing ahead and keeps the pull), on a
+    /// healthy wire (a failed one clears the descriptors and releases every
+    /// wait, which the pull meets by copying nothing), and never while
+    /// `stream` captures a graph.
     fn copies(&self, payload_bytes: usize, ranks: u8, stream: *mut c_void) -> Result<bool> {
-        Ok(ranks != 0 && self.landing.copy_engine(payload_bytes) && !self.library.cuda_stream_capturing(stream)?)
+        use crate::shared::memory::chain;
+        Ok(ranks != 0 && self.landing.copy_engine(payload_bytes) && (!chain::deferred() || chain::paced())
+            && healthy().is_ok() && !self.library.cuda_stream_capturing(stream)?)
     }
 
     /// Queues on `stream` copy-engine copies of `ranks`' published frames (in
