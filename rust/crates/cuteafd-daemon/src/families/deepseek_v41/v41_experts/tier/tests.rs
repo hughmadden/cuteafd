@@ -156,3 +156,129 @@ fn residency_masks_and_slot_tables_name_the_same_experts() -> Result<()> {
     }
     Ok(())
 }
+
+/// Seeded inputs of one expert wave: FP8-K32 wire rows (finite E4M3 values,
+/// UE8M0 scales 2^-7..2^0), six distinct router expert ids per row and
+/// positive gate weights.
+fn wave_inputs(seed: u64, rows: usize) -> (Vec<u8>, Vec<u32>, Vec<f32>) {
+    let mut state = seed | 1;
+    let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+    let (hidden, topk) = (5120usize, 6usize);
+    let mut wire = vec![0u8; rows * (hidden + hidden / 32)];
+    for row in wire.chunks_exact_mut(hidden + hidden / 32) {
+        for value in &mut row[..hidden] {
+            let byte = (next() >> 32) as u8;
+            *value = if byte & 0x7f == 0x7f { byte ^ 1 } else { byte };
+        }
+        for scale in &mut row[hidden..] { *scale = 120 + (next() >> 40) as u8 % 8; }
+    }
+    let mut ids = Vec::with_capacity(rows * topk);
+    for _ in 0..rows {
+        let mut chosen = Vec::with_capacity(topk);
+        while chosen.len() < topk {
+            let id = (next() % 384) as u32;
+            if !chosen.contains(&id) { chosen.push(id); }
+        }
+        ids.extend(chosen);
+    }
+    let weights = (0..rows * topk).map(|_| 0.05 + (next() >> 40) as f32 / (1u64 << 24) as f32).collect();
+    (wire, ids, weights)
+}
+
+/// One GPU's tier half against the whole TP2 layer half on the same GPU: the
+/// router's ids through the device slot kernel over the compact resident
+/// planes give rank partials byte-identical to the whole layer's with every
+/// non-resident route dropped (id -1), at decode, verify and prefill widths,
+/// for both halves and both output policies, so the GPU result the tier adds
+/// to the reduce is exactly the resident experts' share of the layer.
+/// Synthetic coded-layout weights; one GPU (each half in turn).
+#[test]
+#[ignore = "requires CUTEAFD_NATIVE_LIB (V4.1 TP2 expert exports for this GPU) and one CUDA GPU"]
+fn tier_half_equals_the_whole_layer_half_with_other_routes_dropped() -> Result<()> {
+    use crate::shared::experts::rtx::{native::{NativeOutputPolicy, NativeTp2}, ExpertInput, Routes, RtxExpertLayer,
+        RtxSelectionPolicy};
+    use crate::shared::memory::device::{Allocation, Stream};
+    use std::rc::Rc;
+    // SAFETY: the operator-selected native library outlives every owner below.
+    let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    lib.cuda_set_device(0)?;
+    let device = Device { library: &lib, id: 0 };
+    let slot_kernel = lib.v41_tier_slots()?;
+    let (layer, capacity) = (11usize, 256usize);
+    // The planner's uniform spread plus a contiguous block: 64 residents.
+    let resident: Vec<u16> = (0..384u16).filter(|e| e % 7 == 3 || (100..110).contains(e)).collect();
+    let mut layers = vec![Vec::new(); 40];
+    layers[layer] = resident.clone();
+    let residency = TierResidency::new(384, layers)?;
+    let shape = cuteafd_ffi::TierSlotShape { layers: residency.layers(), experts: residency.experts() };
+    let tables = Allocation::new(device, shape.bytes())?;
+    lib.copy_h2d(tables.buffer, &residency.slot_tables().iter().flat_map(|slot| slot.to_ne_bytes()).collect::<Vec<_>>())?;
+    let ids_bytes = capacity * 6 * 4;
+    let [wire, ids, masked, slots, routing] = [capacity * 5280, ids_bytes, ids_bytes, ids_bytes, ids_bytes]
+        .map(|bytes| Allocation::new(device, bytes));
+    let (wire, ids, masked, slots, routing) = (wire?, ids?, masked?, slots?, routing?);
+    let stream = Stream::new(device)?;
+    let host = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
+        let mut data = vec![0u8; bytes];
+        lib.copy_d2h(&mut data, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+        Ok(data)
+    };
+    let words = |values: &[u32]| values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+    let mut compared = 0;
+    for rank in 0..2u8 {
+        let selection = ExpertLayer::BackboneTp2 { layer, rank: usize::from(rank) };
+        let whole = Rc::new(device.own(|| Ok(vec![ExpertWeights::synthetic_coded(&lib, selection, 0x71e2 + u64::from(rank))?]))?);
+        let ids_usize: Vec<usize> = resident.iter().map(|&id| usize::from(id)).collect();
+        let compact = Rc::new(device.own(|| Ok(vec![whole[0].resident_copy(&lib, &ids_usize)?]))?);
+        ensure!(compact[0].experts() == resident.len() && compact[0].resident_ids() == Some(resident.as_slice()));
+        for policy in [NativeOutputPolicy::TokenSums, NativeOutputPolicy::KernelPlanes] {
+            let workspace = NativeTp2::workspace_bytes_for_format(&lib, capacity, RtxSelectionPolicy::CanonicalDecode,
+                policy, false)?;
+            let mut full = NativeTp2::execution(device, rank, vec![layer], capacity, workspace, whole.clone(),
+                RtxSelectionPolicy::CanonicalDecode, policy)?;
+            let mut tier = NativeTp2::resident_weights(device, rank, compact.clone(), capacity,
+                RtxSelectionPolicy::CanonicalDecode, policy)?.execution()?;
+            for (case, rows) in [1usize, 6, 16, 40, 80, 97, 256].into_iter().enumerate() {
+                let (wire_host, ids_host, weights_host) = wave_inputs(0x51ab + case as u64 * 31 + u64::from(rank), rows);
+                // The whole layer's reference drops every non-resident route.
+                let dropped: Vec<u32> = ids_host.iter().map(|&id| if residency.contains(layer, id as usize) { id }
+                    else { u32::MAX }).collect();
+                lib.copy_h2d(wire.buffer, &wire_host)?;
+                lib.copy_h2d(ids.buffer, &words(&ids_host))?;
+                lib.copy_h2d(masked.buffer, &words(&dropped))?;
+                lib.copy_h2d(routing.buffer, &weights_host.iter().flat_map(|w| w.to_ne_bytes()).collect::<Vec<_>>())?;
+                let columns = if policy == NativeOutputPolicy::KernelPlanes { 6 } else { 1 };
+                let bytes = rows * 5120 * 4 * columns;
+                // SAFETY: the fixture owns every input and output and drains the stream before reading.
+                let (reference, actual) = unsafe {
+                    full.enqueue(layer, rows, ExpertInput::Fp8K32(wire.buffer.ptr),
+                        Routes { ids: masked.buffer.ptr, weights: routing.buffer.ptr }, stream.raw, &mut || {})?;
+                    stream.drain()?;
+                    let reference = host(cuteafd_ffi::CuteafdDeviceBuffer { ptr: full.output(), ..wire.buffer }, bytes)?;
+                    slot_kernel.launch(ids.buffer, tables.buffer, slots.buffer, shape, layer, rows * 6, stream.raw)?;
+                    tier.enqueue(layer, rows, ExpertInput::Fp8K32(wire.buffer.ptr),
+                        Routes { ids: slots.buffer.ptr, weights: routing.buffer.ptr }, stream.raw, &mut || {})?;
+                    stream.drain()?;
+                    (reference, host(cuteafd_ffi::CuteafdDeviceBuffer { ptr: tier.output(), ..wire.buffer }, bytes)?)
+                };
+                let floats = |raw: &[u8]| raw.as_chunks::<4>().0.iter().map(|word| f32::from_ne_bytes(*word)).collect::<Vec<_>>();
+                let values = floats(&actual);
+                ensure!(values.iter().all(|value| value.is_finite()), "rank {rank} {policy:?} rows {rows}: non-finite partials");
+                let resident_routes = dropped.iter().filter(|&&id| id != u32::MAX).count();
+                ensure!((resident_routes == 0) == values.iter().all(|&value| value == 0.0),
+                    "rank {rank} {policy:?} rows {rows}: {resident_routes} resident routes but partials {}",
+                    if resident_routes == 0 { "nonzero" } else { "all zero" });
+                if reference != actual {
+                    let differing = floats(&reference).iter().zip(&values).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    anyhow::bail!("rank {rank} {policy:?} rows {rows}: {differing} of {} partials differ from the whole layer",
+                        values.len());
+                }
+                eprintln!("tier half rank {rank} {policy:?} rows {rows}: {resident_routes} of {} routes resident, \
+                    byte-identical to the whole layer", rows * 6);
+                compared += 1;
+            }
+        }
+    }
+    ensure!(compared == 2 * 2 * 7);
+    Ok(())
+}
