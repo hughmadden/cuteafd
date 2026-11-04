@@ -760,9 +760,17 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   return cudaSuccess;
 }
 
+extern "C" int32_t cuteafd_pull_frames_blocks(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, uint32_t blocks, void* stream);
+
 extern "C" int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* replies, void* const* planes,
     const uint64_t* capacity, uint32_t count, void* stream) {
-  if (!replies || !planes || !capacity || !count || count > CUTEAFD_PULL_MAX_RANKS || !stream)
+  return cuteafd_pull_frames_blocks(replies, planes, capacity, count, 0, stream);
+}
+
+extern "C" int32_t cuteafd_pull_frames_blocks(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, uint32_t grid, void* stream) {
+  if (!replies || !planes || !capacity || !count || count > CUTEAFD_PULL_MAX_RANKS || !stream || grid > 1024)
     return cudaErrorInvalidValue;
   PullFrames pull{};
   pull.count = count;
@@ -778,7 +786,9 @@ extern "C" int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* repli
   // wave takes a block or two.
   uint64_t capacity_units = 0;
   for (uint32_t r = 0; r < count; ++r) capacity_units += capacity[r] / 16;
-  const uint64_t blocks = std::min<uint64_t>(std::max<uint64_t>((capacity_units + 2047) / 2048, 1), 64ull * count);
+  // A caller-chosen grid (the probed landing route) wins; 0 keeps this sizing.
+  const uint64_t blocks = grid ? grid
+      : std::min<uint64_t>(std::max<uint64_t>((capacity_units + 2047) / 2048, 1), 64ull * count);
   pull_frames<<<unsigned(blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(pull);
   return cudaGetLastError();
 }
@@ -801,6 +811,15 @@ extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void
   }
   copy_regions<<<staging_blocks(largest), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
   return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_cuda_stream_capturing(void* stream, int32_t* capturing) {
+  if (!capturing) return cudaErrorInvalidValue;
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  const cudaError_t queried = cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status);
+  if (queried != cudaSuccess) return queried;
+  *capturing = status != cudaStreamCaptureStatusNone;
+  return cudaSuccess;
 }
 
 extern "C" int32_t cuteafd_copy_engine_regions(void* const* destinations, const void* const* sources,

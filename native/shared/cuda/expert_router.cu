@@ -226,6 +226,15 @@ __global__ void __launch_bounds__(kCensusThreads) route_census_kernel(const uint
   for(int e=threadIdx.x;e<experts;e+=blockDim.x)
     if(bins[e]) atomicAdd(row+e,static_cast<unsigned long long>(bins[e]));
 }
+// GPU expert tier: each route's compact slot in this layer's resident set.
+constexpr int kTierThreads=256;
+__global__ void __launch_bounds__(kTierThreads) tier_slots_kernel(const uint32_t* __restrict__ ids,
+    const int32_t* __restrict__ table,int32_t* __restrict__ slots,int routes,int experts) {
+  for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<routes;i+=gridDim.x*blockDim.x) {
+    const uint32_t expert=ids[i];
+    slots[i]=expert<uint32_t(experts)?table[expert]:-1;
+  }
+}
 }
 extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* weight,
     const float* bias,const float* bias_vl,const uint8_t* image_mask,float* scores,
@@ -329,6 +338,20 @@ extern "C" int32_t cuteafd_route_census_count(const uint32_t* ids,const uint8_t*
   const int blocks=int(wanted<32?wanted:32);
   route_census_kernel<<<blocks,kCensusThreads,experts*sizeof(uint32_t),reinterpret_cast<cudaStream_t>(stream)>>>(
       ids,live,int(routes),topk,phase,reinterpret_cast<unsigned long long*>(counts),layer,layers,experts);
+  return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_v41_tier_slots(const uint32_t* ids,const int32_t* slot_of,int32_t* slots,
+    int32_t routes,int32_t layer,int32_t layers,int32_t experts,void* stream) {
+  if(routes<1 || routes>65536*16 || experts<1 || experts>1024 || layers<1 || layers>1024 || layer<0 ||
+      layer>=layers) return cudaErrorInvalidValue;
+  const uint64_t bytes=uint64_t(routes)*4,tables=uint64_t(layers)*experts*4;
+  if(!span(ids,bytes,4) || !span(slot_of,tables,4) || !span(slots,bytes,4) || !disjoint(slots,bytes,ids,bytes) ||
+      !disjoint(slots,bytes,slot_of,tables)) return cudaErrorInvalidValue;
+  // A decode wave (<= 256 routes) is one block, a 4096-row prefill unit 64.
+  const uint64_t wanted=(uint64_t(routes)+kTierThreads-1)/kTierThreads;
+  const int blocks=int(wanted<64?wanted:64);
+  tier_slots_kernel<<<blocks,kTierThreads,0,reinterpret_cast<cudaStream_t>(stream)>>>(ids,
+      slot_of+uint64_t(layer)*experts,slots,routes,experts);
   return cudaGetLastError();
 }
 extern "C" int32_t cuteafd_route_census_select(uint8_t* phase,int32_t plane,void* stream) {

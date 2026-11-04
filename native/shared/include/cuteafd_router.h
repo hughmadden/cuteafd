@@ -53,6 +53,15 @@ int32_t cuteafd_route_census_count(const uint32_t* ids,const uint8_t* live,int32
 // Selects the plane (0 or 1) later counts on `stream` read from `phase`: a
 // one-byte write in stream order. Not for use inside a capture.
 int32_t cuteafd_route_census_select(uint8_t* phase,int32_t plane,void* stream);
+// GPU expert tier: slots[r] = slot_of[layer][ids[r]] for every route of a
+// router's U32 IDs (I32 out), -1 for an ID >= experts. slot_of is I32
+// [layers,experts], -1 where the layer's tier does not hold the expert, else
+// the expert's compact slot in the tier's resident planes; the expert kernel's
+// route plan drops a route outside 0..experts, so -1 reads no weights. Reads
+// ids and the table, writes only slots (disjoint from both): capturable, no
+// host sync. routes <= 1048576, experts <= 1024, layers <= 1024.
+int32_t cuteafd_v41_tier_slots(const uint32_t* ids,const int32_t* slot_of,int32_t* slots,int32_t routes,
+    int32_t layer,int32_t layers,int32_t experts,void* stream);
 #ifdef __cplusplus
 }
 #endif

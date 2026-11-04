@@ -556,6 +556,37 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Whether `stream` is capturing a graph (`cudaStreamIsCapturing`).
+    pub fn cuda_stream_capturing(&self, stream: *mut c_void) -> Result<bool> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut i32) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_cuda_stream_capturing") }?;
+        let mut capturing = 0;
+        // SAFETY: a status query of the caller's stream; writes only `capturing`.
+        let status = unsafe { f(stream, &mut capturing) };
+        ensure!(status == 0, "querying the stream's capture status failed with CUDA error {status}");
+        Ok(capturing != 0)
+    }
+
+    /// [`Self::pull_frames`] on `blocks` (1..=1024) blocks of 256 threads, or
+    /// the capacity-sized grid for 0: the probed landing route's grid.
+    /// # Safety
+    /// As [`Self::pull_frames`].
+    pub unsafe fn pull_frames_blocks(&self, replies: &[*const PullFrames], planes: &[(*mut c_void, u64)],
+        blocks: u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const *const PullFrames, *const *mut c_void, *const u64, u32, u32, *mut c_void)
+            -> i32;
+        ensure!((1..=PULL_MAX_RANKS).contains(&replies.len()) && replies.len() == planes.len() && blocks <= 1024,
+            "{} replies into {} planes on {blocks} blocks in one pull", replies.len(), planes.len());
+        let destinations: Vec<_> = planes.iter().map(|plane| plane.0).collect();
+        let capacity: Vec<_> = planes.iter().map(|plane| plane.1).collect();
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_pull_frames_blocks") }?;
+        // SAFETY: the caller vouches for the descriptors and planes; native copies the arrays.
+        let status = unsafe { f(replies.as_ptr(), destinations.as_ptr(), capacity.as_ptr(), replies.len() as u32, blocks,
+            stream) };
+        ensure!(status == 0, "pulling {} ranks' reply frames failed with CUDA error {status}", replies.len());
+        Ok(())
+    }
+
     /// Copies up to [`PEER_MAX_PLANES`] strided planes (local or peer) in one
     /// launch, then publishes the next sequence to `flag` exactly as
     /// [`NativeLibrary::peer_push_signal`] does, so the two share a link

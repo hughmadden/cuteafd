@@ -16,6 +16,14 @@
 //! FP32 gate weights, the canonical six unique experts per token and the hidden
 //! payload are left byte-identical; only the route word's owner field is added.
 //!
+//! The coordinator's GPU expert tier adds one owner the same way: under
+//! [`V41_NATIVE_COORDINATOR_REQUEST_FLAG`] bit 12 joins the one-hot owner
+//! field as [`V41_NATIVE_COORDINATOR_OWNER`], marking a route whose expert is
+//! resident on the coordinator GPUs, which run it. No Spark group owns such a
+//! route, so every worker unpacks it as the unassigned sentinel with zero
+//! weight and its expert costs the Sparks no weight bytes. Without the flag
+//! bit 12 stays reserved; bits `13..31` are always reserved.
+//!
 //! Topology is also bound into response identity: each supported `TP×EP` owns a
 //! disjoint executor-id namespace (see [`SparkTopology::executor_id`]), so a
 //! stale worker from another topology cannot satisfy a receiver that was built
@@ -53,10 +61,27 @@ pub const V41_NATIVE_UNASSIGNED_EXPERT_ID: i32 = 384;
 /// Expert with no routed row in the caller-provided assignment.
 pub const V41_NATIVE_INACTIVE_OWNER: u8 = u8::MAX;
 
+/// Allows [`V41_NATIVE_COORDINATOR_OWNER`] in a native group request: routes
+/// whose expert the coordinator's GPU expert tier holds are marked for the
+/// coordinator, and every Spark group skips them. Only valid together with
+/// [`V41_NATIVE_GROUP_REQUEST_FLAG`]; request-only, never in a response. Set
+/// on every request of a link with a tier, whether or not a batch marks any
+/// route.
+pub const V41_NATIVE_COORDINATOR_REQUEST_FLAG: u32 = 1 << 21;
+
+/// Owner index of a route the coordinator's GPU expert tier runs: wire bit
+/// `9 + 3 = 12`, the next bit of the one-hot owner field, legal only under
+/// [`V41_NATIVE_COORDINATOR_REQUEST_FLAG`]. No Spark group has this index
+/// (at most [`V41_MAX_NATIVE_GROUPS`] groups, `0..=2`).
+pub const V41_NATIVE_COORDINATOR_OWNER: u8 = V41_MAX_NATIVE_GROUPS;
+
 const EXPERT_MASK: u32 = 511;
 const OWNER_SHIFT: u32 = 9;
 const OWNER_MASK: u32 = 0b111;
 const WORD_MASK: u32 = 0xfff;
+/// The owner field and word with the coordinator owner allowed (bit 12).
+const COORDINATOR_OWNER_MASK: u32 = 0b1111;
+const COORDINATOR_WORD_MASK: u32 = 0x1fff;
 
 /// Validated native Spark `TP×EP` topology.
 ///
@@ -202,44 +227,68 @@ impl SparkTopology {
 /// the three groups `0..=2`: bits `0..8` are the true expert, bits `9..11` are a
 /// one-hot owner bitmap with **exactly one** bit set (bit `9 + group`), and bits
 /// `12..31` are reserved and rejected. The API exposes the owning group index
-/// (`owner: 0..EP`); the bitmap is the wire form.
+/// (`owner: 0..EP`); the bitmap is the wire form. Under
+/// [`V41_NATIVE_COORDINATOR_REQUEST_FLAG`] the field has a fourth bit, 12, for
+/// [`V41_NATIVE_COORDINATOR_OWNER`] (the coordinator's GPU expert tier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V41NativeOwnerRouteWord {
     /// True routed expert, `0..384`.
     pub expert_id: u32,
-    /// Replicated group that owns every route to this expert, `0..EP`.
+    /// Replicated group that owns every route to this expert, `0..EP`, or
+    /// [`V41_NATIVE_COORDINATOR_OWNER`].
     pub owner: u8,
 }
 
 impl V41NativeOwnerRouteWord {
     /// Encodes the word with a one-hot owner bit. The topology's actual `EP`
-    /// bound is enforced by [`Self::decode`] and by the request builder.
+    /// bound, and whether the coordinator owner is allowed, are enforced by
+    /// [`Self::decode_owned`] and by the request builder.
     pub fn encode(self) -> Result<u32> {
         ensure!((self.expert_id as usize) < V41_ROUTED_EXPERTS, "native owner expert id out of range");
-        ensure!(self.owner < V41_MAX_NATIVE_GROUPS, "native owner field must fit three bits");
+        ensure!(self.owner <= V41_NATIVE_COORDINATOR_OWNER,
+            "native owner must be a group 0..{V41_MAX_NATIVE_GROUPS} or the coordinator");
         Ok(self.expert_id | (1u32 << (OWNER_SHIFT + u32::from(self.owner))))
+    }
+
+    /// Whether the coordinator's GPU expert tier owns the route.
+    pub fn is_coordinator(self) -> bool {
+        self.owner == V41_NATIVE_COORDINATOR_OWNER
+    }
+
+    /// Decodes and validates against the worker's `group_count` (`EP`), with
+    /// the coordinator owner reserved (a request without the coordinator flag).
+    pub fn decode(word: u32, group_count: u8) -> Result<Self> {
+        Self::decode_owned(word, group_count, false)
     }
 
     /// Decodes and validates against the worker's `group_count` (`EP`).
     ///
-    /// The owner field must contain exactly one group bit, and that group must be
-    /// below `group_count`; a multi-bit or empty owner is rejected so no route
-    /// can be counted by more than one group.
-    pub fn decode(word: u32, group_count: u8) -> Result<Self> {
+    /// The owner field must contain exactly one bit, naming a group below
+    /// `group_count` or, when `coordinator` (the request carries
+    /// [`V41_NATIVE_COORDINATOR_REQUEST_FLAG`]), the coordinator; a
+    /// multi-bit or empty owner is rejected so no route can be counted by more
+    /// than one owner.
+    pub fn decode_owned(word: u32, group_count: u8, coordinator: bool) -> Result<Self> {
         ensure!(
             group_count >= 1 && group_count <= V41_MAX_NATIVE_GROUPS,
             "native group count {group_count} is outside 1..={V41_MAX_NATIVE_GROUPS}"
         );
-        ensure!(word & !WORD_MASK == 0, "native owner route has reserved bits set");
+        let (word_mask, owner_mask) = if coordinator {
+            (COORDINATOR_WORD_MASK, COORDINATOR_OWNER_MASK)
+        } else {
+            (WORD_MASK, OWNER_MASK)
+        };
+        ensure!(word & !word_mask == 0, "native owner route has reserved bits set");
         let expert_id = word & EXPERT_MASK;
         ensure!((expert_id as usize) < V41_ROUTED_EXPERTS, "native owner expert id out of range");
-        let owners = (word >> OWNER_SHIFT) & OWNER_MASK;
+        let owners = (word >> OWNER_SHIFT) & owner_mask;
         ensure!(
             owners.count_ones() == 1,
-            "native owner word must name exactly one replicated group"
+            "native owner word must name exactly one owner"
         );
         let owner = owners.trailing_zeros() as u8;
-        ensure!(owner < group_count, "native owner {owner} is not below group count {group_count}");
+        ensure!(owner < group_count || owner == V41_NATIVE_COORDINATOR_OWNER,
+            "native owner {owner} is not below group count {group_count}");
         Ok(Self { expert_id, owner })
     }
 }
@@ -270,7 +319,14 @@ impl V41NativeOwnershipBatch {
 
     /// Decodes one route word and requires it to agree with earlier occurrences.
     pub fn observe(&mut self, word: u32, group_count: u8) -> Result<V41NativeOwnerRouteWord> {
-        let route = V41NativeOwnerRouteWord::decode(word, group_count)?;
+        self.observe_owned(word, group_count, false)
+    }
+
+    /// [`Self::observe`] with the coordinator owner allowed when `coordinator`
+    /// (the request carries [`V41_NATIVE_COORDINATOR_REQUEST_FLAG`]).
+    pub fn observe_owned(&mut self, word: u32, group_count: u8, coordinator: bool)
+        -> Result<V41NativeOwnerRouteWord> {
+        let route = V41NativeOwnerRouteWord::decode_owned(word, group_count, coordinator)?;
         let previous = &mut self.owners[route.expert_id as usize];
         ensure!(
             *previous == V41_NATIVE_INACTIVE_OWNER || *previous == route.owner,
@@ -304,6 +360,20 @@ impl crate::ExpertProtocolV2Request {
         owners: &[u8],
         topology: SparkTopology,
     ) -> Result<()> {
+        self.with_native_owners(owners, topology, false)
+    }
+
+    /// [`Self::with_native_group_owners`] for a link whose coordinator holds a
+    /// GPU expert tier (`coordinator`): an owner may also be
+    /// [`V41_NATIVE_COORDINATOR_OWNER`], and the request carries
+    /// [`V41_NATIVE_COORDINATOR_REQUEST_FLAG`] (set even when no route of this
+    /// batch is the coordinator's, so a link's requests all share one contract).
+    pub fn with_native_owners(
+        &mut self,
+        owners: &[u8],
+        topology: SparkTopology,
+        coordinator: bool,
+    ) -> Result<()> {
         ensure!(
             owners.len() == V41_ROUTED_EXPERTS,
             "native group ownership needs one entry per routed expert"
@@ -330,13 +400,15 @@ impl crate::ExpertProtocolV2Request {
                 (expert as usize) < V41_ROUTED_EXPERTS,
                 "native group route expert id out of range"
             );
+            let owner = owners[expert as usize];
             ensure!(
-                owners[expert as usize] < topology.group_count(),
+                owner < topology.group_count() || (coordinator && owner == V41_NATIVE_COORDINATOR_OWNER),
                 "routed native expert {expert} has no valid group owner"
             );
         }
         // Every fallible check has passed; the re-encode below cannot fail for a
-        // validated canonical route set (`expert < 384`, `owner < EP <= 3`).
+        // validated canonical route set (`expert < 384`, `owner < EP <= 3` or
+        // the coordinator).
         for route in &mut self.routes {
             let expert = route.expert_id;
             route.expert_id = V41NativeOwnerRouteWord {
@@ -346,6 +418,9 @@ impl crate::ExpertProtocolV2Request {
             .encode()?;
         }
         self.header.flags |= V41_NATIVE_GROUP_REQUEST_FLAG;
+        if coordinator {
+            self.header.flags |= V41_NATIVE_COORDINATOR_REQUEST_FLAG;
+        }
         self.validate()
     }
 }
@@ -585,9 +660,20 @@ mod tests {
         }
         .encode()
         .is_err());
-        assert!(V41NativeOwnerRouteWord {
+        // Owner index 3 is the coordinator (bit 12), which decodes only under
+        // its request flag (`coordinator_owner_words_decode_only_under_the_coordinator_flag`);
+        // nothing past it encodes.
+        assert_eq!(V41_NATIVE_COORDINATOR_OWNER, V41_MAX_NATIVE_GROUPS);
+        assert!(V41NativeOwnerRouteWord::decode(V41NativeOwnerRouteWord {
             expert_id: 0,
             owner: V41_MAX_NATIVE_GROUPS
+        }
+        .encode()
+        .unwrap(), 3)
+        .is_err());
+        assert!(V41NativeOwnerRouteWord {
+            expert_id: 0,
+            owner: V41_MAX_NATIVE_GROUPS + 1
         }
         .encode()
         .is_err());
@@ -1186,6 +1272,180 @@ mod tests {
         assert!(bound_roce.dispatch(&canonical).await.is_err());
         let mut bound_tcp = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 80, config.clone())?;
         assert!(bound_tcp.dispatch(&canonical).await.is_err());
+        Ok(())
+    }
+
+    /// The GPU expert tier's owners for `topology`: every fifth expert is the
+    /// coordinator's, the rest spread over the groups.
+    fn tier_owners(topology: SparkTopology) -> Vec<u8> {
+        (0..V41_ROUTED_EXPERTS)
+            .map(|expert| if expert % 5 == 0 { V41_NATIVE_COORDINATOR_OWNER }
+                else { (expert % topology.group_count() as usize) as u8 })
+            .collect()
+    }
+
+    #[test]
+    fn coordinator_owner_words_decode_only_under_the_coordinator_flag() {
+        for expert_id in 0..V41_ROUTED_EXPERTS as u32 {
+            let word = V41NativeOwnerRouteWord { expert_id, owner: V41_NATIVE_COORDINATOR_OWNER }
+                .encode()
+                .unwrap();
+            // Bit 12, the next bit of the one-hot owner field.
+            assert_eq!(word, expert_id | (1 << 12));
+            for group_count in 1..=V41_MAX_NATIVE_GROUPS {
+                let decoded = V41NativeOwnerRouteWord::decode_owned(word, group_count, true).unwrap();
+                assert!(decoded.is_coordinator());
+                assert_eq!(decoded.expert_id, expert_id);
+                // Without the flag bit 12 stays reserved.
+                assert!(V41NativeOwnerRouteWord::decode(word, group_count).is_err());
+                assert!(V41NativeOwnerRouteWord::decode_owned(word, group_count, false).is_err());
+                // Group owners decode the same with or without the flag.
+                for owner in 0..group_count {
+                    let group = V41NativeOwnerRouteWord { expert_id, owner }.encode().unwrap();
+                    assert_eq!(V41NativeOwnerRouteWord::decode_owned(group, group_count, true).unwrap(),
+                        V41NativeOwnerRouteWord::decode(group, group_count).unwrap());
+                    // A group bit and the coordinator bit never name one owner.
+                    assert!(V41NativeOwnerRouteWord::decode_owned(group | (1 << 12), group_count, true).is_err());
+                }
+            }
+        }
+        // Bits 13..31 are reserved with the flag too.
+        for bit in 13..32 {
+            assert!(V41NativeOwnerRouteWord::decode_owned((1 << 12) | (1 << bit), 3, true).is_err());
+        }
+        assert!(V41NativeOwnerRouteWord::decode_owned(0, 3, true).is_err());
+        assert!(V41NativeOwnerRouteWord { expert_id: 0, owner: V41_NATIVE_COORDINATOR_OWNER + 1 }.encode().is_err());
+    }
+
+    #[test]
+    fn coordinator_routes_unpack_as_unassigned_on_every_group() -> Result<()> {
+        for topology in ALL {
+            let canonical = request(3);
+            let owners = tier_owners(topology);
+            let mut tiered = canonical.clone();
+            tiered.with_native_owners(&owners, topology, true)?;
+            assert_ne!(tiered.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
+            assert_ne!(tiered.header.flags & V41_NATIVE_COORDINATOR_REQUEST_FLAG, 0);
+            assert_eq!(tiered.rows, canonical.rows);
+            assert_eq!(tiered.hidden_payload, canonical.hidden_payload);
+            for (route, original) in tiered.routes.iter().zip(&canonical.routes) {
+                assert_eq!(route.expert_id & EXPERT_MASK, original.expert_id);
+                assert_eq!(route.gate_weight.to_bits(), original.gate_weight.to_bits());
+                assert_eq!(route.row_index, original.row_index);
+            }
+            let frame = tiered.encode()?;
+            // Owner bits only: the frame keeps its exact size.
+            assert_eq!(frame.len(), canonical.encode()?.len());
+            assert!(BackboneRequest::validate_owned_native_group(&tiered, 3, topology).is_ok());
+            let parsed = BackboneRequest::parse_native_group(&frame, 3, topology)?;
+            let count = tiered.routes.len();
+            let mut assigned = vec![0u8; count];
+            for group in 0..topology.group_count() {
+                let mut ids = vec![-1i32; count];
+                let mut weights = vec![-1.0f32; count];
+                parsed.copy_native_group_routes_into(&mut ids, &mut weights, group)?;
+                for (index, route) in canonical.routes.iter().enumerate() {
+                    if owners[route.expert_id as usize] == group {
+                        assert_eq!(ids[index], route.expert_id as i32);
+                        assert_eq!(weights[index].to_bits(), route.gate_weight.to_bits());
+                        assigned[index] += 1;
+                    } else {
+                        // Coordinator routes, like other groups', cost this group nothing.
+                        assert_eq!(ids[index], V41_NATIVE_UNASSIGNED_EXPERT_ID);
+                        assert_eq!(weights[index], 0.0);
+                    }
+                }
+            }
+            // Every route has exactly one owner: one group, or the coordinator.
+            for (index, route) in canonical.routes.iter().enumerate() {
+                let coordinator = owners[route.expert_id as usize] == V41_NATIVE_COORDINATOR_OWNER;
+                assert_eq!(assigned[index], u8::from(!coordinator), "route {index}");
+            }
+            assert!(canonical.routes.iter().any(|route| owners[route.expert_id as usize] == V41_NATIVE_COORDINATOR_OWNER));
+            // Canonical consumers still reject the frame.
+            assert!(BackboneRequest::parse(&frame, 3).is_err());
+
+            // A link with a tier flags every request, even one this batch's
+            // routes leave entirely to the Sparks.
+            let mut spark_only = canonical.clone();
+            spark_only.with_native_owners(&owners_for(topology), topology, true)?;
+            assert_ne!(spark_only.header.flags & V41_NATIVE_COORDINATOR_REQUEST_FLAG, 0);
+            let spark_frame = spark_only.encode()?;
+            let parsed = BackboneRequest::parse_native_group(&spark_frame, 3, topology)?;
+            let mut ids = vec![0i32; count];
+            let mut weights = vec![0.0f32; count];
+            parsed.copy_native_group_routes_into(&mut ids, &mut weights, 0)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_owner_needs_its_request_flag() -> Result<()> {
+        let topology = SparkTopology::NATIVE_TP4_EP1;
+        let owners = tier_owners(topology);
+        // The group-only builder refuses a coordinator owner, leaving the request as it was.
+        let mut plain = request(2);
+        let before = plain.encode()?;
+        assert!(plain.with_native_group_owners(&owners, topology).is_err());
+        assert_eq!(plain.encode()?, before);
+
+        // Coordinator words without the flag: the parser and the owned check refuse.
+        let mut unflagged = request(2);
+        unflagged.with_native_owners(&owners, topology, true)?;
+        unflagged.header.flags &= !V41_NATIVE_COORDINATOR_REQUEST_FLAG;
+        assert!(BackboneRequest::validate_owned_native_group(&unflagged, 2, topology).is_err());
+        assert!(BackboneRequest::parse_native_group(&unflagged.encode()?, 2, topology).is_err());
+
+        // The flag without native group ownership is not a request.
+        let mut lone = request(1);
+        lone.header.flags |= V41_NATIVE_COORDINATOR_REQUEST_FLAG;
+        assert!(lone.encode().is_err());
+
+        // One expert, two owners within a batch: rejected.
+        let mut conflict = request(3);
+        conflict.with_native_owners(&owners, topology, true)?;
+        let coordinator = conflict.routes.iter().position(|route| route.expert_id & (1 << 12) != 0).unwrap();
+        let expert = conflict.routes[coordinator].expert_id & EXPERT_MASK;
+        let other = conflict.routes.iter().rposition(|route| route.expert_id & EXPERT_MASK == expert).unwrap();
+        assert_ne!(other, coordinator);
+        conflict.routes[other].expert_id = expert | (1 << OWNER_SHIFT);
+        assert!(BackboneRequest::parse_native_group(&conflict.encode()?, 3, topology).is_err());
+
+        // The canonical request receiver path never accepts the contract.
+        let flagged = {
+            let mut flagged = request(2);
+            flagged.with_native_owners(&owners, topology, true)?;
+            flagged
+        };
+        assert!(BackboneRequest::validate_owned(&flagged, 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_never_carry_the_coordinator_flag() -> Result<()> {
+        let topology = SparkTopology::NATIVE_TP4_EP1;
+        let mut tiered = request(2);
+        tiered.with_native_owners(&tier_owners(topology), topology, true)?;
+        let frame = tiered.encode()?;
+        let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
+        let mut response = native.response(topology.executor_id(0)?, &vec![0; native.plane_bytes()?])?.to_owned()?;
+        assert_eq!(response.header.flags & (V41_NATIVE_GROUP_REQUEST_FLAG | V41_NATIVE_COORDINATOR_REQUEST_FLAG), 0);
+        response.header.flags |= V41_NATIVE_COORDINATOR_REQUEST_FLAG;
+        assert!(response.encode().is_err());
+
+        // A topology-bound chunk receiver admits the tiered request and its
+        // ranks' plain responses.
+        let executors = topology.executor_ids();
+        let mut receiver = V41Tp4ChunkReceiver::from_owned_topology(&tiered, 2, &executors, topology, 1 << 20)?;
+        let payload = vec![0; native.plane_bytes()?];
+        for (rank, id) in executors.iter().enumerate() {
+            let chunk = native.response(*id, &payload)?.to_owned()?.encode()?;
+            receiver.push(&chunk, |actual, _, _| {
+                assert_eq!(actual, rank);
+                Ok(())
+            })?;
+        }
+        assert!(receiver.complete());
         Ok(())
     }
 }

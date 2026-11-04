@@ -495,6 +495,32 @@ impl<'a> NativeTp2<'a> {
         }))
     }
 
+    /// One GPU's half of the GPU expert tier: per resident layer (strictly
+    /// increasing), the compact `ExpertWeights` of its resident experts
+    /// (`ExpertWeights::load_resident`, `tier::load_halves`). Executions
+    /// launch the layer's kernel over the compact planes, so their routes must
+    /// carry compact slots (`tier::TierResidency::slot_of`), never expert ids.
+    pub(crate) fn resident_weights(
+        device: Device<'a>,
+        rank: u8,
+        weights: Rc<DeviceOwner<'a, Vec<ExpertWeights<'a>>>>,
+        max_rows: usize,
+        selection: RtxSelectionPolicy,
+        output_policy: NativeOutputPolicy,
+    ) -> Result<NativeTp2Weights<'a>> {
+        ensure!(weights.device.id == device.id && std::ptr::eq(weights.device.library, device.library),
+            "tier halves live on another device");
+        let layers = weights.iter().map(|weight| match weight.layer {
+            ExpertLayer::BackboneTp2 { layer, rank: half } if half == rank as usize && weight.resident_ids().is_some()
+                => Ok(layer),
+            other => bail!("{other:?} is not a resident TP2 half of rank {rank}"),
+        }).collect::<Result<Vec<_>>>()?;
+        validate_layers(&layers, rank)?;
+        ensure!(weights.iter().all(|weight| !weight.is_nvfp4()), "tier halves take the native MXFP4 layout");
+        let workspace_bytes = Self::workspace_bytes_for_format(device.library, max_rows, selection, output_policy, false)?;
+        Ok(NativeTp2Weights { device, rank, layers, max_rows, workspace_bytes, weights, selection, output_policy })
+    }
+
     /// [`Self::load_pair_weights`] over halves a push group delivered
     /// (already transformed and published on their GPUs).
     #[allow(clippy::too_many_arguments)]
@@ -763,10 +789,8 @@ impl<'a> NativeTp2<'a> {
             self.layers.contains(&layer),
             "TP2 weight metadata layer unavailable"
         );
-        Ok(self.weights[super::resident_index(&self.layers, layer)?]
-            .budget()
-            .resident_bytes
-            / self.geometry.experts as usize)
+        let weights = &self.weights[super::resident_index(&self.layers, layer)?];
+        Ok(weights.budget().resident_bytes / weights.experts().max(1))
     }
 
     fn execution_index(&self, rows: usize) -> Result<usize> {

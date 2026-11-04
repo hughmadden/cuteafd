@@ -723,12 +723,26 @@ impl<'a> ExpertWeights<'a> {
     #[cfg(test)]
     pub(crate) fn synthetic(library: &'a NativeLibrary, layer: ExpertLayer, seed: u64) -> Result<Self> {
         let info = layer.info(library, 16)?;
+        let strides = library.v41_expert_packer(info.logical_intermediate)?.packed_bytes();
+        Self::synthetic_with(library, layer, seed, strides.map(|stride| stride as usize))
+    }
+    /// [`Self::synthetic`] in the checkpoint's coded-scale layout (the planes a
+    /// V4.1 checkpoint with scale codes loads into, which the SM89 kernels read).
+    #[cfg(test)]
+    pub(crate) fn synthetic_coded(library: &'a NativeLibrary, layer: ExpertLayer, seed: u64) -> Result<Self> {
+        let info = layer.info(library, 16)?;
+        let strides = cuteafd_loader::formats::scale_codes::expert_planes(info.hidden_size as usize,
+            info.logical_intermediate as usize, info.kernel_intermediate as usize).context("invalid coded expert geometry")?;
+        Self::synthetic_with(library, layer, seed, strides)
+    }
+    #[cfg(test)]
+    fn synthetic_with(library: &'a NativeLibrary, layer: ExpertLayer, seed: u64, strides: [usize; 4]) -> Result<Self> {
+        let info = layer.info(library, 16)?;
         ensure!(info.role == layer.role(), "native expert role does not match layer placement");
         let experts = info.experts as usize;
-        let strides = library.v41_expert_packer(info.logical_intermediate)?.packed_bytes();
         let mut owned = Vec::with_capacity(4);
         for (plane, stride) in strides.into_iter().enumerate() {
-            let bytes = usize::try_from(stride)?.checked_mul(experts).context("synthetic expert plane overflow")?;
+            let bytes = stride.checked_mul(experts).context("synthetic expert plane overflow")?;
             let allocation = DeviceAllocation::new(library, bytes)?;
             let mut state = seed ^ (plane as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             let tile: Vec<u8> = (0..bytes.min(1 << 20)).map(|_| {
@@ -793,8 +807,39 @@ impl<'a> ExpertWeights<'a> {
 
     /// Expert ids by plane slot when these planes hold a subset of the layer
     /// (`load_resident`); `None` when slot `e` holds expert `e`.
-    #[allow(dead_code)] // the tier wave's id-to-slot lookup reads it
     pub(crate) fn resident_ids(&self) -> Option<&[u16]> { self.resident.as_deref() }
+
+    /// Experts the planes hold (a resident subset's slots, or the layer's).
+    pub(crate) fn experts(&self) -> usize { self.experts }
+
+    /// The slots of `ids` (ascending, distinct experts of this whole layer)
+    /// copied into compact planes, slot `i` holding expert `ids[i]`, as
+    /// [`Self::load_resident`] would load them: the tier's resident halves
+    /// without a checkpoint, for byte-identity tests against the whole layer.
+    #[cfg(test)]
+    pub(crate) fn resident_copy(&self, library: &'a NativeLibrary, ids: &[usize]) -> Result<Self> {
+        ensure!(self.resident.is_none() && self.nvfp4.is_none(), "resident copies take a whole native layer");
+        let sizes = std::array::from_fn(|i| self.buffers[i].buffer.bytes);
+        let (sizes, budget) = resident_subset(&sizes, self.budget, self.experts, ids)?;
+        let mut owned = Vec::with_capacity(4);
+        for (plane, &size) in sizes.iter().enumerate() {
+            let allocation = DeviceAllocation::new(library, size)?;
+            let source = self.buffers[plane].buffer;
+            let stride = source.bytes / self.experts;
+            for (slot, &id) in ids.iter().enumerate() {
+                let at = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, index: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+                    // SAFETY: `index < experts` of this plane, so the stride fits the allocation.
+                    ptr: unsafe { buffer.ptr.cast::<u8>().add(index * stride) }.cast(),
+                    bytes: stride, ..buffer };
+                library.copy_d2d(at(allocation.buffer, slot), at(source, id), stride)?;
+            }
+            owned.push(allocation);
+        }
+        let resident = ids.iter().map(|&id| u16::try_from(id)).collect::<Result<std::rc::Rc<[u16]>, _>>()?;
+        Ok(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native planes").map(Into::into),
+            layer: self.layer, experts: ids.len(), budget, nvfp4: None, format: self.format,
+            raw_scales: RawScales::none(), resident: Some(resident) })
+    }
 
     /// Loads (or records) expert `ids[i]` into slot `i` of `sizes` planes.
     fn load_slots(
@@ -1308,9 +1353,17 @@ impl<'a> ExpertWeights<'a> {
         kernel: &V41ExpertKernel<'_>,
         slots: &mut [*mut c_void; V41_EXPERT_POINTER_COUNT],
     ) -> Result<()> {
+        let kernel_experts = kernel.info().experts as usize;
         ensure!(
             kernel.info().role == self.layer.role()
-                && kernel.info().experts as usize == self.experts,
+                && match self.resident.as_deref() {
+                    // A resident subset (the GPU expert tier) holds fewer
+                    // experts than the kernel's layer; its routes carry
+                    // compact slots below `self.experts`.
+                    Some(ids) => self.experts <= kernel_experts
+                        && ids.last().is_some_and(|&id| usize::from(id) < kernel_experts),
+                    None => kernel_experts == self.experts,
+                },
             "expert weights do not match kernel role"
         );
         ensure!(
