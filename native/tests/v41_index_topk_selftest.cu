@@ -16,7 +16,8 @@
  * paths still agree with the multiset oracle).
  *
  *   v41_index_topk_selftest            correctness suite
- *   v41_index_topk_selftest --time     plus per-call times of both paths
+ *   v41_index_topk_selftest --time       plus per-call times of both paths
+ *   v41_index_topk_selftest --time-wide  plus times at prefill-sized row counts
  */
 #include "../families/deepseek_v41/cuda/v41_index_topk.cu"
 
@@ -419,6 +420,15 @@ void phases() {
 }
 #endif
 
+void timing_large() {
+  // Prefill-sized waves: many rows per call.
+  for (int r : {128, 256, 1024}) {
+    time_case<512, 1048576>(kBf16, r, 16384, 1, "16K, wide wave");
+    time_case<512, 1048576>(kBf16, r, 4096, 1, "4K, wide wave");
+    time_case<2048, 131072>(kBf16, r, 2048, 2, "blocks, wide wave");
+  }
+}
+
 }  // namespace topk_test
 
 int main(int argc, char** argv) {
@@ -433,6 +443,7 @@ int main(int argc, char** argv) {
               topk_test::checked_calls, topk_test::failures);
   if (topk_test::failures) return 1;
   if (argc > 1 && std::string(argv[1]) == "--time") topk_test::timing();
+  if (argc > 1 && std::string(argv[1]) == "--time-wide") topk_test::timing_large();
 #ifdef CUTEAFD_V41_TOPK_PHASES
   if (argc > 1 && std::string(argv[1]) == "--phases") topk_test::phases();
 #endif
