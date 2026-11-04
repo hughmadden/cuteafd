@@ -256,76 +256,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     Ok(MemoryLayout { devices, pool_tokens, waste, notes })
 }
 
+/// [`v41::solve_with_weight_limit`] over `request`'s fixed weight owners and `draft`.
 fn solve_with_weight_limit(request: &placement::PlacementRequest, draft: Option<&DraftInventory>,
     limit: u64) -> Result<placement::Placement> {
-    let mut placement = placement::solve(request)?;
-    loop {
-        let retained = retained_weight_bytes(request, &placement, draft)?;
-        let fits = retained.iter().all(|&bytes| bytes <= limit);
-        if fits { return Ok(placement); }
-        if let Some(tier) = placement.expert_tier.as_ref().filter(|tier| tier.experts > 0) {
-            // Shrink the tier by the excess, in whole experts (the largest
-            // per-expert part bounds how many must go).
-            let excess = retained.iter().map(|&bytes| bytes.saturating_sub(limit)).max().unwrap_or(0);
-            let largest = request.layers.iter().filter_map(|layer| layer.experts)
-                .flat_map(|cost| [cost.half[0].resident, cost.half[1].resident, cost.whole.resident])
-                .max().unwrap_or(0) / request.expert_tier.as_ref().map_or(1, |t| t.experts_per_layer.max(1)) as u64;
-            let drop = usize::try_from(excess.div_ceil(largest.max(1)))?.max(1);
-            let mut trial = request.clone();
-            let mut shrunk = trial.expert_tier.take().context("GPU expert tier request")?;
-            let keep = tier.experts.saturating_sub(drop);
-            ensure!(keep >= shrunk.pinned,
-                "V4.1 coordinator weight budget exceeded; pinned whole layers need more than {limit} bytes");
-            if shrunk.size == ExpertTierSize::Auto { trial.pool.pin_selected(placement.pool_tokens); }
-            shrunk.size = ExpertTierSize::Experts(keep);
-            trial.expert_tier = Some(shrunk);
-            placement = placement::solve(&trial)?;
-            continue;
-        }
-        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
-            && placement.onboard_layers > request.minimum_expert_layers,
-            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
-        let mut trial = request.clone();
-        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
-        // Keep pool-first's admitted pool while reducing only the optional prefix.
-        if matches!(request.onboard, Onboard::Auto) {
-            trial.pool.pin_selected(placement.pool_tokens);
-        }
-        placement = placement::solve(&trial)?;
-    }
-}
-
-fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placement::Placement,
-    draft: Option<&DraftInventory>) -> Result<Vec<u64>> {
-    let ranks = request.inventory.gpus.len();
-    (0..ranks).map(|gpu| {
-        let mut bytes = request.fixed.iter().filter(|d| usize::from(d.gpu) == gpu
-            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
-                || d.group == "external drafter weights"))
-            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
-        if gpu == ranks - 1 {
-            bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
-        }
-        if gpu == 0 && ranks == 2 {
-            // --tp2-dspark-experts: GPU0 holds the other half of dSpark's experts.
-            bytes = bytes.checked_add(draft.map_or(0, |d| d.peer_half)).context("V4.1 draft weight budget overflow")?;
-        }
-        if let Some(tier) = &placed.expert_tier {
-            bytes = bytes.checked_add(tier.resident_bytes.get(gpu).copied().unwrap_or(0))
-                .context("V4.1 GPU expert tier weight budget overflow")?;
-        }
-        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
-            if let Some(cost) = layer.experts {
-                let resident = match assigned.experts {
-                    placement::ExpertHome::RtxTp2 => cost.half[gpu].resident,
-                    placement::ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
-                    _ => 0,
-                };
-                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
-            }
-        }
-        Ok(bytes)
-    }).collect()
+    let fixed = v41::fixed_weight_bytes(&request.fixed, draft, request.inventory.gpus.len())?;
+    v41::solve_with_weight_limit(request, &fixed, limit)
 }
 
 /// `--tp2-dspark-experts`: dSpark's 3 x 128 routed experts as TP2 halves in the
@@ -412,7 +347,8 @@ mod tests {
         let unconstrained = placement::solve(&request)?;
         let placed = solve_with_weight_limit(&request, None, 10 * GIB)?;
         assert_eq!(placed.onboard_layers, 2);
-        assert_eq!(retained_weight_bytes(&request, &placed, None)?, vec![10 * GIB]);
+        assert_eq!(v41::retained_weight_bytes(&request, &placed, &v41::fixed_weight_bytes(&request.fixed, None, 1)?)?,
+            vec![10 * GIB]);
         assert!(placed.items[0].iter().filter(|i| i.category == Category::Experts)
             .map(|i| i.bytes).sum::<u64>() > 10 * GIB);
         assert!(placed.pool_tokens >= 262_144);

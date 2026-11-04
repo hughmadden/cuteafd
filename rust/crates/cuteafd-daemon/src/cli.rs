@@ -1286,6 +1286,11 @@ pub(crate) struct NativeServeArgs {
     /// plan --gpu-expert-tier-profile`); uniform popularity without one.
     #[arg(long, requires = "gpu_expert_tier")]
     pub gpu_expert_tier_profile: Option<PathBuf>,
+    /// Retained weight cap per coordinator GPU, GiB, as `cuteafd plan
+    /// --coordinator-weight-budget-gib` applies it: optional tier experts and
+    /// whole layers give way until each GPU's weights fit.
+    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
+    pub coordinator_weight_budget_gib: f64,
 
 
     /// Maximum active requests, shared by both execution lanes.

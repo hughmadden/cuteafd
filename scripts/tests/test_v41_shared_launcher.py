@@ -117,11 +117,15 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        # The planner's prefill waves and reserve reach the shared executor.
+        # The planner's prefill waves and reserve reach the shared executor,
+        # and serving applies the deployment plan's coordinator weight cap.
         value = lambda flag: after["command"][after["command"].index(flag) + 1]
+        plan = current["plans"][-1]
+        plan_cap = plan[plan.index("--coordinator-weight-budget-gib") + 1]
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
             "--prefill-waves", value("--prefill-waves"),
-            "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
+            "--prefill-reserve-rows", value("--prefill-reserve-rows"),
+            "--coordinator-weight-budget-gib", plan_cap] if role == "coordinator" else [])
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"

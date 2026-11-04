@@ -315,8 +315,9 @@ pub(super) fn admit_startup(
     // Native geometry queries may initialize modules. Observe that CUDA cost
     // only after every query, still before payloads or retained device owners.
     let (free, total) = measured_pool_memory(lib)?;
-    let pool = resolve_with_owners(args, &[(free, total)], experts, workspace, &[0], 0,
-        &fixed_demands, &startup, draft.as_ref())
+    let cap = WeightCap::over(args, &fixed_demands, draft.as_ref(), 1)?;
+    let pool = resolve_tiered(args, &[(free, total)], experts, workspace, &[0], 0,
+        &fixed_demands, &startup, draft.as_ref(), None, Some(&cap))
         .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}; reduce the prefill batch or increase coordinator memory"))?;
     tracing::info!(fixed_owner_bytes=fixed, loading_phases=?startup, owners=?fixed_demands,
         draft=?draft, admitted_cache_bytes=?pool.cache_bytes,
@@ -462,6 +463,7 @@ pub(super) fn local_workspace(
 
 /// With `draft`, the sample must precede all draft weights, runtime buffers and
 /// the draft-mark arena. `None` is for samples that already contain those owners.
+#[cfg(test)]
 pub(super) fn resolve(
     args: &crate::cli::NativeServeArgs,
     memory: &[(usize, usize)],
@@ -476,6 +478,7 @@ pub(super) fn resolve(
 
 /// `startup` contains full sequential peaks above `memory`, never staging-only
 /// deltas. Draft owners supplied separately must not also appear in `owners`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_with_owners(
     args: &crate::cli::NativeServeArgs,
@@ -488,7 +491,46 @@ pub(super) fn resolve_with_owners(
     startup: &[Demand],
     draft: Option<&families::deepseek_v41::DraftInventory>,
 ) -> Result<Admitted> {
-    resolve_tiered(args, memory, experts, workspace, deferred, minimum, owners, startup, draft, None)
+    resolve_tiered(args, memory, experts, workspace, deferred, minimum, owners, startup, draft, None, None)
+}
+
+/// The coordinator weight cap serving admits under, as `cuteafd plan` does
+/// (`--coordinator-weight-budget-gib`): `limit` bytes of retained weights per
+/// GPU, and each GPU's weights outside the routed experts (`fixed`, the
+/// planner's [`families::deepseek_v41::fixed_weight_bytes`]).
+pub(crate) struct WeightCap {
+    limit: u64,
+    fixed: Vec<u64>,
+}
+
+impl WeightCap {
+    /// The cap over `fixed` weight owners (and `draft`) already in hand.
+    pub(super) fn over(args: &crate::cli::NativeServeArgs, fixed: &[Demand], draft: Option<&families::deepseek_v41::DraftInventory>,
+        gpus: usize) -> Result<Self> {
+        let limit = cuteafd_loader::plan::budget_bytes("--coordinator-weight-budget-gib",
+            args.coordinator_weight_budget_gib)?;
+        Ok(Self { limit, fixed: families::deepseek_v41::fixed_weight_bytes(fixed, draft, gpus)? })
+    }
+
+    /// The cap of a launch whose backbone is loaded before admission samples
+    /// memory: its weights counted from the checkpoint's headers as the plan
+    /// counts them (the embedding only where it is on GPU0, `total` that
+    /// card's bytes), with `draft`'s.
+    pub(super) fn loaded(args: &crate::cli::NativeServeArgs, catalog: &cuteafd_loader::OfficialV41Catalog,
+        gpus: usize, total: usize, draft: Option<&families::deepseek_v41::DraftInventory>) -> Result<Self> {
+        use cuteafd_core::memory_layout::Category;
+        let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
+        let resident = families::deepseek_v41::resident::resident_headers(&config,
+            catalog.tensors().iter().map(|tensor| &tensor.metadata), gpus, false)
+            .context("unsupported V4.1 native backbone residency")?;
+        let host_embedding = embedding_placement(args.embedding_placement, total)
+            == crate::shared::memory::EmbedPlacement::Host;
+        let fixed = resident.into_iter().enumerate().flat_map(|(gpu, items)| items.into_iter()
+            .filter(move |item| !(host_embedding && item.category == Category::Embedding))
+            .map(move |item| Demand::new(gpu as u8, item.category, item.group, item.bytes, item.basis)))
+            .collect::<Vec<_>>();
+        Self::over(args, &fixed, draft, gpus)
+    }
 }
 
 /// `--gpu-expert-tier` as serving asks the solver for it: the planner's own
@@ -512,9 +554,13 @@ impl TierAsk {
     }
 }
 
-/// [`resolve_with_owners`], with the GPU expert tier `tier` in place of
-/// whole-layer onboarding (its TP2 halves on both GPUs, admitted after the
-/// pool as `cuteafd plan` admits them); `minimum` is then 0.
+/// The one shared admission before cache or conditional routed weights are
+/// allocated: `memory` is the context/module inventory less later live
+/// owners; `startup` holds full sequential peaks above it (never
+/// staging-only deltas); draft owners given as `draft` are not also in
+/// `owners`. The GPU expert tier `tier` replaces whole-layer onboarding (its
+/// TP2 halves on both GPUs, admitted after the pool as `cuteafd plan` admits
+/// them; `minimum` is then 0), and `cap` is the plan's coordinator weight cap.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_tiered(
     args: &crate::cli::NativeServeArgs,
@@ -527,6 +573,7 @@ pub(super) fn resolve_tiered(
     startup: &[Demand],
     draft: Option<&families::deepseek_v41::DraftInventory>,
     tier: Option<&TierAsk>,
+    cap: Option<&WeightCap>,
 ) -> Result<Admitted> {
     use cuteafd_core::memory_layout::{Basis, Category};
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
@@ -653,7 +700,10 @@ pub(super) fn resolve_tiered(
         args.resolved_prefix_entries() as u64,
         args.tp2_attention,
     )?;
-    let placement = solve(&req)?;
+    let placement = match cap {
+        Some(cap) => families::deepseek_v41::solve_with_weight_limit(&req, &cap.fixed, cap.limit)?,
+        None => solve(&req)?,
+    };
     families::deepseek_v41::validate_pool_floor(&req.pool, &placement)?;
     ensure!(
         placement.onboard_layers >= minimum,
@@ -1003,7 +1053,8 @@ mod admission_tests {
             args.gpu_expert_tier = tier.parse().map_err(anyhow::Error::msg)?;
             args.rtx_expert_layers = layers.parse()?;
             let ask = TierAsk::of(&args, &catalog)?.context("the tier is on")?;
-            resolve_tiered(&args, memory, experts, workspace, &vec![0; memory.len()], minimum, &[], &[], None, Some(&ask))
+            resolve_tiered(&args, memory, experts, workspace, &vec![0; memory.len()], minimum, &[], &[], None, Some(&ask),
+                None)
         };
         let planned = |setting| -> Result<ExpertTierPlacement> {
             planned_bytes(&snapshot, false, setting)?.solver_placement.and_then(|placement| placement.expert_tier)
@@ -1041,6 +1092,57 @@ mod admission_tests {
             Bytes2 { resident: 384 * (64 << 30), ..half }), ..*cost }).collect();
         let empty = serve("auto", "auto", &memory, huge, 0).map(|_| ()).unwrap_err().to_string();
         assert!(empty.contains("admitted no experts"), "{empty}");
+        Ok(())
+    }
+
+    /// Serving's coordinator weight cap counts each GPU's weights outside the
+    /// routed experts as `cuteafd plan` charges them (its weight, embedding and
+    /// table owners), and a cap below the admitted tier sheds tier experts
+    /// until every GPU's retained weights fit; a cap below the fixed weights
+    /// refuses.
+    #[test]
+    fn serving_weight_cap_counts_the_plans_weights_and_sheds_tier_experts() -> Result<()> {
+        use crate::shared::experts::layer::tp2_half_tests::{expert_fixture, planned_bytes};
+        use cuteafd_core::memory_layout::Category;
+        use families::deepseek_v41::{expert_inventory, owners::DECODE_LANE_ROWS};
+        let (_dir, catalog) = expert_fixture()?;
+        let snapshot = catalog.snapshot().to_path_buf();
+        let report = planned_bytes(&snapshot, false, ExpertTierSetting::PerLayer(6))?;
+        let layout = report.memory_layout.as_ref().context("the plan has a memory layout")?;
+        let card = ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89) as usize;
+        let mut args = args(&snapshot);
+        args.peers = vec![args.peers[0].clone(); 4];
+        args.rtx_gpus = 2;
+        args.max_context_tokens = 262_144;
+        let cap = WeightCap::loaded(&args, &catalog, 2, card, None)?;
+        for gpu in 0..2 {
+            let planned = layout.devices[gpu].items.iter()
+                .filter(|item| matches!(item.category, Category::Weights | Category::Embedding | Category::Tables))
+                .map(|item| item.bytes).sum::<u64>();
+            assert!(planned > 0);
+            assert_eq!(cap.fixed[gpu], planned, "GPU {gpu}: serving counts other weights than the plan");
+        }
+        // Under a cap 20 tier experts' halves short, the tier sheds experts.
+        let (experts, workspace) = expert_inventory(&catalog, &snapshot.join("share/PROGRAMS.json"), 256, 2, 128, 2, 512,
+            DECODE_LANE_ROWS)?;
+        args.gpu_expert_tier = "6".parse().map_err(anyhow::Error::msg)?;
+        let ask = TierAsk::of(&args, &catalog)?.context("the tier is on")?;
+        let memory = vec![(card - (4 << 30), card); 2];
+        let admit = |cap: &WeightCap| resolve_tiered(&args, &memory, experts.clone(), workspace, &[0; 2], 0, &[], &[],
+            None, Some(&ask), Some(cap));
+        let roomy = admit(&WeightCap { limit: u64::MAX, fixed: cap.fixed.clone() })?;
+        let tier = roomy.placement.expert_tier.as_ref().context("tier")?;
+        assert_eq!(tier.experts, 240);
+        let half = tier.resident_bytes[0] / 240;
+        let limit = cap.fixed.iter().zip(&tier.resident_bytes).map(|(fixed, tier)| fixed + tier).max().unwrap() - 20 * half;
+        let tight = admit(&WeightCap { limit, fixed: cap.fixed.clone() })?;
+        let shed = tight.placement.expert_tier.as_ref().context("tier under the cap")?;
+        assert!((200..240).contains(&shed.experts), "{} experts under the cap", shed.experts);
+        for gpu in 0..2 {
+            assert!(cap.fixed[gpu] + shed.resident_bytes[gpu] <= limit, "GPU {gpu} retains more than the cap");
+        }
+        // Below the fixed weights alone nothing optional is left to shed.
+        assert!(admit(&WeightCap { limit: cap.fixed[0].min(cap.fixed[1]) - 1, fixed: cap.fixed.clone() }).is_err());
         Ok(())
     }
 

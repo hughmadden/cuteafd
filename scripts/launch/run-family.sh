@@ -1554,6 +1554,8 @@ args+=("${api_args[@]}")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 args+=(${v41_tier_args[@]+"${v41_tier_args[@]}"})
+# The deployment plan's weight cap: serving sheds the same optional experts.
+args+=(--coordinator-weight-budget-gib "$profile_gib")
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
 [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
 if [[ -n "${POOL_TOKENS:-}" ]]; then
