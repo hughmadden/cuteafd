@@ -166,11 +166,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let routed = catalog.routed_experts();
     let tier = v41::TierChoice { setting: options.expert_tier, profile: options.expert_tier_profile.clone(),
         model: options.expert_tier_model };
-    // Serving reduces the tier's result as one more BF16 plane, which the
-    // fused compressed-reply codec does not take.
-    ensure!(!options.expert_tier.enabled()
-        || options.resolved_spark_reply_format(false) == cuteafd_core::SparkReplyFormat::Bf16,
-        "--gpu-expert-tier needs BF16 Spark replies: the fused compressed-reply reduction has no GPU expert tier plane");
     let tier_inputs = tier.inputs(routed.routed_layers(), routed.experts, routed.topk as u32)?;
     let onboard = if spark_ranks == 0 { Onboard::Layers(routed.routed_layers()) } else {
         options.resolve_onboard(routed.routed_layers()).unwrap_or(Onboard::Auto)

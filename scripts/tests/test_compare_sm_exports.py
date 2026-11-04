@@ -1312,14 +1312,16 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
 def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
     source = (ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/w4a16/expert_reply.py").read_text()
     tree = ast.parse(source)
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "compile_expert_reply_reduce_aot")
     record = lambda *args, **kwargs: SimpleNamespace(args=args, **kwargs)
     namespace = dict(compile_program=record, ExpertReplyReduce=lambda: "kernel",
+                     ExpertReplyReduceTier=lambda: "tier kernel",
                      Operand=record, Scalar=lambda name: name,
                      torch=SimpleNamespace(uint8="u8", bfloat16="bf16", uint32="u32"))
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
-    program = namespace[function.name]()
+    names = ("compile_expert_reply_reduce_aot", "compile_expert_reply_reduce_tier_aot")
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert sorted(function.name for function in functions) == sorted(names)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
+    program, tier = (namespace[name]() for name in names)
     assert program.name == "expert_reply_reduce" and program.key == ()
     assert [operand.args[0] for operand in program.operands] == [
         *(f"p{rank}" for rank in range(8)), "shared", "out", "mode"]
@@ -1327,6 +1329,22 @@ def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
     assert program.geometry == dict(max_ranks=8, fp8_block=32, nvfp4_block=16,
                                     rank_rounding="bf16", accumulation="ordered_fp32")
     assert "scratch" not in vars(program)
+    # The GPU expert tier's variant: one more BF16 plane, after the ranks and
+    # before shared, with the reduce's scalars and no scratch.
+    assert tier.name == "expert_reply_reduce_tier" and tier.key == () and tier.args == ("tier kernel",)
+    assert [operand.args[0] for operand in tier.operands] == [
+        *(f"p{rank}" for rank in range(8)), "tier", "shared", "out", "mode"]
+    assert tier.operands[8].args[1:] == ("bf16", "[rows,width]")
+    assert tier.scalars == program.scalars
+    assert tier.geometry == dict(program.geometry, tier_plane="after_ranks")
+    assert "scratch" not in vars(tier)
     exporter = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
     assert 'work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},' in exporter
     assert "compile_expert_reply_reduce_aot))" in exporter
+    # Coordinators (SM120, sm_89) add the tier variant last; an sm_89
+    # coordinator exports only the two reducers.
+    reply = exporter[exporter.index('if name == "expert_reply":'):]
+    reply = reply[:reply.index("continue")]
+    assert reply.index('"reduce"') < reply.index('"reduce_tier"')
+    assert 'if capability != (12, 1):' in reply and 'if capability != (8, 9):' in reply
+    assert 'an sm_89 coordinator exports only the expert_reply geometry' in exporter

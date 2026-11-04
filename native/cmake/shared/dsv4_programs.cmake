@@ -11,6 +11,8 @@
 # SM121 builds the Spark programs only: the union of what the enabled expert
 # families need (EXLR8's routed serving programs, and the partial-reply
 # epilogue `expert_partial` for families listed in CUTEAFD_PARTIAL_REPLY_FAMILIES).
+# An sm_89 coordinator (DeepSeek V4.1, whose programs have their own exporters)
+# builds only the Spark reply reducers (`expert_reply`).
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
    CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR
@@ -22,8 +24,12 @@ if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
 elseif(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^121" AND (CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
        AND NOT CUTEAFD_FAMILY_PROGRAMS)
   set(CUTEAFD_EXLR8_ROLE spark)
+elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89" AND NOT CUTEAFD_FAMILY_PROGRAMS AND NOT CUTEAFD_ENABLE_EXLR8_AOT
+       AND NOT CUTEAFD_PARTIAL_REPLY_PROGRAMS)
+  set(CUTEAFD_EXLR8_ROLE coordinator)
 else()
-  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the Spark programs)")
+  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the Spark programs, "
+    "an sm_89 coordinator only the Spark reply reducers)")
 endif()
 set(CUTEAFD_PROGRAM_GEOMETRY "")
 if(CUTEAFD_ENABLE_DSV4_AOT)

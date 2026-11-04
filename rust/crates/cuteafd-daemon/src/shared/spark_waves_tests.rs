@@ -2202,6 +2202,124 @@ fn gpu_reply_reduction_adds_the_tier_plane_after_the_ranks() -> Result<()> {
     stream.finish()
 }
 
+/// Compressed Spark replies and the GPU expert tier together: a slot's fused
+/// reduction decodes each rank's FP8 or NVFP4 wire plane (or reads BF16, as
+/// the slot's mode word says), rounds it to BF16, and sums ranks in order,
+/// then the tier's BF16 plane (`expert_reply_reduce_tier`), then shared, in
+/// FP32 rounded once: byte-identical to that decode and sum on the CPU, and
+/// without the plane to `expert_reply_reduce`'s. Unlike the BF16 reducer's
+/// eight planes, a full eight-rank wave still takes the tier's plane. The
+/// wire bytes are random codes, so no quantizer is needed (sm_89 has none).
+#[test]
+#[ignore = "requires a GPU and the native library with codec exports (CUTEAFD_PLANE_UPLOAD_LIBRARY)"]
+fn gpu_fused_reply_reduction_adds_the_tier_plane_after_the_ranks() -> Result<()> {
+    use crate::shared::memory::DeviceAllocation;
+    use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
+    let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
+    // SAFETY: the opt-in path names the built native library for this GPU.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    let fused = std::rc::Rc::new(FusedReplyReduce::bind(&library)?);
+    let hidden = 5120usize;
+    let bf16 = |value: f32| { let bits = value.to_bits(); ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16 };
+    let widen = |bits: u16| f32::from_bits(u32::from(bits) << 16);
+    let e4m3 = |code: u8| {
+        let (exponent, mantissa) = (i32::from((code >> 3) & 15), f32::from(code & 7) / 8.0);
+        let magnitude = if exponent == 0 { mantissa * 2f32.powi(-6) } else { (1.0 + mantissa) * 2f32.powi(exponent - 7) };
+        if code & 0x80 != 0 { -magnitude } else { magnitude }
+    };
+    let fp4 = |code: u8| {
+        let magnitude = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][usize::from(code & 7)];
+        if code & 8 != 0 { -magnitude } else { magnitude }
+    };
+    let mut state = 0x7e1d_f05eu64;
+    let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+    let stream = crate::shared::spark_intake::WarmStream::new(&library)?;
+    let mode = HostAllocation::new(&library, LINE)?;
+    for format in [Fp8, Nvfp4, Bf16] {
+        for (ranks, rows) in [(4usize, 65usize), (6, 130), (8, 65)] {
+            let count = rows * hidden;
+            let row_bytes = format.row_bytes(hidden).context("reply row bytes")?;
+            // Each rank's wire plane and its CPU decode, each value BF16-rounded.
+            let (wires, decoded): (Vec<Vec<u8>>, Vec<Vec<f32>>) = (0..ranks).map(|_| {
+                let mut wire = vec![0u8; rows * row_bytes];
+                let mut values = vec![0f32; count];
+                for row in 0..rows {
+                    let line = &mut wire[row * row_bytes..(row + 1) * row_bytes];
+                    match format {
+                        Fp8 => {
+                            // E4M3 codes without NaN; UE8M0 scales 2^-17..2^13.
+                            for code in &mut line[..hidden] { *code = loop { let c = next() as u8; if c & 0x7f != 0x7f { break c; } }; }
+                            for scale in &mut line[hidden..] { *scale = 110 + (next() % 31) as u8; }
+                            for col in 0..hidden {
+                                let scale = f32::from_bits(u32::from(line[hidden + col / 32]) << 23);
+                                values[row * hidden + col] = widen(bf16(e4m3(line[col]) * scale));
+                            }
+                        }
+                        Nvfp4 => {
+                            // Packed E2M1 pairs (low nibble first); positive normal E4M3 scales.
+                            for pair in &mut line[..hidden / 2] { *pair = next() as u8; }
+                            for scale in &mut line[hidden / 2..] { *scale = ((1 + next() % 14) << 3 | next() % 8) as u8; }
+                            for col in 0..hidden {
+                                let code = (line[col / 2] >> (4 * (col % 2))) & 15;
+                                values[row * hidden + col] = widen(bf16(fp4(code) * e4m3(line[hidden / 2 + col / 16])));
+                            }
+                        }
+                        Bf16 => for col in 0..hidden {
+                            let value = bf16(((next() >> 11) as f32 / (1u64 << 53) as f32 - 0.5)
+                                * [1.0f32, 64.0, 1.0 / 64.0][(next() % 3) as usize]);
+                            line[2 * col..2 * col + 2].copy_from_slice(&value.to_le_bytes());
+                            values[row * hidden + col] = widen(value);
+                        },
+                    }
+                }
+                (wire, values)
+            }).unzip();
+            // The tier's plane and the shared expert's, BF16 at mixed magnitudes.
+            let extras: Vec<Vec<u16>> = (0..2).map(|_| (0..count).map(|_| bf16(((next() >> 11) as f32
+                / (1u64 << 53) as f32 - 0.5) * [1.0f32, 64.0, 1.0 / 64.0][(next() % 3) as usize])).collect()).collect();
+            let upload = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
+                let allocation = DeviceAllocation::new(&library, bytes.len())?;
+                library.copy_h2d(allocation.buffer, bytes)?;
+                Ok(allocation)
+            };
+            let planes_on_device = wires.iter().map(|wire| upload(wire)).collect::<Result<Vec<_>>>()?;
+            let extras_on_device = extras.iter().map(|plane| upload(&plane.iter().flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?;
+            let output = DeviceAllocation::new(&library, count * 2)?;
+            let mut planes = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+            for (pointer, plane) in planes.iter_mut().zip(&planes_on_device) { *pointer = plane.buffer.ptr.cast_const().cast(); }
+            // SAFETY: the mapped mode word is read by the launches below, after this write.
+            unsafe { mode.buffer.ptr.cast::<u32>().write_volatile(match format { Bf16 => 0, Fp8 => 1, Nvfp4 => 2 }) };
+            let reduction = ReplyReduction { planes, ranks: ranks as u32, hidden, capacity: rows,
+                fused: Some(fused.clone()), mode: mode.buffer.ptr.cast() };
+            let tier = extras_on_device[0].buffer.ptr.cast_const().cast::<u16>();
+            for (extra, shared) in [(None, true), (Some(tier), true), (Some(tier), false)] {
+                let shared_plane = if shared { extras_on_device[1].buffer.ptr.cast_const().cast() } else { std::ptr::null() };
+                // SAFETY: every plane, the tier's and shared values and the
+                // output hold `rows` rows on this device; synchronized before reading.
+                unsafe {
+                    reduction.launch_with(&library, extra, shared_plane, output.buffer.ptr.cast(), rows, stream.raw())?;
+                    library.cuda_stream_synchronize(stream.raw())?;
+                }
+                let mut raw = vec![0u8; count * 2];
+                library.copy_d2h(&mut raw, output.buffer)?;
+                let actual: Vec<u16> = raw.chunks_exact(2).map(|word| u16::from_le_bytes([word[0], word[1]])).collect();
+                let expected: Vec<u16> = (0..count).map(|index| {
+                    let mut sum = decoded[0][index];
+                    for plane in &decoded[1..] { sum += plane[index]; }
+                    if extra.is_some() { sum += widen(extras[0][index]); }
+                    if shared { sum += widen(extras[1][index]); }
+                    bf16(sum)
+                }).collect();
+                ensure!(actual == expected, "{format} {ranks} ranks, {rows} rows, tier plane {}, shared {shared}: {} of \
+                    {count} values differ", extra.is_some(), actual.iter().zip(&expected).filter(|(a, b)| a != b).count());
+            }
+            eprintln!("fused reply reduction: {format}, {ranks} rank planes + the tier's, {rows} rows, byte-identical to the CPU decode and sum");
+        }
+    }
+    stream.finish()
+}
+
 /// Host-ordered collects through the real exchange (as `finish_values` runs
 /// them): the host waits for each wave, queuing arrived ranks of wide waves
 /// meanwhile (`pull_arrived`), then lands, reduces and consumes. Landed by

@@ -1196,7 +1196,13 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply") for g in geometries)):
+    capability = (props.major, props.minor)
+    if capability == (8, 9):
+        # An sm_89 coordinator exports only the Spark reply reducers (its V4.1
+        # programs have their own exporters).
+        if set(geometries) != {"expert_reply"} or args.context_split_only:
+            raise SystemExit("an sm_89 coordinator exports only the expert_reply geometry")
+    elif capability not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply") for g in geometries)):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -1237,14 +1243,22 @@ def main() -> None:
             continue
         if name == "expert_reply":
             from b12x.moe._shared.kernels.w4a16.expert_reply import (compile_expert_reply_aot,
-                compile_expert_reply_reduce_aot)
+                compile_expert_reply_reduce_aot, compile_expert_reply_reduce_tier_aot)
             manifest["families"][name] = {"fp8_block": 32, "nvfp4_block": 16}
-            for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
-                work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
-                             lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
-            work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+            if capability != (8, 9):
+                # An sm_89 coordinator only decodes Spark replies (and has no
+                # E2M1 conversion for the quantizer).
+                for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
+                    work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
+                                 lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
+                work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
             work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
                          compile_expert_reply_reduce_aot))
+            if capability != (12, 1):
+                # Coordinators: the reduce with a GPU expert tier's BF16 plane.
+                # Last, so every other program keeps its object and table index.
+                work.append((name, "reduce_tier", "expert_reply", {"max_rows": args.prefill_rows},
+                             compile_expert_reply_reduce_tier_aot))
             continue
         if name == "expert_partial":
             from export_b12x_expert_partial_aot import programs as partial_programs
@@ -1455,6 +1469,7 @@ def main() -> None:
     (output / "dsv4_programs.h").write_text("\n".join([
         "#pragma once",
         *includes,
+        f"#define CUTEAFD_DSV4_CC_MAJOR {props.major}",
         f"#define CUTEAFD_DSV4_CC_MINOR {props.minor}",
         "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join(entries),
         "",
