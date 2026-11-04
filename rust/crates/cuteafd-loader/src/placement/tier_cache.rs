@@ -13,12 +13,15 @@
 //!   from the window itself (an oracle, the bound for any predictor). New
 //!   residents upload while the window's first steps run on the old set, all
 //!   of them slowed by the upload's interference.
-//! - **Not modelled:** a resident change also changes where a prefix's
-//!   experts ran, which the static tier keeps fixed so prefix-cache restores
-//!   stay byte-exact.
+//! - **Exactness:** GPU and Spark expert results differ in their low bits,
+//!   so a resident change makes a prefix's state depend on when it ran. With
+//!   byte-exact prefix restores, every snapshot a change could touch is lost:
+//!   [`invalidations`] prices that from the replayed requests
+//!   ([`ReplayedRequest`]), as the re-prefill of each turn whose cached
+//!   prefix outlived a change.
 use super::expert_tier::{optimized_order, ExpertActivation, ExpertRouteProfile, ExpertTierError, TierStepModel};
 use super::route_trace::RouteWindow;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The costs beside the tier's step model.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -87,10 +90,15 @@ pub struct CacheOutcome {
     pub uploads_per_window: f64,
     /// Share of the expected expert reads that resident experts serve, step-weighted.
     pub hit_rate: f64,
+    /// Windows whose residents changed at their start, by position in the
+    /// replayed slice.
+    #[serde(skip)]
+    pub changed: Vec<usize>,
 }
 
 /// One window as the replay sees it.
 struct Window {
+    position: usize,
     steps: u64,
     counts: Vec<Vec<u64>>,
     activation: ExpertActivation,
@@ -121,6 +129,7 @@ pub fn simulate(windows: &[RouteWindow], topk: usize, capacity: usize, costs: &C
     let mut history: Vec<&Window> = Vec::new();
     let mut last_used = vec![vec![(None::<usize>, 0u64); experts]; layers];
     let (mut time, mut expert_time, mut interference, mut uploads, mut hits, mut steps) = (0.0, 0.0, 0.0, 0u64, 0.0, 0u64);
+    let mut changed = Vec::new();
     for (index, window) in windows.iter().enumerate() {
         let next = match policy {
             CachePolicy::Static(_) => residents.clone(),
@@ -155,6 +164,7 @@ pub fn simulate(windows: &[RouteWindow], topk: usize, capacity: usize, costs: &C
         hits += waiting * hit_rate(&window.activation, &residents) + rest * hit_rate(&window.activation, &next);
         uploads += added;
         steps += window.steps;
+        if added > 0 { changed.push(window.position); }
         residents = next;
         if let CachePolicy::Lru { threshold } = policy {
             let threshold = (*threshold).max(1);
@@ -169,7 +179,7 @@ pub fn simulate(windows: &[RouteWindow], topk: usize, capacity: usize, costs: &C
     let per_step = |total: f64| if steps == 0 { 0.0 } else { total / steps as f64 };
     Ok(CacheOutcome { policy: policy.name(), windows: windows.len(), steps, step_ns: per_step(time),
         expert_ns: per_step(expert_time), upload_ns: per_step(interference),
-        uploads_per_window: uploads as f64 / windows.len() as f64, hit_rate: per_step(hits) })
+        uploads_per_window: uploads as f64 / windows.len() as f64, hit_rate: per_step(hits), changed })
 }
 
 /// The trace's decode and verify counts summed over its windows: the profile
@@ -187,10 +197,125 @@ pub fn trace_totals(windows: &[RouteWindow]) -> Option<ExpertRouteProfile> {
 
 /// The windows that ran decode steps, with their per-step activations.
 fn prepare(windows: &[RouteWindow], topk: usize, model: &TierStepModel) -> Result<Vec<Window>, ExpertTierError> {
-    windows.iter().filter(|w| w.step_count() > 0 && w.tokens > 0).map(|w| {
+    windows.iter().enumerate().filter(|(_, w)| w.step_count() > 0 && w.tokens > 0).map(|(position, w)| {
         let rows = (w.tokens as f64 / w.step_count() as f64).round().max(1.0) as u32;
-        Ok(Window { steps: w.step_count(), counts: w.layers.clone(), activation: activation(&w.layers, rows, topk, model)? })
+        Ok(Window { position, steps: w.step_count(), counts: w.layers.clone(),
+            activation: activation(&w.layers, rows, topk, model)? })
     }).collect()
+}
+
+/// One request as the traffic driver logged it: its client session, its turn
+/// in that session, wall-clock milliseconds, and the server's token usage
+/// (`cached_tokens`: the prompt prefix served from the prefix cache).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReplayedRequest {
+    pub session: String,
+    pub turn: u64,
+    pub started_ms: i64,
+    pub ended_ms: i64,
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl ReplayedRequest {
+    /// The requests of a driver log (JSON lines), without failed ones.
+    pub fn read(path: &std::path::Path) -> Result<Vec<Self>, ExpertTierError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| ExpertTierError::Profile(format!("reading {}: {error}", path.display())))?;
+        let mut requests = Vec::new();
+        for (number, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+            let request: Self = serde_json::from_str(line).map_err(|error|
+                ExpertTierError::Profile(format!("{} line {}: {error}", path.display(), number + 1)))?;
+            if request.error.is_none() { requests.push(request); }
+        }
+        Ok(requests)
+    }
+}
+
+/// Seconds since the epoch of an RFC 3339 UTC time as the census writes it
+/// (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn rfc3339_seconds(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':'
+        || bytes[16] != b':' || bytes[19] != b'Z' { return None; }
+    let field = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 { return None; }
+    // Days from the civil date (Howard Hinnant), March-based years.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some((era * 146_097 + day_of_era - 719_468) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// A window's wall-clock span in milliseconds: its open and close seconds,
+/// the close second included.
+fn span_ms(window: &RouteWindow) -> Option<(i64, i64)> {
+    Some((rfc3339_seconds(&window.started)? * 1000, rfc3339_seconds(&window.time)? * 1000 + 999))
+}
+
+/// Each window's client session: the one whose requests overlap its span
+/// the most (`None` where none does, or the window has no times).
+pub fn window_sessions(windows: &[RouteWindow], requests: &[ReplayedRequest]) -> Vec<Option<String>> {
+    windows.iter().map(|window| {
+        let (open, close) = span_ms(window)?;
+        let mut overlap: std::collections::BTreeMap<&str, i64> = Default::default();
+        for request in requests {
+            let shared = close.min(request.ended_ms) - open.max(request.started_ms);
+            if shared > 0 { *overlap.entry(request.session.as_str()).or_default() += shared; }
+        }
+        overlap.into_iter().max_by_key(|&(session, shared)| (shared, std::cmp::Reverse(session)))
+            .map(|(session, _)| session.to_owned())
+    }).collect()
+}
+
+/// What byte-exact prefix restores cost a policy: the turns whose cached
+/// prefix was computed before a resident change and reused after it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Invalidation {
+    /// Turns that lose their cached prefix, of the turns that had one.
+    pub turns: usize,
+    pub cached_turns: usize,
+    /// Prompt tokens prefilled again, and the time that takes.
+    pub tokens: u64,
+    pub seconds: f64,
+}
+
+/// Prices `changed` (window positions in `windows` whose residents changed
+/// at their start) against `requests`: a turn whose cached prefix came from
+/// its session's previous turn loses it when a change falls between that
+/// turn's start and its own, and prefills it again at `prefill_tok_s`.
+pub fn invalidations(windows: &[RouteWindow], changed: &[usize], requests: &[ReplayedRequest],
+    prefill_tok_s: f64) -> Invalidation {
+    let mut changes: Vec<i64> = changed.iter().filter_map(|&position|
+        windows.get(position).and_then(|window| span_ms(window)).map(|(open, _)| open)).collect();
+    changes.sort_unstable();
+    let mut sessions: std::collections::BTreeMap<&str, Vec<&ReplayedRequest>> = Default::default();
+    for request in requests { sessions.entry(request.session.as_str()).or_default().push(request); }
+    let mut priced = Invalidation { turns: 0, cached_turns: 0, tokens: 0, seconds: 0.0 };
+    for turns in sessions.values_mut() {
+        turns.sort_by_key(|request| (request.turn, request.started_ms));
+        for pair in turns.windows(2) {
+            let (previous, turn) = (pair[0], pair[1]);
+            let cached = turn.cached_tokens.unwrap_or(0);
+            if cached == 0 { continue; }
+            priced.cached_turns += 1;
+            let first = changes.partition_point(|&change| change < previous.started_ms);
+            if changes.get(first).is_some_and(|&change| change <= turn.started_ms) {
+                priced.turns += 1;
+                priced.tokens += cached;
+            }
+        }
+    }
+    priced.seconds = if prefill_tok_s > 0.0 { priced.tokens as f64 / prefill_tok_s } else { 0.0 };
+    priced
 }
 
 /// Rows per step over the trace, for planning from summed counts.
@@ -317,6 +442,64 @@ mod tests {
         let held = run(&windows, &CachePolicy::WindowedLfu { windows: 1, margin: 4.0 }, &costs);
         // Eager swaps expert 3 for 30 after window 3 and back after window 4.
         assert_eq!((eager.uploads_per_window, held.uploads_per_window), ((2 * LAYERS) as f64 / 6.0, 0.0));
+    }
+
+    #[test]
+    fn census_times_read_as_epoch_seconds() {
+        assert_eq!(rfc3339_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_seconds("2026-09-21T14:13:20Z"), Some(1_790_000_000));
+        assert_eq!(rfc3339_seconds("2024-02-29T23:59:59Z"), Some(1_709_251_199));
+        for bad in ["", "2026-09-21 14:13:20Z", "2026-13-01T00:00:00Z", "2026-09-21T14:13:20", "x026-09-21T14:13:20Z"] {
+            assert_eq!(rfc3339_seconds(bad), None, "{bad}");
+        }
+    }
+
+    /// Window `index` spans seconds [10 index, 10 index + 9] of a fixed day.
+    fn timed(index: u64, hot: &[usize; 4]) -> RouteWindow {
+        // 1_790_000_000 is 2026-09-21T14:13:20Z; the offsets stay inside the hour.
+        let at = |offset: u64| { let second = 13 * 60 + 20 + offset;
+            format!("2026-09-21T14:{:02}:{:02}Z", second / 60, second % 60) };
+        let mut window = window(index, hot);
+        (window.started, window.time) = (at(10 * index), at(10 * index + 9));
+        window
+    }
+
+    fn request(session: &str, turn: u64, from_s: i64, to_s: i64, cached: u64) -> ReplayedRequest {
+        let base = 1_790_000_000_000i64;
+        ReplayedRequest { session: session.into(), turn, started_ms: base + from_s * 1000, ended_ms: base + to_s * 1000,
+            prompt_tokens: Some(cached + 100), cached_tokens: Some(cached), error: None }
+    }
+
+    #[test]
+    fn windows_join_their_sessions_and_changes_price_the_reused_prefixes() {
+        let windows: Vec<_> = (0..4).map(|i| timed(i, &A)).collect();
+        assert_eq!(rfc3339_seconds(&windows[1].started), Some(1_790_000_010));
+        assert_eq!(rfc3339_seconds(&windows[3].time), Some(1_790_000_039));
+        // Session s runs turns in windows 0, 1 and 3; t has window 2.
+        let requests = [request("s", 0, 0, 9, 0), request("s", 1, 10, 19, 5000), request("t", 0, 20, 29, 0),
+            request("s", 2, 30, 39, 9000)];
+        assert_eq!(window_sessions(&windows, &requests), ["s", "s", "t", "s"].map(|s| Some(s.to_owned())));
+        // No change: nothing to prefill again.
+        assert_eq!(invalidations(&windows, &[], &requests, 1000.0),
+            Invalidation { turns: 0, cached_turns: 2, tokens: 0, seconds: 0.0 });
+        // A change at window 2 falls between turns 1 and 2 of s: turn 2 loses its 9000-token prefix.
+        assert_eq!(invalidations(&windows, &[2], &requests, 1000.0),
+            Invalidation { turns: 1, cached_turns: 2, tokens: 9000, seconds: 9.0 });
+        // A change at window 1 (turn 1's start) costs turn 1 and turn 2 both.
+        assert_eq!(invalidations(&windows, &[1], &requests, 1000.0).tokens, 14_000);
+        // Windows without times join nothing and price nothing.
+        assert_eq!(window_sessions(&[window(0, &A)], &requests), [None]);
+        assert_eq!(invalidations(&[window(0, &A)], &[0], &requests, 1000.0).turns, 0);
+    }
+
+    #[test]
+    fn a_policy_reports_the_windows_it_changed() {
+        let windows: Vec<_> = (0..8).map(|i| window(i, if i < 4 { &A } else { &B })).collect();
+        let costs = CacheCosts::measured(15_000_000);
+        let lfu = run(&windows, &CachePolicy::WindowedLfu { windows: 1, margin: 0.0 }, &costs);
+        // Static starts on A's tier from the totals; LFU moves to B a window late.
+        assert_eq!(lfu.changed, vec![5]);
+        assert!(run(&windows, &CachePolicy::Static(totals(&windows)), &costs).changed.is_empty());
     }
 
     #[test]
