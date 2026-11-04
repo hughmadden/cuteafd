@@ -216,6 +216,30 @@ impl ReplicatedGroupPlanner {
     }
 }
 
+/// For each route of `experts` (rows of six distinct ids) in `layer`, whether
+/// `planner` marks it for the coordinator (a probe request, encoded as the
+/// link's requests are).
+pub(crate) fn coordinator_routes(planner: &std::sync::Mutex<ReplicatedGroupPlanner>, layer: u32, experts: &[u32])
+    -> Result<Vec<bool>> {
+    use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
+    ensure!(!experts.is_empty() && experts.len() % 6 == 0, "a tier probe routes whole rows of six experts");
+    let rows = (experts.len() / 6) as u32;
+    let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row.into(),
+        source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row.into(),
+        route_offset: row * 6, route_count: 6 }).collect();
+    let routes = experts.iter().enumerate().map(|(index, &expert_id)| ExpertProtocolV2RouteEntry {
+        row_index: index as u32 / 6, expert_id, gate_weight: 1.0 / 6.0 }).collect();
+    let mut request = ExpertProtocolV2Request::new(1, 0, layer, 5120, ExpertV2Dtype::Fp8E4m3Ue8m0K32, descriptors, routes,
+        vec![0; rows as usize * 5280])?;
+    request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    let mut planner = planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?;
+    let groups = planner.topology().group_count();
+    planner.encode(&mut request)?;
+    let coordinator = request.header.flags & cuteafd_transport::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG != 0;
+    request.routes.iter().map(|route| Ok(cuteafd_transport::expert::V41NativeOwnerRouteWord::decode_owned(
+        route.expert_id, groups, coordinator)?.is_coordinator())).collect()
+}
+
 /// A Spark link with V4.1's request contract: the link and, for an explicit
 /// `TP×EP` topology, the planner that encodes each request's ownership in
 /// issue order (shared with the exchange worker). Decode lanes each own one;
@@ -224,13 +248,16 @@ impl ReplicatedGroupPlanner {
 pub(crate) struct V41Link<'a> {
     link: crate::shared::spark_intake::SparkLink<'a>,
     native: Option<(SparkTopology, std::sync::Arc<std::sync::Mutex<ReplicatedGroupPlanner>>)>,
+    /// The GPU expert tier whose experts this link's requests leave to the
+    /// coordinator ([`Self::enable_tier`]).
+    tier: Option<std::sync::Arc<super::tier::TierResidency>>,
 }
 impl<'a> V41Link<'a> {
     pub(crate) fn new(link: crate::shared::spark_intake::SparkLink<'a>,
         topology: Option<SparkTopology>) -> Result<Self> {
         let native = topology.map(|topology| ReplicatedGroupPlanner::new(topology)
             .map(|planner| (topology, std::sync::Arc::new(std::sync::Mutex::new(planner))))).transpose()?;
-        Ok(Self { link, native })
+        Ok(Self { link, native, tier: None })
     }
     /// The one prefill link: `slots` return slots of `unit_rows` rows.
     pub(crate) fn prefill(library: &'a NativeLibrary, transport: SparkExperts, slots: usize, unit_rows: u32)
@@ -255,10 +282,30 @@ impl<'a> V41Link<'a> {
     /// link ([`ReplicatedGroupPlanner::set_tier`]). The link must carry the
     /// owned Spark wire (an explicit `TP×EP` topology): the canonical wire has
     /// no owner field to mark. Before the link's first request.
+    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
     pub(crate) fn enable_tier(&mut self, tier: std::sync::Arc<super::tier::TierResidency>) -> Result<()> {
+        ensure!(self.tier.is_none(), "the GPU expert tier is already enabled on this Spark link");
+        // The tier's result is one more plane in the link's reduce (eight at most).
+        ensure!(self.link.world_size() < crate::shared::spark_intake::MAX_INTAKE_RANKS,
+            "a {}-rank Spark link has no reduce plane left for the GPU expert tier", self.link.world_size());
         let (_, planner) = self.native.as_ref().context(
             "the GPU expert tier needs the owned Spark wire (an explicit TP×EP topology) to mark its routes")?;
-        planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.set_tier(tier)
+        planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.set_tier(tier.clone())?;
+        self.tier = Some(tier);
+        Ok(())
+    }
+    /// The GPU expert tier this link's requests leave to the coordinator.
+    pub(crate) fn tier(&self) -> Option<&std::sync::Arc<super::tier::TierResidency>> { self.tier.as_ref() }
+    /// For each route of `experts` (rows of six distinct ids) in `layer`,
+    /// whether this link's request marks it for the coordinator: the host
+    /// view of the GPU expert tier, through the link's own planner.
+    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
+    pub(crate) fn coordinator_routes(&self, layer: u32, experts: &[u32]) -> Result<Vec<bool>> {
+        coordinator_routes(&self.native.as_ref().context("the Spark link has no owned wire")?.1, layer, experts)
+    }
+    /// Whether this link's requests leave experts of `layer` to the coordinator.
+    pub(crate) fn tier_holds(&self, layer: usize) -> bool {
+        self.tier.as_ref().is_some_and(|tier| !tier.ids(layer).is_empty())
     }
     pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
     pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }
@@ -322,6 +369,42 @@ impl<'a> NativeTp4Wave<'a> {
     pub fn install_tp2(&mut self, wave: super::tp2_ffn::Wave<'a>) -> Result<()> {
         ensure!(self.local.is_none() && self.tp2.is_none(), "local expert lane already installed");
         self.tp2 = Some(Box::new(wave));
+        Ok(())
+    }
+    /// Runs the GPU expert tier on this decode lane's Spark layers: its TP2
+    /// FFN runs `halves` beside the Spark wave, and its link's requests leave
+    /// the same experts (one `TierResidency`) to the coordinator. A lane's two
+    /// views of the set can then never disagree: the Sparks skip exactly the
+    /// routes the GPUs run. At rest, before the link's first request.
+    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
+    pub(crate) fn enable_tier(&mut self, halves: &super::tier::TierHalves<'a>) -> Result<()> {
+        let tp2 = self.tp2.as_ref().context("the GPU expert tier runs on the lane's TP2 FFN (two RTX)")?;
+        ensure!(self.link.is_some(), "the GPU expert tier runs on a decode lane with its own Spark link");
+        tp2.install_tier(halves)?;
+        self.own_link()?.enable_tier(halves.residency.clone())?;
+        self.verify_tier()
+    }
+    /// The startup check ([`super::tier::check_views`]): for every layer, the
+    /// routes this lane's Spark requests leave to the coordinator are exactly
+    /// those both GPUs' slot tables run, each slot naming its route's expert.
+    /// Host owners come from the link's planner, device slots from each GPU's
+    /// uploaded tables through the slot kernel, as the serving path uses them.
+    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
+    fn verify_tier(&self) -> Result<()> {
+        let link = self.link.as_ref().context("the GPU expert tier runs on a decode lane with its own Spark link")?;
+        let tp2 = self.tp2.as_ref().context("the GPU expert tier runs on the lane's TP2 FFN")?;
+        let residency = link.tier().context("the Spark link has no GPU expert tier")?;
+        ensure!(tp2.tier().is_some_and(|tier| std::sync::Arc::ptr_eq(tier, residency)),
+            "the Spark link and the TP2 FFN hold different GPU expert tiers");
+        let probe = super::tier::probe_ids(residency.experts());
+        for layer in 0..residency.layers() {
+            let host = link.coordinator_routes(layer as u32, &probe)?;
+            for (gpu, slots) in tp2.probe_tier_slots(layer, &probe)?.iter().enumerate() {
+                super::tier::check_views(residency, layer, gpu as i32, &probe, &host, slots)?;
+            }
+        }
+        tracing::info!(layers = residency.resident_layers().len(), experts = residency.total(),
+            "GPU expert tier: Spark marking and both GPUs' slot tables agree on every layer");
         Ok(())
     }
     /// Selects a prefill slot's rows in its TP2 FFN's shared planes, at rest
@@ -489,10 +572,16 @@ impl<'a> NativeTp4Wave<'a> {
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativePendingFfn<'w, 'a>> {
         self.ready_rows = None;
         let link = self.link.as_mut().context("prefill-only slot has no Spark link of its own")?;
+        // The Sparks skip this layer's tier experts exactly when the TP2 FFN
+        // runs them (one set: `enable_tier`).
+        let tiered = link.tier_holds(routed.layer);
+        ensure!(tiered == self.tp2.as_ref().is_some_and(|tp2| tp2.tier_holds(routed.layer)),
+            "layer {}: the Spark link and the TP2 FFN disagree on the GPU expert tier", routed.layer);
         let ticket = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
         Ok(NativePendingFfn { ticket: ticket.0, binding: ticket.1, layer: routed.layer, rows: routed.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() })
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(),
+            tier: tiered.then_some([routed.expert_input, routed.ids, routed.routing]) })
     }
     /// A prefill unit's wave on the shared prefill `link` (its return slots
     /// hold the in-flight units): the returned ticket owns nothing borrowed, so
@@ -506,6 +595,9 @@ impl<'a> NativeTp4Wave<'a> {
         router_stream: *mut std::ffi::c_void, placement: u64,
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativeUnitFfn> {
         self.ready_rows = None;
+        // Prefill units do not run the GPU expert tier: their link must leave
+        // every expert to the Sparks.
+        ensure!(link.tier().is_none(), "prefill units do not run the GPU expert tier; its link must not mark it");
         let (ticket, binding) = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
         Ok(NativeUnitFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
             owner: self.output.buffer.ptr as usize })
@@ -526,13 +618,13 @@ impl<'a> NativeTp4Wave<'a> {
         values.bytes = unit.rows as usize * 10240;
         let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() };
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(), tier: None };
         let destination = Some(destination).filter(|&device| device != self.output.buffer.device_id);
         if destination.is_some() {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.buffer.device_id };
-            device.future(unsafe { pending.finish_values(values, destination) }).await
+            device.future(unsafe { pending.finish_values(values, destination, None) }).await
         } else {
-            unsafe { pending.finish_values(values, None).await }
+            unsafe { pending.finish_values(values, None, None).await }
         }
     }
     /// The TP2 shared contribution of a prefill unit, into this transport's
@@ -637,6 +729,9 @@ pub(crate) struct NativePendingFfn<'w, 'a> {
     output: CuteafdDeviceBuffer,
     ready_rows: &'w mut Option<u32>,
     tp2: Option<&'w mut super::tp2_ffn::Wave<'a>>,
+    /// The router's FP8-K32 wire, ids and gate weights when the GPU expert
+    /// tier holds experts of this layer (the request left them to the coordinator).
+    tier: Option<[CuteafdDeviceBuffer; 3]>,
 }
 impl<'w> NativePendingFfn<'w, '_> {
     /// # Safety
@@ -648,7 +743,8 @@ impl<'w> NativePendingFfn<'w, '_> {
         ensure!(self.binding == shared.binding()? && self.layer == shared.layer && self.rows == shared.rows
             && shared.values.bytes == self.rows as usize * 10240 && shared.values.device_id == self.output.device_id,
             "native TP shared contribution differs from routed request");
-        unsafe { self.finish_values(shared.values, None).await }
+        ensure!(self.tier.is_none(), "the GPU expert tier runs only beside TP2 shared halves");
+        unsafe { self.finish_values(shared.values, None, None).await }
     }
     /// Run shared TP2 after the Spark dispatch, reduce on the transport GPU, and
     /// return the result to the block's GPU. The pending owner retains every lane workspace.
@@ -659,19 +755,32 @@ impl<'w> NativePendingFfn<'w, '_> {
         ensure!(self.binding == input.binding() && self.layer == input.layer
             && self.rows as usize == input.tokens.len() && matches!(input.values.device_id, 0 | 1),
             "TP2 shared input/request/device differs");
-        let values = unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
-            .execute_shared_on(input.layer, self.rows, input.values, self.output.device_id as usize).await? };
+        let tp2 = self.tp2.as_mut().context("TP2 shared workspace missing")?;
+        let (values, tier) = match self.tier {
+            // The tier's halves run beside the shared halves; its result
+            // joins the Spark reduce on the reduce's GPU.
+            Some([wire, ids, routing]) => {
+                let (values, tier) = unsafe { tp2.execute_shared_and_tier_on(input.layer, self.rows, input.values,
+                    wire, ids, routing, self.output.device_id as usize).await? };
+                (values, Some(tier))
+            }
+            None => (unsafe { tp2.execute_shared_on(input.layer, self.rows, input.values,
+                self.output.device_id as usize).await? }, None),
+        };
         let destination = input.values.device_id;
         if destination != self.output.device_id {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.device_id };
-            device.future(unsafe { self.finish_values(values, Some(destination)) }).await
+            device.future(unsafe { self.finish_values(values, Some(destination), tier) }).await
         } else {
-            unsafe { self.finish_values(values, Some(destination)).await }
+            unsafe { self.finish_values(values, Some(destination), tier).await }
         }
     }
-    async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, destination: Option<i32>) -> Result<NativeFfnOutput<'w>> {
+    async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, destination: Option<i32>,
+        tier: Option<CuteafdDeviceBuffer>) -> Result<NativeFfnOutput<'w>> {
         ensure!(values.device_id == self.output.device_id && values.bytes == self.rows as usize * 10240,
             "shared reduction device/extent differs");
+        ensure!(tier.is_some() == self.tier.is_some() && tier.is_none_or(|tier| tier.device_id == self.output.device_id
+            && tier.bytes >= self.rows as usize * 10240), "GPU expert tier result device/extent differs");
         let timing = std::time::Instant::now();
         let rows = self.rows;
         let slot = self.ticket.slot();
@@ -714,7 +823,10 @@ impl<'w> NativePendingFfn<'w, '_> {
         unsafe {
             crate::shared::memory::chain::join(self.library, self.stream.raw)?;
             exchange.land(self.ticket, self.stream.raw)?;
-            exchange.reduce(slot, values.ptr.cast(), self.output.ptr.cast(), rows as usize, self.stream.raw)?;
+            // The tier's result is the plane after the ranks': every route of
+            // the layer ran once, on a Spark or on the coordinator GPUs.
+            exchange.reduce_with(slot, tier.map(|tier| tier.ptr.cast_const().cast()), values.ptr.cast(),
+                self.output.ptr.cast(), rows as usize, self.stream.raw)?;
         }
         // Inside a chain this records the head; unchained (prefill) it yields
         // until the reduce completes instead of synchronizing the thread.
@@ -724,6 +836,8 @@ impl<'w> NativePendingFfn<'w, '_> {
         // release it now that the reduce is on the chain head.
         if let Some(tp2) = self.tp2.as_deref() {
             tp2.release_shared_output(values.device_id as usize)?;
+            // So did the tier's result: its scratch may be rewritten next layer.
+            if tier.is_some() { tp2.release_tier_scratch()?; }
         }
         if host_ordered && crate::shared::memory::chain::active() {
             // The layer's one host wait for its streams: the reduce joined the

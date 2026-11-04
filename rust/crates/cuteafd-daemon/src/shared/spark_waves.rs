@@ -1279,8 +1279,30 @@ impl<'a> Waves<'a> {
     pub(crate) unsafe fn reduce(&mut self, slot: usize, shared: *const u16, output: *mut u16, rows: usize,
         stream: *mut c_void) -> Result<()> {
         // SAFETY: forwarded from this function's contract.
+        unsafe { self.reduce_with(slot, None, shared, output, rows, stream) }
+    }
+
+    /// [`Self::reduce`] with one more BF16 `[rows, hidden]` plane summed after
+    /// the ranks' (the GPU expert tier's result for the experts the request
+    /// left to the coordinator): `output = shared + sum of slot's planes +
+    /// extra`, in FP32 in that plane order, rounded once to BF16.
+    ///
+    /// # Safety
+    /// As [`Self::reduce`]; `extra` (when given) is a live BF16 `[rows,
+    /// hidden]` device buffer on `stream`'s device, complete in its order.
+    pub(crate) unsafe fn reduce_with(&mut self, slot: usize, extra: Option<*const u16>, shared: *const u16,
+        output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
+        let mut planes = self.planes(slot);
+        let mut count = self.ranks;
+        if let Some(extra) = extra {
+            ensure!(!extra.is_null() && count < MAX_INTAKE_RANKS,
+                "a {count}-rank wave has no room for the GPU expert tier's plane");
+            planes[count] = extra;
+            count += 1;
+        }
+        // SAFETY: forwarded from this function's contract.
         unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(self.planes(slot), self.ranks as u32, shared,
+            self.library.v41_compact_reducer()?.reduce_planes(planes, count as u32, shared,
                 output, u32::try_from(rows)?, stream)?;
         }
         self.consumed(slot, stream)
