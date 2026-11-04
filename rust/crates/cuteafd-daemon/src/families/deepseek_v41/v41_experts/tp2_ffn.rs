@@ -235,7 +235,7 @@ impl<'a> Wave<'a> {
     /// result for `layer` (both BF16 on `destination`, the Spark reduce's GPU).
     /// # Safety
     /// Inputs are complete and retained until the enclosing chain drains; the
-    /// tier result stays unchanged until [`Self::release_scratch`] after its reduce.
+    /// tier result stays unchanged until [`Self::release_tier_scratch`] after its reduce.
     pub(crate) async unsafe fn execute_shared_and_tier_on(&mut self, layer: usize, rows: u32, values: CuteafdDeviceBuffer,
         wire: CuteafdDeviceBuffer, ids: CuteafdDeviceBuffer, routing: CuteafdDeviceBuffer, destination: usize)
         -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
@@ -760,7 +760,7 @@ impl<'a> Execution<'a> {
     /// The tier's arenas (slots, its owner pair's partials and result) and
     /// the peer planes are this lane's scratch: under a device-ordered pass
     /// that does not push, they are guarded through the Spark reduce, which
-    /// releases them ([`Wave::release_scratch`]) once it read the result.
+    /// releases them ([`Wave::release_tier_scratch`]) once it read the result.
     /// # Safety
     /// As [`Self::execute`]: the router's outputs are complete, immutable and
     /// retained until the enclosing chain drains (or the cancellation drain).
