@@ -697,6 +697,12 @@ release_profile_docker_args() {
           [[ "$CUTEAFD_V41_ROUTE_CENSUS_STEPS" =~ ^[1-9][0-9]{0,8}$ ]] ||
             release_die "CUTEAFD_V41_ROUTE_CENSUS_STEPS must be a positive decode step count"
           RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_STEPS=$CUTEAFD_V41_ROUTE_CENSUS_STEPS")
+        fi
+        # Its trace window in decode steps (default 64, 0 = no trace), likewise.
+        if [[ -n "${CUTEAFD_V41_ROUTE_CENSUS_WINDOW:-}" ]]; then
+          [[ "$CUTEAFD_V41_ROUTE_CENSUS_WINDOW" =~ ^(0|[1-9][0-9]{0,8})$ ]] ||
+            release_die "CUTEAFD_V41_ROUTE_CENSUS_WINDOW must be a decode step count (0: no trace)"
+          RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_WINDOW=$CUTEAFD_V41_ROUTE_CENSUS_WINDOW")
         fi ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
       # Process wrappers (release_profile_wrapper); Spark workers take PROFILE_SPARK.
