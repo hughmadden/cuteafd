@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <atomic>
 #include <mutex>
 #include "cuteafd_v41_hc.h"
 
@@ -319,13 +320,15 @@ Plan plan(int rows, int sms) {
   return p;
 }
 
+// Written under the mutex by initialization; read without it by launches.
 std::mutex mutex;
-int ready_device[16];  // device id + 1 once initialized
-int ready_sms[16];
+std::atomic<int> ready_device[16];  // device id + 1 once initialized
+std::atomic<int> ready_sms[16];
 
 int device_sms(int device) {
   for (int slot = 0; slot < 16; ++slot)
-    if (ready_device[slot] == device + 1) return ready_sms[slot];
+    if (ready_device[slot].load(std::memory_order_acquire) == device + 1)
+      return ready_sms[slot].load(std::memory_order_relaxed);
   return 0;
 }
 
@@ -362,9 +365,9 @@ extern "C" int32_t cuteafd_v41_hc_sm89_initialize() {
   if (!status) status = cudaFuncSetAttribute(begin_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
   if (status) return status;
   for (int slot = 0; slot < 16; ++slot)
-    if (!ready_device[slot]) {
-      ready_sms[slot] = sms;
-      ready_device[slot] = device + 1;
+    if (!ready_device[slot].load(std::memory_order_relaxed)) {
+      ready_sms[slot].store(sms, std::memory_order_relaxed);
+      ready_device[slot].store(device + 1, std::memory_order_release);
       return cudaSuccess;
     }
   return cudaErrorInvalidDevice;
