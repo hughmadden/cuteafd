@@ -20,6 +20,7 @@ use thiserror::Error;
 pub mod draft;
 pub mod expert_tier;
 pub mod route_trace;
+pub mod tier_cache;
 pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;

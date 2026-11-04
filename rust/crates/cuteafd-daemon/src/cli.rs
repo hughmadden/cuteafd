@@ -71,6 +71,9 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
+    /// Replay a route census trace through the static GPU expert tier and
+    /// dynamic expert caches at the same number of resident experts.
+    TierCache(crate::commands::tier_cache::TierCacheArgs),
     /// Validate a built library's program table against its PROGRAMS.json (WIP/release seal).
     #[command(hide = true)]
     ProgramsCheck(crate::commands::programs_check::ProgramsCheckArgs),
