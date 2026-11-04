@@ -86,15 +86,16 @@ case "$exlr8_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF
 # projection scheduling.
 v41_candidate_aot="$coordinator_aot"
 # >>> sm89 V4.1 coordinator
-# SM89 (RTX 4090 class) coordinators carry DeepSeek V4.1 only, exported on the
-# SM89 GPU: the FP8 bundle with the mHC projection, index scorer and router
-# (V41_FP8), the dSpark draft experts (V41_EXPERT), the full-width backbone
-# experts (V41_LOCAL_EXPERT) and the TP2 backbone and dSpark TP2 experts
-# (V41_TP2_EXPERT). Everything else stays off: the V4.1 candidates (direct
-# attention is SM120-only; lagged mHC and narrow scheduling are unqualified on
-# SM89), NVFP4 W4A4 experts (FP4 MMA is SM120), and every other family's
-# programs and expert packages, EXL3, EXLR8, vision and audio, which have no
-# SM89 exporters. `cuteafd plan --coordinator-arch sm_89` names what is missing.
+# SM89 (RTX 4090 class) coordinators carry DeepSeek V4.1 only, exported on b12x's
+# offline SM89 target with no GPU (native/CMakeLists.txt): the FP8 bundle with
+# the mHC projection, index scorer and router (V41_FP8), the dSpark draft
+# experts (V41_EXPERT), the full-width backbone experts (V41_LOCAL_EXPERT) and
+# the TP2 backbone and dSpark TP2 experts (V41_TP2_EXPERT). Everything else
+# stays off: the V4.1 candidates (direct attention is SM120-only; lagged mHC
+# and narrow scheduling are unqualified on SM89), NVFP4 W4A4 experts (FP4 MMA
+# is SM120), and every other family's programs and expert packages, EXL3,
+# EXLR8, vision and audio, which have no SM89 exporters.
+# `cuteafd plan --coordinator-arch sm_89` names what is missing.
 if [[ "$role" == coordinator && "$cuda_arch" == 89 ]]; then
   v41_candidate_aot=OFF exl3_aot=OFF nvfp4_aot=OFF audio_aot=OFF exlr8_aot=OFF
   expert_families="" bf16_families=""

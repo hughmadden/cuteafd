@@ -6,8 +6,9 @@
 #
 # STAGING_DIR is wip.sh's frozen source tree; KEY the native key raptor's Rust
 # phase recorded; ENV_FILE the coordinator build scopes (KEY=VALUE lines); ARCH
-# the coordinator's CUDA architecture (120, or 89 on a host wip.sh found SM89):
-# exports compile for the GPU they run on.
+# the key's coordinator architecture (default 120). wip.sh sends SM120 exports
+# here, which compile for the GPU they run on; an sm_89 export needs no GPU, so
+# wip.sh compiles it on the build host instead.
 # Bulk data moves only through sparknest: the source goes up as one sealed archive
 # replicated to HOST, and the export comes back through the existing native
 # tier (build-cache/wip-native/x86_64/coordinator-ARCH/KEY.tar.zst), which
