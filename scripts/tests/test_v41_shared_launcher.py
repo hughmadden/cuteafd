@@ -365,14 +365,15 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
 
 
 def test_v41_dual_rtx_switches_reach_only_the_coordinator(tmp_root) -> None:
-    """The dual-RTX transfer, busy-lane, staging-check, Spark landing and CUDA
-    connection-count switches travel from the operator's environment to the
-    coordinator only, and only when set."""
+    """The dual-RTX transfer, busy-lane, staging-check, Spark landing, CUDA
+    connection-count and mHC boundary switches travel from the operator's
+    environment to the coordinator only, and only when set."""
     import v41_launch_capture as capture_module
 
     switches = {"CUTEAFD_V41_PEER_EXCHANGE": "pull", "CUTEAFD_V41_PUSH_MAX_BYTES": "1048576",
                 "CUTEAFD_V41_BUSY_LANES": "paced", "CUTEAFD_V41_CHECK_STAGING": "1",
-                "CUTEAFD_SPARK_LANDING": "sm", "CUDA_DEVICE_MAX_CONNECTIONS": "32"}
+                "CUTEAFD_SPARK_LANDING": "sm", "CUDA_DEVICE_MAX_CONNECTIONS": "32",
+                "CUTEAFD_V41_HC_BOUNDARY": "chain"}
     unset = parse_run(capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")["containers"][0]["argv"])["env"]
     assert not any(name in unset for name in switches)
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max", operator_env=switches)

@@ -33,6 +33,16 @@ int32_t cuteafd_v41_hc_begin(const void* residual, const void* fn,
     const void* scale, const void* base, const void* incoming, const void* norm,
     void* predicted, void* post, void* comb, void* normalized, void* scratch,
     uint64_t scratch_bytes, int32_t rows, void* stream);
+// SM89 builds (families/deepseek_v41/cuda/v41_hc_sm89.cu) define the begin
+// above for rows=1..128 with scratch_bytes>=rows*1536: it writes normalized and
+// leaves the projection partials in scratch, and post_finish below writes
+// predicted, post and comb with the post output. Both keep today's SM89 decode
+// arithmetic. Initialize on each device before capture. Sublayer, residual,
+// scratch and output are 16-byte aligned; outputs are disjoint from everything.
+int32_t cuteafd_v41_hc_sm89_initialize();
+int32_t cuteafd_v41_hc_post_finish(const uint16_t* sublayer, const uint16_t* residual,
+    const void* scratch, uint64_t scratch_bytes, const float* scale, const float* base,
+    float* predicted, float* post, float* comb, uint16_t* output, int32_t rows, void* stream);
 #ifdef __cplusplus
 }
 #endif

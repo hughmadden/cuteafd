@@ -1484,7 +1484,7 @@ rdma_env_args=("${bond_args[@]}")
 # CUDA_DEVICE_MAX_CONNECTIONS once, when the coordinator first initializes it.)
 for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_PEER_EXCHANGE \
   CUTEAFD_V41_PUSH_MAX_BYTES CUTEAFD_V41_BUSY_LANES CUTEAFD_V41_CHECK_STAGING CUTEAFD_SPARK_LANDING \
-  CUDA_DEVICE_MAX_CONNECTIONS; do
+  CUDA_DEVICE_MAX_CONNECTIONS CUTEAFD_V41_HC_BOUNDARY; do
   # The V41_FP8_HEAD key (validated above) takes the place of its environment spelling.
   [[ "$switch_name" != CUTEAFD_V41_FP8_HEAD || ${#v41_fp8_head_args[@]} == 0 ]] || continue
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")

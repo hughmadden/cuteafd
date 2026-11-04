@@ -799,6 +799,21 @@ fn cuda_v41_single_gpu_handles_create_at_every_exported_capacity() -> Result<()>
     // width and an exported 256-row unit.
     let rows = cuteafd_core::V41_VERIFY_ROWS;
     sweep.record("mHC", "storage and projection", v41_hc::HcStorage::new(&lib, rows).and_then(|_| lib.v41_hc().map(drop)));
+    // The device picks the boundary: SM89 serves its fused begin with the
+    // finish in post for every decode, verify and replay width, the chain above.
+    sweep.record("mHC", "boundary for the device", (|| {
+        let hc = lib.v41_hc()?;
+        let expected = if arch == cuteafd_core::GpuArch::Sm89 { cuteafd_ffi::HcBoundary::Sm89 } else { hc.boundary() };
+        ensure!(std::env::var_os(cuteafd_ffi::HC_BOUNDARY_SWITCH).is_some() || hc.boundary() == expected,
+            "{arch} runs the {:?} mHC boundary", hc.boundary());
+        let widths = [1, 16, rows, cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS as usize];
+        if hc.boundary() == cuteafd_ffi::HcBoundary::Sm89 {
+            ensure!(widths.iter().all(|&w| hc.defers_finish(w)) && !hc.defers_finish(129),
+                "SM89 mHC boundary widths");
+        }
+        eprintln!("MHC boundary on {arch}: {:?}", hc.boundary());
+        Ok(())
+    })());
     sweep.record("router", "storage, router and quantizer", (|| {
         v41_backbone_router::BackboneRouterStorage::new(&lib, rows as u32, rows as u32)?;
         lib.v41_router()?;
