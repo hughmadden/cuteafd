@@ -75,6 +75,9 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
+    /// Replay a route census trace through the static GPU expert tier and
+    /// dynamic expert caches at the same number of resident experts.
+    TierCache(crate::commands::tier_cache::TierCacheArgs),
     /// Validate a built library's program table against its PROGRAMS.json (WIP/release seal).
     #[command(hide = true)]
     ProgramsCheck(crate::commands::programs_check::ProgramsCheckArgs),
@@ -342,9 +345,14 @@ pub(crate) struct PlanArgs {
     /// Attention placement: auto is the qualified family default (heads until decided).
     #[arg(long, default_value = "auto", value_parser = ["auto", "context", "layers", "heads"])]
     pub(crate) attention_placement: String,
-    /// Resolved global logical GPU ceiling; PRO defaults to its CUDA total (94.97 GiB).
+    /// Resolved global logical GPU ceiling; defaults to the CUDA total of the
+    /// coordinator arch's reference card (PRO 94.97 GiB, RTX 4090 D 47.45 GiB).
     #[arg(skip)]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// Coordinator GPU architecture to plan for: sm_120 (RTX 5090 / RTX PRO 6000)
+    /// or sm_89 (RTX 4090 class). Selects the card class every coordinator plan charges.
+    #[arg(long, default_value = "sm_120")]
+    pub(crate) coordinator_arch: cuteafd_core::GpuArch,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
@@ -383,6 +391,18 @@ pub(crate) struct PlanArgs {
     /// layer count `N` (the KV pool is then the output).
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
+    /// V4.1 GPU expert tier for --layout: per-layer expert residency on the
+    /// coordinator GPUs, ranked by predicted step time, generalising
+    /// whole-layer onboarding (`--rtx-expert-layers N` then pins N whole
+    /// layers inside it). `off`, `auto` (pool first; the tier takes what is
+    /// left while it still helps) or `N` experts per routed layer on average
+    /// (the KV pool is then the output). The Sparks keep every expert.
+    #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
+    pub(crate) gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
+    /// Per-layer expert route counts (JSON `{"layers": [[count; experts]; routed layers]}`) that
+    /// rank the GPU expert tier's resident set; uniform without one.
+    #[arg(long, requires = "gpu_expert_tier")]
+    pub(crate) gpu_expert_tier_profile: Option<PathBuf>,
     /// Removed whole-layer GPU1 placement flag.
     #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
     pub(crate) deprecated_peer_expert_ranges: bool,
@@ -722,6 +742,59 @@ mod tests {
         assert_eq!(args.landing_repeats, 3);
         for repeats in ["0", "6", "-1"] {
             assert!(super::Cli::try_parse_from(["cuteafd", "fabric", "--landing-repeats", repeats]).is_err());
+        }
+    }
+
+    #[test]
+    fn gpu_expert_tier_is_off_by_default_and_takes_auto_or_a_count() {
+        use clap::Parser;
+        use cuteafd_loader::placement::ExpertTierSetting;
+        for (flags, expected) in [(vec![], ExpertTierSetting::Off), (vec!["--gpu-expert-tier", "auto"], ExpertTierSetting::Auto),
+            (vec!["--gpu-expert-tier", "60"], ExpertTierSetting::PerLayer(60)), (vec!["--gpu-expert-tier", "off"], ExpertTierSetting::Off)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model", "--layout"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(args.gpu_expert_tier, expected);
+            let options = crate::commands::plan::layout_options_for_test(&args);
+            assert_eq!(options.expert_tier, expected);
+        }
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--gpu-expert-tier", "most"]).is_err());
+        // A routing profile ranks a tier; alone it is refused.
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--gpu-expert-tier-profile", "r.json"]).is_err());
+        let super::Commands::Plan(args) = super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--layout",
+            "--gpu-expert-tier", "auto", "--gpu-expert-tier-profile", "r.json"]).unwrap().command
+            else { panic!("expected plan"); };
+        assert_eq!(crate::commands::plan::layout_options_for_test(&args).expert_tier_profile,
+            Some(std::path::PathBuf::from("r.json")));
+    }
+
+    /// Serving takes the plan's tier spellings, off by default.
+    #[test]
+    fn serve_native_takes_the_plans_gpu_expert_tier_flags() {
+        use clap::Parser;
+        use cuteafd_loader::placement::ExpertTierSetting;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/lib.so"];
+        for (flags, expected) in [(vec![], ExpertTierSetting::Off), (vec!["--gpu-expert-tier", "auto"], ExpertTierSetting::Auto),
+            (vec!["--gpu-expert-tier", "24"], ExpertTierSetting::PerLayer(24))] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags)).unwrap()
+                .command else { panic!("expected serve-native"); };
+            assert_eq!((args.gpu_expert_tier, args.gpu_expert_tier_profile), (expected, None));
+        }
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--gpu-expert-tier-profile", "r.json"])).is_err());
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter()
+            .chain(["--gpu-expert-tier", "auto", "--gpu-expert-tier-profile", "r.json"])).unwrap().command
+            else { panic!("expected serve-native"); };
+        assert_eq!(args.gpu_expert_tier_profile, Some(std::path::PathBuf::from("r.json")));
+    }
+
+    #[test]
+    fn tp2_dspark_experts_is_off_by_default_and_reaches_the_layout() {
+        use clap::Parser;
+        for (flags, expected) in [(vec![], false), (vec!["--tp2-dspark-experts"], true)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model", "--layout", "--rtx", "2"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(crate::commands::plan::layout_options_for_test(&args).tp2_dspark_experts, expected);
         }
     }
 
@@ -1287,6 +1360,24 @@ pub(crate) struct NativeServeArgs {
     /// Complete bottom-up RTX routed layers: auto fills available memory, or 0..40.
     #[arg(long, default_value = "auto")]
     pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
+    /// GPU expert tier on two RTX GPUs, admitted as `cuteafd plan --layout
+    /// --gpu-expert-tier` plans it: per routed layer a fixed set of experts
+    /// resident on both GPUs as TP2 halves, ranked by predicted step time,
+    /// in place of whole-layer onboarding (`--rtx-expert-layers N` then pins
+    /// N whole layers inside it). `off`, `auto` (pool first) or `N` experts
+    /// per routed layer (the KV pool is then the output). The Sparks keep
+    /// every expert and need an owned topology (`--spark-tp`/`--spark-ep`).
+    #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
+    pub gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
+    /// Per-layer expert route counts ranking the tier (the format of `cuteafd
+    /// plan --gpu-expert-tier-profile`); uniform popularity without one.
+    #[arg(long, requires = "gpu_expert_tier")]
+    pub gpu_expert_tier_profile: Option<PathBuf>,
+    /// Retained weight cap per coordinator GPU, GiB, as `cuteafd plan
+    /// --coordinator-weight-budget-gib` applies it: optional tier experts and
+    /// whole layers give way until each GPU's weights fit.
+    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
+    pub coordinator_weight_budget_gib: f64,
 
 
     /// Maximum active requests, shared by both execution lanes.

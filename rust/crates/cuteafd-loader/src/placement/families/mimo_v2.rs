@@ -488,7 +488,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
             .max(if rank == 0 { inputs.startup_probe_bytes.saturating_add(capacity_bytes - capacity_bytes * 97 / 100) } else { 0 })
             .max(inputs.headroom_floor),
     }).collect();
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,

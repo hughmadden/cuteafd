@@ -10,11 +10,16 @@ use cuteafd_loader::OfficialV41Catalog;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use crate::shared::memory::row_window::RowWindow;
+use crate::shared::route_census::{PhaseSelector, RouteCounter, RoutePhase};
 #[cfg(test)]
 thread_local! {
     static PRIVATE_ALIAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 const ROW_BYTES: [usize; 6] = [10240, 1, 1536, 24, 24, 5280];
+/// The routing census's view of these routers: 40 routed layers of 384
+/// experts, top-6 (`shared::route_census`).
+pub(crate) const ROUTE_CENSUS_SHAPE: cuteafd_ffi::RouteCensusShape =
+    cuteafd_ffi::RouteCensusShape { layers: 40, experts: 384, topk: 6 };
 
 /// Reserve planes: hidden, mask, scores, ids, routing, wire. These outputs
 /// may survive hooks or be read on fork streams. Pinned staging and the ring
@@ -25,6 +30,9 @@ pub(crate) struct BackboneRouterStorage<'a> {
     buffers: Vec<DeviceAllocation<'a>>,
     rows: u32,
     unit: u32,
+    /// With the routing census on: this stream's phase selector, taken by
+    /// the first wave whose weights count (no allocation of its own).
+    census: std::cell::OnceCell<PhaseSelector<'a>>,
 }
 impl<'a> BackboneRouterStorage<'a> {
     pub(crate) fn storage_bytes(rows: u32, unit: u32) -> Result<usize> {
@@ -33,7 +41,9 @@ impl<'a> BackboneRouterStorage<'a> {
             "invalid router storage rows/unit");
         Ok(Self::allocation_sizes(rows).into_iter().sum())
     }
-    fn allocation_sizes(rows: u32) -> [usize; 6] { ROW_BYTES.map(|n| n * rows as usize) }
+    /// Each plane in whole 16-byte units: a decode lane's peer push rounds
+    /// the 24-byte-row route planes up to them (`tp2_ffn::padded`).
+    fn allocation_sizes(rows: u32) -> [usize; 6] { ROW_BYTES.map(|n| (n * rows as usize).next_multiple_of(16)) }
     pub(crate) fn new(library: &'a NativeLibrary, rows: u32, unit: u32) -> Result<Rc<Self>> {
         Self::storage_bytes(rows, unit)?;
         Ok(Rc::new(Self {
@@ -41,6 +51,7 @@ impl<'a> BackboneRouterStorage<'a> {
             buffers: Self::allocation_sizes(rows).into_iter()
                 .map(|n| DeviceAllocation::new(library, n)).collect::<Result<_>>()?,
             rows, unit,
+            census: std::cell::OnceCell::new(),
         }))
     }
 }
@@ -58,6 +69,8 @@ pub(crate) struct BackboneRouterWeights<'a> {
     layer: usize,
     tensors: NativeRtxTensors<'a>,
     nvfp4: bool,
+    /// This layer's routing census binding (`CUTEAFD_V41_ROUTE_CENSUS`).
+    census: Option<RouteCounter<'a>>,
 }
 
 fn request_hidden_format(nvfp4: bool) -> (cuteafd_transport::ExpertV2Dtype, usize) {
@@ -104,7 +117,16 @@ impl<'a> BackboneRouterWeights<'a> {
                 budget,
                 staging,
             )?,
+            census: None,
         })
+    }
+    /// Counts this layer's routes from now on: every wave created or graph
+    /// captured afterwards launches the census kernel after the router.
+    pub(crate) fn install_census(&mut self, counter: RouteCounter<'a>) -> Result<()> {
+        ensure!(counter.device_id() == self.tensors.get(&Self::names(self.layer)?[0])?.device_id,
+            "route census binding belongs to another GPU than layer {}'s router", self.layer);
+        self.census = Some(counter);
+        Ok(())
     }
 
     /// The buffers a decode step reads (L2 prefetch): gate weight and biases.
@@ -121,6 +143,11 @@ impl<'a> BackboneRouterWeights<'a> {
     pub(crate) fn on_storage(&self, storage: Rc<BackboneRouterStorage<'a>>) -> Result<BackboneRouterWave<'_, 'a>> {
         ensure!(std::ptr::eq(storage.stream.library, self.library)
             && storage.buffers[0].buffer.device_id == self.library.cuda_get_device()?, "router storage device/library differs");
+        if let Some(counter) = &self.census {
+            if storage.census.get().is_none() { let _ = storage.census.set(counter.selector()?); }
+            ensure!(storage.census.get().is_some_and(|selector| selector.device_id() == storage.buffers[0].buffer.device_id),
+                "route census selector belongs to another GPU than its router storage");
+        }
         let capacity = storage.unit;
         Ok(BackboneRouterWave {
             #[cfg(test)]
@@ -145,6 +172,7 @@ impl<'a> BackboneRouterWeights<'a> {
             capacity,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             other_graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            route_phase: RoutePhase::default(),
             full_request: true,
             ready: None,
             origin: None,
@@ -408,6 +436,8 @@ pub(crate) struct BackboneRouterWave<'w, 'a> {
     capacity: u32,
     graphs: LayerGraphs<'w, 'a, BackboneRouterWeights<'a>>,
     other_graphs: LayerGraphs<'w, 'a, BackboneRouterWeights<'a>>,
+    /// The phase of the pass this router serves (the routing census's plane).
+    route_phase: RoutePhase,
     full_request: bool,
     ready: Option<u32>,
     origin: Option<QueryBinding>,
@@ -496,6 +526,23 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         }
         Ok(layers)
     }
+    /// The phase of the passes this router serves next: the routing census
+    /// counts them into that phase's plane. Host state only; the stream's
+    /// selector is written before the next launch.
+    pub(crate) fn set_route_phase(&mut self, phase: RoutePhase) { self.route_phase = phase; }
+    /// Before a counted launch (never inside a capture): later census counts
+    /// on this stream go to this pass's phase.
+    fn select_route_phase(&self) -> Result<()> {
+        match (&self.weights.census, self.storage.census.get()) {
+            // SAFETY: the selector belongs to this storage's stream, on its GPU.
+            (Some(_), Some(selector)) => unsafe { selector.select(self.route_phase, self.stream().raw) },
+            _ => Ok(()),
+        }
+    }
+    /// A counted launch of this layer's router was queued.
+    fn observe_route(&self) {
+        if let Some(counter) = &self.weights.census { counter.observe(self.route_phase); }
+    }
     pub fn set_local_mode(&mut self, local: bool) -> Result<()> {
         if self.full_request == !local { return Ok(()); }
         self.stream().require_complete()?;
@@ -538,7 +585,9 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         );
         Ok(())
     }
-    unsafe fn enqueue(&mut self, rows: u32) -> Result<()> {
+    /// Queues the router (and, when `count`, the routing census after it).
+    /// Runs eagerly or under capture; the census launch is capturable.
+    unsafe fn enqueue(&mut self, rows: u32, count: bool) -> Result<()> {
         let names = BackboneRouterWeights::names(self.layer)?;
         unsafe {
             self.kernel.launch(
@@ -566,6 +615,11 @@ impl<'a> BackboneRouterWave<'_, 'a> {
             ensure!(bytes <= self.request_staging.buffer.bytes, "route staging too small");
             let ids = std::slice::from_raw_parts_mut(self.request_staging.buffer.ptr.cast::<u8>(), bytes);
             self.stream().library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
+            // The routing census reads the ids last: every router row is a
+            // live row its experts receive (exact shapes, no padding).
+            if let (true, Some(counter), Some(selector)) = (count, &self.weights.census, self.storage.census.get()) {
+                counter.count(self.b(3), rows, selector, self.stream().raw)?;
+            }
             Ok(())
         }
     }
@@ -573,10 +627,18 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     /// Hidden input is finite and initialized; mask bytes are 0 or 1 in the same
     /// row order. Both inputs are exclusively owned until the call drains.
     pub unsafe fn execute(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
+        unsafe { self.execute_counted(rows, true) }
+    }
+    /// # Safety
+    /// Same contract as execute. Without `count` (a capture's warm-up, whose
+    /// replay follows) the routing census does not count these rows.
+    unsafe fn execute_counted(&mut self, rows: u32, count: bool) -> Result<RouterOutput<'_>> {
         self.validate(rows)?;
+        if count { self.select_route_phase()?; }
         // The ring copy (if captured) completes with the host wait.
-        let launched = unsafe { self.enqueue(rows) }.and_then(|()| unsafe { self.ring_download(rows) });
+        let launched = unsafe { self.enqueue(rows, count) }.and_then(|()| unsafe { self.ring_download(rows) });
         launched.and(self.synchronize())?;
+        if count { self.observe_route(); }
         self.ready = Some(rows);
         self.output()
     }
@@ -588,8 +650,9 @@ impl<'a> BackboneRouterWave<'_, 'a> {
             self.graphs.get_shape(self.layer, self.weights, rows).is_none(),
             "backbone router graph already captured"
         );
+        // The replay that follows a capture counts these rows; the warm-up does not.
         unsafe {
-            self.execute(rows)?;
+            self.execute_counted(rows, false)?;
         }
         unsafe { self.capture_ready(rows) }
     }
@@ -601,7 +664,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
                 .library
                 .cuda_graph_begin_capture(self.stream().raw)?;
         }
-        let launched = unsafe { self.enqueue(rows) };
+        let launched = unsafe { self.enqueue(rows, true) };
         let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
@@ -633,6 +696,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
             .get_shape(self.layer, self.weights, rows)
             .context("backbone router graph missing")?;
         ensure!(count == rows, "backbone router captured rows differ");
+        self.select_route_phase()?;
         let launched = unsafe {
             self.stream()
                 .library
@@ -645,6 +709,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
             .and_then(|()| if device_read { unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) } }
                 else { self.synchronize() })
             .or_else(|error| self.synchronize().and(Err(error)))?;
+        self.observe_route();
         self.ready = Some(rows);
         self.output()
     }
@@ -787,11 +852,13 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         let launched = (|| unsafe {
             self.stage_inputs(input.values, image_mask)?;
             let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw) };
+            self.select_route_phase()?;
             let library = self.stream().library; let stream = self.stream().raw;
             crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
-                graph, || self.enqueue(rows))
+                graph, || self.enqueue(rows, true))
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
+        self.observe_route();
         unsafe { self.ring_download(rows)?; }
         // Every expert that reads the routes on the device lets later stages
         // join the chain instead of the host waiting here: local layers of a
@@ -1027,6 +1094,35 @@ mod host_order_tests {
 }
 
 #[cfg(test)]
+mod route_census_tests {
+    /// The routing census counts each router execution once, inside the
+    /// router's own launch: the count follows the router's last output copy in
+    /// `enqueue` (so its graph captures it), a capture's warm-up run is not
+    /// counted (the replay that follows is), and the stream's phase selector is
+    /// written before a launch, never while capturing.
+    #[test]
+    fn census_counts_each_router_execution_once_and_selects_outside_captures() {
+        let source = include_str!("v41_backbone_router.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod route_census_tests").unwrap()];
+        let body = |signature: &str| {
+            let at = source.find(signature).unwrap_or_else(|| panic!("{signature} missing"));
+            &source[at..at + source[at..].find("\n    }\n").unwrap()]
+        };
+        let enqueue = body("unsafe fn enqueue(&mut self, rows: u32, count: bool)");
+        assert!(enqueue.find("copy_d2h_async(ids, self.b(3)").unwrap()
+            < enqueue.find("counter.count(self.b(3), rows, selector").unwrap());
+        let capture_ready = body("unsafe fn capture_ready(&mut self, rows: u32)");
+        assert!(capture_ready.contains("self.enqueue(rows, true)") && !capture_ready.contains("select_route_phase"));
+        assert!(body("pub unsafe fn capture(&mut self, rows: u32)").contains("self.execute_counted(rows, false)"));
+        for site in ["unsafe fn execute_counted(", "pub unsafe fn replay(", "pub async unsafe fn execute_ffn_cooperative("] {
+            let body = body(site);
+            assert!(body.find(".select_route_phase()").unwrap() < body.find(".observe_route()").unwrap(), "{site}");
+        }
+        assert_eq!((source.matches(".select_route_phase()").count(), source.matches(".observe_route()").count()), (3, 3));
+    }
+}
+
+#[cfg(test)]
 mod storage_bytes_tests {
     use super::*;
     #[test]
@@ -1034,6 +1130,11 @@ mod storage_bytes_tests {
         for unit in [4096, 2752, 2048] {
             assert_eq!(BackboneRouterStorage::storage_bytes(8192, unit)?,
                 BackboneRouterStorage::allocation_sizes(8192).into_iter().sum::<usize>());
+        }
+        // Whole 16-byte units at any row count (a peer push rounds up to them).
+        for rows in [1, 7, 17, 63, 64] {
+            assert!(BackboneRouterStorage::allocation_sizes(rows).iter().zip(ROW_BYTES)
+                .all(|(&n, width)| n % 16 == 0 && n >= width * rows as usize));
         }
         Ok(())
     }
@@ -1089,7 +1190,7 @@ mod shared_storage_tests {
         for (i, slot) in slots.iter_mut().enumerate() {
             unsafe {
                 lib.copy_d2d_async(slot.b(0), inputs[i].buffer, rows * 10240, slot.stream().raw)?;
-                slot.enqueue(rows as u32)?;
+                slot.enqueue(rows as u32, true)?;
                 slot.ring_download(rows as u32)?;
             }
             slot.synchronize()?;
@@ -1104,7 +1205,7 @@ mod shared_storage_tests {
                     crate::shared::memory::chain::join(&lib, stream)?;
                     lib.copy_d2d_async(slot.b(0), inputs[i].buffer, rows * 10240, stream)?;
                     if i == 0 { gate = Some(cuteafd_ffi::test_support::CudaStreamGate::new(&lib, stream)?); }
-                    slot.enqueue(rows as u32)?;
+                    slot.enqueue(rows as u32, true)?;
                     slot.ring_download(rows as u32)?;
                     crate::shared::memory::chain::finish(&lib, stream)
                 }

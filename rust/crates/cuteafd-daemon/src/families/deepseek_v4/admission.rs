@@ -30,6 +30,8 @@ pub(crate) struct Inputs<'a> {
     /// Actual per-rank TP2 expert workspace probe; None means no TP2 package.
     pub tp2_workspace: Option<[u64; 2]>,
     pub exchange_f32: bool,
+    /// The coordinator GPUs' architecture (measured on `--device`).
+    pub arch: cuteafd_core::GpuArch,
 }
 
 #[cfg(test)]
@@ -323,7 +325,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus),
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus, inputs.arch),
         context, attention })?;
     Ok(request)
 }

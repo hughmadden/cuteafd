@@ -425,6 +425,19 @@ mod peer_copy_choice_tests {
 thread_local! {
     /// Test-only negative control: `copy_then_ordered` neither joins nor acquires.
     static SKIP_COPY_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only negative control: a pushing transfer's destination does not
+    /// wait on the push's flag before `then`.
+    pub(crate) static SKIP_PUSH_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How a pushing [`PeerTransfer`] moves its bytes (implemented by
+/// `shared::peer_split::FlagRoute`, one device flag of a peer exchange).
+pub(crate) trait PushRoute {
+    /// Queues on `stream` (the source GPU's producer stream): copy `bytes` of
+    /// `source` into `destination` on the other GPU, then publish the flag.
+    fn push(&self, stream: *mut c_void, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
+    /// Queues on `stream` (the destination GPU): wait for the next publication.
+    fn wait(&self, stream: *mut c_void) -> Result<()>;
 }
 
 /// One transfer direction for one lane; stream and event are allocated at startup.
@@ -433,6 +446,8 @@ pub(crate) struct PeerTransfer<'a> {
     ready: Event<'a>,
     /// SM copies for device-ordered passes ([`super::chain::deferred`]).
     sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
+    /// Device-ordered passes push instead ([`Self::enable_push`]).
+    push: Option<Box<dyn PushRoute + 'a>>,
 }
 impl<'a> PeerTransfer<'a> {
     pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
@@ -443,8 +458,28 @@ impl<'a> PeerTransfer<'a> {
         let ready = Event { device: source,
             raw: source.run(|| source.library.cuda_event_create())? };
         let sm = Some(destination.run(|| destination.library.v41_peer_copy())?);
-        Ok(Self { destination: stream, ready, sm })
+        Ok(Self { destination: stream, ready, sm, push: None })
     }
+
+    /// From now on a device-ordered pass pushes: the producer's stream copies
+    /// the bytes into the destination (SMs up to `decode_lane_bytes`, else its
+    /// copy engine) and publishes a flag, and the destination stream waits on
+    /// that flag before `then`. No cross-device event and no SM pull.
+    ///
+    /// Only for an owner private to one decode lane: its `then` writes and
+    /// its destination are reused once per layer, and the next layer's push
+    /// follows this layer's readers through that lane's flags, which is why
+    /// the guard of [`Self::copy_then_ordered`] is not needed. Layers must not
+    /// pipeline; V4.1's `v41_peer_push::schedule_tests` check this invariant.
+    pub fn enable_push(&mut self, route: Box<dyn PushRoute + 'a>) {
+        self.push = Some(route);
+    }
+
+    /// The source and destination GPUs (a [`PushRoute`]'s two ranks).
+    pub fn devices(&self) -> [Device<'a>; 2] { [self.ready.device, self.destination.device] }
+
+    /// Whether the next device-ordered transfer pushes (see [`Self::enable_push`]).
+    pub fn pushes(&self) -> bool { self.push.is_some() && super::chain::deferred() }
 
     /// # Safety
     /// All source writes must be ordered on `producer`; no aliases may access
@@ -475,6 +510,19 @@ impl<'a> PeerTransfer<'a> {
     /// streams releases the guard after its read.
     pub async unsafe fn copy_then_ordered(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
         producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
+        unsafe { self.copy_then_adopting(source, destination, producer, bytes, guard, None, then).await }
+    }
+    /// As [`Self::copy_then_ordered`]; a pushing transfer given `adopt` (the
+    /// mark of a push whose stream the producer follows) adopts the chain
+    /// head on its destination stream instead of merging it (a merge is a
+    /// cross-device event wait when the head is on the source GPU).
+    /// # Safety
+    /// As `copy_then_ordered`; `producer` follows the stream that joined the
+    /// head `adopt` names, and no stage finished since.
+    pub async unsafe fn copy_then_adopting(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
+        producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        adopt: Option<super::chain::HeadMark>,
         mut then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
         let library = self.destination.device.library;
         ensure!(source.device.id == self.ready.device.id
@@ -486,8 +534,28 @@ impl<'a> PeerTransfer<'a> {
             && bytes <= source.buffer.bytes && bytes <= destination.buffer.bytes,
             "peer transfer owner or extent mismatch");
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
-        self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
+        if let Some(push) = self.push.as_ref().filter(|_| deferred) {
+            // The bytes are final on `producer` in stream order, so the push
+            // queues there behind nothing from the other GPU; the destination
+            // waits on its flag. Push before wait, in one synchronous block.
+            push.push(producer.raw, source.buffer.ptr, destination.buffer.ptr, bytes)?;
+            #[cfg(test)]
+            let unordered = SKIP_PUSH_WAIT.with(|skip| skip.get());
+            #[cfg(not(test))]
+            let unordered = false;
+            self.destination.device.run(|| unsafe {
+                if !unordered { push.wait(self.destination.raw)?; }
+                then(destination.buffer, self.destination.raw)?;
+                match adopt {
+                    Some(mark) => super::chain::finish_after_flag(library, self.destination.raw, Some(mark)),
+                    None => super::chain::finish(library, self.destination.raw),
+                }
+            })?;
+            drain.complete = true;
+            return Ok(());
+        }
+        self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES));
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;

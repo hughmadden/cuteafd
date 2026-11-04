@@ -65,6 +65,68 @@ except (OSError, AttributeError, ValueError) as error:
 PYCAPACITY
 }
 
+# The architecture of the coordinator GPU with this UUID, spelled as
+# `cuteafd plan --coordinator-arch` takes it (sm_89, sm_120, ...), from the driver.
+release_cuda_coordinator_arch() {
+  python3 - "$1" <<'PYARCH'
+import ctypes, sys, uuid
+try:
+    wanted = uuid.UUID(sys.argv[1].removeprefix('GPU-')).bytes
+    cuda = ctypes.CDLL('libcuda.so.1')
+    def checked(name, *args):
+        function = getattr(cuda, name)
+        function.restype = ctypes.c_int
+        code = function(*args)
+        if code:
+            raise ValueError(f'{name} failed with CUDA error {code}')
+    checked('cuInit', ctypes.c_uint(0))
+    count = ctypes.c_int()
+    checked('cuDeviceGetCount', ctypes.byref(count))
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        checked('cuDeviceGet', ctypes.byref(device), ctypes.c_int(ordinal))
+        identity = (ctypes.c_ubyte * 16)()
+        checked('cuDeviceGetUuid_v2', ctypes.byref(identity), device)
+        if bytes(identity) != wanted:
+            continue
+        major, minor = ctypes.c_int(), ctypes.c_int()
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR (75) and _MINOR (76).
+        checked('cuDeviceGetAttribute', ctypes.byref(major), ctypes.c_int(75), device)
+        checked('cuDeviceGetAttribute', ctypes.byref(minor), ctypes.c_int(76), device)
+        print(f'sm_{major.value}{minor.value}')
+        break
+    else:
+        raise ValueError(f'no CUDA device matches UUID {sys.argv[1]}')
+except (OSError, AttributeError, ValueError) as error:
+    sys.exit(f'coordinator CUDA architecture: {error}')
+PYARCH
+}
+
+# The one architecture of these coordinator GPUs (comma-separated UUIDs), for a
+# deployment plan's `--coordinator-arch`. Fails on a driver error or a mix.
+release_coordinator_arch() {
+  local uuid arch first=""
+  local -a uuids
+  IFS=, read -r -a uuids <<<"$1"
+  ((${#uuids[@]})) || { echo "no coordinator GPU to read an architecture from" >&2; return 1; }
+  for uuid in "${uuids[@]}"; do
+    arch="$(release_cuda_coordinator_arch "$uuid")" || return 1
+    [[ -z "$first" || "$arch" == "$first" ]] || { echo "coordinator GPUs mix $first and $arch" >&2; return 1; }
+    first="$arch"
+  done
+  printf '%s\n' "$first"
+}
+
+# Plan flags for that architecture: none for SM120, the planner's default card
+# class, so its plans and their command lines stay as they were.
+release_coordinator_arch_args() {
+  local -n release_arch_args_out="$2"
+  local arch
+  arch="$(release_coordinator_arch "$1")" || release_die "cannot resolve the coordinator GPU architecture"
+  release_arch_args_out=()
+  [[ "$arch" == sm_120 ]] || release_arch_args_out=(--coordinator-arch "$arch")
+}
+
 # Resolve total capacity in bytes, never free memory. Rust owns the default rule.
 release_coordinator_profile() {
   local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
@@ -597,7 +659,7 @@ PYSTATE
 # mount arguments, for the coordinator and every Spark worker) in the caller's
 # shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST
 # [PROFILE_SPARK].
-release_profile_switches='census transport-timing expert-timing expert-routes draft-timing nsys ncu'
+release_profile_switches='census transport-timing expert-timing expert-routes route-census draft-timing nsys ncu'
 # nsys sessions are per container; the window is opened and closed with
 # `docker exec <coordinator> nsys start|stop --session=$RELEASE_NSYS_SESSION`.
 RELEASE_NSYS_SESSION=cuteafd-profile
@@ -628,6 +690,20 @@ release_profile_docker_args() {
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
       expert-routes) [[ -n "$dir" ]] || release_die "PROFILE=expert-routes needs PROFILE_DIR (the route log goes there)"
         RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES=1) ;;
+      route-census) [[ -n "$dir" ]] || release_die "PROFILE=route-census needs PROFILE_DIR (the census goes there)"
+        RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS=$dir/route-census-$host.json")
+        # Its dump interval in decode steps (default 1000), from the launching environment.
+        if [[ -n "${CUTEAFD_V41_ROUTE_CENSUS_STEPS:-}" ]]; then
+          [[ "$CUTEAFD_V41_ROUTE_CENSUS_STEPS" =~ ^[1-9][0-9]{0,8}$ ]] ||
+            release_die "CUTEAFD_V41_ROUTE_CENSUS_STEPS must be a positive decode step count"
+          RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_STEPS=$CUTEAFD_V41_ROUTE_CENSUS_STEPS")
+        fi
+        # Its trace window in decode steps (default 64, 0 = no trace), likewise.
+        if [[ -n "${CUTEAFD_V41_ROUTE_CENSUS_WINDOW:-}" ]]; then
+          [[ "$CUTEAFD_V41_ROUTE_CENSUS_WINDOW" =~ ^(0|[1-9][0-9]{0,8})$ ]] ||
+            release_die "CUTEAFD_V41_ROUTE_CENSUS_WINDOW must be a decode step count (0: no trace)"
+          RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_WINDOW=$CUTEAFD_V41_ROUTE_CENSUS_WINDOW")
+        fi ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
       # Process wrappers (release_profile_wrapper); Spark workers take PROFILE_SPARK.
       nsys|ncu) [[ -n "$dir" ]] || release_die "PROFILE=$switch needs PROFILE_DIR (the report goes there)" ;;
@@ -889,10 +965,11 @@ release_known_key() {
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE) return 0 ;;
     DRAFT_SURVIVAL_LENGTHS|DRAFT_POLICY|DRAFT_ROW_COST) return 0 ;;
     CUDA_MODULE_LOADING) return 0 ;; # V4.1 coordinator CUDA module loading (LAZY or EAGER).
+    GPU_EXPERT_TIER|GPU_EXPERT_TIER_PROFILE) return 0 ;; # V4.1 GPU expert tier and its route profile.
     MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|SPARK_STAGING|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
     EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;

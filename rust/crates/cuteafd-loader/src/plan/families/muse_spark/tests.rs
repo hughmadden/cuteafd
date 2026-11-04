@@ -268,7 +268,7 @@ fn plan_matrix(column: usize) {
             let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
             let pool_from_ledger = devices.iter().map(|device| {
                 let fixed: u64 = device.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum();
-                let context = crate::placement::ArchContext::for_device("sm_120", device.capacity_bytes).context_bytes;
+                let context = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, device.capacity_bytes).context_bytes;
                 (device.capacity_bytes - context - fixed) / (record_bytes * page_rows) * page_rows
             }).min().unwrap().min(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
             assert_eq!(memory.pool_tokens, pool_from_ledger, "pool first, derived from the exact ledger");
@@ -446,7 +446,7 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     assert_eq!(group(0), 0, "the drafter lives beside the head (GPU1)");
     let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
     let config: serde_json::Value = serde_json::from_str(radixark).unwrap();
-    let sms = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES).sms;
+    let sms = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, crate::placement::inventory::PRO_TOTAL_BYTES).sms;
     let expected = crate::placement::families::muse_spark::drafter_inventory(&cfg, &config, 16, 16, 202_112,
         u64::from(sms), crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
     assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch + expected.runtime);
@@ -472,7 +472,7 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     assert_eq!(fixed(draft_device) - fixed(device), charged);
     let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
     let page_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 * page_rows;
-    let context = crate::placement::ArchContext::for_device("sm_120", device.capacity_bytes).context_bytes;
+    let context = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, device.capacity_bytes).context_bytes;
     let available = device.capacity_bytes - context - fixed(device);
     assert!(memory.pool_tokens < cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(memory.pool_tokens, available / page_bytes * page_rows);
@@ -540,7 +540,7 @@ fn media_auto_off_disables_component_bytes() {
     options.vision = MediaMode::Auto;
     options.audio = MediaMode::Auto;
     // The ledger excludes the baseline CUDA context deducted by GpuBudget.
-    let context = crate::placement::ArchContext::for_device("sm_120", used).context_bytes;
+    let context = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, used).context_bytes;
     options.layout.as_mut().unwrap().rtx_bytes = vec![used + context + 1024];
     options.layout.as_mut().unwrap().vision_replicas = 9;
     // Audio has one copy, so remove its Spark candidate by retaining only the

@@ -303,19 +303,12 @@ fn expert_workspace(
     let role = if local { "rtx_backbone" } else { "rtx_tp2" };
     // A compiled capacity on one RTX (the caller covers live rows); TP2 rows.
     let capacity = rows;
+    let format = if catalog.nvfp4().is_some() { "nvfp4" } else { "mxfp4" };
+    let path = parent.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json"));
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| {
+        format!("missing exact workspace manifest {}", path.display())
+    })?)?;
     let (stored, routed) = {
-        let format = if catalog.nvfp4().is_some() {
-            "nvfp4"
-        } else {
-            "mxfp4"
-        };
-        let path = parent
-            .join("V41_EXPERT_WORKSPACES")
-            .join(format!("{format}_{role}.json"));
-        let value =
-            serde_json::from_slice(&std::fs::read(&path).with_context(|| {
-                format!("missing exact workspace manifest {}", path.display())
-            })?)?;
         let workspace = NativeWorkspace::from_manifest(
             &value,
             role,
@@ -366,7 +359,37 @@ fn expert_workspace(
             Ok(cost)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(storage) = value.get("expert_storage") {
+        for cost in &experts {
+            check_expert_storage(storage, cost, shape.experts as u64)
+                .with_context(|| path.display().to_string())?;
+        }
+    }
     Ok((experts, lane))
+}
+
+/// A package that declares its resident expert layout (`expert_storage`, as
+/// SM89 exports do) must store exactly the bytes the planner charges for this
+/// role: one TP2 half per expert on two RTX, one whole expert on one.
+fn check_expert_storage(storage: &serde_json::Value, cost: &ExpertCost, experts: u64) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    let declared = storage["bytes_per_expert"].as_u64().context("expert_storage has no bytes_per_expert")?;
+    if let Some(planes) = storage.get("plane_bytes") {
+        let planes = planes.as_array().context("expert_storage plane_bytes is not a list")?.iter()
+            .map(|plane| plane.as_u64().context("expert_storage plane is not a byte count"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(planes.iter().sum::<u64>() == declared,
+            "expert_storage planes {planes:?} do not sum to its {declared} B per expert");
+    }
+    let parts = if cost.tp2 { cost.half.to_vec() } else { vec![cost.whole] };
+    for part in parts {
+        ensure!(experts > 0 && part.resident == declared.checked_mul(experts).context("expert_storage overflow")?,
+            "the package stores {declared} B per expert ({}, {}) but the planner charges {} B: \
+             it does not load this expert layout",
+            storage["weight_layout"].as_str().unwrap_or("unnamed weights"),
+            storage["scale_layout"].as_str().unwrap_or("unnamed scales"), part.resident / experts.max(1));
+    }
+    Ok(())
 }
 
 pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64> {
@@ -482,7 +505,7 @@ pub fn request(
 ) -> PlacementRequest {
     let gpus = inventory.gpus.len();
     assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
-    PlacementRequest {
+    PlacementRequest { expert_tier: None,
         inventory,
         attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
         context_buffers: ContextBuffers::default(),
@@ -520,7 +543,175 @@ pub fn request(
     }
 }
 
-/// What the V4.1 dSpark drafter retains, measured from its own plan before
+/// `--gpu-expert-tier` and `--gpu-expert-tier-profile` as `cuteafd plan
+/// --layout` and serving both read them: the one source of the tier V4.1
+/// asks the solver for, so a plan admits the resident set serving loads.
+#[derive(Debug, Clone, Default)]
+pub struct TierChoice {
+    pub setting: ExpertTierSetting,
+    pub profile: Option<std::path::PathBuf>,
+    /// What the slots are ranked by (serving: the default model).
+    pub model: TierStepModel,
+}
+
+/// The activations a tier's order comes from, and the profile they were
+/// read from (the plan's notes).
+#[derive(Debug, Clone)]
+pub struct TierInputs {
+    pub activation: ExpertActivation,
+    pub source: ExpertTierSource,
+    pub profile: Option<ExpertRouteProfile>,
+}
+
+impl TierChoice {
+    /// The tier's expected activations over `routed` routed layers of
+    /// `experts` experts (`topk` per row): the profile at the step model's
+    /// verify width, else uniform popularity; `None` when the tier is off.
+    /// A profile without a tier is refused.
+    pub fn inputs(&self, routed: usize, experts: usize, topk: u32) -> anyhow::Result<Option<TierInputs>> {
+        match (&self.profile, self.setting.enabled()) {
+            (Some(_), false) => anyhow::bail!("--gpu-expert-tier-profile needs --gpu-expert-tier auto or N"),
+            (_, false) => Ok(None),
+            (None, true) => Ok(Some(TierInputs {
+                activation: ExpertActivation::uniform(routed, experts, self.model.active_experts),
+                source: ExpertTierSource::Uniform, profile: None })),
+            (Some(path), true) => {
+                let profile = ExpertRouteProfile::read(path)?;
+                let activation = ExpertActivation::from_profile(&profile, routed, experts, self.model.step_rows, topk,
+                    self.model.active_experts)?;
+                Ok(Some(TierInputs { activation, source: ExpertTierSource::Profile, profile: Some(profile) }))
+            }
+        }
+    }
+
+    /// Asks `request` (V4.1's, built by [`request`]) for the tier: every
+    /// routed slot ranked by how much its residency cuts the predicted step
+    /// time, behind the whole layers `pinned` (`--rtx-expert-layers`) pins,
+    /// in place of whole-layer onboarding (no TP2 or TP1 layer prefix, none
+    /// mandatory). The Sparks keep every expert, so it needs Spark ranks.
+    pub fn apply(&self, request: &mut PlacementRequest, inputs: &TierInputs, pinned: Option<Onboard>,
+        experts: usize) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let routed = request.layers.iter().enumerate().filter(|(_, layer)| layer.experts.is_some())
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        let size = self.setting.size(routed.len()).ok_or_else(|| anyhow::anyhow!("the GPU expert tier is off"))?;
+        ensure!(request.inventory.spark_ranks > 0,
+            "the GPU expert tier runs non-resident experts on the Sparks: plan it with Spark ranks");
+        let pinned = match pinned {
+            None | Some(Onboard::Auto) => 0,
+            Some(Onboard::Layers(layers)) => layers,
+        };
+        ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
+        let order = super::super::expert_tier::optimized_order(&routed, &inputs.activation, &self.model, pinned);
+        request.expert_tier = Some(ExpertTierRequest::new(size, experts, order, inputs.source));
+        request.onboard = Onboard::Layers(0);
+        request.minimum_expert_layers = 0;
+        Ok(())
+    }
+}
+
+/// Device bytes one lane's GPU expert tier adds on each GPU beyond the routed
+/// owner pair it runs on (the TP2 FFN's, sized like a whole layer's): the
+/// `slot_of` tables of `layers` backbone layers of `experts` experts, and the
+/// compact slots of `rows` rows of six routes.
+pub fn tier_lane_bytes(layers: u64, experts: u64, rows: u64) -> u64 {
+    layers * experts * 4 + rows * 6 * 4
+}
+
+/// Each GPU's weights outside the routed experts, as `--coordinator-weight-
+/// budget-gib` counts them: the weight, embedding and table owners in
+/// `fixed` (and an external drafter's weights), plus the dSpark drafter's
+/// resident bytes beside the head on the last GPU and, with its TP2 experts,
+/// the other half on GPU0.
+pub fn fixed_weight_bytes(fixed: &[Demand], draft: Option<&DraftInventory>, gpus: usize) -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    (0..gpus).map(|gpu| {
+        let mut bytes = fixed.iter().filter(|d| usize::from(d.gpu) == gpu
+            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
+                || d.group == "external drafter weights"))
+            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
+        if gpu == gpus - 1 {
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
+        }
+        if gpu == 0 && gpus == 2 {
+            // --tp2-dspark-experts: GPU0 holds the other half of dSpark's experts.
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.peer_half)).context("V4.1 draft weight budget overflow")?;
+        }
+        Ok(bytes)
+    }).collect()
+}
+
+/// Each GPU's retained weights in `placed`: its `fixed` weights
+/// ([`fixed_weight_bytes`]) plus the GPU expert tier's and the onboarded
+/// routed layers' resident experts.
+pub fn retained_weight_bytes(request: &PlacementRequest, placed: &Placement, fixed: &[u64])
+    -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    fixed.iter().enumerate().map(|(gpu, &fixed)| {
+        let mut bytes = fixed;
+        if let Some(tier) = &placed.expert_tier {
+            bytes = bytes.checked_add(tier.resident_bytes.get(gpu).copied().unwrap_or(0))
+                .context("V4.1 GPU expert tier weight budget overflow")?;
+        }
+        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
+            if let Some(cost) = layer.experts {
+                let resident = match assigned.experts {
+                    ExpertHome::RtxTp2 => cost.half[gpu].resident,
+                    ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
+                    _ => 0,
+                };
+                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
+            }
+        }
+        Ok(bytes)
+    }).collect()
+}
+
+/// Solves `request` within `limit` retained weight bytes per GPU
+/// (`--coordinator-weight-budget-gib`), as `cuteafd plan` and serving both
+/// admit: an over-budget solution sheds GPU expert tier experts (whole
+/// experts, by the excess), else optional whole layers, and solves again
+/// (an automatic pool kept as first admitted). `fixed` is each GPU's weights
+/// outside the routed experts ([`fixed_weight_bytes`]).
+pub fn solve_with_weight_limit(request: &PlacementRequest, fixed: &[u64], limit: u64) -> anyhow::Result<Placement> {
+    use anyhow::{ensure, Context};
+    let mut placement = solve(request)?;
+    loop {
+        let retained = retained_weight_bytes(request, &placement, fixed)?;
+        if retained.iter().all(|&bytes| bytes <= limit) { return Ok(placement); }
+        if let Some(tier) = placement.expert_tier.as_ref().filter(|tier| tier.experts > 0) {
+            // Shrink the tier by the excess, in whole experts (the largest
+            // per-expert part bounds how many must go).
+            let excess = retained.iter().map(|&bytes| bytes.saturating_sub(limit)).max().unwrap_or(0);
+            let largest = request.layers.iter().filter_map(|layer| layer.experts)
+                .flat_map(|cost| [cost.half[0].resident, cost.half[1].resident, cost.whole.resident])
+                .max().unwrap_or(0) / request.expert_tier.as_ref().map_or(1, |t| t.experts_per_layer.max(1)) as u64;
+            let drop = usize::try_from(excess.div_ceil(largest.max(1)))?.max(1);
+            let mut trial = request.clone();
+            let mut shrunk = trial.expert_tier.take().context("GPU expert tier request")?;
+            let keep = tier.experts.saturating_sub(drop);
+            ensure!(keep >= shrunk.pinned,
+                "V4.1 coordinator weight budget exceeded; pinned whole layers need more than {limit} bytes");
+            if shrunk.size == ExpertTierSize::Auto { trial.pool.pin_selected(placement.pool_tokens); }
+            shrunk.size = ExpertTierSize::Experts(keep);
+            trial.expert_tier = Some(shrunk);
+            placement = solve(&trial)?;
+            continue;
+        }
+        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
+            && placement.onboard_layers > request.minimum_expert_layers,
+            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
+        let mut trial = request.clone();
+        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
+        // Keep pool-first's admitted pool while reducing only the optional prefix.
+        if matches!(request.onboard, Onboard::Auto) {
+            trial.pool.pin_selected(placement.pool_tokens);
+        }
+        placement = solve(&trial)?;
+    }
+}
+
+/// What the V4.1 dSpark drafter retains, measured from its own plan before/// What the V4.1 dSpark drafter retains, measured from its own plan before
 /// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
 /// (request lanes, main context, windows) on the default native BF16 path;
 /// EXL3 arenas and TP2 expert halves are sized from their packages.

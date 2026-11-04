@@ -520,6 +520,15 @@ impl DsparkChain<'_, '_> {
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
         Ok(Some((tokens, confidence)))
     }
+    /// poll_replay for a caller that blocks: drain the stream before each poll,
+    /// so a cold count warms, captures and replays without the host spinning.
+    pub fn wait_replay(&mut self) -> Result<(Vec<u32>, Vec<f32>)> {
+        for _ in 0..2 {
+            if let Err(error) = self.synchronize() { self.pending = None; return Err(error); }
+            if let Some(output) = self.poll_replay()? { return Ok(output); }
+        }
+        anyhow::bail!("dSpark replay incomplete after its stream drained")
+    }
     #[cfg(test)]
     pub fn cancel_pending_for_test(&mut self) {
         self.pending = None; // guard drains before releasing reads

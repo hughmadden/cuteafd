@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Compare CPU-only SM120 AOT exports, including their embedded CUDA images.
+"""Compare CPU-only SM120 (or, with --arch sm89, SM89) AOT exports, including
+their embedded CUDA images.
 
 Run in the coordinator compiler image without --gpus. Differences are evidence
 for review, not proof of incompatibility; --require-identical is an optional
 strict gate. Reports include exact object bytes, cubins, headers and metadata.
+SM89 mode exports the sm_89 coordinator build's groups on b12x's offline SM89
+target. Programs in its recorded-variation file may differ in device code only:
+the toolchain compiles them to different instruction orders run to run.
 """
 from __future__ import annotations
 
@@ -57,6 +61,16 @@ _spec = importlib.util.spec_from_file_location("v41_capacities", ROOT / "python/
 _v41 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_v41)
 V41_CAPACITIES = ",".join(map(str, _v41.TARGET_CAPACITIES))
+# The groups an sm_89 coordinator build exports (native CMake with
+# CUTEAFD_CUDA_ARCHITECTURES=89). Its narrow FP8 plans stay off; the lagged mHC
+# begin is exported for the manifest's inventory (build-wip-artifacts.sh's
+# v41_hc_lagged_aot), and its program table holds only the Spark reply
+# reducers (expert-reply). The target is every supported SM89 card.
+SM89_GROUPS = ("v41-fp8", "v41-experts", "v41-index", "v41-router",
+               "v41-slices-rtx_backbone", "v41-slices-rtx_tp2", "v41-slices-dspark_tp2", "expert-reply")
+ARCHES = {"sm120": {"sms": (188, 170)}, "sm89": {"sms": (128, 114), "capability": [8, 9]}}
+SM89_VARIATION = ROOT / "scripts/build/sm89-export-variation.json"
+SUPPORTED_CAPABILITIES = ([12, 0], [12, 1], [8, 9])
 V41_DRAFT_CAPACITIES = ",".join(map(str, _v41.DRAFT_CAPACITIES))
 V41_PROJECTION_CAPACITIES = ",".join(map(str, _v41.PROJECTION_CAPACITIES))
 # EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
@@ -603,8 +617,9 @@ def worker(payload):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
-    os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = "1"
-    os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = "1"
+    candidates = payload.get("candidates", "1")
+    os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = candidates
+    os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = payload.get("hc_lagged", candidates)
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
@@ -615,7 +630,8 @@ def worker(payload):
         ("--role" in payload["args"] and payload["args"][payload["args"].index("--role") + 1] == "spark"))
     routed_spark = (payload["exporter"] == "package_fp8_moe_aot.py" and "--role" in payload["args"]
                     and payload["args"][payload["args"].index("--role") + 1] == "spark")
-    capability = (12, 1) if native_spark or exl3_spark or routed_spark else (12, 0)
+    capability = (tuple(payload["capability"]) if payload.get("capability")
+                  else (12, 1) if native_spark or exl3_spark or routed_spark else (12, 0))
     _initialize_worker(0, capability, "sm-export-comparison", "sm-export-comparison",
                        payload["sms"], 101376, 102400, multiprocessing.Array("i", [0, 0]))
     import torch
@@ -768,7 +784,26 @@ def aggregate_header_after_removals(header, removed):
     return "".join(lines).encode("utf-8")
 
 
-def compare(left, right, *, source_comparison=False, expected_removals=None):
+def read_variation(path):
+    """Recorded run-to-run device-code variation: {toolchain, programs: [group/stem]}."""
+    record = json.loads(path.read_text())
+    programs = record.get("programs")
+    if (not isinstance(record.get("toolchain"), dict) or not isinstance(programs, list)
+            or not programs or len(programs) != len(set(programs))
+            or any(not isinstance(name, str) or name.count("/") != 1 for name in programs)):
+        raise ValueError(f"{path}: recorded variation needs a toolchain and unique group/program names")
+    return record
+
+
+def variation_for(record, group, contexts):
+    """Program stems of `group` allowed to vary, if both exports used the recorded toolchain."""
+    if record is None or any(context.get("toolchain", {}).get(name) != version
+                             for context in contexts for name, version in record["toolchain"].items()):
+        return frozenset()
+    return frozenset(name.split("/", 1)[1] for name in record["programs"] if name.split("/", 1)[0] == group)
+
+
+def compare(left, right, *, source_comparison=False, expected_removals=None, variation=None, group=None):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
     right_names = {path.relative_to(right).as_posix() for path in right.rglob("*") if path.suffix in (".o", ".cubin")}
@@ -787,8 +822,8 @@ def compare(left, right, *, source_comparison=False, expected_removals=None):
         raise ValueError("comparison context did not prove CPU-only export")
     for context in contexts:
         sms = context.get("sms")
-        if type(sms) is not int or sms <= 0 or context.get("capability") not in ([12, 0], [12, 1]):
-            raise ValueError("comparison context must identify positive SM count and compute 12.0")
+        if type(sms) is not int or sms <= 0 or context.get("capability") not in SUPPORTED_CAPABILITIES:
+            raise ValueError("comparison context must identify positive SM count and a supported compute capability")
     if source_comparison:
         if contexts[0]["sms"] != contexts[1]["sms"]:
             raise ValueError("source comparison contexts must have the same SM count")
@@ -804,6 +839,7 @@ def compare(left, right, *, source_comparison=False, expected_removals=None):
         if contexts[0][key] != contexts[1][key] and not (source_comparison and key in source_fields):
             raise ValueError(f"comparison target differs beyond {'source' if source_comparison else 'SM count'}: {key}")
     metas = [metadata(directory) for directory in (left, right)]
+    allowed = variation_for(variation, group, contexts)
     if contexts[0]["exporter"] == "export_b12x_dsv4_aot.py" and "--only" not in contexts[0]["args"]:
         for target in metas:
             for name, record in target.items():
@@ -832,13 +868,21 @@ def compare(left, right, *, source_comparison=False, expected_removals=None):
             raise ValueError(f"{name}: missing exported ABI header")
         same_object = blobs[0] == blobs[1]
         same_cubins = sorted(blob for _, blob in images[0]) == sorted(blob for _, blob in images[1])
+        # Device code only, with the same kernels, headers and plan: recorded
+        # variation when listed, otherwise a candidate for the record.
+        code_only = (not same_cubins and headers[0] == headers[1] and not fields
+                     and [[s["section"] for s in image] for image in sections[0]]
+                     == [[s["section"] for s in image] for image in sections[1]])
+        recorded = code_only and stem in allowed
         records.append({"program": stem, "artifact_kind": Path(name).suffix[1:], "object_identical": same_object,
                         "cubins_identical": same_cubins, "header_identical": headers[0] == headers[1],
                         "object_sha256": [sha(blob) for blob in blobs], "object_bytes": list(map(len, blobs)),
                         "cubin_sha256": cubin_hashes, "cubin_sections": sections,
                         "sass_identical": text_hashes[0] == text_hashes[1] if all(text_hashes) else None,
                         "metadata_changed_fields": fields,
-                        "classification": "identical" if same_object else "host-only" if same_cubins else "cubin-bytes"})
+                        "classification": "identical" if same_object else "host-only" if same_cubins
+                        else "recorded-variation" if recorded else "cubin-bytes",
+                        **({"variation_candidate": code_only and not recorded} if variation is not None else {})})
     header_names = {path.relative_to(directory).as_posix()
                     for directory in (left, right) for path in directory.rglob("*.h")}
     headers_changed = [name for name in sorted(header_names)
@@ -867,9 +911,9 @@ def compare(left, right, *, source_comparison=False, expected_removals=None):
                     expected = aggregate_header_after_removals((left / name).read_bytes(), local_removals)
                     if expected == (right / name).read_bytes():
                         changed_headers.remove(name)
-        survivors = [row["program"] for row in records if not all((row["object_identical"],
-                     row["cubins_identical"], row["header_identical"], row["sass_identical"] is not False))
-                     or row["metadata_changed_fields"]]
+        survivors = [row["program"] for row in records if row["classification"] != "recorded-variation" and (
+                     not all((row["object_identical"], row["cubins_identical"], row["header_identical"],
+                              row["sass_identical"] is not False)) or row["metadata_changed_fields"])]
         if survivors or changed_headers or changed:
             raise ValueError(f"changed survivors: {survivors}; headers={sorted(changed_headers)}; metadata={changed}")
     return report
@@ -905,7 +949,11 @@ def parse_sms(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sms", type=parse_sms, default=(188, 170))
+    parser.add_argument("--arch", choices=tuple(ARCHES), default="sm120",
+                        help="sm89: the sm_89 coordinator groups on the offline SM89 target")
+    parser.add_argument("--sms", type=parse_sms, help="default: 188,170 (sm120) or 128,114 (sm89)")
+    parser.add_argument("--variation", type=Path,
+                        help="recorded device-code variation (default for sm89: scripts/build/sm89-export-variation.json)")
     parser.add_argument("--role", choices=("coordinator", "spark"), default="coordinator",
                         help="role for non-compact EXL3 expert groups")
     parser.add_argument("--scope", choices=("suspects", "all"), default="all")
@@ -925,6 +973,13 @@ def main():
     if args._worker:
         worker(json.loads(args._worker))
         return 0
+    target = ARCHES[args.arch]
+    args.sms = args.sms or target["sms"]
+    variation_path = args.variation or (SM89_VARIATION if args.arch == "sm89" else None)
+    try:
+        variation = read_variation(variation_path) if variation_path else None
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     if args.expected_removals and not args.baseline_source:
         parser.error("--expected-removals requires --baseline-source")
     try:
@@ -932,6 +987,8 @@ def main():
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     selected_jobs = jobs(args.scope)
+    if args.arch == "sm89":
+        selected_jobs = [job for job in selected_jobs if job[0] in SM89_GROUPS]
     if args.list:
         print("\n".join(name for name, _, _ in selected_jobs))
         return 0
@@ -976,6 +1033,8 @@ def main():
                     del context_args[index:index + 2]
                 context_args.append("--source-package-layouts")
             payload = dict(sms=sms, exporter=exporter, args=context_args, output=str(directory))
+            if "capability" in target:
+                payload.update(capability=target["capability"], candidates="0", hc_lagged="1")
             print(f"export {name} SMs={sms}", flush=True)
             env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(source),
                        CUTEAFD_SPARKINFER_SOURCE_DIR=str(source / "third_party/sparkinfer"),
@@ -990,7 +1049,10 @@ def main():
                           file=sys.stderr, flush=True)
                     raise
         options = {"expected_removals": expected_removals} if expected_removals is not None else {}
-        report = compare(*directories, source_comparison=True, **options) if baseline_source else compare(*directories)
+        if variation is not None:
+            options.update(variation=variation, group=name)
+        report = (compare(*directories, source_comparison=True, **options) if baseline_source
+                  else compare(*directories, **options))
         report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
         if baseline_source and expected_removals is None and report["removed_programs"]:
@@ -1002,7 +1064,9 @@ def main():
         for record in report["programs"]:
             print(f"{name}/{record['program']}: {record['classification']}; "
                   f"header={'same' if record['header_identical'] else 'different'}; "
-                  f"sass={record['sass_identical']}; metadata_fields={len(record['metadata_changed_fields'])}", flush=True)
+                  f"sass={record['sass_identical']}; metadata_fields={len(record['metadata_changed_fields'])}"
+                  + ("; device code only, not in the recorded variation" if record.get("variation_candidate") else ""),
+                  flush=True)
         return report
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -1025,13 +1089,15 @@ def main():
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-    different = sum(not row["object_identical"] for report in reports for row in report["programs"])
+    different = sum(not row["object_identical"] and row["classification"] != "recorded-variation"
+                    for report in reports for row in report["programs"])
+    varied = sum(row["classification"] == "recorded-variation" for report in reports for row in report["programs"])
     total = sum(len(report["programs"]) for report in reports)
     inventory_delta = sum(len(report[key]) for report in reports
                           for key in (("removed_programs",) if baseline_source
                                       else ("added_programs", "removed_programs")))
-    print(f"Compared {total} common programs: {total - different} identical objects, {different} different, "
-          f"{inventory_delta} added/removed. Report: {output / 'comparison.json'}")
+    print(f"Compared {total} common programs: {total - different - varied} identical objects, {different} different, "
+          f"{varied} recorded variation, {inventory_delta} added/removed. Report: {output / 'comparison.json'}")
     return int(args.require_identical and (different > 0 or (inventory_delta > 0 and expected_removals is None)))
 
 

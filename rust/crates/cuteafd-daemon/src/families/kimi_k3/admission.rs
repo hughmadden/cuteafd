@@ -850,7 +850,7 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
     let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
         i.requested_pool, MLA_PAGE_ROWS as u64, true);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
-    Ok(PlacementRequest { inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
+    Ok(PlacementRequest { expert_tier: None, inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool, layers, pool_overhead: vec![0; RANKS], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
@@ -1326,7 +1326,7 @@ pub(super) mod tests {
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
-        let arch = ArchContext::for_device("sm_120", capacity);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
         let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
             "kimik3", "exl3", false, 0, arch, Some(&programs));
@@ -1457,7 +1457,7 @@ pub(super) mod tests {
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
                 cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
-            let arch = ArchContext::for_device("sm_120", capacity);
+            let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
             let mut i = inputs(&cfg);
             i.cache_format = format;
             i.requested_pool = requested_pool;

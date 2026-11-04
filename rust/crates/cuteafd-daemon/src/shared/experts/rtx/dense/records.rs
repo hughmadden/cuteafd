@@ -88,6 +88,22 @@ impl Rect {
     pub fn sub(&self, rows: Range<usize>) -> Self {
         Self { rows: self.rows.start + rows.start..self.rows.start + rows.end, ..self.clone() }
     }
+
+    /// TP2 half `rank` of this matrix: its row half (`axis` 0) or the half of
+    /// every row's bytes (`axis` 1). Every coordinator tensor split in half
+    /// across two GPUs takes its rank's bytes through this one rule.
+    pub fn half(&self, axis: usize, rank: usize) -> Result<Self> {
+        ensure!(axis < 2 && rank < 2, "{}: no TP2 half {rank} on axis {axis}", self.name);
+        if axis == 0 {
+            ensure!(!self.rows.is_empty() && self.rows.len() % 2 == 0, "{}: rows do not halve", self.name);
+            let half = self.rows.len() / 2;
+            return Ok(self.sub(rank * half..(rank + 1) * half));
+        }
+        ensure!(!self.cols.is_empty() && self.cols.len() % 2 == 0, "{}: row bytes do not halve", self.name);
+        let width = self.cols.len() / 2;
+        let first = self.cols.start + rank * width;
+        Ok(Self { cols: first..first + width, ..self.clone() })
+    }
 }
 
 /// A class-2 operand: rectangles landing unchanged at byte offsets of `buffer`

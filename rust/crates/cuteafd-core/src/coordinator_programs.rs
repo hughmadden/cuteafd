@@ -8,6 +8,9 @@ pub struct AttentionReductionPlan {
     active_drafts: Option<usize>,
     override_rows: Option<usize>,
     rows: usize,
+    /// Compressed (indexed) attention's ten-part kernel, fixed per coordinator
+    /// architecture ([`crate::GpuArch::v41_compressed_attention`]).
+    compressed: SparseAttentionBackend,
 }
 
 impl AttentionReductionPlan {
@@ -24,7 +27,15 @@ impl AttentionReductionPlan {
             Some(rows) => rows,
             None => automatic,
         };
-        Ok(Self { capacity_rows, active_drafts, override_rows, rows })
+        Ok(Self { capacity_rows, active_drafts, override_rows, rows, compressed: SparseAttentionBackend::Bf16Aot })
+    }
+
+    /// The compressed recipe's kernel, from the coordinator architecture
+    /// ([`crate::GpuArch::v41_compressed_attention`]; BF16 AOT by default).
+    /// Keyed on the device, never on which symbols a library carries: an
+    /// SM120 library without its AOT export still refuses at plan install.
+    pub fn with_compressed(self, compressed: SparseAttentionBackend) -> Self {
+        Self { compressed, ..self }
     }
 
     pub fn rows(self) -> usize { self.rows }
@@ -34,7 +45,7 @@ impl AttentionReductionPlan {
     /// Alignment is a load contract, never a reason to change the reduction.
     pub fn sparse_recipe(self, compressed: bool) -> SparseAttentionRecipe {
         SparseAttentionRecipe { parts: if compressed { 10 } else { 2 },
-            backend: if compressed { SparseAttentionBackend::Bf16Aot } else { SparseAttentionBackend::NativeFp32 } }
+            backend: if compressed { self.compressed } else { SparseAttentionBackend::NativeFp32 } }
     }
 
     /// A row without indexed records must retain the window-only fold even when
@@ -59,7 +70,8 @@ impl AttentionReductionPlan {
     /// Admission may use validated checkpoint geometry before loading the drafter.
     /// Check raw geometry too: different widths can clamp to the same plan.
     pub fn validate_loaded(self, active_drafts: Option<usize>) -> Result<Self, AttentionPlanError> {
-        let loaded = Self::new(self.capacity_rows, active_drafts, self.override_rows)?;
+        let loaded = Self { compressed: self.compressed,
+            ..Self::new(self.capacity_rows, active_drafts, self.override_rows)? };
         if loaded != self {
             return Err(AttentionPlanError::DrafterMismatch {
                 provisional: self.active_drafts, loaded: active_drafts,
@@ -176,6 +188,14 @@ pub struct MlaDraftLayoutError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
+
+/// Split scratch of a `parts`-part sparse attention launch over `rows` x
+/// `heads`: the native FP32 kernel's per-part partial output (512), max and
+/// sum per head. The BF16 AOT ten-part recipe uses a prefix of it, so planner
+/// and runtime reserve this one extent whichever backend the plan names.
+pub const fn sparse_split_scratch_bytes(rows: usize, parts: usize, heads: usize) -> usize {
+    rows * parts * heads * 514 * 4
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseAttentionRecipe {
@@ -428,29 +448,32 @@ pub fn select_attention_plans(manifest: &mut serde_json::Value, plan: AttentionR
 #[error("invalid attention recipe scratch contract or numerical domain mismatch")]
 pub struct AttentionScratchError;
 
-/// Select the same 170/188-SM program recipe as native load, before admission.
-/// The retained plans allow another device to select its own scratch envelope.
+/// Select the program recipe exported for exactly this card's SM count, as native load does,
+/// before admission. Every exported plan must be well formed (unique positive `sm_count`,
+/// integral scratch, object geometry); a card without its own plan fails closed rather than
+/// borrowing another card's split geometry. The retained plans let another device select its
+/// own scratch envelope.
 pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(), CardPlanError> {
     let Some(programs) = manifest["programs"].as_array_mut() else { return Ok(()) };
     for program in programs {
         if program.get("card_plans").is_none() { continue; }
         let name = program["name"].as_str().unwrap_or("<unnamed>").to_string();
-        let invalid = || CardPlanError { name: name.clone() };
+        let invalid = || CardPlanError { name: name.clone(), reason: "invalid card-plan contract".into() };
         let plans = program["card_plans"].as_array().ok_or_else(invalid)?;
-        if sms == 0 || plans.len() != 2 { return Err(invalid()); }
-        let selected_sms = if sms >= 188 { 188 } else { 170 };
+        if sms == 0 || plans.is_empty() { return Err(invalid()); }
+        let mut exported = std::collections::BTreeSet::new();
         let mut selected = None;
-        for expected in [170, 188] {
-            let matching: Vec<_> = plans.iter().filter(|p| p["sm_count"].as_u64() == Some(expected)).collect();
-            if matching.len() != 1 { return Err(invalid()); }
-            let plan = matching[0];
+        for plan in plans {
+            let count = plan["sm_count"].as_u64().filter(|&count| count > 0).ok_or_else(invalid)?;
+            if !exported.insert(count) { return Err(invalid()); }
             let scratch = plan["scratch_bytes_at_capacity"].as_object().ok_or_else(invalid)?;
             if scratch.values().any(|v| v.as_u64().is_none()) || !plan["geometry"].is_object() {
                 return Err(invalid());
             }
-            if expected == selected_sms { selected = Some(plan.clone()); }
+            if count == u64::from(sms) { selected = Some(plan.clone()); }
         }
-        let plan = selected.ok_or_else(invalid)?;
+        let plan = selected.ok_or_else(|| CardPlanError { name: name.clone(),
+            reason: format!("no card plan for {sms} SMs (exported for {exported:?}); export one for this card") })?;
         program["scratch_bytes_at_capacity"] = plan["scratch_bytes_at_capacity"].clone();
         program["geometry"] = plan["geometry"].clone();
     }
@@ -458,9 +481,10 @@ pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("program {name} has an invalid 170/188-SM card-plan contract")]
+#[error("program {name}: {reason}")]
 pub struct CardPlanError {
     pub name: String,
+    pub reason: String,
 }
 
 #[cfg(test)]
@@ -523,6 +547,39 @@ mod tests {
             assert!(plan.validate_loaded(Some(7)).is_err());
             assert_eq!(plan.rows(), plan_rows);
         }
+    }
+
+    #[test]
+    fn compressed_backend_follows_the_coordinator_architecture() {
+        use crate::GpuArch;
+        let chosen = |plan: AttentionReductionPlan, arch: GpuArch| plan.with_compressed(arch.v41_compressed_attention());
+        for (drafts, override_rows) in [(None, None), (Some(5), None), (Some(7), Some(3))] {
+            let plan = AttentionReductionPlan::new(64, drafts, override_rows).unwrap();
+            // SM120 (and SM121) keep the default plan exactly: BF16 AOT ten-part.
+            for arch in [GpuArch::Sm120, GpuArch::Sm121] {
+                assert_eq!(chosen(plan, arch), plan);
+            }
+            assert_eq!(plan.sparse_recipe(true), SparseAttentionRecipe { parts: 10,
+                backend: SparseAttentionBackend::Bf16Aot });
+            // SM89 has no direct attention AOT: native FP32, still ten parts.
+            let sm89 = chosen(plan, GpuArch::Sm89);
+            assert_ne!(sm89, plan);
+            assert_eq!(sm89.sparse_recipe(true), SparseAttentionRecipe { parts: 10,
+                backend: SparseAttentionBackend::NativeFp32 });
+            // Window attention, rows and drafts are the same on every architecture.
+            for arch in GpuArch::ALL {
+                let chosen = chosen(plan, arch);
+                assert_eq!(chosen.sparse_recipe(false), SparseAttentionRecipe { parts: 2,
+                    backend: SparseAttentionBackend::NativeFp32 });
+                assert_eq!((chosen.rows(), chosen.capacity_rows(), chosen.active_drafts()),
+                    (plan.rows(), plan.capacity_rows(), plan.active_drafts()));
+                // Loading the drafter keeps the architecture's backend.
+                assert_eq!(chosen.validate_loaded(drafts).unwrap(), chosen);
+            }
+            assert_eq!(chosen(sm89, GpuArch::Sm120), plan);
+        }
+        // One split extent for both backends: the native kernel's layout.
+        assert_eq!(sparse_split_scratch_bytes(64, 10, 64), 64 * 10 * 64 * 514 * 4);
     }
 
     #[test]
@@ -672,6 +729,25 @@ mod tests {
             }
             let error = select_card_plans(&mut manifest, if defect == 4 { 0 } else { 188 }).unwrap_err();
             assert_eq!(error.name, "dsv4p_sparse_mla_decode_c128_m64");
+        }
+    }
+
+    #[test]
+    fn card_plans_select_the_exact_sm_count_and_never_round_to_another_card() {
+        // A 114-SM card (RTX 4090 D) on a 170/188-only export fails closed by name.
+        let error = select_card_plans(&mut dual_manifest(), 114).unwrap_err();
+        assert_eq!(error.name, "dsv4p_sparse_mla_decode_c128_m64");
+        assert!(error.reason.contains("114 SMs"), "{error}");
+        // A card between the two exported counts no longer borrows the 170-SM plan.
+        assert!(select_card_plans(&mut dual_manifest(), 180).is_err());
+        // An export carrying the card's own plan selects it; the others stay valid.
+        let mut manifest = dual_manifest();
+        manifest["programs"][0]["card_plans"].as_array_mut().unwrap().push(serde_json::json!(
+            {"sm_count": 114, "scratch_bytes_at_capacity": {"scratch": 77}, "geometry": {"num_splits": 7}}));
+        for (sms, bytes, splits) in [(114, 77, 7), (170, 1094778880, 130), (188, 8421376, 1)] {
+            select_card_plans(&mut manifest, sms).unwrap();
+            assert_eq!(manifest["programs"][0]["scratch_bytes_at_capacity"]["scratch"], bytes);
+            assert_eq!(manifest["programs"][0]["geometry"]["num_splits"], splits);
         }
     }
 

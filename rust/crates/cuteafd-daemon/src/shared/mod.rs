@@ -39,6 +39,7 @@ pub(crate) mod loop_abort;
 pub(crate) mod qwen;
 pub(crate) mod repeat_guard;
 pub(crate) mod rope;
+pub(crate) mod route_census;
 pub(crate) mod sampler;
 pub(crate) mod serve;
 pub(crate) mod speculation;

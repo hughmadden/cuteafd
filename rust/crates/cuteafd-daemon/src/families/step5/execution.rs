@@ -1941,7 +1941,7 @@ mod tests {
         let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.layers];
         let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
             rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
-        let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
+        let placement = Placement { expert_tier: None, pool_tokens: 0, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
             onboard_layers: 0, max_pool_tokens_no_onboard: 0, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
             movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec)?,

@@ -6,6 +6,8 @@ pub enum CuteafdError {
     InvalidDeepseekV4AttentionGeometry { reason: String },
     #[error("unknown role: {0}")]
     UnknownRole(String),
+    #[error("unsupported GPU architecture {0}: cuteafd plans and runs sm_89 and sm_120 coordinators and sm_121 Spark ranks")]
+    UnsupportedGpuArch(String),
     #[error("unknown placement policy: {0}")]
     UnknownPlacementPolicy(String),
     #[error("unknown replicated expert tie-seed mode: {0} (expected dispatch or layer)")]

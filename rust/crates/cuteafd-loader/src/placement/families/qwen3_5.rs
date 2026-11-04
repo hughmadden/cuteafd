@@ -148,7 +148,7 @@ pub fn request(mut inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
             fixed_bytes: ModeBytes::default(), extra, context_indexer: false, colocate: None,
             experts: None, modes: vec![WHOLE] })
     }).collect::<Result<_>>()?;
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus: vec![inputs.gpu], spark_ranks: 0, peer_access: false },
         attention_placement: None, context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,

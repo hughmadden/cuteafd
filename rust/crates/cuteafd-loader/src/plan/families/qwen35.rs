@@ -171,7 +171,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];
-    let context = ArchContext::coordinator(capacity, None).context_bytes + set.module_bytes();
+    let context = ArchContext::coordinator(options.coordinator_arch, capacity, None).context_bytes + set.module_bytes();
     let drafter = options.dense_qwen_drafter_snapshot.as_ref().map(|snapshot| {
         ensure!(crate::formats::block_dspark::supports_sequences(slots), "dense dSpark sequence capacity exceeded");
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
@@ -179,7 +179,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
             "dense dSpark checkpoint differs from target geometry");
         placement::families::qwen3_5::DrafterBytes::block_dspark(&config, slots,
-            options.physical_sms.unwrap_or_else(|| ArchContext::coordinator(capacity, None).sms) as u64, cfg.max_context)
+            options.physical_sms.unwrap_or_else(|| ArchContext::coordinator(options.coordinator_arch, capacity, None).sms) as u64, cfg.max_context)
     }).transpose()?;
     let drafter = if options.dense_qwen_mtp {
         Some(placement::families::qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)

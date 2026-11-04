@@ -60,8 +60,7 @@ pub(crate) fn library() -> Result<NativeLibrary> {
 /// head and dSpark recipes are the same constructors the serving loaders use.
 #[test]
 fn installed_full_v41_push_host_owners_are_admitted_exactly() -> Result<()> {
-    use crate::shared::{experts::{layer::{native_coded_scale_steps, native_weight_windows},
-        rtx::dense::{HostStaging, Operand, RankLayout, Rect}},
+    use crate::shared::{experts::{layer::native_expert_steps, rtx::dense::{HostStaging, Operand, RankLayout}},
         memory::{push_coordinator::CoordinatorExpertPlan, push_native::ScalePlan}};
     use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
     use cuteafd_loader::{push_load::native::NativePlanes, V41ExpertSelection, V41TensorPlacement};
@@ -108,19 +107,8 @@ fn installed_full_v41_push_host_owners_are_admitted_exactly() -> Result<()> {
             assert!(steps.iter().all(|step| step.bytes() == 16 * 10240));
             if gpu == draft_gpu {
                 for stage in 0..shape.draft_stages { for expert in 0..shape.draft_experts {
-                    let selection = catalog.expert_staging(V41ExpertSelection::Dspark { stage, expert })?;
-                    let names = selection.tensor_names();
-                    for (slot, projection) in [(0, 0), (1, 1), (2, 2)] {
-                        let tensor = catalog.tensor(&names[slot])?;
-                        let rows = tensor.metadata.shape[0];
-                        let width = tensor.metadata.byte_length as usize / rows;
-                        let rect = Rect { name: names[slot].clone(), path: snapshot.join(&tensor.shard),
-                            base: tensor.metadata.byte_offset, row_bytes: width, rows: 0..rows, cols: 0..width };
-                        steps.extend(native_weight_windows(rect, device, shape.hidden, shape.intermediate as u32,
-                            projection, buffer(device, 2 * shape.hidden * shape.intermediate))?);
-                    }
-                    steps.extend(native_coded_scale_steps(&catalog, names, shape.intermediate, device,
-                        [buffer(device, 2 * shape.hidden * shape.intermediate); 2])?);
+                    steps.extend(native_expert_steps(&catalog, V41ExpertSelection::Dspark { stage, expert }, device,
+                        [buffer(device, 2 * shape.hidden * shape.intermediate); 4])?);
                 } }
             }
             let layout = RankLayout::new(operands, steps, device)?;

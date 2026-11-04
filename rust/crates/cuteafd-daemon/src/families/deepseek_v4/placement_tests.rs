@@ -139,7 +139,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
     let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
     let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
-    let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
+    let inputs = admission::Inputs { arch: cuteafd_core::GpuArch::Sm120, cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
         loaded_modes: None, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
@@ -684,7 +684,7 @@ impl FixtureGpu {
                     bytes: code, source: "fixture replay",
                 };
                 let context = cuteafd_loader::placement::inventory::ArchContext::for_device(
-                    "sm_120", self.total_bytes).context_bytes;
+                    cuteafd_core::GpuArch::Sm120, self.total_bytes).context_bytes;
                 self.admission_free_bytes.checked_add(reserved).unwrap()
                     .checked_sub(loaded.pending(untracked, context)).unwrap()
             }
@@ -739,7 +739,8 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let catalog = shared.input.expert_catalog().unwrap();
         let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
         let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
-            cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+            cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx,
+        cuteafd_core::GpuArch::Sm120);
         // Replay pending-code reservation, retaining the raw launch sample.
         for (gpu, measured) in fixture.gpus.iter().enumerate() {
             let device = &layout.devices[gpu];
@@ -819,7 +820,8 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
-        cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+        cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx,
+        cuteafd_core::GpuArch::Sm120);
     let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| (g.total_bytes,
         Baseline::Measured { free_bytes: g.free_with_current_code(code[gpu]) })).collect();
     let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
@@ -828,7 +830,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     let loaded_modes = vec![if case.rtx == 2 { cuteafd_loader::placement::LayerMode::HeadSplit }
         else { cuteafd_loader::placement::LayerMode::Whole { gpu: 0,
             ffn: cuteafd_loader::placement::FfnMode::Owner } }; cfg.n_layers];
-    let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
+    let inputs = admission::Inputs { arch: cuteafd_core::GpuArch::Sm120, cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
         loaded_modes: Some(&loaded_modes), cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),

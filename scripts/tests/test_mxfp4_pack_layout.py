@@ -490,3 +490,27 @@ def test_native_prefill_policy_rejects_invalid_recipes(failure):
         data["native_slices"][0].update(capacities=[], slices=[], prefill=[])
     with pytest.raises(ValueError):
         LAYOUTS.validate(data)
+
+
+def test_sm89_expert_exports_declare_charged_storage_and_a_valid_attestation():
+    spec = importlib.util.spec_from_file_location(
+        "native_export_sm89", ROOT / "python/tools/aot/export_b12x_slices_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    assert set(exporter.SM89_ROLES) == {"coordinator", "dspark_tp2", "rtx_tp2", "rtx_backbone"}
+    # The planner charges the SM120 coded-scale layout; SM89 reads the same bytes.
+    for role, per_expert in (("rtx_tp2", 9_131_264), ("dspark_tp2", 9_131_264),
+                             ("rtx_backbone", 18_257_408), ("coordinator", 18_257_408)):
+        _, logical, stored, _ = exporter.role_geometry("v41", role)
+        storage = exporter.expert_storage("v41", 5120, logical, stored)
+        assert storage["bytes_per_expert"] == per_expert
+        assert storage["plane_bytes"] == list(exporter.expert_plane_bytes("v41", 5120, logical, stored))
+        assert storage["scale_layout"] == "ue8m0_offset4_n256_k128"
+        # Rust's version-1 validation of the C attestation (V41ExpertReduction::validate).
+        recipe = exporter.sm89_numerical_recipe(logical, dict(fc1_k_parts=8, fc2_k_parts=2))
+        width, steps, planes = recipe["slice_width"], recipe["fc2_k_steps"], recipe["plane_count"]
+        assert width in (32, 64, 128, 192) and steps == width // 32
+        assert planes == -(-logical // width) and planes * width - logical < width
+        assert recipe["block_threads"] == 128 and recipe["fc1_k_stage"] == 128
+    with pytest.raises(ValueError, match="128-aligned"):
+        exporter.sm89_numerical_recipe(576, {})

@@ -87,13 +87,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
         let item = match (core.as_ref().ok().and_then(Option::as_ref), shape.manifest.as_deref()) {
             (Some(core), Some(manifest)) => {
-                let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[index], None);
+                let arch = crate::placement::ArchContext::coordinator(options.coordinator_arch, options.rtx_bytes[index], None);
                 let allowance = crate::placement::inventory::loaded_code_allowance(&format!("{program_family}-k6"), local_package(report), split,
                     index as u8, &arch, Some(&core.program_set(manifest, split)));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
             }
             _ => runtime_item(shape.manifest.as_deref(), &program_families(program_family, split),
-                local_package(report), split, index, options.rtx_bytes[index]),
+                local_package(report), split, index, options.coordinator_arch, options.rtx_bytes[index]),
         };
         device.items.push(item);
     }
@@ -384,7 +384,7 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
                 options.draft_context_slots.map(usize::try_from).transpose()?);
             let context = if options.context_tokens == 0 { 1 << 20 } else { usize::try_from(options.context_tokens)? };
             let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-                "sm_120", options.rtx_bytes[0]).sms) as usize;
+                options.coordinator_arch, options.rtx_bytes[0]).sms) as usize;
             let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context, sms)?;
             let block = layout.capacity().block_rows / sequences;
             // Prefix marks of its draft windows, by the serving mark rule.
@@ -410,7 +410,7 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
             let drafts = usize::try_from(block)?.checked_sub(1)
                 .ok_or_else(|| anyhow::anyhow!("GLM draft block must include an anchor"))?;
             (glm::drafter_bytes(&snapshot, slots, sequences,
-                options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as u64,
+                options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms) as u64,
                 options.glm5_draft_bf16, options.draft_kv_cache)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?, Some(drafts),
                 Some(sequences.checked_mul(usize::try_from(block)?).context("GLM native draft head row extent")?))
         })
@@ -468,7 +468,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         onboard, full_prefill_logits: options.full_prefill_logits,
         context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(&cfg, m,
             options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-                "sm_120", options.rtx_bytes[0]).sms) as usize, &attention_plan)) };
+                options.coordinator_arch, options.rtx_bytes[0]).sms) as usize, &attention_plan)) };
     // Auto resolves in the solver (context where the build carries its programs), as at runtime.
     Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
 }
@@ -504,7 +504,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
     let context_programs = if split { Some(glm::manifest_context(&cfg, &manifest,
         options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-            "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
+            options.coordinator_arch, options.rtx_bytes[0]).sms) as usize, &plan)
         .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
         else { None };
     let native = crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
@@ -535,7 +535,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
                 else { Category::Weights }, group, format, bytes, Basis::Exact)).collect();
         items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes[rank], Basis::Exact));
         let set = crate::families::glm5::DensePrograms::Exlr8.program_set(&manifest, split);
-        let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[rank], None);
+        let arch = crate::placement::ArchContext::coordinator(options.coordinator_arch, options.rtx_bytes[rank], None);
         let allowance = crate::placement::inventory::loaded_code_allowance("glm", "glm:exlr8", split,
             rank as u8, &arch, Some(&set));
         let mut runtime = Item::new(Category::Runtime, "context+modules", "",
@@ -705,7 +705,7 @@ mod tests {
                 names, scratch: Vec::new() };
             assert!(old.names.iter().any(|name| name.starts_with("glm_stage_")));
             for (rank, device) in layout.devices.iter().enumerate().take(gpus) {
-                let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[rank], None);
+                let arch = crate::placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, options.rtx_bytes[rank], None);
                 let allowance = crate::placement::inventory::loaded_code_allowance("glm", "glm:exlr8",
                     gpus == 2, rank as u8, &arch, Some(&old));
                 let actual = device.items.iter().find(|i| i.group == "EXLR8 context+modules").unwrap();

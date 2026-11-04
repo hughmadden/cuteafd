@@ -31,14 +31,7 @@ pub(crate) fn half(catalog: &OfficialV41Catalog, name: &str, axis: usize, rank: 
     let tensor = catalog.tensor(name)?;
     let shape = &tensor.metadata.shape;
     ensure!(shape.len() == 2 && axis < 2 && rank < 2 && shape[axis] % 2 == 0, "{name}: no TP2 half on axis {axis}");
-    let whole = rect(catalog, name, None)?;
-    Ok(if axis == 0 {
-        let half = shape[0] / 2;
-        whole.sub(rank * half..(rank + 1) * half)
-    } else {
-        let width = whole.row_bytes / 2;
-        crate::shared::experts::rtx::dense::Rect { cols: rank * width..(rank + 1) * width, ..whole }
-    })
+    rect(catalog, name, None)?.half(axis, rank)
 }
 
 pub(crate) struct NativeRtxTensors<'a> {

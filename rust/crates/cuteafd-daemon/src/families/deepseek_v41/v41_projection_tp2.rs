@@ -1,5 +1,5 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
-use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
+use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use anyhow::{ensure, Context, Result};
 use crate::shared::decode_graph::LayerGraphs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
@@ -23,17 +23,32 @@ pub(crate) struct Weights<'a> {
     kind: Kind,
     weight: Allocation<'a>,
     scales: Allocation<'a>,
+    /// The raw scales until their recorded pack ran (a push lands them and
+    /// packs them at Done), then [`Weights::release_raw_scales`].
+    source_scales: std::cell::Cell<Option<Allocation<'a>>>,
 }
 impl<'a> Weights<'a> {
-    pub fn device_bytes(kind: Kind) -> usize {
-        let (k,n)=kind.geometry(); k*(n/2) + k*(n/2)/32
+    /// A shard's resident bytes: its FP8 weight half and packed scales, at the
+    /// packed size the loaded library's export reports (SM120 expands the
+    /// scale grid; SM89 keeps it).
+    pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
+        let (k,n)=kind.geometry();
+        let packed=library.v41_fp8_matrix_info(1,u32::try_from(k)?,u32::try_from(n/2)?)?.packed_weight_scale_bytes;
+        Ok(k*(n/2) + usize::try_from(packed)?)
     }
-    pub fn load_peak_device_bytes(kind: Kind) -> usize {
-        let (k,n)=kind.geometry(); Self::device_bytes(kind) + k*(n/2)/1024
+    /// The resident bytes plus the raw scale grid held until its pack runs.
+    pub fn load_peak_device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
+        let (k,n)=kind.geometry(); Ok(Self::device_bytes(library,kind)? + k*(n/2)/1024)
     }
+    /// Rank `rank`'s output-channel half of layer `layer`'s projection: the
+    /// row halves (`Rect::half`) of its FP8 weight and raw scales land
+    /// unchanged, then the scales pack. Through the mount it reads now; under
+    /// a dense recording it records for the coordinator push group, as the
+    /// shared expert's TP2 halves do.
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
         kind: Kind, rank: usize, budget: usize) -> Result<Self> {
-        ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(kind),
+        use crate::shared::experts::rtx::dense;
+        ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(device.library,kind)?,
             "invalid projection shard layer, rank or budget");
         let (k,n)=kind.geometry(); let n=n/2;
         let prefix=format!("layers.{layer}.attn.{}",kind.name());
@@ -42,20 +57,27 @@ impl<'a> Weights<'a> {
             && catalog.tensor(&scale_name)?.metadata.shape==[2*n/32,k/32],
             "projection checkpoint geometry differs");
         let stream=Stream::new(device)?;
-        let weight=Allocation::new(device,k*n)?;
-        let scales=Allocation::new(device,k*n/32)?;
-        let raw_scales=Allocation::new(device,k*n/1024)?;
-        let mut staging=HostAllocation::new(device.library,k*n)?;
-        for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
-            let bytes=catalog.read_coordinator_tp2_into(name,0,rank,staging.bytes_mut(),&mut [])?;
-            ensure!(bytes==target.buffer.bytes,"projection shard payload size differs");
-            device.run(||device.library.copy_h2d(target.buffer,&staging.bytes_mut()[..bytes]))?;
-        }
+        // Packed scales at the size the library's export reports (SM120 expands
+        // the grid, SM89 keeps it), as `device_bytes` charges.
         let kernel=device.run(||device.library.v41_fp8_matrix_kernel(1,k as u32,n as u32))?;
-        let queued=device.run(||unsafe { kernel.pack_scales(raw_scales.buffer,scales.buffer,stream.raw) });
+        let weight=Allocation::new(device,k*n)?;
+        let scales=Allocation::new(device,usize::try_from(kernel.info().packed_weight_scale_bytes)?)?;
+        let raw_scales=Allocation::new(device,k*n/1024)?;
+        let loader=dense::DenseLoad::mount(device.library);
+        for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
+            let rect=crate::families::deepseek_v41::v41_tensors::half(catalog,name,0,rank)?;
+            ensure!(rect.bytes()==target.buffer.bytes,"projection shard payload size differs");
+            loader.operand(dense::Operand { device: device.id, buffer: target.buffer, lands: vec![(rect,0)],
+                bytes: target.buffer.bytes })?;
+        }
+        let queued=device.run(||unsafe { dense::v41_pack_scales(&kernel,raw_scales.buffer,scales.buffer,stream.raw) });
         let drained=stream.drain();queued.and(drained)?;
-        Ok(Self { device,layer,rank,kind,weight,scales })
+        // Through the mount the pack already drained: release the raw scales now.
+        let source_scales=std::cell::Cell::new(dense::is_recording().then_some(raw_scales));
+        Ok(Self { device,layer,rank,kind,weight,scales,source_scales })
     }
+    /// Frees raw scales kept for a recorded scale pack (after it ran).
+    pub fn release_raw_scales(&self) { drop(self.source_scales.take()); }
 }
 
 /// Guarded unit-cap inputs/outputs; gathered/query fork readers finish inside
@@ -376,9 +398,9 @@ mod tests {
         for kind in [Kind::QueryB,Kind::OutputB] {
             let (k,n)=kind.geometry();let capacity=16;
             let weights=[(0..2).map(|i|Weights::load(devices[0],&catalog,[2,20][i],kind,0,
-                Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>()?,
+                Weights::load_peak_device_bytes(&lib,kind)?)).collect::<Result<Vec<_>>>()?,
                 (0..2).map(|i|Weights::load(devices[1],&catalog,[2,20][i],kind,1,
-                Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>()?];
+                Weights::load_peak_device_bytes(&lib,kind)?)).collect::<Result<Vec<_>>>()?];
             let banks=[weights[0].as_slice(),weights[1].as_slice()];
             assert!(Wave::new(banks,capacity,0,[0,0]).is_err());
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
@@ -477,8 +499,8 @@ mod shared_storage_tests {
         let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
-        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(kind))?],
-            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(kind))?]];
+        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(&lib,kind)?)?],
+            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(&lib,kind)?)?]];
         let banks=[weights[0].as_slice(),weights[1].as_slice()];
         let (rows,unit)=(13u32,16u32);let (k,n)=kind.geometry();
         let inputs=[Allocation::new(devices[0],rows as usize*k*2)?,Allocation::new(devices[0],rows as usize*k*2)?];
@@ -533,5 +555,73 @@ mod shared_storage_tests {
     #[ignore = "requires projection AOT, snapshot and two GPUs"]
     fn tp2_projection_without_guard_clobbers_gated_peer_reader() -> Result<()> {
         for _ in 0..3 {for kind in [Kind::QueryB,Kind::OutputB] {run(kind,false)?;}} Ok(())
+    }
+}
+
+/// Test inspection of a loaded shard: its weight and packed scales, and its layer.
+#[cfg(test)]
+#[allow(dead_code)] // the coordinator push tests read them; other test crates do not
+impl<'a> Weights<'a> {
+    pub(crate) fn buffers(&self) -> [CuteafdDeviceBuffer; 2] { [self.weight.buffer, self.scales.buffer] }
+    pub(crate) fn layer_index(&self) -> usize { self.layer }
+}
+
+#[cfg(test)]
+pub(crate) mod shard_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    /// Layer `layer`'s `kind` checkpoint weight and scale names.
+    #[allow(dead_code)] // the coordinator push tests use it; other test crates do not
+    pub(crate) fn names(layer: usize, kind: Kind) -> [String; 2] {
+        ["weight", "scale"].map(|suffix| format!("layers.{layer}.attn.{}.{suffix}", kind.name()))
+    }
+
+    /// Finite E4M3 weights (|w| <= 0.9375) and UE8M0 scales of 2^-7..2^0 for
+    /// layer `layer`'s `kind` projection.
+    pub(crate) fn pattern(catalog: &OfficialV41Catalog, layer: usize, kind: Kind) -> Result<()> {
+        for (suffix, scale) in [("weight", false), ("scale", true)] {
+            let tensor = catalog.tensor(&format!("layers.{layer}.attn.{}.{suffix}", kind.name()))?;
+            let bytes = (0..tensor.metadata.byte_length as usize).map(|i| if scale { 120 + (i * 7 % 8) as u8 } else {
+                (0x30 + (i * 13 + i / 977 + layer) % 16) as u8 | if (i * 5 + layer) % 3 == 0 { 0x80 } else { 0 }
+            }).collect::<Vec<_>>();
+            std::fs::OpenOptions::new().write(true).open(catalog.snapshot().join(&tensor.shard))?
+                .write_all_at(&bytes, tensor.metadata.byte_offset)?;
+        }
+        Ok(())
+    }
+
+    /// Each shard's recorded halves (`Rect::half` rows of the weight and raw
+    /// scales) are exactly the bytes the shard loader's former private mount
+    /// read uploaded (`read_coordinator_tp2_into`), and the ranks' halves
+    /// tile each tensor.
+    #[test]
+    fn shard_halves_are_the_coordinator_tp2_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().canonicalize()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(&snapshot);
+        let catalog = cuteafd_loader::read_official_v41_role_catalog(&snapshot, "projections",
+            |name| name.contains(".attn.wq_b.") || name.contains(".attn.wo_b."))?;
+        for kind in [Kind::QueryB, Kind::OutputB] {
+            let (k, n) = kind.geometry();
+            for layer in [2usize, 39] {
+                pattern(&catalog, layer, kind)?;
+                for (suffix, bytes) in [("weight", k * n / 2), ("scale", k * n / 2048)] {
+                    let name = format!("layers.{layer}.attn.{}.{suffix}", kind.name());
+                    let mut whole = vec![0u8; 2 * bytes];
+                    crate::families::deepseek_v41::v41_tensors::rect(&catalog, &name, None)?.read(&mut whole)?;
+                    for rank in 0..2 {
+                        let rect = crate::families::deepseek_v41::v41_tensors::half(&catalog, &name, 0, rank)?;
+                        let mut recorded = vec![0u8; rect.bytes()];
+                        rect.read(&mut recorded)?;
+                        let mut read = vec![0u8; bytes];
+                        ensure!(catalog.read_coordinator_tp2_into(&name, 0, rank, &mut read, &mut [])? == bytes
+                            && recorded == read && recorded == whole[rank * bytes..(rank + 1) * bytes],
+                            "{name} rank {rank}: recorded half differs from the coordinator TP2 read");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

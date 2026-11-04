@@ -1,6 +1,6 @@
 # Full RTX backbone experts coexist with the ordinary dSpark variant table.
 if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT OR NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "coordinator")
-  message(FATAL_ERROR "Local V4.1 experts require the SM120 coordinator expert build")
+  message(FATAL_ERROR "Local V4.1 experts require the SM120 or SM89 coordinator expert build")
 endif()
 set(CUTEAFD_V41_LOCAL_EXPERT_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_local_experts")
 set(CUTEAFD_V41_LOCAL_EXPERT_OBJECTS)

@@ -61,13 +61,14 @@ def fake_deployment_memory_layout(rtx, ranks, spark_budget_gib=108):
     ]}
 
 
-def stub_cuda_capacity(common, total_bytes):
+def stub_cuda_capacity(common, total_bytes, arch="sm_120"):
     """Launcher captures fake the host; driver/UUID behavior has its own unit tests."""
     common = Path(common)
     source = common.read_text()
     common.unlink()  # Cached inputs may be hardlinked into other captures.
     common.write_text(source + '\nrelease_cuda_total_bytes() { printf "%s\\n" '
-                      + str(int(total_bytes)) + '; }\n')
+                      + str(int(total_bytes)) + '; }\n'
+                      + 'release_cuda_coordinator_arch() { printf "%s\\n" ' + arch + '; }\n')
 
 
 def stub_cuda_python(bin_dir, total_bytes):
@@ -80,6 +81,8 @@ def stub_cuda_python(bin_dir, total_bytes):
         'source = sys.stdin.read() if args and args[0] == "-" else None\n'
         'if source is not None and "cuDeviceTotalMem_v2" in source:\n'
         f'    print({int(total_bytes)})\n'
+        'elif source is not None and "CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR" in source:\n'
+        '    print("sm_120")\n'
         'else:\n'
         f'    raise SystemExit(subprocess.run([{sys.executable!r}, *args], input=source, text=True).returncode)\n')
     wrapper.chmod(0o755)

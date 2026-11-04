@@ -358,6 +358,7 @@ release_profile_exec "$@"
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),
     ('nsys,ncu', '/data/prof', 'nsys or ncu, not both'),
     ('expert-routes', '', 'PROFILE=expert-routes needs PROFILE_DIR'),
+    ('route-census', '', 'PROFILE=route-census needs PROFILE_DIR'),
 ])
 def test_helper_refuses_bad_values(profile, directory, message):
     out = _helper(profile, directory, 'kiwi')
@@ -475,6 +476,34 @@ def test_expert_routes_switch_and_its_sample_cap():
                                      ('expert-routes', '1000000', 'must be 0..999999')]:
         out = _sample(profile, sample)
         assert out.returncode != 0 and message in out.stderr, (profile, sample, out.stderr)
+
+
+def test_route_census_switch_names_the_census_file(monkeypatch):
+    monkeypatch.delenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', raising=False)
+    monkeypatch.delenv('CUTEAFD_V41_ROUTE_CENSUS_WINDOW', raising=False)
+    out = _helper('route-census', '/data/prof', 'host0')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_V41_ROUTE_CENSUS=/data/prof/route-census-host0.json',
+        '-e', 'CUTEAFD_PROFILE_HOST=host0', '-v', '/data/prof:/data/prof', '-e', 'CUTEAFD_PROFILE_DIR=/data/prof']
+    monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', '200')
+    out = _helper('route-census', '/data/prof', 'host0')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split('\n')[2:4] == ['-e', 'CUTEAFD_V41_ROUTE_CENSUS_STEPS=200']
+    for steps in ('0', '-5', 'ten'):
+        monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', steps)
+        out = _helper('route-census', '/data/prof', 'host0')
+        assert out.returncode != 0 and 'must be a positive decode step count' in out.stderr, steps
+    # The trace window is forwarded likewise; 0 turns the trace off.
+    monkeypatch.delenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', raising=False)
+    for window in ('0', '16'):
+        monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_WINDOW', window)
+        out = _helper('route-census', '/data/prof', 'host0')
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.split('\n')[2:4] == ['-e', f'CUTEAFD_V41_ROUTE_CENSUS_WINDOW={window}']
+    for window in ('-1', '08', 'many'):
+        monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_WINDOW', window)
+        out = _helper('route-census', '/data/prof', 'host0')
+        assert out.returncode != 0 and 'must be a decode step count' in out.stderr, window
 
 
 def test_family_launch_expert_routes_sample_reaches_only_the_coordinator(tmp_path):

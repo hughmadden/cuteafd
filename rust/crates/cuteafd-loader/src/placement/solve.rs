@@ -58,6 +58,7 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
     let capacity_error = |error: &PlacementError| matches!(error,
         PlacementError::PoolDoesNotFit { .. } | PlacementError::StartupPeak { .. }
         | PlacementError::Mandatory { .. } | PlacementError::ExpertLayers { .. }
+        | PlacementError::ExpertTier { .. }
         | PlacementError::BelowFloor { .. } | PlacementError::SparkFree { .. }
         | PlacementError::OwnerCandidates { .. });
     let mut final_error = match trial(legacy_slots) {
@@ -89,12 +90,15 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
 }
 
 /// One extra solve: the same request and attention modes with the RTX
-/// onboarding set emptied and the pool free to fill its ceiling. A Spark-free
-/// layout cannot drop its routed layers, so its maximum is the admitted pool.
+/// onboarding set (whole layers or a GPU expert tier) emptied and the pool
+/// free to fill its ceiling. A Spark-free layout cannot drop its routed
+/// layers, so its maximum is the admitted pool.
 fn max_pool_without_onboard(request: &PlacementRequest, placement: &Placement) -> u64 {
-    if placement.onboard_layers == 0 || request.inventory.spark_ranks == 0 { return placement.pool_tokens; }
+    let tier = placement.expert_tier.as_ref().is_some_and(|tier| tier.experts > 0);
+    if (placement.onboard_layers == 0 && !tier) || request.inventory.spark_ranks == 0 { return placement.pool_tokens; }
     let mut trial = request.clone();
     trial.onboard = Onboard::Layers(0);
+    trial.expert_tier = None;
     trial.minimum_expert_layers = 0;
     trial.pool.requested = None;
     trial.pool.target = trial.pool.ceiling;
@@ -402,9 +406,21 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             return Err(PlacementError::Mandatory { gpu: gpu as u8, what: describe(&selected_fixed, gpu, &movables) });
         }
     }
-    let fixed_layers = match request.onboard.layers(routed) {
-        None if spark_free => Some(routed),
-        other => other,
+    // A GPU expert tier generalises whole-layer onboarding (its pinned whole
+    // layers included): its size, not the onboard, fixes the plan (auto: pool
+    // first; N experts: pool as output).
+    let tier = request.expert_tier.as_ref();
+    if tier.is_some() && (spark_free || request.inventory.spark_ranks == 0) {
+        return Err(PlacementError::Inventory("a GPU expert tier needs Spark ranks that hold every expert"));
+    }
+    if tier.is_some() && (request.onboard != Onboard::Layers(0) || request.minimum_expert_layers != 0) {
+        return Err(PlacementError::Inventory("a GPU expert tier holds its whole layers itself (onboard 0 layers)"));
+    }
+    let fixed_layers = match (tier.map(|tier| tier.size), request.onboard.layers(routed)) {
+        (Some(ExpertTierSize::Auto), _) => None,
+        (Some(ExpertTierSize::Experts(_)), _) => Some(0),
+        (None, None) if spark_free => Some(routed),
+        (None, other) => other,
     };
     if spark_free && fixed_layers != Some(routed) {
         return Err(PlacementError::SparkFree { layers: routed, placed: fixed_layers.unwrap_or(0) });
@@ -412,7 +428,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     if request.minimum_expert_layers > routed || fixed_layers.is_some_and(|n| n < request.minimum_expert_layers) {
         return Err(PlacementError::Inventory("invalid mandatory expert prefix"));
     }
-    let (units, ranges, homes, tp2_range, limits) = match fixed_layers {
+    let (units, ranges, homes, tp2_range, limits, tier_placement) = match fixed_layers {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
             let (fit, limits) = if request.minimum_expert_layers == 0 {
@@ -445,20 +461,26 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             };
             let units = pool_units(request, if context { fit / 2 * 2 } else { fit }, &limits)?;
             let pool_used = with_pool(request, &used, &unit_bytes, units)?;
-            let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
+            let caps = if tier.is_some() { [0, 0] } else {
+                [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }]
+            };
             let (ranges, homes, _, tp2_range) = place_experts(request, &available, &pool_used, &mut arenas, first_moe,
                 request.layers.len(), &caps)?;
+            let tier_placement = tier.map(|tier| place_tier(request, tier, &available, &pool_used, &mut arenas, None))
+                .transpose()?;
             // Successful diagnostics describe installed experts, not the larger
             // pre-onboarding capacity used to choose the pool-first reservation.
             let limits = pool_limits(request, &available, &used, &arenas, &unit_bytes);
-            (units, ranges, homes, tp2_range, limits)
+            (units, ranges, homes, tp2_range, limits, tier_placement)
         }
         // Fixed onboard: exactly `n` routed layers (the contiguous prefix the
         // executors run), split over the GPUs where the pool is largest; the
         // pool is the output.
         Some(n) => {
             let end = nth_moe_end(request, first_moe, n);
-            let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Option<Tp2Range>, PoolLimits)> = None;
+            #[allow(clippy::type_complexity)]
+            let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Option<Tp2Range>, PoolLimits,
+                Option<ExpertTierPlacement>)> = None;
             let splits: Vec<usize> = if tp2 || gpus == 1 || request.expert_gpus < 2 { vec![n] } else { (0..=n).rev().collect() };
             let mut most = 0;
             for on_first in splits {
@@ -468,13 +490,19 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
                 most = most.max(placed);
                 if next < end || placed < n { continue; }
+                // A fixed tier is charged before the pool, which is the output.
+                let tier_placement = match tier {
+                    Some(tier @ ExpertTierRequest { size: ExpertTierSize::Experts(count), .. }) =>
+                        Some(place_tier(request, tier, &available, &used, &mut trial, Some(*count))?),
+                    _ => None,
+                };
                 let fit = pool_fit(request, &available, &used, &trial, &unit_bytes);
                 if best.as_ref().is_none_or(|(units, ..)| fit > *units) {
                     best = Some((fit, ranges, homes, tp2_range,
-                        pool_limits(request, &available, &used, &trial, &unit_bytes)));
+                        pool_limits(request, &available, &used, &trial, &unit_bytes), tier_placement));
                 }
             }
-            let Some((fit, ranges, homes, tp2_range, limits)) = best else {
+            let Some((fit, ranges, homes, tp2_range, limits, tier_placement)) = best else {
                 return Err(if spark_free { PlacementError::SparkFree { layers: routed, placed: most } }
                     else { PlacementError::ExpertLayers { requested: n, placed: most } });
             };
@@ -487,7 +515,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 return Err(PlacementError::BelowFloor { pool: tokens, floor: request.pool.floor, layers: n,
                     short: request.pool.floor - tokens, limits });
             }
-            (units, ranges, homes, tp2_range, limits)
+            (units, ranges, homes, tp2_range, limits, tier_placement)
         }
     };
     if units == 0 {
@@ -520,6 +548,11 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             items[gpu].push(Item::new(Category::Experts,
                 format!("TP2 expert layer halves {}..{}", range.first, range.first + range.layers),
                 "tp2", range.peak_bytes[gpu], Basis::Formula));
+        }
+        if let Some(tier) = tier_placement.as_ref().filter(|tier| tier.peak_bytes[gpu] > 0) {
+            items[gpu].push(Item::new(Category::Experts,
+                format!("GPU expert tier ({} resident experts)", tier.experts),
+                "tier", tier.peak_bytes[gpu], Basis::Formula));
         }
         let range = ranges[gpu];
         if range.peak_bytes > 0 {
@@ -562,6 +595,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         residual,
         hops,
         tp2: tp2_range,
+        expert_tier: tier_placement,
         items,
     })
 }
@@ -952,4 +986,96 @@ fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &
             .ok_or(PlacementError::Overflow("TP1 and TP2 arena peaks"))?;
     }
     Ok((ranges, homes, next, range))
+}
+
+/// The GPU expert tier: a prefix of `tier.order` resident beside the Sparks
+/// in its own arena per GPU (the RTX expert workspace once, the resident
+/// experts, then the largest per-expert load staging), after any TP1 movable
+/// arena. Two peer GPUs with TP2-capable layers hold TP2 halves on both; one
+/// GPU holds whole experts. `exact` admits exactly that many slots or refuses;
+/// otherwise the longest prefix that fits, up to `tier.useful`. Either way the
+/// pinned whole layers must fit. An empty tier charges nothing.
+fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &[u64], used: &[u64],
+    arenas: &mut [Arena], exact: Option<usize>) -> Result<ExpertTierPlacement, PlacementError> {
+    use PlacementError::{Inventory, Overflow};
+    let gpus = available.len();
+    let tp2 = gpus == 2 && request.inventory.peer_access
+        && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2));
+    let charged = if tp2 { 0..2 } else { 0..1 };
+    let experts = tier.experts_per_layer;
+    let mut seen = std::collections::BTreeSet::new();
+    for slot in &tier.order {
+        let cost = request.layers.get(usize::from(slot.layer)).and_then(|layer| layer.experts)
+            .ok_or(Inventory("GPU expert tier names a dense or absent layer"))?;
+        if usize::from(slot.expert) >= experts || !seen.insert(*slot) {
+            return Err(Inventory("GPU expert tier order repeats a slot or names an absent expert"));
+        }
+        for gpu in charged.clone() {
+            super::expert_tier::per_expert(&cost, tp2, gpu, experts)
+                .ok_or(Inventory("GPU expert tier needs a layer residency that divides evenly over its experts"))?;
+        }
+    }
+    if tier.pinned > tier.order.len() || exact.is_some_and(|count| count < tier.pinned) {
+        return Err(Inventory("GPU expert tier is smaller than its pinned whole layers"));
+    }
+    let limit = exact.unwrap_or(tier.useful.clamp(tier.pinned, tier.order.len()));
+    if limit > tier.order.len() {
+        return Err(PlacementError::ExpertTier { requested: limit, placed: tier.order.len() });
+    }
+    let budget = (0..gpus).map(|gpu| available[gpu].saturating_sub(used[gpu]).saturating_sub(arenas[gpu].peak))
+        .collect::<Vec<_>>();
+    let workspace = |gpu: usize| if tp2 { request.tp2_workspace[gpu] } else { request.expert_workspace };
+    let mut arena = vec![Arena::default(); gpus];
+    let mut placed = 0;
+    for slot in &tier.order[..limit] {
+        let cost = request.layers[usize::from(slot.layer)].experts.expect("checked above");
+        let mut candidate = arena.clone();
+        for gpu in charged.clone() {
+            let part = super::expert_tier::per_expert(&cost, tp2, gpu, experts).expect("checked above");
+            candidate[gpu].open(workspace(gpu));
+            candidate[gpu].add(part)?;
+            candidate[gpu].staging = candidate[gpu].staging.max(part.staging);
+            candidate[gpu].peak = candidate[gpu].resident.checked_add(candidate[gpu].staging)
+                .ok_or(Overflow("GPU expert tier resident plus largest staging"))?;
+        }
+        if charged.clone().any(|gpu| candidate[gpu].peak > budget[gpu]) { break; }
+        arena = candidate;
+        placed += 1;
+    }
+    if let Some(requested) = exact.filter(|&requested| placed < requested).or((placed < tier.pinned).then_some(tier.pinned)) {
+        return Err(PlacementError::ExpertTier { requested, placed });
+    }
+    let mut resident = vec![Vec::new(); request.layers.len()];
+    for slot in &tier.order[..placed] { resident[usize::from(slot.layer)].push(slot.expert); }
+    resident.iter_mut().for_each(|ids| ids.sort_unstable());
+    let mut resident_bytes = vec![0u64; gpus];
+    let mut peak_bytes = vec![0u64; gpus];
+    if placed > 0 {
+        for gpu in charged.clone() {
+            resident_bytes[gpu] = arena[gpu].resident - workspace(gpu);
+            peak_bytes[gpu] = arena[gpu].peak;
+            arenas[gpu].peak = arenas[gpu].peak.checked_add(arena[gpu].peak)
+                .ok_or(Overflow("TP1 and GPU expert tier arena peaks"))?;
+        }
+    }
+    // Resident share of every routed expert's bytes (all GPUs' parts).
+    let expert_bytes = |cost: &ExpertCost| charged.clone()
+        .map(|gpu| super::expert_tier::per_expert(cost, tp2, gpu, experts).map_or(0, |part| part.resident))
+        .sum::<u64>();
+    let routed = request.layers.iter().filter_map(|layer| layer.experts).collect::<Vec<_>>();
+    let all = routed.iter().map(|cost| u128::from(expert_bytes(cost)) * experts as u128).sum::<u128>();
+    let held = tier.order[..placed].iter()
+        .map(|slot| u128::from(expert_bytes(&request.layers[usize::from(slot.layer)].experts.expect("checked above"))))
+        .sum::<u128>();
+    Ok(ExpertTierPlacement {
+        shard: if tp2 { ExpertTierShard::Tp2 } else { ExpertTierShard::Whole { gpu: 0 } },
+        source: tier.source,
+        whole_layers: resident.iter().filter(|ids| ids.len() == experts).count(),
+        resident,
+        experts: placed,
+        routed_experts: routed.len() * experts,
+        resident_bytes,
+        peak_bytes,
+        byte_share_ppm: (held * 1_000_000).checked_div(all).map_or(0, |ppm| ppm as u32),
+    })
 }

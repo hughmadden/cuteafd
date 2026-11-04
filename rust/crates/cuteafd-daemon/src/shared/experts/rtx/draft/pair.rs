@@ -1,19 +1,53 @@
 //! Capture-compatible draft expert fork/join on the caller-selected owner.
+//!
+//! The owner quantizes the rows once; both GPUs run their expert halves; the
+//! owner reduces. Rows cross between the GPUs in one of two ways:
+//! - events (default): the peer's SMs read the owner's encoded inputs after a
+//!   cross-device event and write their routes into the owner's buffer; the
+//!   join event orders those writes before the owner's reduce;
+//! - push ([`Pair::enable_push`]): the GPU that produced each plane writes it
+//!   into the other GPU's buffer on its own stream and publishes a device
+//!   flag, which the consumer's stream waits on (no peer reads at all).
+//!
+//! Either way the events still fork the peer stream from the owner's and join
+//! it back, so a capture of the owner stream takes the peer branch with it.
+//! Flag sequences live on the device (positional), so graph replays and eager
+//! runs pair each wait with its own push.
 use super::{
     rank::{Wave, Weights},
     Layout,
 };
 use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::peer_split::PeerExchange;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{
-    CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer, V41PeerCopy, V41RouteReducer,
+    peer_exchange::PeerPlane, CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer,
+    V41PeerCopy, V41RouteReducer,
 };
-use std::{ffi::c_void, rc::Rc};
+use std::{cell::Cell, ffi::c_void, rc::Rc};
+
+/// Ranks of a pushing pair's flag exchange.
+const OWNER: usize = 0;
+const PEER: usize = 1;
+/// Its flags: the owner's encoded inputs, then the peer's routes.
+const INPUT: usize = 0;
+const ROUTES: usize = 1;
+const FLAGS: usize = 2;
+
+/// Bytes of an input plane pushed in whole 16-byte units (route ids and
+/// weights are 12 bytes a row); input allocations are whole units too.
+pub(crate) fn padded(bytes: usize) -> usize { bytes.next_multiple_of(16) }
 
 pub(crate) struct Pair<'a> {
     // External root stream and its graphs must be drained/destroyed by caller
     // first. Our peer stream drains before any of its referenced allocations.
     peer: Rc<Stream<'a>>,
+    /// `enable_push`: flags of the pushed exchange (ranks [`OWNER`], [`PEER`]).
+    push: Option<PeerExchange<'a>>,
+    /// Set from a pushing enqueue's first push until its last wait is
+    /// queued: still set means a failed enqueue left a push without its wait,
+    /// the positional flags are out of step, and the pair refuses more work.
+    unmatched: Cell<bool>,
     ready: Event<'a>,
     done: Event<'a>,
     ranks: [Wave<'a>; 2],
@@ -37,11 +71,12 @@ impl<'a> Pair<'a> {
         layout.validate()?;
         let scratch = Wave::device_bytes(library, capacity, layout)?;
         let rows = capacity as usize;
-        let widths = layout.input_bytes();
-        let mut bytes = [scratch; 2];
-        bytes[1 - layout.owner] += rows * widths.iter().sum::<usize>();
+        let inputs = layout.input_bytes().map(|width| padded(rows * width));
+        // Flag control words on both GPUs, whether or not the pair pushes.
+        let mut bytes = [scratch + PeerExchange::flag_bytes(FLAGS); 2];
+        bytes[1 - layout.owner] += inputs.iter().sum::<usize>();
         bytes[layout.owner] +=
-            rows * (widths[0] + layout.route_bytes() + layout.geometry.row_bytes() as usize);
+            inputs[0] + rows * (layout.route_bytes() + layout.geometry.row_bytes() as usize);
         Ok(bytes)
     }
     pub fn new(weights: [Rc<Weights<'a>>; 2], capacity: u32, layout: Layout) -> Result<Self> {
@@ -64,17 +99,19 @@ impl<'a> Pair<'a> {
         let [left, right] = weights;
         let ranks = [Wave::new(left, capacity)?, Wave::new(right, capacity)?];
         let rows = capacity as usize;
-        let widths = layout.input_bytes();
+        let [wire, ids, weights] = layout.input_bytes().map(|width| padded(rows * width));
         Ok(Self {
             peer: Rc::new(Stream::new(peer)?),
+            push: None,
+            unmatched: Cell::new(false),
             ready: Event::new(owner)?,
             done: Event::new(peer)?,
             ranks,
-            wire: Allocation::new(owner, rows * widths[0])?,
+            wire: Allocation::new(owner, wire)?,
             peer_inputs: [
-                Allocation::new(peer, rows * widths[0])?,
-                Allocation::new(peer, rows * widths[1])?,
-                Allocation::new(peer, rows * widths[2])?,
+                Allocation::new(peer, wire)?,
+                Allocation::new(peer, ids)?,
+                Allocation::new(peer, weights)?,
             ],
             peer_output: Allocation::new(owner, rows * layout.route_bytes())?,
             output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize)?,
@@ -88,6 +125,19 @@ impl<'a> Pair<'a> {
     }
     pub fn output(&self) -> CuteafdDeviceBuffer {
         self.output.buffer
+    }
+    /// Push instead of pull from now on: SM pushes up to `decode_lane_bytes`
+    /// a transfer, the sender's copy engine plus a zero-byte flag above.
+    /// Reuse needs no slots: the next push into either GPU's buffers follows
+    /// that buffer's last reader through the routes flag, the reduction and
+    /// stream order (`v41_peer_push::schedule_tests` checks a draft round).
+    pub fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        let devices = [self.owner.id, self.peer.device.id];
+        self.push = Some(PeerExchange::new_flags(self.owner.library, devices, FLAGS, decode_lane_bytes)?);
+        Ok(())
+    }
+    pub fn pushes(&self) -> bool {
+        self.push.is_some()
     }
     /// Quantize once on the owner, fork the peer, then join its FP32 route contributions
     /// before ordered top-3 reduction. No allocations or host waits here.
@@ -127,6 +177,9 @@ impl<'a> Pair<'a> {
             );
         }
         let library = self.owner.library;
+        if self.push.is_some() {
+            return unsafe { self.enqueue_pushed(stage, rows, inputs, shared, stream) };
+        }
         self.owner.run(|| unsafe {
             self.quantizer
                 .launch(inputs[0], self.wire.buffer, rows, stream)?;
@@ -179,6 +232,80 @@ impl<'a> Pair<'a> {
                 self.layout.geometry.topk,
                 stream,
             )
+        })
+    }
+    /// [`Self::enqueue`] with pushes. Every push is queued before its wait:
+    /// - owner: quantize, fork (`ready`), push the encoded inputs (flag
+    ///   [`INPUT`]), its half;
+    /// - peer: fork, wait for [`INPUT`], its half, push its routes (flag
+    ///   [`ROUTES`]), join (`done`);
+    /// - owner: wait for [`ROUTES`], reduce, then the join, which only closes
+    ///   the capture topology: the flag already ordered the routes.
+    ///
+    /// # Safety
+    /// As [`Self::enqueue`]; route ids and weights hold whole 16-byte units
+    /// past `rows` (the plane rounds up to them).
+    unsafe fn enqueue_pushed(
+        &mut self,
+        stage: usize,
+        rows: u32,
+        inputs: [CuteafdDeviceBuffer; 3],
+        shared: Option<CuteafdDeviceBuffer>,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        ensure!(!self.unmatched.get(),
+            "draft TP2 flags are out of step after a failed enqueue; rebuild the pair");
+        let library = self.owner.library;
+        let encoded = [self.wire.buffer, inputs[1], inputs[2]];
+        let planes = encoded.iter().zip(&self.peer_inputs).zip(self.layout.input_bytes())
+            .map(|((source, destination), width)| {
+                let bytes = padded(rows as usize * width);
+                ensure!(bytes <= source.bytes && bytes <= destination.buffer.bytes,
+                    "draft TP2 pushed input plane exceeds its allocation");
+                Ok(PeerPlane { destination: destination.buffer.ptr, source: source.ptr.cast_const(),
+                    rows: 1, row_bytes: bytes as u64, destination_pitch: bytes as u64, source_pitch: bytes as u64 })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let flags = self.push.as_ref().expect("pushing pair");
+        self.owner.run(|| unsafe {
+            self.quantizer.launch(inputs[0], self.wire.buffer, rows, stream)?;
+            library.cuda_event_record(self.ready.raw, stream)
+        })?;
+        self.unmatched.set(true);
+        let local = self.owner.run(|| unsafe {
+            flags.push_planes_on(OWNER, stream, INPUT, &planes)?;
+            self.ranks[self.layout.owner].enqueue(stage, rows, encoded, stream)
+        })?;
+        let route_bytes = rows as usize * self.layout.route_bytes();
+        self.peer.device.run(|| unsafe {
+            library.cuda_stream_wait_event(self.peer.raw, self.ready.raw)?;
+            flags.wait_on(PEER, self.peer.raw, INPUT)?;
+            let routes = self.ranks[1 - self.layout.owner].enqueue(
+                stage,
+                rows,
+                self.peer_inputs.each_ref().map(|v| v.buffer),
+                self.peer.raw,
+            )?;
+            flags.push_to_on(PEER, self.peer.raw, ROUTES, routes.ptr.cast_const(),
+                self.peer_output.buffer.ptr, route_bytes)?;
+            library.cuda_event_record(self.done.raw, self.peer.raw)
+        })?;
+        self.owner.run(|| unsafe {
+            flags.wait_on(OWNER, stream, ROUTES)?;
+            self.unmatched.set(false);
+            let mut planes = [std::ptr::null(); 4];
+            planes[self.layout.owner] = local.ptr.cast();
+            planes[1 - self.layout.owner] = self.peer_output.buffer.ptr.cast();
+            self.reducer.launch(
+                planes,
+                shared.map_or(std::ptr::null(), |v| v.ptr.cast()),
+                self.output.buffer.ptr.cast(),
+                rows,
+                2,
+                self.layout.geometry.topk,
+                stream,
+            )?;
+            library.cuda_stream_wait_event(stream, self.done.raw)
         })
     }
     /// Keep the peer alive in submission guards, including before a join exists.

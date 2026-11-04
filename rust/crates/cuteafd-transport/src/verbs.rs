@@ -78,6 +78,11 @@ const VERBS_HOST_MAPPED_RDMA_RING_MAX_DEPTH: usize = 32;
 const VERBS_HOST_RDMA_RING_SLOT_BYTES: usize = 8 * 1024 * 1024;
 const PROTOCOL_V2_TCP_TIMING_ENV: &str = "CUTEAFD_PROTOCOL_V2_TCP_TIMING";
 const VERBS_HOST_RDMA_DEVICE_MAP_ENV: &str = "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP";
+/// Local IP the client's verbs-host control connections originate from. The RDMA
+/// port follows the control connection's local address, so on a host with several
+/// RoCE ports this picks the client's port; it also lets a same-host test cross a
+/// port-to-port cable instead of looping inside the destination's port.
+const VERBS_HOST_LOCAL_ADDR_ENV: &str = "CUTEAFD_PROTOCOL_V2_VERBS_LOCAL_ADDR";
 static VERBS_HOST_PSN_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 fn parse_verbs_host_rdma_device_map(raw: &str, local_ip: IpAddr) -> Result<Option<String>> {
@@ -4486,14 +4491,35 @@ fn validate_control_endpoint_metadata(
 }
 
 fn connect_control_stream(peer: &str, timeout: Duration) -> Result<TcpStream> {
+    let local = match env::var(VERBS_HOST_LOCAL_ADDR_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => Some(raw.trim().parse::<IpAddr>()
+            .with_context(|| format!("{VERBS_HOST_LOCAL_ADDR_ENV}={raw} is not an IP address"))?),
+        _ => None,
+    };
+    connect_control_stream_from(peer, timeout, local)
+}
+
+/// [`connect_control_stream`] from `local` when given (the kernel's choice otherwise).
+fn connect_control_stream_from(peer: &str, timeout: Duration, local: Option<IpAddr>) -> Result<TcpStream> {
     let mut addrs = peer
         .to_socket_addrs()
         .with_context(|| format!("resolving verbs-host ProtocolV2 peer {peer}"))?;
     let first = addrs
         .next()
         .with_context(|| format!("verbs-host ProtocolV2 peer {peer} resolved no addresses"))?;
-    let stream = TcpStream::connect_timeout(&first, timeout)
-        .with_context(|| format!("connecting verbs-host ProtocolV2 control plane to {peer}"))?;
+    let stream = match local {
+        None => TcpStream::connect_timeout(&first, timeout),
+        Some(local) => {
+            anyhow::ensure!(local.is_ipv4() == first.is_ipv4(),
+                "{VERBS_HOST_LOCAL_ADDR_ENV}={local} and peer {first} are different address families");
+            let socket = socket2::Socket::new(socket2::Domain::for_address(first), socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP))?;
+            socket.bind(&SocketAddr::new(local, 0).into())
+                .with_context(|| format!("binding the verbs-host ProtocolV2 control plane to {local}"))?;
+            socket.connect_timeout(&first.into(), timeout).map(|()| TcpStream::from(socket))
+        }
+    }
+    .with_context(|| format!("connecting verbs-host ProtocolV2 control plane to {peer}"))?;
     crate::traffic::observe_peers(&[first]);
     Ok(stream)
 }
@@ -4998,6 +5024,21 @@ fn valid_gid_hex(value: &str) -> bool {
 mod persistent_tests {
     use super::*;
     use crate::{ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
+
+    #[test]
+    fn control_stream_originates_from_the_requested_local_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap().to_string();
+        let timeout = Duration::from_secs(5);
+        let bound = connect_control_stream_from(&peer, timeout, Some("127.0.0.2".parse().unwrap())).unwrap();
+        assert_eq!(bound.local_addr().unwrap().ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+        let (accepted, from) = listener.accept().unwrap();
+        assert_eq!(from.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+        drop(accepted);
+        let kernel = connect_control_stream_from(&peer, timeout, None).unwrap();
+        assert_eq!(kernel.local_addr().unwrap().ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert!(connect_control_stream_from(&peer, timeout, Some("::1".parse().unwrap())).is_err());
+    }
 
 
     #[test]

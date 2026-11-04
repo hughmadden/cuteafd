@@ -84,7 +84,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let package = if report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) { "exl3" } else { "*" };
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
         device.items.push(runtime_item(shape.manifest.as_deref(), &program_families(id, split), package, split,
-            index, options.rtx_bytes[index]));
+            index, options.coordinator_arch, options.rtx_bytes[index]));
     }
     let mut spark_working = crate::placement::SparkWorkingSet {
         rtx_layers: Vec::new(),
@@ -230,7 +230,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),
         exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len(), options.coordinator_arch),
         context,
         attention: report.requested_attention };
     let request = v4::request(&inputs)?;

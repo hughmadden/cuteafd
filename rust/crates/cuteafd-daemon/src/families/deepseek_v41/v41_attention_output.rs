@@ -149,6 +149,7 @@ impl<'a> AttentionOutputWeights<'a> {
         let value = AttentionOutputWave {
             norm: self.library.v41_attention_ops()?,
             position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
+            position_check: crate::shared::memory::staging_check::StagingCheck::new(self.library, "V4.1 attention output positions", 1),
             weights: self,
             capacity: storage.unit,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
@@ -231,6 +232,8 @@ pub(crate) struct AttentionOutputWave<'w, 'a> {
     norm: V41AttentionOps<'a>,
     /// Per slot: rewritten on the host for each unit (pinned staging rule).
     position_staging: HostAllocation<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: its upload ran before each rewrite.
+    position_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     weights: &'w AttentionOutputWeights<'a>,
     capacity: u32,
     graphs: LayerGraphs<'w, 'a, AttentionOutputWeights<'a>>,
@@ -456,6 +459,7 @@ impl AttentionOutputWave<'_, '_> {
                 && attention.values.device_id == self.b(0).device_id,
             "attention output origin differs"
         );
+        self.position_check.before_write(0)?;
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
@@ -467,6 +471,7 @@ impl AttentionOutputWave<'_, '_> {
                 self.storage.stream.library.copy_host_buffer_h2d_async(
                     self.positions(), self.position_staging.buffer, tokens.len() * 8, self.storage.stream.raw,
                 )?;
+                self.position_check.uploaded(0, self.storage.stream.raw)?;
             }
             let rows = attention.rows as u32;
             if self.graphed(rows) {
@@ -504,6 +509,7 @@ impl AttentionOutputWave<'_, '_> {
             && attention.rows > 0 && attention.rows <= self.capacity as usize
             && attention.values.device_id == self.b(0).device_id,
             "queued attention output origin differs");
+        self.position_check.before_write(0)?;
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
@@ -511,6 +517,7 @@ impl AttentionOutputWave<'_, '_> {
             self.storage.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
                 tokens.len() * 8, stream)?;
+            self.position_check.uploaded(0, stream)?;
         }
         let rows = attention.rows as u32;
         if !self.graphed(rows) || crate::shared::decode_graph::census::eager("layer_row") {
@@ -548,6 +555,7 @@ impl AttentionOutputWave<'_, '_> {
             && attention.rows > 0 && attention.rows <= self.capacity as usize
             && attention.values.device_id == self.b(0).device_id,
             "queued attention output origin differs");
+        self.position_check.before_write(0)?;
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
@@ -555,6 +563,7 @@ impl AttentionOutputWave<'_, '_> {
             self.storage.stream.library.copy_d2d_async(self.b(0), attention.values, attention.values.bytes, stream)?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
                 tokens.len() * 8, stream)?;
+            self.position_check.uploaded(0, stream)?;
         }
         let rows = attention.rows as u32;
         if self.window.is_windowed() {
@@ -602,11 +611,13 @@ impl AttentionOutputWave<'_, '_> {
     pub unsafe fn prepare_chain_graph(&mut self, tokens: &[u64], stream: *mut std::ffi::c_void) -> Result<()> {
         self.validate(tokens.len() as u32)?;
         ensure!(tokens.iter().all(|&p| p < 1048576), "projection graph positions exceed context");
+        self.position_check.before_write(0)?;
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
         unsafe { self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
-            tokens.len() * 8, stream) }
+            tokens.len() * 8, stream)?;
+            self.position_check.uploaded(0, stream) }
     }
     /// # Safety
     /// Matching sparse output is ordered on stream. Capture retains all weights
@@ -785,9 +796,9 @@ mod tp2_tests {
             let mut output=device.own(||split.wave(capacity,usize::MAX))?;
             assert!(output.storage.scratch.is_none() && output.rebind(&weights).is_err());
             let halves=[vec![Weights::load(devices[0],&catalog,layer,Kind::OutputB,0,
-                Weights::load_peak_device_bytes(Kind::OutputB))?],
+                Weights::load_peak_device_bytes(&library,Kind::OutputB)?)?],
                 vec![Weights::load(devices[1],&catalog,layer,Kind::OutputB,1,
-                Weights::load_peak_device_bytes(Kind::OutputB))?]];
+                Weights::load_peak_device_bytes(&library,Kind::OutputB)?)?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::OutputB,capacity,owner)?)?;
             let input=Allocation::new(device,capacity as usize*ROW_BYTES[0])?;

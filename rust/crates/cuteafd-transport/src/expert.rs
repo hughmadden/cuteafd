@@ -17,9 +17,9 @@ mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
 mod native_group;
 pub use native_group::{
-    SparkTopology, V41_MAX_NATIVE_GROUPS, V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_INACTIVE_OWNER,
-    V41_NATIVE_UNASSIGNED_EXPERT_ID, V41_ROUTED_EXPERTS, V41NativeOwnerRouteWord,
-    V41NativeOwnershipBatch,
+    SparkTopology, V41_MAX_NATIVE_GROUPS, V41_NATIVE_COORDINATOR_OWNER, V41_NATIVE_COORDINATOR_REQUEST_FLAG,
+    V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_INACTIVE_OWNER, V41_NATIVE_UNASSIGNED_EXPERT_ID,
+    V41_ROUTED_EXPERTS, V41NativeOwnerRouteWord, V41NativeOwnershipBatch,
 };
 
 pub const V41_HIDDEN: u32 = 5120;
@@ -249,14 +249,17 @@ fn validate_native_group(
         header.flags
             & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | V41_NATIVE_GROUP_REQUEST_FLAG | COMPRESSED_REPLY_FLAGS)
+                | V41_NATIVE_GROUP_REQUEST_FLAG
+                | V41_NATIVE_COORDINATOR_REQUEST_FLAG
+                | COMPRESSED_REPLY_FLAGS)
             == 0,
         "native group requests cannot use legacy reduction/compression or stream flags"
     );
+    let coordinator = header.flags & V41_NATIVE_COORDINATOR_REQUEST_FLAG != 0;
     let mut batch = V41NativeOwnershipBatch::default();
     validate_canonical_body(header, max_rows, row_at, |index| {
         let route = route_at(index)?;
-        let decoded = batch.observe(route.expert_id, topology.group_count())?;
+        let decoded = batch.observe_owned(route.expert_id, topology.group_count(), coordinator)?;
         Ok(crate::ExpertProtocolV2RouteEntry {
             expert_id: decoded.expert_id,
             ..route
@@ -405,7 +408,9 @@ impl<'a> BackboneRequest<'a> {
     /// A route owned by `group` keeps its true expert id and exact FP32 gate
     /// weight; every other route receives [`V41_NATIVE_UNASSIGNED_EXPERT_ID`]
     /// and a zero weight, which the existing kernel reduces to zero through its
-    /// invalid-id inverse `-1` path. The batch-wide ownership check rejects a
+    /// invalid-id inverse `-1` path. That includes every route the coordinator's
+    /// GPU expert tier owns ([`V41_NATIVE_COORDINATOR_OWNER`]): no group owns it.
+    /// The batch-wide ownership check rejects a
     /// request whose encoded owners conflict, so a route can never be counted
     /// twice. Buffers are reused; no allocation occurs on success.
     pub fn copy_native_group_routes_into(
@@ -426,10 +431,11 @@ impl<'a> BackboneRequest<'a> {
             ids.len() >= count && weights.len() >= count,
             "native group routing buffers are too short"
         );
+        let coordinator = self.view.header.flags & V41_NATIVE_COORDINATOR_REQUEST_FLAG != 0;
         let mut batch = V41NativeOwnershipBatch::default();
         for index in 0..count {
             let route = self.view.route(index)?;
-            let decoded = batch.observe(route.expert_id, topology.group_count())?;
+            let decoded = batch.observe_owned(route.expert_id, topology.group_count(), coordinator)?;
             if decoded.owner == group {
                 ids[index] = decoded.expert_id as i32;
                 weights[index] = route.gate_weight;
@@ -458,7 +464,7 @@ impl<'a> BackboneRequest<'a> {
             output_payload_bytes: self.plane_bytes()? as u64,
             status: ExpertProtocolV2Status::Ok,
             // Request-only admission flags never appear in a response.
-            flags: header.flags & !V41_NATIVE_GROUP_REQUEST_FLAG,
+            flags: header.flags & !(V41_NATIVE_GROUP_REQUEST_FLAG | V41_NATIVE_COORDINATOR_REQUEST_FLAG),
             executor_id,
             pace: None,
         })

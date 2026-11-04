@@ -53,10 +53,18 @@ const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 == DECODE_LANE_ROWS);
 /// 0..20 on GPU0, 20..40 on GPU1).
 fn v41_attention_gpu(layer: usize) -> usize { usize::from(layer >= 20) }
 
-/// Full-head sparse attention storage (64 heads) for units of `unit` rows.
-fn sparse64(unit: u64) -> u64 {
+/// Full-head sparse attention storage (64 heads) for units of `unit` rows
+/// (`SparseAttentionStorage::<64>::storage_bytes`): query and output planes,
+/// the split scratch of the `compressed` recipe's parts at the verify batch,
+/// batch descriptors, replay begins and metadata.
+pub fn sparse_attention_bytes(unit: u64, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend)
+    -> Result<u64> {
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(cuteafd_core::V41_VERIFY_ROWS, None, None)?
+        .with_compressed(compressed);
     let batch = unit.min(cuteafd_core::V41_VERIFY_ROWS as u64);
-    2 * unit * 64 * 1024 + batch * 10 * 64 * 514 * 4 / 64 * 64 + batch * 120 + unit * 8 + unit * 80
+    let split = cuteafd_core::coordinator_programs::sparse_split_scratch_bytes(
+        usize::try_from(batch)?, plan.sparse_recipe(true).parts, 64) as u64;
+    Ok(2 * unit * 64 * 1024 + split + batch * 120 + unit * 8 + unit * 80)
 }
 
 /// Index selection's unit scratch (`IndexSelectionWave::sizes`).
@@ -186,13 +194,23 @@ impl TargetOwners {
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
+    compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend,
 }
 
 impl<'a> NativePrograms<'a> {
     pub fn new(manifest: &'a Value, sms: u32) -> Result<Self> {
         ensure!(sms > 0, "V4.1 native plans require physical SM count");
-        Ok(Self { manifest, sms })
+        Ok(Self { manifest, sms, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot })
     }
+
+    /// The compressed sparse attention kernel the coordinator architecture
+    /// runs (`GpuArch::v41_compressed_attention`): the planner passes
+    /// `--coordinator-arch`, serve the measured device. BF16 AOT by default.
+    pub fn with_compressed_attention(self, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend) -> Self {
+        Self { compressed, ..self }
+    }
+
+    pub fn compressed_attention(&self) -> cuteafd_core::coordinator_programs::SparseAttentionBackend { self.compressed }
 
     pub fn scratch(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
         ProgramSet::v41_fp8(self.manifest, &[(k, n)], rows, self.sms)?.scratch
@@ -271,7 +289,7 @@ impl<'a> NativePrograms<'a> {
             let query = 4 + u * 81160 + self.scratch(u, 5120, 1280)? + self.scratch(u, 1280, 32768)?;
             let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.scratch(u, 8192, 5120)?;
             let shared = if placed { 0 } else { self.shared_ffn(u)? + r * 20480 };
-            let sparse = sparse64(u);
+            let sparse = sparse_attention_bytes(u, self.compressed)?;
             add(&mut out, "lane", 2 * r * 112752 + query + output + shared + sparse + r * 17105);
             // Cache producers: window storage and the source compressor storage(s).
             let windows = if placed { (0..40).filter(|&l| v41_attention_gpu(l) == rank).count() as u64 } else { 40 };
@@ -358,8 +376,7 @@ impl<'a> NativePrograms<'a> {
                     + self.scratch(rows, 5120, 1280)? + self.scratch(rows, 1280, 32768)?;
                 let output = 4 + rows * (65536 + 16384 + 10240 + 8 + 256)
                     + self.scratch(rows, 32768, 8192)? + self.scratch(rows, 8192, 5120)?;
-                let sparse = rows * (64 * 2048 + 88)
-                    + rows.min(cuteafd_core::V41_VERIFY_ROWS as u64) * (10 * 64 * 514 * 4 + 120);
+                let sparse = sparse_attention_bytes(rows, self.compressed)?;
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
                 add(&mut out, "backbone", 2 * rows * 112752 + query + output + sparse
                     + rows * (11825 + 5280) + shared);
@@ -777,6 +794,44 @@ mod tests {
         let variant = duplicate["variants"][0].clone();
         duplicate["variants"].as_array_mut().unwrap().push(variant);
         assert!(programs.dspark(&duplicate, 256, 1, 5, 1, Fp8Head::Off).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sm89_attention_charges_are_native_fp32_and_sm120_charges_are_unchanged() -> Result<()> {
+        use cuteafd_core::{coordinator_programs::SparseAttentionBackend, GpuArch};
+        // The sparse attention charge before the plan carried its backend.
+        let before = |u: u64| { let batch = u.min(64);
+            2 * u * 64 * 1024 + batch * 10 * 64 * 514 * 4 + batch * 120 + u * 8 + u * 80 };
+        for u in [1, 16, 63, 64, 65, 256, 1024, 2048, 2752, 4096] {
+            // SM89 reserves the native FP32 ten-part kernel's split scratch;
+            // SM120's BF16 AOT recipe keeps exactly the same extent.
+            let native = sparse_attention_bytes(u, GpuArch::Sm89.v41_compressed_attention())?;
+            let split = cuteafd_core::coordinator_programs::sparse_split_scratch_bytes(u.min(64) as usize, 10, 64);
+            assert_eq!(native, 2 * u * 64 * 1024 + split as u64 + u.min(64) * 120 + u * 88);
+            for arch in GpuArch::ALL {
+                assert_eq!(sparse_attention_bytes(u, arch.v41_compressed_attention())?, before(u));
+            }
+        }
+        let manifest = manifest();
+        for sms in [114, 188] {
+            let default = NativePrograms::new(&manifest, sms)?;
+            assert_eq!(default.compressed_attention(), SparseAttentionBackend::Bf16Aot);
+            let sm120 = NativePrograms::new(&manifest, sms)?
+                .with_compressed_attention(GpuArch::Sm120.v41_compressed_attention());
+            let sm89 = NativePrograms::new(&manifest, sms)?
+                .with_compressed_attention(GpuArch::Sm89.v41_compressed_attention());
+            assert_eq!(sm89.compressed_attention(), SparseAttentionBackend::NativeFp32);
+            for ranks in [1, 2] {
+                for (reserve, unit, slots) in [(8256, 2752, 3), (8192, 4096, 2), (8192, 2048, 4)] {
+                    let target = |programs: &NativePrograms| programs.target(DECODE_LANE_ROWS, reserve, unit,
+                        ranks, slots, 8, Fp8Head::All, ranks == 1);
+                    let baseline = target(&default)?;
+                    assert_eq!(target(&sm120)?, baseline);
+                    assert_eq!(target(&sm89)?, baseline);
+                }
+            }
+        }
         Ok(())
     }
 

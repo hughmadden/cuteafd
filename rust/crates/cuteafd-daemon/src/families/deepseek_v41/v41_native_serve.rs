@@ -10,6 +10,8 @@ pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
 pub(crate) mod admission;
+#[cfg(test)]
+mod creation_sweep;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
@@ -192,6 +194,18 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         })?;
     Ok(Started { send, readiness, worker_thread, stats, http })
 }
+/// The attention reduction plan every lane installs. Its compressed kernel is
+/// the measured device's (`GpuArch::v41_compressed_attention`, the planner's
+/// rule): SM89 runs the native FP32 ten-part kernel. Installing the plan only
+/// checks that the library carries that kernel's symbols.
+pub(crate) fn attention_plan(lib: &NativeLibrary, device: i32, args: &crate::cli::NativeServeArgs)
+    -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
+    let arch = crate::shared::inventory::device_arch(lib, device)?;
+    Ok(cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
+        args.attention_plan_rows)?.with_compressed(arch.v41_compressed_attention()))
+}
+
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.
 fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
@@ -425,12 +439,13 @@ fn worker(
         Ok(())
     })?;
     let recorder = dense::Recorder::start(push_policy == PushPolicy::Required)?;
-    let weights = BackboneLaneWeights::load(
+    let mut weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
         BackboneLaneWeights::device_bytes(&lib, &catalog)?,
         16 * 1024 * 1024,
     )?;
+    let census = route_census(&lib, &args, &[lib.cuda_get_device()?], &mut weights)?;
     let producers = CacheProducerWeights::load(
         &lib,
         &catalog,
@@ -451,9 +466,7 @@ fn worker(
     );
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
-    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
-        args.attention_plan_rows)?;
+    let attention_plan = attention_plan(&lib, lib.cuda_get_device()?, &args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))
@@ -633,7 +646,15 @@ fn worker(
     }
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
+    // The plan's coordinator weight cap, over the loaded backbone and the
+    // drafter as the plan counts them.
+    let draft_inventory = if args.dspark {
+        Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(&lib, &catalog,
+            capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 })?)
+    } else { None };
+    let cap = admission::WeightCap::loaded(&args, &catalog, 1, memory[0].1, draft_inventory.as_ref())?;
+    let pool = admission::resolve_tiered(&args, &memory, experts, local_workspace, &[0], 0, &[], &[], None, None,
+        Some(&cap))?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
     for (slot, _) in &mut prefill_slots.slots { slot.bind_execution_plan(&pool.placement)?; }
@@ -735,7 +756,22 @@ fn worker(
         .send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second,
-        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes)
+        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes,
+        census.as_ref())
+}
+
+/// `CUTEAFD_V41_ROUTE_CENSUS` (`shared::route_census`): the census of the
+/// routers on `gpus`, installed in every layer's router before any lane or
+/// graph exists. Its model id is `--model-id`, else the snapshot's hub id or
+/// directory name.
+fn route_census<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs, gpus: &[i32],
+    weights: &mut BackboneLaneWeights<'a>) -> Result<Option<crate::shared::route_census::RouteCensus<'a>>> {
+    let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&args.snapshot))
+        .unwrap_or_else(|| args.snapshot.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned()));
+    let census = crate::shared::route_census::RouteCensus::from_env(lib, gpus,
+        crate::families::deepseek_v41::v41_backbone_router::ROUTE_CENSUS_SHAPE, model)?;
+    if let Some(census) = &census { weights.install_route_census(census)?; }
+    Ok(census)
 }
 
 /// The HC-9 prefill pacing hold at a chunk boundary: bounded by the host cache's store

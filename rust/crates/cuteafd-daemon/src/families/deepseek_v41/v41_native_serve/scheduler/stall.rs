@@ -189,7 +189,7 @@ mod tests {
         assert!(independent.contains("stall::tick();"));
         let scheduler = include_str!("../scheduler.rs");
         let single = &scheduler[scheduler.find("fn single_lane_round<").unwrap()..];
-        assert!(single[..4000].contains("clock.draft(|| draft.propose(lib, lane, &seeds))?"));
+        assert!(single[..4000].contains("clock.draft(|| draft.propose(lane, &seeds))?"));
         assert!(!scheduler.contains("stall::anchor_only"));
         assert!(!independent.contains("stall::anchor_only"));
         let admission = &scheduler[scheduler.find("let mut held_slots =").unwrap()..];

@@ -653,7 +653,7 @@ mod tests {
             args.attention_plan_rows = attention_rows;
             let reduction = super::super::attention_plan(&args, mtp)?;
             let manifests = qwen4::dual_program_manifests(&manifest,
-                capacities.map(|bytes| cuteafd_loader::placement::ArchContext::for_device("sm_120", bytes).sms), reduction)?;
+                capacities.map(|bytes| cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, bytes).sms), reduction)?;
             args.fp8_decode = fp8_projections;
             args.mtp_fp8_head = fp8_head;
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }

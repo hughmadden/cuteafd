@@ -982,6 +982,19 @@ impl<'a> OwnerPair<'a> {
         self.bf16_input
     }
 
+    /// Device-ordered passes push each remote partial to its owner
+    /// ([`super::combine::OwnerReduce::enable_push`]). For a pair private to
+    /// one decode lane only.
+    pub(crate) fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        for reduction in &mut self.reductions { reduction.enable_push(decode_lane_bytes)?; }
+        Ok(())
+    }
+
+    /// Bytes per row of the widest partial a reduction moves.
+    pub(crate) fn partial_row_bytes(&self) -> usize {
+        self.reductions[0].partial_row_bytes()
+    }
+
     #[cfg(test)]
     pub(crate) fn rank_output(&self, rank: usize) -> CuteafdDeviceBuffer {
         self.ranks[rank].execution.allocation().buffer
@@ -1001,6 +1014,26 @@ impl<'a> OwnerPair<'a> {
         rows: u32,
         owner: usize,
         inputs: [OwnerInputs<'_, 'a>; 2],
+    ) -> Result<CuteafdDeviceBuffer> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.execute_into(layer, rows, owner, inputs, None).await }
+    }
+
+    /// [`Self::execute`] with the reduced result written into `into` (on the
+    /// `owner` GPU, holding the BF16 result) when `Some`, instead of the owner
+    /// reduction's own output: a plane of the caller's, which the pair's next
+    /// execution does not overwrite.
+    ///
+    /// # Safety
+    /// As [`Self::execute`]; nothing else reads or writes `into` until the
+    /// reduction completes.
+    pub(crate) async unsafe fn execute_into(
+        &mut self,
+        layer: usize,
+        rows: u32,
+        owner: usize,
+        inputs: [OwnerInputs<'_, 'a>; 2],
+        into: Option<CuteafdDeviceBuffer>,
     ) -> Result<CuteafdDeviceBuffer> {
         ensure!(
             owner < 2 && (1..=self.max_rows).contains(&rows),
@@ -1097,7 +1130,7 @@ impl<'a> OwnerPair<'a> {
         // SAFETY: rank outputs and streams remain borrowed through reduction drainage.
         let output = unsafe {
             self.reductions[owner]
-                .reduce(
+                .reduce_into(
                     local.execution.allocation(),
                     remote.execution.allocation(),
                     &local.stream,
@@ -1105,6 +1138,7 @@ impl<'a> OwnerPair<'a> {
                     rows,
                     dtype,
                     layout,
+                    into,
                 )
                 .await?
         };

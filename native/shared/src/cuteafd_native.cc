@@ -1808,6 +1808,13 @@ extern "C" cuteafd_status_t cuteafd_copy_h2d(cuteafd_device_buffer_t dst, const 
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_COPY_FAILED, "cudaMemcpy host-to-device failed", err);
   }
+  // From pageable memory cudaMemcpy may return once the bytes reach its staging
+  // buffer, before the DMA lands; kernels on nonblocking streams do not wait for
+  // it. Wait here so the upload is complete when this call returns.
+  err = cudaStreamSynchronize(nullptr);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_COPY_FAILED, "host-to-device DMA completion failed", err);
+  }
 #else
   std::memcpy(dst.ptr, src, bytes);
 #endif

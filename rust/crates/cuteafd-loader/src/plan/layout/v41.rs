@@ -4,7 +4,8 @@ pub use crate::placement::families::deepseek_v41::resident::*;
 use super::*;
 use anyhow::{ensure, Context, Result};
 use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Baseline,
-    Demand, GpuBudget, Inventory, Onboard, PoolPolicy, SparkWorkingSet};
+    Demand, ExpertActivation, ExpertRouteProfile, ExpertTierRequest, ExpertTierSize, GpuBudget,
+    Inventory, Onboard, PoolPolicy, SparkWorkingSet};
 use v41::DraftInventory;
 
 // Conservative combined code/ready-graph envelope; pure LoadedCode is unqualified.
@@ -47,8 +48,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let directory = manifest.parent().context("V4.1 manifest has no parent")?;
     let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_FP8_AOT.json"))
         .context("missing V4.1 native FP8 allocation manifest")?)?;
-    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
-    let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
+    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms);
+    // The compressed attention kernel this architecture runs (serve applies
+    // the same rule to the measured device).
+    let attention = options.coordinator_arch.v41_compressed_attention();
+    let programs = v41::owners::NativePrograms::new(&fp8, sms)?.with_compressed_attention(attention);
     let mode = Fp8Head::configured();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     // The prefill slots, one storage set over their units; two decode lanes
@@ -68,6 +72,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; combined startup census residuals fit this bound. Pure LoadedCode and ready parity are not qualified.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is reserved by shared V4.1 solver demands, not included in the ready residency claim.".into()];
+    if attention != cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot {
+        notes.push(format!("compressed sparse attention: native FP32 ten-part kernel ({} exports no BF16 AOT \
+            attention); same split scratch as BF16 AOT", options.coordinator_arch));
+    }
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
@@ -126,7 +134,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
         Some(draft)
     } else { None };
-    let automatic = options.pool_tokens == Some(0);
+    // `--pool-tokens` 0 or omitted: automatic (a 97% admission ceiling plus
+    // the growth reserve), as the flag documents; only a positive count pins the pool.
+    let automatic = options.pool_tokens.unwrap_or(0) == 0;
     let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0)
         .with_automatic_context(options.context_tokens == 0);
     if pool.requested.is_none() {
@@ -136,7 +146,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
     let mut inventory = Inventory { gpus: Vec::new(), spark_ranks, peer_access: ranks == 2 };
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
-        let arch = ArchContext::coordinator(total, None);
+        let arch = ArchContext::coordinator(options.coordinator_arch, total, None);
         let ceiling = if total <= 32 * GIB {
             cuteafd_core::serving_capacity::admission_ceiling(total, 97,
                 cuteafd_core::serving_capacity::small_card_headroom_bytes(total))?
@@ -146,18 +156,33 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: NATIVE_CODE_ESTIMATE } });
         devices[gpu].capacity_bytes = ceiling;
         devices[gpu].items.clear();
-        devices[gpu].items.push(Item::new(Category::Runtime, "CUDA context and cuBLAS", "SM120 architecture inventory", context, Basis::Calibrated));
+        devices[gpu].items.push(Item::new(Category::Runtime, "CUDA context and cuBLAS",
+            format!("{} architecture inventory", options.coordinator_arch.as_str()), context, Basis::Calibrated));
         devices[gpu].items.push(Item::new(Category::Runtime, "native LoadedCode estimate", "unqualified native code/ready graph residency", NATIVE_CODE_ESTIMATE, Basis::Estimated));
         fixed.extend(v41::growth_demands(total, ranks, automatic, gpu as u8));
     }
-    let onboard = if spark_ranks == 0 { Onboard::Layers(catalog.routed_experts().routed_layers()) } else {
-        options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto)
+    // A GPU expert tier generalises whole-layer onboarding: --rtx-expert-layers
+    // pins whole layers inside it, and the Sparks keep every expert.
+    let routed = catalog.routed_experts();
+    let tier = v41::TierChoice { setting: options.expert_tier, profile: options.expert_tier_profile.clone(),
+        model: options.expert_tier_model };
+    let tier_inputs = tier.inputs(routed.routed_layers(), routed.experts, routed.topk as u32)?;
+    let onboard = if spark_ranks == 0 { Onboard::Layers(routed.routed_layers()) } else {
+        options.resolve_onboard(routed.routed_layers()).unwrap_or(Onboard::Auto)
     };
+    // Both decode lanes and the prefill slots run the tier, each TP2 FFN on
+    // its own slot tables (the slots' at the unit).
+    let lane = |rows: u64| v41::tier_lane_bytes(routed.layers as u64, routed.experts as u64, rows);
+    let workspace = workspace + if tier_inputs.is_some() { 2 * lane(v41::owners::DECODE_LANE_ROWS) + lane(rows) }
+        else { 0 };
     let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
+    if let Some(inputs) = &tier_inputs {
+        tier.apply(&mut request, inputs, options.resolve_onboard(routed.routed_layers()), routed.experts)?;
+    }
     request.fixed = fixed;
     request.startup = startup.clone();
     if let Some(draft) = &draft { request.startup.extend(owners.draft_load_phases(draft)?); }
-    request.minimum_expert_layers = usize::from(ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
+    request.minimum_expert_layers = usize::from(ranks == 2 && !matches!(request.onboard, Onboard::Layers(0)));
     if let Some(draft) = &draft { request.movables.push(v41::drafter(draft, ranks)?); }
     v41::cache_demands(&mut request, &checkpoint.config, shape.concurrency, turns, false)?;
     let mut placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
@@ -170,6 +195,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut encoder_request = request.clone();
     if request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none() {
         encoder_request.onboard = Onboard::Layers(request.minimum_expert_layers);
+        encoder_request.pool.pin_selected(placement.pool_tokens);
+    }
+    // An automatic tier is optional too, apart from its pinned whole layers:
+    // the encoder displaces it, not the pool.
+    if let Some(tier) = request.expert_tier.as_ref().filter(|tier| tier.size == ExpertTierSize::Auto) {
+        encoder_request.expert_tier = (tier.pinned > 0)
+            .then(|| ExpertTierRequest { size: ExpertTierSize::Experts(tier.pinned), ..tier.clone() });
         encoder_request.pool.pin_selected(placement.pool_tokens);
     }
     let encoder_budget = placement::solve(&encoder_request)?;
@@ -211,6 +243,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
+    if let Some(draft) = draft.as_ref().filter(|draft| draft.peer_half > 0) {
+        notes.push(format!("dSpark routed experts: TP2 halves, {} B on each GPU (whole on rtx{}: {} B)",
+            draft.peer_half, ranks - 1, 3 * native_expert_bytes(128, 5120, 2304)));
+    }
+    if let (Some(tier), Some(inputs)) = (&placement.expert_tier, &tier_inputs) {
+        notes.extend(expert_tier_notes(tier, &request, &inputs.activation, inputs.profile.as_ref(),
+            &options.expert_tier_model));
+    }
     if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
         let e = catalog.routed_experts();
         let capacity = cuteafd_core::V41_TARGET_CAPACITIES.into_iter().find(|&c| c >= rows)
@@ -231,47 +271,40 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     Ok(MemoryLayout { devices, pool_tokens, waste, notes })
 }
 
+/// [`v41::solve_with_weight_limit`] over `request`'s fixed weight owners and `draft`.
 fn solve_with_weight_limit(request: &placement::PlacementRequest, draft: Option<&DraftInventory>,
     limit: u64) -> Result<placement::Placement> {
-    let mut placement = placement::solve(request)?;
-    loop {
-        let fits = retained_weight_bytes(request, &placement, draft)?.into_iter().all(|bytes| bytes <= limit);
-        if fits { return Ok(placement); }
-        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
-            && placement.onboard_layers > request.minimum_expert_layers,
-            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
-        let mut trial = request.clone();
-        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
-        // Keep pool-first's admitted pool while reducing only the optional prefix.
-        if matches!(request.onboard, Onboard::Auto) {
-            trial.pool.pin_selected(placement.pool_tokens);
-        }
-        placement = placement::solve(&trial)?;
-    }
+    let fixed = v41::fixed_weight_bytes(&request.fixed, draft, request.inventory.gpus.len())?;
+    v41::solve_with_weight_limit(request, &fixed, limit)
 }
 
-fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placement::Placement,
-    draft: Option<&DraftInventory>) -> Result<Vec<u64>> {
-    let ranks = request.inventory.gpus.len();
-    (0..ranks).map(|gpu| {
-        let mut bytes = request.fixed.iter().filter(|d| usize::from(d.gpu) == gpu
-            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
-                || d.group == "external drafter weights"))
-            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
-        let draft_bytes = draft.map_or(0, |d| if gpu == ranks - 1 { d.resident } else { d.peer_half });
-        bytes = bytes.checked_add(draft_bytes).context("V4.1 draft weight budget overflow")?;
-        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
-            if let Some(cost) = layer.experts {
-                let resident = match assigned.experts {
-                    placement::ExpertHome::RtxTp2 => cost.half[gpu].resident,
-                    placement::ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
-                    _ => 0,
-                };
-                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
-            }
-        }
-        Ok(bytes)
-    }).collect()
+/// Plan notes: resident experts per routed layer, and the expert time the step
+/// model predicts per verify step against all-Spark and against the same
+/// bytes spent on whole layers.
+fn expert_tier_notes(tier: &placement::ExpertTierPlacement, request: &placement::PlacementRequest,
+    activation: &ExpertActivation, profile: Option<&ExpertRouteProfile>, model: &placement::TierStepModel)
+    -> Vec<String> {
+    let routed = request.layers.iter().zip(&tier.resident).filter(|(layer, _)| layer.experts.is_some())
+        .map(|(_, ids)| ids.as_slice()).collect::<Vec<_>>();
+    let mut notes = vec![format!("GPU expert tier resident experts per routed layer: {:?}",
+        routed.iter().map(|ids| ids.len()).collect::<Vec<_>>())];
+    let ms = |ns: f64| ns / 1e6;
+    let all_spark = model.step_ns(activation, &[]);
+    let tiered = model.step_ns(activation, &routed);
+    let experts = activation.layers.first().map_or(1, Vec::len).max(1);
+    let per_whole_layer = (all_spark - model.whole_step_ns(activation)) / activation.layers.len().max(1) as f64;
+    let whole = per_whole_layer * tier.experts as f64 / experts as f64;
+    notes.push(format!("GPU expert tier predicted expert time per verify step: {:.2} -> {:.2} ms ({:.2} ms saved) \
+        at a {:.1}% byte hit rate; the same bytes as whole layers save {:.2} ms (step model: GPU {:.2} us per \
+        expert + {:.0} us, Spark {:.2} us per expert + {:.0} us, {} active experts per layer)",
+        ms(all_spark), ms(tiered), ms(all_spark - tiered), 100.0 * activation.hit_rate(&routed), ms(whole),
+        model.gpu_expert_ns as f64 / 1e3, model.gpu_fixed_ns as f64 / 1e3, model.spark_expert_ns as f64 / 1e3,
+        model.spark_fixed_ns as f64 / 1e3, model.active_experts));
+    if let Some(profile) = profile {
+        notes.push(format!("GPU expert tier profile: route hit rate {:.1}% (one-row steps)",
+            100.0 * profile.route_share(&routed)));
+    }
+    notes
 }
 
 #[cfg(test)]
@@ -283,7 +316,7 @@ mod tests {
         // Raw ready untracked samples from the min/max native startup census.
         // Removing the calibrated context/cuBLAS leaves a combined code/graph
         // residual, NOT pure LoadedCode or a 64 MiB ready-parity qualification.
-        let arch = ArchContext::coordinator(96 * GIB, None);
+        let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, 96 * GIB, None);
         assert_eq!(arch.context_bytes + arch.cublas_bytes, 657_719_296);
         for (card, untracked, residual, slack) in [
             ("min GPU0", 2_149_527_512, 1_491_808_216, 655_675_432),
@@ -310,7 +343,8 @@ mod tests {
         let unconstrained = placement::solve(&request)?;
         let placed = solve_with_weight_limit(&request, None, 10 * GIB)?;
         assert_eq!(placed.onboard_layers, 2);
-        assert_eq!(retained_weight_bytes(&request, &placed, None)?, vec![10 * GIB]);
+        assert_eq!(v41::retained_weight_bytes(&request, &placed, &v41::fixed_weight_bytes(&request.fixed, None, 1)?)?,
+            vec![10 * GIB]);
         assert!(placed.items[0].iter().filter(|i| i.category == Category::Experts)
             .map(|i| i.bytes).sum::<u64>() > 10 * GIB);
         assert!(placed.pool_tokens >= 262_144);

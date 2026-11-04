@@ -503,7 +503,8 @@ pub(crate) fn with_engine<T>(
             }
         } else { None };
         let exchange_f32 = engine::ExchangePolicy::from_env()? == engine::ExchangePolicy::F32;
-        let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
+        let arch = crate::shared::inventory::device_arch(&loaded.library, args.device)?;
+        let inputs = admission::Inputs { arch, cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
             family: loaded.family, gpus, loaded_modes: None, cache_stages,
             prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32 };

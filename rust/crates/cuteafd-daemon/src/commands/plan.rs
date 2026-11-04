@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use crate::cli::PlanArgs;
 
-/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the RTX PRO
-/// 6000's CUDA-reported total (`placement::inventory::PRO_TOTAL_BYTES`), what the
-/// runtime's own sample sees.
-fn coordinator_bytes(gib: Option<f64>) -> Result<u64, PlanError> {
-    gib.map_or(Ok(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES),
+/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the CUDA-reported
+/// total of `arch`'s reference card (the RTX PRO 6000's
+/// `placement::inventory::PRO_TOTAL_BYTES` on sm_120), what the runtime's own sample sees.
+fn coordinator_bytes(gib: Option<f64>, arch: cuteafd_core::GpuArch) -> Result<u64, PlanError> {
+    gib.map_or(Ok(cuteafd_loader::placement::inventory::ArchContext::reference_total_bytes(arch)),
         |gib| budget_bytes("--coordinator-gpu-budget-gib", gib))
 }
 
@@ -36,8 +36,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
         spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
-            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
-                coordinator_bytes(args.coordinator_gpu_budget_gib)?
+            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some()
+                || args.coordinator_arch != cuteafd_core::GpuArch::Sm120 {
+                coordinator_bytes(args.coordinator_gpu_budget_gib, args.coordinator_arch)?
             } else { u64::MAX }),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
@@ -51,7 +52,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
                 },
                 media_cache_bytes: args.media_cache_bytes,
-                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
+                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib, args.coordinator_arch)?; args.rtx],
+                coordinator_arch: args.coordinator_arch,
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
@@ -75,6 +77,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 onboard: args.rtx_expert_layers,
+                expert_tier: args.gpu_expert_tier,
+                expert_tier_profile: args.gpu_expert_tier_profile.clone(),
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
@@ -136,6 +140,35 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
+}
+
+/// The `--layout` options `args` resolve to, for CLI parsing tests.
+#[cfg(test)]
+pub(crate) fn layout_options_for_test(args: &PlanArgs) -> cuteafd_loader::plan::layout::LayoutOptions {
+    options(args).expect("valid plan options").layout.expect("--layout")
+}
+
+/// The report `run_plan` prints for a V4.1 checkpoint directory, without
+/// printing: the same options, speculator and V4.1 layout steps, in order,
+/// for tests that size runtime owners from the deployment plan.
+#[cfg(test)]
+pub(crate) fn v41_report_for_test(mut args: PlanArgs) -> Result<cuteafd_loader::plan::PlanReport> {
+    let mut options = options(&args)?;
+    let snapshot = PathBuf::from(&args.model);
+    let input = cuteafd_loader::plan::PlanInput::open(&snapshot)?;
+    let family = cuteafd_loader::plan::family::detect(input.checkpoint()).map_or("", |family| family.id());
+    anyhow::ensure!(family == "deepseek_v41", "expected a DeepSeek V4.1 checkpoint, found {family:?}");
+    let cfg = launch_config(args.config.as_deref())?;
+    resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
+    if let Some(layout) = &mut options.layout {
+        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        v41_layout(layout, &args);
+        layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?;
+        layout.tp2_dspark_experts = v41_tp2_dspark_experts(&args, family, &cfg)?;
+    }
+    options.vision = glm_flash_vision(&args, family, &snapshot);
+    Ok(input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?)
 }
 
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
@@ -959,6 +992,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             exlr8_manifest: None,
@@ -996,6 +1030,8 @@ mod tests {
             fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
             rtx_expert_layers: None,
+            gpu_expert_tier: Default::default(),
+            gpu_expert_tier_profile: None,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),

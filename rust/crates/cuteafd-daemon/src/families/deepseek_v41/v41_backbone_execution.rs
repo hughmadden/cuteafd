@@ -366,6 +366,8 @@ struct WindowBatch<'a> {
     library: &'a NativeLibrary,
     stream: crate::shared::memory::LoadStream<'a>,
     staging: crate::shared::memory::HostAllocation<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: the previous batch's upload ran.
+    staging_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     table: crate::shared::memory::DeviceAllocation<'a>,
     kernel: cuteafd_ffi::V41KvStoreLayers<'a>,
     capacity: usize,
@@ -382,6 +384,7 @@ impl<'a> WindowBatch<'a> {
             library,
             stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
             staging: crate::shared::memory::HostAllocation::new(library, bytes)?,
+            staging_check: crate::shared::memory::staging_check::StagingCheck::new(library, "V4.1 window batch", 1),
             table: crate::shared::memory::DeviceAllocation::new(library, bytes)?,
             kernel: library.v41_kv_store_layers()?,
             capacity,
@@ -393,11 +396,13 @@ impl<'a> WindowBatch<'a> {
     unsafe fn enqueue(&mut self, layers: &[crate::families::deepseek_v41::v41_window::BatchedWindowCommit]) -> Result<()> {
         let rows = layers.first().context("empty window batch")?.destinations.len();
         let chunks = layers[0].ends.len();
+        self.staging_check.before_write(0)?;
         let offset = Self::stage(self.staging.bytes_mut(), self.table.buffer.ptr as u64,
             self.table.buffer.device_id, self.capacity, layers)?;
         let mut host = self.staging.buffer; host.bytes = offset;
         unsafe {
             self.library.copy_host_buffer_h2d_async(self.table.buffer, host, offset, self.stream.raw)?;
+            self.staging_check.uploaded(0, self.stream.raw)?;
             self.kernel.launch(self.table.buffer, layers.len(), rows, chunks, self.stream.raw)
         }
     }

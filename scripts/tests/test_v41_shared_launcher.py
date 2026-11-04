@@ -118,11 +118,15 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        # The planner's prefill waves and reserve reach the shared executor.
+        # The planner's prefill waves and reserve reach the shared executor,
+        # and serving applies the deployment plan's coordinator weight cap.
         value = lambda flag: after["command"][after["command"].index(flag) + 1]
+        plan = current["plans"][-1]
+        plan_cap = plan[plan.index("--coordinator-weight-budget-gib") + 1]
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
             "--prefill-waves", value("--prefill-waves"),
-            "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
+            "--prefill-reserve-rows", value("--prefill-reserve-rows"),
+            "--coordinator-weight-budget-gib", plan_cap] if role == "coordinator" else [])
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
@@ -225,6 +229,57 @@ def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit)
         assert args.count("--dspark-draft-limit") == (limit is not None)
         resolved = args[args.index("--dspark-draft-limit") + 1] if limit is not None else "5"
         assert resolved == (limit or "5")
+
+
+@pytest.mark.parametrize("tier", ["auto", "24"])
+def test_v41_gpu_expert_tier_and_profile_reach_plan_and_serve(tmp_root, monkeypatch, tier) -> None:
+    """GPU_EXPERT_TIER reaches the deployment plan and serve-native, never a
+    Spark; GPU_EXPERT_TIER_PROFILE is mounted read-only at one path in both
+    containers. Six Sparks take the planner's owned wire unasked."""
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    profile = tmp_root / "routes.json"
+    profile.write_text('{"layers": []}\n')
+
+    def with_tier(name, directory):
+        return capture_module.append_config(original(name, directory),
+                                            f"GPU_EXPERT_TIER={tier}\nGPU_EXPERT_TIER_PROFILE={profile}\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_tier)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = parse_run(result["containers"][0]["argv"])
+    inside = "/run/cuteafd/gpu-expert-tier-profile.json"
+    mount = f"{profile.resolve()}:{inside}:ro"
+    assert mount in coordinator["mounts"]
+    for args in [coordinator["command"], *result["plans"]]:
+        assert args[args.index("--gpu-expert-tier") + 1] == tier and args.count("--gpu-expert-tier") == 1
+        assert args[args.index("--gpu-expert-tier-profile") + 1] == inside
+    assert all(mount in plan for plan in result["plans"])
+    for worker in result["containers"][1:]:
+        assert not any("expert-tier" in arg for arg in worker["argv"])
+
+
+def test_v41_gpu_expert_tier_refuses_one_rtx_a_bare_profile_and_the_canonical_wire(tmp_root, monkeypatch) -> None:
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    lines = {"one": "GPU_EXPERT_TIER=24\n", "bare": "GPU_EXPERT_TIER_PROFILE=/dev/null\n",
+             "canonical": "GPU_EXPERT_TIER=24\n", "owned": "GPU_EXPERT_TIER=24\nSPARK_TP=4\nSPARK_EP=1\n"}
+    for case, line in lines.items():
+        def with_key(name, directory, line=line, case=case):
+            config = original(name, directory)
+            if case in ("canonical", "owned"):
+                config.write_text(config.read_text().replace("SPARK_COUNT=6", "SPARK_COUNT=4"))
+            return capture_module.append_config(config, line)
+        monkeypatch.setattr(capture_module, "example_config", with_key)
+        example = "deepseek-v41-mxfp4-min" if case == "one" else "deepseek-v41-mxfp4-max"
+        if case == "owned":
+            command = parse_run(capture_module.capture(ROOT, example)["containers"][0]["argv"])["command"]
+            assert command[command.index("--spark-tp") + 1] == "4" and "--gpu-expert-tier" in command
+            continue
+        expected = {"one": r"two RTX GPUs", "bare": r"set GPU_EXPERT_TIER",
+                    "canonical": r"GPU_EXPERT_TIER needs an owned Spark topology"}[case]
+        with pytest.raises(RuntimeError, match=expected):
+            capture_module.capture(ROOT, example)
 
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
@@ -367,6 +422,27 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert result["containers"][0]["argv"].count(f"CUTEAFD_V41_FP8_HEAD={value}") == 1
     for worker in result["containers"][1:]:
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
+
+
+def test_v41_dual_rtx_switches_reach_only_the_coordinator(tmp_root) -> None:
+    """The dual-RTX transfer, busy-lane, staging-check, Spark landing, index top-k,
+    CUDA connection-count, mHC boundary and host-cache store switches travel from the
+    operator's environment to the coordinator only, and only when set."""
+    import v41_launch_capture as capture_module
+
+    switches = {"CUTEAFD_V41_PEER_EXCHANGE": "pull", "CUTEAFD_V41_PUSH_MAX_BYTES": "1048576",
+                "CUTEAFD_V41_BUSY_LANES": "paced", "CUTEAFD_V41_CHECK_STAGING": "1",
+                "CUTEAFD_SPARK_LANDING": "sm", "CUTEAFD_V41_INDEX_TOPK": "merge",
+                "CUDA_DEVICE_MAX_CONNECTIONS": "32", "CUTEAFD_V41_HC_BOUNDARY": "chain",
+                "CUTEAFD_HOST_CACHE_STORE": "on-evict"}
+    unset = parse_run(capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")["containers"][0]["argv"])["env"]
+    assert not any(name in unset for name in switches)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max", operator_env=switches)
+    coordinator = parse_run(result["containers"][0]["argv"])["env"]
+    for name, value in switches.items():
+        assert coordinator[name] == value
+    for worker in result["containers"][1:]:
+        assert not any(name in parse_run(worker["argv"])["env"] for name in switches)
 
 
 @pytest.mark.parametrize("value", [None, "LAZY", "EAGER", "eager"])

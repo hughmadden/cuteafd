@@ -119,13 +119,14 @@ pub use layerwave::{
 pub use model::{
     AttentionKind, DType, ModelFacts, ModelVariant, TensorCatalog, TensorInfo, TensorRole,
 };
-pub use node::NodeRole;
+pub use node::{GpuArch, NodeRole};
 pub use placement::{
     owner_for_expert, ExpertOwnerLookup, LoadPlan, PlacementPolicy, TensorAssignment,
 };
 pub use replicated_expert_schedule::{
-    replicated_expert_tie_seed, replicated_expert_tie_seed_for, ReplicatedExpertCostModel,
-    ReplicatedExpertGroupId, ReplicatedExpertGroupLoad, ReplicatedExpertGroupPlan,
+    replicated_expert_tie_seed, replicated_expert_tie_seed_for, ExpertResidencySet,
+    ReplicatedExpertCostModel, ReplicatedExpertGroupId, ReplicatedExpertGroupLoad,
+    ReplicatedExpertGroupPlan, ReplicatedExpertGroupSpec, ReplicatedExpertResidency,
     ReplicatedExpertScheduleConfig, ReplicatedExpertScheduler, ReplicatedExpertTieSeedMode,
     INACTIVE_REPLICATED_EXPERT_GROUP, MAX_REPLICATED_EXPERT_GROUPS, TIE_SEED_FIXED_REQUEST_ID,
 };

@@ -924,6 +924,12 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
             "intermediate":2304,"kernel_intermediate":2304,"experts":128,"topk":3},
         "variants":([16,40,80,256].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*7})))
     })).unwrap()).unwrap();
+    // `--tp2-dspark-experts` charges the dSpark TP2 role's own workspaces.
+    fs::write(share.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"), serde_json::to_vec(&json!({
+        "role":"dspark_tp2","input_format":"fp8_k32","geometry":{"hidden":5120,
+            "intermediate":1152,"kernel_intermediate":1152,"experts":128,"topk":3},
+        "variants":([1,16,40,80,256,1024,4096].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*11})))
+    })).unwrap()).unwrap();
     programs
 }
 

@@ -240,6 +240,15 @@ def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_KIMIK3_AOT='ON', CUTEAFD_ENABLE_GLM_AOT='ON')
     assert fields['GEOMETRY'] == 'glm,glm2,kimik3,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
+    # An sm_89 coordinator (V4.1) builds only the Spark reply reducers; table
+    # families, EXLR8 and partial replies stay SM120's.
+    fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89', CUTEAFD_ENABLE_V41_EXPERT_AOT='ON')
+    assert fields['GEOMETRY'] == 'expert_reply' and fields['ROLE'] == 'coordinator'
+    for flag in ('CUTEAFD_ENABLE_DSV4_AOT', 'CUTEAFD_ENABLE_GLM_AOT', 'CUTEAFD_ENABLE_EXLR8_AOT',
+                 'CUTEAFD_PARTIAL_REPLY_PROGRAMS'):
+        fields, error = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89',
+                                          CUTEAFD_ENABLE_V41_EXPERT_AOT='ON', **{flag: 'ON'})
+        assert fields is None and 'an sm_89 coordinator only the Spark reply reducers' in ' '.join(error.split()), flag
 
 
 def test_exporter_forwards_role_to_the_fork_and_appends_last():

@@ -393,7 +393,7 @@ impl RuntimeInputs {
             })
             .collect::<Vec<_>>();
         let spec = self.hops();
-        let placement = Placement {
+        let placement = Placement { expert_tier: None,
             pool_tokens: 0,
             pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Heads,
@@ -675,7 +675,7 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
             if trial_pool.requested.is_none() {
                 trial_pool.target = tokens;
             }
-            let request = PlacementRequest {
+            let request = PlacementRequest { expert_tier: None,
                 inventory: inputs.inventory.clone(),
                 attention_placement: None,
                 context_buffers: ContextBuffers::default(),

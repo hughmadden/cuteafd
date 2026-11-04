@@ -3,6 +3,7 @@ use super::*;
 use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
+pub(crate) mod busy_lanes;
 mod admission;
 mod queue;
 mod round_failure;
@@ -826,7 +827,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
+    census: Option<&crate::shared::route_census::RouteCensus<'a>>,
 ) -> Result<()> {
+    // Serving starts with every lane idle: the routing census counts from here.
+    if let Some(census) = census { census.begin()?; }
     if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact {
         let manifest = cuteafd_loader::placement::families::deepseek_v41::owners::native_manifest(
             &args.native_lib, "V41_FP8_AOT.json")?;
@@ -883,6 +887,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // This point is reached only after both complete stacks have drained and
         // committed. No cache owner is migrated or retired inside a layer stack.
         stall::mark(stall::Phase::Retire, active.iter().flatten().count());
+        // Drained: the routing census reads its device counts here when a dump
+        // or a trace window is due; a window notes the requests in serving.
+        if let Some(census) = census {
+            census.tick(active.iter().flatten().map(|r| (r.id(), round_failure::RoundMember::is_done(r))));
+        }
         {
             let mut releaser = round_failure::RetireAdapter { requests: &mut *requests,
                 prefixes: &mut prefixes, draft: draft.as_deref_mut() };
@@ -1272,6 +1281,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         waiting.ticket.fail(0);
         round_failure::release_admission(requests, draft.as_deref_mut(), waiting.lease, waiting.id);
     }
+    // Every lane stopped: the final routing census.
+    if let Some(census) = census { census.finish(); }
     result
 }
 
@@ -2082,7 +2093,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
     prefetch_drafts(requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
-        clock.draft(|| draft.propose(lib, lane, &seeds))?
+        clock.draft(|| draft.propose(lane, &seeds))?
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
     prefetch_drafts(requests, active, members, &inputs);

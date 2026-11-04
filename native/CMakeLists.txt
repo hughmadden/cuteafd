@@ -312,6 +312,12 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
     "PYTHONDONTWRITEBYTECODE=1"
     "PYTHONPATH=${CUTEAFD_SPARKINFER_SOURCE_DIR}"
   )
+  # sm_89 exports compile on b12x's offline SM89 target (python/tools/lib/
+  # sm89_cards.py) with CUDA hidden: the build needs no GPU, and the card it
+  # sees shapes no kernel. SM120 and SM121 exports run on their GPU.
+  if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+    list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "CUTEAFD_EXPORT_OFFLINE_TARGET=sm89")
+  endif()
   execute_process(
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     RESULT_VARIABLE CUTEAFD_SPARKINFER_VERIFY_RESULT
@@ -345,6 +351,7 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
   )
   list(APPEND CUTEAFD_SPARKINFER_EXPORT_INPUTS
     "${CUTEAFD_SPARKINFER_SOURCE_DIR}/pyproject.toml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/sm89_cards.py"
   )
   set(CUTEAFD_MXFP4_POLICY_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
@@ -441,6 +448,23 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/nvfp4_payload.cu
     shared/cuda/nvfp4_scale.cu
   )
+  # SM89 (Ada) runs V4.1 split sparse attention above one wave of 16-head
+  # blocks as one block per (row, part) over a shared KV tile, bit-identical
+  # to the 16-head launch. SM120 and SM121 keep their kernels unchanged.
+  if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+    set_source_files_properties(families/deepseek_v41/cuda/v41_sparse_attention.cu PROPERTIES
+      COMPILE_DEFINITIONS CUTEAFD_V41_ATTENTION_SM89=1)
+    # V4.1 index top-k defaults to the radix select on SM89, bit-identical to
+    # the sort-and-merge path and measured on SM89. SM120 and SM121 keep the
+    # merge default until it is measured there; CUTEAFD_V41_INDEX_TOPK=radix
+    # or =merge overrides either default at run time.
+    set_source_files_properties(families/deepseek_v41/cuda/v41_index_topk.cu PROPERTIES
+      COMPILE_DEFINITIONS CUTEAFD_V41_INDEX_TOPK_RADIX=1)
+    # SM89 runs V4.1's mHC boundary as one begin launch with the finish folded
+    # into post, in today's decode arithmetic (cuteafd_v41_hc_begin and
+    # cuteafd_v41_hc_post_finish). SM120 and SM121 builds never compile it.
+    list(APPEND CUTEAFD_NATIVE_SOURCES families/deepseek_v41/cuda/v41_hc_sm89.cu)
+  endif()
   # SM120 builds use the family-specific target (sm_120f); every live AOT
   # export and hand kernel is qualified with it.
   if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120")
@@ -736,6 +760,10 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_cuda_peer_planes_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_peer_planes_selftest COMMAND cuteafd_cuda_peer_planes_selftest)
   set_tests_properties(cuteafd_cuda_peer_planes_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  add_executable(cuteafd_cuda_staging_selftest tests/cuda_staging_selftest.cc)
+  target_link_libraries(cuteafd_cuda_staging_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_cuda_staging_selftest COMMAND cuteafd_cuda_staging_selftest)
+  set_tests_properties(cuteafd_cuda_staging_selftest PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   add_executable(cuteafd_cuda_load_scale_gather_selftest tests/cuda_load_scale_gather_selftest.cc)
   target_link_libraries(cuteafd_cuda_load_scale_gather_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_load_scale_gather_selftest COMMAND cuteafd_cuda_load_scale_gather_selftest)
@@ -766,6 +794,16 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE CUDA::cudart CUDA::cublas)
   add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
   set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  # V4.1 index top-k: the radix-select and merge paths against an exact CPU
+  # oracle and each other. It includes the kernel source (both paths in one
+  # process), so it does not link the library; --time adds per-call times.
+  add_executable(cuteafd_v41_index_topk_selftest tests/v41_index_topk_selftest.cu)
+  set_target_properties(cuteafd_v41_index_topk_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_include_directories(cuteafd_v41_index_topk_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+  target_link_libraries(cuteafd_v41_index_topk_selftest PRIVATE CUDA::cudart)
+  add_test(NAME cuteafd_v41_index_topk_selftest COMMAND cuteafd_v41_index_topk_selftest)
+  set_tests_properties(cuteafd_v41_index_topk_selftest PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
   # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with

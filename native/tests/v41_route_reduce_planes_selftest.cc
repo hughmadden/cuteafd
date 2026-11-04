@@ -283,6 +283,10 @@ int main() {
       upload_planes();
       upload_shared(rows);
       check_cuda(cudaMemset(output_raw, kPoison, plane_bytes), "poison output B");
+      // The poison and the pageable uploads run on the legacy default stream,
+      // which the non-blocking replay stream does not wait for: settle them
+      // first, or the poison can land after the replay wrote the output.
+      check_cuda(cudaDeviceSynchronize(), "settle uploads and poison B");
       check_cuda(cudaGraphLaunch(executable, stream), "graph launch B");
       check_cuda(cudaStreamSynchronize(stream), "graph sync B");
       verify(reinterpret_cast<uint16_t*>(output_raw), rows, ranks, true, "graph replay B");
@@ -291,6 +295,10 @@ int main() {
       upload_planes();
       upload_shared(rows);
       check_cuda(cudaMemset(output_raw, kPoison, plane_bytes), "poison output C");
+      // The poison and the pageable uploads run on the legacy default stream,
+      // which the non-blocking replay stream does not wait for: settle them
+      // first, or the poison can land after the replay wrote the output.
+      check_cuda(cudaDeviceSynchronize(), "settle uploads and poison C");
       check_cuda(cudaGraphLaunch(executable, stream), "graph launch C");
       check_cuda(cudaStreamSynchronize(stream), "graph sync C");
       verify(reinterpret_cast<uint16_t*>(output_raw), rows, ranks, true, "graph replay C");
