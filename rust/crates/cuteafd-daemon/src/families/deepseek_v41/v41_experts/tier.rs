@@ -5,17 +5,17 @@
 //! the mount the selected halves are read alone, and under a dense recording
 //! they record for the coordinator push group instead.
 //!
-//! At run time a decode lane's TP2 FFN runs the tier ([`TierLane`]) beside
-//! its Spark wave: each GPU turns the router's expert ids into compact slots
-//! (`slot_of`, -1 for the experts it does not hold), runs its half of the
-//! resident experts on the unchanged TP2 expert kernel, and the halves meet on
-//! the Spark reduce's GPU, whose result joins that reduce as one more plane.
-//! The Spark request leaves the same experts to the coordinator
-//! (`ReplicatedGroupPlanner::set_tier`), so every route runs exactly once.
-// Prefill units and the serving start-up wiring use parts of this later.
-#![allow(dead_code)]
+//! At run time a decode lane's TP2 FFN runs the tier beside its Spark wave,
+//! in place of whole TP2 layers: its routed owner pair is over the tier's
+//! halves, each GPU turns the router's expert ids into compact slots
+//! ([`TierLane`]: `slot_of`, -1 for the experts it does not hold), runs its
+//! half of the resident experts on the unchanged TP2 expert kernel, and the
+//! halves meet on the Spark reduce's GPU, whose result joins that reduce as
+//! one more plane. The Spark request leaves the same experts to the
+//! coordinator (`ReplicatedGroupPlanner::set_tier`), so every route runs
+//! exactly once.
 use super::{ExpertLayer, ExpertWeights};
-use crate::shared::experts::rtx::pair::{OwnerInputs, OwnerPair, OwnerPolicy, OwnerWeights};
+use crate::shared::experts::rtx::pair::{OwnerPolicy, OwnerWeights};
 use crate::shared::experts::rtx::native::NativeTp2;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Stream};
 use anyhow::{ensure, Context, Result};
@@ -183,11 +183,11 @@ impl<'a> TierHalves<'a> {
     }
 }
 
-/// One lane's GPU expert tier: the compact halves' owner pair, and on each
-/// GPU the uploaded `slot_of` tables and the slots its rank's kernel reads.
+/// One lane's GPU expert tier beside the routed owner pair it runs on (the
+/// lane's TP2 FFN's, over the tier's halves): on each GPU the uploaded
+/// `slot_of` tables and the slots its rank's kernel reads.
 pub(crate) struct TierLane<'a> {
     residency: Arc<TierResidency>,
-    routed: OwnerPair<'a>,
     tables: [Allocation<'a>; 2],
     slots: [Allocation<'a>; 2],
     kernel: TierSlotKernel<'a>,
@@ -196,42 +196,39 @@ pub(crate) struct TierLane<'a> {
 }
 
 impl<'a> TierLane<'a> {
-    /// Device bytes of one lane's tier beyond the owner pair (tables and slots per GPU).
-    pub(crate) fn table_bytes(residency: &TierResidency, capacity: u32) -> usize {
-        residency.layers() * residency.experts() * 4 + capacity as usize * 6 * 4
+    /// What one lane's tier allocates on each GPU beyond its owner pair: the
+    /// `slot_of` tables, and the slots of `capacity` rows of six routes.
+    fn allocation_sizes(shape: TierSlotShape, capacity: u32) -> [usize; 2] {
+        [shape.bytes(), capacity as usize * 6 * 4]
     }
 
-    pub(crate) fn new(halves: &TierHalves<'a>, capacity: u32, timing: bool) -> Result<Self> {
-        let residency = halves.residency.clone();
-        let devices = [halves.weights[0].device(), halves.weights[1].device()];
-        let routed = OwnerPair::new([halves.weights[0].with_max_rows(capacity as usize)?,
-            halves.weights[1].with_max_rows(capacity as usize)?], capacity, cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
-            timing)?;
+    /// Device bytes of one lane's tier on each GPU beyond its owner pair.
+    pub(crate) fn table_bytes(residency: &TierResidency, capacity: u32) -> usize {
+        Self::allocation_sizes(TierSlotShape { layers: residency.layers(), experts: residency.experts() }, capacity)
+            .iter().sum()
+    }
+
+    /// `residency`'s tables and `capacity` rows of slots on both `devices`.
+    pub(crate) fn new(residency: Arc<TierResidency>, devices: [Device<'a>; 2], capacity: u32) -> Result<Self> {
         let shape = TierSlotShape { layers: residency.layers(), experts: residency.experts() };
         shape.validate()?;
+        let [table_bytes, slot_bytes] = Self::allocation_sizes(shape, capacity);
         let table: Vec<u8> = residency.slot_tables().iter().flat_map(|slot| slot.to_ne_bytes()).collect();
         let tables = devices.map(|device| -> Result<Allocation<'a>> {
-            let allocation = Allocation::new(device, shape.bytes())?;
+            let allocation = Allocation::new(device, table_bytes)?;
             device.run(|| device.library.copy_h2d(allocation.buffer, &table))?;
             Ok(allocation)
         });
         let [left, right] = tables;
-        let slots = devices.map(|device| Allocation::new(device, capacity as usize * 6 * 4));
+        let slots = devices.map(|device| Allocation::new(device, slot_bytes));
         let [first, second] = slots;
-        Ok(Self { residency, routed, tables: [left?, right?], slots: [first?, second?],
+        Ok(Self { residency, tables: [left?, right?], slots: [first?, second?],
             kernel: devices[0].library.v41_tier_slots()?, shape, capacity })
     }
 
-    pub(crate) fn residency(&self) -> &Arc<TierResidency> { &self.residency }
     /// Whether this lane's tier holds experts of `layer` (its Spark requests
     /// then leave them to the coordinator).
     pub(crate) fn holds(&self, layer: usize) -> bool { !self.residency.ids(layer).is_empty() }
-    /// Device-ordered passes push the remote half's partial to its owner.
-    pub(crate) fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
-        self.routed.enable_push(decode_lane_bytes)
-    }
-    /// Bytes per row of the widest partial the halves' reduction moves.
-    pub(crate) fn partial_row_bytes(&self) -> usize { self.routed.partial_row_bytes() }
 
     /// Queues on `stream` (GPU `rank`'s) the slots of `rows` rows of the
     /// router's `ids` (U32 `[rows, 6]` on that GPU) in `layer`, and returns
@@ -253,19 +250,6 @@ impl<'a> TierLane<'a> {
             self.kernel.launch(ids, self.tables[rank].buffer, slots, self.shape, layer, rows as usize * 6, stream.raw)
         })?;
         Ok(slots)
-    }
-
-    /// Both halves of `layer`'s resident experts for `rows` rows, reduced in
-    /// FP32 on `owner` and rounded once to BF16 `[rows, hidden]` there: the
-    /// plane the Spark reduce adds. `inputs[r]` are GPU `r`'s FP8-K32 wire,
-    /// slots ([`Self::slot_routes`]) and gate weights.
-    ///
-    /// # Safety
-    /// As [`OwnerPair::execute`].
-    pub(crate) async unsafe fn execute(&mut self, layer: usize, rows: u32, owner: usize,
-        inputs: [OwnerInputs<'_, 'a>; 2]) -> Result<CuteafdDeviceBuffer> {
-        ensure!(self.holds(layer), "the GPU expert tier holds no expert of layer {layer}");
-        unsafe { self.routed.execute(layer, rows, owner, inputs).await }
     }
 
     /// Each GPU's slots for `probe` (router ids) in `layer`, through its

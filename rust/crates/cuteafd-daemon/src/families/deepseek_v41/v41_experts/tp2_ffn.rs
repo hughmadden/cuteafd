@@ -141,6 +141,17 @@ impl<'a> Storage<'a> {
         Ok(Rc::new(Self { execution: tokio::sync::Mutex::new(execution), streams, rows, unit, layers, shared_layers,
             tier: std::cell::OnceCell::new() }))
     }
+    /// A TP2 FFN that runs the GPU expert tier in place of whole TP2 layers:
+    /// its routed owner pair is over the tier's `halves` (no whole layer), and
+    /// its tier lane turns the router's ids into their slots. Planes at
+    /// `rows`, scratch at `unit`.
+    pub(crate) fn tiered(halves: &super::tier::TierHalves<'a>, shared: [Rc<Vec<SharedWeights<'a>>>; 2],
+        rows: u32, unit: u32) -> Result<Rc<Self>> {
+        let storage = Self::new(halves.weights.clone(), shared, 0, rows, unit, [None, None])?;
+        storage.execution.try_lock().context("a new TP2 FFN is borrowed")?.install_tier(halves)?;
+        storage.tier.set(halves.residency.clone()).map_err(|_| anyhow::anyhow!("a new TP2 FFN holds a tier"))?;
+        Ok(storage)
+    }
 }
 pub(crate) struct Wave<'a> {
     storage: Rc<Storage<'a>>,
@@ -158,6 +169,11 @@ impl<'a> Wave<'a> {
         modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2]) -> Result<Self> {
         Ok(Self::on_storage(Storage::new(routed, shared, layers, capacity, capacity, modules)?))
     }
+    /// A decode lane's private TP2 FFN on the GPU expert tier ([`Storage::tiered`]).
+    pub(crate) fn tiered(halves: &super::tier::TierHalves<'a>, shared: [Rc<Vec<SharedWeights<'a>>>; 2],
+        capacity: u32) -> Result<Self> {
+        Ok(Self::on_storage(Storage::tiered(halves, shared, capacity, capacity)?))
+    }
     pub(crate) fn on_storage(storage: Rc<Storage<'a>>) -> Self {
         Self { storage, window: crate::shared::memory::row_window::RowWindow::NONE }
     }
@@ -169,17 +185,6 @@ impl<'a> Wave<'a> {
         self.window = window; Ok(())
     }
     pub(crate) fn contains(&self, layer: usize) -> bool { layer < self.storage.layers }
-    /// Runs the GPU expert tier on this wave's Spark layers: a lane of its
-    /// own over `halves` (shared weights) in this wave's execution arena. For
-    /// a decode lane's private wave; at rest, once.
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
-    pub(crate) fn install_tier(&self, halves: &super::tier::TierHalves<'a>) -> Result<()> {
-        ensure!(self.window.range().is_none(), "only a decode lane's private TP2 FFN runs the GPU expert tier");
-        let mut execution = self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?;
-        execution.install_tier(halves)?;
-        self.storage.tier.set(halves.residency.clone())
-            .map_err(|_| anyhow::anyhow!("the GPU expert tier is already installed on this TP2 FFN"))
-    }
     /// The GPU expert tier's set, when this wave runs one.
     pub(crate) fn tier(&self) -> Option<&std::sync::Arc<super::tier::TierResidency>> { self.storage.tier.get() }
     /// Whether this wave's tier holds experts of `layer`.
@@ -188,7 +193,6 @@ impl<'a> Wave<'a> {
     }
     /// Each GPU's tier slots for the router ids `probe` in `layer` (the
     /// startup check, at rest).
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
     pub(crate) fn probe_tier_slots(&self, layer: usize, probe: &[u32]) -> Result<[Vec<i32>; 2]> {
         let execution = self.storage.execution.try_lock().context("TP2 FFN submit still borrowed")?;
         execution.tier.as_ref().context("this TP2 FFN runs no GPU expert tier")?.probe_slots(layer, probe)
@@ -273,8 +277,6 @@ struct Execution<'a> {
     flags: Option<crate::shared::peer_split::PeerExchange<'a>>,
     /// The GPU expert tier on this lane's Spark layers ([`Self::install_tier`]).
     tier: Option<super::tier::TierLane<'a>>,
-    /// The decode width pushes were enabled for (the tier's push follows it).
-    push_rows: Option<usize>,
 }
 /// Flag of the result a Spark layer's reduce GPU returns to its block's GPU.
 const RETURN: usize = 0;
@@ -400,8 +402,10 @@ impl<'a> Execution<'a> {
                 && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid TP2 FFN devices"
         );
+        // No whole layer (`layers` 0): the GPU expert tier's halves are the
+        // routed weights ([`Storage::tiered`]).
         ensure!(
-            (1..=40).contains(&layers) && (1..=4096).contains(&capacity),
+            layers <= 40 && (1..=4096).contains(&capacity),
             "invalid TP2 FFN layer count/capacity"
         );
         for rank in 0..2 {
@@ -444,20 +448,18 @@ impl<'a> Execution<'a> {
             released: crate::shared::memory::row_window::ScratchGuard::new(devices[0].library, &[0,1])?,
             flags: None,
             tier: None,
-            push_rows: None,
         })
     }
-    /// See [`Wave::install_tier`]. The tier's owner pair reduces its halves
-    /// like the routed TP2 layers' (pushed once this lane pushes).
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
+    /// See [`Storage::tiered`], whose routed pair is over `halves`: it
+    /// reduces the tier's halves like whole TP2 layers' (pushed once this
+    /// lane pushes).
     fn install_tier(&mut self, halves: &super::tier::TierHalves<'a>) -> Result<()> {
-        use crate::families::deepseek_v41::v41_peer_push::lane_bytes;
-        ensure!(self.tier.is_none(), "the GPU expert tier is already installed on this TP2 FFN");
-        ensure!(halves.weights.iter().enumerate().all(|(rank, weights)| weights.device().id == self.streams[rank].device.id),
+        ensure!(self.tier.is_none() && self.layers == 0,
+            "the GPU expert tier runs on a TP2 FFN over its halves, without whole TP2 layers");
+        let devices = [self.streams[0].device, self.streams[1].device];
+        ensure!(halves.weights.iter().zip(devices).all(|(weights, device)| weights.device().id == device.id),
             "the GPU expert tier's halves live on other GPUs than this TP2 FFN");
-        let mut tier = super::tier::TierLane::new(halves, self.capacity, std::env::var_os("CUTEAFD_TP2_TIMING").is_some())?;
-        if let Some(rows) = self.push_rows { tier.enable_push(lane_bytes(rows, tier.partial_row_bytes())?)?; }
-        self.tier = Some(tier);
+        self.tier = Some(super::tier::TierLane::new(halves.residency.clone(), devices, self.capacity)?);
         Ok(())
     }
     /// See [`Wave::enable_peer_push`].
@@ -469,8 +471,6 @@ impl<'a> Execution<'a> {
         let library = self.streams[0].device.library;
         self.flags = Some(crate::shared::peer_split::PeerExchange::new_flags(library, [0, 1], FLAGS,
             lane_bytes(rows, PeerInputs::allocation_sizes(1).iter().sum::<usize>())?)?);
-        if let Some(tier) = self.tier.as_mut() { tier.enable_push(lane_bytes(rows, tier.partial_row_bytes())?)?; }
-        self.push_rows = Some(rows);
         Ok(())
     }
     pub fn contains(&self, layer: usize) -> bool {
@@ -825,18 +825,19 @@ impl<'a> Execution<'a> {
         }
         let mut ranks = [inputs; 2];
         ranks[remote] = peer;
-        let tier = self.tier.as_mut().context("GPU expert tier missing")?;
+        let tier = self.tier.as_ref().context("GPU expert tier missing")?;
         // Each GPU's slots follow its copy of the router's ids on its stream.
         let slots = [0, 1].map(|rank| unsafe { tier.slot_routes(rank, layer, rows, ranks[rank][2], &self.streams[rank]) });
         let [first, second] = slots;
         let slots = [first?, second?];
+        // The routed pair is over the tier's halves (`Storage::tiered`).
         let (shared, tiered) = tokio::try_join!(
             unsafe {
                 self.shared.execute(layer, rows, destination, [ranks[0][0], ranks[1][0]],
                     [&self.streams[0], &self.streams[1]], adopt)
             },
             unsafe {
-                tier.execute(layer, rows, destination, std::array::from_fn(|rank| OwnerInputs {
+                self.routed.execute(layer, rows, destination, std::array::from_fn(|rank| OwnerInputs {
                     input: ranks[rank][1], ids: slots[rank], weights: ranks[rank][3], producer: &self.streams[rank],
                 }))
             }

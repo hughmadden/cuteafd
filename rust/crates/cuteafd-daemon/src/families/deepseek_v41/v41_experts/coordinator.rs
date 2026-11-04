@@ -282,7 +282,6 @@ impl<'a> V41Link<'a> {
     /// link ([`ReplicatedGroupPlanner::set_tier`]). The link must carry the
     /// owned Spark wire (an explicit `TP×EP` topology): the canonical wire has
     /// no owner field to mark. Before the link's first request.
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
     pub(crate) fn enable_tier(&mut self, tier: std::sync::Arc<super::tier::TierResidency>) -> Result<()> {
         ensure!(self.tier.is_none(), "the GPU expert tier is already enabled on this Spark link");
         // The tier's result is one more plane in the link's reduce (eight at most).
@@ -299,7 +298,6 @@ impl<'a> V41Link<'a> {
     /// For each route of `experts` (rows of six distinct ids) in `layer`,
     /// whether this link's request marks it for the coordinator: the host
     /// view of the GPU expert tier, through the link's own planner.
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
     pub(crate) fn coordinator_routes(&self, layer: u32, experts: &[u32]) -> Result<Vec<bool>> {
         coordinator_routes(&self.native.as_ref().context("the Spark link has no owned wire")?.1, layer, experts)
     }
@@ -372,16 +370,16 @@ impl<'a> NativeTp4Wave<'a> {
         Ok(())
     }
     /// Runs the GPU expert tier on this decode lane's Spark layers: its TP2
-    /// FFN runs `halves` beside the Spark wave, and its link's requests leave
-    /// the same experts (one `TierResidency`) to the coordinator. A lane's two
-    /// views of the set can then never disagree: the Sparks skip exactly the
-    /// routes the GPUs run. At rest, before the link's first request.
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
-    pub(crate) fn enable_tier(&mut self, halves: &super::tier::TierHalves<'a>) -> Result<()> {
+    /// FFN (`tp2_ffn::Wave::tiered`) runs the tier's halves beside the Spark
+    /// wave, and its link's requests leave the same experts (one
+    /// `TierResidency`) to the coordinator. A lane's two views of the set can
+    /// then never disagree: the Sparks skip exactly the routes the GPUs run.
+    /// At rest, before the link's first request.
+    pub(crate) fn enable_tier(&mut self) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("the GPU expert tier runs on the lane's TP2 FFN (two RTX)")?;
+        let residency = tp2.tier().context("this lane's TP2 FFN runs no GPU expert tier")?.clone();
         ensure!(self.link.is_some(), "the GPU expert tier runs on a decode lane with its own Spark link");
-        tp2.install_tier(halves)?;
-        self.own_link()?.enable_tier(halves.residency.clone())?;
+        self.own_link()?.enable_tier(residency)?;
         self.verify_tier()
     }
     /// The startup check ([`super::tier::check_views`]): for every layer, the
@@ -389,7 +387,6 @@ impl<'a> NativeTp4Wave<'a> {
     /// those both GPUs' slot tables run, each slot naming its route's expert.
     /// Host owners come from the link's planner, device slots from each GPU's
     /// uploaded tables through the slot kernel, as the serving path uses them.
-    #[allow(dead_code)] // called by the serving start-up of decode lanes (not wired yet)
     fn verify_tier(&self) -> Result<()> {
         let link = self.link.as_ref().context("the GPU expert tier runs on a decode lane with its own Spark link")?;
         let tp2 = self.tp2.as_ref().context("the GPU expert tier runs on the lane's TP2 FFN")?;
