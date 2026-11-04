@@ -215,6 +215,57 @@ def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit)
         assert resolved == (limit or "5")
 
 
+@pytest.mark.parametrize("tier", ["auto", "24"])
+def test_v41_gpu_expert_tier_and_profile_reach_plan_and_serve(tmp_root, monkeypatch, tier) -> None:
+    """GPU_EXPERT_TIER reaches the deployment plan and serve-native, never a
+    Spark; GPU_EXPERT_TIER_PROFILE is mounted read-only at one path in both
+    containers. Six Sparks take the planner's owned wire unasked."""
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    profile = tmp_root / "routes.json"
+    profile.write_text('{"layers": []}\n')
+
+    def with_tier(name, directory):
+        return capture_module.append_config(original(name, directory),
+                                            f"GPU_EXPERT_TIER={tier}\nGPU_EXPERT_TIER_PROFILE={profile}\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_tier)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = parse_run(result["containers"][0]["argv"])
+    inside = "/run/cuteafd/gpu-expert-tier-profile.json"
+    mount = f"{profile.resolve()}:{inside}:ro"
+    assert mount in coordinator["mounts"]
+    for args in [coordinator["command"], *result["plans"]]:
+        assert args[args.index("--gpu-expert-tier") + 1] == tier and args.count("--gpu-expert-tier") == 1
+        assert args[args.index("--gpu-expert-tier-profile") + 1] == inside
+    assert all(mount in plan for plan in result["plans"])
+    for worker in result["containers"][1:]:
+        assert not any("expert-tier" in arg for arg in worker["argv"])
+
+
+def test_v41_gpu_expert_tier_refuses_one_rtx_a_bare_profile_and_the_canonical_wire(tmp_root, monkeypatch) -> None:
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    lines = {"one": "GPU_EXPERT_TIER=24\n", "bare": "GPU_EXPERT_TIER_PROFILE=/dev/null\n",
+             "canonical": "GPU_EXPERT_TIER=24\n", "owned": "GPU_EXPERT_TIER=24\nSPARK_TP=4\nSPARK_EP=1\n"}
+    for case, line in lines.items():
+        def with_key(name, directory, line=line, case=case):
+            config = original(name, directory)
+            if case in ("canonical", "owned"):
+                config.write_text(config.read_text().replace("SPARK_COUNT=6", "SPARK_COUNT=4"))
+            return capture_module.append_config(config, line)
+        monkeypatch.setattr(capture_module, "example_config", with_key)
+        example = "deepseek-v41-mxfp4-min" if case == "one" else "deepseek-v41-mxfp4-max"
+        if case == "owned":
+            command = parse_run(capture_module.capture(ROOT, example)["containers"][0]["argv"])["command"]
+            assert command[command.index("--spark-tp") + 1] == "4" and "--gpu-expert-tier" in command
+            continue
+        expected = {"one": r"two RTX GPUs", "bare": r"set GPU_EXPERT_TIER",
+                    "canonical": r"GPU_EXPERT_TIER needs an owned Spark topology"}[case]
+        with pytest.raises(RuntimeError, match=expected):
+            capture_module.capture(ROOT, example)
+
+
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
     examples = {p.stem for p in (ROOT / "examples" / "configs").glob("deepseek-v41-*.config")}
     assert examples <= set(CASES)

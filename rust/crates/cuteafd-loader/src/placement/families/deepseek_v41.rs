@@ -543,6 +543,81 @@ pub fn request(
     }
 }
 
+/// `--gpu-expert-tier` and `--gpu-expert-tier-profile` as `cuteafd plan
+/// --layout` and serving both read them: the one source of the tier V4.1
+/// asks the solver for, so a plan admits the resident set serving loads.
+#[derive(Debug, Clone, Default)]
+pub struct TierChoice {
+    pub setting: ExpertTierSetting,
+    pub profile: Option<std::path::PathBuf>,
+    /// What the slots are ranked by (serving: the default model).
+    pub model: TierStepModel,
+}
+
+/// The activations a tier's order comes from, and the profile they were
+/// read from (the plan's notes).
+#[derive(Debug, Clone)]
+pub struct TierInputs {
+    pub activation: ExpertActivation,
+    pub source: ExpertTierSource,
+    pub profile: Option<ExpertRouteProfile>,
+}
+
+impl TierChoice {
+    /// The tier's expected activations over `routed` routed layers of
+    /// `experts` experts (`topk` per row): the profile at the step model's
+    /// verify width, else uniform popularity; `None` when the tier is off.
+    /// A profile without a tier is refused.
+    pub fn inputs(&self, routed: usize, experts: usize, topk: u32) -> anyhow::Result<Option<TierInputs>> {
+        match (&self.profile, self.setting.enabled()) {
+            (Some(_), false) => anyhow::bail!("--gpu-expert-tier-profile needs --gpu-expert-tier auto or N"),
+            (_, false) => Ok(None),
+            (None, true) => Ok(Some(TierInputs {
+                activation: ExpertActivation::uniform(routed, experts, self.model.active_experts),
+                source: ExpertTierSource::Uniform, profile: None })),
+            (Some(path), true) => {
+                let profile = ExpertRouteProfile::read(path)?;
+                let activation = ExpertActivation::from_profile(&profile, routed, experts, self.model.step_rows, topk,
+                    self.model.active_experts)?;
+                Ok(Some(TierInputs { activation, source: ExpertTierSource::Profile, profile: Some(profile) }))
+            }
+        }
+    }
+
+    /// Asks `request` (V4.1's, built by [`request`]) for the tier: every
+    /// routed slot ranked by how much its residency cuts the predicted step
+    /// time, behind the whole layers `pinned` (`--rtx-expert-layers`) pins,
+    /// in place of whole-layer onboarding (no TP2 or TP1 layer prefix, none
+    /// mandatory). The Sparks keep every expert, so it needs Spark ranks.
+    pub fn apply(&self, request: &mut PlacementRequest, inputs: &TierInputs, pinned: Option<Onboard>,
+        experts: usize) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let routed = request.layers.iter().enumerate().filter(|(_, layer)| layer.experts.is_some())
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        let size = self.setting.size(routed.len()).ok_or_else(|| anyhow::anyhow!("the GPU expert tier is off"))?;
+        ensure!(request.inventory.spark_ranks > 0,
+            "the GPU expert tier runs non-resident experts on the Sparks: plan it with Spark ranks");
+        let pinned = match pinned {
+            None | Some(Onboard::Auto) => 0,
+            Some(Onboard::Layers(layers)) => layers,
+        };
+        ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
+        let order = super::super::expert_tier::optimized_order(&routed, &inputs.activation, &self.model, pinned);
+        request.expert_tier = Some(ExpertTierRequest::new(size, experts, order, inputs.source));
+        request.onboard = Onboard::Layers(0);
+        request.minimum_expert_layers = 0;
+        Ok(())
+    }
+}
+
+/// Device bytes one lane's GPU expert tier adds on each GPU beyond the routed
+/// owner pair it runs on (the TP2 FFN's, sized like a whole layer's): the
+/// `slot_of` tables of `layers` backbone layers of `experts` experts, and the
+/// compact slots of `rows` rows of six routes.
+pub fn tier_lane_bytes(layers: u64, experts: u64, rows: u64) -> u64 {
+    layers * experts * 4 + rows * 6 * 4
+}
+
 /// What the V4.1 dSpark drafter retains, measured from its own plan before
 /// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
 /// (request lanes, main context, windows) on the default native BF16 path;

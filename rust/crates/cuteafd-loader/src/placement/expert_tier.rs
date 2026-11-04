@@ -231,6 +231,14 @@ impl TierStepModel {
         active_experts: 24,
         step_rows: 6,
     };
+}
+
+/// The model `cuteafd plan` and serving rank a tier by unless told otherwise.
+impl Default for TierStepModel {
+    fn default() -> Self { Self::C1_VERIFY_48GB_PAIR_4_SPARKS }
+}
+
+impl TierStepModel {
 
     /// One layer's time in `ns * ACTIVATION_ONE` for expected `gpu` and
     /// `spark` activations (in `ACTIVATION_ONE` units).
