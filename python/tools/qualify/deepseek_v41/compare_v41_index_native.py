@@ -57,7 +57,9 @@ def main():
                 for graph in graphs: graph.replay()
                 torch.cuda.synchronize()
                 assert torch.cuda.memory_allocated()==allocated
-                assert torch.equal(buffers[0][0],buffers[1][0])
+                # The carry is opaque: each top-k path orders it its own way and
+                # reads it as a set, so compare the per-row key sets.
+                assert torch.equal(buffers[0][0].sort(dim=1).values,buffers[1][0].sort(dim=1).values)
                 assert torch.equal(buffers[0][2],buffers[1][2])
                 # Independent oracle: position order first, then stable descending score.
                 sc=torch.cat(scores,dim=1);pos=torch.cat(positions,dim=1)
@@ -72,7 +74,7 @@ def main():
                 expected=expected.sort(dim=1).values
                 expected[expected==limit]=-1
                 assert torch.equal(buffers[1][2].long(),expected), (k,rows,width,cycle)
-                checks.append({'cycle':cycle,'carry_exact':True,'output_exact':True,'oracle_exact':True})
+                checks.append({'cycle':cycle,'carry_set_exact':True,'output_exact':True,'oracle_exact':True})
             for score in scores: score.normal_();score.copy_(score.bfloat16().float())
             timings=[[],[]]
             for repeat in range(6):
