@@ -699,3 +699,18 @@ def test_base_worktree_fetches_local_only_submodule_pins(tmp_path, monkeypatch):
     # The upstream URL is restored for the lock checks.
     assert git('config', 'submodule.third_party/sub.url', cwd=base) == str(upstream)
     assert git('remote', 'get-url', 'origin', cwd=base / 'third_party/sub') == str(upstream)
+
+
+def test_failing_subtests_are_named_so_counts_match():
+    text = (
+        "FAILED scripts/tests/test_a.py::test_one - AssertionError\n"
+        "SUBFAILED(override=\"'CONCURRENCY=17'\") scripts/tests/test_b.py::T::test_two - AssertionError: x(1)\n"
+        "SUBFAILED(override=\"'CONCURRENCY=64'\") scripts/tests/test_b.py::T::test_two\n"
+        "ERROR scripts/tests/test_c.py::test_three\n"
+        "3 failed, 1 error, 10 passed in 1.00s\n")
+    assert gate.pytest_failing(text) == [
+        "scripts/tests/test_a.py::test_one",
+        "scripts/tests/test_b.py::T::test_two (override=\"'CONCURRENCY=17'\")",
+        "scripts/tests/test_b.py::T::test_two (override=\"'CONCURRENCY=64'\")",
+        "scripts/tests/test_c.py::test_three",
+    ]

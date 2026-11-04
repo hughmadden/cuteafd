@@ -108,6 +108,14 @@ CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
 CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
 PYTEST_SUMMARY = re.compile(r'^=*\s*(.*?\b(?:passed|failed|error|errors|no tests ran)\b.*?) in [\d.]+s', re.M)
 PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
+# pytest-subtests prints each failing subtest on its own SUBFAILED(label) line and
+# counts it among the summary's failures; name it by test id and label.
+PYTEST_SUBFAIL = re.compile(r'^SUBFAILED(\(.*?\))? (\S+)', re.M)
+
+
+def pytest_failing(text):
+    return sorted(set(PYTEST_FAIL.findall(text))
+                  | {f'{node} {label}'.rstrip() for label, node in PYTEST_SUBFAIL.findall(text)})
 # Release benches with a bound: (crate, test target, environment).
 BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
@@ -660,7 +668,7 @@ def scripts(source, root, args, env):
     text = test_log.read_text(errors='replace')
     summary = PYTEST_SUMMARY.findall(text)
     counts = {key: int(value) for value, key in re.findall(r'(\d+) (passed|failed|errors?|skipped)', summary[-1] if summary else '')}
-    ids = sorted(set(PYTEST_FAIL.findall(text)))
+    ids = pytest_failing(text)
     result = dict(suite='scripts', exit=code, test_s=round(seconds), log=str(test_log), python=str(python),
                   passed=counts.get('passed', 0), failed=counts.get('failed', 0) + counts.get('error', 0) + counts.get('errors', 0),
                   skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None,
