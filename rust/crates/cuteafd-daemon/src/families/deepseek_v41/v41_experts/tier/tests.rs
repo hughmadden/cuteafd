@@ -421,6 +421,65 @@ fn startup_check_on_a_gpu_refuses_a_corrupted_table() -> Result<()> {
     Ok(())
 }
 
+/// As much of the tier's serving start-up as one GPU allows: the planner's
+/// tier (two experts per layer, two SM89 cards, four Sparks) is what the
+/// loader charges each GPU; both GPUs' halves (here on one GPU) load at those
+/// bytes in slot order and make the tier's owner weights; a lane's tables
+/// and slots are the planned lane bytes; and the startup check passes on
+/// every layer between a tiered link planner and the lane's uploaded tables.
+#[test]
+#[ignore = "requires CUTEAFD_NATIVE_LIB (V4.1 TP2 expert exports and cuteafd_v41_tier_slots) and one CUDA GPU"]
+fn tier_start_up_on_one_gpu_loads_the_planned_halves_and_checks_both_views() -> Result<()> {
+    use super::super::coordinator::coordinator_routes;
+    // SAFETY: the operator-selected native library outlives every owner below.
+    let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    lib.cuda_set_device(0)?;
+    let device = Device { library: &lib, id: 0 };
+    let (_dir, catalog) = expert_fixture()?;
+    let tier = planned_tier(catalog.snapshot(), 2)?;
+    for (layer, ids) in tier.resident.iter().enumerate() {
+        for &id in ids {
+            pattern_expert(&catalog, V41ExpertSelection::BackboneFull { layer, expert: usize::from(id) },
+                layer * 384 + usize::from(id))?;
+        }
+    }
+    let charged = resident_bytes(&lib, &catalog, &tier.resident)?;
+    ensure!((0..2).all(|rank| charged[rank] as u64 == tier.resident_bytes[rank]),
+        "the loader charges {charged:?} B, the planner {:?}", tier.resident_bytes);
+    let started = std::time::Instant::now();
+    let residency = Arc::new(TierResidency::new(384, tier.resident.clone())?);
+    let halves = [0usize, 1].map(|rank| -> Result<RankHalves<'_>> {
+        let mut half = device.own(|| Ok(Vec::new()))?;
+        for (layer, ids) in tier.resident.iter().enumerate().filter(|(_, ids)| !ids.is_empty()) {
+            let ids = ids.iter().map(|&id| usize::from(id)).collect::<Vec<_>>();
+            let loaded = device.run(|| ExpertWeights::load_resident(&lib, &catalog,
+                ExpertLayer::BackboneTp2 { layer, rank }, &ids, 8 << 30))?;
+            half.push((layer, loaded));
+        }
+        let bytes = half.iter().map(|(_, weights)| weights.budget().resident_bytes).sum::<usize>();
+        ensure!(bytes == charged[rank], "half {rank}: {bytes} B loaded, {} B charged", charged[rank]);
+        Ok(half)
+    });
+    let [left, right] = halves;
+    let halves = TierHalves::new(residency.clone(), [left?, right?], 2752)?;
+    eprintln!("tier halves: {} experts over {} layers, {:?} B, loaded in {:.0} ms", residency.total(),
+        residency.resident_layers().len(), charged, started.elapsed().as_secs_f64() * 1e3);
+    let lane = TierLane::new(halves.residency.clone(), [device, device], 64)?;
+    ensure!(TierLane::table_bytes(&residency, 64) as u64
+        == cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(40, 384, 64));
+    let planner = tiered_planner(&residency)?;
+    let probe = probe_ids(384);
+    let started = std::time::Instant::now();
+    for layer in 0..40usize {
+        let host = coordinator_routes(&planner, layer as u32, &probe)?;
+        for (gpu, slots) in lane.probe_slots(layer, &probe)?.iter().enumerate() {
+            check_views(&residency, layer, gpu as i32, &probe, &host, slots)?;
+        }
+    }
+    eprintln!("startup check, 40 layers on both tables: {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    Ok(())
+}
+
 /// BF16 bits of `value`, round to nearest even (`__float2bfloat16_rn`).
 fn bf16(value: f32) -> u16 {
     let bits = value.to_bits();
