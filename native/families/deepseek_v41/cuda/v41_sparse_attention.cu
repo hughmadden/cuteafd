@@ -46,6 +46,19 @@ __device__ __forceinline__ uint64_t packed_fp4_quad(uint16_t input,uint8_t scale
   return result;
 #endif
 }
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+// The portable FP8 decode of attend's per-key loop, four values at a time.
+__device__ __forceinline__ uint64_t packed_fp8_quad(uint32_t bytes,uint8_t exponent) {
+  const float scale=exponent==0?0x1p-127f:__uint_as_float(uint32_t(exponent)<<23);
+  uint64_t packed=0;
+#pragma unroll
+  for(int j=0;j<4;++j) {
+    __nv_fp8_e4m3 f;f.__x=uint8_t(bytes>>(j*8));
+    packed|=uint64_t(__bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(float(f),scale))))<<(j*16);
+  }
+  return packed;
+}
+#endif
 // Pad shared rows to distribute WMMA traffic across memory banks.
 constexpr int kKvStride=520, kOutputStride=516, kProbabilityStride=80;
 constexpr int kKvBytes=64*kKvStride*2, kOutputBytes=16*kOutputStride*4;
@@ -55,6 +68,16 @@ constexpr int kScoreBytes=16*64*4;
 constexpr int kGroupedSharedBytes=kKvBytes+2*kScoreBytes+2*192+512;
 constexpr int kFourSharedBytes=kKvBytes+4*kScoreBytes+4*192+512;
 static_assert(2*kOutputBytes<=kKvBytes, "retired KV must fit two output groups");
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+// SM89 shared-tile blocks stage their queries through shared memory in
+// 128-dimension chunks (padded rows keep ldmatrix conflict-free): sixteen
+// warps loading fragments straight from global memory touch eight lines per
+// load. The stage aliases the scores, which are written after the last chunk.
+constexpr int kQueryChunk=128,kQueryStride=kQueryChunk+8;
+template<int Groups> constexpr int kQueryStageBytes=Groups*16*kQueryStride*2;
+template<int Groups> constexpr int kTileScoreBytes=
+    Groups*kScoreBytes>kQueryStageBytes<Groups>?Groups*kScoreBytes:kQueryStageBytes<Groups>;
+#endif
 
 __device__ float warp_max(float x) {
   for(int n=16;n;n>>=1)x=fmaxf(x,__shfl_xor_sync(0xffffffffu,x,n));
@@ -100,7 +123,9 @@ __global__ __launch_bounds__(128*Groups,1) void attend(const __nv_bfloat16* quer
   }
   static_assert(Groups==1 || Groups==2 || Groups==4);
   static_assert((Heads==32 || Heads==64) && Groups*16<=Heads);
+#ifndef CUTEAFD_V41_ATTENTION_SM89
   static_assert(!Split || Groups==1);
+#endif
   // Each 128-thread group owns 16 heads; all groups share one decoded KV tile.
   const int subgroup=Groups==1?0:threadIdx.x/128;
   const int row=blockIdx.x,group=blockIdx.y*Groups+subgroup;
@@ -133,13 +158,30 @@ __global__ __launch_bounds__(128*Groups,1) void attend(const __nv_bfloat16* quer
   auto* scratch=reinterpret_cast<float*>(memory+kKvBytes+(Groups==1?0:subgroup*kScoreBytes));
   // Scores, accumulator rescaling and PV probabilities have disjoint lifetimes.
   auto* probability=reinterpret_cast<__nv_bfloat16*>(scratch);
-  auto* maximum=reinterpret_cast<float*>(memory+kKvBytes+(Groups==1?kOutputBytes:Groups*kScoreBytes+subgroup*192));
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+  constexpr int score_region=Split && Groups>1?kTileScoreBytes<Groups>:Groups*kScoreBytes;
+#else
+  constexpr int score_region=Groups*kScoreBytes;
+#endif
+  auto* maximum=reinterpret_cast<float*>(memory+kKvBytes+(Groups==1?kOutputBytes:score_region+subgroup*192));
   float* sum=maximum+16;float* rescale=sum+16;
   if(tid<16){maximum[tid]=-1e30f;sum[tid]=0;}
   wmma::fragment<wmma::accumulator,16,16,16,float> acc[8];
 #pragma unroll
   for(int t=0;t<8;++t)wmma::fill_fragment(acc[t],0.0f);
-  auto* refs=reinterpret_cast<uint64_t*>(memory+kKvBytes+(Groups==1?kOutputBytes+192:Groups*kScoreBytes+Groups*192));
+  auto* refs=reinterpret_cast<uint64_t*>(memory+kKvBytes+(Groups==1?kOutputBytes+192:score_region+Groups*192));
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+  // Batched descriptors live in global memory: read the eight plane pointers
+  // once instead of once per staged value. Aligned planes take whole-row loads.
+  __shared__ const uint8_t* planes[8];
+  if(global_tid<8)planes[global_tid]=global_tid<4?v.values[global_tid]:v.scales[global_tid-4];
+  const bool row_loads=((reinterpret_cast<uintptr_t>(v.values[0])|reinterpret_cast<uintptr_t>(v.values[1])|
+      reinterpret_cast<uintptr_t>(v.values[2])|reinterpret_cast<uintptr_t>(v.values[3]))&15)==0;
+  auto* query_stage=reinterpret_cast<__nv_bfloat16*>(memory+kKvBytes);
+  // Each thread stages two 16-byte pieces of the block's 16*Groups query rows.
+  const uint64_t query_base=(uint64_t(row)*Heads+blockIdx.y*Groups*16)*512;
+  uint4 query_next[2];
+#endif
   const int count=width+(v.compressed?512:0);
   // The first valid tile starts from zero accumulators; no rescale is needed.
   bool empty=true;
@@ -153,6 +195,60 @@ __global__ __launch_bounds__(128*Groups,1) void attend(const __nv_bfloat16* quer
     // online-softmax state and accumulators unchanged. Vote over the same
     // resolved references used below; valid entries may occur after empty tiles.
     if(!__syncthreads_or(global_tid<64 && refs[global_tid]!=UINT64_MAX))continue;
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+    if constexpr(Split && Groups>1) {
+#pragma unroll
+      for(int j=0;j<2;++j) {
+        const int piece=global_tid+j*128*Groups;
+        query_next[j]=__ldg(reinterpret_cast<const uint4*>(query+query_base+(piece/16)*512+(piece%16)*8));
+      }
+    }
+    if(row_loads) {
+      // One warp per key; lane l stages dims [16l,16l+16) from one 16-byte
+      // FP8 or 8-byte FP4 load and one scale byte. A warp issues every load
+      // of a batch before decoding, so it waits on memory once per batch.
+      constexpr int warps=4*Groups,kGatherBatch=4;
+      for(int first=global_tid/32;first<64;first+=warps*kGatherBatch) {
+        uint4 raw[kGatherBatch];uint8_t scale[kGatherBatch];bool fp4[kGatherBatch];
+#pragma unroll
+        for(int b=0;b<kGatherBatch;++b) {
+          const int key=first+b*warps;
+          const uint64_t ref=key<64?refs[key]:UINT64_MAX;
+          raw[b]=make_uint4(0,0,0,0);scale[b]=0;fp4[b]=false;
+          if(ref!=UINT64_MAX) {
+            const int tag=ref>>62;const uint64_t physical=ref&((1ull<<62)-1);
+            fp4[b]=SourceFP4 && tag>=2;
+            if(fp4[b]) {
+              const uint2 w=__ldg(reinterpret_cast<const uint2*>(planes[tag]+physical*256)+lane);
+              raw[b].x=w.x;raw[b].y=w.y;
+              scale[b]=__ldg(planes[4+tag]+physical*32+lane);
+            } else {
+              raw[b]=__ldg(reinterpret_cast<const uint4*>(planes[tag]+physical*512)+lane);
+              scale[b]=__ldg(planes[4+tag]+physical*16+lane/2);
+            }
+          }
+        }
+#pragma unroll
+        for(int b=0;b<kGatherBatch;++b) {
+          const int key=first+b*warps;
+          if(key>=64)continue;
+          uint64_t q[4]={0,0,0,0};
+          if(refs[key]!=UINT64_MAX) {
+            if(fp4[b]) {
+              q[0]=packed_fp4_quad(uint16_t(raw[b].x),scale[b]);q[1]=packed_fp4_quad(uint16_t(raw[b].x>>16),scale[b]);
+              q[2]=packed_fp4_quad(uint16_t(raw[b].y),scale[b]);q[3]=packed_fp4_quad(uint16_t(raw[b].y>>16),scale[b]);
+            } else {
+              q[0]=packed_fp8_quad(raw[b].x,scale[b]);q[1]=packed_fp8_quad(raw[b].y,scale[b]);
+              q[2]=packed_fp8_quad(raw[b].z,scale[b]);q[3]=packed_fp8_quad(raw[b].w,scale[b]);
+            }
+          }
+          auto* row_out=reinterpret_cast<uint4*>(kv+key*kKvStride+16*lane);
+          row_out[0]=make_uint4(uint32_t(q[0]),uint32_t(q[0]>>32),uint32_t(q[1]),uint32_t(q[1]>>32));
+          row_out[1]=make_uint4(uint32_t(q[2]),uint32_t(q[2]>>32),uint32_t(q[3]),uint32_t(q[3]>>32));
+        }
+      }
+    } else
+#endif
     // A warp stages four contiguous FP8 values per lane, reusing each
     // resolved key pointer. Preserve unaligned byte-addressed ABI inputs.
     for(int key=global_tid/32;key<64;key+=4*Groups) {
@@ -197,6 +293,37 @@ __global__ __launch_bounds__(128*Groups,1) void attend(const __nv_bfloat16* quer
     }
     __syncthreads();
     // Each warp computes one 16-key score tile in the original K order.
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+    if constexpr(Split && Groups>1) {
+      wmma::fragment<wmma::accumulator,16,16,16,float> scores;
+      wmma::fill_fragment(scores,0.0f);
+      for(int chunk=0;chunk<512/kQueryChunk;++chunk) {
+#pragma unroll
+        for(int j=0;j<2;++j) {
+          const int piece=global_tid+j*128*Groups;
+          *reinterpret_cast<uint4*>(query_stage+(piece/16)*kQueryStride+(piece%16)*8)=query_next[j];
+        }
+        __syncthreads();
+        if(chunk+1<512/kQueryChunk) {
+#pragma unroll
+          for(int j=0;j<2;++j) {
+            const int piece=global_tid+j*128*Groups;
+            query_next[j]=__ldg(reinterpret_cast<const uint4*>(
+                query+query_base+(piece/16)*512+(chunk+1)*kQueryChunk+(piece%16)*8));
+          }
+        }
+        for(int k=0;k<kQueryChunk;k+=16) {
+          wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> a;
+          wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::col_major> b;
+          wmma::load_matrix_sync(a,query_stage+subgroup*16*kQueryStride+k,kQueryStride);
+          wmma::load_matrix_sync(b,kv+warp*16*kKvStride+chunk*kQueryChunk+k,kKvStride);
+          wmma::mma_sync(scores,a,b,scores);
+        }
+        __syncthreads();
+      }
+      wmma::store_matrix_sync(scratch+warp*16,scores,64,wmma::mem_row_major);
+    } else
+#endif
     {
       wmma::fragment<wmma::accumulator,16,16,16,float> scores;
       wmma::fill_fragment(scores,0.0f);
@@ -273,10 +400,18 @@ __global__ __launch_bounds__(128*Groups,1) void attend(const __nv_bfloat16* quer
       if(active) {
 #pragma unroll
         for(int t=0;t<8;++t)wmma::store_matrix_sync(final_output+warp*128+t*16,acc[t],kOutputStride,wmma::mem_row_major);
-        if(tid<16)sum[tid]+=expf(sink[group*16+tid]-maximum[tid]);
+        if constexpr(Split) {
+          if(tid<16) {
+            partial[partial_base+tid*514+512]=maximum[tid];
+            partial[partial_base+tid*514+513]=sum[tid];
+          }
+        } else if(tid<16)sum[tid]+=expf(sink[group*16+tid]-maximum[tid]);
       }
       __syncthreads();
-      if(active)for(int i=tid;i<16*512;i+=128)
+      if constexpr(Split) {
+        if(active)for(int i=tid;i<16*512;i+=128)
+          partial[partial_base+(i/512)*514+i%512]=final_output[(i/512)*kOutputStride+i%512];
+      } else if(active)for(int i=tid;i<16*512;i+=128)
         output[base+i]=__float2bfloat16_rn(final_output[(i/512)*kOutputStride+i%512]/sum[i/512]);
       __syncthreads();
     }
@@ -333,9 +468,44 @@ bool disjoint(const void* a,uint64_t n,const void* b,uint64_t m) {
   const auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);return x+n<=y||y+m<=x;
 }
 }
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+// SM89 fits one ~98 KB 16-head block per SM, so a 16-head split launch runs
+// in waves of one four-warp block. Once those blocks overflow one wave, one
+// block per (row, part) decodes the KV tile once for every local head group
+// (Heads/16 groups of four warps). Each head's arithmetic, tile order and
+// partial layout are unchanged, so both launches match bit for bit.
+template<int Heads> constexpr int kSharedTileBytes=kKvBytes+kTileScoreBytes<Heads/16>+Heads/16*192+512;
+template<int Heads> static bool shared_tile(int32_t rows,int parts) {
+  int device=0,sms=0;
+  if(cudaGetDevice(&device)!=cudaSuccess ||
+     cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess)return true;
+  return int64_t(rows)*(Heads/16)*parts>sms;
+}
+template<bool FP4,bool Batched,int Heads> static int32_t launch_shared_tile(const uint16_t* query,
+    const float* sink,const uint64_t* metadata,const int32_t* selected,uint16_t* output,int32_t rows,
+    int32_t window_width,const cuteafd_v41_sparse_kv_t& v,void* stream,float* partial,int parts,
+    const uint64_t* window_begins,const cuteafd_v41_sparse_kv_t* views) {
+  attend<true,Heads/16,FP4,Batched,Heads><<<dim3(rows,1,parts),8*Heads,kSharedTileBytes<Heads>,
+      reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const __nv_bfloat16*>(query),sink,
+      metadata,selected,reinterpret_cast<__nv_bfloat16*>(output),window_width,v,partial,window_begins,views);
+  const auto status=cudaGetLastError();
+  if(status!=cudaSuccess)return status;
+  merge<Heads><<<dim3(rows,Heads),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+    partial,sink,reinterpret_cast<__nv_bfloat16*>(output),parts);
+  return cudaGetLastError();
+}
+#endif
 template<bool FP4,int Heads=64> static int32_t initialize_format() {
   const auto status=cudaFuncSetAttribute(attend<false,1,FP4,false,Heads>,cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedBytes);
   if(status!=cudaSuccess)return status;
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+  const auto tile=cudaFuncSetAttribute(attend<true,Heads/16,FP4,false,Heads>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedTileBytes<Heads>);
+  if(tile!=cudaSuccess)return tile;
+  const auto tile_batch=cudaFuncSetAttribute(attend<true,Heads/16,FP4,true,Heads>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedTileBytes<Heads>);
+  if(tile_batch!=cudaSuccess)return tile_batch;
+#endif
   const auto split=cudaFuncSetAttribute(attend<true,1,FP4,false,Heads>,cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedBytes);
   if(split!=cudaSuccess)return split;
   const auto batch=cudaFuncSetAttribute(attend<true,1,FP4,true,Heads>,cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedBytes);
@@ -358,6 +528,10 @@ template<bool FP4,int Heads=64> static int32_t dispatch_attention(const uint16_t
     int32_t window_width,const cuteafd_v41_sparse_kv_t& v,void* stream,float* partial,
     int parts,const uint64_t* window_begins) {
   if(partial) {
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+    if(shared_tile<Heads>(rows,parts))return launch_shared_tile<FP4,false,Heads>(query,sink,metadata,selected,
+        output,rows,window_width,v,stream,partial,parts,window_begins,nullptr);
+#endif
     attend<true,1,FP4,false,Heads><<<dim3(rows,Heads/16,parts),128,kSharedBytes,reinterpret_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<const __nv_bfloat16*>(query),sink,metadata,selected,
       reinterpret_cast<__nv_bfloat16*>(output),window_width,v,partial,window_begins);
@@ -519,6 +693,10 @@ template<bool FP4,int Heads> static int32_t dispatch_batch(const uint16_t* query
     const cuteafd_v41_sparse_kv_t* views,void* stream,const uint64_t* begins,
     float* partial,int32_t parts) {
   cuteafd_v41_sparse_kv_t unused{};
+#ifdef CUTEAFD_V41_ATTENTION_SM89
+  if(shared_tile<Heads>(rows,parts))return launch_shared_tile<FP4,true,Heads>(query,sink,metadata,selected,
+      output,rows,0,unused,stream,partial,parts,begins,views);
+#endif
   attend<true,1,FP4,true,Heads><<<dim3(rows,Heads/16,parts),128,kSharedBytes,reinterpret_cast<cudaStream_t>(stream)>>>(
     reinterpret_cast<const __nv_bfloat16*>(query),sink,metadata,selected,
     reinterpret_cast<__nv_bfloat16*>(output),0,unused,partial,begins,views);
