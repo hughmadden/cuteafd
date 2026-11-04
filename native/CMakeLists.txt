@@ -454,6 +454,12 @@ if(CUTEAFD_ENABLE_CUDA)
   if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
     set_source_files_properties(families/deepseek_v41/cuda/v41_sparse_attention.cu PROPERTIES
       COMPILE_DEFINITIONS CUTEAFD_V41_ATTENTION_SM89=1)
+    # V4.1 index top-k defaults to the radix select on SM89, bit-identical to
+    # the sort-and-merge path and measured on SM89. SM120 and SM121 keep the
+    # merge default until it is measured there; CUTEAFD_V41_INDEX_TOPK=radix
+    # or =merge overrides either default at run time.
+    set_source_files_properties(families/deepseek_v41/cuda/v41_index_topk.cu PROPERTIES
+      COMPILE_DEFINITIONS CUTEAFD_V41_INDEX_TOPK_RADIX=1)
   endif()
   # SM120 builds use the family-specific target (sm_120f); every live AOT
   # export and hand kernel is qualified with it.
@@ -784,6 +790,16 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE CUDA::cudart CUDA::cublas)
   add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
   set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  # V4.1 index top-k: the radix-select and merge paths against an exact CPU
+  # oracle and each other. It includes the kernel source (both paths in one
+  # process), so it does not link the library; --time adds per-call times.
+  add_executable(cuteafd_v41_index_topk_selftest tests/v41_index_topk_selftest.cu)
+  set_target_properties(cuteafd_v41_index_topk_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_include_directories(cuteafd_v41_index_topk_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+  target_link_libraries(cuteafd_v41_index_topk_selftest PRIVATE CUDA::cudart)
+  add_test(NAME cuteafd_v41_index_topk_selftest COMMAND cuteafd_v41_index_topk_selftest)
+  set_tests_properties(cuteafd_v41_index_topk_selftest PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
   # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with
