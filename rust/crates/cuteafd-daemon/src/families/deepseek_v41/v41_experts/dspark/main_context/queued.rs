@@ -42,6 +42,11 @@ impl DsparkMainContext<'_, '_> {
         ensure!(self.pending_writes.is_some(), "main-context commit not pending");
         unsafe { self.stream.library.cuda_stream_query(self.stream.raw) }
     }
+    /// poll_commit for a caller that blocks until the commit drains.
+    pub fn wait_commit(&self) -> Result<()> {
+        ensure!(self.pending_writes.is_some(), "main-context commit not pending");
+        self.synchronize()
+    }
     pub fn publish_commit(&mut self, windows: &mut [DsparkWindow<'_>; 3]) -> Result<()> {
         ensure!(self.poll_commit()?, "main-context commit has not completed");
         self.timing.publish_completed()?;
