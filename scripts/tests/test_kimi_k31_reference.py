@@ -19,6 +19,51 @@ def config(topk=2):
         linear_attn_config=dict(full_attn_layers=[2]), _attn_implementation="eager")
 
 
+def memory_config():
+    return types.SimpleNamespace(hidden_size=7168, num_attention_heads=96,
+        num_hidden_layers=93, attn_res_block_size=12, q_lora_rank=1536,
+        kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        dsa_config=dict(index_num_heads=32, index_head_dim=128, index_topk=2048),
+        linear_attn_config=dict(num_heads=96, head_dim=128),
+        num_experts=896, num_experts_per_token=16, routed_expert_hidden_size=3584,
+        moe_intermediate_size=3072, intermediate_size=33792)
+
+
+def test_k31_live_memory_bounds_tiled_scores_history_and_routed_combine():
+    c = memory_config()
+    small = k31.execution_memory(c, 128, 0)
+    large = k31.execution_memory(c, 15915, 92)
+    assert large['margin'] == 4 * 2**30
+    assert large['residual'] == 4 * 15915 * 7168 * (5 * 9 + 6)
+    assert large['peak'] == large['residual'] + max(large[k] for k in ('attention', 'kda', 'moe', 'dense'))
+    assert large['attention'] > 4 * 128 * 16000 * (3 * 96 + 3 * 32)
+    assert large['moe'] > 4 * 15915 * 16 * 3584 * 5
+    assert small['peak'] < large['peak'] < 64 * 2**30
+    assert k31.execution_memory(c, 15915, 0)['residual'] < large['residual']
+    for length in (0, -1):
+        with pytest.raises(ValueError, match='memory geometry'):
+            k31.execution_memory(c, length, 0)
+
+
+def test_layer_admission_reclaims_gb10_cache_without_cuda_free_gate(tmp_path, monkeypatch):
+    from families.kimi_k3 import golden
+    import allocatable_memory
+    import fidelity_windows
+    info = tmp_path / 'meminfo'
+    info.write_text('MemFree: 1048576 kB\nMemAvailable: 117440512 kB\n')
+    cuda = types.SimpleNamespace(synchronize=lambda: None, current_device=lambda: 0,
+        get_device_properties=lambda _: types.SimpleNamespace(is_integrated=True, total_memory=119 * 2**30),
+        mem_get_info=lambda *a: (_ for _ in ()).throw(AssertionError('UMA must not gate on CUDA free')))
+    monkeypatch.setattr(fidelity_windows, 'cuda_allocatable_memory_info',
+        lambda actual: allocatable_memory.cuda_allocatable_memory_info(actual, meminfo=info))
+    golden.admit_layer_memory(cuda, memory_config(), 92, 17 * 2**30, 2**26, 15915)
+    # The unchanged K3 64-GiB reserve uses the same reclaim-aware admission.
+    golden.admit_layer_memory(cuda, types.SimpleNamespace(), 0, 17 * 2**30, 2**26, 15915)
+    info.write_text('MemFree: 1048576 kB\nMemAvailable: 2097152 kB\n')
+    with pytest.raises(RuntimeError, match='admission failed'):
+        golden.admit_layer_memory(cuda, memory_config(), 92, 17 * 2**30, 2**26, 15915)
+
+
 def tiny_reference(torch):
     class RMSNorm(torch.nn.Module):
         def __init__(self, size, eps=1e-6):

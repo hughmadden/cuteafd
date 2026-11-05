@@ -19,8 +19,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_windows import (canonical, finish_golden, load_set, verify_snapshot,
-                              write_scored_logits)
+from fidelity_windows import (admit_reference_memory, canonical, finish_golden, load_set,
+                              verify_snapshot, write_scored_logits)
 from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_official,
                                     package_source_identity, source_identity)
 
@@ -152,7 +152,20 @@ class LayerState:
             shutil.rmtree(self.root / ("layer%03d" % previous["layer"]))
 
 
-def native_layer(reference, config, weights, index):
+def admit_layer_memory(cuda, config, index, required, largest, max_length):
+    if getattr(config, "dsa_config", None) is not None:
+        from families.kimi_k3.k31 import execution_memory
+        buffers = execution_memory(config, max_length, index)
+        print("K3.1 live-buffer admission: " + json.dumps(buffers, sort_keys=True), flush=True)
+        admit_reference_memory(cuda, required + largest * 5 + buffers["peak"],
+                               margin_bytes=buffers["margin"])
+    else:
+        # Preserve K3's established reserve, but allow GB10 to reclaim file cache.
+        admit_reference_memory(cuda, required + largest * 5 + 64 * 1024 ** 3,
+                               margin_bytes=0)
+
+
+def native_layer(reference, config, weights, index, *, max_length=16384):
     import torch
     with torch.device("meta"):
         layer = reference.KimiDecoderLayer(config, index)
@@ -170,10 +183,7 @@ def native_layer(reference, config, weights, index):
                 largest = max(largest, parameter.numel() * 4)
             else:
                 required += parameter.numel() * 4
-        free, _ = torch.cuda.mem_get_info()
-        # Admission covers all 16K-window state/combine/KDA buffers plus slack.
-        if required + largest * 5 + 64 * 1024 ** 3 > free:
-            raise ValueError("packed layer plus strict F32 execution reserve does not fit")
+        admit_layer_memory(torch.cuda, config, index, required, largest, max_length)
         return weights.load_module(layer, prefix, stream_experts=True)
     required = 0
     for name, parameter in layer.named_parameters():
@@ -186,9 +196,7 @@ def native_layer(reference, config, weights, index):
             required += parameter.numel() * sizes[descriptor["dtype"]]
         else:
             required += parameter.numel() * 2
-    free, _ = torch.cuda.mem_get_info()
-    if required + 16 * 1024 ** 3 > free:
-        raise ValueError("native layer plus 16 GiB execution reserve does not fit")
+    admit_reference_memory(torch.cuda, required + 16 * 1024 ** 3, margin_bytes=0)
     return weights.load_module(layer, prefix)
 
 
@@ -333,7 +341,8 @@ def execute(a):
         print(f"resume after layer {state.latest['layer']}; {len(windows)} streams", flush=True)
         for index in range(state.latest["layer"] + 1, config.num_hidden_layers if stop is None else stop + 1):
             tick = time.monotonic()
-            layer = native_layer(reference, config, weights, index)
+            layer = native_layer(reference, config, weights, index,
+                                 max_length=max(len(window["tokens"]) for window in windows))
             pending = state.begin(index)
             short_outputs = {}
             for window in windows:

@@ -81,6 +81,48 @@ def expected_source_identity(runtime_digests):
             **{name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}}
 
 
+def execution_memory(config, length, layer_index):
+    """Conservative F32 live buffers for one cache-free stream, excluding weights."""
+    if type(length) is not int or length <= 0 or not 0 <= layer_index < config.num_hidden_layers:
+        raise ValueError("invalid K3.1 reference memory geometry")
+    rows, word = 128, 4
+    extent = ((length + rows - 1) // rows) * rows
+    heads, hidden = config.num_attention_heads, config.hidden_size
+    blocks = (layer_index + config.attn_res_block_size) // config.attn_res_block_size
+    # Loaded history, appended history, cat/norm/product temporaries in _apply_attn_res.
+    residual = word * length * hidden * (5 * (blocks + 1) + 6)
+    dsa = config.dsa_config
+    # Full MLA Q/K/V, latent/index projections, accumulated tile outputs and output gate.
+    projections = word * length * (config.q_lora_rank + 2 * config.kv_lora_rank
+        + config.qk_rope_head_dim + heads * (config.qk_nope_head_dim
+        + config.qk_rope_head_dim + config.qk_nope_head_dim + config.v_head_dim)
+        + dsa["index_num_heads"] * dsa["index_head_dim"] + dsa["index_head_dim"]
+        + dsa["index_num_heads"] + 4 * heads * config.v_head_dim)
+    # No selected-KV gather: dense masked eager consumes padded K/V. Index score
+    # products/ReLU and attention scores/softmax use fixed 128-row tiles, not L^2.
+    tiles = word * rows * extent * (3 * heads + 3 * dsa["index_num_heads"] + 12)
+    padded_kv = word * extent * heads * (config.qk_nope_head_dim
+        + config.qk_rope_head_dim + config.v_head_dim)
+    selected = rows * dsa["index_topk"] * (2 * 8 + word)
+    attention = projections + tiles + padded_kv + selected
+    linear = config.linear_attn_config
+    kh, kd = linear["num_heads"], linear["head_dim"]
+    # Q/K/V+conv, gates, normalized Q/K, FLA W/U/output and triangular scratch;
+    # FLA stores one D-by-D recurrent state per 64-token chunk plus final state.
+    chunks = (length + 63) // 64
+    kda = word * (18 * length * kh * kd + (chunks + 1) * kh * kd * kd
+                  + 4 * length * kh * 64)
+    # sorted tokens, expert-output list, cat, inverse permutation and weighted combine.
+    routed = word * length * config.num_experts_per_token * config.routed_expert_hidden_size * 5
+    routing = length * config.num_experts * (8 + 3 * word)
+    expert = word * length * (6 * config.moe_intermediate_size + 6 * hidden)
+    dense = word * length * (6 * config.intermediate_size + 6 * hidden)
+    stages = {"attention": attention, "kda": kda, "moe": routed + routing + expert,
+              "dense": dense}
+    return {"residual": residual, **stages, "peak": residual + max(stages.values()),
+            "margin": 4 * 2**30}
+
+
 def validate_config(config):
     dsa = config.dsa_config
     if (not isinstance(dsa, dict) or dsa.get("index_rope_dim") != 0
