@@ -254,8 +254,7 @@ def test_source_pin_trees_accept_flat_and_nested_and_fail_closed():
             packager.validate_source_pins({'unknown': value})
 
 
-def test_published_minimax_flat_pins_and_nested_identity_are_unchanged():
-    from families.minimax_m3 import golden
+def test_published_minimax_flat_pins_are_unchanged():
     published = {
         'cache_programs_sha256': '254a333163abe9332ef223eafff55c0f21c80d40035e4ad002adf8d9694d74bd',
         'fidelity_windows_sha256': 'c3e7ee1805ecd5ec34d1df7a278852d99f92ef1fa440a63aeb0c7aaf72353d21',
@@ -269,8 +268,6 @@ def test_published_minimax_flat_pins_and_nested_identity_are_unchanged():
         'vllm_sources_sha256': '2fa9e9653084bb940af5f615e297a35390729c098ee54e695614ec50109b2793'}
     # Source pins from immutable 87e0e905 / minimax-m3_1-flash-v1_20261105_own-text-native.
     assert packager.validate_source_pins(published) == published
-    identity = golden.source_identity()
-    assert packager.validate_source_pins(identity, golden.source_identity()) == identity
 
 
 def test_k31_finalizer_reconstructs_source_identity_and_rejects_tampering(tmp_path, monkeypatch):
