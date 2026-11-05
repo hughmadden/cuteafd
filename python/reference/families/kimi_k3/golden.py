@@ -244,13 +244,20 @@ def execute(a):
 
     started = time.monotonic()
     a.out.mkdir(parents=True, exist_ok=True)
-    arithmetic = configure_f32()
+    if getattr(a, "check_only", False):
+        torch.set_default_dtype(torch.float32)
+        arithmetic = None
+    else:
+        arithmetic = configure_f32()
     torch.manual_seed(0)
     manifest = load_set(a.windows)
-    if manifest["family"] != "kimi_k3" or any(w.get("media") for w in manifest["windows"]):
+    if manifest["family"] not in ("kimi_k3", "kimi_k31") or any(w.get("media") for w in manifest["windows"]):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
+    is_k31 = getattr(config, "dsa_config", None) is not None
+    if (manifest["family"] == "kimi_k31") != is_k31:
+        raise ValueError("Kimi panel family differs from checkpoint")
     if stop is not None and not 0 <= stop < config.num_hidden_layers:
         raise ValueError("diagnostic stop layer is outside checkpoint")
     weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
@@ -272,11 +279,18 @@ def execute(a):
         weights.validate_module(module, prefix)
     del outer, module
     print(f"native shape preflight passed; {len(weights.narrowed_a_log)} zero-padded KDA A_log tensors", flush=True)
+    if getattr(a, "check_only", False):
+        return
     pins = {**source_identity(a.snapshot), "fla_source_sha256": package_source_identity(fla),
             "transformers_source_sha256": package_source_identity(transformers),
             "compressed_tensors_source_sha256": package_source_identity(compressed_tensors),
             "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
             "reference_runner_sha256": digest(Path(__file__))}
+    if is_k31:
+        if transformers.__version__ != "4.57.6":
+            raise ValueError("K3.1 oracle requires explicitly installed transformers 4.57.6")
+        pins["indexer_ops_sha256"] = digest(Path(__file__).parents[1] / "mistral_large4/ops.py")
+        pins["shape_invariant_sha256"] = digest(ROOT / "python/reference/shape_invariant.py")
     checking = getattr(a, "_prefix_probe", False)
     if not checking and stop is None:
         a._kimi_probe_state = a.out.parent / (a.out.name + "-prefix-state")
@@ -393,6 +407,9 @@ def execute(a):
         comparison = None
         if checking:
             comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]], state.latest["checks"])
+            if is_k31:
+                comparison["comparison"] = "K3.1 adapter streams with original versus fixed-row shared linears; both DSA arms use the same source-pinned adapter, not independent upstream implementations"
+                atomic_json(a.out / "official-forward.json", comparison)
         else:
             evidence = next(a.out.glob("prefix-gate-*/official-forward.json"), None)
             if evidence is None:
@@ -411,7 +428,7 @@ def execute(a):
                              "kda_a_log_zero_padding": weights.padding_provenance()},
                       official_forward=comparison, arithmetic=arithmetic,
                       expert_storage=binding["expert_storage"],
-                      root_arithmetic={"source": "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32",
+                      root_arithmetic={"source": ("hash-checked official K3 decoder plus isolated K3.1 DSA adapter, cross-checked against pinned vLLM and SGLang; F32 indexer does not emulate serving E4M3/UE8M0 QDQ; original/fixed-row comparison shares the DSA adapter" if is_k31 else "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32"),
                           "arithmetic": "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
                       platform={"capability": list(torch.cuda.get_device_capability()),
                                 "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda})
@@ -422,6 +439,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--check-only", action="store_true", help="CPU checkpoint source/header/shape validation; no golden or device allocation")
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--stop-after-layer", type=int, default=None,
                         help="diagnostic only: retain residual at this zero-based layer; never score or publish")

@@ -338,7 +338,7 @@ class APIClient(TextGenerator):
 
     def rendering_body(self, request):
         rendered = copy.deepcopy(request)
-        if self.family == "kimi_k3" and not (request.get("reasoning_effort")
+        if self.family in ("kimi_k3", "kimi_k31") and not (request.get("reasoning_effort")
                 or (request.get("reasoning") or {}).get("effort")):
             # Official K3 API docs and native template both default to max.
             rendered["reasoning_effort"] = "max"
@@ -396,7 +396,7 @@ class APIClient(TextGenerator):
         return self.result(rendered_body, generated, visible_message, {
             **self.identity, "date": record["date"], "provider": raw.get("provider"),
             "rendered_reasoning": {"template_options": self.renderer.template_options(rendered_body),
-                "source": "documented Kimi K3 provider default max" if self.family == "kimi_k3"
+                "source": "documented Kimi K3 provider default max" if self.family in ("kimi_k3", "kimi_k31")
                     and rendered_body != record["binding"]["request"] else "cached wire request"},
             "response_model": raw.get("model"), "response_id": raw.get("id"),
             "usage": raw.get("usage"), "finish_reason": choice.get("finish_reason"),
