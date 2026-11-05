@@ -209,6 +209,68 @@ def test_new_root_loader_dispatches_without_changing_k3(monkeypatch, tmp_path):
         model.source_identity(tmp_path / ("a" * 40))
 
 
+@pytest.mark.parametrize("drift,allowed", [(1e-7, True), (.01, False)])
+def test_teacher_forced_routes_gate_arithmetic_not_f32_cutoff_ties(tmp_path, drift, allowed):
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+    from shape_invariant import ForcedRouteQualification
+    from families.kimi_k3.golden import official_check
+
+    class Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.eye(2))
+        def forward(self, value):
+            logits = F.linear(value, self.weight)
+            scores = logits.sigmoid()
+            ids = scores.topk(1).indices
+            return ids, scores.gather(1, ids)
+
+    gate = Gate()
+    teacher = ForcedRouteQualification()
+    eager_x = torch.tensor([[drift, 0.]])
+    candidate_x = torch.tensor([[0., drift]])
+    choices = lambda logits: logits.sigmoid()
+    weights = lambda logits, ids: logits.sigmoid().gather(1, ids)
+    original_linear = F.linear
+    with teacher.observe(gate, choices=choices):
+        eager_ids, eager_weights = gate(eager_x)
+    with teacher.observe(gate, choices=choices, weights=weights):
+        forced_ids, forced_weights = gate(candidate_x)
+    assert torch.equal(eager_ids, forced_ids)
+    assert torch.equal(forced_weights, candidate_x.sigmoid().gather(1, eager_ids))
+    assert F.linear is original_linear
+    assert not gate._forward_hooks and not gate._forward_pre_hooks
+    assert teacher.report["selection_flip_tokens"] == 1
+    assert teacher.report["passed"] == allowed
+    assert teacher.report["flips"][0]["eager_only_experts"] == [0]
+    assert teacher.report["flips"][0]["natural_only_experts"] == [1]
+    if allowed:
+        teacher.require_valid()
+        expert_values = torch.tensor([[1., 0.], [0., 1.]])
+        eager = (expert_values[eager_ids] * eager_weights[..., None]).sum(1).detach().numpy()
+        forced = (expert_values[forced_ids] * forced_weights[..., None]).sum(1).detach().numpy()
+        assert official_check(tmp_path, [eager, forced], [])['passed']
+    else:
+        with pytest.raises(ValueError, match="F32 margin"):
+            teacher.require_valid()
+    natural_ids, _ = gate(candidate_x)
+    assert not torch.equal(natural_ids, eager_ids)
+
+
+def test_forced_route_hook_restores_after_failure():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+    from shape_invariant import ForcedRouteQualification
+    gate = torch.nn.Linear(2, 2)
+    original = F.linear
+    with pytest.raises(RuntimeError, match="fixture interruption"):
+        with ForcedRouteQualification().observe(gate, choices=lambda logits: logits):
+            raise RuntimeError("fixture interruption")
+    assert F.linear is original
+    assert not gate._forward_hooks and not gate._forward_pre_hooks
+
+
 def test_ml4_shared_score_reduction_preserves_math():
     torch = pytest.importorskip("torch")
     from families.mistral_large4.ops import indexer_score_reduction

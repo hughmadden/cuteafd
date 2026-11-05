@@ -208,7 +208,7 @@ def official_mask(hidden):
     return mask[None, None]
 
 
-def official_check(out, arrays, per_layer):
+def official_check(out, arrays, per_layer, *, comparison=None):
     import numpy as np
     native, adapted = arrays
     logp = native.astype(np.float64)
@@ -221,7 +221,7 @@ def official_check(out, arrays, per_layer):
     result = {"schema": "cuteafd.kimi.official-forward/1", "tokens": len(native),
               "top1": top1, "kl": kl, "relative_logit_l2": relative,
               "max_abs_logit_difference": float(np.abs(native - adapted).max()),
-              "comparison": "independent native decoder streams; original eager versus fixed-M128 causal tiles; same exact native weights and F32 output head",
+              "comparison": comparison or "independent native decoder streams; original eager versus fixed-M128 causal tiles; same exact native weights and F32 output head",
               "passed": top1 >= .99 and kl <= 1e-4 and relative <= .01,
               "limits": {"top1_min": .99, "kl_max": 1e-4, "relative_logit_l2_max": .01},
               "layers": per_layer}
@@ -308,7 +308,8 @@ def execute(a):
             archive.mkdir(exist_ok=True)
             previous.rename(archive / previous.name)
     # A diagnostic prefix is never passed to qualification or output scoring.
-    proof = qualify(a, manifest, execute) if stop is None else None
+    proof = qualify(a, manifest, execute, route_forcing=is_k31) if stop is None else None
+    forced_routes = checking and getattr(a, "_route_forced_qualification", False)
     windows = copy.deepcopy(manifest["windows"])
     if checking:
         for name in ("official_short", "adapted_short"):
@@ -325,6 +326,8 @@ def execute(a):
                "expert_storage": "GPU packed cache; one F32 matrix resident per native Linear call",
                "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 4 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
+    if forced_routes:
+        binding["qualification_routing"] = "eager IDs; adapted native weights; relative cutoff margin <=1e-5"
     state = LayerState(a._kimi_probe_state if checking else
                        a.out.parent / (a.out.name + "-layer-state"), binding,
                        diagnostic_prefix=stop)
@@ -345,18 +348,37 @@ def execute(a):
                                  max_length=max(len(window["tokens"]) for window in windows))
             pending = state.begin(index)
             short_outputs = {}
+            from contextlib import nullcontext
+            from shape_invariant import ForcedRouteQualification
+            routing = ForcedRouteQualification() if forced_routes and hasattr(layer, "block_sparse_moe") else None
+            gate = layer.block_sparse_moe.gate if routing else None
+            if gate and (gate.moe_router_activation_func != "sigmoid" or gate.num_expert_group != 1):
+                raise ValueError("Kimi forced routing requires ungrouped sigmoid gate")
+
+            def choices(logits):
+                return logits.sigmoid() + gate.e_score_correction_bias.unsqueeze(0)
+
+            def route_weights(logits, ids):
+                values = logits.sigmoid().gather(1, ids)
+                if gate.top_k > 1 and gate.moe_renormalize:
+                    values = values / (values.sum(dim=-1, keepdim=True) + 1e-20)
+                return values * gate.routed_scaling_factor
+
             for window in windows:
                 wid = window["id"]
                 hidden, blocks = state.load(wid, config.hidden_size)
                 original_blocks = blocks.shape[1]
                 if wid == "official_short":
                     mask = None if layer.is_linear_attn else official_mask(hidden)
-                    result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
-                                            use_cache=False, output_attentions=False)
-                else:
-                    with geometry(reference):
-                        result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                    with routing.observe(gate, choices=choices) if routing else nullcontext():
+                        result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
                                                 use_cache=False, output_attentions=False)
+                else:
+                    forced = routing and wid == "adapted_short"
+                    with geometry(reference):
+                        with routing.observe(gate, choices=choices, weights=route_weights) if forced else nullcontext():
+                            result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                                                    use_cache=False, output_attentions=False)
                 append = index % config.attn_res_block_size == 0
                 if history.shape[1] != original_blocks + int(append):
                     raise ValueError("official block-residual count differs")
@@ -370,7 +392,13 @@ def execute(a):
                 difference = short_outputs["official_short"] - short_outputs["adapted_short"]
                 pending["checks"].append({"layer": index, "max_abs_hidden_difference": difference.abs().max().item(),
                                           "relative_hidden_l2": (difference.norm() /
-                                              short_outputs["official_short"].norm().clamp_min(1e-30)).item()})
+                                              short_outputs["official_short"].norm().clamp_min(1e-30)).item(),
+                                          **({"natural_routing": routing.report} if routing else {})})
+                if routing:
+                    atomic_json(a.out / "route-qualification.json", {
+                        "schema": "cuteafd.reference.forced-routes/1", "layers": pending["checks"],
+                        "forced_ids_only": True, "published_scoring": "unforced fixed-M128"})
+                    routing.require_valid()
             pending["native_fp32_parameters"] = sorted(set(pending["native_fp32_parameters"]) | weights.native_fp32)
             state.commit(pending)
             del layer
@@ -415,10 +443,13 @@ def execute(a):
             del hidden, blocks, selected, logits
         comparison = None
         if checking:
-            comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]], state.latest["checks"])
+            description = None
             if is_k31:
-                comparison["comparison"] = "K3.1 adapter streams with original versus fixed-row shared linears; both DSA arms use the same source-pinned adapter, not independent upstream implementations"
-                atomic_json(a.out / "official-forward.json", comparison)
+                description = ("K3.1 eager versus fixed-M128 arithmetic with teacher-forced eager expert IDs, "
+                               "candidate-native combine weights; natural choice flips/margins reported per layer; "
+                               "both DSA arms share the source-pinned adapter; published scoring remains unforced")
+            comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]],
+                                        state.latest["checks"], comparison=description)
         else:
             evidence = next(a.out.glob("prefix-gate-*/official-forward.json"), None)
             if evidence is None:
