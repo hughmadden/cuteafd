@@ -327,6 +327,60 @@ def test_diagnostic_hooks_are_removed_after_failure():
     assert all(not module._forward_hooks and not module._forward_pre_hooks for module in layer.modules())
 
 
+def test_route_capture_records_actual_logits_choices_and_restores_after_failure():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+    from families.kimi_k3.diagnostic import route_capture, route_comparison
+
+    class Gate(torch.nn.Module):
+        top_k, num_expert_group, moe_router_activation_func = 1, 1, "sigmoid"
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([[1., 0.], [0., 1.]]))
+            self.e_score_correction_bias = torch.zeros(2)
+
+        def forward(self, value):
+            logits = F.linear(value, self.weight)
+            scores = logits.sigmoid() + self.e_score_correction_bias
+            return scores.topk(self.top_k).indices, scores.topk(self.top_k).values
+
+    gate = Gate()
+    original = F.linear
+    with route_capture(gate) as left:
+        gate(torch.tensor([[1., 0.], [0., 1.]]))
+    with route_capture(gate) as right:
+        gate(torch.tensor([[0., 1.], [0., 1.]]))
+    result = route_comparison(gate, left, right)
+    assert result["selection_flip_tokens"] == 1
+    assert result["flips"][0]["token"] == 0
+    assert result["flips"][0]["official_only_experts"] == [0]
+    assert result["flips"][0]["adapted_only_experts"] == [1]
+    assert result["flips"][0]["arms"][0]["cutoff_margin"] > 0
+    assert route_comparison(gate, left, left)["selection_flip_tokens"] == 0
+    assert F.linear is original
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with route_capture(gate):
+            raise RuntimeError("interrupted")
+    assert F.linear is original
+    assert not gate._forward_hooks and not gate._forward_pre_hooks
+    gate.num_expert_group = 2
+    with pytest.raises(ValueError, match="ungrouped"):
+        route_comparison(gate, left, right)
+
+
+def test_route_comparison_reports_exact_cutoff_tie():
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.diagnostic import route_comparison
+    gate = types.SimpleNamespace(top_k=1, num_expert_group=1, moe_router_activation_func="sigmoid")
+    left = dict(ids=torch.tensor([[0]]), logits=torch.zeros(1, 2),
+                choice=torch.ones(1, 2), input=torch.ones(1, 2))
+    right = {**left, "ids": torch.tensor([[1]])}
+    report = route_comparison(gate, left, right)
+    assert report["flips"][0]["arms"][0]["cutoff_margin"] == 0
+    assert report["router_logits"][0]["different_elements"] == 0
+
+
 def blob(root, pending, wid, data=b"\0\0\0\0"):
     path = root / ("layer%03d" % pending["layer"]) / (wid + ".bin")
     path.write_bytes(data)

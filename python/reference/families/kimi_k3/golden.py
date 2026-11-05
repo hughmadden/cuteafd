@@ -454,7 +454,7 @@ def main():
     parser.add_argument("--stop-after-layer", type=int, default=None,
                         help="diagnostic only: retain residual at this zero-based layer; never score or publish")
     parser.add_argument("--diagnose-layer", type=int, default=None,
-                        help="compare native/fixed sub-ops at layer 1 without running a golden")
+                        help="diagnostic only: layer 1 sub-ops, otherwise replay through this zero-based layer and stop at the first route flip")
     parser.add_argument("--diagnose-official-noise", action="store_true",
                         help="compare unmodified native batch 2 with retained batch-1 probe states")
     parser.add_argument("--diagnose-blas", choices=("cublas", "cublaslt"),
