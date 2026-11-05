@@ -325,14 +325,22 @@ impl FamilyModel for Model {
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::{placement::AttentionPlacement, serving_capacity::CacheGeometryError};
-        if !matches!(options.coordinator_ranks, 1 | 2) || options.attention_placement == Some(AttentionPlacement::Context) {
+        let context = options.attention_placement == Some(AttentionPlacement::Context);
+        if !matches!(options.coordinator_ranks, 1 | 2) || (context && options.coordinator_ranks != 2) {
             return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "requires one owner or TP2 owned/head-split MLA" });
         }
         let layers = self.cfg.mla_layers();
         let resident = if options.coordinator_ranks == 1 { vec![layers] }
             else if options.attention_placement == Some(AttentionPlacement::Heads) { vec![layers; 2] }
             else { vec![layers.div_ceil(2), layers / 2] };
-        crate::families::kimi_k3::kda::cache_geometry_for_ranks(&self.cfg, &resident, options.mla_kv).map(Some)
+        let mut geometry = crate::families::kimi_k3::kda::cache_geometry_for_ranks(&self.cfg, &resident, options.mla_kv)?;
+        if context {
+            geometry.placement = crate::serving_capacity::KvPlacement::PartitionedContext;
+            for rank in &mut geometry.ranks {
+                rank.persistent_unit_bytes = (layers * 64 * options.mla_kv.record_bytes() / 2) as u64;
+            }
+        }
+        Ok(Some(geometry))
     }
     fn spark_budget_bytes(&self) -> u64 { SPARK_BUDGET_BYTES }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {

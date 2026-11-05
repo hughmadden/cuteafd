@@ -16,6 +16,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0)] pub device: i32,
     /// Optional distinct physical peer; absent serves the full model on --device.
     #[arg(long)] pub split_device: Option<i32>,
+    /// MLA ownership; KDA remains head-split on two devices. Auto retains layers.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "heads", "context", "layers"])]
+    pub attention_placement: String,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
@@ -100,6 +104,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
         snapshot: snapshot.clone(), fp8: args.draft_fp8, cache_format: args.kv_cache });
     startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
+        attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
         spark_budget_gib: args.spark_budget_gib,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
@@ -219,6 +224,16 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(argv)?;
         let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
         Ok(args)
+    }
+
+    #[test]
+    fn attention_selector_defaults_auto_and_preserves_explicit_modes() -> Result<()> {
+        assert_eq!(args(&[])?.attention_placement, "auto");
+        for value in ["auto", "heads", "context", "layers"] {
+            assert_eq!(args(&["--attention-placement", value])?.attention_placement, value);
+        }
+        assert!(args(&["--attention-placement", "invalid"]).is_err());
+        Ok(())
     }
 
     #[test]

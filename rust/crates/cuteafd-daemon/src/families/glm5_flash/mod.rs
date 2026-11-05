@@ -1184,7 +1184,7 @@ mod draft_cli_tests {
         // The small-budget NVFP4 placement retains one empty range per RTX GPU.
         let mut placement = Placement {
             pool_tokens: 1 << 20, pool_limits: PoolLimits(vec![]), attention_placement: AttentionPlacement::Heads,
-            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
             layers: (0..45).map(|layer| LayerAssignment {
                 mode: LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
                 experts: if cfg.dense[layer] { ExpertHome::Dense } else { ExpertHome::Spark },
@@ -2565,7 +2565,7 @@ impl Opened {
             max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
-        engine.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+        engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 

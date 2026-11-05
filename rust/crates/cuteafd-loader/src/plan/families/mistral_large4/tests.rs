@@ -163,9 +163,18 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for (ranks, gpus) in [(5, 1), (6, 2), (7, 2), (8, 2)] {
         let mut options = layout_options(ranks, gpus);
-        options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("absent.json"));
+        options.vision = MediaMode::Off;
+        let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, testing::glm_k6_programs(&cfg, &core).unwrap().to_string()).unwrap();
+        options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+        options.attention_placement = Some(if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+            else { crate::placement::AttentionPlacement::Heads });
         let report = input.plan(&options).unwrap();
         let memory = report.memory_layout.as_ref().expect("a memory layout");
+        assert!(report.placement_supported, "{ranks}+{gpus}: {:?}", report.hints);
         assert!(!memory.devices.is_empty(), "{ranks}+{gpus}: {:?}", report.hints);
         assert_eq!(report.prefill_waves, Some(3), "{ranks}+{gpus}");
         let rtx = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count();
@@ -177,13 +186,14 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             assert_eq!(spark.worker_budget_bytes, 108 << 30, "{ranks}+{gpus}");
             assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
         }
-        // No build manifest: two GPUs own whole MLA layers rather than replicate KV.
+        // The explicit whole-layer layout avoids replicated KV.
         assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
-        let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
-        for group in ["attention", "indexer", "embedding", "lm_head"] {
-            assert!(groups.iter().any(|g| g.contains(group)), "{ranks}+{gpus}: no {group} in {groups:?}");
-        }
+        let items = &memory.devices[0].items;
+        assert!(items.iter().any(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
+            && item.bytes > 0), "{ranks}+{gpus}: missing physical embedding owner");
+        assert!(items.iter().any(|item| item.group == "GLM target weights" && item.bytes > 0),
+            "{ranks}+{gpus}: missing admitted target owners");
         println!("ml4 {ranks} Sparks + {gpus} RTX: pool {} tokens, onboard {:?}, fits {}",
             memory.pool_tokens, report.onboard_layers, report.fits);
         // Admitted Spark worlds use their own retained-manifest owner census.
@@ -301,22 +311,11 @@ fn tp2_onboarding_inventory_reads_the_checkpoint_geometry_package_and_router() {
     assert!(glm::local_inventory(&other, &catalog, &manifest, 3, 64, 3, false).is_err());
 }
 
-/// The Pixtral tower on the 2-RTX column (full release headers, native K6
-/// programs): wherever it resolves to an RTX (`--vision rtx`, or auto when no
-/// Spark holds tower + scratch + 1 GiB, as at n=5) it is reserved before the
-/// pool and onboard solve and the plan holds, never a refused encoder; where a
-/// Spark holds it (auto at n=6..8) the RTX working set is untouched. That the
-/// reserved bytes shed onboarded layers is the solver's own contract
-/// (`placement::families::glm5` `reserved_tower_sheds_onboarded_layers`); this
-/// manifest carries no local expert package, so nothing onboards here.
-#[test]
-fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
-    use crate::plan::encoder::EncoderKind;
-    let dir = snapshot(true, None);
-    let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+fn executable_manifest(dir: &std::path::Path) -> std::path::PathBuf {
+    let checkpoint = crate::plan::Checkpoint::open(dir).unwrap();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
     let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
-    let manifest = dir.path().join("PROGRAMS.json");
+    let manifest = dir.join("PROGRAMS.json");
     let mut programs = testing::glm_k6_programs(&cfg, &core).unwrap();
     let entries = programs["programs"].as_array_mut().unwrap();
     // Use admission's requirements, materializing its partial-count wildcard as s2.
@@ -331,6 +330,16 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
         }
     }
     std::fs::write(&manifest, programs.to_string()).unwrap();
+    manifest
+}
+
+/// The executable manifest has no local expert package. Both local and remote
+/// encoder choices must appear in the same solved physical ledger.
+#[test]
+fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
+    use crate::plan::encoder::EncoderKind;
+    let dir = snapshot(true, None);
+    let manifest = executable_manifest(dir.path());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let plan = |ranks: usize, vision: MediaMode| {
         let mut options = layout_options(ranks, 2);
@@ -359,14 +368,21 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
             let memory = report.memory_layout.as_ref().unwrap();
             assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "n={ranks} {vision:?}");
             if on_rtx {
-                // Reserved first: the pool gave way, the tower was not refused.
+                // An explicit tower can reduce the pool, but must be physically charged.
                 assert!(memory.devices.iter().any(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx
-                    && d.items.iter().any(|i| i.group == "vision tower")));
+                    && d.items.iter().any(|i| i.group == "bundled encoder weights")));
                 assert!(memory.pool_tokens <= off.memory_layout.as_ref().unwrap().pool_tokens);
             } else {
                 assert!(matches!(encoder.kind, EncoderKind::Spark { .. }), "n={ranks}: {:?}", encoder.kind);
                 assert_eq!(rtx_used(&report), rtx_used(&off), "n={ranks}: a Spark-hosted tower leaves the RTX set");
             }
+            let host_ready = |report: &plan::PlanReport| report.phase_ledger.as_ref().unwrap().phases.iter()
+                .find(|phase| phase.budget == "coordinator host RAM"
+                    && phase.phase == crate::placement::planner::Phase::Ready).unwrap().owned;
+            let host_total = report.phase_ledger.as_ref().unwrap().budgets.iter()
+                .find(|budget| budget.id == "coordinator host RAM").unwrap().physical_bytes;
+            assert_eq!(host_ready(&report) - host_ready(&off), (8u64 << 30).min(host_total / 20),
+                "both local and remote towers charge their coordinator embedding cache");
             println!("ml4 n={ranks} 2 RTX {vision:?}: encoder {:?}, pool {} (off {})", encoder.kind,
                 memory.pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
         }
@@ -490,4 +506,64 @@ fn retained_fp8_schema_rejects_unsupported_source_claims() {
         let error = native_fixture_check(dir.path(), &bad, &headers).unwrap_err().to_string();
         assert!(error.contains(key), "{error}");
     }
+}
+
+#[test]
+fn shared_host_quota_is_not_overwritten_by_the_legacy_ledger() {
+    let dir = snapshot(true, None);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = layout_options(6, 2);
+    options.vision = MediaMode::Off;
+    options.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
+    let layout = options.layout.as_mut().unwrap();
+    layout.host_cache_bytes = None;
+    layout.host_memory = Some((128 << 30, 64 << 30));
+    layout.workspace_manifest = Some(executable_manifest(dir.path()));
+    let report = input.plan(&options).unwrap();
+    assert!(report.placement_supported, "{:?}", report.hints);
+    assert!(report.host_ledger.is_none());
+    assert_eq!(report.host_budget_bytes, 0);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("coordinator host memory shortfall")));
+}
+
+#[test]
+fn auto_vision_can_disable_inside_joint_ml4_capacity_solve() {
+    let dir = snapshot(true, None);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = layout_options(5, 2);
+    options.vision = MediaMode::Auto;
+    let layout = options.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![52 << 30; 2];
+    layout.glm5_drafter_disabled = false;
+    layout.workspace_manifest = Some(executable_manifest(dir.path()));
+    // The corrected graph figures let the original 52 GiB witness fit its
+    // tower. Construct a physical boundary from the executable text-only plan.
+    options.vision = MediaMode::Off;
+    let off = input.plan(&options).unwrap();
+    assert!(off.placement_supported, "{:?}", off.hints);
+    let ledger = off.phase_ledger.as_ref().unwrap();
+    let budget = ledger.budgets.iter().find(|budget| budget.locations.contains(
+        &crate::placement::planner::Location::coordinator(1))).unwrap();
+    let peak = ledger.phases.iter().filter(|phase| phase.budget == budget.id)
+        .map(|phase| phase.owned + phase.opaque).max().unwrap();
+    let tower = crate::families::mistral_large4::vision::resident_weight_bytes()
+        + crate::plan::layout::mistral_scratch_bytes(55 * 55);
+    let layout = options.layout.as_mut().unwrap();
+    layout.pool_tokens = Some(off.memory_layout.as_ref().unwrap().pool_tokens);
+    layout.rtx_bytes[1] = peak + budget.headroom + tower / 2;
+    options.vision = MediaMode::Auto;
+    let report = input.plan(&options).unwrap();
+    assert!(report.placement_supported, "{:?}", report.hints);
+    let encoder = report.encoder.as_ref().unwrap();
+    assert_eq!(encoder.kind, crate::plan::encoder::EncoderKind::Off);
+    assert!(encoder.shortfall > 0);
+    assert!(encoder.reason.contains("during"), "{}", encoder.reason);
+    assert!(encoder.reason.contains("short by"), "{}", encoder.reason);
+    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| note.contains(&encoder.reason)));
+    assert!(report.host_ledger.is_none());
+    // An explicit placement never uses the Auto-only Off candidate.
+    options.vision = MediaMode::Rtx(None);
+    options.layout.as_mut().unwrap().pool_tokens = Some(report.memory_layout.as_ref().unwrap().pool_tokens);
+    let explicit = input.plan(&options).unwrap();
+    assert!(!explicit.placement_supported, "explicit tower must refuse at the admitted pool");
 }

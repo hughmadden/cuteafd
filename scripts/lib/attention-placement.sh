@@ -21,9 +21,10 @@ release_check_attention_placement() {
   # carries its programs); the planner and the server resolve it. Explicit modes run only where an
   # executor exists.
   case "$attention_placement:$family" in
-    # Kimi K3, Step-5 and Muse Spark run only their recorded automatic placement.
-    auto:kimi_k3|auto:step5|auto:muse_spark) ;;
-    *:kimi_k3|*:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
+    auto:kimi_k3|heads:kimi_k3|context:kimi_k3|layers:kimi_k3) ;;
+    # Step-5 and Muse Spark run only their recorded automatic placement.
+    auto:step5|auto:muse_spark) ;;
+    *:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
     # K4/P7 qualified explicit layers; context remains the recorded auto default.
     # The planner still requires the selected image's executor and native programs.

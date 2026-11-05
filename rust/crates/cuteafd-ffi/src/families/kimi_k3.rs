@@ -93,6 +93,29 @@ impl<'a> KimiMla<'a> {
         Ok(())
     }
 
+    /// Rank-local projection and owner-only cache writes. Slots are local to
+    /// this rank's compact cache; -1 suppresses writes owned by the peer.
+    pub fn produce(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_producer(weights, b, self.heads, self.rows, self.scratch[0], self.cache_format.record_bytes())?;
+        // SAFETY: phase-local extents, devices and writer aliases are checked;
+        // caller retains the compact cache, fixed query and exact stream.
+        unsafe { self.producer.launch(&[b.x.ptr, b.slots.ptr, weights.qkv_a.ptr, weights.q_a_norm.ptr,
+            weights.kv_a_norm.ptr, weights.q_b.ptr, weights.uk.ptr, b.cache.ptr, b.query.ptr,
+            b.q_resid.ptr, b.producer_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+
+    /// UV/gate/output after the fixed-order two-owner LSE combination. This
+    /// phase does not read the cache, query or local partial scratch.
+    pub fn output(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_output(weights, b, self.heads, self.rows, self.scratch[2])?;
+        // SAFETY: phase-local operands are validated; the combine precedes this
+        // launch on the same retained compute stream.
+        unsafe { self.output.launch(&[b.attention.ptr, b.x.ptr, weights.uv.ptr, weights.gate.ptr,
+            weights.output.ptr, b.output.ptr, b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+
     /// Enqueue without allocation of device storage, synchronization or lazy
     /// kernel loading. The owning engine serializes accesses and retains all
     /// buffers through completion and every replay of a captured graph.
@@ -138,6 +161,44 @@ impl<'a> KimiMla<'a> {
     }
 }
 
+fn validate_phase(operands: &[(Buffer, usize)], writers: std::ops::Range<usize>, device: i32) -> Result<()> {
+    validate_buffers(operands, device)?;
+    for &(buffer, bytes) in operands {
+        if buffer.flags != 0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
+            return Err(KimiMlaError::Invalid("phase flags/address overflow"));
+        }
+    }
+    for writer in writers { for other in 0..operands.len() {
+        if writer != other { reject_overlap(operands[writer], operands[other])
+            .map_err(|_| KimiMlaError::Invalid("phase operands overlap"))?; }
+    }}
+    Ok(())
+}
+
+fn validate_producer(w: KimiMlaWeights, b: KimiMlaBatch, heads: usize, rows: usize,
+    scratch: usize, record_bytes: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("producer batch/cache geometry"));
+    }
+    let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS * record_bytes)
+        .ok_or(KimiMlaError::Invalid("producer cache overflow"))?;
+    let r = b.rows;
+    validate_phase(&[(b.x, r * 7168 * 2), (b.slots, r * 8),
+        (w.qkv_a, 2112 * 7168 * 2), (w.q_a_norm, 1536 * 2), (w.kv_a_norm, 512 * 2),
+        (w.q_b, heads * 192 * 1536 * 2), (w.uk, heads * 512 * 128 * 2),
+        (b.cache, cache), (b.query, r * heads * 576 * 2), (b.q_resid, r * 1536 * 2),
+        (b.producer_scratch, scratch)], 7..11, b.x.device_id)
+}
+
+fn validate_output(w: KimiMlaWeights, b: KimiMlaBatch, heads: usize, rows: usize, scratch: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows { return Err(KimiMlaError::Invalid("output batch geometry")); }
+    let r = b.rows;
+    validate_phase(&[(b.attention, r * heads * 512 * 2), (b.x, r * 7168 * 2),
+        (w.uv, heads * 128 * 512 * 2), (w.gate, heads * 128 * 7168 * 2),
+        (w.output, 7168 * heads * 128 * 2), (b.output, r * 7168 * 2),
+        (b.output_scratch, scratch)], 5..7, b.x.device_id)
+}
+
 fn validate_projected_attention(b:KimiMlaBatch,heads:usize,rows:usize,context:usize,splits:usize,scratch:usize,
     record_bytes:usize)->Result<()> {
     if b.rows==0 || b.rows>rows || b.requests==0 || b.requests>b.rows
@@ -166,6 +227,113 @@ fn validate_projected_attention(b:KimiMlaBatch,heads:usize,rows:usize,context:us
         }
     }}
     Ok(())
+}
+
+/// A resolved owned-page partial; h96 queries produce compact h48 outputs.
+/// The caller supplies one already-causal local length/table per query row.
+/// LSE stays base2 through the partial and shared two-owner combine.
+pub struct KimiMlaPartial<'a> {
+    program: Program<'a>,
+    rows: usize,
+    context: usize,
+    scratch: usize,
+    record_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiMlaPartialBatch {
+    pub rows: usize,
+    /// Fixed device scalar, updated outside capture; contents must be in 2..=16.
+    pub active_splits: Buffer,
+    pub cache_pages: usize,
+    pub page_table_width: usize,
+    pub query: Buffer,
+    pub cache: Buffer,
+    pub page_table: Buffer,
+    pub lengths: Buffer,
+    /// Identity cumulative query offsets [0, 1, ..., rows].
+    pub query_offsets: Buffer,
+    pub attention: Buffer,
+    pub lse: Buffer,
+    pub scratch: Buffer,
+}
+
+impl<'a> KimiMlaPartial<'a> {
+    pub fn load(programs: &'a Programs<'a>, name: &str, head_begin: usize, rows: usize,
+        format: MlaCacheFormat) -> Result<Self> {
+        let program = programs.program(name, &["query", "kv_cache", "page_table", "cache_seqlens",
+            "cu_seqlens_q", "attn", "lse", "scratch", "active_splits"])?;
+        let (context, scratch) = validate_partial_manifest(program.spec(), head_begin, rows, format)?;
+        Ok(Self { program, rows, context, scratch, record_bytes: format.record_bytes() })
+    }
+
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+    pub fn max_context(&self) -> usize { self.context }
+
+    pub fn launch(&self, b: KimiMlaPartialBatch, stream: *mut c_void) -> Result<()> {
+        if b.rows == 0 || b.rows > self.rows || b.page_table_width == 0
+            || b.page_table_width > self.context.div_ceil(MLA_PAGE_ROWS)
+            || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+            return Err(KimiMlaError::Invalid("context partial batch geometry"));
+        }
+        let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS * self.record_bytes)
+            .ok_or(KimiMlaError::Invalid("context partial cache overflow"))?;
+        let operands = [(b.query, b.rows * 96 * 576 * 2), (b.cache, cache),
+            (b.page_table, b.rows * b.page_table_width * 4), (b.lengths, b.rows * 4),
+            (b.query_offsets, (b.rows + 1) * 4), (b.attention, b.rows * 48 * 512 * 2),
+            (b.lse, b.rows * 48 * 4), (b.scratch, self.scratch), (b.active_splits, 4)];
+        validate_buffers(&operands, b.query.device_id)?;
+        for (buffer, bytes) in operands {
+            if buffer.flags != 0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
+                return Err(KimiMlaError::Invalid("context partial flags/address overflow"));
+            }
+        }
+        if !(b.active_splits.ptr as usize).is_multiple_of(4) {
+            return Err(KimiMlaError::Invalid("context partial split scalar alignment"));
+        }
+        for writer in 5..8 { for other in 0..9 {
+            if writer != other {
+                reject_overlap(operands[writer], operands[other])
+                    .map_err(|_| KimiMlaError::Invalid("context partial operands overlap"))?;
+            }
+        }}
+        // SAFETY: startup validates the base2 h96->h48 ABI; live extents,
+        // devices and write aliases are checked. The caller owns the stream,
+        // causal table contents and buffers through queued work/graph replay.
+        unsafe { self.program.launch(&[b.query.ptr, b.cache.ptr, b.page_table.ptr, b.lengths.ptr,
+            b.query_offsets.ptr, b.attention.ptr, b.lse.ptr, b.scratch.ptr, b.active_splits.ptr],
+            &[Scalar::I32(b.rows as i32), Scalar::I64(b.page_table_width as i64)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_partial_manifest(spec: &ProgramSpec, begin: usize, rows: usize, format: MlaCacheFormat)
+    -> Result<(usize, usize)> {
+    let g = &spec.geometry;
+    if !matches!(begin, 0 | 48) || !(1..=4096).contains(&rows)
+        || !matches!(g["heads_per_tile"].as_u64(), Some(8 | 16))
+        || spec.capacity_rows as usize != rows || spec.scalar_kinds != b"il"
+        || g["kv_cache"].as_str() != Some(format.label())
+        || g["head_begin"].as_u64() != Some(begin as u64)
+        || g["norm_eps"].as_f64() != Some(1e-6)
+        || [("heads", 96), ("head_count", 48), ("hidden", 7168), ("q_lora_rank", 1536),
+            ("kv_lora_rank", 512), ("qk_nope_dim", 128), ("qk_rope_dim", 64),
+            ("v_head_dim", 128), ("page_rows", 64), ("lse_base", 2), ("max_rows", rows)]
+            .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64)) {
+        return Err(KimiMlaError::Invalid("context partial manifest geometry/scalars"));
+    }
+    let context = g["max_context"].as_u64().filter(|&n| (1..=1048576).contains(&n))
+        .ok_or(KimiMlaError::Invalid("context partial manifest context"))? as usize;
+    let splits = g["num_splits"].as_u64().filter(|&n| n == 16)
+        .ok_or(KimiMlaError::Invalid("context partial manifest splits"))? as usize;
+    let n = rows * 48 * splits;
+    let scratch = (n * 512 * 2).div_ceil(1024) * 1024 + n * 4;
+    if g["runtime_splits"].as_bool() != Some(true)
+        || g["device_splits"].as_bool() != Some(true) || g["fixed_split_grid"] != 16
+        || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
+        return Err(KimiMlaError::Invalid("context partial manifest traversal/scratch"));
+    }
+    Ok((context, scratch))
 }
 
 fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: KimiMlaMode, cache_format: MlaCacheFormat)
@@ -964,6 +1132,43 @@ mod tests {
     }
 
     #[test]
+    fn context_producer_and_output_validate_only_their_phase_operands() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let absent = Buffer { ptr: std::ptr::null_mut(), bytes: 0, device_id: 0, flags: 0 };
+        let b = KimiMlaBatch { rows: 8, requests: 0, page_table_width: 0, cache_pages: 2, active_splits: 0,
+            x: buffer(1), slots: buffer(2), cache: buffer(3), page_table: absent, lengths: absent,
+            query_offsets: absent, query: buffer(4), q_resid: buffer(5), attention: buffer(6), lse: absent,
+            output: buffer(7), producer_scratch: buffer(8), attention_scratch: absent, output_scratch: buffer(9) };
+        let w = KimiMlaWeights { qkv_a: buffer(10), q_a_norm: buffer(11), kv_a_norm: buffer(12),
+            q_b: buffer(13), uk: buffer(14), uv: buffer(15), gate: buffer(16), output: buffer(17) };
+        let producer = |b| validate_producer(w, b, 48, 64, 4096, MLA_RECORD_BYTES);
+        let output = |b| validate_output(w, b, 48, 64, 4096);
+        producer(b).unwrap();
+        output(b).unwrap();
+        // No phase demands the exchange's h96 assembled query, full history,
+        // attention tables, or another phase's scratch before enqueueing.
+        producer(KimiMlaBatch { attention: absent, output: absent, output_scratch: absent, ..b }).unwrap();
+        output(KimiMlaBatch { slots: absent, cache: absent, query: absent, q_resid: absent,
+            producer_scratch: absent, cache_pages: 0, ..b }).unwrap();
+        for bad in [KimiMlaBatch { rows: 0, ..b }, KimiMlaBatch { rows: 65, ..b }] {
+            assert!(producer(bad).is_err()); assert!(output(bad).is_err());
+        }
+        assert!(producer(KimiMlaBatch { cache_pages: usize::MAX, ..b }).is_err());
+        for reader in [b.x, b.slots, w.qkv_a, w.q_a_norm, w.kv_a_norm, w.q_b, w.uk] {
+            assert!(producer(KimiMlaBatch { query: Buffer { ptr: reader.ptr, ..b.query }, ..b }).is_err());
+        }
+        for reader in [b.attention, b.x, w.uv, w.gate, w.output] {
+            assert!(output(KimiMlaBatch { output: Buffer { ptr: reader.ptr, ..b.output }, ..b }).is_err());
+        }
+        for bad in [Buffer { flags: 1, ..b.query }, Buffer { bytes: 1, ..b.query },
+            Buffer { device_id: 1, ..b.query }, Buffer { ptr: (usize::MAX - 15) as *mut c_void, ..b.query }] {
+            assert!(producer(KimiMlaBatch { query: bad, ..b }).is_err());
+            assert!(output(KimiMlaBatch { output: bad, ..b }).is_err());
+        }
+    }
+
+    #[test]
     fn projected_attention_checks_geometry_extents_and_writer_aliases() {
         let buffer=|index|Buffer{ptr:(index*0x10000000usize)as *mut c_void,
             bytes:0x10000000,device_id:0,flags:0};
@@ -990,6 +1195,44 @@ mod tests {
             assert!(validate(KimiMlaBatch{query,..b}).is_err());
         }
         assert!(validate(KimiMlaBatch{lse:Buffer{ptr:b.attention.ptr,..b.lse},..b}).is_err());
+    }
+
+    #[test]
+    fn context_partial_manifest_rejects_lse_base_and_owned_traversal_drift() {
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            for begin in [0, 48] {
+                let mut spec = specs(96, 64, KimiMlaMode::Decode)[1].clone();
+                spec.scalar_kinds = b"il".to_vec();
+                spec.geometry["runtime_splits"] = true.into();
+                spec.geometry["device_splits"] = true.into();
+                spec.geometry["fixed_split_grid"] = 16.into();
+                spec.geometry["kv_cache"] = format.label().into();
+                spec.geometry["head_begin"] = begin.into();
+                spec.geometry["head_count"] = 48.into();
+                spec.geometry["heads_per_tile"] = 16.into();
+                spec.geometry["max_rows"] = 64.into();
+                spec.geometry["lse_base"] = 2.into();
+                spec.scratch.insert("scratch".into(), (64 * 48 * 16 * (512 * 2 + 4)) as u64);
+                assert!(validate_partial_manifest(&spec, begin, 64, format).is_ok());
+                let mut tile8 = spec.clone();
+                tile8.geometry["heads_per_tile"] = 8.into();
+                assert!(validate_partial_manifest(&tile8, begin, 64, format).is_ok());
+                for (key, bad) in [("lse_base", 0), ("heads", 48), ("head_count", 96),
+                    ("num_splits", 1), ("runtime_splits", 0), ("device_splits", 0),
+                    ("fixed_split_grid", 8), ("max_context", 0), ("heads_per_tile", 4)] {
+                    let mut wrong = spec.clone();
+                    wrong.geometry[key] = bad.into();
+                    assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err(), "{key}");
+                }
+                let mut wrong = spec.clone();
+                wrong.scratch.clear();
+                assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err());
+                wrong = spec.clone();
+                wrong.scalar_kinds = b"iili".to_vec();
+                assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err());
+                assert!(validate_partial_manifest(&spec, 1, 64, format).is_err());
+            }
+        }
     }
 
     #[test]

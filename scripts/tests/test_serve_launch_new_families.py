@@ -107,6 +107,15 @@ def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     assert _flag(serve, "--max-sequences") == "8"
 
 
+@pytest.mark.parametrize("placement", ["auto", "heads", "context", "layers"])
+def test_kimi_attention_placement_reaches_plan_and_serve(tmp_path: Path, placement: str) -> None:
+    result = _kimi(tmp_path, f"ATTENTION_PLACEMENT={placement}\n")
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    plan = _line(result, "cuteafd plan")
+    assert _flag(plan, "--attention-placement") == placement
+    assert f"CUTEAFD_ATTENTION_PLACEMENT={placement}" in serve
+
+
 def test_kimi_forwards_all_onboard_pin(tmp_path: Path) -> None:
     serve = _line(_kimi(tmp_path, "RTX_EXPERT_LAYERS=all\n"), "cuteafd serve-kimi --snapshot")
     assert _flag(serve, "--rtx-expert-layers") == "all"
@@ -153,8 +162,7 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
-    ("ATTENTION_PLACEMENT=heads\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
-    ("ATTENTION_PLACEMENT=context\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
+    ("ATTENTION_PLACEMENT=invalid\n", "ATTENTION_PLACEMENT must be auto, context, layers or heads"),
     ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
     ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),

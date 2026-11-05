@@ -1,4 +1,4 @@
-//! Physical local TP2 owners. Payload rows and peer routers are target-owned.
+//! Physical local expert owners. Pair payload rows and routers are target-owned.
 use super::{GlmLocalFormat, LocalInventory};
 use crate::{families::glm5::GlmDsaConfig, OfficialV41Catalog, V41Exl3Layer};
 use crate::placement::planner::{Allocation, Lifetime, Location, View};
@@ -11,6 +11,17 @@ use std::{collections::BTreeMap, path::Path};
 /// Supplied by the same mount/push decision that selects the serving loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStorage { Mount, Push }
+
+impl LocalStorage {
+    pub fn for_snapshot(snapshot: &Path) -> Result<Self> {
+        match crate::push_load::namespace(snapshot) {
+            Ok(_) => Ok(Self::Push),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && error.raw_os_error().is_none() && snapshot.exists() => Ok(Self::Mount),
+            Err(error) => Err(error).context("discovering checkpoint storage namespace"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalPhysicalInput {
@@ -52,9 +63,23 @@ pub struct LocalPhysicalSource {
 }
 
 impl LocalPhysicalSource {
+    pub fn world(&self) -> usize { self.world }
+
+    #[cfg(test)]
+    pub(super) fn test_source(world: usize, layers: std::ops::Range<usize>, rows: usize) -> Self {
+        Self { weights: std::array::from_fn(|rank| if rank < world {
+            layers.clone().map(|layer| (layer, LayerStorage { bytes: 4096,
+                mount: vec![(String::new(), 4096)], views: vec![(String::new(), 0, 4096)] })).collect()
+        } else { BTreeMap::new() }), backend: LocalPhysicalInventory::default(),
+            rows, activations: PrefillActivations::A16, topk: 8, world }
+    }
+
     pub fn read(cfg: &GlmDsaConfig, catalog: &OfficialV41Catalog, local: &LocalInventory,
         input: &LocalPhysicalInput, exlr8: Option<&MetadataInput>) -> Result<Self> {
         validate_input(cfg, input)?;
+        ensure!((1..=2).contains(&local.world)
+            && (local.world == 2 || local.format == GlmLocalFormat::Exlr8),
+            "GLM local physical source has no executor for this format/world");
         let mut source = Self { weights: Default::default(), backend: Default::default(),
             rows: input.max_rows, activations: input.activations, topk: cfg.topk, world: local.world };
         if input.layers.is_empty() { return Ok(source); }
@@ -76,15 +101,13 @@ impl LocalPhysicalSource {
                                 (index.to_string(), offset, spec.bytes.max(16))).collect() }
                     }
                     GlmLocalFormat::Exlr8 => {
-                        let plan = exlr8.context("EXLR8 selected metadata missing")?
-                            .plan(layer, local.world, rank, ExpertSet::Routed)?;
-                        let units = plan.compact_unit_limit();
+                        let (bytes, units) = exlr8.context("EXLR8 selected metadata missing")?
+                            .admission_geometry(layer, local.world, rank, ExpertSet::Routed)?;
                         ensure!(unit_limit.is_none_or(|previous| previous == units),
                             "EXLR8 local layers have inconsistent unit limits");
                         unit_limit = Some(units);
-                        LayerStorage { bytes: plan.resident_bytes,
-                            mount: vec![(String::new(), plan.resident_bytes)],
-                            views: vec![(String::new(), 0, plan.resident_bytes)] }
+                        LayerStorage { bytes, mount: vec![(String::new(), bytes)],
+                            views: vec![(String::new(), 0, bytes)] }
                     }
                     GlmLocalFormat::Nvfp4 { w4a4: true } => {
                         use crate::formats::fp8_experts::Fp8Projection;

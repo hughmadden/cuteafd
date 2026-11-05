@@ -6,6 +6,320 @@ fn cfg() -> GlmDsaConfig {
     GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap()
 }
 
+fn production_link(cfg: &GlmDsaConfig, ranks: usize, shape: PrefillShape, prefill: bool)
+    -> crate::placement::PreparedSparkLink {
+    use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
+    let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
+        experts: cfg.experts as u32, topk: cfg.topk as u32,
+        intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+    PreparedSparkLink::endpoint(if prefill { "test.prefill" } else { "test.decode" }, 0,
+        SparkEndpointOwners { ranks, geometry,
+            endpoint: cuteafd_core::SparkEndpoint { capacity: shape.rows as u32,
+                ingress: cuteafd_core::SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
+            rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 } },
+        shape.waves as usize, prefill, true, SparkIntakeCandidates::Probed,
+        cuteafd_core::SparkReplyFormat::Bf16, Lifetime::TARGET).unwrap()
+}
+
+fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: PrefillShape)
+    -> ProductionInput<'_> {
+    let mut budgets = budgets();
+    for rank in 2..ranks {
+        budgets.push(Budget { id: format!("spark.{rank}"),
+            locations: vec![Location { device: Device::Spark(rank as u8), domain: Domain::Managed }],
+            physical_bytes: 1 << 40, logical_bytes: 1 << 40,
+            baseline: Baseline::Forecast { occupied: 0, source: "test physical witness".into(), assumed: false },
+            headroom: 0 });
+    }
+    ProductionInput { cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
+        attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
+        gpus, prefill,
+        target: TargetFacts {
+            weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
+                core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default() })],
+            hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
+                native: None, core: None, shared_workspace: None }).collect(),
+            embedding_read: None, native_load: None,
+        },
+        draft: DraftFacts::default(), scratch: Default::default(),
+        context_scratch: (gpus == 2).then(super::super::GlmContext::default),
+        exchange_element_bytes: 2, peer_diagnostics: false, local: None, spark_ranks: ranks,
+        decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
+        prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
+        skip_routed_experts: false, operation: Operation::Serving,
+        sync_upload_bytes: 0, owners: vec![], budgets }
+}
+
+#[test]
+fn target_checkpoint_facts_use_exact_inventory_and_preserve_embedding_alternatives() {
+    use crate::plan::{testing, Checkpoint};
+    let dir = tempfile::tempdir().unwrap();
+    let (config, tensors) = testing::glm5_compact_weights();
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = GlmDsaConfig::from_hf(&config).unwrap();
+    let homes = [EmbeddingHome::Device(0), EmbeddingHome::HostPinned];
+    let target = TargetFacts::checkpoint(&checkpoint, cfg.layers, 2, None, false, &homes, None).unwrap();
+    assert_eq!(target.weights.len(), homes.len());
+    for ((home, actual), expected_home) in target.weights.iter().zip(homes) {
+        assert_eq!(*home, expected_home);
+        let expected = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
+            false, false, expected_home).unwrap();
+        assert_eq!(actual.owners.iter().map(|owner| &owner.allocation).collect::<Vec<_>>(),
+            expected.owners.iter().map(|owner| &owner.allocation).collect::<Vec<_>>());
+        assert_eq!(actual.core_loading, expected.core_loading);
+        assert_eq!(actual.kv_b_loading, expected.kv_b_loading);
+        assert_eq!(actual.row_loading, expected.row_loading);
+    }
+    assert_eq!(target.hooks.iter().map(|hook| hook.device).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(target.embedding_read.unwrap().pinned_bytes(),
+        crate::shared::dense_read::ReadBatch::new(cfg.vocab_size, cfg.hidden * 2, cfg.hidden * 2,
+            crate::shared::dense_read::STEP_BYTES).unwrap().pinned_bytes());
+    assert!(target.native_load.is_none());
+    for homes in [vec![], vec![EmbeddingHome::Device(0); 2]] {
+        assert!(TargetFacts::checkpoint(&checkpoint, cfg.layers, 2, None, false, &homes, None).is_err());
+    }
+}
+
+fn gqa_layout(representation: crate::families::glm5::draft_representation::GlmDraftRepresentation)
+    -> crate::families::glm5::draft_physical::GlmDflashPhysicalLayout {
+    use crate::families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout},
+        draft_representation::GlmDraftCapacity};
+    let cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
+        kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
+        mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
+        row_window: false, sample_from_anchor: false };
+    GlmDflashPhysicalLayout::new(&cfg, representation, GlmDraftCapacity::new(20, 16, cfg.block).unwrap(),
+        188, 0, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap()
+}
+
+#[test]
+fn draft_facts_preserve_owner_ids_resources_and_serial_fp8_sources() {
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation::{Bf16Only, Fp8Only};
+    for representation in [Bf16Only, Fp8Only] {
+        let layout = gqa_layout(representation);
+        let facts = DraftFacts::from_gqa(&layout).unwrap();
+        assert_eq!(facts.owners, layout.allocations("glm.draft", Location::coordinator(0)));
+        let ids = facts.owners.iter().map(|owner| owner.id.as_str()).collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), facts.owners.len());
+        for weight in &facts.weights {
+            let owner = facts.owners.iter().find(|owner| owner.id == weight.id).unwrap();
+            assert_eq!(weight.location, owner.location);
+            assert_eq!(weight.weights.0, owner.bytes);
+        }
+        assert_eq!(facts.weights.len(), layout.weight_owners().count());
+        let values = layout.weight_owners().filter(|owner| owner.id.ends_with(".values"))
+            .collect::<Vec<_>>();
+        if representation == Bf16Only {
+            assert!(facts.loading.is_empty());
+        } else {
+            assert_eq!(facts.loading.len(), 1);
+            assert_eq!(facts.loading[0].members.len(), values.len());
+            assert_eq!(facts.loading[0].peak(), values.iter().map(|owner| owner.bytes * 2).max().unwrap());
+            assert!(facts.loading[0].members.iter().all(|owner| owner.location == Location::coordinator(0)
+                && owner.lifetime == Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }));
+        }
+        assert!(facts.components(0).is_err());
+        let cfg = cfg();
+        let mut input = production_input(&cfg, 1, 4, PrefillShape { rows: 128, waves: 3 });
+        input.draft = facts.clone();
+        let solved = input.prepare().unwrap().admit(request()).unwrap().solved;
+        for weight in &facts.weights {
+            assert!(solved.facts.resident_weights.contains(weight));
+        }
+        for owner in facts.owners.iter().filter(|owner| owner.location != Location::HOST) {
+            assert!(solved.facts.allocations.contains(owner));
+        }
+        assert_eq!(solved.facts.allocations.iter().find(|owner| owner.id == "glm.load.sync_h2d").unwrap().bytes,
+            facts.sync_upload_bytes);
+        assert_eq!(solved.facts.sequential.iter().filter(|group| group.id == "glm.draft.load.sources").count(),
+            usize::from(representation == Fp8Only));
+    }
+}
+
+#[test]
+fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
+    use crate::formats::{block_dspark::DsparkRotaryPlan, dflash::MlaDflashConfig, mla::MlaGeometry};
+    use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Bf16Only};
+    let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+        kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
+        block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1, 18, 36, 54, 71],
+        vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
+        rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+        kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+    let layout = cfg.runtime_layout(Bf16Only, GlmDraftCapacity::new(20, 16, 3).unwrap(),
+        1 << 20, 1 << 21, 188, 0, cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+    let facts = DraftFacts::ml4(&layout).unwrap();
+    let retained = layout.owners().iter().filter(|owner|
+        !owner.on_use && owner.shared_key.as_deref() != Some("library/sync-h2d")).collect::<Vec<_>>();
+    assert_eq!(facts.owners.len(), retained.len() + 1);
+    for expected in retained {
+        let owner = facts.owners.iter().find(|owner| owner.id == format!("glm.draft.{}", expected.id)).unwrap();
+        assert_eq!(owner.bytes, expected.bytes as u64);
+        assert_eq!(owner.alignment, expected.alignment as u64);
+        assert_eq!(owner.shape, expected.shape.iter().map(|&n| n as u64).collect::<Vec<_>>());
+    }
+    assert_eq!(facts.weights.iter().map(|owner| owner.weights.0).sum::<u64>(),
+        layout.weights().resident_bytes().unwrap());
+    assert_eq!(facts.sync_upload_bytes, layout.owners().iter()
+        .filter(|owner| owner.shared_key.as_deref() == Some("library/sync-h2d"))
+        .map(|owner| owner.bytes as u64).max().unwrap());
+    let mount = facts.owners.iter().find(|owner| owner.id == "glm.draft.load.mount").unwrap();
+    assert_eq!(mount.location, Location::PINNED);
+    assert_eq!(mount.bytes, crate::shared::dense_read::STEP_BYTES as u64);
+    assert_eq!(mount.lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad });
+    assert!(facts.loading.is_empty(), "ML4 BF16 storage must not invent GQA FP8 source matrices");
+}
+
+#[test]
+fn native_load_keeps_exact_banks_and_serializes_ranks_without_host_cache_double_charge() {
+    use crate::plan::exlr8::{dense::DensePlan, residency::{ExpertSet, Residency}};
+    use super::super::local_physical::LocalStorage;
+    let dense = (0..2).map(|rank| DensePlan { rank, world: 2, tensors: vec![],
+        resident_bytes: 0, pinned_staging_bytes: (rank + 1) * 1_048_576,
+        cached_rows_bytes: (rank + 1) * 8_388_608,
+        read_staging_bytes: (rank + 1) * 9_437_184 }).collect::<Vec<_>>();
+    let vocabulary = DensePlan { rank: 0, world: 2, tensors: vec![], resident_bytes: 0,
+        pinned_staging_bytes: 32 << 20, cached_rows_bytes: 0, read_staging_bytes: 32 << 20 };
+    let plans = (0..2).map(|rank| (1..3).map(|layer| Residency {
+        layer, world: 2, rank, hidden: 64, experts: 1, units: 2, set: ExpertSet::Shared,
+        set_id: String::new(), manifest: String::new(), loads: vec![], signs: [vec![], vec![]],
+        signs_offsets: [0, 0], pointers_offset: 0, bits_offset: 0, compact_offsets: [0; 2],
+        resident_bytes: 4096, payload_bytes: 0, staging_bytes: (rank + layer) * 32,
+    }).collect::<Vec<_>>()).collect::<Vec<_>>();
+    let refs = dense.iter().collect::<Vec<_>>();
+    assert_eq!(DensePlan::mount_staging_bytes(&refs).unwrap(), (2 << 20, 16 << 20));
+    assert!(DensePlan::mount_staging_bytes(&[&dense[1], &dense[0]]).is_err());
+    let mount = NativeLoad::new(&refs, &vocabulary, &plans, LocalStorage::Mount).unwrap();
+    mount.validate_vocabulary(0).unwrap();
+    assert!(mount.validate_vocabulary(1).is_err());
+    for plan in &plans { mount.validate_shared(plan).unwrap(); }
+    let mut changed = plans[0].clone();
+    changed[0].staging_bytes += 1;
+    assert!(mount.validate_shared(&changed).is_err());
+    changed[0].staging_bytes -= 1;
+    changed[0].world = 1;
+    assert!(mount.validate_shared(&changed).is_err());
+    assert_eq!(mount.groups.len(), 33);
+    assert_eq!(mount.groups[0].members.len(), 1);
+    assert_eq!(mount.groups[0].peak(), 2 << 20,
+        "one reused Mount bank, not two ranks or the mixed-domain aggregate");
+    assert_eq!(mount.sync_upload_bytes, 1 * 2 * 3 * 3 * 8);
+    assert_eq!(mount.coarse_overcharge_bytes, 32 * 96);
+    let mut ids = BTreeSet::new();
+    for group in &mount.groups[1..] {
+        assert_eq!(group.members.len(), 4);
+        assert_eq!(group.peak(), 96);
+        for owner in &group.members {
+            assert!(ids.insert(owner.id.clone()));
+            assert_eq!(owner.location, Location::PINNED);
+            assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+        }
+    }
+    assert_eq!(ids.len(), 128);
+    let push = NativeLoad::new(&refs, &vocabulary, &plans, LocalStorage::Push).unwrap();
+    assert_eq!(push.groups.len(), 32,
+        "Push does not also create the native Mount bank; shared experts still load separately");
+    assert_eq!(push.coarse_overcharge_bytes, 0);
+    let components = mount.components(1);
+    assert_eq!(components.iter().filter(|component|
+        matches!(component.kind, ComponentKind::Sequential(_))).count(), 33);
+}
+
+#[test]
+fn production_native_sync_bank_is_one_maximum_not_one_copy_per_rank_or_layer() {
+    let cfg = cfg();
+    let prefill = PrefillShape { rows: 128, waves: 3 };
+    let mut input = production_input(&cfg, 2, 4, prefill);
+    input.sync_upload_bytes = 4096;
+    input.target.native_load = Some(NativeLoad { gpus: 2, sync_upload_bytes: 8192,
+        coarse_overcharge_bytes: 0, groups: vec![] });
+    let prepared = input.prepare().unwrap();
+    let solved = prepared.admit(request()).unwrap().solved;
+    let banks = solved.facts.allocations.iter().filter(|owner| owner.id == "glm.load.sync_h2d")
+        .collect::<Vec<_>>();
+    assert_eq!(banks.len(), 1);
+    assert_eq!(banks[0].bytes, 8192);
+}
+
+#[test]
+fn production_min_and_max_keep_devs_spark_prefill_shape() {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    let cfg = cfg();
+    // Both example cards leave rows/waves unpinned. The launcher's shared depth
+    // resolver selects three waves; the old solver never transitions to one.
+    for (gpus, ranks) in [(1, 4), (2, 6)] {
+        let dev = prefill_shape(ranks, PrefillLimits::default(), PrefillOverrides::default()).unwrap();
+        assert_eq!((dev.unit_rows, dev.waves), (2752, 3));
+        let prefill = PrefillShape { rows: dev.unit_rows, waves: dev.waves };
+        let prepared = production_input(&cfg, gpus, ranks, prefill).prepare().unwrap();
+        assert_eq!(prepared.recipe.prefill, vec![prefill]);
+        let admitted = prepared.admit(request()).unwrap();
+        assert_eq!(admitted.solved.decisions.prefill, prefill);
+        assert_eq!(admitted.spark.prefill_lanes, dev.waves);
+        assert_eq!(admitted.spark.spark_ranks, ranks);
+        assert!(admitted.decode_link.is_some() && admitted.prefill_link.is_some());
+    }
+}
+
+#[test]
+fn production_count_domain_preserves_executable_wave_capabilities() {
+    assert_eq!(production_counts(3, false, 3, false), [0]);
+    assert_eq!(production_counts(3, true, 1, false), [0, 1, 2, 3]);
+    assert_eq!(production_counts(3, true, 3, false), [0, 1, 2]);
+    assert_eq!(production_counts(0, true, 3, false), [0]);
+    assert_eq!(production_counts(3, true, 3, true), [0]);
+    let cfg = cfg();
+    let prefill = PrefillShape { rows: 128, waves: 3 };
+    let mut prepared = production_input(&cfg, 2, 4, prefill).prepare().unwrap();
+    prepared.recipe.experts.as_mut().unwrap().counts = production_counts(1, true, 3, false);
+    let mut exact = request();
+    exact.onboard = Pin::Exact(1);
+    assert!(planner::solve(exact, prepared.budgets, &prepared.recipe).is_err(),
+        "an unavailable full count must refuse, not clamp or change shape");
+}
+
+#[test]
+fn production_rejects_misindexed_hooks_and_spark_free_multiwave() {
+    let cfg = cfg();
+    let mut input = production_input(&cfg, 2, 4, PrefillShape { rows: 128, waves: 3 });
+    input.target.hooks.swap(0, 1);
+    assert!(input.prepare().is_err());
+    let input = production_input(&cfg, 2, 0, PrefillShape { rows: 128, waves: 3 });
+    assert!(input.prepare().is_err());
+}
+
+#[test]
+fn production_whole_local_has_no_pair_owners_and_rejects_wrong_world() {
+    use super::super::local_physical::{LocalPhysicalInput, LocalPhysicalSource, LocalStorage};
+    let mut cfg = cfg();
+    // Keep a remote suffix: full onboarding is deliberately unavailable at three waves.
+    cfg.layers += 1;
+    cfg.indexers.push(crate::families::glm5::GlmIndexer::Shared);
+    let prefill = PrefillShape { rows: 128, waves: 3 };
+    let source = LocalPhysicalSource::test_source(1, cfg.first_moe_layer..cfg.layers, 128);
+    let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
+        max_rows: 128, lanes: 3, storage: LocalStorage::Mount, route_checks: true,
+        peer_diagnostics: true, activations: crate::plan::exlr8::PrefillActivations::A16 };
+    let mut input = production_input(&cfg, 1, 4, prefill);
+    input.local = Some((&source, physical.clone()));
+    let mut req = request();
+    req.onboard = Pin::Exact(1);
+    let admitted = input.prepare().unwrap().admit(req).unwrap();
+    assert_eq!(admitted.placement.onboard_layers, 1);
+    assert!(admitted.solved.facts.allocations.iter().any(|owner|
+        owner.id == format!("glm.expert.routed.rank.0.weight.{}.backing", cfg.first_moe_layer)));
+    assert!(admitted.solved.facts.allocations.iter().all(|owner|
+        owner.location != Location::coordinator(1)
+            && !owner.id.contains(".peer.") && !owner.id.contains(".checks.")
+            && !owner.id.ends_with(".rows.payload")));
+    assert!(admitted.graphs.layers[cfg.first_moe_layer].local);
+    let mut input = production_input(&cfg, 2, 4, prefill);
+    input.local = Some((&source, physical));
+    assert!(matches!(input.prepare(), Err(Refusal::InvalidFact(_))));
+}
+
 #[test]
 fn glm_zero_demand_omits_charge_and_positive_demand_has_one_exact_item() {
     let cfg = cfg();
@@ -168,6 +482,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         spark_links: true,
         prefill,
         lanes: vec![1],
+        encoders: vec![], media_cache_bytes: 0,
         embedding: vec![EmbeddingHome::Device(0), EmbeddingHome::HostPinned],
         experts: Some(ExpertProfile {
             layers: vec![1],
@@ -180,7 +495,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         exchanges: vec![],
         weights: vec![],
         graphs: vec![],
-        returns: vec![],
+        host: None,
         owners: vec![],
     };
     for &shape in &recipe.prefill {
@@ -344,6 +659,137 @@ fn budgets() -> Vec<Budget> {
         headroom: 0,
     })
     .collect()
+}
+
+fn local_execution_inventory() -> super::super::local_physical::LocalPhysicalInventory {
+    use super::super::local_physical::LocalPhysicalInventory;
+    let mut inventory = LocalPhysicalInventory::default();
+    for rank in 0..2 {
+        let location = Location::coordinator(rank);
+        for (suffix, bytes) in [("weight.1.backing", 100 + u64::from(rank)),
+            ("execution.scratch", 13 + 4 * u64::from(rank))] {
+            inventory.owners.push(Allocation::buffer(format!("glm.expert.routed.rank.{rank}.{suffix}"),
+                location, bytes, Lifetime::TARGET, Category::Experts, "local backend"));
+        }
+        inventory.owners.push(Allocation::buffer(format!("glm.expert.routed.routes.rank.{rank}.peer.recv.0"),
+            location, 201 + u64::from(rank), Lifetime::TARGET, Category::Experts, "local routes"));
+        let mut view = Allocation::buffer(format!("glm.expert.routed.rank.{rank}.weight.1"),
+            location, 50, Lifetime::TARGET, Category::Experts, "local backend");
+        view.view = Some(View { backing: format!("glm.expert.routed.rank.{rank}.weight.1.backing"), offset: 0 });
+        inventory.views.push(view);
+    }
+    inventory.owners.push(Allocation::buffer("glm.expert.routed.checks.0.1.0", Location::PINNED,
+        81, Lifetime::TARGET, Category::Experts, "local route checks"));
+    inventory
+}
+
+#[test]
+fn execution_adapter_uses_resolved_homes_and_unique_tp2_prefix_and_backend_bytes() {
+    use crate::placement::{ExpertHome, ResidualHome};
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let local = local_execution_inventory();
+    recipe.owners.retain(|case| !case.when.iter().any(|when| matches!(when, When::LocalLayer(_))));
+    recipe.owners.push(Case { when: vec![When::LocalLayer(1)], value: local.owners.iter()
+        .chain(&local.views).cloned().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, recipe.maximum_pages);
+            Component::allocation(owner, bytes, false, recipe.maximum_pages)
+        }).collect() });
+    for onboard in [0, 1] {
+        let resolved = planner::solve(Request { onboard: Pin::Exact(onboard), ..request() }, budgets(), &recipe).unwrap();
+        let inventory = if onboard == 0 { Default::default() } else { local.clone() };
+        let (placement, working) = recipe.execution(&resolved, &inventory).unwrap();
+        assert_eq!(placement.pool_tokens, resolved.pool_tokens);
+        assert!(placement.pool_limits.0.is_empty());
+        assert_eq!(placement.max_pool_tokens_no_onboard, None);
+        assert_eq!(placement.onboard_layers, onboard as usize);
+        assert_eq!(placement.layers[0].experts, ExpertHome::Dense);
+        assert_eq!(working.prefill_lanes, resolved.decisions.prefill.waves);
+        assert_eq!(placement.residual, vec![ResidualHome::Owned(0), ResidualHome::Replicated, ResidualHome::Replicated]);
+        let geometry = super::super::context_buffers(&cfg, recipe.context,
+            resolved.decisions.prefill.rows, resolved.decisions.prefill.waves, Default::default());
+        assert_eq!(cfg.indexers, vec![crate::families::glm5::GlmIndexer::Full,
+            crate::families::glm5::GlmIndexer::Shared]);
+        // Shared layers reuse indices: candidates cross the peer only for the full indexer.
+        assert_eq!(placement.peer_row_bytes, 2 * (geometry.query_row_bytes + geometry.partial_row_bytes)
+            + geometry.candidate_row_bytes);
+        for rank in 0..2 {
+            // Traffic is per layer; candidate storage is one reusable owner per rank.
+            let candidates = resolved.facts.allocations.iter().filter(|owner|
+                owner.id == format!("glm.exchange.rank.{rank}.context.candidates")).collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].bytes, super::super::DECODE_ROWS * geometry.candidate_row_bytes);
+            assert_eq!(placement.items[rank], resolved.items(Location::coordinator(rank as u8)).unwrap());
+            assert_eq!(placement.expert_ranges[rank].layers, 0);
+            assert_eq!(placement.expert_ranges[rank].peak_bytes, 0);
+        }
+        if onboard == 0 {
+            assert_eq!(placement.layers[1].experts, ExpertHome::Spark);
+            assert_eq!(working.rtx_layers, Vec::<usize>::new());
+            assert_eq!(working.spark_layers, vec![1]);
+            assert_eq!(working.selected_ranks().collect::<Vec<_>>(), vec![0, 1]);
+            assert!(placement.tp2.is_none());
+        } else {
+            assert_eq!(resolved.decisions.onboard_layers, vec![vec![1], vec![1]]);
+            assert_eq!(placement.layers[1].experts, ExpertHome::RtxTp2);
+            assert_eq!(working.rtx_layers, vec![1]);
+            assert!(working.spark_layers.is_empty());
+            assert!(working.selected_ranks().next().is_none());
+            let range = placement.tp2.as_ref().unwrap();
+            assert_eq!((range.first, range.layers, range.peak_bytes), (1, 1, [113, 118]));
+            assert!(placement.summary().contains("TP2"));
+            assert_eq!(placement.items[0].iter().find(|item| item.group == "local routes").unwrap().bytes, 201);
+            assert_eq!(placement.items[0].iter().find(|item| item.group == "local backend").unwrap().bytes, 113);
+        }
+    }
+}
+
+#[test]
+fn execution_adapter_preserves_whole_expert_range_and_shared_hop_geometry() {
+    use crate::placement::{ExpertHome, HopSpec, HopStorage, TerminalHome, plan_hops, residual_homes};
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    recipe.attention = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+    recipe.targets.clear();
+    recipe.exchanges.clear();
+    recipe.experts.as_mut().unwrap().destination = vec![1];
+    let mut local = local_execution_inventory();
+    local.owners.retain(|owner| owner.location == Location::coordinator(1));
+    local.views.retain(|owner| owner.location == Location::coordinator(1));
+    let resolved = planner::solve(Request { onboard: Pin::Exact(1), ..request() }, budgets(), &recipe).unwrap();
+    let (placement, working) = recipe.execution(&resolved, &local).unwrap();
+    assert_eq!(placement.attention_placement, AttentionPlacement::Layers);
+    assert_eq!(placement.layers[1].experts, ExpertHome::RtxWhole { gpu: 1 });
+    assert_eq!(resolved.decisions.onboard_layers, vec![vec![], vec![1]]);
+    assert!(placement.tp2.is_none());
+    assert_eq!(placement.expert_ranges[0].layers, 0);
+    let range = &placement.expert_ranges[1];
+    assert_eq!((range.first, range.layers, range.peak_bytes), (1, 1, 118));
+    assert_eq!(placement.peer_row_bytes, 0);
+    assert_eq!(working.rtx_layers, vec![1]);
+    let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2,
+        rows: resolved.decisions.prefill.rows.max(64), lanes: resolved.decisions.prefill.waves,
+        entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+    assert_eq!(placement.residual, residual_homes(&recipe.attention, &spec).unwrap());
+    assert_eq!(placement.hops, plan_hops(&recipe.attention, &spec).unwrap());
+}
+
+#[test]
+fn execution_adapter_refuses_nonprefix_sparks_without_renumbering_or_clamping() {
+    let cfg = cfg();
+    let recipe = recipe(&cfg);
+    let resolved = planner::solve(Request { onboard: Pin::Exact(0), ..request() }, budgets(), &recipe).unwrap();
+    let mut nonprefix = resolved.clone();
+    nonprefix.decisions.expert_homes.insert(1, ExpertDestination::Sparks { ranks: vec![2, 3] });
+    let error = recipe.execution(&nonprefix, &Default::default()).unwrap_err();
+    assert!(matches!(error, Refusal::InvalidFact(ref detail)
+        if detail.contains("non-prefix rank sets cannot be renumbered")));
+    let mut wrong_prefix = resolved.clone();
+    wrong_prefix.decisions.expert_homes.insert(1, ExpertDestination::Coordinator { gpus: vec![0, 1] });
+    assert!(matches!(recipe.execution(&wrong_prefix, &Default::default()), Err(Refusal::InvalidFact(_))));
+    assert!(matches!(planner::solve(Request { onboard: Pin::Exact(2), ..request() }, budgets(), &recipe),
+        Err(Refusal::PinConflict)));
 }
 
 #[test]
@@ -700,57 +1146,499 @@ fn shared_serving_owners_compose_without_family_private_geometry_or_policy() {
     }
 }
 
+fn graph_layers(owners: &[u8], tp2: &[bool]) -> Vec<GlmGraphLayer> {
+    owners.iter().zip(tp2).enumerate().map(|(index, (&owner, &tp2))| GlmGraphLayer {
+        dense: index == 0, local: tp2, attention_owner: Some(owner),
+    }).collect()
+}
+
 #[test]
-fn owned_graph_census_is_fixed_above_full_context_and_separates_opaque_growth() {
-    use crate::serving_capacity::glm_graphs::glm_owned_startup_graphs;
-    let owners = [0, 1];
-    let tp2 = [false, true];
-    for context in [64, 1024, 1025, 131072, 131073, 262144, 262145, 1 << 20] {
-        let graphs = OwnedGraphs::new(context, &owners, &tp2).unwrap();
-        let floor = (context as usize).div_ceil(super::super::PAGE_ROWS as usize);
-        for pages in [floor, floor + 1, floor * 2, 32768] {
-            let actual = glm_owned_startup_graphs(context as usize, pages, &owners, &tp2).unwrap();
-            assert_eq!(&actual, graphs.startup());
+fn maintained_graph_figures_cover_every_placement_without_an_automatic_growth_margin() {
+    for (attention, gpus) in [(AttentionPlacement::Heads, 1), (AttentionPlacement::Heads, 2),
+        (AttentionPlacement::Context, 2), (AttentionPlacement::Layers, 2)] {
+        let mut layers = graph_layers(&[0, 1], &[false, gpus == 2]);
+        if attention != AttentionPlacement::Layers {
+            for layer in &mut layers { layer.attention_owner = None; }
         }
-        let components = graphs.components(32768).unwrap();
-        assert_eq!(components.len(), 4);
-        for rank in 0..2 {
-            for (index, at) in [Phase::Warmup, Phase::Growth].into_iter().enumerate() {
-                let component = &components[2 * rank + index];
+        for context in [64, 1024, 1025, 131072, 131073, 262144, 262145, 1 << 20] {
+            let graphs = StartupGraphs::new(context, attention, gpus, &layers, 4).unwrap();
+            let floor = (context as usize).div_ceil(PAGE_ROWS as usize);
+            for pages in [floor, floor + 1, floor * 2, 32768] {
+                let actual = glm_declared_graphs(&glm_graph_shapes(context as usize, pages),
+                    attention, gpus, &layers, 4).unwrap();
+                for (rank, declared) in actual.iter().enumerate() {
+                    assert_eq!(declared.fingerprint(rank as u8).unwrap(),
+                        graphs.declared()[rank].fingerprint(rank as u8).unwrap());
+                }
+            }
+            let components = graphs.components(32768).unwrap();
+            assert_eq!(components.len(), gpus, "one whole-set figure, no growth reserve");
+            for (rank, component) in components.iter().enumerate() {
                 let ComponentKind::Allowance(allowance) = &component.kind else {
                     panic!("graphs are opaque, not physical allocations")
                 };
                 assert_eq!(allowance.location, Location::coordinator(rank as u8));
-                assert_eq!(
-                    allowance.lifetime,
-                    Lifetime {
-                        first: at,
-                        last: Phase::Growth
-                    }
-                );
-                assert!(allowance.assumed);
-                assert!(allowance.source.contains("5090 unmeasured"));
-                let expected = if index == 0 {
-                    graphs.startup().inventory.at_ready(rank)
-                } else {
-                    graphs.startup().inventory.growth(rank)
-                };
-                assert_eq!(allowance.bytes, expected);
+                assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
+                assert!(allowance.assumed, "these synthetic layouts are estimated, not measured");
+                assert!(allowance.source.contains("instantiate"));
+                let figure = graphs.figures()[rank];
+                assert_eq!(allowance.bytes, figure.bytes);
+                let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
+                let keys = if rank == 0 { 16_827u128 } else { 16_614 };
+                assert_eq!(u128::from(figure.bytes),
+                    (u128::from(source.bytes) * if attention == AttentionPlacement::Layers {
+                        (layers.len() * glm_graph_shapes(context as usize, floor).len()) as u128
+                    } else { graphs.declared()[rank].len() as u128 }).div_ceil(keys));
                 for pages in [1, floor as u64, 32768] {
-                    assert_eq!(component.bytes.at(pages).unwrap(), expected);
+                    assert_eq!(component.bytes.at(pages).unwrap(), figure.bytes);
                 }
             }
         }
     }
-    assert!(OwnedGraphs::new(0, &owners, &tp2).is_err());
-    assert!(OwnedGraphs::new(64, &[2, 0], &tp2).is_err());
-    assert!(OwnedGraphs::new(64, &owners, &[false]).is_err());
-    assert!(
-        OwnedGraphs::new(64, &owners, &tp2)
-            .unwrap()
-            .components(0)
-            .is_err()
-    );
+    let layers = graph_layers(&[0, 1], &[false, true]);
+    assert!(StartupGraphs::new(0, AttentionPlacement::Layers, 2, &layers, 4).is_err());
+    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 2,
+        &graph_layers(&[2, 0], &[false, true]), 4).is_err());
+    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 1, &layers, 4).is_err());
+    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 2, &layers, 4)
+        .unwrap().components(0).is_err());
+}
+
+#[test]
+fn measured_reference_figures_match_independently_declared_min_max_sets() {
+    let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
+        dense: layer < 3, local: false, attention_owner: None,
+    }).collect();
+    let mut max_layers = min_layers.clone();
+    for layer in &mut max_layers[3..9] { layer.local = true; }
+    let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
+    let max = StartupGraphs::new(1 << 20, AttentionPlacement::Context, 2, &max_layers, 6).unwrap();
+    assert_eq!(min.declared()[0].fingerprint(0).unwrap(), MIN_GRAPHS);
+    assert_eq!(min.figures(), [GLM_MIN_GRAPH]);
+    assert_eq!(min.figures()[0].bytes, 2_560_622_592);
+    assert_eq!(GLM_MIN_CONTEXT.bytes, 598_999_040);
+    assert_eq!(max.figures(), GLM_MAX_GRAPH);
+    assert_eq!(GLM_MAX_CONTEXT.map(|figure| figure.bytes), [594_804_736, 603_193_344]);
+    assert_eq!(GLM_MAX_GRAPH.map(|figure| figure.bytes), [3_042_967_552, 2_971_664_384]);
+    for rank in 0..2 {
+        assert_eq!(max.declared()[rank].fingerprint(rank as u8).unwrap(), MAX_GRAPHS[rank]);
+        assert_eq!(max.figures()[rank].attribution, FigureAttribution::Measured);
+        let ComponentKind::Allowance(allowance) = &max.components(32768).unwrap()[rank].kind else {
+            panic!("expected graph allowance")
+        };
+        assert!(!allowance.assumed);
+        assert_eq!(allowance.bytes, GLM_MAX_GRAPH[rank].bytes);
+    }
+    let mut owned = max_layers.clone();
+    for (layer, spec) in owned.iter_mut().enumerate() { spec.attention_owner = Some((layer % 2) as u8); }
+    let layers = StartupGraphs::new(1 << 20, AttentionPlacement::Layers, 2, &owned, 6).unwrap();
+    for rank in 0..2 {
+        assert!(layers.declared()[rank].len() > max.declared()[rank].len() * 2);
+        assert!(layers.figures()[rank].bytes <= GLM_MAX_GRAPH[rank].bytes);
+        assert!(layers.figures()[rank].bytes > GLM_MAX_GRAPH[rank].bytes * 9 / 10);
+        assert!(matches!(layers.figures()[rank].attribution, FigureAttribution::Estimated { .. }));
+    }
+    // Equal counts are not graph-set identity: heads and context have different tables.
+    let heads = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6).unwrap();
+    for figure in heads.figures() {
+        assert!(matches!(figure.attribution, FigureAttribution::Estimated { .. }));
+    }
+}
+
+#[test]
+fn runtime_figures_preserve_recorded_peaks_without_double_charging_or_margins() {
+    for (ranks, layout, context, unattributed) in [
+        (1, MIN_LAYOUT, vec![598_999_040], vec![621_275_328]),
+        (2, MAX_LAYOUT, vec![594_804_736, 603_193_344], vec![912_069_460, 581_053_972]),
+    ] {
+        let figures = RuntimeFigures::new(ranks, layout).unwrap();
+        assert_eq!(figures.context().iter().map(|f| f.bytes).collect::<Vec<_>>(), context);
+        assert_eq!(figures.unattributed().iter().map(|f| f.bytes).collect::<Vec<_>>(), unattributed);
+        assert!(figures.context().iter().chain(figures.unattributed())
+            .all(|f| f.attribution == FigureAttribution::Measured));
+        let load = if ranks == 1 { vec![552_230_080] } else { vec![843_024_212, 509_750_804] };
+        assert_eq!(figures.load().iter().map(|f| f.bytes).collect::<Vec<_>>(), load);
+        for maximum in [1, 32768] {
+            let components = figures.components(maximum).unwrap();
+            assert_eq!(components.len(), ranks * 3);
+            for (index, component) in components.iter().enumerate() {
+                let ComponentKind::Allowance(owner) = &component.kind else {
+                    panic!("opaque runtime has no invented allocation owner")
+                };
+                let rank = index % ranks;
+                let (bytes, lifetime) = match index / ranks {
+                    0 => (context[rank], Lifetime::RESIDENT),
+                    1 => (load[rank], Lifetime { first: Phase::Load, last: Phase::Warmup }),
+                    _ => (unattributed[rank], Lifetime { first: Phase::Ready, last: Phase::Growth }),
+                };
+                assert_eq!(owner.location, Location::coordinator(rank as u8));
+                assert_eq!(owner.bytes, bytes);
+                assert!(!owner.assumed);
+                assert_eq!(owner.lifetime, lifetime);
+                assert_eq!(component.activation, Activation::always());
+                assert_eq!(component.bytes.at(1).unwrap(), bytes);
+                assert_eq!(component.bytes.at(maximum).unwrap(), bytes);
+            }
+        }
+        let estimated = RuntimeFigures::new(ranks, "different complete layout").unwrap();
+        for (source, derived) in figures.context().iter().chain(figures.load()).chain(figures.unattributed())
+            .zip(estimated.context().iter().chain(estimated.load()).chain(estimated.unattributed())) {
+            assert_eq!(derived.bytes, source.bytes, "uncovered is not permission to add a margin");
+            assert_eq!(derived.evidence, source.evidence);
+            assert_eq!(derived.producing_commit, source.producing_commit);
+            assert!(matches!(derived.attribution, FigureAttribution::Estimated { .. }));
+        }
+        assert!(estimated.components(32768).unwrap().iter().all(|component|
+            matches!(&component.kind, ComponentKind::Allowance(a) if a.assumed)));
+        assert!(figures.components(0).is_err());
+    }
+    for ranks in [0, 3, usize::MAX] { assert!(RuntimeFigures::new(ranks, MIN_LAYOUT).is_err()); }
+    assert!(RuntimeFigures::new(1, " ").is_err());
+}
+
+#[test]
+fn load_allowances_cover_each_reference_sample_and_do_not_overlap_ready() {
+    // #1242 raw untracked samples: target, draft, pool, transport, warmed graph.
+    // The final sample has signed instantiate bytes removed; no other graph
+    // bytes are subtracted before instantiate actually happened.
+    for (gpus, layout, rank, raw, context, graph) in [
+        (1, MIN_LAYOUT, 0, [742_390_144, 865_686_208, 988_469_184, 1_078_613_952, 3_711_851_712],
+            598_999_040, 2_560_622_592),
+        (2, MAX_LAYOUT, 0, [863_806_848, 940_924_096, 1_267_960_148, 1_437_828_948, 4_480_796_500],
+            594_804_736, 3_042_967_552),
+        (2, MAX_LAYOUT, 1, [743_268_224, 743_268_224, 1_082_881_044, 1_110_846_996, 4_084_608_532],
+            603_193_344, 2_971_664_384),
+    ] {
+        let figures = RuntimeFigures::new(gpus, layout).unwrap();
+        let peak = raw.into_iter().enumerate().map(|(i, bytes)|
+            bytes - context - if i == 4 { graph } else { 0 }).max().unwrap();
+        assert_eq!(figures.load()[rank].bytes, peak);
+        let components = figures.components(32768).unwrap();
+        for phase in PhaseOrder::DRAFT_THEN_TARGET.phases() {
+            let opaque = components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allowance(owner) if owner.location == Location::coordinator(rank as u8)
+                    && owner.lifetime.contains(*phase, PhaseOrder::DRAFT_THEN_TARGET) => Some(owner.bytes),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(opaque.len(), 2, "context plus exactly one residual in {phase}");
+            assert_eq!(opaque.iter().sum::<u64>(), context + if matches!(phase, Phase::Ready | Phase::Growth) {
+                figures.unattributed()[rank].bytes
+            } else { peak });
+        }
+    }
+}
+
+#[test]
+fn host_figures_keep_reference_receipts_and_estimate_uncovered_layouts_without_scaling() {
+    use crate::placement::inventory::{FigureUse, census_recommendation};
+    for (gpus, layout, load, steady) in [
+        (1, MIN_LAYOUT, GLM_MIN_HOST_LOAD, GLM_MIN_HOST_STEADY),
+        (2, MAX_LAYOUT, GLM_MAX_HOST_LOAD, GLM_MAX_HOST_STEADY),
+    ] {
+        let figures = HostFigures::for_layout(gpus, layout).unwrap();
+        assert_eq!(figures.load(), load);
+        assert_eq!(figures.steady(), steady);
+        assert_eq!(load.attribution, FigureAttribution::Measured);
+        let recommendation = census_recommendation([
+            FigureUse { name: "host load", figure: load, current: load.identity },
+            FigureUse { name: "host steady", figure: steady, current: steady.identity },
+        ]);
+        if gpus == 1 {
+            assert_eq!(load.bytes, 5_759_569_920);
+            assert_eq!(steady.bytes, 40_403_427_328 - 36_902_883_328);
+            let FigureAttribution::Estimated { derivation } = steady.attribution else {
+                panic!("incomplete min Ready must never become a measured receipt")
+            };
+            assert!(derivation.contains("ordinary_rss_bytes missing and complete=false"));
+            let recommendation = recommendation.unwrap();
+            assert!(recommendation.contains("census recommended"));
+            assert!(recommendation.contains("host steady"));
+            assert!(!recommendation.contains("host load"));
+        } else {
+            assert_eq!(load.bytes, 8_439_906_304);
+            assert_eq!(steady.bytes, 8_439_906_304);
+            assert_eq!(steady.attribution, FigureAttribution::Measured);
+            assert!(recommendation.is_none());
+        }
+        for sparks in [0, 1, 4, 6, 8] {
+            let uncovered = HostFigures::for_layout(gpus, &format!("other layout; sparks/{sparks}")).unwrap();
+            for (source, derived) in [(load, uncovered.load()), (steady, uncovered.steady())] {
+                assert_eq!(derived.bytes, source.bytes);
+                assert_eq!(derived.evidence, source.evidence);
+                assert_eq!(derived.identity, source.identity);
+                assert_eq!(derived.producing_commit, source.producing_commit);
+                let FigureAttribution::Estimated { derivation } = derived.attribution else {
+                    panic!("an uncovered layout is estimated")
+                };
+                assert!(derivation.contains("no Spark-count scaling"));
+                assert!(derivation.contains(if gpus == 1 {
+                    "glm53-exl3-min-census-r1"
+                } else { "glm53-exl3-max-census-r1" }));
+                assert!(derivation.contains("#1242 retained coordinator log"));
+            }
+        }
+        assert!(figures.components(0).is_err());
+    }
+    for gpus in [0, 3, usize::MAX] {
+        assert!(HostFigures::for_layout(gpus, MIN_LAYOUT).is_err());
+    }
+    assert!(HostFigures::for_layout(1, " ").is_err());
+}
+
+#[test]
+fn host_envelopes_cover_every_startup_phase_exactly_once_including_warmup() {
+    let order = PhaseOrder::DRAFT_THEN_TARGET;
+    let phases = order.phases();
+    let ready = phases.iter().position(|phase| *phase == Phase::Ready).unwrap();
+    assert_eq!(phases[ready - 1], Phase::Warmup);
+    for (gpus, layout) in [(1, MIN_LAYOUT), (2, MAX_LAYOUT)] {
+        let figures = HostFigures::for_layout(gpus, layout).unwrap();
+        for maximum in [1, 32768] {
+            let components = figures.components(maximum).unwrap();
+            assert_eq!(components.len(), 2, "process RSS is never multiplied by GPU count");
+            for &phase in phases {
+                let active: Vec<_> = components.iter().filter_map(|component| {
+                    assert_eq!(component.activation, Activation::always());
+                    let ComponentKind::Allowance(allowance) = &component.kind else {
+                        panic!("RSS is opaque, not an invented allocation owner")
+                    };
+                    assert_eq!(allowance.location, Location::HOST);
+                    assert_eq!(component.bytes.at(1).unwrap(), allowance.bytes);
+                    assert_eq!(component.bytes.at(maximum).unwrap(), allowance.bytes);
+                    allowance.lifetime.contains(phase, order).then_some(allowance)
+                }).collect();
+                assert_eq!(active.len(), 1, "{gpus} GPUs, phase {phase:?}");
+                let expected = if order.at_or_before(phase, Phase::Warmup) {
+                    figures.load()
+                } else { figures.steady() };
+                assert_eq!(active[0].bytes, expected.bytes);
+                assert_eq!(active[0].assumed,
+                    matches!(expected.attribution, FigureAttribution::Estimated { .. }));
+            }
+        }
+    }
+}
+
+#[test]
+fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight_facts() {
+    let cfg = cfg();
+    let mut without = recipe(&cfg);
+    for case in &mut without.weights {
+        case.value.core_loading.heap_payload_bytes = 54321;
+    }
+    let maximum = without.maximum_pages;
+    fn owner(id: impl Into<String>, location: Location, bytes: u64, lifetime: Lifetime) -> Allocation {
+        Allocation::buffer(id, location, bytes, lifetime, Category::Staging, "domain preservation")
+    }
+    let heap = owner("test.host.retained", Location::HOST, 512, Lifetime::RESIDENT);
+    let mut components = DflashPrefetch { file_bytes: 98765 }.components(maximum).unwrap();
+    for (id, location, bytes, deferred) in [
+        ("test.host.retained", Location::HOST, 512, false),
+        ("test.host.deferred", Location::HOST, 256, true),
+        ("glm.media.cache", Location::HOST, 4096, false),
+        ("test.pinned.retained", Location::PINNED, 1024, false),
+        ("test.device.retained", Location::coordinator(1), 2048, false),
+    ] {
+        components.push(Component::allocation(owner(id, location, bytes, Lifetime::RESIDENT),
+            ByteCurve::fixed(bytes, maximum), deferred, maximum));
+    }
+    components.push(Component::resident_weight(
+        ResidentWeight::from_allocation(&heap, crate::placement::ResidentWeights(heap.bytes)),
+        ByteCurve::fixed(heap.bytes, maximum)));
+    for (name, location) in [("host", Location::HOST), ("pinned", Location::PINNED),
+        ("device", Location::coordinator(0))] {
+        let group = Sequential { id: format!("test.{name}.sequential"),
+            members: [64, 128].into_iter().enumerate().map(|(index, bytes)| owner(
+                format!("test.{name}.sequential.{index}"), location, bytes,
+                Lifetime { first: Phase::Load, last: Phase::Load })).collect() };
+        components.push(Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(group.peak(), maximum), kind: ComponentKind::Sequential(group) });
+    }
+    components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(4096, maximum), kind: ComponentKind::Reservation(Reservation {
+            id: "test.pinned.load.reserve".into(), location: Location::PINNED, bytes: 4096,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+            source: "synthetic bounded pinned load pool".into(),
+        }) });
+    without.owners.push(Case { when: vec![], value: components });
+    let mut with = without.clone();
+    let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
+    with.host = Some(host.clone());
+    for shape in without.prefill.clone() {
+        for count in [0, 1] {
+            let request = Request { onboard: Pin::Exact(count), prefill: Pin::Exact(shape), ..request() };
+            let before = planner::solve(request.clone(), budgets(), &without).unwrap();
+            let after = planner::solve(request, budgets(), &with).unwrap();
+            assert_eq!(after.decisions, before.decisions);
+            assert_eq!(after.pool_tokens, before.pool_tokens);
+            assert_eq!(after.facts.resident_weights, before.facts.resident_weights);
+            assert!(after.facts.resident_weights.iter().any(|fact| fact.id == heap.id));
+            let nonhost = |facts: &Facts| {
+                let mut facts = facts.clone();
+                facts.allocations.retain(|a| a.location != Location::HOST);
+                facts.deferred.retain(|a| a.location != Location::HOST);
+                facts.sequential.retain(|g| g.members[0].location != Location::HOST);
+                facts.allowances.retain(|a| a.location != Location::HOST);
+                facts
+            };
+            assert_eq!(nonhost(&after.facts), nonhost(&before.facts),
+                "every PINNED/device owner, view, reservation and byte total is unchanged");
+            assert!(before.facts.allowances.iter().any(|a|
+                a.source.contains("serialized target payload heap subset")));
+            assert!(before.facts.allowances.iter().any(|a| a.source.contains("DFlash whole-file")));
+            let retained_host = after.facts.allocations.iter().chain(&after.facts.deferred)
+                .filter(|a| a.location == Location::HOST).collect::<Vec<_>>();
+            assert_eq!(retained_host.len(), 1);
+            assert_eq!((retained_host[0].id.as_str(), retained_host[0].bytes), ("glm.media.cache", 4096),
+                "future media capacity is not covered by the text-only RSS census");
+            assert!(after.facts.sequential.iter().all(|g| g.members[0].location != Location::HOST));
+            assert!(after.facts.reservations.iter().all(|r| r.location != Location::HOST));
+            let allowances: Vec<_> = after.facts.allowances.iter()
+                .filter(|a| a.location == Location::HOST).collect();
+            assert_eq!(allowances.len(), 2);
+            assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
+                host.load().bytes + host.steady().bytes);
+            for phase in after.facts.phase_order.phases() {
+                let active: Vec<_> = allowances.iter().filter(|a|
+                    a.lifetime.contains(*phase, after.facts.phase_order)).collect();
+                assert_eq!(active.len(), 1);
+                let expected = if after.facts.phase_order.at_or_before(*phase, Phase::Warmup) {
+                    host.load().bytes
+                } else { host.steady().bytes };
+                assert_eq!(active[0].bytes, expected);
+            }
+        }
+    }
+    with.host = Some(HostFigures::for_layout(1, MIN_LAYOUT).unwrap());
+    assert!(matches!(with.prepare(&request()), Err(Refusal::InvalidFact(_))));
+}
+
+#[test]
+fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
+    use crate::placement::planner::serving::{HostPrefixOwners, ServingOwners};
+    use cuteafd_core::prefix::HostCacheGeometry;
+
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
+    recipe.host = Some(host.clone());
+    // Fix embedding placement so the shortage cannot move its backing to a GPU.
+    recipe.embedding = vec![EmbeddingHome::HostPinned];
+    recipe.weights.retain(|case|
+        matches!(case.when.as_slice(), [When::Embedding(EmbeddingHome::HostPinned)]));
+    let request = Request { onboard: Pin::Exact(0), prefill: Pin::Exact(recipe.prefill[0]),
+        ..request() };
+    let without_prefix = planner::solve(request.clone(), budgets(), &recipe).unwrap();
+    let steady = without_prefix.phases.iter().find(|phase|
+        phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
+    assert_eq!(steady.opaque, host.steady().bytes);
+    let pinned: u64 = without_prefix.facts.allocations.iter().filter(|owner|
+        owner.location == Location::PINNED && owner.view.is_none()
+            && owner.lifetime.contains(Phase::Ready, without_prefix.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert!(pinned > 0);
+    assert_eq!(steady.owned, pinned);
+
+    // Use the existing resolver, not a new cutover default or free-RAM clamp.
+    let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
+        mark_bytes: 0, draft_bytes: 0 };
+    let chunk = geometry.chunk_bytes();
+    let host_total = 128 << 30;
+    for explicit in [None, Some(40 << 30)] {
+        let quota = geometry.resolve(explicit, 1 << 20, 16, host_total, chunk).unwrap();
+        assert_eq!(quota, explicit.unwrap_or(32 << 30));
+        let mut with_prefix = recipe.clone();
+        let prefix = HostPrefixOwners { quota_bytes: quota, chunk_bytes: chunk }
+            .allocations("glm.host.prefix", ServingOwners::LIFETIME).unwrap();
+        assert_eq!(prefix.iter().map(|owner| owner.bytes).sum::<u64>(), quota);
+        with_prefix.owners.push(Case { when: vec![], value: prefix.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, with_prefix.maximum_pages);
+            Component::allocation(owner, bytes, false, with_prefix.maximum_pages)
+        }).collect() });
+        let mut joint = budgets();
+        let occupied = 128 << 20;
+        let headroom = 256 << 20;
+        let available = host.steady().bytes + pinned + quota;
+        joint[2] = Budget { id: "physical.2".into(),
+            locations: vec![Location::HOST, Location::PINNED],
+            physical_bytes: available + occupied + headroom,
+            logical_bytes: available + occupied + headroom,
+            baseline: Baseline::Forecast { occupied, source: "external host consumers".into(),
+                assumed: false }, headroom };
+        assert_eq!(joint[2].available().unwrap() - host.steady().bytes - pinned, quota);
+        let admitted = planner::solve(request.clone(), joint.clone(), &with_prefix).unwrap();
+        let ready = admitted.phases.iter().find(|phase|
+            phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
+        assert_eq!(ready.opaque, host.steady().bytes);
+        assert_eq!(ready.owned, pinned + quota);
+        assert_eq!(admitted.pool_tokens, without_prefix.pool_tokens);
+        assert_eq!(admitted.decisions, without_prefix.decisions);
+        assert_eq!(admitted.facts.allocations.iter().filter(|owner|
+            owner.id.starts_with("glm.host.prefix.")).map(|owner| owner.bytes).sum::<u64>(), quota);
+        joint[2].logical_bytes -= 1;
+        assert!(matches!(planner::solve(request.clone(), joint, &with_prefix),
+            Err(Refusal::Capacity { budget, required, available: free, .. })
+                if budget == "physical.2" && required == available && free == available - 1),
+            "a fixed quota refuses instead of silently shrinking into remaining RAM");
+    }
+}
+
+#[test]
+fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
+    use crate::placement::planner::serving::{HostPrefixOwners, ServingOwners};
+    use cuteafd_core::prefix::HostCacheGeometry;
+
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
+    recipe.host = Some(host.clone());
+    let request = Request { onboard: Pin::Exact(0), prefill: Pin::Exact(recipe.prefill[0]),
+        ..request() };
+    let without_prefix = planner::solve(request.clone(), budgets(), &recipe).unwrap();
+    assert_eq!(without_prefix.decisions.embedding, Some(EmbeddingHome::HostPinned));
+    let embedding = without_prefix.facts.allocations.iter()
+        .find(|owner| owner.id == "glm.weights.embedding").unwrap();
+    assert_eq!(embedding.location, Location::PINNED);
+    assert_eq!(embedding.bytes, 8192);
+    let pinned = without_prefix.phases.iter().find(|phase|
+        phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap().owned;
+    let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
+        mark_bytes: 0, draft_bytes: 0 };
+    let chunk = geometry.chunk_bytes();
+    for explicit in [None, Some(40 << 30)] {
+        let quota = geometry.resolve(explicit, 1 << 20, 16, 128 << 30, chunk).unwrap();
+        let mut with_prefix = recipe.clone();
+        let prefix = HostPrefixOwners { quota_bytes: quota, chunk_bytes: chunk }
+            .allocations("glm.host.prefix", ServingOwners::LIFETIME).unwrap();
+        with_prefix.owners.push(Case { when: vec![], value: prefix.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, with_prefix.maximum_pages);
+            Component::allocation(owner, bytes, false, with_prefix.maximum_pages)
+        }).collect() });
+        let available = host.steady().bytes + pinned + quota;
+        let mut joint = budgets();
+        joint[2].physical_bytes = available;
+        joint[2].logical_bytes = available;
+        let exact = planner::solve(request.clone(), joint.clone(), &with_prefix).unwrap();
+        assert_eq!(exact.decisions, without_prefix.decisions);
+        joint[2].logical_bytes -= 1;
+        let moved = planner::solve(request.clone(), joint, &with_prefix).unwrap();
+        assert_eq!(moved.decisions.embedding, Some(EmbeddingHome::Device(0)));
+        let mut expected = exact.decisions.clone();
+        expected.embedding = Some(EmbeddingHome::Device(0));
+        assert_eq!(moved.decisions, expected);
+        assert_eq!(moved.pool_tokens, without_prefix.pool_tokens);
+        assert_eq!(moved.facts.allocations.iter().filter(|owner|
+            owner.id.starts_with("glm.host.prefix.")).map(|owner| owner.bytes).sum::<u64>(), quota);
+        let ready = moved.phases.iter().find(|phase|
+            phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
+        assert_eq!(ready.opaque, host.steady().bytes);
+        assert_eq!(ready.owned, pinned + quota - embedding.bytes);
+        assert_eq!(ready.available - ready.owned - ready.opaque, embedding.bytes - 1);
+        let relocated = moved.facts.allocations.iter()
+            .find(|owner| owner.id == embedding.id).unwrap();
+        assert_eq!(relocated.location, Location::coordinator(0));
+        assert_eq!(relocated.bytes, embedding.bytes);
+    }
 }
 
 fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {
@@ -808,7 +1696,8 @@ fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {
                 first: count,
                 last: count,
             }],
-            value: OwnedGraphs::new(context, &[0, 1], &[false, count != 0]).unwrap(),
+            value: StartupGraphs::new(context, AttentionPlacement::Layers, 2,
+                &graph_layers(&[0, 1], &[false, count != 0]), 4).unwrap(),
         });
     }
     recipe
@@ -843,13 +1732,11 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     assert_eq!(plan.pool_tokens, wanted);
     assert_eq!(plan.request.context, context);
     assert_eq!(contract.maximum_pages, 32768);
-    // Actual startup census differs below the full-context floor; those keys
-    // may not be used to make an otherwise infeasible full request appear to fit.
-    let smaller = OwnedGraphs::new(context - 64, &[0, 1], &[false, false]).unwrap();
-    assert_ne!(
-        smaller.startup().keys,
-        recipe.graphs[0].value.startup().keys
-    );
+    // A smaller context changes the declaration; it cannot make the full request fit.
+    let smaller = StartupGraphs::new(context - 64, AttentionPlacement::Layers, 2,
+        &graph_layers(&[0, 1], &[false, false]), 4).unwrap();
+    assert_ne!(smaller.declared()[0].fingerprint(0).unwrap(),
+        recipe.graphs[0].value.declared()[0].fingerprint(0).unwrap());
     request.pool = Pin::Exact(wanted);
     assert_eq!(
         planner::solve(request.clone(), limits.clone(), &recipe)
@@ -881,7 +1768,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     request.pool = Pin::Auto;
     assert!(matches!(
         planner::solve(request.clone(), limits, &recipe),
-        Err(Refusal::Capacity { .. })
+        Err(Refusal::FullContextShortfall { .. })
     ));
     request.context -= 64;
     assert!(matches!(
@@ -891,7 +1778,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
 }
 
 #[test]
-fn owned_graph_census_must_match_every_activated_onboard_count_and_attention_owner() {
+fn declared_graphs_must_match_every_activated_onboard_count_and_attention_owner() {
     let cfg = cfg();
     let mut recipe = owned_graph_recipe(&cfg, 4096);
     let request = request();
@@ -902,12 +1789,14 @@ fn owned_graph_census_must_match_every_activated_onboard_count_and_attention_own
         Err(Refusal::InvalidFact(_))
     ));
     recipe.graphs[0].when = vec![When::Onboard { first: 0, last: 0 }];
-    recipe.graphs[0].value = OwnedGraphs::new(4096, &[1, 0], &[false, false]).unwrap();
+    recipe.graphs[0].value = StartupGraphs::new(4096, AttentionPlacement::Layers, 2,
+        &graph_layers(&[1, 0], &[false, false]), 4).unwrap();
     assert!(matches!(
         recipe.prepare(&request),
         Err(Refusal::InvalidFact(_))
     ));
-    recipe.graphs[0].value = OwnedGraphs::new(2048, &[0, 1], &[false, false]).unwrap();
+    recipe.graphs[0].value = StartupGraphs::new(2048, AttentionPlacement::Layers, 2,
+        &graph_layers(&[0, 1], &[false, false]), 4).unwrap();
     assert!(matches!(
         recipe.prepare(&request),
         Err(Refusal::InvalidFact(_))
@@ -991,172 +1880,6 @@ fn composition_refuses_mismatched_geometry_domains_and_non_target_experts() {
     beyond.context = 8192;
     assert!(matches!(
         base.prepare(&beyond),
-        Err(Refusal::InvalidFact(_))
-    ));
-}
-
-#[test]
-fn phase_returns_compose_per_physical_link_and_retain_bf16_fallback() {
-    use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
-    let cfg = cfg();
-    let mut recipe = recipe(&cfg);
-    for (link, ranks) in [vec![0, 1], vec![2, 3]].into_iter().enumerate() {
-        recipe.returns.push(Case {
-            when: vec![],
-            value: ReplyReturns {
-                id: format!("returns.decode.{link}"),
-                device: 0,
-                ranks: ranks.clone(),
-                phase: ReplyPhase::Decode,
-            },
-        });
-        for &shape in &recipe.prefill {
-            recipe.returns.push(Case {
-                when: vec![When::Prefill(shape)],
-                value: ReplyReturns {
-                    id: format!("returns.prefill.{link}"),
-                    device: 0,
-                    ranks: ranks.clone(),
-                    phase: ReplyPhase::Prefill(shape),
-                },
-            });
-        }
-    }
-    for prefill in [Bf16, Fp8, Nvfp4] {
-        for decode in [Bf16, Fp8, Nvfp4] {
-            for &shape in &recipe.prefill {
-                let request = Request {
-                    onboard: Pin::Exact(1),
-                    prefill: Pin::Exact(shape),
-                    spark_reply_formats: SparkReplyFormats {
-                        prefill: Some(prefill),
-                        decode: Some(decode),
-                    },
-                    ..request()
-                };
-                let plan = planner::solve(request, budgets(), &recipe).unwrap();
-                assert_eq!(
-                    plan.decisions.spark_reply_formats,
-                    Some(SparkReplyFormats {
-                        prefill: Some(prefill),
-                        decode: Some(decode)
-                    })
-                );
-                let returns: Vec<_> = plan
-                    .facts
-                    .allocations
-                    .iter()
-                    .filter(|a| a.id.starts_with("returns."))
-                    .collect();
-                assert_eq!(
-                    returns.len(),
-                    8,
-                    "two links per phase, two rank reserves per link"
-                );
-                for phase in ["decode", "prefill"] {
-                    let rows = if phase == "decode" {
-                        64
-                    } else {
-                        shape.rows * shape.waves
-                    };
-                    let expected = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                        rows * cfg.hidden as u64 * 2,
-                    )
-                    .unwrap();
-                    let owners: Vec<_> = returns
-                        .iter()
-                        .filter(|a| a.id.starts_with(&format!("returns.{phase}.")))
-                        .collect();
-                    assert_eq!(owners.len(), 4);
-                    assert!(owners.iter().all(|a| a.bytes == expected
-                        && a.location == Location::coordinator(0)
-                        && a.view.is_none()));
-                    assert_eq!(owners.iter().map(|a| a.bytes).sum::<u64>(), 4 * expected);
-                }
-                assert_eq!(plan.decisions.onboard_layers, vec![vec![1], vec![1]]);
-                assert!(
-                    !plan
-                        .facts
-                        .allocations
-                        .iter()
-                        .any(|a| a.id.contains("codec"))
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn return_owners_refuse_wrong_domains_links_and_duplicate_backings() {
-    let cfg = cfg();
-    let mut recipe = recipe(&cfg);
-    let shape = recipe.prefill[0];
-    let good = Case {
-        when: vec![When::Prefill(shape)],
-        value: ReplyReturns {
-            id: "returns.prefill".into(),
-            device: 0,
-            ranks: vec![0, 1],
-            phase: ReplyPhase::Prefill(shape),
-        },
-    };
-    for bad in [
-        Case {
-            when: vec![],
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                device: 2,
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                ranks: vec![1, 1],
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                ranks: vec![8],
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                ranks: vec![],
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                id: String::new(),
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-    ] {
-        recipe.returns = vec![bad];
-        assert!(matches!(
-            recipe.prepare(&request()),
-            Err(Refusal::InvalidFact(_))
-        ));
-    }
-    recipe.returns = vec![good.clone()];
-    recipe.spark_links = false;
-    assert!(matches!(
-        recipe.prepare(&request()),
-        Err(Refusal::InvalidFact(_))
-    ));
-    recipe.spark_links = true;
-    recipe.returns = vec![good.clone(), good];
-    assert!(matches!(
-        planner::solve(request(), budgets(), &recipe),
         Err(Refusal::InvalidFact(_))
     ));
 }
@@ -1255,4 +1978,66 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
             limit: 28671
         })
     ));
+}
+
+#[test]
+fn bf16_target_receipt_matches_selected_physical_representation() {
+    use crate::plan::{testing, Checkpoint};
+    let (config, tensors) = testing::glm5_compact_weights();
+    let tensors = tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+        .map(|(name, dtype, shape)| (name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)).collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut totals = Vec::new();
+    for bf16 in [false, true] {
+        let target = TargetFacts::checkpoint(&checkpoint, 2, 2, None, bf16,
+            &[EmbeddingHome::Device(0), EmbeddingHome::HostPinned], None).unwrap();
+        let device = target.device_weight_bytes(EmbeddingHome::Device(0)).unwrap();
+        let host = target.device_weight_bytes(EmbeddingHome::HostPinned).unwrap();
+        assert_eq!(device[0] - host[0], 64 * 256 * 2);
+        assert_eq!(device[1], host[1]);
+        assert!(target.device_weight_bytes(EmbeddingHome::Device(1)).is_err());
+        let groups = target.weights[0].1.resident_groups().unwrap();
+        assert_eq!(device, groups.iter().map(|rank| rank.iter().map(|entry| entry.2).sum()).collect::<Vec<u64>>());
+        totals.push(device.into_iter().sum::<u64>());
+    }
+    assert!(totals[1] > totals[0], "native BF16 must not use the FP8 admission");
+}
+
+#[test]
+fn scoring_host_output_is_additional_to_text_only_rss() {
+    let cfg = cfg();
+    let shape = PrefillShape { rows: 128, waves: 3 };
+    let mut input = production_input(&cfg, 2, 4, shape);
+    input.operation = Operation::Scoring;
+    let mut scoring = request();
+    scoring.operation = Operation::Scoring;
+    let admitted = input.prepare().unwrap().admit(scoring).unwrap();
+    let owner = admitted.solved.facts.allocations.iter().find(|owner| owner.id == "glm.scoring.host_logits").unwrap();
+    assert_eq!(owner.location, Location::HOST);
+    assert_eq!(owner.bytes, cuteafd_core::memory_layout::host_logits_bytes(128, 128, cfg.vocab_size as u64).unwrap());
+}
+
+#[test]
+fn optional_encoder_is_selected_jointly_and_never_uses_absent_spark_workers() {
+    use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let off = EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0, replicas: vec![], reason: "off".into(), shortfall: 0 };
+    recipe.encoders = vec![EncoderPlacement { kind: EncoderKind::Rtx { gpu: 1 }, weights: 1 << 50, scratch: 0,
+        ..off.clone() }, off.clone()];
+    let solved = planner::solve(request(), budgets(), &recipe).unwrap();
+    assert_eq!(solved.decisions.encoder, Some(1));
+    assert_eq!(solved.encoder_diagnostics.len(), 1);
+    assert!(solved.encoder_diagnostics[0].0.contains(&format!("during {}", Phase::Load)), "{:?}", solved.encoder_diagnostics);
+    assert!(solved.encoder_diagnostics[0].1 > 0);
+    assert!(!solved.facts.allocations.iter().any(|owner| owner.id.starts_with("glm.encoder")));
+    recipe.encoders.pop();
+    assert!(planner::solve(request(), budgets(), &recipe).is_err(), "explicit oversized encoder must refuse");
+    recipe.encoders = vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 }, weights: 256, ..off.clone() }, off];
+    let mut pinned = request();
+    pinned.onboard = Pin::Exact(recipe.experts.as_ref().unwrap().layers.len() as u64);
+    let solved = planner::solve(pinned, budgets(), &recipe).unwrap();
+    assert_eq!(solved.decisions.encoder, Some(1));
 }

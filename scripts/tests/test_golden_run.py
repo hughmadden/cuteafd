@@ -949,12 +949,9 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
-@pytest.mark.parametrize('family', ['kimi'])
-def test_raw_family_requires_raw_mode(env, capsys, family):
-    write_slot(env['home'], 'i1')
-    argv = ['--task', 'gr', '--family', family, '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
-    assert golden.main(argv) == 2
-    assert 'has no golden subcommand' in capsys.readouterr().err
+def test_kimi_golden_routes_to_its_subcommand():
+    args = ['--snapshot', '{snapshot}', '--windows', '/panel', '--peers', '{peers}']
+    assert golden.golden_args('kimi', args, sparks=True) == ['kimi-golden', *args]
 
 
 def test_muse_golden_routes_packing_and_worker_arguments():

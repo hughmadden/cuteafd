@@ -39,4 +39,12 @@ fn main() {
     let commit = if commit.trim().is_empty() { "unknown" } else { &commit };
     println!("cargo:rustc-env=CUTEAFD_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=CUTEAFD_BUILD_DIRTY={}", u8::from(dirty));
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let toolchain = Command::new(compiler).arg("-vV").output().ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).lines()
+            .map(str::trim).collect::<Vec<_>>().join("; "))
+        .filter(|text| !text.is_empty()).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=CUTEAFD_BUILD_TOOLCHAIN={toolchain}");
 }

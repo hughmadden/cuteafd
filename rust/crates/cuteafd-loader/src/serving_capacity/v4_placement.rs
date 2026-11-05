@@ -145,7 +145,7 @@ mod tp2_tests {
     }
     #[test]
     fn real_tp2_costs_match_catalog_reference() {
-        let inputs = crate::plan::testing::v4_placement_inputs().unwrap();
+        let inputs = crate::plan::inputs::v4_placement_inputs().unwrap();
         let hub = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
             .unwrap_or_else(|| "/mnt/sparknest/hf-home".into()).join("hub");
         for (model, family, resident, staging) in [

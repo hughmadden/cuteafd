@@ -272,7 +272,7 @@ impl<'a> Qwen4Loader<'a> {
         ensure!(tensor.meta.dtype == DType::Bf16, "{name}: expected BF16, found {:?}", tensor.meta.dtype);
         let rect = self.rect(name, None)?;
         let bytes = rect.bytes();
-        self.landed(vec![(rect, 0)], bytes, bytes.max(256), false)
+        self.landed(vec![(rect, 0)], bytes, resident::native_operand_bytes(bytes), false)
     }
 
     /// Native FP32 values land unchanged; BF16 values widen exactly on the GPU.
@@ -281,10 +281,10 @@ impl<'a> Qwen4Loader<'a> {
         let tensor = self.tensor(name)?;
         let rect = self.rect(name, None)?;
         match tensor.meta.dtype {
-            DType::F32 => { let bytes = rect.bytes(); self.landed(vec![(rect, 0)], bytes, bytes.max(256), false) }
+            DType::F32 => { let bytes = rect.bytes(); self.landed(vec![(rect, 0)], bytes, resident::native_operand_bytes(bytes), false) }
             DType::Bf16 => {
                 let width = rect.width();
-                let out = Allocation::new(self.device()?, (rect.bytes() * 2).max(256))?;
+                let out = Allocation::new(self.device()?, resident::native_operand_bytes(rect.bytes() * 2))?;
                 for (parts, window) in crate::shared::experts::rtx::dense::windows(&[rect], 1)? {
                     let dst = cuteafd_ffi::CuteafdDeviceBuffer {
                         // SAFETY: these rows' FP32 values lie inside `out` (twice the BF16 bytes).
@@ -487,7 +487,92 @@ mod coordinator_golden_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::projection_residency;
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn gdn_small_owners_match_admission_and_replay_payloads() -> Result<()> {
+        use crate::shared::experts::rtx::dense::{self, DenseLoad};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::plan::testing::{qwen4_config, t, write_snapshot};
+        use std::os::unix::fs::FileExt;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let mut config = qwen4_config(1);
+        config["text_config"]["hidden_size"] = 128.into();
+        let cfg = Qwen4Config::from_hf(&config)?;
+        let p = "model.language_model.layers.0";
+        let a = format!("{p}.linear_attn");
+        let mut tensors = vec![
+            t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
+            t(format!("{a}.in_proj_qkv.weight"), "BF16", &[cfg.gdn_conv_width(), cfg.hidden]),
+            t(format!("{a}.in_proj_z.weight"), "BF16", &[cfg.gdn_value_width(), cfg.hidden]),
+            t(format!("{a}.in_proj_b.weight"), "BF16", &[48, cfg.hidden]),
+            t(format!("{a}.in_proj_a.weight"), "BF16", &[48, cfg.hidden]),
+            t(format!("{a}.out_proj.weight"), "BF16", &[cfg.hidden, cfg.gdn_value_width()]),
+            t(format!("{a}.conv1d.weight"), "BF16", &[cfg.gdn_conv_width(), 1, 4]),
+            t(format!("{a}.norm.weight"), "BF16", &[128]),
+            t(format!("{p}.mlp.gate.weight"), "BF16", &[2, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[640, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert.up_proj.weight"), "BF16", &[640, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert_gate.weight"), "BF16", &[1, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert.down_proj.weight"), "BF16", &[cfg.hidden, 640]),
+        ];
+        for (prefix, inject) in [(format!("{p}.attn_hyper_connection"), true),
+            (format!("{p}.mlp_hyper_connection"), true),
+            ("model.language_model.hyper_connection_mixer".to_string(), false)] {
+            tensors.extend([t(format!("{prefix}.hc_norm.weight"), "BF16", &[cfg.hidden]),
+                t(format!("{prefix}.input_mix_weight_down.weight"), "BF16", &[4, cfg.hidden]),
+                t(format!("{prefix}.input_mix_weight_up.weight"), "BF16", &[cfg.hidden, 4])]);
+            if inject { tensors.push(t(format!("{prefix}.block_inject_weight.weight"), "BF16", &[4, cfg.hidden])); }
+        }
+        for dtype in ["BF16", "F32"] {
+            let mut tensors = tensors.clone();
+            tensors.extend([t(format!("{a}.A_log"), dtype, &[48]), t(format!("{a}.dt_bias"), dtype, &[48])]);
+            write_snapshot(fixture.directory(), &config, &tensors, None);
+            let checkpoint = Checkpoint::open(fixture.directory())?;
+            for tensor in &checkpoint.tensors {
+                let bytes = match tensor.meta.dtype {
+                    DType::Bf16 => (0..tensor.meta.byte_length / 2).flat_map(|i|
+                        (((0.125 * (1 + i % 7) as f32).to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<_>>(),
+                    DType::F32 => (0..tensor.meta.byte_length / 4).flat_map(|i|
+                        (0.125 * (1 + i % 7) as f32).to_le_bytes()).collect(),
+                    _ => unreachable!(),
+                };
+                std::fs::File::options().write(true).open(checkpoint.snapshot.join(&tensor.shard))?
+                    .write_all_at(&bytes, tensor.meta.byte_offset)?;
+            }
+            let loader = Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode: false,
+                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
+                dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
+            let mounted = loader.model(&cfg, 1, false, false)?;
+            let admitted = resident::checkpoint_resident_bytes(&checkpoint, &cfg, 1, false,
+                resident::Qwen4Representation::default())?;
+            assert_eq!(mounted.bytes() as u64, admitted.target_bytes + admitted.head_bytes);
+            let load = std::rc::Rc::new(DenseLoad::push(&library));
+            let planning = Qwen4Loader { dense: load.clone(), ..loader };
+            let (pushed, mut records) = dense::recording(|| planning.model(&cfg, 1, false, false))?;
+            records.extend(load.sink.as_ref().unwrap().take_all());
+            let sockets = tempfile::tempdir_in(fixture.directory())?;
+            let _committed = crate::shared::experts::rtx::push::tests::receive_pushed(
+                Device { library: &library, id: 0 }, None, &checkpoint.snapshot, sockets.path(), &records, None, 0, 0)?;
+            assert_eq!(pushed.bytes(), mounted.bytes());
+            for key in ["a_log", "dt_bias"] {
+                let mounted = &mounted.layers[0].operands[key];
+                let pushed = &pushed.layers[0].operands[key];
+                assert_eq!((mounted.buffer.bytes, pushed.buffer.bytes), (256, 256));
+                let read = |allocation: &Allocation<'_>| -> Result<Vec<u8>> {
+                    let mut bytes = vec![0; 48 * 4];
+                    library.copy_d2h(&mut bytes, allocation.buffer)?;
+                    Ok(bytes)
+                };
+                assert_eq!(read(mounted)?, read(pushed)?);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_projection_is_resident_in_exactly_one_representation() {

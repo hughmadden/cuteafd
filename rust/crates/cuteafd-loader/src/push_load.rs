@@ -120,11 +120,41 @@ fn load_group_with_client<T, E>(
     })
 }
 
+/// Linux reserves one pathname byte for NUL; abstract addresses use that byte
+/// for the leading NUL represented by `@` in the configured endpoint.
+#[derive(Debug, thiserror::Error)]
+#[error("{setting}: socket {kind} is {bytes} bytes > {limit} bytes")]
+pub struct SocketEndpointError {
+    pub setting: &'static str,
+    pub kind: &'static str,
+    pub bytes: usize,
+    pub limit: usize,
+}
+
+fn validate_endpoint(socket: &str, setting: &'static str) -> io::Result<()> {
+    let (kind, bytes) = match socket.strip_prefix('@') {
+        Some(name) => ("abstract name", name.len()),
+        None => ("path", socket.len()),
+    };
+    if bytes > 107 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            SocketEndpointError { setting, kind, bytes, limit: 107 }));
+    }
+    Ok(())
+}
+
+/// Validate before binding an isolated fake-source endpoint, without creating
+/// directories, removing socket paths, or silently renaming the endpoint.
+pub fn validate_socket_endpoint(socket: &str) -> io::Result<()> {
+    validate_endpoint(socket, "push socket")
+}
+
 /// Uses the shared protocol implementation, including deadlines from the first
 /// Create/Join send. No optional accelerator may hang normal model loading.
 pub struct PushClient {
     socket: String,
     timeout: Duration,
+    setting: &'static str,
 }
 
 impl Default for PushClient {
@@ -136,7 +166,7 @@ impl Default for PushClient {
 impl PushClient {
     fn configured(socket: Option<String>) -> Self {
         Self { socket: socket.filter(|name| !name.is_empty()).unwrap_or_else(|| SOCKET.into()),
-            timeout: PUSH_IDLE_TIMEOUT }
+            timeout: PUSH_IDLE_TIMEOUT, setting: "CUTEAFD_PUSH_SOCKET" }
     }
 
     /// Explicit endpoint for embedding and isolated startup protocol fixtures.
@@ -144,15 +174,18 @@ impl PushClient {
         if socket.is_empty() || timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid push endpoint or timeout"));
         }
-        Ok(Self { socket, timeout })
+        validate_socket_endpoint(&socket)?;
+        Ok(Self { socket, timeout, setting: "push socket" })
     }
 
     pub fn create(&self, ranks: Vec<RankSpec>, files: Vec<String>) -> io::Result<PushGroup> {
+        validate_endpoint(&self.socket, self.setting)?;
         Coordinator::create(&self.socket, ranks, files, Some(self.timeout))
             .map(|coordinator| PushGroup { coordinator })
     }
 
     pub fn join(&self, args: JoinArgs) -> io::Result<PushRank> {
+        validate_endpoint(&self.socket, self.setting)?;
         Rank::join(&self.socket, args, Some(self.timeout)).map(|rank| PushRank { rank })
     }
 }

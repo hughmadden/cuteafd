@@ -274,22 +274,18 @@ fn glm53_max_deployment_runs_three_2752_row_units() {
 
     options.layout.as_mut().unwrap().host_memory = Some((20 << 30, 15 << 30));
     let capped = input.plan_spark_count(&options, 6, Some(6)).unwrap();
-    assert!(capped.executable(), "{}", cuteafd_loader::plan::render(&capped));
-    assert_eq!(capped.prefill_waves, Some(3));
-    assert!(capped.prefill_unit_rows.is_some_and(|rows| rows > 0 && rows < 2752));
-    assert!(capped.prefill_reserve_rows.is_some_and(|rows| rows > 0 && rows < 8192));
-    let host = capped.host_ledger.as_ref().unwrap();
-    assert_eq!((host.total_bytes, host.available_bytes), (20 << 30, 15 << 30));
-    assert_eq!(host.shortfall_bytes, 0);
-    release_accepts_prefill(&serde_json::to_vec(
-        &DeploymentSpec::from_report(&capped, &launch).unwrap()).unwrap());
+    // Whole-process load RSS plus physical headroom cannot fit, even with tiny
+    // prefill units. The former workspace-only host ledger missed this owner.
+    assert!(!capped.executable());
+    assert!(capped.hints.iter().any(|hint| hint.what.contains("coordinator host RAM")
+        && hint.what.contains("checkpoint loading")), "{:?}", capped.hints);
+    assert!(!DeploymentSpec::from_report(&capped, &launch).unwrap().executable);
 
     options.layout.as_mut().unwrap().prefill_rows = 2752;
     let refused = input.plan_spark_count(&options, 6, Some(6)).unwrap();
     assert_eq!(refused.prefill_unit_rows, Some(2752));
     assert!(!refused.executable());
-    assert!(refused.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("coordinator host memory shortfall")));
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("coordinator host RAM")));
 }
 
 fn installed_example_snapshot(model_id: &str, revision: Option<&str>, hf_home: &std::path::Path)
@@ -323,7 +319,7 @@ fn installed_example_inventory_detects_absent_checkpoints_and_revisions() {
 
 fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path) -> std::path::PathBuf {
     let manifest = override_path.unwrap_or_else(|| home.join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
-    cuteafd_loader::plan::testing::validate_placement_inputs(&manifest)
+    cuteafd_loader::plan::inputs::validate_placement_inputs(&manifest)
         .unwrap_or_else(|error| panic!("{error:#}"));
     manifest
 }
@@ -573,7 +569,22 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
             .collect::<std::collections::BTreeMap<_, _>>();
         let name = example.file_name().unwrap().to_str().unwrap();
         let revision = config.get("MODEL_REVISION").copied();
-        let _snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
+        let snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
+        if ["glm53-exl3-min.config", "glm53-exl3-max.config",
+            "glm53-exlr8-min.config", "glm53-exlr8-max.config"].contains(&name) {
+            let temporary = tempfile::tempdir().unwrap();
+            let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
+                .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
+            let output = Command::new(interpreter).args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_glm_real_planner_launch
+capture_glm_real_planner_launch(*map(Path, sys.argv[2:]))
+"#]).arg(root).arg(&snapshot).arg(&example).arg(env!("CARGO_BIN_EXE_cuteafd"))
+                .arg(&programs).arg(&hf_home).arg(temporary.path()).output().unwrap();
+            assert!(output.status.success(), "{name} real launcher: {}", String::from_utf8_lossy(&output.stderr));
+        }
         let mut command = Command::new("timeout");
         command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
             "--deployment", "--config"]).arg(&example)

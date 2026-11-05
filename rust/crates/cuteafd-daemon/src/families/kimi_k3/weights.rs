@@ -740,7 +740,11 @@ mod tests {
         let pair = PackedLayer::pair(&cfg, 3, LayerMode::HeadSplit, tensor)?;
         assert!(pair.iter().all(|rank| rank.attention == AttentionShare::Split));
         assert_eq!(pair[0].operands["mla.q_b"].len(), 6 * 3 * 2);
-        assert!(PackedLayer::pair(&cfg, 3, LayerMode::ContextSplit, |_| unreachable!()).is_err());
+        let context = PackedLayer::pair(&cfg, 3, LayerMode::ContextSplit, tensor)?;
+        for (heads, context) in pair.iter().zip(&context) {
+            assert_eq!(context.attention, AttentionShare::Split);
+            assert_eq!(heads.operands, context.operands);
+        }
         assert!(PackedLayer::pair(&cfg, 3, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
             |_| unreachable!()).is_err());
         assert!(PackedLayer::pair(&cfg, 0, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },

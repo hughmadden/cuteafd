@@ -283,6 +283,11 @@ def jobs(scope):
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
+    kimi_context = [f"mla_partial{cache}_h{begin}_t{tile}_m64"
+                    for cache in ("", "_fp8") for begin in (0, 48) for tile in (8, 16)]
+    kimi_context += ["paged_staging_gather", "paged_staging_gather_fp8", "lse_combine2"]
+    result.append(("context-split-kimik3", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--context-split", "on", "--only", ",".join(kimi_context)]))
     result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
                    ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry]])
                   for geometry in EXL3_GEOMETRIES)

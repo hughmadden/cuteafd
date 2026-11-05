@@ -84,7 +84,7 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     let mut placement = solve_attention(request)?;
-    placement.max_pool_tokens_no_onboard = max_pool_without_onboard(request, &placement);
+    placement.max_pool_tokens_no_onboard = Some(max_pool_without_onboard(request, &placement));
     Ok(placement)
 }
 
@@ -582,7 +582,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     .and_then(|n| n.checked_add(sum))).ok_or(Overflow("context peer rows"))?
         } else { 0 },
         onboard_layers,
-        max_pool_tokens_no_onboard: pool_tokens,
+        max_pool_tokens_no_onboard: Some(pool_tokens),
         layers: modes.into_iter().zip(homes).map(|(mode, experts)| LayerAssignment { mode, experts }).collect(),
         movables,
         expert_ranges: ranges,

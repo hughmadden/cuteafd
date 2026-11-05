@@ -29,6 +29,9 @@ impl Split {
         Self { started: Instant::now(), read: READ.with(Cell::get), upload: UPLOAD.with(Cell::get),
             quantize: QUANTIZE.with(Cell::get) }
     }
+    #[cfg(test)]
+    pub fn read_bytes(&self) -> u64 { READ.with(Cell::get).0 - self.read.0 }
+
     pub fn log(self, label: &str) {
         let elapsed = self.started.elapsed().as_secs_f64();
         let (rb, rs) = READ.with(Cell::get);

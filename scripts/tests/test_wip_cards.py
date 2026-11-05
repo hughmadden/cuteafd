@@ -2095,6 +2095,25 @@ def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch, capsys)
     assert 'context_suffix=512' in capsys.readouterr().out
 
 
+def test_run_timeout_overrides_one_cards_sweep_limit(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'timeout-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--run-timeout', 'v41-min=3600', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['run_timeout_s'] == 3600
+
+
+@pytest.mark.parametrize('value', ['v41-min=0', 'v41-min=-5', 'v41-min=oops', 'other-card=3600'])
+def test_run_timeout_rejects_bad_values_and_unselected_cards(entry, tmp_path, monkeypatch, value):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(tmp_path / 'bad-timeout'), '--run-timeout', value, '--dry-run'])
+    with pytest.raises((SystemExit, ValueError)):
+        cards.main()
+
+
 @pytest.mark.parametrize('option,value', [('--context-lengths', '255'), ('--context-lengths', '1048577'),
     ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8'),
     ('--context-suffix', '-1'), ('--context-suffix', '1048577'), ('--context-suffix', 'oops')])

@@ -969,6 +969,18 @@ exec python3 -c "$code" "$@"
     deployment_stub = tmp_path / "deployment-stub.py"
     deployment_stub.write_text("""import json, os, subprocess, sys
 args = sys.argv[1:]
+if os.environ.get("STUB_REAL_PLANNER"):
+    args = args[args.index("plan"):]
+    args[1] = os.environ["STUB_REAL_SNAPSHOT"]
+    args += ["--workspace-manifest", os.environ["STUB_REAL_PROGRAMS"],
+             "--hf-home", os.environ["STUB_REAL_HF_HOME"]]
+    result = subprocess.run([os.environ["STUB_REAL_PLANNER"], *args],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "HF_HOME": os.environ["STUB_REAL_HF_HOME"]})
+    open(os.environ["STUB_REAL_PLAN_OUTPUT"], "w").write(result.stdout)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    sys.exit(result.returncode)
 if os.environ.get("STUB_REAL_DEPLOYMENT"):
     print(open(os.environ["STUB_REAL_DEPLOYMENT"]).read())
     sys.exit(0)
@@ -1085,6 +1097,36 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
     for rank, worker in enumerate(sorted(workers, key=lambda w: int(w[w.index("--rank") + 1]))):
         assert worker[worker.index("--world") + 1] == str(ranks)
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
+
+
+def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                    programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    # Fake only hardware and execution. The planner reads the actual snapshot,
+    # drafter and exporter metadata, not a canned deployment response.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/glm-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
+    assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if "cuteafd plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    assert "prefill reserve does not fit" not in result.stderr
 
 
 def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:

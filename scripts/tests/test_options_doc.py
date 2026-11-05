@@ -276,6 +276,13 @@ done
     assert seen == set(expected), f"{family}: {sorted(set(expected) - seen)} not exercised"
 
 
+@pytest.mark.parametrize("placement", sorted(ATTENTION_VALUES))
+def test_kimi_accepts_explicit_mla_placements(placement: str):
+    result = run_bash(f"release_check_attention_placement {placement} kimi_k3")
+    assert result.returncode == 0, result.stderr
+    assert ATTENTION[placement]["Kimi K3"] == "✓"
+
+
 def test_doc_is_linked():
     readme = (ROOT / "README.md").read_text()
     examples = (ROOT / "examples" / "configs" / "README.md").read_text()

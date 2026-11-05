@@ -22,12 +22,13 @@ pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
 pub mod planner;
+pub mod runtime_memory;
 mod pool;
 pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, PreparedSparkLink, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeCandidates, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkCandidate, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
@@ -577,10 +578,11 @@ pub struct Placement {
     pub peer_row_bytes: u64,
     /// The onboard this placement resolved: RTX-resident routed layers.
     pub onboard_layers: usize,
-    /// The pool the same solve admits with no RTX expert layers (everything
-    /// else, including the chosen attention modes, unchanged), filled to the
-    /// pool ceiling; equal to `pool_tokens` when nothing is onboarded.
-    pub max_pool_tokens_no_onboard: u64,
+    /// The legacy solve's no-onboarding pool ceiling, when it computed one.
+    /// Contract plans do not compute this counterfactual. Remove this field
+    /// outright once the last family moves to the contract planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pool_tokens_no_onboard: Option<u64>,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
     /// Bounding whole-layer RTX expert range per GPU (`layers == 0`: none).
@@ -644,6 +646,8 @@ impl Placement {
 
     pub fn summary(&self) -> String {
         let attention = self.attention_summary();
+        let counterfactual = self.max_pool_tokens_no_onboard
+            .map(|maximum| format!(" (max_pool_tokens_no_onboard={maximum})")).unwrap_or_default();
         let charged = self.hops.iter().filter(|h| h.charged()).count();
         let mut hops = if charged == 0 { String::new() } else { format!("; {charged} residual hops") };
         let direct: Vec<_> = self.hops.iter().filter(|h| h.storage == HopStorage::DirectInput).map(|h|
@@ -652,8 +656,8 @@ impl Placement {
             hops.push_str(&format!("; direct-input residual hops [{}] (no extra receive storage)", direct.join(", ")));
         }
         if let Some(t) = self.tp2 {
-            return format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
-                self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers, t.layers, t.first, t.first + t.layers,
+            return format!("attention {attention}; pool {} tokens{counterfactual}; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
+                self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
@@ -661,8 +665,8 @@ impl Placement {
                 .filter_map(|(layer, a)| (a.experts == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer))
                 .collect::<Vec<_>>(), r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
-        format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: {ranges}{hops}",
-            self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers)
+        format!("attention {attention}; pool {} tokens{counterfactual}; onboard {} RTX expert layers: {ranges}{hops}",
+            self.pool_tokens, self.onboard_layers)
     }
 }
 

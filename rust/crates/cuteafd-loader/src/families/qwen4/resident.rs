@@ -32,6 +32,11 @@ pub struct Qwen4Projection {
     pub cols: usize,
 }
 
+/// Requested storage for a native scalar/vector operand, including the loader's minimum.
+pub fn native_operand_bytes(bytes: usize) -> usize {
+    bytes.max(256)
+}
+
 /// Device bytes of a BF16 `[rows, cols]` weight.
 pub fn bf16_bytes(rows: usize, cols: usize) -> usize {
     rows * cols * 2

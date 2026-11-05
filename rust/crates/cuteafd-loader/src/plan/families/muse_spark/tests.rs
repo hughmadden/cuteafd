@@ -280,7 +280,8 @@ fn plan_matrix(column: usize) {
             assert!(memory.pool_tokens >= 1 << 20, "pool {}", memory.pool_tokens);
             // Onboarding stays automatic; pool first decides the count.
             assert!(report.onboard_layers.is_some());
-            assert!(report.solver_placement.as_ref().unwrap().max_pool_tokens_no_onboard >= memory.pool_tokens);
+            assert!(report.solver_placement.as_ref().unwrap().max_pool_tokens_no_onboard
+                .expect("legacy solve computes the counterfactual") >= memory.pool_tokens);
         }
     }
     // The installed inventory supports the serving path at the qualified width.

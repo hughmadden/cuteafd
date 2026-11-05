@@ -161,7 +161,7 @@ pub fn execution_workspace_from_manifest(programs: &Value, family: KernelFamily,
 }
 
 /// Admit the shared expert from the same validated geometry and arena as runtime.
-pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
+pub fn shared_execution_workspace(programs: &Value, family: KernelFamily) -> Result<ExecutionWorkspace> {
     let variant = ExecutionVariant::SharedDecode;
     let group_name = variant.group(family);
     let group = program_spec(programs, group_name)?;
@@ -172,8 +172,12 @@ pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
         "EXLR8 shared grouping hidden differs from compute family");
     let spec = program_spec(programs, variant.program(family, PrefillActivations::A16))?;
     let rows = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
-    Ok(u64::try_from(execution_workspace(&spec, rows, ExpertSet::Shared, variant,
-        family.geometry().units, PrefillActivations::A16)?.bytes)?)
+    execution_workspace(&spec, rows, ExpertSet::Shared, variant,
+        family.geometry().units, PrefillActivations::A16)
+}
+
+pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
+    Ok(u64::try_from(shared_execution_workspace(programs, family)?.bytes)?)
 }
 
 /// The stream-serialized TP2 backend owns both decode variants, one prefill

@@ -45,7 +45,18 @@ def exporter(monkeypatch):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    package.kimi_mla.KimiMlaGeometry = lambda **kw: types.SimpleNamespace(**kw)
+    class KimiGeometry(types.SimpleNamespace):
+        @property
+        def record_bytes(self):
+            return 656 if self.kv_cache == "fp8" else 1152
+    package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
+    package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
+    @dataclasses.dataclass(frozen=True)
+    class PartialProgram:
+        call: tuple
+        geometry: dict
+    package.kimi_mla.compile_kimi_mla_partial_aot = lambda *args, **kw: PartialProgram(
+        ("kimi_mla", "compile_kimi_mla_partial_aot", args, kw), dict(kw))
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
     package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
@@ -508,6 +519,35 @@ def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool
         assert calls["index_expand_owned"][1][:2] == ("glmf", "compile_glmf_index_expand_owned_aot")
 
 
+@pytest.mark.parametrize("name", ["flash", "pro", "glm", "glmf", "kimik3"])
+def test_context_only_dispatches_native_geometry_without_other_programs(exporter, name):
+    tree = ast.parse(EXPORTER.read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    validation = next(node for node in main.body if isinstance(node, ast.If)
+                      and any(isinstance(child, ast.Constant) and isinstance(child.value, str)
+                              and child.value.startswith("--context-split-only takes") for child in ast.walk(node)))
+    dispatch = next(node for node in ast.walk(main) if isinstance(node, ast.If)
+                    and ast.unparse(node.test) == "args.context_split_only"
+                    and any(isinstance(child, ast.Name) and child.id == "family_work" for child in ast.walk(node)))
+    geometry = types.SimpleNamespace(heads=64, index_topk=2048, record_bytes=656,
+                                     page_rows=64, kv_page_bytes=656*64, index_kpool=4, o_groups=8)
+    def unexpected(*args):
+        pytest.fail("context-only mode must not enumerate ordinary KDA/MLA programs")
+    scope = {"args": types.SimpleNamespace(context_split_only=True, decode_rows=64, prefill_rows=4096),
+             "name": name, "geometries": [name], "g": geometry, "extent": 1048576,
+             "make": unexpected, "kimi_context_programs": exporter.kimi_context_programs,
+             "context_split_programs": exporter.context_split_programs}
+    exec(compile(ast.Module(body=[validation, dispatch], type_ignores=[]), str(EXPORTER), "exec"), scope)
+    expected = (exporter.kimi_context_programs(64, 1048576) if name == "kimik3" else
+                exporter.context_split_programs(geometry, 64, 1048576))
+    assert [item[:3] for item in scope["family_work"]] == [item[:3] for item in expected]
+    if name == "kimik3":
+        assert len(scope["family_work"]) == 11
+    scope["geometries"] = ["qwen4"]
+    with pytest.raises(SystemExit, match="--context-split-only takes"):
+        exec(compile(ast.Module(body=[validation], type_ignores=[]), str(EXPORTER), "exec"), scope)
+
+
 def test_context_split_programs_append_after_every_other_program_when_switched_on():
     """CUTEAFD_CONTEXT_SPLIT_AOT (default OFF) reaches the exporter; ON appends the primitives after
     the glmf wide programs so no existing stem or table index moves, ONLY exports nothing else."""
@@ -588,6 +628,36 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
                 assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
                 assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
                 assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
+
+
+def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter, monkeypatch):
+    package = sys.modules["b12x.integration.cuteafd"]
+    # Deliberately change the fork rule: exporter/runtime metadata must not copy its threshold.
+    monkeypatch.setattr(package.kimi_mla, "kimi_context_heads_per_tile",
+                        lambda *, rows: 8 if rows in (1, 5, 11) else 16)
+    programs = exporter.kimi_context_programs(64, 1048576)
+    assert len(programs) == 11
+    for stem, op, params, thunk in programs:
+        result = thunk()
+        module, fn, args, kw = result.call if op == "mla_partial" else result
+        if op == "mla_partial":
+            assert result.geometry["context_heads_per_tile"] == [
+                8 if rows in (1, 5, 11) else 16 for rows in range(1, 65)]
+            assert result.geometry["heads_per_tile"] == params["heads_per_tile"]
+            assert f'_t{params["heads_per_tile"]}_' in stem
+            assert params["heads_per_tile"] in (8, 16)
+            assert module == "kimi_mla" and fn == "compile_kimi_mla_partial_aot"
+            assert kw == {k: v for k, v in params.items() if k != "kv_cache"}
+            assert args[0].kv_cache == params["kv_cache"]
+            assert params["head_begin"] in (0, 48) and params["head_count"] == 48
+            assert params["num_splits"] == 16
+            assert params["device_splits"] is True
+        else:
+            assert module == "context_split"
+            assert fn == f"compile_{op}_aot"
+            assert kw == params
+    catalog = {stem for stem, *_ in exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
+    assert {stem for stem, *_ in programs} <= catalog
 
 
 @pytest.mark.parametrize("namespace", ["kimik3"])

@@ -2,6 +2,7 @@ mod families;
 mod shared;
 pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
+    KimiMlaPartial, KimiMlaPartialBatch,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit, KimiKdaGeometry,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
@@ -1782,6 +1783,7 @@ native_symbols! {
 
 pub struct NativeLibrary {
     artifact_root: std::path::PathBuf,
+    loaded_path: std::path::PathBuf,
     lib: ManuallyDrop<Arc<Library>>,
     symbols: NativeSymbols,
     quarantine_after_failed_drain: AtomicBool,
@@ -2320,6 +2322,7 @@ impl NativeLibrary {
         sync_expert_hidden(&lib)?;
         Ok(Self {
             artifact_root,
+            loaded_path: path,
             lib: ManuallyDrop::new(Arc::new(lib)),
             symbols: NativeSymbols::default(),
             quarantine_after_failed_drain: AtomicBool::new(false),
@@ -2328,6 +2331,10 @@ impl NativeLibrary {
             rdma_rc_endpoint_try_poll_fn,
         })
     }
+
+    /// The actual host-ISA-selected module, not the unselected base filename.
+    /// Startup provenance hashes this file; it is never an admission input.
+    pub fn loaded_path(&self) -> &Path { &self.loaded_path }
 
     /// Irreversibly retain this module and its reusable pinned H2D staging
     /// until process teardown after a stream drain failed to prove completion.

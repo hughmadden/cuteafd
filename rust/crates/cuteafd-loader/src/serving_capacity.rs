@@ -372,16 +372,6 @@ pub fn glm_decode_table_widths(context: usize, pool_pages: usize) -> Vec<usize> 
     widths
 }
 
-/// Per GPU: a 170 KB/segment calibration plus 10% and 64 MiB bounds the
-/// measured 131K/1M captures on SM120. Keep the qualified 3 GiB floor.
-/// The lead has one head segment in addition to the target's layer segments.
-pub fn glm_decode_graph_allowance(context: usize, layers: usize) -> Result<u64, CacheGeometryError> {
-    let shapes: usize = glm_decode_table_widths(context, context.div_ceil(GLM_PAGE_ROWS)).iter()
-        .map(|&width| glm_decode_row_buckets(width).len()).sum();
-    let bytes = product("GLM decode graphs", &[shapes as u64, layers as u64 + 1, 187_000])?;
-    Ok(sum("GLM decode graph margin", &[bytes, 64 << 20])?.max(3 << 30))
-}
-
 /// GLM keeps the complete latent/index pools on every head-split GPU.
 pub fn glm_cache_geometry(
     cfg: &GlmDsaConfig,
@@ -911,19 +901,6 @@ mod tests {
         assert!(glm_decode_row_bucket(0, 16384).is_err());
         assert!(glm_decode_row_bucket(65, 16384).is_err());
         assert_eq!(glm_decode_table_widths(1_048_576, 3000), vec![16, 32, 64, 128, 256, 512, 1024, 2048, 3000]);
-    }
-
-    #[test]
-    fn glm_graph_allowance_bounds_measured_captures_and_scales() {
-        let old = glm_decode_graph_allowance(131_072, 78).unwrap();
-        let new = glm_decode_graph_allowance(1_048_576, 78).unwrap();
-        assert_eq!(old, 3 << 30);
-        assert_eq!(new, 3 << 30);
-        assert!(old >= 2_575_302_656);
-        // Conservative physical bound at 213 shapes (79 lead segments each).
-        assert!(new >= 213 * 79 * 170_000 + (64 << 20));
-        assert!(glm_decode_graph_allowance(1_048_576, 100).unwrap() > new);
-        assert!(glm_decode_graph_allowance(0, 78).unwrap() >= 3 << 30);
     }
 
     #[test]

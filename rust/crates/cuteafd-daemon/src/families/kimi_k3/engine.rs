@@ -3,7 +3,7 @@
 use super::{device::{LocalLane, SequenceRows, TokenIo}, layers::Execution, spark::RoutedLane};
 use crate::shared::{experts::rtx::pair::{submit_scoped, teardown, Teardown},
     peer_split::{hop::HopLink, PeerExchange, TerminalState}};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_loader::placement::LayerExecutionPlan;
 use std::{cell::{Cell, RefCell}, rc::Rc};
 use crate::shared::memory::device::Stream;
@@ -160,6 +160,7 @@ impl<'a> Engine<'a> {
         mut admission: super::admission::Admission<'a>,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; RANKS],
+        context_programs: [Option<Rc<super::context::Programs<'a>>>; RANKS],
         peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig,
         mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS]) -> Result<Self> {
@@ -208,6 +209,16 @@ impl<'a> Engine<'a> {
             .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
         let kda = (0..RANKS).map(|rank| admission.allocate_kda(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
         let mla = (0..RANKS).map(|rank| admission.allocate_mla(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
+        ensure!(context_programs.iter().all(Option::is_some) == admission.context_layout().is_some()
+            && (admission.context_layout().is_some() || context_programs.iter().all(Option::is_none)),
+            "Kimi context programs differ from admitted storage");
+        let context = if admission.context_layout().is_some() {
+            let peer = peer.as_ref().context("Kimi context missing ordinary peer abort owner")?;
+            Some(admission.allocate_context(library,
+                [lane_streams[0].clone(), lane_streams[1].clone()],
+                [peer.abort_word(0)?.context("Kimi context missing rank 0 abort word")?,
+                    peer.abort_word(1)?.context("Kimi context missing rank 1 abort word")?])?)
+        } else { None };
         let mut experts = Vec::with_capacity(lanes);
         let mut local = Vec::with_capacity(lanes);
         let mut io = Vec::with_capacity(lanes);
@@ -215,8 +226,14 @@ impl<'a> Engine<'a> {
             experts.push((0..RANKS).map(|rank| expert_weights[rank].as_ref()
                 .map(|owner| owner.execution_with_modules(expert_modules[rank].take())).transpose())
                 .collect::<Result<Vec<_>>>()?);
-            local.push(allocated.into_iter().enumerate().map(|(rank, allocated)|
-                admission.bind_local(rank, lane, allocated, programs[rank].clone())).collect::<Result<Vec<_>>>()?);
+            local.push(allocated.into_iter().enumerate().map(|(rank, allocated)| {
+                let mut local = admission.bind_local(rank, lane, allocated, programs[rank].clone())?;
+                if let Some(owner) = &context {
+                    local.bind_context(owner.clone(), context_programs[rank].as_ref()
+                        .context("Kimi context missing rank programs")?.clone())?;
+                }
+                Ok(local)
+            }).collect::<Result<Vec<_>>>()?);
             io.push((0..RANKS).map(|rank| admission.allocate_io(devices[rank], rank, lane))
                 .collect::<Result<Vec<_>>>()?);
         }
@@ -240,7 +257,7 @@ impl<'a> Engine<'a> {
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
             local, routed, io, experts, prefill, coordinator_packing_cap)?;
-        engine.max_pool_tokens_no_onboard = Some(admission.placement.max_pool_tokens_no_onboard);
+        engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)

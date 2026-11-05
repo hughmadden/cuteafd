@@ -584,7 +584,7 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
-            cache_format, devices: [0], native_lib: &native, peers,
+            cache_format, attention: None, devices: [0], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
             spark_budget_gib: Some(110.), rows: 2048, waves: 2, prefill_rows: Some(1024),
             slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false,
@@ -671,7 +671,7 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
             cache_format,
-            devices: [0, 1], native_lib: &native, peers,
+            attention: None, devices: [0, 1], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers), spark_budget_gib: None,
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),

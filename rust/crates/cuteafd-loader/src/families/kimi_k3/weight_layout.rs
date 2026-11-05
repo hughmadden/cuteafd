@@ -94,7 +94,6 @@ impl LayerLayout {
         let kind = *cfg.attention.get(layer).context("Kimi attention layer out of range")?;
         ensure!(cfg.layers == cfg.attention.len() && cfg.dense.len() == cfg.layers,
             "Kimi dense/attention inventories differ");
-        ensure!(mode != LayerMode::ContextSplit, "Kimi context attention has no query/LSE exchange ABI");
         ensure!(ranks == 1 || !matches!(mode, LayerMode::Whole { ffn: crate::placement::FfnMode::Owner, .. }),
             "Kimi FFNs require TP2 intermediate slices");
         ensure!(ranks != 1 || matches!(mode, LayerMode::Whole { gpu: 0, ffn: crate::placement::FfnMode::Owner }),

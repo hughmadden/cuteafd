@@ -60,7 +60,8 @@ pub fn checkpoint_resident_bytes(checkpoint: &Checkpoint, cfg: &Qwen4Config,
             || name.ends_with(".linear_attn.A_log") || name.ends_with(".linear_attn.dt_bias")
             || name.ends_with(".ple.conv1d.weight");
         if widened {
-            bytes = tensor.meta.shape.iter().map(|&d| d as u64).product::<u64>() * 4;
+            let payload = tensor.meta.shape.iter().map(|&d| d as u64).product::<u64>() * 4;
+            bytes = u64::try_from(super::native_operand_bytes(usize::try_from(payload)?))?;
         }
         if role.component == Component::Speculator { out.mtp_bytes += bytes; }
         else if let Some(layer) = role.layer { out.layer_bytes[layer] += bytes; }
@@ -127,7 +128,7 @@ mod tests {
         let checkpoint = Checkpoint::open(&dir).unwrap();
         let bf16 = checkpoint_resident_bytes(&checkpoint, &cfg, 1, false, Qwen4Representation::default()).unwrap();
         assert_eq!(bf16.target_bytes, (16480 * 2560 * 2 + 2560 * 6144 * 2
-            + (10240 * 4 + 48 * 2) * 4 + 1296 * 2560 * 2 + 2560 * 640 * 2) as u64);
+            + 10240 * 4 * 4 + 2 * 256 + 1296 * 2560 * 2 + 2560 * 640 * 2) as u64);
         assert_eq!(bf16.embedding_bytes, 64 * 2560 * 2);
         assert_eq!(bf16.head_bytes, 64 * 2560 * 2);
         assert_eq!((bf16.ple_table_bytes, bf16.ple_row_bytes), (1000 * 160 * 2, 160 * 2));

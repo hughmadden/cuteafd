@@ -69,6 +69,16 @@ def test_draft_bf16_group_matches_exported_shapes():
         assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
 
 
+def test_kimi_context_group_covers_both_tiles_formats_and_shared_primitives():
+    job, = (job for job in compare_sm.jobs("all") if job[0] == "context-split-kimik3")
+    stems = [f"mla_partial{cache}_h{begin}_t{tile}_m64"
+             for cache in ("", "_fp8") for begin in (0, 48) for tile in (8, 16)]
+    stems += ["paged_staging_gather", "paged_staging_gather_fp8", "lse_combine2"]
+    assert len(stems) == len(set(stems)) == 11
+    assert job == ("context-split-kimik3", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--context-split", "on", "--only", ",".join(stems)])
+
+
 def test_spark_routed_groups_cover_all_shipped_weight_geometries_with_valid_inputs():
     groups = {name: args for name, _, args in compare_sm.jobs("all")}
     for geometry in compare_sm.ROUTED_GEOMETRIES:
@@ -688,7 +698,7 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     ml4_args = next(args for name, _, args in jobs if name == "exl3-ml4-k45")
     assert ml4_args[ml4_args.index("--bits") + 1] == "4,5"
     assert not {"exl3-qwen4-k345", "exl3-qwen4-k2345"} & set(names)
-    assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf")} <= set(names)
+    assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf", "kimik3")} <= set(names)
     assert {"v41-fp8", "v41-experts", "v41-index", "v41-router", "v41-attention"} <= set(names)
     assert {"suspect-flash-m1", "suspect-flash-m16", "suspect-glm-mla", "suspect-glmf-mla"} <= set(names)
     assert all("--only" in args for _, _, args in compare_sm.jobs("suspects"))

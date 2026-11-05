@@ -631,7 +631,7 @@ impl Search<'_> {
         &mut self,
         mut domains: Vec<Vec<usize>>,
         pages: u64,
-        best: &mut Option<((u64, u64, u64), Vec<usize>)>,
+        best: &mut Option<((u64, u64, u64, u64), Vec<usize>)>,
     ) -> Result<(), Refusal> {
         if !self.restrict(&mut domains, pages, pages)? {
             return Ok(());
@@ -673,8 +673,11 @@ impl Search<'_> {
             .map(|(v, &o)| v.onboard(o))
             .sum();
         let phases = self.costs.phases(self.budgets, &assignment, pages)?;
+        let encoder_preference = self.contract.variables.iter().zip(&assignment).find_map(|(variable, &option)|
+            if let Variable::Encoder(values) = variable { Some((values.len() - option) as u64) } else { None }).unwrap_or(0);
         let score = (
             layers,
+            encoder_preference,
             coordinator_slack(&phases, self.budgets),
             remaining(&phases),
         );
@@ -788,13 +791,26 @@ pub fn solve(
     };
     let pages = if search.feasible(domains.clone(), wanted)? {
         wanted
-    } else if matches!(request.pool, Pin::Exact(_)) || minimum == wanted {
+    } else if matches!(request.pool, Pin::Exact(_)) {
         return Err(search.last);
     } else {
         let mut maximum = None;
-        search.maximum(domains.clone(), minimum, wanted - 1, &mut maximum)?;
-        maximum.ok_or_else(|| search.last.clone())?
+        if wanted > 1 {
+            search.maximum(domains.clone(), 1, wanted - 1, &mut maximum)?;
+        }
+        maximum.unwrap_or(0)
     };
+    if pages < minimum {
+        // Reuse this search's validated facts and domains; never publish a
+        // reduced-context plan or rebuild the family recipe with another context.
+        search.feasible(domains.clone(), pages + 1)?;
+        if !matches!(search.last, Refusal::Capacity { .. }) {
+            return Err(search.last);
+        }
+        return Err(Refusal::FullContextShortfall { context: request.context,
+            tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
+            limiting: Box::new(search.last) });
+    }
     let mut best = None;
     search.complete(domains, pages, &mut best)?;
     tracing::trace!(target: "cuteafd::planner", surviving_assignments = search.assignments,
@@ -820,7 +836,40 @@ pub fn solve(
             "component cost vectors differ from exact phase evaluator".into(),
         ));
     }
+    // Diagnose alternatives at this exact solution. Do not shrink the pool or
+    // rerun the optimizer merely to explain why Auto disabled image input.
+    let mut encoder_diagnostics = Vec::new();
+    for (variable, domain) in contract.variables.iter().enumerate() {
+        if !matches!(domain, Variable::Encoder(_)) { continue; }
+        for option in 0..selected[variable] {
+            let mut alternative = selected.clone();
+            alternative[variable] = option;
+            if contract.requires.iter().any(|rule| alternative[rule.when.variable] == rule.when.option
+                && !rule.any_of.iter().any(|choice| alternative[choice.variable] == choice.option)) {
+                encoder_diagnostics.push((format!("encoder candidate {option}: no active Spark worker at the admitted onboarding"), 0));
+                continue;
+            }
+            let alternate_facts = contract.facts(&alternative, pages)?;
+            let mut refusal = evaluate(&alternate_facts, &budgets).err();
+            if refusal.is_none() {
+                if let Some(limit) = request.resident_weight_limit {
+                    refusal = costs.weights(&alternative, pages)?.iter().enumerate().find_map(|(gpu, required)|
+                        (required.0 > limit.0).then_some(Refusal::ResidentWeightLimit {
+                            gpu: gpu as u8, required: required.0, limit: limit.0 }));
+                }
+            }
+            if let Some(refusal) = refusal {
+                let missing = match &refusal {
+                    Refusal::Capacity { required, available, .. } => required.saturating_sub(*available),
+                    Refusal::ResidentWeightLimit { required, limit, .. } => required.saturating_sub(*limit),
+                    _ => 0,
+                };
+                encoder_diagnostics.push((format!("encoder candidate {option}: {refusal}; short by {missing} bytes"), missing));
+            }
+        }
+    }
     Ok(ResolvedPlan {
+        encoder_diagnostics,
         request,
         decisions,
         pool_tokens: pages

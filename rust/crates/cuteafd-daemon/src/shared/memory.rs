@@ -436,6 +436,22 @@ mod load_stream_lifetime_tests {
 /// Test support for fake SparkNest push sources.
 #[cfg(test)]
 pub(crate) mod push_testing {
+    pub(crate) fn bind(socket: &str) -> std::io::Result<cuteafd_loader::push_load::Listener> {
+        cuteafd_loader::push_load::validate_socket_endpoint(socket)?;
+        cuteafd_loader::push_load::Listener::bind(socket)
+    }
+
+    #[test]
+    fn overlong_fixture_socket_is_rejected_before_bind() {
+        let error = match bind(&"x".repeat(108)) {
+            Ok(_) => panic!("overlong fixture socket accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.get_ref().unwrap().is::<cuteafd_loader::push_load::SocketEndpointError>());
+        assert!(error.to_string().contains("socket path is 108 bytes > 107 bytes"));
+    }
+
     /// A fake SparkNest's `accept`, bounded: a rank that never connects fails the
     /// test after `timeout` with a clear error instead of hanging (Listener has no
     /// accept timeout; a waker connects at the deadline).

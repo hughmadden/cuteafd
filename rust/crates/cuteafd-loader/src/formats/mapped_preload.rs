@@ -90,9 +90,40 @@ pub fn host_memory() -> Result<(u64, u64)> {
     cuteafd_ffi::host_memory()
 }
 
+/// Credit this process's anonymous RSS when a recipe charges its full envelope.
+/// File-backed RSS may already be reclaimable in MemAvailable; shared memory is
+/// conservatively left in the occupied baseline.
+pub fn host_memory_before_process() -> Result<(u64, u64)> {
+    let memory = host_memory()?;
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    normalize_process_rss(memory, &status)
+}
+
+fn normalize_process_rss((total, available): (u64, u64), status: &str) -> Result<(u64, u64)> {
+    use anyhow::{Context, ensure};
+    ensure!(available <= total, "host available exceeds total");
+    let mut value = status.lines().find_map(|line| line.strip_prefix("RssAnon:"))
+        .context("process status missing RssAnon")?.split_whitespace();
+    let rss = value.next().context("process RSS missing value")?.parse::<u64>()?
+        .checked_mul(1024).context("process RSS overflow")?;
+    ensure!(value.next() == Some("kB") && value.next().is_none(), "invalid process RSS units");
+    let external_occupied = total.saturating_sub(available).saturating_sub(rss);
+    Ok((total, total - external_occupied))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whole_process_recipe_credits_only_existing_anonymous_rss() {
+        let mixed = "VmRSS: 12 kB\nRssAnon: 4 kB\nRssFile: 6 kB\nRssShmem: 2 kB\n";
+        assert_eq!(normalize_process_rss((16384, 4096), mixed).unwrap(), (16384, 8192));
+        let reclaimable = "VmRSS: 12 kB\nRssAnon: 0 kB\nRssFile: 10 kB\nRssShmem: 2 kB\n";
+        assert_eq!(normalize_process_rss((16384, 4096), reclaimable).unwrap(), (16384, 4096));
+        assert_eq!(normalize_process_rss((16384, 12288), "RssAnon: 8 kB\n").unwrap(), (16384, 16384));
+        assert!(normalize_process_rss((16384, 4096), "RssAnon: 4 bytes\n").is_err());
+        assert!(normalize_process_rss((16384, 4096), "VmRSS: 4 kB\n").is_err());
+    }
     #[test]
     fn all_or_nothing_cap_and_host_admission() {
         let bytes = 6 << 30;

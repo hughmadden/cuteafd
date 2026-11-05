@@ -129,7 +129,7 @@ pub struct EncoderRequest {
     pub copies: usize,
 }
 
-fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<EncoderPlacement> {
+pub(crate) fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<EncoderPlacement> {
     if request.mode == MediaMode::Off || request.weights == 0 {
         return vec![encoder_placement(MediaMode::Off, hardware, 0, 0, 1)];
     }

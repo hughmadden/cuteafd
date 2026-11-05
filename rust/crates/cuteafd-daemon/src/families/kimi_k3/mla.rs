@@ -31,6 +31,20 @@ impl<'a> Mla<'a> {
     pub(crate) fn max_context(&self) -> usize { self.native.max_context() }
     pub(crate) fn splits(&self) -> usize { self.native.splits() }
 
+    pub(crate) fn produce(&self, layer: usize, weights: KimiMlaWeights,
+        batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
+        self.native.produce(weights, batch, stream)?;
+        Ok(())
+    }
+
+    pub(crate) fn output(&self, layer: usize, weights: KimiMlaWeights,
+        batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
+        self.native.output(weights, batch, stream)?;
+        Ok(())
+    }
+
     pub(crate) fn attention(&self,layer:usize,batch:KimiMlaBatch,stream:*mut c_void)->Result<()> {
         ensure!(self.layers.get(layer)==Some(&KimiAttention::Mla),"layer {layer} is not Kimi MLA");
         self.native.attention(batch,stream)?;Ok(())
@@ -53,6 +67,8 @@ pub(crate) struct CacheLayout {
     format: MlaCacheFormat,
     layers: Vec<Option<AttentionShare>>,
     pages: usize,
+    rank: usize,
+    parity: bool,
     layer_bytes: usize,
     bytes: usize,
 }
@@ -68,11 +84,13 @@ impl CacheLayout {
             && placement.layers.len() == cfg.layers && cfg.attention.len() == cfg.layers,
             "Kimi MLA cache placement inventory/rank");
         ensure!(cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi MLA cache record geometry");
+        let parity = placement.layers.iter().any(|layer| layer.mode == LayerMode::ContextSplit);
         ensure!(cfg.attention.iter().zip(&placement.layers).all(|(kind, assignment)| {
             if ranks == 1 {
                 assignment.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }
             } else {
                 match kind {
+                    KimiAttention::Mla if parity => assignment.mode == LayerMode::ContextSplit,
                     KimiAttention::Mla => matches!(assignment.mode, LayerMode::HeadSplit
                         | LayerMode::Whole { gpu: 0 | 1, ffn: FfnMode::Split }),
                     KimiAttention::Kda => assignment.mode == LayerMode::HeadSplit,
@@ -83,14 +101,16 @@ impl CacheLayout {
         ensure!(tokens > 0 && tokens % MLA_PAGE_ROWS == 0, "Kimi MLA cache pool is not whole pages");
         let pages = tokens / MLA_PAGE_ROWS;
         ensure!(pages <= i32::MAX as usize, "Kimi MLA page count exceeds native ABI");
-        let layer_bytes = tokens.checked_mul(format.record_bytes()).context("Kimi MLA cache extent overflow")?;
+        ensure!(!parity || pages % 2 == 0, "Kimi context pool needs equal whole-page shards");
+        let local_tokens = if parity { tokens / 2 } else { tokens };
+        let layer_bytes = local_tokens.checked_mul(format.record_bytes()).context("Kimi MLA cache extent overflow")?;
         let layers = cfg.attention.iter().zip(&placement.layers).map(|(kind, assignment)| -> Result<_> {
             if *kind != KimiAttention::Mla { return Ok(None); }
             let share = AttentionShare::bind(assignment.mode, ranks)?[rank];
             Ok(share.present().then_some(share))
         }).collect::<Result<Vec<_>>>()?;
         let bytes = layer_bytes.checked_mul(layers.iter().flatten().count()).context("Kimi MLA cache total overflow")?;
-        Ok(Self { format, layers, pages, layer_bytes, bytes })
+        Ok(Self { format, layers, pages, rank, parity, layer_bytes, bytes })
     }
 
     pub(crate) fn bytes(&self) -> usize { self.bytes }
@@ -99,7 +119,9 @@ impl CacheLayout {
         ensure!(self.layers.get(layer).is_some_and(Option::is_some), "Kimi MLA cache absent on nonowner or non-MLA layer");
         ensure!(page < self.pages && (1..=MLA_PAGE_ROWS).contains(&rows),
             "Kimi MLA prefix page/rows outside admitted pool");
-        Ok((page * MLA_PAGE_ROWS * self.format.record_bytes(), rows * self.format.record_bytes()))
+        ensure!(!self.parity || page % 2 == self.rank, "Kimi context page belongs to the other rank");
+        let local_page = if self.parity { page >> 1 } else { page };
+        Ok((local_page * MLA_PAGE_ROWS * self.format.record_bytes(), rows * self.format.record_bytes()))
     }
 
     pub(super) fn allocate<'a>(&self, device: Device<'a>, readers: Vec<Rc<Stream<'a>>>) -> Result<CacheBank<'a>> {
@@ -160,6 +182,16 @@ impl<'a> CacheBank<'a> {
 
     pub(crate) fn pages(&self) -> usize { self.layout.pages }
 
+    pub(crate) fn local_pages(&self) -> usize {
+        if self.layout.parity { self.layout.pages / 2 } else { self.layout.pages }
+    }
+
+    pub(crate) fn parity(&self) -> bool { self.layout.parity }
+
+    pub(crate) fn owns_page(&self, page: u32) -> bool {
+        !self.layout.parity || page as usize % 2 == self.layout.rank
+    }
+
     pub(crate) fn owners(&self) -> Vec<Rc<Allocation<'a>>> { self.layers.iter().flatten().cloned().collect() }
 }
 
@@ -178,7 +210,7 @@ mod tests {
         let bytes = MLA_PAGE_ROWS * MLA_RECORD_BYTES;
         let bank = CacheBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
             layers: vec![None, Some(Rc::new(Allocation::new(device, bytes)?))],
-            layout: CacheLayout { format: MlaCacheFormat::Bf16, layers: vec![None, Some(AttentionShare::Whole)], pages: 1, layer_bytes: bytes, bytes } };
+            layout: CacheLayout { format: MlaCacheFormat::Bf16, layers: vec![None, Some(AttentionShare::Whole)], pages: 1, rank: 0, parity: false, layer_bytes: bytes, bytes } };
         assert!(bank.layer(0).is_err());
         assert!(bank.layer(2).is_err());
         assert_eq!(bank.pages(), 1);
@@ -210,6 +242,38 @@ mod tests {
         assert_eq!(events[before.len()..first_free].matches('S').count(), 6,
             "both compute readers and copy stream drain before the first page free: {events}");
         assert_eq!(events.matches('d').count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn context_pages_have_one_physical_owner_and_compact_offsets() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let mut placement = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?.placement;
+        for (kind, layer) in cfg.attention.iter().zip(&mut placement.layers) {
+            if *kind == KimiAttention::Mla { layer.mode = LayerMode::ContextSplit; }
+        }
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            let shards = [CacheLayout::new(&cfg, &placement, 0, format)?,
+                CacheLayout::new(&cfg, &placement, 1, format)?];
+            assert!(shards.iter().all(|shard| shard.parity));
+            assert_eq!(shards.iter().map(CacheLayout::bytes).sum::<usize>(),
+                placement.pool_tokens as usize * format.record_bytes() * cfg.mla_layers());
+            let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+            for page in [0, 1, 2, 3, shards[0].pages - 2, shards[0].pages - 1] {
+                let owner = page % 2;
+                let (offset, bytes) = shards[owner].page_range(layer, page, 17)?;
+                assert_eq!(offset, (page >> 1) * MLA_PAGE_ROWS * format.record_bytes());
+                assert_eq!(bytes, 17 * format.record_bytes());
+                assert!(offset + bytes <= shards[owner].layer_bytes);
+                assert!(shards[1 - owner].page_range(layer, page, 17).is_err());
+            }
+            let mut mixed = placement.clone();
+            mixed.layers[layer].mode = LayerMode::HeadSplit;
+            assert!(CacheLayout::new(&cfg, &mixed, 0, format).is_err());
+            let mut odd = placement.clone();
+            odd.pool_tokens = 3 * MLA_PAGE_ROWS as u64;
+            assert!(CacheLayout::new(&cfg, &odd, 0, format).is_err());
+        }
         Ok(())
     }
 

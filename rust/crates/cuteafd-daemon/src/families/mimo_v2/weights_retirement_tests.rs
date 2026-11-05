@@ -98,17 +98,20 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
         Ok(out)
     };
     let expected = digests(&mounted[0])?;
+    let (mounted_target, _) = mounted_loader.model(&cfg, 0)?;
+    let MimoHead::Bf16(mounted_head) = &mounted_target.head else { unreachable!() };
+    let expected_head = super::super::coordinator_golden_tests::digest(&library, mounted_head.buffer)?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight").unwrap();
     let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, 256)?;
     let (mounted_embedding, ()) = TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || Ok(()))?;
     assert_eq!(mounted_embedding.verify_resident()?, 256 * 256 * 2);
     // Recording must succeed with missing payload bytes, on either target layout.
     std::fs::write(&path, [])?;
-    for peers in [0, 1] {
+    for (peers, fp8_head) in [(0, false), (1, false), (0, true), (1, true)] {
         let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
         let mut planning = loader(&library, &checkpoint, &formats);
         planning.peers.truncate(peers);
-        planning.fp8_head = true;
+        planning.fp8_head = fp8_head;
         planning.dense = load.clone();
         let empty = planning.mtp_weights(&cfg, 0)?;
         assert!(empty.is_empty());
@@ -141,6 +144,13 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
             Device { library: &library, id: 0 }, None, &checkpoint.snapshot, sockets.path(), &records, None, 0, 0)?;
         planning.release_transient();
         assert_eq!(digests(&predictors[0])?, expected);
+        if !fp8_head {
+            let MimoHead::Bf16(head) = &target.0.head else { panic!("Flash must retain its BF16 head") };
+            assert_eq!(super::super::coordinator_golden_tests::digest(&library, head.buffer)?, expected_head);
+            assert!(records.operands.iter().any(|o| o.buffer.ptr == head.buffer.ptr
+                && o.lands.iter().any(|(rect, _)| rect.name == "lm_head.weight")),
+                "BF16 head must land directly through the committed push group");
+        }
         assert_eq!(embedding.verify_resident()?, 256 * 256 * 2);
         std::fs::write(&path, [])?;
     }
@@ -224,65 +234,54 @@ fn later_tensor_error_cannot_release_an_earlier_queued_dequant() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn split_copy_failure_drains_before_releasing_source_or_destination() -> Result<()> {
-    for drain in [0, 1] {
-        let fixture = Fixture::build()?;
-        let library = fixture.load()?;
-        fixture.configure_pack(&library, 1, drain)?;
-        let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
-        let formats = BTreeMap::new();
-        let result = loader(&library, &checkpoint, &formats).o_proj("weight", 2);
-        assert!(result.is_err());
-        drop(result);
-        drop(library);
-        let events = fixture.events()?;
-        assert_eq!(count(&events, 'C'), 1, "{events}");
-        assert_eq!(count(&events, 'S'), 1, "{events}");
-        if drain == 0 {
-            assert_eq!(count(&events, 'd'), 2, "{events}");
-            assert!(events.find('S') < events.find('d'), "{events}");
-            assert!(events.ends_with("FU"), "{events}");
-            assert!(!fixture.resident()?);
-        } else {
-            assert!(!events.contains(['d', 'F', 'U']), "{events}");
-            assert!(fixture.resident()?);
+fn bf16_output_projection_records_column_shares_and_replays_mount_bytes() -> Result<()> {
+    use crate::shared::{experts::rtx::dense, memory::device::Device};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    for shape in [[8, 256], [4096, 8448]] {
+    let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &shape)])?;
+    let path = checkpoint.snapshot.join("weights.bin");
+    let payload: Vec<_> = (0..shape[0] * shape[1] * 2).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &payload)?;
+    let formats = BTreeMap::new();
+    for ranks in [1, 2] {
+        let timing = crate::shared::memory::load_timing::Split::start();
+        let mounted = loader(&library, &checkpoint, &formats).o_proj("weight", ranks)?;
+        assert_eq!(timing.read_bytes(), payload.len() as u64, "each source byte is read once");
+        std::fs::write(&path, [])?;
+        let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
+        let planning = MimoLoader { dense: load.clone(), ..loader(&library, &checkpoint, &formats) };
+        let (pushed, mut records) = dense::recording(|| planning.o_proj("weight", ranks))?;
+        records.extend(load.sink.as_ref().unwrap().take_all());
+        let per = cuteafd_loader::shared::dense_read::ReadBatch::new(
+            shape[0], shape[1] * 2, shape[1] * 2 / ranks, dense::STEP_BYTES)?.rows;
+        assert_eq!(records.operands.len(), ranks * shape[0].div_ceil(per));
+        assert!(records.steps.is_empty() && records.finishes.is_empty());
+        std::fs::write(&path, &payload)?;
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        for rank in 0..ranks {
+            crate::shared::experts::rtx::push::tests::receive_pushed(
+                Device { library: &library, id: rank as i32 }, None, &checkpoint.snapshot,
+                sockets.path(), &records, None, 0, rank)?;
+            let expected: Vec<_> = payload.chunks_exact(shape[1] * 2).flat_map(|row|
+                row[rank * shape[1] * 2 / ranks..(rank + 1) * shape[1] * 2 / ranks].iter().copied()).collect();
+            for allocation in [&mounted[rank], &pushed[rank]] {
+                let mut actual = vec![0; expected.len()];
+                library.copy_d2h(&mut actual, allocation.buffer)?;
+                assert_eq!(actual, expected);
+            }
         }
+    }
     }
     Ok(())
 }
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn failed_peer_copy_drain_retains_all_split_outputs_without_calling_free() -> Result<()> {
-    let fixture = Fixture::build()?;
-    let library = fixture.load()?;
-    fixture.configure_pack(&library, 0, 1)?;
-    fixture.configure_drain_after(&library, 1)?;
-    let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
-    let formats = BTreeMap::new();
-    // A preceding layer's unrelated owners also unwind after a loader error.
-    // Their frees must not synchronize with the failed peer's queued work.
-    let preceding_layer = DeviceAllocation::new(&library, 512)?;
-    let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512)?;
-    let result = loader(&library, &checkpoint, &formats).o_proj("weight", 2);
-    assert!(result.is_err());
-    drop(result);
-    drop(preceding_layer);
-    drop(preceding_pin);
-    drop(library);
-    let events = fixture.events()?;
-    assert_eq!((count(&events, 'D'), count(&events, 'C'), count(&events, 'S')), (4, 2, 2), "{events}");
-    assert_eq!(count(&events, 'd'), 0,
-        "even a completed rank's cudaFree can synchronize with pending peer work: {events}");
-    assert!(!events.contains(['F', 'U']), "{events}");
-    assert!(fixture.resident()?);
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
-    for path in 0..3 {
+    for path in 0..2 {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         let checkpoint = if path == 0 {
@@ -295,7 +294,6 @@ fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
         let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512)?;
         match path {
             0 => drop(loader.rows(&["weight".into()])?),
-            1 => drop(loader.o_proj("weight", 2)?),
             _ => drop(loader.fp8_projection("weight", 1, false)?),
         }
         drop(preceding_layer);

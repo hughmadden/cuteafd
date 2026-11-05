@@ -8,6 +8,18 @@ mod draft_physical_layout;
 pub mod native;
 pub use config::{GlmDsaConfig, GlmIndexer, GlmVariant};
 
+/// Shared representation choice for header admission and runtime program/loading paths.
+pub fn native_bf16() -> bool {
+    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native"))
+}
+
+/// Replicated heads cannot restore the host prefix tier; marks remain device-resident.
+pub fn host_prefix_enabled(gpus: usize, attention: crate::placement::AttentionPlacement,
+    requested: bool, entries: u64) -> bool {
+    requested && entries > 0 && !(gpus == 2 && attention == crate::placement::AttentionPlacement::Heads)
+}
+
 /// Stage ABIs follow the checkpoint's dense core, not the build's union of exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DensePrograms { Fp8, Exlr8, Trellis }

@@ -25,20 +25,30 @@ pub struct PoolPolicy {
 }
 
 impl PoolPolicy {
+    /// Both CLI zero and an omitted pool request select automatic admission.
+    pub fn normalize_request(requested: Option<u64>) -> Option<u64> {
+        requested.filter(|&tokens| tokens > 0)
+    }
+
+    pub fn maximum_tokens(&self) -> u64 {
+        self.requested.unwrap_or(self.target)
+    }
+
     /// `card_bytes` are the coordinator GPUs' totals; `context` the compiled
     /// serving context; `requested` 0 or `None` means automatic.
     pub fn resolve(card_bytes: &[u64], context: u64, requested: Option<u64>, unit_rows: u64,
         spark_free: bool) -> Self {
+        let requested = Self::normalize_request(requested);
         let small = card_bytes.iter().any(|&bytes| bytes <= SMALL_CARD_BYTES);
         let target = if small { SMALL_CARD_POOL_TOKENS } else { DEFAULT_GPU_KV_TOKENS }.max(context);
         // Explicit pools must cover the compiled context. Only automatic,
         // Spark-free pools additionally retain the agentic floor.
-        let floor = match requested.filter(|&n| n > 0) {
+        let floor = match requested {
             Some(n) => n.max(context),
             None if spark_free => context.max(AGENTIC_FLOOR_TOKENS),
             None => context,
         };
-        Self { compiled_context: context, requested: requested.filter(|&n| n > 0), target, floor,
+        Self { compiled_context: context, requested, target, floor,
             ceiling: u64::MAX, unit_rows }
     }
 

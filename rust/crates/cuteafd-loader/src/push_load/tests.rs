@@ -27,6 +27,7 @@ impl Server {
             client: PushClient {
                 socket: path.to_str().unwrap().into(),
                 timeout: Duration::from_millis(50),
+                setting: "push socket",
             },
             _directory: directory,
             thread,
@@ -228,6 +229,7 @@ fn absent_socket_restarts_whole_group() {
     let client = PushClient {
         socket: directory.path().join("absent").to_str().unwrap().into(),
         timeout: Duration::from_millis(50),
+        setting: "push socket",
     };
     assert_fallback(&client, |c| c.create(vec![], vec![]).map(|_| ()));
 }
@@ -560,6 +562,7 @@ fn full_socket_backlog_cannot_hang_model_loading() {
     let client = PushClient {
         socket: path.to_str().unwrap().into(),
         timeout: Duration::from_millis(50),
+        setting: "push socket",
     };
     assert_fallback(&client, |client| {
         let error = match client.create(vec![], vec![]) {
@@ -663,6 +666,43 @@ fn socket_setting_defaults_and_accepts_an_explicit_endpoint() {
         assert_eq!(PushClient::configured(setting).socket, SOCKET);
     }
     assert_eq!(PushClient::configured(Some("@isolated-push".into())).socket, "@isolated-push");
+}
+
+#[test]
+fn socket_endpoint_limits_count_bytes_and_distinguish_abstract_names() {
+    for socket in ["x".repeat(107), format!("@{}", "x".repeat(107)), "\u{00e9}".repeat(53)] {
+        assert!(PushClient::at(socket, Duration::from_secs(1)).is_ok());
+    }
+    for (socket, bytes) in [("x".repeat(108), 108),
+        (format!("@{}", "x".repeat(108)), 108), ("\u{00e9}".repeat(54), 108)] {
+        let error = validate_socket_endpoint(&socket).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let cause = error.get_ref().unwrap().downcast_ref::<SocketEndpointError>().unwrap();
+        assert_eq!((cause.bytes, cause.limit), (bytes, 107));
+        assert!(error.to_string().contains("108 bytes > 107 bytes"));
+        assert!(PushClient::at(socket, Duration::from_secs(1)).is_err());
+    }
+}
+
+#[test]
+fn overlong_env_endpoint_fails_before_create_or_join_connects() {
+    let client = PushClient::configured(Some("x".repeat(108)));
+    let create = match client.create(vec![], vec![]) {
+        Ok(_) => panic!("overlong endpoint accepted"),
+        Err(error) => error,
+    };
+    let join = match client.join(JoinArgs {
+        group: 1, token: 2, rank: 0, ring_fd: -1, slots: 1, slot_bytes: 4096,
+    }) {
+        Ok(_) => panic!("overlong endpoint accepted"),
+        Err(error) => error,
+    };
+    for error in [create, join] {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let cause = error.get_ref().unwrap().downcast_ref::<SocketEndpointError>().unwrap();
+        assert_eq!(cause.setting, "CUTEAFD_PUSH_SOCKET");
+        assert!(error.to_string().starts_with("CUTEAFD_PUSH_SOCKET: socket path"));
+    }
 }
 
 /// A joined rank waits through the group's start (its peers still joining,

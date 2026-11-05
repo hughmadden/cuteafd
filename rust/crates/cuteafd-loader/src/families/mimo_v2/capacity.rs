@@ -416,12 +416,9 @@ mod tests {
                 .iter()
                 .all(|d| d.reservations.iter().all(|r| r.name != "loading.temporary")));
             assert!(phases.loading.iter().all(|d| d.pool_unit_bytes == 0));
-            let loading_extra = phases.loading[0]
-                .reservations
-                .iter()
-                .find(|r| r.name == "loading.temporary")
-                .unwrap();
-            assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
+            assert!(phases.loading.iter().all(|device| device.reservations.iter()
+                .all(|reservation| reservation.name != "loading.temporary")),
+                "native BF16 column shares land directly in final owners");
             for phase in &phases.post_target_kv {
                 assert_eq!(phase.pool_unit_bytes, 64 * 720);
                 assert!(phase

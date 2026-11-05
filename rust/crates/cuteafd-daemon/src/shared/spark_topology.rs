@@ -308,7 +308,23 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
                     + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
             }
-            if family != "kimik3" {
+            if matches!(family, "glm" | "ml4") {
+                // GLM's unified physical ledger admits GPU return reserves;
+                // the deleted ordinary-host ledger is not an allocation owner.
+                let placement = report.solver_placement.as_ref().expect("shared GLM placement");
+                let envelopes: Vec<_> = placement.items[0].iter().filter(|item|
+                    item.group.starts_with("glm.prefill: Spark intake transport envelope")).collect();
+                assert_eq!(envelopes.len(), 1, "{key}: one admitted prefill endpoint");
+                assert!(envelopes[0].bytes >= intake, "{key}: device return envelope omits ranks");
+                for rank in 0..8 {
+                    let bytes = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                        waves * rows * hidden * 2)?;
+                    assert!(envelopes[0].group.contains(&format!(
+                        "glm.prefill.intake.rank.{rank}.storage={bytes}")), "{key}: rank {rank} return receipt");
+                }
+                let ledger = report.phase_ledger.as_ref().expect("joint physical ledger");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
                     ("mimo/spark-intake-upper-bound", (rows * waves + 64) * hidden * 2 * 8)

@@ -1,6 +1,7 @@
 //! Kimi K3 (`kimi_k3` wrapping `text_config.model_type=kimi_linear`) checkpoint readers.
 pub mod allocation;
 pub mod config;
+pub mod context;
 pub mod core;
 pub mod kda;
 pub mod mla;

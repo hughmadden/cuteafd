@@ -182,7 +182,12 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
     if args.dspark && prefix.prefix_cache_entries > 0 {
         let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
             args.draft_context_slots.unwrap_or(20), args.draft_sequences, args.max_context, 1)?;
-        args.draft_window_marks = prefix.mark_rule(max_sequences)
+        let mut rule = prefix.mark_rule(max_sequences);
+        let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?.unwrap_or(cuteafd_loader::placement::AttentionPlacement::Context);
+        rule.host = cuteafd_loader::families::glm5::host_prefix_enabled(
+            if args.split_device.is_some() { 2 } else { 1 }, attention, rule.host, rule.entries as u64);
+        args.draft_window_marks = rule
             .slots(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?);
     }
     Ok(())
@@ -243,11 +248,12 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
             return Ok(());
         }
     };
-    // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
+    // Retain the early tower allocation receipt for the joint LM recipe.
     let (mut vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    let media_owner = vision.as_ref().and_then(|v| v.device_owner);
     let media_push = vision.as_mut().map(|v| std::mem::take(&mut v.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|v| v.preparer.clone());
     let expander = vision.as_ref().map(|v| v.expander);
@@ -255,7 +261,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), |engine, transport, runtime| {
+    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), (media_owner, bytes as u64), |engine, transport, runtime| {
         media_push.commit()?;
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
@@ -478,10 +484,8 @@ impl Trace {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrency: usize)
+fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, _concurrency: usize)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On, engine.draft_window_marks)?;
     let template = engine.paged_buffers().iter().find_map(|(records, _)| records.map(|(buffer, _)| buffer))
@@ -497,10 +501,11 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     } else if engine.ranks() > 1 {
         // SAFETY of the registration: the engine (and its pools) outlives the cache, which
         // `schedule` drops first.
-        args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
+        engine.admitted_host_config.clone().map(|config|
             CudaCopyEngine::registered(engine.library, &family.buffers()).map(|copy| (config, copy))).transpose()?
     } else {
-        args.host_tier(engine.library, template, family.layout(), engine.max_context, concurrency)?
+        engine.admitted_host_config.clone().map(|config|
+            CudaCopyEngine::new(engine.library, template).map(|copy| (config, copy))).transpose()?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
@@ -1509,7 +1514,8 @@ mod draft_tests {
         for context in [0usize, 1_048_576] {
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
-                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16"])?.args;
+                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16",
+                "--host-cache-bytes", "auto"])?.args;
             args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
             assert_eq!(resolved.args.max_context, 1_048_576);
@@ -1520,6 +1526,18 @@ mod draft_tests {
             size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
             assert!(resolved.args.draft_window_marks > 0);
             census.push((resolved.args.max_context, resolved.args.draft_window_marks));
+            resolved.args.split_device = Some(1);
+            resolved.args.attention_placement = "heads".into();
+            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
+            let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&resolved.args.snapshot,
+                resolved.args.draft_context_slots.unwrap_or(20), resolved.args.draft_sequences,
+                resolved.args.max_context, 1)?;
+            let mut rule = args.prefix.mark_rule(args.max_sequences.unwrap());
+            rule.host = false;
+            assert_eq!(resolved.args.draft_window_marks, rule.slots(
+                cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?));
+            assert!(resolved.args.draft_window_marks > census.last().unwrap().1);
+
             let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
                 resolved.automatic_context, 524_288, 256);
             if context == 0 { assert_eq!(pool_context?, 524_032); }

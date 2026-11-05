@@ -235,6 +235,179 @@ impl SparkLinkOwners {
     }
 }
 
+/// The setting before the existing runtime landing probe. Preparing candidates
+/// is pure geometry and must not discover the fabric or create device storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkIntakeCandidates {
+    Host,
+    Pinned,
+    Probed,
+}
+
+impl SparkIntakeCandidates {
+    pub fn from_setting(setting: &str) -> Result<Self, super::planner::Refusal> {
+        match setting {
+            "host" => Ok(Self::Host),
+            "pinned" => Ok(Self::Pinned),
+            "auto" | "gpu" => Ok(Self::Probed),
+            _ => Err(super::planner::Refusal::InvalidFact(format!(
+                "CUTEAFD_SPARK_INTAKE={setting:?} is not one of auto, gpu, pinned, host"))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SparkLinkCandidate {
+    pub mode: SparkIntakeMode,
+    /// Only zero/nonzero changes physical storage. A mixed landing world uses
+    /// the same pull backing as an entirely host-landed world.
+    pub pinned: bool,
+    pub owners: Vec<super::planner::Allocation>,
+}
+
+/// Immutable link geometry admitted before construction. Endpoint and staging
+/// facts are supplied by the selected transport; the probe stays at its old
+/// construction point. An allowance is an envelope, never a fictitious owner.
+#[derive(Debug, Clone)]
+pub struct PreparedSparkLink {
+    prefix: String,
+    geometry: SparkLinkOwners,
+    candidates: Vec<SparkLinkCandidate>,
+    envelope: std::collections::BTreeMap<super::planner::Location, u64>,
+    lifetime: super::planner::Lifetime,
+}
+
+impl PreparedSparkLink {
+    /// A canonical endpoint's widest request fixes its retained staging before
+    /// bootstrap. `registered_egress` is the selected transport capability, not
+    /// a live capability probe. No allocations or device calls happen here.
+    pub fn endpoint(prefix: &str, gpu: u8, endpoints: SparkEndpointOwners,
+        waves: usize, prefill: bool, registered_egress: bool, modes: SparkIntakeCandidates,
+        reply: cuteafd_core::SparkReplyFormat, lifetime: super::planner::Lifetime)
+        -> Result<Self, super::planner::Refusal> {
+        use super::planner::Refusal;
+        let endpoint = endpoints.endpoint;
+        let geometry = endpoints.geometry;
+        let rows = u64::from(endpoint.capacity);
+        let bf16 = matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
+        let row_bytes = if bf16 { u64::from(geometry.hidden).checked_mul(2) }
+            else { u64::from(geometry.hidden).checked_add(u64::from(geometry.hidden) / 32) }
+            .ok_or(Refusal::Overflow("Spark request row"))?;
+        let staging = rows.checked_mul(u64::from(geometry.topk)).and_then(|bytes| bytes.checked_mul(8))
+            .and_then(|bytes| bytes.checked_add(rows.checked_mul(row_bytes)?))
+            .ok_or(Refusal::Overflow("Spark request staging"))?.max(256);
+        let egress = if registered_egress {
+            Some(geometry.compact_wire_bytes(endpoint.capacity, bf16)
+                .ok_or_else(|| Refusal::InvalidFact("invalid Spark registered egress geometry".into()))?.0 as u64)
+        } else { None };
+        let (staging, unused_egress_bytes) = match egress {
+            Some(slot_bytes) if slot_bytes >= staging => (SparkWaveStaging::Registered { slot_bytes }, None),
+            bytes => (SparkWaveStaging::Standalone { slot_bytes: staging }, bytes.map(|bytes|
+                bytes.checked_mul(waves as u64).ok_or(Refusal::Overflow("Spark unused egress"))).transpose()?),
+        };
+        Self::new(prefix, SparkLinkOwners {
+            intake: SparkIntakeOwners { gpu, ranks: endpoints.ranks, rows,
+                row_bytes: u64::from(geometry.hidden).checked_mul(2)
+                    .ok_or(Refusal::Overflow("Spark reply row"))?, waves, mode: SparkIntakeMode::Gpu },
+            waves: SparkWaveOwners { ranks: endpoints.ranks, waves, pinned: 0, staging },
+            endpoints, spark_reply_format: reply, prefill, unused_egress_bytes,
+        }, modes, lifetime)
+    }
+
+    pub fn new(prefix: &str, geometry: SparkLinkOwners, modes: SparkIntakeCandidates,
+        lifetime: super::planner::Lifetime) -> Result<Self, super::planner::Refusal> {
+        use super::planner::Refusal;
+        let modes: &[(SparkIntakeMode, bool)] = match modes {
+            SparkIntakeCandidates::Host => &[(SparkIntakeMode::Host, true)],
+            SparkIntakeCandidates::Pinned => &[(SparkIntakeMode::Pinned, true)],
+            SparkIntakeCandidates::Probed => &[(SparkIntakeMode::Gpu, false),
+                (SparkIntakeMode::Gpu, true), (SparkIntakeMode::Pinned, true)],
+        };
+        let all = if geometry.intake.ranks == 8 { u8::MAX }
+            else if geometry.intake.ranks < 8 { (1u8 << geometry.intake.ranks) - 1 } else { 0 };
+        let mut envelope = std::collections::BTreeMap::<_, u64>::new();
+        let mut candidates = Vec::new();
+        for &(mode, pinned) in modes {
+            let selected = SparkLinkOwners {
+                intake: SparkIntakeOwners { mode, ..geometry.intake },
+                waves: SparkWaveOwners { pinned: if pinned { all } else { 0 }, ..geometry.waves },
+                ..geometry
+            };
+            let owners = selected.allocations(prefix, lifetime)?;
+            for (location, bytes) in owner_totals(&owners)? {
+                envelope.entry(location).and_modify(|peak| *peak = (*peak).max(bytes)).or_insert(bytes);
+            }
+            candidates.push(SparkLinkCandidate { mode, pinned, owners });
+        }
+        if candidates.is_empty() || envelope.is_empty() {
+            return Err(Refusal::InvalidFact("empty Spark transport envelope".into()));
+        }
+        Ok(Self { prefix: prefix.into(), geometry, candidates, envelope, lifetime })
+    }
+
+    pub fn geometry(&self) -> SparkLinkOwners { self.geometry }
+    pub fn candidates(&self) -> &[SparkLinkCandidate] { &self.candidates }
+    pub fn envelope(&self) -> &std::collections::BTreeMap<super::planner::Location, u64> { &self.envelope }
+
+    pub fn selected(&self, mode: SparkIntakeMode, pinned: bool)
+        -> Result<&SparkLinkCandidate, super::planner::Refusal> {
+        self.candidates.iter().find(|candidate| candidate.mode == mode && candidate.pinned == pinned)
+            .ok_or_else(|| super::planner::Refusal::InvalidFact(
+                "probed Spark receive mode is outside the admitted transport candidates".into()))
+    }
+
+    /// Called at construction with actual retained owners, excluding aliases.
+    /// Candidate identity alone cannot authorize a larger physical allocation.
+    pub fn check_owners(&self, mode: SparkIntakeMode, pinned: bool,
+        actual: &[super::planner::Allocation]) -> Result<(), super::planner::Refusal> {
+        use super::planner::Refusal;
+        let selected = self.selected(mode, pinned)?;
+        let expected = owner_totals(&selected.owners)?;
+        let actual = owner_totals(actual)?;
+        if actual.keys().any(|location| !expected.contains_key(location)) {
+            return Err(Refusal::InvalidFact("Spark construction used an unadmitted memory location".into()));
+        }
+        for (location, bytes) in actual {
+            if bytes > expected[&location] || bytes > self.envelope[&location] {
+                return Err(Refusal::InvalidFact(format!(
+                    "Spark construction at {location:?} owns {bytes} bytes, selected candidate admits {} bytes",
+                    expected[&location])));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn components(&self, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{Activation, Allowance, ByteCurve, Component, ComponentKind, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark transport envelope requires a positive pool domain".into()));
+        }
+        Ok(self.envelope.iter().map(|(&location, &bytes)| {
+            let receipts = self.candidates.iter().map(|candidate| {
+                let owners = candidate.owners.iter().filter(|owner| owner.location == location && owner.view.is_none())
+                    .map(|owner| format!("{}={}", owner.id, owner.bytes)).collect::<Vec<_>>().join(",");
+                format!("{:?}/pinned={}: [{owners}]", candidate.mode, candidate.pinned)
+            }).collect::<Vec<_>>().join("; ");
+            Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location, bytes, lifetime: self.lifetime,
+                    source: format!("{}: Spark intake transport envelope (probe-selected); derived exact finite maximum from candidate geometry; {receipts}", self.prefix),
+                    assumed: false }) }
+        }).collect())
+    }
+}
+
+fn owner_totals(owners: &[super::planner::Allocation])
+    -> Result<std::collections::BTreeMap<super::planner::Location, u64>, super::planner::Refusal> {
+    let mut totals = std::collections::BTreeMap::<_, u64>::new();
+    for owner in owners.iter().filter(|owner| owner.view.is_none()) {
+        let bytes = totals.entry(owner.location).or_default();
+        *bytes = bytes.checked_add(owner.bytes)
+            .ok_or(super::planner::Refusal::Overflow("Spark transport envelope"))?;
+    }
+    Ok(totals)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 
@@ -624,6 +797,88 @@ pub struct SparkIoBytes {
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category};
+
+    #[test]
+    fn prepared_link_envelope_is_candidate_maximum_not_sum_and_keeps_receipts() {
+        use super::super::planner::{ComponentKind, Lifetime, Location, Phase};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkReplyFormat, SparkRings};
+        let lifetime = Lifetime { first: Phase::PostTargetKv, last: Phase::Growth };
+        for ranks in [1, 4, 8] { for rows in [64, 2752] { for waves in [1, 3] {
+            let endpoint = SparkEndpointOwners { ranks, geometry: ExpertGeometry::GLM5,
+                endpoint: SparkEndpoint { capacity: rows, ingress: SparkIngress::Fp8K32,
+                    ring_depth: None, partial_reply_bytes: None },
+                rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } };
+            let plan = PreparedSparkLink::endpoint("test", 1, endpoint, waves, rows > 64, true,
+                SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, lifetime).unwrap();
+            assert_eq!(plan.candidates().len(), 3);
+            let mut independent = std::collections::BTreeMap::<_, u64>::new();
+            for candidate in plan.candidates() {
+                let mut bytes = std::collections::BTreeMap::<_, u64>::new();
+                for owner in candidate.owners.iter().filter(|owner| owner.view.is_none()) {
+                    *bytes.entry(owner.location).or_default() += owner.bytes;
+                }
+                for (location, bytes) in bytes {
+                    independent.entry(location).and_modify(|peak| *peak = (*peak).max(bytes)).or_insert(bytes);
+                }
+                plan.check_owners(candidate.mode, candidate.pinned, &candidate.owners).unwrap();
+            }
+            assert_eq!(plan.envelope(), &independent);
+            assert_eq!(independent.len(), 2);
+            assert!(independent.contains_key(&Location::coordinator(1)));
+            assert!(independent.contains_key(&Location::PINNED));
+            for component in plan.components(64).unwrap() {
+                let ComponentKind::Allowance(allowance) = component.kind else { panic!("not an envelope") };
+                assert_eq!(allowance.bytes, independent[&allowance.location]);
+                assert_eq!(allowance.lifetime, lifetime);
+                assert!(!allowance.assumed);
+                assert!(allowance.source.contains("derived exact finite maximum from candidate geometry"));
+                assert!(allowance.source.contains("Gpu/pinned=false"));
+                assert!(allowance.source.contains("Pinned/pinned=true"));
+            }
+            let candidate = plan.selected(SparkIntakeMode::Pinned, true).unwrap();
+            let mut oversized = candidate.owners.clone();
+            oversized.iter_mut().find(|owner| owner.location == Location::PINNED
+                && owner.view.is_none()).unwrap().bytes += 1;
+            assert!(plan.check_owners(candidate.mode, candidate.pinned, &oversized).is_err());
+            assert!(plan.selected(SparkIntakeMode::Host, true).is_err());
+            assert!(plan.selected(SparkIntakeMode::Pinned, false).is_err());
+        } } }
+    }
+
+    #[test]
+    fn prepared_link_staging_uses_selected_endpoint_and_egress_capability_without_probe() {
+        use super::super::planner::{Lifetime, Phase};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkReplyFormat, SparkRings};
+        let lifetime = Lifetime { first: Phase::PostTargetKv, last: Phase::Growth };
+        for (setting, expected) in [("host", SparkIntakeMode::Host), ("pinned", SparkIntakeMode::Pinned)] {
+            for ingress in [SparkIngress::Fp8K32, SparkIngress::Bf16] {
+                for registered in [false, true] {
+                    let endpoints = SparkEndpointOwners { ranks: 4, geometry: ExpertGeometry::GLM5,
+                        endpoint: SparkEndpoint { capacity: 2752, ingress, ring_depth: None, partial_reply_bytes: None },
+                        rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } };
+                    let plan = PreparedSparkLink::endpoint("prefill", 0, endpoints, 3, true, registered,
+                        SparkIntakeCandidates::from_setting(setting).unwrap(), SparkReplyFormat::Bf16, lifetime).unwrap();
+                    assert_eq!(plan.candidates().len(), 1);
+                    assert_eq!(plan.candidates()[0].mode, expected);
+                    let geometry = plan.geometry();
+                    let bf16 = ingress == SparkIngress::Bf16;
+                    let row = if bf16 { 6144 * 2 } else { 6144 + 6144 / 32 };
+                    let stage = 2752 * (8 * 8 + row);
+                    if registered {
+                        let SparkWaveStaging::Registered { slot_bytes } = geometry.waves.staging else { panic!("not registered") };
+                        assert_eq!(slot_bytes, ExpertGeometry::GLM5.compact_wire_bytes(2752, bf16).unwrap().0 as u64);
+                        assert!(slot_bytes >= stage);
+                    } else {
+                        assert_eq!(geometry.waves.staging, SparkWaveStaging::Standalone { slot_bytes: stage });
+                    }
+                    assert!(geometry.unused_egress_bytes.is_none());
+                }
+            }
+        }
+        assert!(SparkIntakeCandidates::from_setting("other").is_err());
+        assert_eq!(SparkIntakeCandidates::from_setting("auto").unwrap(), SparkIntakeCandidates::Probed);
+        assert_eq!(SparkIntakeCandidates::from_setting("gpu").unwrap(), SparkIntakeCandidates::Probed);
+    }
 
     #[test]
     fn compressed_prefill_reply_reuses_raw_bf16_without_scratch() {

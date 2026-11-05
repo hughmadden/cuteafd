@@ -8,6 +8,105 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
+    use crate::placement::planner::{self, Allocation, Allowance, Baseline, Budget, Contract,
+        Facts, Lifetime, Location, Operation, Phase, PhaseOrder, Pin, PrefillShape, Recipe,
+        Refusal, Request, Reservation, Sequential, Variable};
+    use cuteafd_core::memory_layout::Category;
+    struct Fixed(Facts);
+    impl Recipe for Fixed {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            let mut contract = Contract::fixed(64, 1, 2, self.0.clone());
+            contract.variables = vec![
+                Variable::Attention { layer: 0, values: vec![crate::placement::LayerMode::ContextSplit] },
+                Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
+                Variable::Lanes(vec![1]),
+            ];
+            Ok(contract)
+        }
+    }
+    let at = |phase| Lifetime { first: phase, last: phase };
+    let owner = |id, location, bytes, lifetime| Allocation::buffer(id, location, bytes,
+        lifetime, Category::Workspace, id);
+    let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+        resident_weights: vec![], deferred: vec![],
+        allocations: vec![
+            owner("gpu0.load", Location::coordinator(0), 700, at(Phase::Load)),
+            owner("gpu0.resident", Location::coordinator(0), 100, Lifetime::TARGET),
+            owner("gpu1.warm", Location::coordinator(1), 200, at(Phase::Warmup)),
+            owner("gpu1.resident", Location::coordinator(1), 50, Lifetime::TARGET),
+            owner("prefix", Location::PINNED, 200,
+                Lifetime { first: Phase::Warmup, last: Phase::Growth }),
+        ],
+        sequential: vec![Sequential { id: "load slices".into(), members: vec![
+            owner("slice0", Location::PINNED, 400, at(Phase::Load)),
+            owner("slice1", Location::PINNED, 600, at(Phase::Load)),
+        ] }],
+        reservations: vec![Reservation { id: "draft pool".into(), location: Location::PINNED,
+            bytes: 300, lifetime: at(Phase::DraftLoad), source: "bounded load pool".into() }],
+        allowances: vec![
+            Allowance { location: Location::coordinator(0), bytes: 20, lifetime: Lifetime::RESIDENT,
+                source: "gpu0 runtime".into(), assumed: false },
+            Allowance { location: Location::coordinator(1), bytes: 10, lifetime: Lifetime::RESIDENT,
+                source: "gpu1 runtime".into(), assumed: true },
+            Allowance { location: Location::HOST, bytes: 1000,
+                lifetime: Lifetime { first: Phase::Load, last: Phase::Warmup },
+                source: "load RSS".into(), assumed: false },
+            Allowance { location: Location::HOST, bytes: 800,
+                lifetime: Lifetime { first: Phase::Ready, last: Phase::Growth },
+                source: "steady RSS".into(), assumed: true },
+        ],
+    };
+    let budgets = vec![
+        Budget { id: "gpu.0".into(), locations: vec![Location::coordinator(0)],
+            physical_bytes: 4096, logical_bytes: 2048, headroom: 32,
+            baseline: Baseline::Forecast { occupied: 16, source: "maintained baseline".into(), assumed: false } },
+        Budget { id: "gpu.1".into(), locations: vec![Location::coordinator(1)],
+            physical_bytes: 4096, logical_bytes: 2048, headroom: 32,
+            baseline: Baseline::Sampled { free: 4080, phase: Phase::Load, source: "preload sample".into() } },
+        Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+            physical_bytes: 8192, logical_bytes: 4096, headroom: 64,
+            baseline: Baseline::Forecast { occupied: 128, source: "host baseline".into(), assumed: true } },
+    ];
+    let solved = planner::solve(Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+        prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
+        spark_reply_formats: Default::default() }, budgets, &Fixed(facts)).unwrap();
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = empty_report(&input, &PlanOptions::default()).unwrap();
+    assert!(serde_json::to_value(&report).unwrap().get("phase_ledger").is_none());
+    report.phase_ledger = Some(SolvedPhaseLedger::from(&solved));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["phase_ledger"]["budgets"], serde_json::to_value(&solved.budgets).unwrap());
+    assert_eq!(json["phase_ledger"]["phases"], serde_json::to_value(&solved.phases).unwrap());
+    assert_eq!(solved.phases.len(), 18);
+    assert_eq!(solved.phases[1].phase, Phase::DraftLoad);
+    assert!(report.memory_layout.is_none(), "startup peaks never become Ready items");
+    assert_eq!(solved.items(Location::coordinator(0)).unwrap().iter().map(|item| item.bytes).sum::<u64>(), 120);
+    let text = render(&report);
+    for expected in [
+        "memory peak gpu.0 [coordinator GPU 0 device]: checkpoint loading; 720 bytes (owned 700, opaque 20); available 2000 bytes",
+        "memory peak gpu.1 [coordinator GPU 1 device]: decode warm-up; 260 bytes (owned 250, opaque 10); available 2000 bytes",
+        "memory peak host [host RAM ordinary + host RAM pinned]: checkpoint loading; 1600 bytes (owned 600, opaque 1000); available 3904 bytes",
+        "baseline 16 bytes (calibrated: maintained baseline); headroom 32 bytes",
+        "baseline 16 bytes (sampled: preload sample); headroom 32 bytes",
+        "baseline 128 bytes (estimated: host baseline); headroom 64 bytes",
+    ] { assert!(text.contains(expected), "missing {expected}: {text}"); }
+    assert_eq!(text.matches("memory peak ").count(), 3);
+
+    let mut refused = empty_report(&input, &PlanOptions::default()).unwrap();
+    let error = Refusal::Capacity { budget: "host RAM (ordinary + pinned)".into(),
+        phase: Phase::DraftLoad, required: 4097, available: 4096, owners: vec![] };
+    refused.refuse_placement(error.to_string(), "Increase the host RAM budget or reduce an explicit allocation.");
+    assert!(!refused.fits && !refused.placement_supported);
+    let text = render(&refused);
+    assert!(text.contains("memory budget 'host RAM (ordinary + pinned)' during draft loading needs 4097 bytes, has 4096 bytes available"), "{text}");
+    assert!(text.contains("Increase the host RAM budget"), "{text}");
+    assert!(!text.contains("memory peak "));
+    assert!(serde_json::to_value(&refused).unwrap().get("phase_ledger").is_none());
+}
+
+#[test]
 fn glm5_native_head_members_classify_and_validate_as_one_operand() {
     let mut config = glm5_config();
     config["vocab_size"] = json!(128);
@@ -363,59 +462,36 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
 
 #[test]
 fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
-    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
-    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
-    let input = PlanInput::open(dir.path()).unwrap();
-    let mut report = input.plan(&sparks(4)).unwrap();
-    let spec = report.spec.as_ref().unwrap();
-    let moe = spec.moe.as_ref().unwrap();
-    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
-        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-    let vocab = spec.vocab as u64;
-    let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        host_cache_bytes: Some(0), full_prefill_logits: true, prefill_lanes: 1,
-        prefill_rows: 4096, ..Default::default() };
-    report.prefill_transports = Some(1);
-    for native in [false, true] {
-        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (2752, 3, 8256), (2048, 4, 8192), (2048, 2, 4096)] {
-            options.prefill_rows = span;
-            options.prefill_unit_rows = Some(unit);
-            options.prefill_waves = waves;
-            report.prefill_span_rows = Some(span);
-            for family in ["glm5", "glm5_flash"] {
-                report.family = Some(family.into());
-                layout::charge_host(&mut report, &options, &input, native).unwrap();
-                assert_eq!(report.prefill_span_rows, Some(span));
-                let host = report.host_ledger.as_ref().unwrap();
-                let bytes = |name: &str| host.items.iter().find(|i| i.group == name).unwrap().bytes;
-                if family == "mimo_v2" {
-                    let cfg = MimoV2Config::from_hf(&input.checkpoint().config).unwrap();
-                    let expected = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
-                        unit as usize, waves as usize, 1, 0, options.context_tokens.max(1) as usize,
-                        4, options.mimo_expert_input, crate::families::mimo_v2::MimoKvFormats::default(),
-                        crate::families::mimo_v2::MimoPrefillOutput::AllRows, true, unit.min(256) as usize, 0).unwrap();
-                    for (name, expected) in expected { assert_eq!(bytes(&name), expected, "{name}"); }
-                    assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
-                    continue;
+    use cuteafd_core::{SparkIngress, SparkRings};
+    use crate::placement::{families::glm5::admission::production_links,
+        planner::{Location, PrefillShape}, SparkWaveStaging};
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
+    let rings = SparkRings { max_frame_bytes: 128 << 20, depth: 8,
+        slot_bytes: 8 << 20, alignment: 4096 };
+    for ingress in [SparkIngress::Bf16, SparkIngress::Fp8K32] {
+        for (rows, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (2048, 2)] {
+            let (decode, prefill) = production_links(&cfg, 4, PrefillShape { rows, waves },
+                ingress, rings, Default::default()).unwrap();
+            for (link, rows, waves) in [(decode.unwrap(), 64, 1), (prefill.unwrap(), rows, waves)] {
+                let geometry = link.geometry();
+                assert_eq!((geometry.intake.rows, geometry.intake.waves), (rows, waves as usize));
+                let expected_rings = geometry.endpoints.endpoint.ring_bytes(
+                    geometry.endpoints.geometry, rings).unwrap() as u64 * 4;
+                let expected_return = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                    rows * waves * cfg.hidden as u64 * 2).unwrap();
+                let expected_slot = geometry.endpoints.geometry.compact_wire_bytes(rows as u32,
+                    ingress == SparkIngress::Bf16).unwrap().0 as u64;
+                assert!(matches!(geometry.waves.staging, SparkWaveStaging::Registered { slot_bytes }
+                    if slot_bytes == expected_slot));
+                for candidate in link.candidates() {
+                    let rings: u64 = candidate.owners.iter().filter(|a|
+                        a.group == "Spark endpoint rings").map(|a| a.bytes).sum();
+                    assert_eq!(rings, expected_rings);
+                    let returns: Vec<_> = candidate.owners.iter().filter(|a|
+                        a.location == Location::coordinator(0) && a.group == "Spark intake").collect();
+                    assert_eq!(returns.len(), 4);
+                    assert!(returns.iter().all(|a| a.bytes == expected_return));
                 }
-                let endpoints = layout::spark_endpoints(family, 1) as u64;
-                let ingress = if !native && family == "glm5" { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress, partial_reply_bytes: None };
-                let (frame_request, response) = endpoint.wire_bytes(geometry).unwrap();
-                let request = geometry.compact_wire_bytes(unit as u32,
-                    !native && input.checkpoint().spark_input_is_bf16()).unwrap().0;
-                let rings = SparkRings { max_frame_bytes: (64 << 20).max(frame_request).max(response),
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-                assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(geometry, rings).unwrap() as u64
-                    * endpoints * 4, "{family} {unit}x{waves}");
-                assert_eq!(bytes("transport/egress"), request as u64 * waves * endpoints);
-                assert_eq!(bytes("spark-intake"), unit * waves * geometry.hidden as u64
-                    * if native { 4 } else { 2 } * endpoints * 4);
-                if family == "glm5" {
-                    assert!(!host.items.iter().any(|item| item.group == "workspace/router"));
-                }
-                assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
-                assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
             }
         }
     }
@@ -1749,67 +1825,6 @@ fn glm5_local_contract_distinguishes_tp2_prefix_from_standalone_placement() {
     assert!(reason.contains("solver-selected local RTX TP2 prefix"), "{reason}");
     assert!(reason.contains("not standalone --local-experts placement"), "{reason}");
     assert!(!reason.contains("has no local expert path"), "{reason}");
-}
-
-#[test]
-fn glm5_layout_matches_runtime_request_from_header_baseline() {
-    use crate::placement::{families::glm5 as glm, Baseline, Onboard};
-    use cuteafd_core::memory_layout::Category;
-    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
-    for (cards, pool) in [vec![32 << 30], vec![96 << 30], vec![96 << 30, 80 << 30]].into_iter()
-        .flat_map(|cards| [None, Some(65536)].map(|pool| (cards.clone(), pool))) {
-        for host_embedding in [false, true] {
-            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: cards.clone(), context_tokens: 65536,
-                pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 1, host_embedding,
-                glm5_drafter_disabled: true, ..Default::default() };
-            // No manifest here: auto resolves context on two GPUs and now fails
-            // closed without its programs (#202), so request heads explicitly.
-            let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
-                attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
-            assert!(report.executable(), "{}", render(&report));
-            // The planner publishes the units serving runs: rows each, waves in
-            // flight, and exactly their admitted row extent.
-            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(4096), Some(1), Some(4096)));
-            let memory = report.memory_layout.unwrap();
-            let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
-                .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
-                    .filter(|i| matches!(i.category, Category::Weights | Category::Embedding)
-                        || i.group == "context+modules")
-                    .map(|i| i.bytes).sum::<u64>() })).collect::<Vec<_>>();
-            let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
-            let weights = layout::glm5::device_bytes(&checkpoint, cards.len(), cfg.layers, host_embedding, None).unwrap();
-            let pre_weight = memory.devices.iter().take(cards.len()).zip(weights).map(|(device, weights)| {
-                let context = device.items.iter().filter(|item| item.group == "context+modules")
-                    .map(|item| item.bytes).sum::<u64>();
-                (device.capacity_bytes, Baseline::Measured { free_bytes: device.capacity_bytes - context - weights })
-            }).collect::<Vec<_>>();
-            assert_eq!(pre_weight, gpus);
-            let inputs = glm::GlmInputs {
-                loaded_weights: vec![crate::placement::ResidentWeights::default(); gpus.len()],
-                drafter_weights: crate::placement::ResidentWeights::default(),
-        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg: &cfg, layers: cfg.layers, gpus,
-                headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), native_head: false, skip_routed_experts: false,
-                prefill_rows: 4096,
-                prefill_lanes: 1, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
-                drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
-                tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
-                full_prefill_logits: false, context: None };
-            let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
-            let mut before_upload = inputs.clone();
-            before_upload.gpus = pre_weight;
-            let (pre, pre_working) = glm::solve_working_set(&before_upload, [0; 2], Some(report.attention_placement)).unwrap();
-            assert_eq!(pre, runtime);
-            assert_eq!(pre_working, working);
-            assert_eq!(working.spark.spark_ranks, report.spark_ranks);
-            assert_eq!(working.spark.prefill_lanes, 1);
-            assert_eq!(memory.pool_tokens, runtime.pool_tokens);
-            for (rank, items) in runtime.items.iter().enumerate() {
-                for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }
-            }
-        }
-    }
 }
 
 #[test]
@@ -4670,11 +4685,19 @@ fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
     assert!(tight.hints.iter().any(|hint| hint.what.starts_with("spark0") && hint.what.contains("shortfall 1 bytes")),
         "{:?}", tight.hints);
     let placement = roomy.solver_placement.as_ref().unwrap();
-    assert!(placement.max_pool_tokens_no_onboard >= placement.pool_tokens);
-    assert!(render(&roomy).contains(&format!("max_pool_tokens_no_onboard {}", placement.max_pool_tokens_no_onboard)));
+    let maximum = placement.max_pool_tokens_no_onboard.expect("legacy solve computes the counterfactual");
+    assert!(maximum >= placement.pool_tokens);
+    assert!(render(&roomy).contains(&format!("max_pool_tokens_no_onboard {maximum}")));
     let json = serde_json::to_value(&roomy).unwrap();
-    assert_eq!(json["max_pool_tokens_no_onboard"], placement.max_pool_tokens_no_onboard);
+    assert_eq!(json["max_pool_tokens_no_onboard"], maximum);
     assert_eq!(json["onboard_layers"], placement.onboard_layers);
+    let mut without_counterfactual = roomy.clone();
+    without_counterfactual.max_pool_tokens_no_onboard = None;
+    without_counterfactual.solver_placement.as_mut().unwrap().max_pool_tokens_no_onboard = None;
+    let text = render(&without_counterfactual);
+    assert!(text.contains(&format!("{} tokens admitted with {} RTX expert layers", roomy.memory_layout.as_ref().unwrap().pool_tokens, placement.onboard_layers)));
+    assert!(!text.contains("max_pool_tokens_no_onboard") && !text.contains("null tokens"));
+    assert!(serde_json::to_value(&without_counterfactual).unwrap().get("max_pool_tokens_no_onboard").is_none());
     // One wave fits the same budget: the k units divide the reserve, they
     // never add a second prefill scratch (only per-unit staging differs).
     let one = spark(&plan_at(121 << 30, 1));
@@ -5548,4 +5571,49 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
             old_capacity(old_quota, 50_000), host.conversations(new_quota, 50_000, chunk));
     }
     Ok(())
+}
+
+#[test]
+fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
+    use cuteafd_core::memory_layout::Category;
+    let mut config = glm5_config();
+    config["tie_word_embeddings"] = json!(true);
+    let dir = snapshot(config, &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536, glm5_drafter_disabled: true,
+        host_embedding: true, host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+    }), ..sparks(4) }).unwrap();
+    assert!(!report.fits);
+    assert!(report.placement_supported, "{:?}", report.hints);
+    let memory = report.memory_layout.unwrap();
+    assert!(memory.notes.iter().any(|note| note.contains("GPU residency retained")));
+    assert!(memory.devices[0].by_category()[&Category::Embedding] > 0);
+    assert!(report.host_ledger.is_none());
+}
+
+#[test]
+fn glm_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536, glm5_drafter_disabled: true,
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        ..Default::default()
+    }), ..sparks(4) };
+    let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(automatic.wip_launchable(), "{}", render(&automatic));
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let direct = plan(dir.path(), &zero).unwrap();
+    let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }

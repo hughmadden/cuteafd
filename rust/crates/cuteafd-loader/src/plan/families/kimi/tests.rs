@@ -318,16 +318,18 @@ fn planned_headers_supply_range_geometry_without_claiming_fit() {
 }
 
 #[test]
-fn context_refuses_the_missing_executor_instead_of_claiming_fit() {
+fn context_refuses_missing_programs_but_auto_stays_layers() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
     let report = testing::plan(dir.path(), &options).unwrap();
     assert!(!report.placement_supported && !report.fits && !report.executable());
-    let reason = report.config_error.as_deref().unwrap();
-    assert!(reason.contains("kimi_k3") && reason.contains("context")
-        && reason.contains("executor not implemented"), "{reason}");
-    assert!(report.memory_layout.is_none());
+    assert!(report.hints.iter().any(|h| h.what.contains("Kimi context program admission refused")
+        && h.how.contains("kimik3_mla_partial") && h.how.contains("kimik3_lse_combine2")), "{:?}", report.hints);
+    options.attention_placement = None;
+    let report = testing::plan(dir.path(), &options).unwrap();
+    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Layers);
+    assert!(!report.hints.iter().any(|h| h.what.contains("context program")));
 }
 
 #[test]
@@ -516,7 +518,12 @@ fn cache_geometry_preserves_actual_physical_owners_and_mla_copies() {
         assert_eq!(cache.ranks[0], cache.ranks[1]);
         assert_eq!(cache.ranks[0].retained_mark_bytes, 224_686_080);
     }
-    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+    let context = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+        attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap().unwrap();
+    assert_eq!(context.placement, KvPlacement::PartitionedContext);
+    assert_eq!(context.ranks[0].persistent_unit_bytes, single.ranks[0].persistent_unit_bytes / 2);
+    assert_eq!(context.ranks[0], context.ranks[1]);
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 1,
         attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
 }
 
@@ -685,5 +692,84 @@ fn default_context_follows_the_checkpoint_core() -> Result<()> {
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");
     }
+    Ok(())
+}
+
+#[test]
+fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Result<()> {
+    use crate::{families::kimi_k3::{context::{self, ContextLayout}, core::CoreSplit},
+        placement::{AttentionPlacement, LayerMode}};
+    use cuteafd_core::{MlaCacheFormat, memory_layout::{Category, DeviceKind}};
+    let dir = tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(dir.path(), true);
+    let checkpoint = Checkpoint::open(dir.path())?;
+    let model = Model::open(&checkpoint)?;
+    let package = tempfile::tempdir()?;
+    let path = installed_inventory(package.path(), false);
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    context::add_manifest_programs(&mut manifest);
+    let mut policies = std::collections::BTreeMap::new();
+    for p in model.core.projections.values() {
+        for world in [1, 2] {
+            let (mut n, mut k) = (p.stored_outputs, p.shape[1]);
+            let side = if world == 1 || p.split != CoreSplit::Input { 1 } else { 2 };
+            if world == 2 && p.split != CoreSplit::Whole {
+                if side == 1 { n /= 2; } else { k /= 2; }
+            }
+            let book = match p.codebook {
+                crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+                crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
+            };
+            policies.insert((k, n, side, book), serde_json::json!({"input_features":k,
+                "output_features":n,"sharded_side":side,"codebook":book}));
+        }
+    }
+    manifest["families"] = serde_json::json!({"dense_trellis_k6":{"abi_version":1,
+        "row_policies":policies.into_values().collect::<Vec<_>>()}});
+    for capacity in [64, 4096] {
+        let mut names = vec![format!("kda_core_h48_m{capacity}")];
+        for heads in [48, 96] { for stride in [576, 640] { for cache in ["", "_fp8"] {
+            names.push(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"));
+        } } }
+        manifest["programs"].as_array_mut().unwrap().extend(names.into_iter().map(|name|
+            serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":256}})));
+    }
+    std::fs::write(&path, manifest.to_string())?;
+    let input = testing::BudgetedPlanInput::open(dir.path())?;
+    let mut options = with_layout(6, Some(110 << 30));
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(path);
+    layout.context_tokens = 262_144;
+    layout.pool_tokens = Some(2_097_152);
+    layout.target_pool_tokens = 2_097_152;
+    layout.mla_kv = MlaCacheFormat::Fp8;
+    layout.prefix_slots = Some(1);
+    let layers = input.plan(&options)?;
+    assert_eq!(layers.attention_placement, AttentionPlacement::Layers);
+    options.attention_placement = Some(AttentionPlacement::Context);
+    let report = input.plan(&options)?;
+    let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+    assert_eq!(report.attention_placement, AttentionPlacement::Context);
+    assert_eq!(placed.pool_tokens, layers.solver_placement.as_ref().unwrap().pool_tokens);
+    assert_eq!(placed.pool_tokens, 2_097_152);
+    assert!(placed.onboard_layers > 0);
+    for (layer, assignment) in placed.layers.iter().enumerate() {
+        assert_eq!(assignment.mode, if model.cfg.attention[layer] == KimiAttention::Mla {
+            LayerMode::ContextSplit } else { LayerMode::HeadSplit });
+    }
+    let expected = ContextLayout::from_manifest(&manifest, MlaCacheFormat::Fp8, 262_144,
+        report.prefill_unit_rows.unwrap() as usize, report.prefill_waves.unwrap() as usize)?.buffers();
+    let demands = expected.demands()?;
+    let memory = report.memory_layout.as_ref().unwrap();
+    for device in memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx) {
+        for demand in demands.iter().filter(|d| u32::from(d.gpu) == device.index) {
+            assert_eq!(device.items.iter().filter(|i| i.group == demand.group).map(|i| i.bytes).sum::<u64>(), demand.bytes);
+        }
+        let kv = device.items.iter().filter(|i| i.category == Category::Kv && i.group == "records")
+            .map(|i| i.bytes).sum::<u64>();
+        assert_eq!(kv, placed.pool_tokens * model.cfg.mla_layers() as u64 * MlaCacheFormat::Fp8.record_bytes() as u64 / 2);
+    }
+    assert!(memory.notes.iter().any(|n| n.contains("configured 262144 tokens = 343932928 B")
+        && n.contains("compiled cap 1048576 tokens = 1375731712 B")), "{:?}", memory.notes);
     Ok(())
 }

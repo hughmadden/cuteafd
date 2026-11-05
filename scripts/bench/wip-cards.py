@@ -2498,6 +2498,8 @@ def main():
     parser.add_argument('--preflight-only', action='store_true', help='run every CPU check (slots, packages, audio, containers, '
                         'binary, trace dirs), write the plan and exit; for hwlock --preflight')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
+    parser.add_argument('--run-timeout', action='append', default=[], metavar='CARD=SECONDS',
+                        help="override a card's kit run_timeout_s (the timed sweep's limit), e.g. for a long-context panel")
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
     parser.add_argument('--seed', '--seed-host', dest='seed_host', default=DEFAULT_SEED, choices=SEEDS,
@@ -2683,7 +2685,13 @@ def main():
     for item in args.expect_pool:
         name, value = item.split('=', 1)
         expected[name] = int(value)
-    if (set(overrides) | set(probes) | set(expected)) - set(args.cards):
+    run_timeouts = {}
+    for item in args.run_timeout:
+        name, value = item.split('=', 1)
+        if not value.isdigit() or int(value) < 1:
+            raise ValueError('--run-timeout needs CARD=SECONDS with a positive integer')
+        run_timeouts[name] = int(value)
+    if (set(overrides) | set(probes) | set(expected) | set(run_timeouts)) - set(args.cards):
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
@@ -2691,6 +2699,8 @@ def main():
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
+        if card['name'] in run_timeouts:
+            card['run_timeout_s'] = run_timeouts[card['name']]
         values = {**config(card['config']), **card['set']}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
         if not 0 <= count <= len(HOSTS):

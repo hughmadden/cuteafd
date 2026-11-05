@@ -264,9 +264,9 @@ Attention placement (`ATTENTION_PLACEMENT`; the default is the planner's
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ heads² | ✓ layers | ✓ layers | ✓ heads |
-| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗⁴ | ✗ | ✗ |
-| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✗ | ✗ |
+| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ (explicit; auto stays layers) | ✗ | ✗ |
+| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
 family's attention-placement error.
@@ -276,9 +276,9 @@ accepted on either. ² Dense Qwen is a single-device executor: `auto` resolves
 to `heads`, and an explicit `heads` is refused until a multi-GPU executor is
 qualified. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
 explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
-mode whose image lacks its programs. ⁴ Kimi K3's engine and
-planner take explicit `heads` for MLA layers (the #795 comparison), but the
-launch key serves only `auto` until the launcher allows it.
+mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
+`context` and `layers` for MLA layers; `auto` stays `layers`. KDA stays
+head-split on two GPUs, independent of the MLA placement.
 
 Speculator (`SPECULATOR`):
 

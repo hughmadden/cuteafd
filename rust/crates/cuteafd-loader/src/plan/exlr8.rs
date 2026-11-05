@@ -19,7 +19,7 @@ pub mod residency;
 pub mod dense;
 pub mod native;
 mod workspace;
-pub use workspace::{execution_workspace_from_manifest, execution_workspace, routed_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
+pub use workspace::{execution_workspace_from_manifest, execution_workspace, routed_workspace, shared_execution_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
@@ -133,7 +133,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let family = super::family::detect(checkpoint).context("EXLR8 family is not recognized")?;
     let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator, family.id())?;
     let model = family.open(checkpoint)?;
-    let (layers, first_moe_layer, kernels) = native::family_geometry(&checkpoint.config)?;
+    let (layers, first_moe_layer, _) = native::family_geometry(&checkpoint.config)?;
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(input, options)?;
     report.family = Some(family.id().into());
@@ -164,7 +164,6 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         layers, &plans, resolved_layout.exlr8_prefill_pin, resolved_layout.exlr8_prefill_activations)?;
     ensure!(activations == resolved_layout.exlr8_prefill_activations,
         "EXLR8 resolved activation differs from requested layout charge");
-    let workspace = shared_workspace(&programs, kernels)?;
     let facts = native::DenseFacts::new(records, selection, layers, shared)?;
     drop(catalog_timer);
     let (memory, placement) = {
@@ -175,8 +174,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             let placement = report.solver_placement.clone().context("Flash EXLR8 native placement was refused")?;
             (memory, placement)
         } else {
-            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
-                workspace, world, &programs, Some(selected), Some(&metadata), Some(attention))?
+            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout,
+                world, &programs, selected, Some(&metadata), Some(attention), Some(&mut report))?
         }
     };
     let layout = &resolved_layout;
@@ -258,7 +257,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     append_spark_devices(&mut memory, layout, &residents);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
-    {
+    if family.id() != "glm5" {
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
         super::layout::charge_host(&mut report, layout, input, true)?;
     }
@@ -1549,7 +1548,7 @@ mod mounted_tests {
         use crate::plan::{ExpertPlacement, PlanInput, PlanOptions, layout::LayoutOptions};
         let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("CUTEAFD_EXLR8_TEST_SNAPSHOT"));
         let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"));
-        crate::plan::testing::validate_placement_inputs(&programs).unwrap();
+        crate::plan::inputs::validate_placement_inputs(&programs).unwrap();
         let output = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_PARITY_OUTPUT").expect("CUTEAFD_EXLR8_PARITY_OUTPUT"));
         std::fs::create_dir_all(&output).unwrap();
         struct Reset;

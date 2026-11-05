@@ -1135,8 +1135,7 @@ impl<'a> GlmLoader<'a> {
 /// the bytes (one RTX PRO 6000, coordinator alone: C1 step 28.6 vs 21.0 ms, 8K prefill 3.35
 /// vs 2.74 s), a decision pending in PLAN.md Phase 5.
 pub(crate) fn bf16_programs() -> bool {
-    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native"))
+    cuteafd_loader::families::glm5::native_bf16()
 }
 
 #[cfg(test)]

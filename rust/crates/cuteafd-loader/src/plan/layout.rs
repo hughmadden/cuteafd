@@ -1607,7 +1607,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
     let lanes = match report.prefill_transports {
         Some(transports) => transports,
         None => match family {
-            "glm5" | "glm5_flash" => u64::from(ranks > 0),
+            "glm5_flash" => u64::from(ranks > 0),
             "mimo_v2" => u64::from(ranks > 0),
             _ => 1,
         },
@@ -1657,7 +1657,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
                 topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
                 layers: u32::try_from(spec.layers.len())? };
             let endpoints = spark_endpoints(family, lanes);
-            let bf16 = native || matches!(family, "glm5" | "qwen4");
+            let bf16 = native || family == "qwen4";
             let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
                 else { SparkIngress::Fp8K32 };
             let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress, partial_reply_bytes: None };
@@ -1693,9 +1693,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
             push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
         }
         let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
-        // GLM route staging lives in the exchange slots already charged above;
-        // standalone router_host storage is allocated only by diagnostics.
-        if !matches!(family, "qwen4" | "glm5" | "muse_spark") {
+        if !matches!(family, "qwen4" | "muse_spark") {
             let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
                 .context("host routing stride overflow")?).context("host routing workspace overflow")?;
             push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
@@ -1764,7 +1762,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
                 Basis::Formula);
         }
     }
-    let score_lanes = if matches!(family, "glm5" | "glm5_flash") { lanes } else { 1 };
+    let score_lanes = if matches!(family, "glm5_flash") { lanes } else { 1 };
     let score_rows = if options.full_prefill_logits { rows.checked_mul(score_lanes).context("host scoring rows overflow")? }
         else if family == "deepseek_v41" { rows.max(256) } else { 64 };
     let logits = host_logits_bytes(score_rows, rows, spec.vocab as u64).context("host logits overflow")?;
@@ -1799,7 +1797,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
         let media = options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20));
         push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);
     }
-    let tier_disabled = options.rtx_bytes.len() > 1 && matches!(family, "glm5" | "deepseek_v4")
+    let tier_disabled = options.rtx_bytes.len() > 1 && family == "deepseek_v4"
         && report.attention_placement == crate::placement::AttentionPlacement::Heads;
     let family = family.to_owned();
     let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {

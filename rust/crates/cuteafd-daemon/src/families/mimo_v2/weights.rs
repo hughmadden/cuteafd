@@ -345,9 +345,28 @@ impl<'a> MimoLoader<'a> {
 
     /// The row-concatenation of 2-D `names` as one BF16 operand.
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+        let headers = names.iter().map(|name| self.tensor(name)).collect::<Result<Vec<_>>>()?;
+        if !headers.is_empty() && headers.iter().all(|t| t.meta.dtype == DType::Bf16) {
+            let mut lands = Vec::new();
+            let (mut bytes, mut cols) = (0usize, None);
+            for (name, tensor) in names.iter().zip(headers) {
+                let shape = &tensor.meta.shape;
+                ensure!(shape.len() == 2 && shape[0] > 0 && shape[1] > 0
+                    && cols.is_none_or(|width| width == shape[1]),
+                    "{names:?}: BF16 row operands require nonempty matrices sharing columns");
+                cols = Some(shape[1]);
+                let size = shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
+                    .context("row operand storage overflow")?;
+                ensure!(u64::try_from(size)? == tensor.meta.byte_length,
+                    "{name}: BF16 bytes disagree with row shape");
+                lands.push((self.rect(name, None, None)?, bytes));
+                bytes = bytes.checked_add(size).context("row operand storage overflow")?;
+            }
+            return self.landed(0, lands, bytes, &[]);
+        }
         ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
             "{}: this representation loads through the mount", format!("{names:?}"));
-        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         ensure!(!tensors.is_empty() && tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[0] > 0 && s[1] > 0),
             "{names:?}: row operands require nonempty two-dimensional tensors");
@@ -669,8 +688,6 @@ impl<'a> MimoLoader<'a> {
     /// The BF16 o_proj `[H, heads * v_head]` sliced by columns over `ranks`
     /// (rank `r`'s heads). The final operands own BF16 values only.
     fn o_proj(&self, name: &str, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
-        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
-            "{}: this representation loads through the mount", name);
         let tensor = self.tensor(name)?;
         if ranks == 1 && tensor.meta.dtype != DType::Bf16 {
             return Ok(vec![self.rows(&[name.to_string()])?]);
@@ -680,54 +697,32 @@ impl<'a> MimoLoader<'a> {
             "{name}: a head split takes o_proj as BF16 [H, K] with K a multiple of {}, found {:?} {shape:?}",
             ranks * 128, tensor.meta.dtype);
         let (rows, cols) = (shape[0], shape[1] / ranks);
-        // The whole weight goes up once to rank 0; each rank's columns are a pitched
-        // device copy from it (over peer memory for the others).
-        let whole = crate::shared::memory::staging::with_staging(tensor.meta.byte_length as usize, |bytes| {
-            self.read_into(name, bytes, 0)?;
-            self.upload(bytes)
-        })?;
-        let mut whole = Some(whole);
-        let mut completed = Vec::with_capacity(ranks);
-        for rank in 0..ranks {
-            let operand = self.on_rank(rank, |stream| {
-                if ranks == 1 {
-                    // One GPU: the uploaded weight itself.
-                    let out = whole.take().context("o_proj")?;
-                    return Ok(out);
-                }
-                let source_allocation = whole.as_ref().context("o_proj")?;
-                let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
-                let source = CuteafdDeviceBuffer {
-                    // SAFETY: column block `rank` of every row lies inside the whole weight.
-                    ptr: unsafe { source_allocation.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
-                    bytes: source_allocation.buffer.bytes - rank * cols * 2,
-                    ..source_allocation.buffer
-                };
-                // SAFETY: both buffers are live and sized for these pitched spans; peer access to
-                // rank 0 is enabled on every rank (the engine's split setup), drained below.
-                let queued = unsafe {
-                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)
-                };
-                // SAFETY: the loader owns this stream; the copy reads `whole`, which drops after.
-                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
-                    self.library.quarantine_module_after_failed_drain();
-                    std::mem::forget(out);
-                    std::mem::forget(whole.take());
-                    // cudaFree of a completed rank's independent output can still
-                    // synchronize with this pending peer copy. Retain every split
-                    // output on the unproved path so error return cannot block on
-                    // unrelated allocation destruction.
-                    std::mem::forget(std::mem::take(&mut completed));
-                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("split projection completion failed"))
-                        .context(format!("split projection owners and native module quarantined after failed drain: {drain}")));
-                }
-                queued?;
-                Ok(out)
-            })?;
-            completed.push(operand);
+        ensure!(shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
+            .is_some_and(|bytes| bytes as u64 == tensor.meta.byte_length),
+            "{name}: BF16 bytes disagree with output projection shape");
+        let allocations = (0..ranks).map(|rank| self.on_rank(rank, |_| {
+            DeviceAllocation::new(self.library, (rows * cols * 2).max(256))
+        })).collect::<Result<Vec<_>>>()?;
+        let per = cuteafd_loader::shared::dense_read::ReadBatch::new(
+            rows, shape[1] * 2, cols * 2, crate::shared::experts::rtx::dense::STEP_BYTES)?.rows;
+        // Adjacent rank shares reuse the same full-row cache before it advances.
+        for first in (0..rows).step_by(per) {
+            let end = (first + per).min(rows);
+            for (rank, allocation) in allocations.iter().enumerate() {
+                let rect = self.rect(name, Some(first..end), Some(rank * cols * 2..(rank + 1) * cols * 2))?;
+                let offset = first * cols * 2;
+                let bytes = (end - first) * cols * 2;
+                // SAFETY: this row window is wholly inside the final rank allocation.
+                let buffer = CuteafdDeviceBuffer { ptr: unsafe {
+                    allocation.buffer.ptr.cast::<u8>().add(offset).cast()
+                }, bytes, ..allocation.buffer };
+                let (device, _) = self.rank_device(rank)?;
+                self.on_rank(rank, |_| self.dense.operand(crate::shared::experts::rtx::dense::Operand {
+                    device, buffer, lands: vec![(rect, 0)], bytes,
+                }))?;
+            }
         }
-        drop(whole);
-        Ok(completed)
+        Ok(allocations)
     }
 
     /// The FP8 checkpoint weights `names` concatenated by rows (as

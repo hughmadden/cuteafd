@@ -335,6 +335,76 @@ mod tests {
         Ok(output)
     }
 
+    fn live_prefix_restores(backend: &KimiBackend<'_, '_>, source: &[u32]) -> Result<()> {
+        use cuteafd_engine::prefix::{After, SnapshotKind};
+        use cuteafd_hostcache::{config::Config, copy::{CopyEngine, Stream as CopyStream}};
+        let family = backend.engine.prefix_family()?;
+        let layout = family.layout();
+        let draft = backend.engine.native_draft().context("live prefix gate requires DFlash2")?;
+        let tokens = (0..131).map(|i| source[i % source.len()]).collect::<Vec<_>>();
+        let build = |slot| move |units| Placement { units, slot, len: 0, state_len: 0 };
+        let chunk = layout.mark_bytes.max(layout.page_bytes) as u64;
+        let copy = CudaCopyEngine::registered_retained(backend.library(), family.snapshot_owners(), family.snapshot_retained())?;
+        let mut cache = PrefixCache::new_with_draft_pages(layout, PrefixConfig {
+            entries: 4, mark_slots: family.slots(), keep_logits: true, min_tokens: 1,
+        }, Some((Config { bytes: chunk * 12, chunk_bytes: chunk, min_tokens: 1,
+            ..Default::default() }, copy)), family.draft_page_bytes())?;
+        let cold = cache.admit(&family, &tokens[..130], tokens.len(), false, build(0))?;
+        ensure!(cold.resume == 0 && cold.source.is_none(), "Kimi prefix gate did not start cold");
+        let mut original = cold.placement;
+        let mut state = DraftState::default();
+        let mut snapshots = Vec::new();
+        for (end, kind) in [(65, SnapshotKind::Prompt), (130, SnapshotKind::Turn)] {
+            let start = original.len;
+            let logits = backend.prefill_device(&mut original, &tokens[start..end], 1, cache.pool())?
+                .context("Kimi snapshot logits missing")?.row_host(backend.library(), 0)?;
+            backend.prefill_draft(&original, start, &tokens[start..end], Some(tokens[end]), &mut state)?;
+            let expected = family.live_digest(&original)?;
+            let expected_draft = draft.readback(0, 0)?;
+            ensure!(cache.capture(&family, kind, &tokens[..end], &original, After::from_logits(&logits, true))?,
+                "Kimi live {kind:?} snapshot was not retained");
+            cache.host_engine_mut().context("Kimi host tier missing")?.synchronize(CopyStream::Store)?;
+            cache.tick();
+            let next = backend.prefill_device(&mut original, &tokens[end..end + 1], 1, cache.pool())?
+                .context("Kimi cold continuation logits missing")?.row_host(backend.library(), 0)?;
+            backend.prefill_draft(&original, end, &tokens[end..end + 1], Some(43), &mut state)?;
+            let next_state = family.live_digest(&original)?;
+            let next_draft = draft.readback(0, 0)?;
+            snapshots.push((end, kind, expected, expected_draft, next, next_state, next_draft));
+        }
+        family.discard(&mut original).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        cache.release(&family, &original.units)?;
+        cache.clear(&family)?;
+
+        for (end, kind, expected, expected_draft, next, next_state, next_draft) in snapshots {
+            let hit = cache.admit(&family, &tokens[..end + 1], end + 1, false, build(1))?;
+            ensure!(hit.resume == end && hit.source.as_ref().is_some_and(|hit| hit.host && hit.kind == kind),
+                "Kimi live {kind:?} did not restore the deepest exact host frontier {end}");
+            let mut restored = hit.placement;
+            ensure!(family.live_digest(&restored)? == expected && draft.readback(1, 0)? == expected_draft,
+                "Kimi live {kind:?} target/draft restored bytes differ at {end}");
+            let actual = backend.prefill_device(&mut restored, &tokens[end..end + 1], 1, cache.pool())?
+                .context("Kimi restored continuation logits missing")?.row_host(backend.library(), 0)?;
+            let mut restored_state = DraftState::default();
+            backend.prefill_draft(&restored, end, &tokens[end..end + 1], Some(43), &mut restored_state)?;
+            ensure!(actual == next && family.live_digest(&restored)? == next_state && draft.readback(1, 0)? == next_draft,
+                "Kimi live {kind:?} append differs from cold state/logits at {end}");
+            // A second restore after appending must still see the immutable partial tail.
+            let again = cache.admit(&family, &tokens[..end], end + 1, false, build(2))?;
+            ensure!(again.resume == end && family.live_digest(&again.placement)? == expected
+                && draft.readback(2, 0)? == expected_draft, "Kimi live {kind:?} append mutated retained snapshot");
+            let mut again = again.placement;
+            family.discard(&mut again).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            cache.release(&family, &again.units)?;
+            family.discard(&mut restored).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            cache.release(&family, &restored.units)?;
+            cache.clear(&family)?;
+            family.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            println!("Kimi live exact prefix PASS: kind={kind:?} rows={end} host=true target+draft+append bytes identical");
+        }
+        Ok(())
+    }
+
     fn live_logits_score(reference: &[Vec<f32>], actual: &[Vec<f32>]) -> Result<(f64, f64)> {
         ensure!(!reference.is_empty() && reference.len() == actual.len(), "Kimi packed score rows");
         let (mut kl, mut matches) = (0.0, 0usize);
@@ -565,6 +635,7 @@ mod tests {
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;
         let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
             super::super::startup::Options { cache_format: args.kv_cache, devices: [args.device, peer],
+                attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
                 native_lib: &args.native_lib, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 spark_budget_gib: args.spark_budget_gib, rows: usize::try_from(prefill.span_rows)?,
                 waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
@@ -577,7 +648,7 @@ mod tests {
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
         library.cuda_set_device(peer)?;
-        let mut pool = RefPagePool::new(engine.prefix_family()?.layout().pages, 64);
+        let mut pool = super::super::prefix::diagnostic_pool(engine.prefix_family()?.layout());
         if std::env::var("CUTEAFD_KIMI_PACK_GATE_ROUTE64").as_deref() == Ok("1") {
             // live_arm prefills private prefixes of 0/3/7 rows, leaving 64
             // total packed rows; both arms therefore stay on the skinny route.
@@ -625,7 +696,9 @@ mod tests {
                     packed[i].state == partner[i].state, packed[i].draft == partner[i].draft);
             }
         }
-        live_golden_packed(&backend, &mut pool)
+        live_golden_packed(&backend, &mut pool)?;
+        drop(pool);
+        live_prefix_restores(&backend, &source)
     }
 
     #[test]

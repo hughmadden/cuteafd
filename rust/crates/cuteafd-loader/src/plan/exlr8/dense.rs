@@ -197,6 +197,10 @@ pub struct DensePlan {
     pub tensors: Vec<DenseSlice>,
     /// Sum of exact native operand allocation requests (each at least 256 bytes).
     pub resident_bytes: usize,
+    /// Serialized native readers share one pinned batch per active rank load.
+    pub pinned_staging_bytes: usize,
+    /// Ordinary heap row cache, not registered or pinned storage.
+    pub cached_rows_bytes: usize,
     /// Loading-only peak: reusable pinned batch plus retained full-row cache.
     /// Never part of resident_bytes or steady-state device admission.
     pub read_staging_bytes: usize,
@@ -751,6 +755,23 @@ impl DenseRecord {
 }
 
 impl DensePlan {
+    /// The vocabulary reader streams one native unit, unlike Mount's component
+    /// windows. No row cache or minimum Mount allocation belongs to this bank.
+    pub fn unit_staging_bytes(&self) -> anyhow::Result<usize> {
+        self.tensors.iter().flat_map(|slice| &slice.units)
+            .try_fold(0usize, |peak, unit| Ok(peak.max(unit.staging_bytes()?)))
+    }
+
+    /// One Mount instance visits coordinator ranks serially and retains a single
+    /// reusable bank and row cache. Rank-local maxima do not coexist.
+    pub fn mount_staging_bytes(plans: &[&Self]) -> anyhow::Result<(usize, usize)> {
+        let world = plans.len();
+        ensure!((1..=2).contains(&world) && plans.iter().enumerate().all(|(rank, plan)|
+            plan.world == world && plan.rank == rank), "native Mount rank identity");
+        Ok((plans.iter().map(|plan| plan.pinned_staging_bytes).max().unwrap_or(0),
+            plans.iter().map(|plan| plan.cached_rows_bytes).max().unwrap_or(0)))
+    }
+
     /// Streaming owns one staging buffer; retained/pinned host storage is caller-owned.
     pub fn admit_host(&self, available: usize, reserved: usize) -> Result<usize> {
         (|| -> anyhow::Result<_> {
@@ -849,6 +870,8 @@ impl DensePlan {
                 world,
                 tensors,
                 resident_bytes,
+                pinned_staging_bytes,
+                cached_rows_bytes,
                 read_staging_bytes: sum([pinned_staging_bytes, cached_rows_bytes])?,
             })
         })()

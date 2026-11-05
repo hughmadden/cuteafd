@@ -15,7 +15,8 @@ pub(crate) use shared::{NativeExperts, NativePlan};
 
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 
-const BANKS: usize = 2;
+const BANKS: usize = Residency::LOAD_BANKS;
+const _: () = assert!(EXPERT_READ_LANES == Residency::LOAD_LANES);
 
 pub(crate) struct Exlr8Weights<'a> {
     buffer: CuteafdDeviceBuffer,
@@ -90,14 +91,7 @@ impl<'a> Exlr8Weights<'a> {
 
     pub(crate) fn plan(layout: &Residency) -> Result<ExpertLoadBudget> {
         let descriptor_bytes = layout.descriptor_host_bytes()?;
-        let descriptor_upload = layout.experts.checked_mul(layout.units)
-            .and_then(|n| n.checked_mul(3 * 3 * 8))
-            .context("EXLR8 descriptor upload overflow")?;
-        let bank_bytes = layout
-            .staging_bytes
-            .max(16)
-            .checked_mul(EXPERT_READ_LANES * BANKS)
-            .and_then(|bytes| bytes.checked_add(descriptor_upload.max(layout.hidden)))
+        let bank_bytes = layout.mount_pinned_bytes()?.checked_add(layout.sync_upload_bytes()?)
             .context("EXLR8 pinned staging overflow")?;
         Ok(ExpertLoadBudget {
             resident_bytes: layout.resident_bytes,

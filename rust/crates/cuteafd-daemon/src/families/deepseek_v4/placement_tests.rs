@@ -569,7 +569,7 @@ fn planner_equals_runtime_deepseek_v4() {
             String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
-    let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
+    let inputs = cuteafd_loader::plan::inputs::v4_placement_inputs().unwrap();
     let flash = snapshot("deepseek-ai/DeepSeek-V4-Flash-0731").expect("required Flash checkpoint missing");
     let pro = snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1")
         .expect("required Pro EXL3 K2 checkpoint missing");
@@ -633,7 +633,7 @@ fn planner_equals_runtime_deepseek_v4() {
 
 #[test]
 fn planner_equals_runtime_deepseek_v4_missing_tp2_package() {
-    let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
+    let inputs = cuteafd_loader::plan::inputs::v4_placement_inputs().unwrap();
     let pro = snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1")
         .expect("required Pro EXL3 K2 checkpoint missing");
     let dir = tempfile::tempdir().unwrap();
@@ -729,7 +729,7 @@ const MIB: u64 = 1 << 20;
 #[test]
 fn planner_equals_runtime_deepseek_v4_measured() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shared/placement_fixtures");
-    let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
+    let inputs = cuteafd_loader::plan::inputs::v4_placement_inputs().unwrap();
     let mut checked = 0;
     let mut failures = Vec::new();
     let mut paths = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();

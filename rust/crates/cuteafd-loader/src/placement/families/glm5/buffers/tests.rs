@@ -109,11 +109,11 @@ fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases()
                 let spec = PrefixBuffers { device, draft_windows: windows, mark_slots: slots };
                 let owners = spec.allocations(life).unwrap();
                 assert_eq!(owners.len(), 1 + usize::from(windows.is_some() && slots > 0));
-                assert_eq!(owners[0].id, format!("glm.prefix.gpu.{device}.tail-scratch"));
+                assert_eq!(owners[0].id, "glm.prefix.scratch");
                 assert_eq!(owners[0].bytes, 256);
                 if let Some(windows) = windows.filter(|_| slots > 0) {
                     assert_eq!(owners[1].bytes, if windows == 0 {256} else {((windows + 16) * slots).max(256)});
-                    assert_eq!(owners[1].id, format!("glm.prefix.gpu.{device}.draft-marks"));
+                    assert_eq!(owners[1].id, "glm.prefix.draft_marks");
                 }
                 assert!(owners.iter().all(|a| a.view.is_none() && a.lifetime == life
                     && a.location == Location::coordinator(device) && a.category == Category::Prefix));
@@ -200,6 +200,42 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .owned,
                 physical
             );
+        }
+    }
+}
+
+#[test]
+fn ml4_target_caches_preserve_nope_and_shared_latent_geometry() {
+    let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap();
+    assert!((0..cfg.layers).any(|layer| !cfg.owns_kv(layer)));
+    assert!((0..cfg.layers).any(|layer| !cfg.rope(layer) && cfg.owns_kv(layer)));
+    for partitioned in [false, true] {
+        let mut target = target(0);
+        target.partitioned = partitioned;
+        target.page_tokens = if partitioned { 128 } else { 64 };
+        target.owned_layers = (0..cfg.layers).map(|layer| layer % 3 != 2).collect();
+        let components = target.components(&cfg).unwrap();
+        for pages in [1, 17, 128] {
+            let mut contract = Contract::fixed(target.page_tokens, target.maximum_pages, 2,
+                Facts { phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET,
+                    allocations: vec![], deferred: vec![], sequential: vec![],
+                    reservations: vec![], allowances: vec![], resident_weights: vec![] });
+            contract.variables = vec![
+                Variable::Prefill(vec![target.prefill.as_ref().unwrap().0]),
+                Variable::Lanes(vec![1]),
+            ];
+            contract.components = components.clone();
+            let facts = contract.facts(&[0, 0], pages).unwrap();
+            for (layer, &owned) in target.owned_layers.iter().enumerate() {
+                let get = |suffix: &str| facts.allocations.iter().find(|owner|
+                    owner.id == format!("glm.target.gpu.0.{suffix}.{layer}"));
+                let bytes = if owned && cfg.owns_kv(layer) {
+                    (pages + 1) * 64 * if cfg.rope(layer) { 656 } else { 528 }
+                } else { 256 };
+                assert_eq!(get("kv").unwrap().bytes, bytes, "layer {layer}");
+                assert_eq!(get("index").map(|owner| owner.bytes),
+                    (owned && cfg.indexers[layer] == GlmIndexer::Full).then_some((pages + 1) * 8448));
+            }
         }
     }
 }

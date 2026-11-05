@@ -179,6 +179,27 @@ impl PushDestination for NoDense {
     fn done(self) -> Result<()> { Ok(()) }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("push rank {rank} on device {device}: {stage} failed for {bytes} bytes: {source:#}")]
+struct RankJoinError {
+    rank: usize,
+    device: i32,
+    stage: &'static str,
+    bytes: usize,
+    #[source]
+    source: anyhow::Error,
+}
+
+fn join_stage<T>(group: u64, rank: usize, device: i32, stage: &'static str, bytes: usize,
+    work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let start = std::time::Instant::now();
+    tracing::info!(group, rank, device, stage, bytes, "coordinator push join stage starting");
+    let result = work().map_err(|source| RankJoinError { rank, device, stage, bytes, source });
+    tracing::info!(group, rank, device, stage, bytes, elapsed_ms = start.elapsed().as_millis(),
+        success = result.is_ok(), "coordinator push join stage finished");
+    Ok(result?)
+}
+
 /// One coordinator GPU's rank of a push group, received on its own thread and
 /// ring under the same control protocol as a Spark rank (a loopback stream to
 /// the group driver): its TP2 halves (`tp2`: their entries alone from offset
@@ -203,14 +224,20 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     tracing::info!(group, rank, device = device.id, tp2 = tp2.is_some(), dense = dense.is_some(),
         "coordinator push rank joining load group");
     let joined = device.run(|| -> Result<_> {
-        let arena = tp2.as_ref().map(|(_, plan, checked)| -> Result<_> {
-            let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank)?)?;
-            plan.scales.destination(device, plan.layout.clone(), expected)
+        let arena = tp2.as_ref().map(|(_, plan, checked)| {
+            join_stage(group, rank, device.id, "expert arena", plan.layout.bytes(), || {
+                let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank)?)?;
+                plan.scales.destination(device, plan.layout.clone(), expected)
+            })
         }).transpose()?;
-        let ring = RegisteredRing::new(library, slots, slot_bytes)?;
-        let joined = client.join(cuteafd_loader::push_load::JoinArgs { group, token,
-            rank: u32::try_from(rank)?, ring_fd: ring.fd().as_raw_fd(),
-            slots: u32::try_from(ring.slots())?, slot_bytes: u32::try_from(ring.slot_bytes())? })?;
+        let ring_bytes = slots.checked_mul(slot_bytes).context("push ring bytes overflow")?;
+        let ring = join_stage(group, rank, device.id, "host-ring registration", ring_bytes,
+            || RegisteredRing::new(library, slots, slot_bytes))?;
+        let joined = join_stage(group, rank, device.id, "SparkNest client.join", ring_bytes, || {
+            Ok(client.join(cuteafd_loader::push_load::JoinArgs { group, token,
+                rank: u32::try_from(rank)?, ring_fd: ring.fd().as_raw_fd(),
+                slots: u32::try_from(ring.slots())?, slot_bytes: u32::try_from(ring.slot_bytes())? })?)
+        })?;
         Ok((arena, ring, joined))
     });
     if let Err(error) = &joined { tracing::info!(group, rank, %error, "coordinator push rank join failed"); }

@@ -65,6 +65,7 @@ fn request() -> Request {
 }
 fn decisions(onboard: u64) -> Decisions {
     Decisions {
+        encoder: None,
         spark_reply_formats: None,
         attention: vec![LayerMode::Whole {
             gpu: 0,
@@ -143,6 +144,7 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
     let facts = facts(allocations);
     let phases = evaluate(&facts, &budgets).unwrap();
     ResolvedPlan {
+        encoder_diagnostics: vec![],
         request: request(),
         decisions: decisions(0),
         pool_tokens: 64,
@@ -151,6 +153,57 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
         phases,
     }
 }
+#[test]
+fn ready_items_include_opaque_attribution_but_not_startup_peaks_or_views() {
+    let owner = allocation("owner", 100);
+    let mut view = allocation("view", 16);
+    view.view = Some(View { backing: owner.id.clone(), offset: 0 });
+    let mut startup = allocation("startup", 500);
+    startup.lifetime = Lifetime { first: Phase::Load, last: Phase::Load };
+    let mut p = plan(vec![owner, view, startup]);
+    p.facts.allowances = vec![
+        Allowance { location: Location::coordinator(0), bytes: 37,
+            lifetime: Lifetime::RESIDENT, source: "measured context".into(), assumed: false },
+        Allowance { location: Location::coordinator(0), bytes: 19,
+            lifetime: Lifetime::TARGET, source: "estimated runtime".into(), assumed: true },
+        Allowance { location: Location::coordinator(0), bytes: 11,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::Warmup },
+            source: "load only".into(), assumed: true },
+        Allowance { location: Location::coordinator(0), bytes: 13,
+            lifetime: Lifetime { first: Phase::Growth, last: Phase::Growth },
+            source: "growth only".into(), assumed: false },
+        Allowance { location: Location::coordinator(0), bytes: 0,
+            lifetime: Lifetime::RESIDENT, source: "empty".into(), assumed: true },
+    ];
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    let items = p.items(Location::coordinator(0)).unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), 156);
+    assert!(items.iter().all(|item|
+        item.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident));
+    for (name, bytes, basis) in [("measured context", 37, Basis::Calibrated),
+        ("estimated runtime", 19, Basis::Estimated)]
+    {
+        let item = items.iter().find(|item| item.group == name).unwrap();
+        assert_eq!((item.bytes, item.category, item.basis), (bytes, Category::Runtime, basis));
+    }
+    assert_eq!(items.iter().filter(|item| item.basis == Basis::Exact)
+        .map(|item| item.bytes).sum::<u64>(), 100);
+    let ready = p.phases.iter().find(|row| row.phase == Phase::Ready).unwrap();
+    assert_eq!(ready.owned + ready.opaque, 156);
+    let load = p.phases.iter().find(|row| row.phase == Phase::Load).unwrap();
+    assert_eq!(load.owned + load.opaque, 548);
+}
+
+#[test]
+fn capacity_refusal_names_binding_budget_phase_and_exact_bytes() {
+    let refusal = Refusal::Capacity { budget: "coordinator GPU 0".into(),
+        phase: Phase::Warmup, required: 1025, available: 1024, owners: vec![] };
+    let text = refusal.to_string();
+    assert!(text.contains("memory budget 'coordinator GPU 0' during decode warm-up"), "{text}");
+    assert!(text.contains("needs 1025 bytes, has 1024 bytes available"), "{text}");
+}
+
 fn receipts(plan: &ResolvedPlan) -> Vec<Receipt> {
     plan.facts
         .allocations
@@ -650,7 +703,9 @@ fn embedding_and_remote_rank_domains_share_pool_first_constraints_and_exact_prof
     assert_eq!((smaller.pool_tokens, smaller.decisions.onboard()), (128, 2));
     let mut restricted = contract.clone();
     restricted.requires.push(Requires { when: Choice { variable: 3, option: 1 }, any_of: vec![] });
-    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)), Err(Refusal::Capacity { .. })));
+    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)),
+        Err(Refusal::FullContextShortfall { tokens: 0, limiting, .. })
+            if matches!(*limiting, Refusal::Capacity { .. })));
     // Resolved local homes override remote fallback independent of variable order.
     let mut reversed = contract.clone();
     reversed.variables.swap(3, 4);
@@ -1098,7 +1153,8 @@ fn capacity_shaving_keeps_resource_failure_distinct_from_pin_conflict() {
     }
     assert!(matches!(
         solve(request(), two_gpus(64, 64), &Prepared(contract.clone())),
-        Err(Refusal::Capacity { .. })
+        Err(Refusal::FullContextShortfall { tokens: 0, limiting, .. })
+            if matches!(*limiting, Refusal::Capacity { .. })
     ));
     assert_eq!(
         solve(
@@ -1394,17 +1450,17 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
         (automatic.request.context, automatic.pool_tokens),
         (129, 192)
     );
-    assert!(matches!(
-        solve(
-            Request {
-                context: 193,
-                ..request()
-            },
-            vec![budget(192)],
-            &recipe
-        ),
-        Err(Refusal::Capacity { .. })
-    ));
+    for (available, context, tokens) in [(192, 193, 192), (192, 2 << 20, 192), (63, 64, 0)] {
+        let refusal = solve(Request { context, ..request() }, vec![budget(available)], &recipe).unwrap_err();
+        let text = refusal.to_string();
+        assert!(text.contains(&format!("maximum feasible pool is {tokens} tokens")), "{text}");
+        assert!(text.contains("lower explicit context"), "{text}");
+        let Refusal::FullContextShortfall { context: actual, tokens: maximum, limiting } = refusal else {
+            panic!("expected a full-context refusal");
+        };
+        assert_eq!((actual, maximum), (context, tokens));
+        assert!(matches!(*limiting, Refusal::Capacity { phase: Phase::PostTargetKv, .. }));
+    }
 }
 
 #[test]
@@ -2332,4 +2388,36 @@ fn analytical_weight_cap_rejects_alias_duplicate_unknown_home_and_overflow() {
     overflow.components.push(resource("loaded.a", 0, u64::MAX, overflow.maximum_pages));
     overflow.components.push(resource("loaded.b", 0, 1, overflow.maximum_pages));
     assert!(matches!(solve(request(), vec![budget(1 << 30)], &Prepared(overflow)), Err(Refusal::Overflow(_))));
+}
+
+#[test]
+fn encoder_priority_follows_pool_and_onboarding_before_slack() {
+    struct WithEncoder;
+    impl Recipe for WithEncoder {
+        fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+            let mut base = Linear::new();
+            base.maximum = 128;
+            base.onboard = 1;
+            let mut contract = base.prepare(request)?;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Encoder(vec![0, 1]));
+            let mut tower = Component::allocation(allocation("tower", 64),
+                ByteCurve::fixed(64, 2), false, 2);
+            tower.activation = Activation::choice(variable, 0);
+            contract.components.push(tower);
+            Ok(contract)
+        }
+    }
+    let roomy = solve(request(), vec![budget(256)], &WithEncoder).unwrap();
+    assert_eq!(roomy.pool_tokens, 128);
+    assert_eq!(roomy.decisions.onboard_layers, vec![vec![0]]);
+    assert_eq!(roomy.decisions.encoder, Some(0), "encoder wins over extra slack");
+    let tight = solve(request(), vec![budget(192)], &WithEncoder).unwrap();
+    assert_eq!(tight.pool_tokens, 128);
+    assert_eq!(tight.decisions.onboard_layers, vec![vec![0]]);
+    assert_eq!(tight.decisions.encoder, Some(1), "onboarding wins over optional encoder");
+    assert_eq!(tight.encoder_diagnostics[0].1, 64);
+    let tighter = solve(request(), vec![budget(128)], &WithEncoder).unwrap();
+    assert_eq!(tighter.pool_tokens, 128, "pool wins over optional encoder");
+    assert_eq!(tighter.decisions.encoder, Some(1));
 }

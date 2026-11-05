@@ -55,6 +55,7 @@ struct LayerSources {
 }
 
 struct LayerCensus {
+    units: usize,
     routed: Vec<Vec<usize>>,
     shared: Vec<Vec<usize>>,
 }
@@ -84,20 +85,30 @@ impl MetadataInput {
     /// Scalar admission facts live only for this selected manifest's plan. Runtime
     /// arena construction uses `plan`, which always revalidates its sources.
     pub(crate) fn resident_bytes(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<usize> {
+        self.admission_geometry(layer, world, rank, set).map(|(bytes, _)| bytes)
+    }
+
+    /// Arena bytes and compact-unit width from the same validated layer census.
+    pub(crate) fn admission_geometry(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<(usize, usize)> {
         if !(1..=8).contains(&world) || rank >= world {
             return Err(anyhow::anyhow!("expected TP1..8 and rank below world").into());
         }
         #[cfg(test)]
-        if self.uncached_census { return Ok(self.plan(layer, world, rank, set)?.resident_bytes); }
+        if self.uncached_census {
+            let plan = self.plan(layer, world, rank, set)?;
+            return Ok((plan.resident_bytes, plan.compact_unit_limit()));
+        }
         let mut census = self.census.lock().map_err(|_| ResidencyError(anyhow::anyhow!("EXLR8 census lock poisoned")))?;
         if !census.contains_key(&layer) {
             let mut sources = LayerSources::default();
             let routed = Residency::plan_inner(self, layer, 1, 0, ExpertSet::Routed, &mut sources)?;
             let shared = Residency::plan_inner(self, layer, 1, 0, ExpertSet::Shared, &mut sources)?;
-            census.insert(layer, LayerCensus { routed: routed.rank_bytes(routed.experts)?, shared: shared.rank_bytes(routed.experts)? });
+            census.insert(layer, LayerCensus { units: routed.units,
+                routed: routed.rank_bytes(routed.experts)?, shared: shared.rank_bytes(routed.experts)? });
         }
         let layer = &census[&layer];
-        Ok(match set { ExpertSet::Routed => &layer.routed, ExpertSet::Shared => &layer.shared }[world - 1][rank])
+        Ok((match set { ExpertSet::Routed => &layer.routed, ExpertSet::Shared => &layer.shared }[world - 1][rank],
+            layer.units.div_ceil(world).max(1)))
     }
 
     #[cfg(test)]
@@ -412,6 +423,21 @@ fn read_u64(source: Range, index: &[u8]) -> anyhow::Result<u64> {
 }
 
 impl Residency {
+    pub const LOAD_BANKS: usize = 2;
+    pub const LOAD_LANES: usize = 16;
+
+    /// The async unit-reader banks, excluding the library-wide synchronous H2D bank.
+    pub fn mount_pinned_bytes(&self) -> anyhow::Result<usize> {
+        self.staging_bytes.max(16).checked_mul(Self::LOAD_LANES * Self::LOAD_BANKS)
+            .context("EXLR8 pinned unit banks overflow")
+    }
+
+    /// Descriptor and sign uploads share one library-owned reusable pinned bank.
+    pub fn sync_upload_bytes(&self) -> anyhow::Result<usize> {
+        self.experts.checked_mul(self.units).and_then(|n| n.checked_mul(3 * 3 * 8))
+            .map(|bytes| bytes.max(self.hidden)).context("EXLR8 descriptor upload overflow")
+    }
+
     pub fn plan(
         snapshot: &Path,
         selected: &str,
@@ -990,7 +1016,8 @@ mod tests {
                 for rank in 0..world {
                     for set in [ExpertSet::Routed, ExpertSet::Shared] {
                         let fresh = input.plan(3, world, rank, set).unwrap();
-                        assert_eq!(input.resident_bytes(3, world, rank, set).unwrap(), fresh.resident_bytes,
+                        assert_eq!(input.admission_geometry(3, world, rank, set).unwrap(),
+                            (fresh.resident_bytes, fresh.compact_unit_limit()),
                             "padded={padded}, world={world}, rank={rank}, set={set:?}");
                     }
                 }

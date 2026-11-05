@@ -10,6 +10,7 @@ pub mod families;
 pub mod family;
 pub mod files;
 pub mod format;
+pub mod inputs;
 pub mod launch;
 pub mod layout;
 pub mod names;
@@ -192,6 +193,57 @@ pub struct RoleReadiness {
     pub unavailable: Vec<Rejection>,
 }
 
+/// The admitted phase totals, separate from Ready-resident layout items.
+#[derive(Debug, Clone, Serialize)]
+pub struct SolvedPhaseLedger {
+    pub budgets: Vec<crate::placement::planner::Budget>,
+    pub phases: Vec<crate::placement::planner::PhaseBudget>,
+}
+
+impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
+    fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
+        Self { budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+    }
+}
+
+impl SolvedPhaseLedger {
+    fn render(&self, out: &mut String) {
+        use crate::placement::planner::{Baseline, Device, Domain};
+        use std::fmt::Write;
+        for budget in &self.budgets {
+            let Some(peak) = self.phases.iter().filter(|row| row.budget == budget.id)
+                .reduce(|peak, row| if u128::from(row.owned) + u128::from(row.opaque)
+                    > u128::from(peak.owned) + u128::from(peak.opaque) { row } else { peak })
+            else { continue };
+            let locations = budget.locations.iter().map(|location| {
+                let device = match location.device {
+                    Device::Coordinator(rank) => format!("coordinator GPU {rank}"),
+                    Device::Spark(rank) => format!("Spark rank {rank}"),
+                    Device::Host => "host RAM".into(),
+                };
+                let domain = match location.domain {
+                    Domain::Device => "device", Domain::Host => "ordinary",
+                    Domain::Pinned => "pinned", Domain::Managed => "managed",
+                };
+                format!("{device} {domain}")
+            }).collect::<Vec<_>>().join(" + ");
+            let total = u128::from(peak.owned) + u128::from(peak.opaque);
+            let _ = writeln!(out,
+                "memory peak {} [{locations}]: {}; {total} bytes (owned {}, opaque {}); available {} bytes",
+                budget.id, peak.phase, peak.owned, peak.opaque, peak.available);
+            let (occupied, source, attribution) = match &budget.baseline {
+                Baseline::Forecast { occupied, source, assumed } =>
+                    (*occupied, source, if *assumed { "estimated" } else { "calibrated" }),
+                Baseline::Sampled { free, source, .. } =>
+                    (budget.physical_bytes - free, source, "sampled"),
+            };
+            let _ = writeln!(out,
+                "memory limit {}: physical {} bytes; logical {} bytes; baseline {occupied} bytes ({attribution}: {source}); headroom {} bytes",
+                budget.id, budget.physical_bytes, budget.logical_bytes, budget.headroom);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
@@ -199,6 +251,9 @@ pub struct PlanReport {
     pub host_budget_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_ledger: Option<cuteafd_core::memory_layout::HostLayout>,
+    /// Already solved startup and resident totals; never a second admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_ledger: Option<SolvedPhaseLedger>,
     pub attention_placement: crate::placement::AttentionPlacement,
     /// The routed-expert weight budget per Spark rank this plan used
     /// (explicit, or the family's default).
@@ -802,6 +857,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
+        phase_ledger: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
@@ -1175,7 +1231,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
-            report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+            report.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         }
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
@@ -1197,7 +1253,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        if !refused { layout::charge_host(&mut report, &layout_options, input, false)?; }
+        if !refused && !matches!(family.id(), "glm5" | "mistral_large4") {
+            layout::charge_host(&mut report, &layout_options, input, false)?;
+        }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -1470,7 +1528,10 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
         let mut report = input.plan(&candidate)?;
-        if ranks == 0 || candidate.layout.is_none() {
+        // Shared Recipe families admit one fixed prefill shape. Preserve their
+        // typed refusal instead of retrying smaller reserves in a second solve.
+        if ranks == 0 || candidate.layout.is_none()
+            || matches!(report.family.as_deref(), Some("glm5" | "mistral_large4")) {
             return Ok(report);
         }
         // The prefill reserve is sized first (TJ 2026-10-27): the largest
@@ -1603,9 +1664,12 @@ pub fn render(report: &PlanReport) -> String {
             let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
         }
     }
-    if let (Some(layers), Some(maximum)) = (report.onboard_layers, report.max_pool_tokens_no_onboard) {
+    if let Some(ledger) = &report.phase_ledger { ledger.render(&mut out); }
+    if let Some(layers) = report.onboard_layers {
         let pool = report.memory_layout.as_ref().map_or(0, |memory| memory.pool_tokens);
-        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
+        let maximum = report.max_pool_tokens_no_onboard
+            .map(|maximum| format!("; max_pool_tokens_no_onboard {maximum}")).unwrap_or_default();
+        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers{maximum}");
     }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }

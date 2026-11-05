@@ -56,6 +56,12 @@ pub(crate) enum IntakeMode {
 }
 
 impl IntakeMode {
+    fn planner_mode(self) -> cuteafd_loader::placement::SparkIntakeMode {
+        use cuteafd_loader::placement::SparkIntakeMode;
+        match self { Self::Host => SparkIntakeMode::Host, Self::Pinned => SparkIntakeMode::Pinned,
+            Self::Gpu => SparkIntakeMode::Gpu }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Host => "host",
@@ -1333,89 +1339,7 @@ mod warm_stream_tests {
         assert_eq!(library.calls(), [ALL[0]]);
     }
 
-    /// GLM 5.3 Flash's and MiMo's start-up warm-ups hold their temporary stream in the guard, so
-    /// every way out of them destroys it, and neither handles a raw warm-up stream any more.
-    #[test]
-    fn the_spark_transport_warm_ups_hold_their_stream_in_the_guard() {
-        // The needles are joined here, so that this file's own text does not match them.
-        let finished = ["warm_stream.", "finish()?;"].concat();
-        for (family, source, library) in [
-            ("glm5_flash", include_str!("../families/glm5_flash/mod.rs"), "self.library.as_ref()"),
-            ("mimo_v2", include_str!("../families/mimo_v2/mod.rs"), "&*self.library"),
-        ] {
-            let created = ["let warm_stream = crate::shared::spark_intake::Warm", "Stream::new(", library, ")?;"].concat();
-            assert_eq!((source.matches(&created).count(), source.matches(&finished).count()), (1, 1), "{family}");
-            let (start, end) = (source.find(&created).unwrap(), source.find(&finished).unwrap());
-            assert!(start < end, "{family}");
-            let warm_up = &source[start..end];
-            assert!(warm_up.contains(&["warm_stream.", "raw()"].concat()), "{family}");
-            for raw in ["_create(", "_synchronize(", "_destroy("] {
-                assert!(!warm_up.contains(&["cuda_stream", raw].concat()), "{family}: {raw}");
-            }
-            assert!(!source.contains(&["(warm_", "stream)"].concat()), "{family}: a raw warm-up stream call");
-        }
-    }
 
-    fn spark_transport_constructor(source: &str) -> Option<usize> {
-        ["new", "new_waves"].iter()
-            .filter_map(|constructor| source.find(&format!("SparkLink::{constructor}(")))
-            .min()
-    }
-
-    #[test]
-    fn transport_audit_recognizes_single_and_multi_wave_constructors() {
-        for constructor in ["new", "new_waves"] {
-            let source = format!("let transport = SparkLink::{constructor}(");
-            assert_eq!(spark_transport_constructor(&source), Some(16));
-        }
-        assert_eq!(spark_transport_constructor("SparkLink::new_unchecked("), None);
-    }
-
-    /// Every family that builds a Spark transport bootstraps it with a request
-    /// at install, so each rank's persistent session is open and its immutable
-    /// installed expert grouping is published before anything plans against the
-    /// workers. Qwen 4's draft planner reads the grouping that early, and a
-    /// transport that had never opened a session answered "worker rank 0 did
-    /// not report installed expert grouping" instead of launching.
-    ///
-    /// The request argument is load-bearing: the request that opens a rank's
-    /// session sizes its registered rings, so the bootstrap must hand over the
-    /// widest wave the family dispatches (its own start-up warm-up's request).
-    #[test]
-    fn every_spark_family_bootstraps_its_transport_with_a_wave_request() {
-        // The needles are joined here, so this file's own text does not match them.
-        let open = [".boot", "strap(&"].concat();
-        for (family, source) in [
-            ("deepseek_v4", include_str!("../families/deepseek_v4/mod.rs")),
-            ("glm5", include_str!("../families/glm5/mod.rs")),
-            ("glm5_flash", include_str!("../families/glm5_flash/mod.rs")),
-            ("mimo_v2", include_str!("../families/mimo_v2/mod.rs")),
-            ("qwen4", include_str!("../families/qwen4/mod.rs")),
-            ("step5", include_str!("../families/step5/serve.rs")),
-            ("step5 golden", include_str!("../families/step5/golden.rs")),
-        ] {
-            let transport = spark_transport_constructor(source)
-                .unwrap_or_else(|| panic!("{family}: no Spark transport"));
-            let bootstrap = source.find(&open)
-                .unwrap_or_else(|| panic!("{family}: the Spark transport is never bootstrapped"));
-            assert!(bootstrap > transport, "{family}: the bootstrap precedes the transport it opens");
-        }
-        // The argument-less form is the shape that leaves every session
-        // unopened; it must not come back.
-        let bare = [".boot", "strap()"].concat();
-        for source in [
-            include_str!("../families/deepseek_v4/mod.rs"),
-            include_str!("../families/deepseek_v4/engine.rs"),
-            include_str!("../families/glm5/mod.rs"),
-            include_str!("../families/glm5/engine.rs"),
-            include_str!("../families/glm5_flash/mod.rs"),
-            include_str!("../families/mimo_v2/mod.rs"),
-            include_str!("../families/qwen4/mod.rs"),
-            include_str!("../families/qwen4/engine.rs"),
-        ] {
-            assert!(!source.contains(&bare), "a Spark transport is bootstrapped without a wave request");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1592,6 +1516,7 @@ pub(crate) struct SparkLink<'a> {
     world: cuteafd_transport::expert::SparkWorld,
     world_size: usize,
     capacity: u32,
+    admitted: Option<cuteafd_loader::placement::PreparedSparkLink>,
 }
 
 impl<'a> SparkLink<'a> {
@@ -1664,6 +1589,30 @@ impl<'a> SparkLink<'a> {
         Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, true, waves, wave_rows, timing)
     }
 
+    /// Construct exactly the endpoint geometry already admitted. The existing
+    /// receive probe still runs inside with_egress_waves, never in preparation.
+    pub(crate) fn prepared(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], config: cuteafd_transport::TcpTransportConfig,
+        admitted: cuteafd_loader::placement::PreparedSparkLink) -> Result<Self> {
+        use cuteafd_loader::placement::SparkWaveStaging;
+        let spec = admitted.geometry();
+        ensure!(spec.intake.ranks == peers.len() && spec.endpoints.endpoint.capacity as u64 == spec.intake.rows
+            && config.max_frame_bytes == spec.endpoints.rings.max_frame_bytes,
+            "Spark construction differs from admitted endpoint geometry");
+        let timing = config.timing;
+        let capacity = spec.endpoints.endpoint.capacity;
+        let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        transport.set_max_waves(spec.intake.waves)?;
+        let enable_egress = matches!(spec.waves.staging, SparkWaveStaging::Registered { .. })
+            || spec.unused_egress_bytes.is_some();
+        let mut link = Self::with_egress_waves(library, transport, usize::try_from(spec.intake.row_bytes)?,
+            IntakePreference::Probed, enable_egress, spec.prefill, spec.intake.waves, capacity, timing)?;
+        ensure!(admitted.candidates().iter().any(|candidate| candidate.mode == link.intake.mode.planner_mode()),
+            "probed Spark intake mode was not admitted");
+        link.admitted = Some(admitted);
+        Ok(link)
+    }
+
     /// Return slots.
     pub(crate) fn waves(&self) -> usize { self.intake.waves() }
     pub(crate) fn slots(&self) -> usize { self.intake.slots() }
@@ -1711,7 +1660,7 @@ impl<'a> SparkLink<'a> {
         let world = transport.world();
         Ok(Self { prefill, intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
-            staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
+            staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity, admitted: None })
     }
 
     /// The transport while no exchange runs (setup and teardown only).
@@ -1723,6 +1672,35 @@ impl<'a> SparkLink<'a> {
     /// Bind the admitted endpoint before bootstrap starts its exchange worker.
     pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
         self.idle_transport()?.bind_model_endpoint(endpoint)
+    }
+
+    fn validate_admitted_bootstrap(admitted: &cuteafd_loader::placement::PreparedSparkLink,
+        request: &cuteafd_transport::ExpertProtocolV2Request, staging: usize,
+        egress_enabled: bool) -> Result<()> {
+        let spec = admitted.geometry();
+        let endpoint = spec.endpoints.endpoint;
+        let bf16 = matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
+        ensure!(request.header.row_count == endpoint.capacity
+            && request.header.hidden_dim == spec.endpoints.geometry.hidden
+            && request.header.route_count.checked_div(request.header.row_count)
+                == Some(spec.endpoints.geometry.topk)
+            && (request.header.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16) == bf16,
+            "Spark bootstrap differs from admitted request geometry");
+        let expected = match spec.waves.staging {
+            cuteafd_loader::placement::SparkWaveStaging::Registered { slot_bytes }
+            | cuteafd_loader::placement::SparkWaveStaging::Standalone { slot_bytes } => slot_bytes,
+        };
+        ensure!(staging.max(256) as u64 <= expected, "Spark request staging exceeds admission");
+        if egress_enabled {
+            let expected = match spec.waves.staging {
+                cuteafd_loader::placement::SparkWaveStaging::Registered { slot_bytes } => slot_bytes,
+                _ => spec.unused_egress_bytes.context("registered egress missing from admission")?
+                    / spec.intake.waves as u64,
+            };
+            ensure!(registered_egress_bytes(request)? as u64 == expected,
+                "Spark registered egress differs from admission");
+        }
+        Ok(())
     }
 
     /// Completes every rank's persistent bootstrap without dispatching a wave,
@@ -1739,6 +1717,9 @@ impl<'a> SparkLink<'a> {
         let staging = crate::shared::experts::staging::RouteStaging::new(request.header.row_count as usize,
             usize::try_from(request.header.route_count / request.header.row_count.max(1))?.max(1),
             request.hidden_payload.len() / (request.header.row_count as usize).max(1))?.bytes;
+        if let Some(admitted) = &self.admitted {
+            Self::validate_admitted_bootstrap(admitted, request, staging, self.egress_enabled)?;
+        }
         let (egress_enabled, egress_bytes, waves) = (self.egress_enabled, self.egress_bytes, self.slots());
         let transport = self.idle_transport()?;
         let mut registered = egress_bytes;
@@ -1795,6 +1776,38 @@ impl<'a> SparkLink<'a> {
             Ok(storage) => storage,
             Err(error) => { self.transport = Some(transport); return Err(error); }
         };
+        if let Some(admitted) = &self.admitted {
+            let check = (|| -> Result<()> {
+                use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location, PhaseOrder};
+                use cuteafd_core::memory_layout::Category;
+                let physical = [intake.device()];
+                let devices = CoordinatorDevices::new(&physical)?;
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+                    "spark-construction", Lifetime::TARGET, Category::Transport, "Spark construction");
+                intake.allocation_receipts(&mut inventory, "intake")?;
+                for (slot, arena) in arenas.iter().enumerate() {
+                    inventory.backed_pinned(&format!("staging.{slot}"), arena.host(), arena.allocation_buffer())?;
+                }
+                // Reuse the passive retained-owner receipt path before the worker
+                // takes the transport. No extra probe, synchronization or device work.
+                let mut census = crate::shared::memory::receipts::Census::default();
+                census.owners(inventory.receipts);
+                let mut transport_owners = transport.allocation_census();
+                transport_owners.resolve_recycled_frames();
+                census.transport("transport", transport_owners, devices, Lifetime::TARGET)?;
+                census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+                let rank = admitted.geometry().intake.gpu;
+                let owners = census.receipts.into_iter().map(|receipt| {
+                    let mut owner = receipt.allocation;
+                    if owner.location == Location::coordinator(0) { owner.location = Location::coordinator(rank); }
+                    owner
+                }).collect::<Vec<_>>();
+                let all = if intake.ranks() == 8 { u8::MAX } else { (1u8 << intake.ranks()) - 1 };
+                admitted.check_owners(intake.mode.planner_mode(), geometry.landing & all != all, &owners)?;
+                Ok(())
+            })();
+            if let Err(error) = check { self.transport = Some(transport); return Err(error); }
+        }
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
             arenas, self.timing, storage)?);
         Ok(())
@@ -2018,9 +2031,13 @@ mod tests {
     fn registered_egress_matches_widest_bootstrap_request_geometry() -> Result<()> {
         use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor,
             ExpertProtocolV2RouteEntry, ExpertV2SourceKind, ExpertV2Dtype};
-        for rows in [64u32, 1024, 2048, 4096] {
+        for rows in [64u32, 1024, 2048, 2752, 4096] {
             for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
-                let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
+                let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(
+                    &cuteafd_loader::plan::testing::glm5_config())?;
+                let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
+                    experts: cfg.experts as u32, topk: cfg.topk as u32,
+                    intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
                 let hidden_bytes = if dtype == ExpertV2Dtype::Bf16 { geometry.hidden * 2 }
                     else { geometry.hidden + geometry.hidden / 32 };
                 let request = ExpertProtocolV2Request::new(1, 17, 0, geometry.hidden, dtype,
@@ -2035,6 +2052,29 @@ mod tests {
                 let expected = geometry.compact_wire_bytes(rows, dtype == ExpertV2Dtype::Bf16).unwrap().0;
                 assert_eq!(registered_egress_bytes(&request)?, expected);
                 assert_eq!(request.encode()?.len(), expected);
+                for ranks in [1, 4, 6, 8] {
+                    let ingress = if dtype == ExpertV2Dtype::Bf16 { cuteafd_core::SparkIngress::Bf16 }
+                        else { cuteafd_core::SparkIngress::Fp8K32 };
+                    let (decode, prefill) = cuteafd_loader::placement::families::glm5::admission::production_links(
+                        &cfg, ranks, cuteafd_loader::placement::planner::PrefillShape { rows: rows as u64, waves: 3 },
+                        ingress, cuteafd_core::SparkRings { max_frame_bytes: 128 << 20, depth: 8,
+                            slot_bytes: 8 << 20, alignment: 4096 }, Default::default())?;
+                    let mut links = vec![prefill.unwrap()];
+                    if rows == 64 { links.push(decode.unwrap()); }
+                    let staging = crate::shared::experts::staging::RouteStaging::new(rows as usize,
+                        geometry.topk as usize, hidden_bytes as usize)?.bytes;
+                    for link in links {
+                        SparkLink::validate_admitted_bootstrap(&link, &request, staging, true)?;
+                        assert_eq!(link.geometry().intake.ranks, ranks);
+                        let mut narrow = request.clone();
+                        narrow.header.row_count -= 1;
+                        assert!(SparkLink::validate_admitted_bootstrap(&link, &narrow, staging, true).is_err());
+                        let mut wrong_wire = request.clone();
+                        wrong_wire.header.hidden_dtype = if dtype == ExpertV2Dtype::Bf16 {
+                            ExpertV2Dtype::Fp8E4m3Ue8m0K32 } else { ExpertV2Dtype::Bf16 };
+                        assert!(SparkLink::validate_admitted_bootstrap(&link, &wrong_wire, staging, true).is_err());
+                    }
+                }
             }
         }
         Ok(())

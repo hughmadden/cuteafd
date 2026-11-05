@@ -59,6 +59,8 @@ pub enum Variable {
     Prefill(Vec<PrefillShape>),
     Lanes(Vec<u64>),
     Embedding(Vec<EmbeddingHome>),
+    /// Ordered optional bundled-encoder candidates; lower index is preferred.
+    Encoder(Vec<usize>),
     /// Fallback rank set for this routed group, after the selected ordered
     /// onboarding prefixes have claimed their local layers. No per-layer
     /// optional local home is introduced.
@@ -82,6 +84,7 @@ impl Variable {
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
             Self::Embedding(values) => values.len(),
+            Self::Encoder(values) => values.len(),
             Self::ExpertHome { rank_sets, .. } => rank_sets.len(),
             Self::Onboard { counts, .. } => counts.len(),
         }
@@ -416,6 +419,7 @@ impl Contract {
         let mut expert_homes = BTreeMap::new();
         let mut remote_homes = BTreeMap::new();
         let mut embedding = None;
+        let mut encoder = None;
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
                 Variable::Attention { layer, values } => {
@@ -430,6 +434,11 @@ impl Contract {
                 Variable::Embedding(values) => {
                     if embedding.replace(values[option]).is_some() {
                         return Err(Refusal::InvalidFact("duplicate embedding domain".into()));
+                    }
+                }
+                Variable::Encoder(values) => {
+                    if encoder.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate encoder domain".into()));
                     }
                 }
                 Variable::ExpertHome { layers, rank_sets } => {
@@ -473,6 +482,7 @@ impl Contract {
             onboard_layers,
             expert_homes,
             embedding,
+            encoder,
             prefill: prefill
                 .ok_or_else(|| Refusal::InvalidFact("missing prefill domain".into()))?,
             lanes: lanes.ok_or_else(|| Refusal::InvalidFact("missing lane domain".into()))?,
@@ -525,6 +535,7 @@ impl Contract {
         let mut attention = BTreeSet::new();
         let mut remote_layers = BTreeSet::new();
         let (mut prefill, mut lanes, mut embedding) = (0, 0, 0);
+        let mut encoder = false;
         for variable in &self.variables {
             if variable.len() == 0 {
                 return Err(Refusal::Unsupported);
@@ -560,6 +571,12 @@ impl Contract {
                     }) {
                         return Err(Refusal::InvalidFact("invalid embedding domain".into()));
                     }
+                }
+                Variable::Encoder(values) => {
+                    if encoder || values.iter().copied().ne(0..values.len()) {
+                        return Err(Refusal::InvalidFact("invalid encoder domain".into()));
+                    }
+                    encoder = true;
                 }
                 Variable::ExpertHome { layers, rank_sets } => {
                     if layers.is_empty()

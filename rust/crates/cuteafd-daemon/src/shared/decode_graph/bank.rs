@@ -2,6 +2,7 @@
 //! caller proves every stream using the captured storage has drained.
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use cuteafd_loader::placement::inventory::DeclaredGraphSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GraphPolicy {
@@ -36,7 +37,7 @@ pub(crate) struct GraphBank<K, E> {
     entries: HashMap<K, Entry<E>>,
     seen: HashSet<K>,
     policy: GraphPolicy,
-    startup: Option<HashSet<K>>,
+    startup: Option<DeclaredGraphSet<K>>,
     startup_sealed: bool,
     clock: u64,
     stats: GraphStats,
@@ -63,8 +64,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// from an empty slot on a live request.
     pub fn declare_startup(&mut self, keys: &[K]) -> anyhow::Result<()> {
         anyhow::ensure!(self.entries.is_empty() && self.startup.is_none(), "graph bank already warmed");
-        let expected: HashSet<K> = keys.iter().cloned().collect();
-        anyhow::ensure!(expected.len() == keys.len(), "duplicate startup graph key");
+        let expected = DeclaredGraphSet::new(keys).map_err(anyhow::Error::msg)?;
         self.policy = GraphPolicy::FixedStartup;
         self.startup = Some(expected);
         Ok(())
@@ -81,8 +81,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn finish_startup(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.startup_sealed, "startup graph bank already sealed");
         let expected = self.startup.as_ref().ok_or_else(|| anyhow::anyhow!("startup graph inventory undeclared"))?;
-        anyhow::ensure!(self.entries.len() == expected.len()
-            && expected.iter().all(|key| self.contains(key)), "startup graph inventory differs from captured bank");
+        expected.verify(self.entries.keys()).map_err(anyhow::Error::msg)?;
         self.startup_sealed = true;
         Ok(())
     }
@@ -91,14 +90,12 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// unexpected captures fail startup rather than merely logging a mismatch.
     pub fn warm(&mut self, keys: &[K], mut capture: impl FnMut(&K) -> anyhow::Result<(E, Option<u64>)>) -> anyhow::Result<()> {
         anyhow::ensure!(self.entries.is_empty() && self.startup.is_none(), "graph bank already warmed");
-        let expected: HashSet<K> = keys.iter().cloned().collect();
-        anyhow::ensure!(expected.len() == keys.len(), "duplicate startup graph key");
+        let expected = DeclaredGraphSet::new(keys).map_err(anyhow::Error::msg)?;
         for key in keys {
             let (exec, bytes) = capture(key)?;
             self.insert(key.clone(), exec, bytes);
         }
-        anyhow::ensure!(self.entries.len() == expected.len()
-            && expected.iter().all(|key| self.contains(key)), "startup graph inventory differs from captured bank");
+        expected.verify(self.entries.keys()).map_err(anyhow::Error::msg)?;
         self.startup = Some(expected);
         self.policy = GraphPolicy::FixedStartup;
         self.startup_sealed = true;
@@ -107,11 +104,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     /// Seal a family-driven warm-up (some captures encompass a whole step).
     pub fn seal_startup(&mut self, keys: &[K]) -> anyhow::Result<()> {
-        let expected: HashSet<K> = keys.iter().cloned().collect();
-        anyhow::ensure!(expected.len() == keys.len(), "duplicate startup graph key");
+        let expected = DeclaredGraphSet::new(keys).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(self.startup.is_none(), "startup graph bank already sealed");
-        anyhow::ensure!(self.entries.len() == expected.len()
-            && expected.iter().all(|key| self.contains(key)), "startup graph inventory differs from captured bank");
+        expected.verify(self.entries.keys()).map_err(anyhow::Error::msg)?;
         self.startup = Some(expected);
         self.policy = GraphPolicy::FixedStartup;
         self.startup_sealed = true;

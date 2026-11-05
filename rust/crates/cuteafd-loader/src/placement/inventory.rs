@@ -17,6 +17,92 @@ use cuteafd_core::memory_layout::{Basis, Category};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Only inputs that affect a maintained figure participate in compatibility.
+/// The producing engine commit belongs to evidence, not this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FigureIdentity<'a> {
+    pub declared_graphs: &'a str,
+    /// The manifest hash includes its kernel object hashes.
+    pub programs_sha256: &'a str,
+    pub native_sha256: &'a str,
+    pub toolchain: &'a str,
+    pub gpu_class: &'a str,
+    pub driver: &'a str,
+    pub layout: &'a str,
+}
+
+impl FigureIdentity<'_> {
+    pub fn stale_parts(&self, current: FigureIdentity<'_>) -> Vec<&'static str> {
+        [
+            ("declared graph set", self.declared_graphs == current.declared_graphs),
+            ("kernel/program hashes", self.programs_sha256 == current.programs_sha256),
+            ("native library", self.native_sha256 == current.native_sha256),
+            ("toolchain", self.toolchain == current.toolchain),
+            ("GPU class", self.gpu_class == current.gpu_class),
+            ("driver", self.driver == current.driver),
+            ("layout", self.layout == current.layout),
+        ].into_iter().filter_map(|(part, equal)| (!equal).then_some(part)).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FigureAttribution {
+    Measured,
+    Estimated { derivation: &'static str },
+}
+
+/// A family-code parameter, never a receipt or an independently proved bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFigure {
+    pub bytes: u64,
+    pub attribution: FigureAttribution,
+    pub evidence: &'static str,
+    pub producing_commit: &'static str,
+    pub identity: FigureIdentity<'static>,
+}
+
+impl MemoryFigure {
+    /// Derive an explicitly estimated layout from a whole measured figure.
+    /// Rounding is integral-byte ceiling, not an automatic safety margin.
+    pub fn scaled(self, numerator: u64, denominator: u64, derivation: &'static str)
+        -> Result<Self, &'static str> {
+        if denominator == 0 || derivation.trim().is_empty() {
+            return Err("invalid maintained memory figure derivation");
+        }
+        let bytes = u128::from(self.bytes).checked_mul(u128::from(numerator))
+            .ok_or("maintained memory figure overflow")?.div_ceil(u128::from(denominator));
+        Ok(Self { bytes: bytes.try_into().map_err(|_| "maintained memory figure overflow")?,
+            attribution: FigureAttribution::Estimated { derivation }, ..self })
+    }
+}
+
+/// Call only for figures consumed by the resolved plan. Unselected alternatives
+/// must not produce recommendations, and compatibility never changes the bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct FigureUse<'a> {
+    pub name: &'a str,
+    pub figure: MemoryFigure,
+    pub current: FigureIdentity<'a>,
+}
+
+pub fn census_recommendation<'a>(figures: impl IntoIterator<Item = FigureUse<'a>>) -> Option<String> {
+    let mut findings = std::collections::BTreeSet::new();
+    for used in figures {
+        let mut reasons = Vec::new();
+        if let FigureAttribution::Estimated { derivation } = used.figure.attribution {
+            reasons.push(format!("estimated, derived from {}: {derivation}", used.figure.evidence));
+        }
+        let stale = used.figure.identity.stale_parts(used.current);
+        if !stale.is_empty() { reasons.push(format!("stale {}", stale.join(", "))); }
+        if !reasons.is_empty() {
+            findings.insert(format!("{} ({}; evidence {})", used.name, reasons.join("; "), used.figure.evidence));
+        }
+    }
+    (!findings.is_empty()).then(|| format!(
+        "census recommended for maintained runtime memory figures: {}; using maintained bytes unchanged",
+        findings.into_iter().collect::<Vec<_>>().join("; ")))
+}
+
 #[path = "spark_inventory.rs"]
 mod spark_inventory;
 pub use spark_inventory::{v41_spark_inventory, QualifiedSparkRuntime, SparkExecutionInventory, SparkInventoryError, SparkLoadInventory, SparkManifestProvenance, SparkMemoryDomains, SparkRankInventory, SparkRuntimeMethod, SparkRuntimeProvenance, SparkRuntimeTerm};
@@ -198,12 +284,6 @@ pub fn glmf_local_tp2_runtime_items(rank: usize) -> Vec<cuteafd_core::memory_lay
 /// One GPU: 1,946,157,056 / 13,800; split lead: 2,231,369,728 / 13,800;
 /// split peer: 2,283,798,528 / 13,500. Values retain P2's rounded arithmetic.
 pub const GLMF_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
-
-/// GLM owned-phase SM120 executable mean, RTX PRO 6000, EXL3 K4, 2026-10-15.
-/// 49,416 executables/rank used 5,790,236,672 / 5,762,973,696 B on two launches.
-/// This is a phase-class calibration, not a whole-engine budget. Recheck ready
-/// deltas on RTX 5090 or after changing the phase/shape census.
-pub const GLM_OWNED_SM120_GRAPH_BYTES: u64 = 117_000;
 
 /// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
@@ -420,6 +500,61 @@ pub struct StartupGraphs<K> {
     pub keys: Vec<K>,
 }
 
+/// An independently declared exact executable-key set. Memory observations and
+/// node counts never participate in its identity. Keys must serialize stable
+/// launch geometry, with no pointer addresses or process-local identifiers.
+#[derive(Debug, Clone)]
+pub struct DeclaredGraphSet<K> {
+    keys: std::collections::HashSet<K>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone + std::fmt::Debug> DeclaredGraphSet<K> {
+    pub fn new(keys: &[K]) -> Result<Self, String> {
+        let declared = keys.iter().cloned().collect::<std::collections::HashSet<_>>();
+        if declared.len() != keys.len() { return Err("duplicate startup graph key".into()); }
+        Ok(Self { keys: declared })
+    }
+
+    pub fn contains(&self, key: &K) -> bool { self.keys.contains(key) }
+    pub fn len(&self) -> usize { self.keys.len() }
+    pub fn is_empty(&self) -> bool { self.keys.is_empty() }
+
+    pub fn verify<'a>(&self, actual: impl IntoIterator<Item = &'a K>) -> Result<(), String>
+        where K: 'a {
+        let mut seen = std::collections::HashSet::new();
+        for key in actual {
+            if !seen.insert(key) || !self.contains(key) {
+                return Err(format!("unexpected or duplicate startup graph key: {key:?}"));
+            }
+        }
+        if seen.len() != self.len() {
+            return Err(format!("startup graph coverage differs: declared {}, captured {}", self.len(), seen.len()));
+        }
+        Ok(())
+    }
+
+    /// Sort the serialized keys and length-frame every entry, so declaration
+    /// order and randomized HashSet iteration do not affect a rank's identity.
+    pub fn fingerprint(&self, rank: u8) -> Result<String, String> where K: Serialize {
+        use sha2::{Digest, Sha256};
+        let mut encoded = self.keys.iter().map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        encoded.sort_unstable();
+        if encoded.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("distinct startup graph keys serialize identically".into());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd-declared-graphs-v1\0");
+        hash.update([rank]);
+        hash.update((encoded.len() as u64).to_le_bytes());
+        for key in encoded {
+            hash.update((key.len() as u64).to_le_bytes());
+            hash.update(key);
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+}
+
 /// A measured V4.1 executable class on one lane/device. bindings counts stable
 /// source/table geometries of this exact row shape, not a padding bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -585,6 +720,62 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn measured_figure() -> MemoryFigure {
+        MemoryFigure { bytes: 101, attribution: FigureAttribution::Measured,
+            evidence: "synthetic census", producing_commit: "producer-A",
+            identity: FigureIdentity { declared_graphs: "declared", programs_sha256: "programs",
+                native_sha256: "native", toolchain: "compiler", gpu_class: "card",
+                driver: "driver", layout: "layout" } }
+    }
+
+    #[test]
+    fn maintained_figures_use_unchanged_bytes_and_ignore_unrelated_producing_commits() {
+        let figure = measured_figure();
+        let used = |figure| FigureUse { name: "selected", figure, current: measured_figure().identity };
+        assert_eq!(census_recommendation([used(figure)]), None);
+        assert_eq!(census_recommendation([used(MemoryFigure { producing_commit: "producer-B", ..figure })]), None);
+        let mut current = figure.identity;
+        for part in 0..7 {
+            match part {
+                0 => current.declared_graphs = "changed",
+                1 => current.programs_sha256 = "changed",
+                2 => current.native_sha256 = "changed",
+                3 => current.toolchain = "changed",
+                4 => current.gpu_class = "changed",
+                5 => current.driver = "changed",
+                _ => current.layout = "changed",
+            }
+            let stale = figure.identity.stale_parts(current);
+            assert_eq!(stale.len(), 1);
+            let message = census_recommendation([FigureUse { current, ..used(figure) }]).unwrap();
+            assert!(message.contains(stale[0]));
+            assert!(message.contains("using maintained bytes unchanged"));
+            assert_eq!(figure.bytes, 101);
+            current = figure.identity;
+        }
+    }
+
+    #[test]
+    fn maintained_figures_aggregate_only_consumed_estimates_and_keep_derivations() {
+        let measured = measured_figure();
+        let estimated = measured.scaled(3, 2, "declared key-count ratio").unwrap();
+        assert_eq!(estimated.bytes, 152);
+        assert_eq!(estimated.identity, measured.identity);
+        assert_eq!(estimated.evidence, measured.evidence);
+        assert!(measured.scaled(1, 0, "ratio").is_err());
+        assert!(measured.scaled(1, 1, "").is_err());
+        assert!(MemoryFigure { bytes: u64::MAX, ..measured }.scaled(2, 1, "ratio").is_err());
+        assert_eq!(census_recommendation([]), None);
+        let used = FigureUse { name: "selected estimate", figure: estimated, current: measured.identity };
+        let message = census_recommendation([used, used]).unwrap();
+        assert_eq!(message.matches("selected estimate").count(), 1);
+        assert!(message.contains("synthetic census"));
+        assert!(message.contains("declared key-count ratio"));
+        // An unconsumed alternative never enters this after-solve aggregation.
+        assert_eq!(census_recommendation([FigureUse { name: "selected measured",
+            figure: measured, current: measured.identity }]), None);
+    }
+
     #[test]
     fn native_package_names_and_scratch_share_the_format_contract() {
         use crate::formats::fp8_experts::ExpertFormat;
@@ -603,6 +794,35 @@ mod tests {
             std::fs::remove_file(root.join("manifest.json")).unwrap();
             assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
         }
+    }
+
+    #[test]
+    fn declared_graph_identity_is_order_independent_ranked_and_exact() {
+        let keys = [(0u32, 1u32, 16u32), (1, 4, 32), (2, 64, 256)];
+        let declared = DeclaredGraphSet::new(&keys).unwrap();
+        let reversed = DeclaredGraphSet::new(&keys.into_iter().rev().collect::<Vec<_>>()).unwrap();
+        let fingerprint = declared.fingerprint(0).unwrap();
+        assert_eq!(fingerprint, reversed.fingerprint(0).unwrap());
+        assert_ne!(fingerprint, declared.fingerprint(1).unwrap());
+        declared.verify(keys.iter().rev()).unwrap();
+        assert!(declared.verify(keys[..2].iter()).is_err());
+        assert!(declared.verify(keys.iter().chain([&(3, 1, 16)])).is_err());
+        assert!(declared.verify(keys.iter().chain(keys[..1].iter())).is_err());
+        assert!(DeclaredGraphSet::new(&[keys[0], keys[0]]).is_err());
+        let changed = DeclaredGraphSet::new(&[(0, 1, 16), (1, 4, 32), (2, 64, 512)]).unwrap();
+        assert_ne!(fingerprint, changed.fingerprint(0).unwrap());
+        let empty = DeclaredGraphSet::<u32>::new(&[]).unwrap();
+        assert!(empty.is_empty());
+        empty.verify([].iter()).unwrap();
+        assert_ne!(empty.fingerprint(0).unwrap(), empty.fingerprint(1).unwrap());
+    }
+
+    #[test]
+    fn declared_graph_identity_rejects_lossy_key_serialization() {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        struct Lossy { stable: u32, #[serde(skip)] omitted: u32 }
+        let keys = [Lossy { stable: 1, omitted: 0 }, Lossy { stable: 1, omitted: 1 }];
+        assert!(DeclaredGraphSet::new(&keys).unwrap().fingerprint(0).is_err());
     }
 
     #[test]

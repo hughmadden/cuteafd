@@ -574,6 +574,63 @@ mod tests {
     }
 
     #[test]
+    fn kimi_context_replays_mandatory_graphs_after_prefill_and_ungraphed_scoring() -> Result<()> {
+        use crate::families::kimi_k3::{context::split_bucket, graphs::{self, Key, Op}};
+        use cuteafd_loader::families::kimi_k3::{config::{KimiAttention, KimiK3Config}, context::DecodeBuckets};
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.layers = 1;
+        cfg.attention = vec![KimiAttention::Mla];
+        let decode = DecodeBuckets::from_manifest(&serde_json::json!({"programs":[{
+            "name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+            "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
+        let set = graphs::inventory_with_context(&cfg, 1, 2752, 16, 8, 2,
+            |_, _| true, |_| true, Some(&decode))?;
+        let keys = set.keys.iter().copied().collect::<std::collections::HashSet<_>>();
+        let replay = |rows, speculative, optional, history: usize| -> Result<()> {
+            let rows = decode.dispatch_rows(rows, speculative)?;
+            let op = Op::Context { layer: 0, speculative };
+            assert!(graphs::replay_allowed(op, optional, false)?);
+            assert!(graphs::replay_allowed(op, optional, true).is_err());
+            assert_eq!(graphs::replay_allowed(Op::Ffn(0), optional, false)?, optional);
+            for rank in 0..2 {
+                assert!(keys.contains(&Key { lane: 0, rank, rows, op }),
+                    "missing scoring/decode Context graph at history={history}, rows={rows}");
+                for sms in [170, 188] {
+                    let logical = (0..history.div_ceil(64) as u32).collect::<Vec<_>>();
+                    let pages = crate::shared::peer_split::context::local_pages(&logical, rank)?.len();
+                    assert!(crate::families::kimi_k3::context::SPLIT_BUCKETS
+                        .contains(&split_bucket(pages, rows, sms)?));
+                }
+            }
+            Ok(())
+        };
+        // Walk the actual card sequence: a wide prefill, then the 513-token
+        // teacher-forced probe, then ordinary and mixed speculative C1..C16.
+        for prompt in [8027, 8192, 65536] {
+            let units = crate::shared::prefill_pipeline::prefill_units(prompt, 2752, 3, 256)?;
+            assert_eq!(units.iter().map(|unit| unit.len()).sum::<usize>(), prompt);
+            for unit in units { if unit.len() <= 64 { replay(unit.len(), false, true, unit.end)?; } }
+            for requested in [None, Some(1), Some(8), Some(13), Some(64)] {
+                let steps = score_plan(513, 1, 2752 * 3, 64, requested, ScorePath::Decode, false)?;
+                for step in steps {
+                    if step.tokens.len() <= 64 {
+                        replay(step.tokens.len(), false, step.path == ScorePath::Prefill, step.tokens.end)?;
+                    }
+                }
+            }
+            for active in 1..=16 {
+                for optional in [false, true] {
+                    replay(active, false, optional, prompt + 1)?;
+                    for rows in active.max(2)..=(active * 8).min(64) {
+                        replay(rows, true, optional, prompt + 8)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn prefill_requires_launch_admission_and_rejects_verify_override() {
         let error = score_plan(20, 4, 8, 8, None, ScorePath::Prefill, false).unwrap_err();
         assert!(error.to_string().contains("--full-prefill-logits"));

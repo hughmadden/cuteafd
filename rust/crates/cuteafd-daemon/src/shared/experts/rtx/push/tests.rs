@@ -4,8 +4,51 @@ use crate::shared::memory::device::Device;
 use anyhow::Context;
 use cuteafd_ffi::{native_library_lifetime_fixture::Fixture, push_ring::DEFAULT_SLOT_BYTES};
 use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
-    push_load::{proto::{Event, Request}, slot, Listener, PushClient}};
+    push_load::{proto::{Event, Request}, slot, PushClient}};
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
+
+#[test]
+fn join_stage_errors_name_rank_device_stage_and_requested_bytes() {
+    for (stage, bytes) in [("expert arena", 8 << 30), ("host-ring registration", 128 << 20)] {
+        let error = join_stage::<()>(7, 6, 0, stage, bytes,
+            || anyhow::bail!("injected allocation refusal")).unwrap_err();
+        let typed = error.downcast_ref::<RankJoinError>().unwrap();
+        assert_eq!((typed.rank, typed.device, typed.stage, typed.bytes), (6, 0, stage, bytes));
+        assert!(error.to_string().contains("injected allocation refusal"));
+    }
+}
+
+#[test]
+fn stalled_sparknest_join_times_out_with_rank_and_ring_bytes() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir()?;
+    let socket = root.path().join("join.sock").to_string_lossy().into_owned();
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let server_socket = socket.clone();
+    let server = std::thread::spawn(move || -> Result<()> {
+        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(2))?;
+        conn.set_timeout(Some(Duration::from_secs(2)))?;
+        assert!(matches!(conn.next_request()?.context("Join request")?.0, Request::Join { rank: 6, .. }));
+        let _ = released.recv_timeout(Duration::from_secs(2));
+        Ok(())
+    });
+    let client = PushClient::at(socket, Duration::from_millis(50))?;
+    let ring = tempfile::tempfile()?;
+    let started = std::time::Instant::now();
+    let result = join_stage(7, 6, 0, "SparkNest client.join", 128 << 20, || {
+        Ok(client.join(cuteafd_loader::push_load::JoinArgs { group: 7, token: 11, rank: 6,
+            ring_fd: ring.as_raw_fd(), slots: 128, slot_bytes: 1 << 20 })?)
+    });
+    drop(release);
+    server.join().unwrap()?;
+    let error = result.err().context("stalled join must fail")?;
+    let typed = error.downcast_ref::<RankJoinError>().context("typed join boundary")?;
+    assert_eq!((typed.rank, typed.bytes), (6, 128 << 20));
+    assert_eq!(typed.source.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
 
 #[test]
 fn whole_binding_requires_exact_selected_inventory_and_admission() -> Result<()> {
@@ -316,7 +359,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
             let rank = sparks + gpu;
             let socket = root.path().join(format!("{}-{gpu}.sock", if fail { "fail" } else { "good" }))
                 .to_string_lossy().into_owned();
-            let listener = Listener::bind(&socket)?;
+            let listener = crate::shared::memory::push_testing::bind(&socket)?;
             let packed = pack(&checked[gpu], root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
             let (mut coordinator, worker) = control_pair()?;
             let server_socket = socket.clone();
@@ -465,7 +508,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     plan.append_at(&mut builder, &catalog, rank as u32, base)?;
     let combined = builder.finish()?;
     let socket = root.path().join("combined.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let packed = pack(&combined, root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
     let (mut coordinator, mut worker) = control_pair()?;
     let server_socket = socket.clone();
@@ -781,7 +824,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
         &layout.checked(root, sparks + 2, rank)?, rank as u32)?;
     let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
     let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let (mut coordinator, mut worker) = control_pair()?;
     for stream in [&coordinator, &worker] { stream.set_read_timeout(Some(Duration::from_secs(600)))?; }
     let streamed = build()?;
@@ -910,7 +953,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
 fn fake_source_accept_is_bounded() -> Result<()> {
     let root = tempfile::tempdir()?;
     let socket = root.path().join("idle.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let started = std::time::Instant::now();
     let error = crate::shared::memory::push_testing::accept_within(&listener, &socket, Duration::from_secs(1)).err().context("an idle source must fail")?;
     assert!(error.to_string().contains("no rank connected"), "{error}");
@@ -1110,7 +1153,7 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let push = CoordinatorPush::prepare_alone_at(root.path(), None, 2, None, Some(socket.clone()))?;
     let hub_root = root.path().to_path_buf();
     let hub_socket = socket.clone();
@@ -1319,7 +1362,7 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
                 let combined = builder.finish()?;
                 let packed = pack(&combined, root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
                 let socket = root.path().join("c.sock").to_string_lossy().into_owned();
-                let listener = Listener::bind(&socket)?;
+                let listener = crate::shared::memory::push_testing::bind(&socket)?;
                 let (mut coordinator, mut worker) = control_pair()?;
                 let events_path = fixture.directory().join("events");
                 let before = fixture.events()?.len();

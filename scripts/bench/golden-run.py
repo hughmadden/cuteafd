@@ -97,9 +97,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
-               'step5': 'step5-golden', 'muse': 'muse-golden'}
-# Families without a golden subcommand yet: native tests and commands only.
-RAW_FAMILIES = ('kimi',)
+               'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
@@ -1353,7 +1351,7 @@ def parse_pairs(values, arms):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--task', required=True, help='output under ~/.cache/cuteafd/builds/TASK/golden')
-    parser.add_argument('--family', required=True, choices=sorted({*SUBCOMMANDS, *RAW_FAMILIES}),
+    parser.add_argument('--family', required=True, choices=sorted(SUBCOMMANDS),
                         help='family (its golden subcommand; raw-only families need --native-test/--command)')
     parser.add_argument('--model', required=True, help='HF id (ORG/NAME[@REV]) or snapshot directory; {snapshot} in ARGS')
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=WIP_INSTANCE:SLOT')
@@ -1415,8 +1413,6 @@ def main(argv=None):
             raise ValueError('invalid --task, --repeats or --timeout')
         if not args.golden and not args.native_test:
             raise ValueError('missing args after --')
-        if args.family in RAW_FAMILIES and not (args.native_test or args.command):
-            raise ValueError(f'family {args.family} has no golden subcommand yet; use --native-test or --command')
         arms = parse_arms(args.arm)
         if not arms:
             raise ValueError('at least one --arm is required')

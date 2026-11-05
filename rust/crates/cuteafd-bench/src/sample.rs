@@ -280,6 +280,28 @@ mod tests {
     }
 
     #[test]
+    fn contract_capacity_without_counterfactual_renders_and_round_trips() {
+        let mut report = super::report(false);
+        report.server.family = Some("glm5".into());
+        report.server.configuration.settings.push(Setting { name: "rtx-expert-layers".into(),
+            value: Some("6".into()), source: "resolved".into(), ..Default::default() });
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(1_800_000), max_tokens: None,
+            kv_format: Some("FP8 MLA latent".into()), ..Default::default() });
+        let expected = "KV 1.8M tok · 6 RTX expert layers · FP8 MLA latent";
+        assert_eq!(report.capacity_line(), expected);
+        let card = render::card::card_svg(&report);
+        assert!(card.contains(expected));
+        assert!(!card.contains("KV 0") && !card.contains("null tokens") && !card.contains("(max "));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("\"max_tokens\""));
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.capacity().max_tokens, None);
+        assert_eq!(restored.capacity_line(), expected);
+        assert!(render::card::card_svg(&restored).contains(expected));
+    }
+
+    #[test]
     fn old_reports_without_maximum_still_load() {
         let original = super::report(false);
         let json = serde_json::to_string(&original).unwrap();
