@@ -417,6 +417,7 @@ def execute(a):
             comparison = json.loads(evidence.read_bytes())
             shutil.copyfile(evidence, a.out / "official-forward.json")
         finish_golden(a.out, manifest, entries, snapshot_identity=snapshot, source_pin=pins,
+                      **({"source_identity_provider": "families.kimi_k3.k31"} if is_k31 else {}),
                       nll=total_nll / total_rows, scored_tokens=total_rows, seconds=time.monotonic() - started,
                       torch=torch.__version__, transformers=transformers.__version__, tokenizers=tokenizers.__version__,
                       attention="eager", mtp=False, use_cache=False, prefix_qualification=proof,

@@ -113,7 +113,17 @@ class ChatRenderer:
         rendered = copy.deepcopy(body)
         rendered["messages"] = messages
         if self.native:
-            raise ValueError("recipe v2 trailing context needs a Jinja template or checkpoint encoder")
+            options = self.template_options(rendered)
+            conversation = normalized_messages(messages)
+            ids = list(self.tokenizer.apply_chat_template(
+                conversation, tools=body.get("tools"), tokenize=True,
+                add_generation_prompt=False, **options))
+            text = self.tokenizer.apply_chat_template(
+                conversation, tools=body.get("tools"), tokenize=False,
+                add_generation_prompt=False, **options)
+            if self.tokenizer.decode(ids) != text:
+                raise ValueError("conversation does not re-tokenize losslessly")
+            return ids
         if self.encoder:
             text = self.render(rendered)
             ids = token_ids(self.tokenizer, text)

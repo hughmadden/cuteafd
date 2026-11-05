@@ -51,12 +51,34 @@ def source_identity(snapshot):
     raw = json.loads((snapshot / "config.json").read_bytes())
     if snapshot.name != REVISION or raw.get("model_type") != "kimi_k31":
         raise ValueError("K3.1 reference requires the pinned official checkpoint")
-    base = model.source_identity(base_snapshot(snapshot))
+    model.source_identity(base_snapshot(snapshot))
+    return _static_source_identity()
+
+
+def _static_source_identity():
+    from . import model
     return {"checkpoint": CHECKPOINT, "revision": REVISION,
-            "base_decoder": {"checkpoint": "moonshotai/Kimi-K3", **base},
+            "base_decoder": {"checkpoint": "moonshotai/Kimi-K3", "revision": model.REVISION,
+                **{name.removesuffix(".py") + "_sha256": value for name, value in model.SOURCE_PINS.items()}},
             "upstream": UPSTREAM,
             "dsa_adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "dsa_arithmetic": ARITHMETIC}
+
+
+def expected_source_identity(runtime_digests):
+    """Reconstruct static pins from reference code; only installed-package hashes vary."""
+    import re
+    names = {"fla_source_sha256", "transformers_source_sha256", "compressed_tensors_source_sha256"}
+    if (set(runtime_digests) != names or any(not isinstance(value, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value) for value in runtime_digests.values())):
+        raise ValueError("invalid reference runtime source digests")
+    root = Path(__file__).resolve().parents[2]
+    files = {"reference_adapter_sha256": Path(__file__).with_name("model.py"),
+             "reference_runner_sha256": Path(__file__).with_name("golden.py"),
+             "indexer_ops_sha256": root / "families/mistral_large4/ops.py",
+             "shape_invariant_sha256": root / "shape_invariant.py"}
+    return {**_static_source_identity(), **runtime_digests,
+            **{name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}}
 
 
 def validate_config(config):
