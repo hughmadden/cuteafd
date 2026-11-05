@@ -448,8 +448,11 @@ def diagnose_routes(a, *, native_layer, atomic_json, digest, state_type, officia
                            kda_num_heads=config.linear_attn_config["num_heads"])
 
     def forward(layer, hidden, blocks, adapted):
+        from contextlib import nullcontext
         def run():
-            with route_capture(layer.block_sparse_moe.gate) as route:
+            capture = (route_capture(layer.block_sparse_moe.gate)
+                       if hasattr(layer, "block_sparse_moe") else nullcontext({}))
+            with capture as route:
                 mask = None if adapted or layer.is_linear_attn else official_mask(hidden)
                 output, history = layer(hidden, attention_mask=mask, block_residual=blocks,
                                         use_cache=False, output_attentions=False)
@@ -487,7 +490,9 @@ def diagnose_routes(a, *, native_layer, atomic_json, digest, state_type, officia
                 routes.append(route)
                 outputs.append(result.detach().cpu())
                 del hidden, blocks, result, history
-            comparison = route_comparison(layer.block_sparse_moe.gate, *routes)
+            comparison = (route_comparison(layer.block_sparse_moe.gate, *routes)
+                          if hasattr(layer, "block_sparse_moe") else
+                          {"selection_flip_tokens": 0, "flips": [], "dense_layer": True})
             row = {"layer": index, **comparison, "output": differences(*outputs)}
             pending["checks"].append(row)
             atomic_json(a.out / "routes.json", {"binding": binding, "layers": pending["checks"]})

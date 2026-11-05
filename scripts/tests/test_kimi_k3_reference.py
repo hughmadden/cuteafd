@@ -369,6 +369,106 @@ def test_route_capture_records_actual_logits_choices_and_restores_after_failure(
         route_comparison(gate, left, right)
 
 
+def test_bounded_routes_skip_dense_then_stop_at_first_moe_flip(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from contextlib import contextmanager
+    import torch.nn.functional as F
+    from families.kimi_k3.diagnostic import diagnose_routes
+    for name in ("fla", "transformers", "compressed_tensors"):
+        package = types.ModuleType(name)
+        package.__version__ = "fixture"
+        monkeypatch.setitem(sys.modules, name, package)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.backends.cuda, "preferred_blas_library", lambda *args: "fixture")
+    monkeypatch.setattr(model, "configure_f32", lambda: {"arithmetic": "fixture"})
+    monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE_SHA256", "fixture-image")
+    monkeypatch.setattr("fidelity_windows.load_set", lambda path: {"set_sha256": "fixture"})
+    monkeypatch.setattr("fidelity_windows.verify_snapshot", lambda *args: "fixture-snapshot")
+    monkeypatch.setattr(model, "source_identity", lambda path: {"revision": "fixture"})
+    monkeypatch.setattr(model, "package_source_identity", lambda package: "fixture")
+    binding = dict(snapshot_identity="fixture-snapshot", set_sha256="fixture", torch=torch.__version__,
+                   fla="fixture", transformers="fixture", compressed_tensors="fixture",
+                   image_sha256="fixture-image", compute_capability=[12, 1], state_dtype="float32")
+    retained = golden.LayerState(tmp_path / "retained", binding)
+    source = torch.tensor([1.1, 1., 0., 0.]).repeat(1, 128, 1)
+    pending = retained.begin(-1)
+    for name in ("official_short", "adapted_short"):
+        retained.save(pending, name, source)
+    retained.commit(pending)
+    pending = retained.begin(0)
+    for name in ("official_short", "adapted_short"):
+        retained.save(pending, name, source, append_block=True)
+    retained.commit(pending)
+    config = types.SimpleNamespace(hidden_size=4, num_hidden_layers=3, attn_res_block_size=12,
+                                   linear_attn_config={"num_heads": 1})
+    monkeypatch.setattr(model, "load_official", lambda path: (object(), config, None))
+    class Weights:
+        def __init__(self, *args, **kwargs):
+            pass
+        def close(self):
+            pass
+        def release_experts(self):
+            pass
+    monkeypatch.setattr(model, "LayerWeights", Weights)
+    adapted = False
+    @contextmanager
+    def geometry(reference):
+        nonlocal adapted
+        adapted = True
+        try:
+            yield
+        finally:
+            adapted = False
+    monkeypatch.setattr(model, "geometry", geometry)
+    class Gate(torch.nn.Module):
+        top_k, num_expert_group, moe_router_activation_func = 1, 1, "sigmoid"
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.eye(2, 4))
+            self.e_score_correction_bias = torch.zeros(2)
+        def forward(self, hidden):
+            logits = F.linear(hidden.reshape(-1, 4), self.weight)
+            return (logits.sigmoid() + self.e_score_correction_bias).topk(1).indices, logits
+    calls = []
+    class Layer:
+        is_linear_attn = True
+        def __init__(self, index):
+            self.index = index
+            if index:
+                self.block_sparse_moe = types.SimpleNamespace(gate=Gate())
+        def __call__(self, hidden, *, block_residual, **kwargs):
+            calls.append(self.index)
+            if self.index == 0:
+                history = torch.cat((block_residual, hidden[0, :, None]), dim=1)
+                delta = hidden.new_tensor([0., .2 if adapted else 0., 0., 0.])
+                return hidden + delta, history
+            self.block_sparse_moe.gate(hidden)
+            return hidden, block_residual
+    loaded = []
+    def native_layer(reference, config, weights, index, **kwargs):
+        loaded.append(index)
+        return Layer(index)
+    args = types.SimpleNamespace(probe_state=retained.root, out=tmp_path / "routes",
+                                 windows=tmp_path / "input.json", snapshot=tmp_path / "snapshot",
+                                 diagnose_layer=2, diagnose_blas=None)
+    diagnose_routes(args, native_layer=native_layer, atomic_json=golden.atomic_json,
+                    digest=golden.digest, state_type=golden.LayerState, official_mask=golden.official_mask)
+    report = json.loads((args.out / "layer-diagnostic.json").read_bytes())
+    assert loaded == [0, 1] and calls == [0, 0, 1, 1, 1]
+    assert report["first_flip"]["layer"] == 1
+    assert report["first_flip"]["selection_flip_tokens"] == 128
+    assert report["retained_input_layer"] == 0
+    assert report["controlled_layer_same_input"]["selection_flip_tokens"] == 0
+    assert report["controlled_router_same_input"]["selection_flip_tokens"] == 0
+    routes = json.loads((args.out / "routes.json").read_bytes())
+    assert routes["layers"][0]["dense_layer"]
+    assert routes["layers"][1]["flips"][0]["official_only_experts"] == [0]
+    assert json.loads((args.out / "layer-state/latest.json").read_bytes())["layer"] == 0
+    assert report["qualification"].startswith("diagnostic only")
+
+
 def test_route_comparison_reports_exact_cutoff_tie():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import route_comparison
