@@ -125,7 +125,7 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
-    /// Split DFlash attention and FFN over the target's two RTX ranks.
+    /// Split DFlash attention and FFN over both RTX ranks (default on with --split-device and --draft).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub tp2_dflash: bool,
     /// Native MTP drafter: run this many of the checkpoint's MTP stages

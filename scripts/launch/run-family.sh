@@ -1632,7 +1632,11 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then
     *) release_die "EXPERT_USAGE must be on or off" ;;
   esac
 fi
-tp2_dflash="$(get TP2_DFLASH off)"
+tp2_dflash_default=off
+if [[ "$family" == mimo_v2 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+  tp2_dflash_default=on
+fi
+tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
 case "$tp2_dflash" in on|off) ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
 [[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
   release_die "TP2_DFLASH requires MiMo/Kimi, two selected RTX GPUs and DFlash2"

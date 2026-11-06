@@ -263,11 +263,14 @@ async fn run() -> Result<()> {
     let parse = |matches: clap::ArgMatches| {
 
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
-                cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
-                        prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
-                cli.coordinator_weight_budget_gib),
+            Ok(mut cli) => {
+                cli::resolve_tp2_dflash(&mut cli.command, &matches);
+                (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
+                    cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
+                        idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
+                            prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
+                    cli.coordinator_weight_budget_gib)
+            },
             Err(error) => error.exit(),
         }
     };

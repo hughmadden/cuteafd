@@ -4,6 +4,23 @@ use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
+pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
+    family == "mimo_v2" && split && draft
+}
+
+/// Resolve the topology-dependent bool once, without losing an explicit false.
+pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
+    let engine = match command {
+        Commands::ServeMimo(args) => &mut args.engine,
+        Commands::MimoGolden(args) => &mut args.engine,
+        _ => return,
+    };
+    let Some((_, sub)) = matches.subcommand() else { return };
+    if sub.value_source("tp2_dflash") != Some(clap::parser::ValueSource::CommandLine) {
+        engine.tp2_dflash = tp2_dflash_default("mimo_v2", engine.split_device.is_some(), engine.draft.is_some());
+    }
+}
+
 /// Inspect original argv: clap normalizes aliases before exposing matches.
 pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
     let mut replacements = Vec::new();

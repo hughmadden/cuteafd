@@ -4876,8 +4876,10 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
 
 
 @pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")])
-@pytest.mark.parametrize("value,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+@pytest.mark.parametrize("value,expected", [(None, None), ("off", "false"), ("on", "true")])
 def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, command, value, expected):
+    if expected is None:
+        expected = "true" if family == "mimo_v2" else "false"
     config = {"model_type": family, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
     if family == "kimi_k3":
         config = {"model_type": family, "text_config": {"model_type": "kimi_linear",

@@ -99,9 +99,11 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
             if entry["family"] == "mimo_v2":
-                # Explicit off reaches serve just as it reaches the planner.
+                # MiMo defaults to the qualified TP2 drafter on split pairs.
+                tp2_dflash = ("true" if "--split-device" in before["command"]
+                              and "--draft" in before["command"] else "false")
                 position = before["command"].index("--embedding-placement") + 2
-                before["command"][position:position] = ["--tp2-dflash", "false"]
+                before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
