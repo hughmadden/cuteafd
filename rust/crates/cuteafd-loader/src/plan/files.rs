@@ -289,6 +289,65 @@ mod tests {
     }
 
     #[test]
+    fn declared_native_headers_survive_index_only_eager_family_role_open() -> Result<()> {
+        use crate::plan::{checkpoint::{AttentionMode, CheckpointView}, testing::*};
+        let dir = tempfile::tempdir()?;
+        write_kimi_snapshot(dir.path(), false);
+        let names = ["language_model.model.layers.0.self_attn.o_proj.weight",
+            "language_model.model.layers.3.self_attn.q_b_proj.weight"];
+        let tensors = kimi_k3_tensors(false).into_iter().filter(|tensor| names.contains(&tensor.0.as_str()))
+            .collect::<Vec<_>>();
+        let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("model.safetensors.index.json"))?)?;
+        let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
+            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
+                "compact-attention":{"config":"config.compact-attention.json",
+                    "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
+            "native_modules":"quantize_config.json:native_attention"});
+        let mut config = kimi_k3_config();
+        config["quantization_config"]["attention_view"] = declaration.clone();
+        let native = tensors.iter().map(|(name, dtype, shape)| {
+            index["weight_map"][name] = serde_json::json!("native.safetensors");
+            (name.strip_suffix(".weight").unwrap().to_owned(), serde_json::json!({"format":"bf16",
+                "shard":"native.safetensors", "compact_attention_bits":6, "tensors":{name:{"dtype":dtype,"shape":shape}}}))
+        }).collect::<serde_json::Map<_, _>>();
+        let quant = serde_json::json!({"attention_view":declaration, "native_attention":native});
+        for (name, value) in [("config.json", &config), ("model.safetensors.index.json", &index),
+            ("quantize_config.json", &quant)] {
+            std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
+        }
+        let mut shard = tensors.clone();
+        shard.push(t("unindexed.weight", "BF16", &[2, 2]));
+        write_safetensors(&dir.path().join("native.safetensors"), &shard);
+        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let started = std::time::Instant::now();
+            let inventory = Checkpoint::inventory_view(&view)?;
+            let role = ReadRole::Coordinator { local_experts: false, speculator: false };
+            // Kimi constructs its core eagerly inside family.open, including in
+            // required_tensors before the role has loaded its ordinary headers.
+            let selected = required_tensors(&inventory, role)?;
+            let opened = open_role_view(&view, role)?;
+            eprintln!("native inventory {mode:?}: inventory+required+role {:?}", started.elapsed());
+            assert_eq!(inventory.tensors.len(), names.len());
+            assert!(!inventory.has_header("unindexed.weight"));
+            for name in names {
+                assert!(selected.contains(name));
+                assert!(inventory.has_header(name));
+                let stem = name.strip_suffix(".weight").unwrap();
+                assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
+            }
+        }
+        write_safetensors(&dir.path().join("native.safetensors"), &tensors[..1]);
+        let view = CheckpointView::select(dir.path(), AttentionMode::Hqa)?;
+        assert!(Checkpoint::inventory_view(&view).unwrap_err().to_string().contains("native attention header missing"));
+        let mut malformed = tensors.clone();
+        malformed[0].2[0] += 1;
+        write_safetensors(&dir.path().join("native.safetensors"), &malformed);
+        assert!(Checkpoint::inventory_view(&view).unwrap_err().to_string().contains("disagree with selected safetensors header"));
+        Ok(())
+    }
+
+    #[test]
     fn mimo_coordinator_ignores_expert_and_disabled_tower_shards() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&mimo_flash_config()).unwrap()).unwrap();

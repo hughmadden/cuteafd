@@ -193,8 +193,8 @@ impl Checkpoint {
         super::files::open_role(snapshot, super::files::ReadRole::Coordinator { local_experts, speculator })
     }
 
-    /// Reads the index/configuration plus scale-free declared-A4 weight headers
-    /// to distinguish unquantized modules from incomplete packed storage.
+    /// Reads the index/configuration plus declared native-attention and scale-free
+    /// declared-A4 headers needed to classify storage before opening a role.
     pub fn inventory(snapshot: &Path) -> Result<Self> {
         Self::inventory_view(&CheckpointView::select(snapshot, AttentionMode::Hqa)?)
     }
@@ -202,24 +202,32 @@ impl Checkpoint {
     pub fn inventory_view(view: &CheckpointView) -> Result<Self> {
         let snapshot = view.snapshot();
         let mut checkpoint = Self::open_view_filtered(view, None, |_| false, None)?;
-        let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
+        let native = view.native_attention_names().collect::<BTreeSet<_>>();
+        let mut required = BTreeMap::<String, BTreeSet<String>>::new();
+        for name in &native {
+            let shard = checkpoint.weight_map.get(*name).context("declared native attention is not indexed")?;
+            required.entry(shard.clone()).or_default().insert((*name).to_owned());
+        }
         for (name, shard) in &checkpoint.weight_map {
             let Some(module) = name.strip_suffix(".weight") else { continue };
             if checkpoint.declared_numerics(module)? == ModuleNumerics::W4A4
                 && ["weight_scale", "weight_scale_2", "input_scale"].iter()
                     .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
-                unscaled.entry(shard.clone()).or_default().insert(name.clone());
+                required.entry(shard.clone()).or_default().insert(name.clone());
             }
         }
-        // Only anomalous unscaled declarations need headers; group by shard so
-        // the many BF16 nextn experts do not reopen the same header per module.
-        for (shard, names) in unscaled {
+        // Hydrate declared native operands for eager family inventories, sharing
+        // each header read with anomalous unscaled A4 declarations on that shard.
+        for (shard, mut names) in required {
             for meta in read_safetensors_metadata(&snapshot.join(&shard))? {
-                if names.contains(&meta.name) {
+                if names.remove(&meta.name) {
                     checkpoint.tensors.push(CheckpointTensor { shard:shard.clone(), meta });
                 }
             }
+            ensure!(!names.iter().any(|name| native.contains(name.as_str())),
+                "declared native attention header missing in shard {shard}: {}", names.into_iter().collect::<Vec<_>>().join(", "));
         }
+        view.check_attention_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         debug_assert!(checkpoint.tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
         Ok(checkpoint)
