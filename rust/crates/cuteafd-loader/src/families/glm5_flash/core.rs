@@ -222,6 +222,7 @@ mod tests {
                 meta: SafetensorsTensorMetadata { name, dtype: DType::Bf16, byte_offset: 0,
                     byte_length: shape.iter().product::<usize>() as u64 * 2, shape } });
         }
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
         for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
             checkpoint.view = Some(CheckpointView::select(dir.path(), mode)?);
@@ -711,6 +712,7 @@ mod tests {
                     meta: SafetensorsTensorMetadata { name, dtype: DType::Bf16, byte_offset: 0,
                         byte_length: shape.iter().product::<usize>() as u64 * 2, shape } });
             }
+            checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
             checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
             checkpoint.view = Some(CheckpointView::select(dir.path(), mode)?);
             let mut core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
