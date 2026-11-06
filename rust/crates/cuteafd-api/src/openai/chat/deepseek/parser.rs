@@ -51,6 +51,7 @@ use deepseek_recipe::stream::state_machine::{
 
 use crate::openai::chat::glm5::TextParser;
 use crate::openai::chat::glm5::parser::GlmStop;
+use crate::openai::chat::stream_args::{ArgStream, name_is_readable};
 
 /// The DSML tool-call envelope opener; a call's content is returned from here.
 const DSML_BEGIN: &str = "<｜DSML｜";
@@ -156,10 +157,22 @@ pub struct DeepseekOutputParser {
     pending_name: Option<String>,
     /// Skipped bytes since the last emitted chunk: the opener a call begins with.
     pending: String,
+    /// Emit tool-call argument deltas as they arrive instead of holding the
+    /// whole call until it closes (on for streamed requests).
+    stream_args: ArgStream,
+    /// The open call's `ToolCall` was emitted to the client: a call that turns
+    /// out unreadable has already been streamed and cannot be retracted.
+    streamed: bool,
 }
 
 impl DeepseekOutputParser {
     pub fn new(options: ParsingOptions) -> Self {
+        Self::with_stream_args(options, false)
+    }
+
+    /// [`Self::new`] with the streaming knob set explicitly, so tests and the
+    /// router can enable it without touching process env.
+    pub fn with_stream_args(options: ParsingOptions, stream_args: bool) -> Self {
         Self {
             machine: Some(StateMachine::new(options)),
             chunks: VecDeque::new(),
@@ -178,6 +191,8 @@ impl DeepseekOutputParser {
             skip_run: String::new(),
             pending_name: None,
             pending: String::new(),
+            stream_args: ArgStream::new(stream_args),
+            streamed: false,
         }
     }
 
@@ -192,6 +207,7 @@ impl DeepseekOutputParser {
     /// ever seen as a tool call.
     fn lose(&mut self, out: &mut Vec<OutputChunk>) {
         let text = std::mem::take(&mut self.retained);
+        let streamed = std::mem::take(&mut self.streamed);
         self.held.clear();
         self.open = false;
         self.closing = false;
@@ -199,7 +215,14 @@ impl DeepseekOutputParser {
         self.skip_run.clear();
         self.pending_name = None;
         self.pending.clear();
-        if !text.is_empty() {
+        if streamed {
+            // The call's bytes already reached the client as streamed tool
+            // chunks; count it so the finish is `tool_calls` and the validator
+            // rejects the assembled arguments cleanly instead of a 500.
+            self.calls += 1;
+            tracing::warn!(tool = %self.open_name, text = %excerpt(&text),
+                "DeepSeek tool call streamed, then found unreadable");
+        } else if !text.is_empty() {
             tracing::warn!(tool = %self.open_name, text = %excerpt(&text),
                 "DeepSeek tool call returned as content");
             out.push(OutputChunk::Raw { content: text });
@@ -218,7 +241,12 @@ impl DeepseekOutputParser {
         self.lost_len = None;
         let text = self.retained[..index].to_owned();
         self.retained = self.retained[index..].to_owned();
-        if !text.is_empty() {
+        let streamed = std::mem::take(&mut self.streamed);
+        if streamed {
+            self.calls += 1;
+            tracing::warn!(tool = %self.open_name, text = %excerpt(&text),
+                "DeepSeek tool call streamed, then found unreadable");
+        } else if !text.is_empty() {
             tracing::warn!(tool = %self.open_name, text = %excerpt(&text),
                 "DeepSeek tool call returned as content");
             out.push(OutputChunk::Raw { content: text });
@@ -263,9 +291,12 @@ impl DeepseekOutputParser {
     /// case JSON validity alone cannot see: a malformed parameter envelope is
     /// skipped into a perfectly valid `{}`), or when the arguments assembled
     /// are not valid JSON.
-    fn close(&mut self, out: &mut Vec<OutputChunk>) {
+    ///
+    /// Returns whether the call was readable and released; `false` when there
+    /// was no open call or the call was lost.
+    fn close(&mut self, out: &mut Vec<OutputChunk>) -> bool {
         if !self.open {
-            return;
+            return false;
         }
         self.flush_skip_run();
         self.flush_param_name();
@@ -277,6 +308,27 @@ impl DeepseekOutputParser {
             || self.malformed
             || serde_json::from_str::<serde_json::Value>(&arguments).is_err();
         if unreadable {
+            if self.streamed {
+                // The call's bytes already reached the client as streamed tool
+                // chunks and cannot be retracted. Count it so the finish is
+                // `tool_calls`; the validator then rejects the assembled
+                // arguments with a clean 400/SSE error, never a 500.
+                self.calls += 1;
+                tracing::warn!(tool = %self.open_name, text = %excerpt(&self.retained),
+                    "DeepSeek tool call streamed, then found unreadable");
+                self.held.clear();
+                self.open = false;
+                self.closing = false;
+                self.lost_len = None;
+                self.malformed = false;
+                self.skip_run.clear();
+                self.pending_name = None;
+                self.retained.clear();
+                self.pending.clear();
+                self.open_name.clear();
+                self.streamed = false;
+                return false;
+            }
             // The envelope is not complete yet: the machine still consumes the
             // ` invoke>` tail as skipped bytes, and they belong to the returned
             // text. Keep collecting and emit at `flush_lost`.
@@ -287,9 +339,14 @@ impl DeepseekOutputParser {
             self.malformed = false;
             self.skip_run.clear();
             self.pending_name = None;
-            return;
+            return false;
         }
-        out.extend(self.held.drain(..));
+        if self.streamed {
+            // The deltas were emitted as they arrived; only the count is owed.
+            self.held.clear();
+        } else {
+            out.extend(self.held.drain(..));
+        }
         self.calls += 1;
         self.open = false;
         self.malformed = false;
@@ -298,6 +355,8 @@ impl DeepseekOutputParser {
         self.retained.clear();
         self.pending.clear();
         self.open_name.clear();
+        self.streamed = false;
+        true
     }
 
     /// The opened call's bytes, back to the last `<｜DSML｜` in `pending` (which
@@ -428,17 +487,30 @@ impl DeepseekOutputParser {
                 Vec::new()
             }
             OutputAction::ToolNameEnd => {
+                let mut out = Vec::new();
                 if last_pop_action != OutputAction::ToolNameEnd {
                     let tool_name = std::mem::take(&mut self.stashed_tool_name);
                     self.open_name = tool_name.clone();
-                    self.held.push(OutputChunk::ToolCall { tool_name, arguments: String::new() });
+                    self.held.push(OutputChunk::ToolCall { tool_name: tool_name.clone(), arguments: String::new() });
+                    // Name check before emitting: a call with an unreadable name
+                    // is never streamed as a tool call (it is returned as
+                    // content on loss, as in hold mode).
+                    if self.stream_args.enabled() && name_is_readable(&tool_name, None) {
+                        // Begin and call together, after the name check, as the
+                        // other families do: a call with an unreadable name is
+                        // never streamed as a tool call.
+                        self.stream_args.begin(&mut out);
+                        self.stream_args.call(&tool_name, &mut out);
+                        self.streamed = true;
+                    }
                 }
-                Vec::new()
+                out
             }
             OutputAction::LabelToolCallArguments { label, id } => {
                 // A new parameter's name starts, or the one just read ends: a
                 // match, so taken once, not once per fragment (an empty
                 // fragment would otherwise close a name that never started).
+                let mut out = Vec::new();
                 if last_pop_action != action.action {
                     match id {
                         // `{` / `, `: the machine is now inside a parameter name.
@@ -451,8 +523,11 @@ impl DeepseekOutputParser {
                         _ => {}
                     }
                     self.held.push(OutputChunk::ToolArgumentsDelta { content: label.to_string() });
+                    if self.streamed {
+                        self.stream_args.delta(label, &mut out);
+                    }
                 }
-                Vec::new()
+                out
             }
             OutputAction::RawToolCallArguments { string } => {
                 let content = if string { escape_json_string(front_chunk.unwrap_or_default()) }
@@ -461,19 +536,33 @@ impl DeepseekOutputParser {
                 if let Some(name) = self.pending_name.as_mut() {
                     name.push_str(&content);
                 }
-                self.held.push(OutputChunk::ToolArgumentsDelta { content });
-                Vec::new()
+                self.held.push(OutputChunk::ToolArgumentsDelta { content: content.clone() });
+                let mut out = Vec::new();
+                if self.streamed {
+                    self.stream_args.delta(&content, &mut out);
+                }
+                out
             }
             OutputAction::ToolCallArgumentsEnd { output } => {
-                if last_pop_action != action.action {
+                let mut closed = Vec::new();
+                let fresh = last_pop_action != action.action;
+                if fresh {
                     if let Some(output) = output {
                         self.held.push(OutputChunk::ToolArgumentsDelta { content: output.to_string() });
                     }
                 }
                 // Every `ToolCallArgumentsEnd` closes the call, including the
                 // repeated segments the guard above suppresses from the output.
-                let mut closed = Vec::new();
-                self.close(&mut closed);
+                // The closing bytes are streamed only once the call is known to
+                // be readable: a malformed envelope must not reach the client
+                // as a complete, valid-looking arguments object.
+                let was_streamed = self.streamed;
+                let readable = self.close(&mut closed);
+                if fresh && was_streamed && readable {
+                    if let Some(output) = output {
+                        self.stream_args.delta(output, &mut closed);
+                    }
+                }
                 closed
             }
             OutputAction::Label(label) => {
@@ -931,21 +1020,28 @@ mod tests {
                 "properties": {"query": {"type": "string"}}}}}]);
             let valid = "Plan.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n\
 <｜DSML｜ parameter name=\"query\" string=\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
-            for (shape, text, content, calls, finish) in [
-                // An unreadable call: content, stop, never a failed request.
-                ("unreadable", "Plan.\n<｜DSML｜ invoke name=\"search\">\n\
-<｜DSML｜ parameter name=\"query\" string\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>".to_owned(),
-                    "Plan.\n<｜DSML｜ invoke name=\"search\">\n\
-<｜DSML｜ parameter name=\"query\" string\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>".to_owned(),
-                    0, "stop"),
-                // A call that parsed: tool_calls.
-                ("readable", valid.to_owned(), "Plan.".to_owned(), 1, "tool_calls"),
+            // A call whose NAME is unreadable is never streamed as a tool call, so
+            // it comes back as content in both modes. A call whose name IS readable
+            // begins streaming before its arguments are known: a later malformed
+            // argument cannot be retracted, so the streamed request is rejected
+            // with a clean SSE error while the hold path still returns content.
+            let malformed = "Plan.\n<｜DSML｜ invoke name=\"search\">\n\
+<｜DSML｜ parameter name=\"query\" string\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>".to_owned();
+            for (shape, text, hold, streamed) in [
+                ("malformed", malformed.clone(), Some((malformed.as_str(), 0, "stop")), None),
+                ("readable", valid.to_owned(), Some(("Plan.", 1, "tool_calls")), Some(("Plan.", 1, "tool_calls"))),
             ] {
                 for streaming in [false, true] {
+                    let expected = if streaming { streamed } else { hold };
                     let body = json!({"model": MODEL, "stream": streaming, "enable_thinking": false,
                         "tools": tools, "messages": [{"role": "user", "content": "Search for cats."}]});
                     let (status, bytes) = serve(body, &text).await;
                     assert_eq!(status, StatusCode::OK, "{shape} streaming={streaming}");
+                    let Some((content, calls, finish)) = expected else {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        assert!(text.contains("\"error\""), "{shape} streaming={streaming}: {text}");
+                        continue;
+                    };
                     let (reply, names, reason) = if streaming {
                         let events = sse_events(&bytes);
                         let reply: String = events.iter()
@@ -964,9 +1060,132 @@ mod tests {
                             value["choices"][0]["finish_reason"].clone())
                     };
                     assert_eq!((reply.as_str(), names.len(), reason.as_str()),
-                        (content.as_str(), calls, Some(finish)), "{shape} streaming={streaming}");
+                        (content, calls, Some(finish)), "{shape} streaming={streaming}");
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------- streamed args
+
+    /// The concatenated `ToolArgumentsDelta` content of a parse.
+    fn deltas(chunks: &[OutputChunk]) -> String {
+        chunks.iter().filter_map(|chunk| match chunk {
+            OutputChunk::ToolArgumentsDelta { content } => Some(content.as_str()),
+            _ => None,
+        }).collect()
+    }
+
+    fn parse_streaming(text: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = DeepseekOutputParser::with_stream_args(options(), streaming);
+        let mut chunks = Vec::new();
+        for character in text.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    /// With streaming on, argument deltas arrive before the call's close and
+    /// concatenate to exactly the held arguments.
+    #[test]
+    fn streamed_deltas_arrive_before_close_and_match_hold() {
+        let (hold, hold_calls) = parse_streaming(CALL, false);
+        let (streamed, streamed_calls) = parse_streaming(CALL, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1));
+        assert_eq!(deltas(&streamed), deltas(&hold), "streamed == held, byte for byte");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&deltas(&streamed)).unwrap(),
+            serde_json::json!({"query": "cats"}));
+
+        let close = CALL.find("</｜DSML｜ invoke>").expect("the call closes") + DSML_END.len();
+        let mut parser = DeepseekOutputParser::with_stream_args(options(), true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in CALL.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "a delta must arrive before the call closes");
+    }
+
+    /// A non-streamed request always buffers: no delta is emitted before the
+    /// close, whatever the knob says.
+    #[test]
+    fn non_streamed_request_always_buffers() {
+        let (chunks, calls) = parse_streaming(CALL, false);
+        assert_eq!(calls, 1);
+        let close = CALL.find("</｜DSML｜ invoke>").expect("the call closes") + DSML_END.len();
+        let mut parser = DeepseekOutputParser::with_stream_args(options(), false);
+        let mut saw_delta_before_close = false;
+        for (index, character) in CALL.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index + character.len_utf8() < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(!saw_delta_before_close, "a non-streamed request must buffer");
+        assert_eq!(deltas(&chunks), "{\"query\": \"cats\"}");
+    }
+
+    /// A call whose name is unreadable is never streamed as a tool call: only
+    /// the opener `ToolCallBegin` is emitted, no `ToolCall`/delta chunk, and it
+    /// comes back as content.
+    #[test]
+    fn unreadable_name_is_never_streamed_as_a_tool_call() {
+        let text = "Sure.\n<｜DSML｜ invoke name=\"se<arch\">\n</｜DSML｜ invoke>";
+        let (chunks, calls) = parse_streaming(text, true);
+        assert_eq!(calls, 0);
+        assert!(!chunks.iter().any(|chunk| matches!(chunk,
+            OutputChunk::ToolCall { .. } | OutputChunk::ToolArgumentsDelta { .. })));
+        assert_eq!(content(&chunks), text);
+    }
+
+    /// Two calls in one block each stream their own deltas, in order.
+    #[test]
+    fn two_calls_stream_independently() {
+        let (chunks, calls) = parse_streaming(TWO_CALLS, true);
+        assert_eq!(calls, 2);
+        let names: Vec<String> = chunks.iter().filter_map(|chunk| match chunk {
+            OutputChunk::ToolCall { tool_name, .. } => Some(tool_name.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(names, ["search", "lookup"]);
+        assert_eq!(deltas(&chunks), "{\"query\": \"cats\"}{\"id\": 42}");
+    }
+
+    /// A call truncated mid-argument has already streamed its deltas and cannot
+    /// be retracted: it is counted so the finish is `tool_calls`, and the
+    /// validator rejects the assembled arguments. The call's bytes are not
+    /// returned as content.
+    #[test]
+    fn truncated_call_is_counted_not_returned_as_content() {
+        let text = "Sure.\n<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">ca";
+        let (chunks, calls) = parse_streaming(text, true);
+        assert_eq!(calls, 1);
+        assert!(!content(&chunks).contains("search"), "the call was streamed, not returned as content");
+    }
+
+    /// A malformed envelope whose skipped parameter still assembles valid JSON
+    /// (`{}`) must not be streamed as a complete, valid-looking call: the
+    /// closing bytes are withheld, so the assembled arguments are invalid and
+    /// the validator rejects them, exactly as the hold path returns the
+    /// envelope as content.
+    #[test]
+    fn a_malformed_envelope_is_not_streamed_as_a_valid_call() {
+        let (chunks, calls) = parse_streaming(MALFORMED_ENVELOPE, true);
+        assert_eq!(calls, 1, "the streamed call is counted so the finish is tool_calls");
+        let arguments = deltas(&chunks);
+        assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_err(),
+            "the streamed arguments must not be valid JSON: {arguments:?}");
+        let (hold, hold_calls) = parse_streaming(MALFORMED_ENVELOPE, false);
+        assert_eq!(hold_calls, 0);
+        assert_eq!(content(&hold), MALFORMED_ENVELOPE);
     }
 }

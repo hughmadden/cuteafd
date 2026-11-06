@@ -19,7 +19,7 @@
 //!   loses its whole call: the argument cannot be named or has no value, and
 //!   the call that would be released with it silently missing is not the one
 //!   the model meant. Stray text between arguments is still dropped, and a
-//!   repeated key keeps its last value, in the place of its first.
+//!   repeated key keeps its first value, in the place of its first.
 //!
 //! Each case is logged. Results are independent of how the text is chunked.
 //!
@@ -28,6 +28,8 @@
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
+
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
 
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
@@ -84,6 +86,9 @@ struct Call {
     /// The pieces of the argument being read.
     value: Vec<String>,
     string_open: bool,
+    /// The current value repeats a key already read: it is consumed but not
+    /// emitted, so the first value is kept (streaming only).
+    skip_value: bool,
     /// The call's text from its opening tag, content again if the call is lost.
     text: String,
     /// Whitespace held before the opening tag, kept with a lost call's text.
@@ -100,14 +105,27 @@ pub struct GlmOutputParser {
     content_started: bool,
     held_whitespace: String,
     stop: Option<GlmStop>,
+    /// Emit tool-call argument deltas as they arrive instead of holding the
+    /// whole call until it closes (on for streamed requests).
+    stream_args: ArgStream,
+    /// The open call's `ToolCall` was emitted to the client: a call that turns
+    /// out unreadable has already been streamed and cannot be retracted.
+    streamed: bool,
 }
 
 impl GlmOutputParser {
-    pub fn new(mut options: GlmParserOptions) -> Self {
+    pub fn new(options: GlmParserOptions) -> Self {
+        Self::with_stream_args(options, false)
+    }
+
+    /// [`Self::new`] with the streaming knob set explicitly, so tests and the
+    /// router can enable it without touching process env.
+    pub fn with_stream_args(mut options: GlmParserOptions, stream_args: bool) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.thinking { Mode::Reasoning } else { Mode::Content };
         Self { options, mode, pending: String::new(), call: None, calls: 0, content_started: false,
-            held_whitespace: String::new(), stop: None }
+            held_whitespace: String::new(), stop: None, stream_args: ArgStream::new(stream_args),
+            streamed: false }
     }
 
     /// Consume generated text; returns the chunks it completes.
@@ -149,8 +167,8 @@ impl GlmOutputParser {
             Mode::Reasoning | Mode::Content => self.step_text(finishing, out),
             Mode::Name => self.step_name(out),
             Mode::Key => self.step_key(),
-            Mode::ValueStart => self.step_value_start(),
-            Mode::Value => self.step_value(),
+            Mode::ValueStart => self.step_value_start(out),
+            Mode::Value => self.step_value(out),
             Mode::KeyOrEnd => self.step_key_or_end(out),
             Mode::Skip => self.step_skip(),
             Mode::Lost(reason) => self.step_lost(reason, out),
@@ -281,11 +299,25 @@ impl GlmOutputParser {
         if tag == TOOL_CALL_END {
             self.call = None;
             self.calls += 1;
-            out.push(OutputChunk::ToolCall { tool_name: name, arguments: "{}".into() });
+            if self.stream_args.enabled() && name_is_readable(&name, None) {
+                self.stream_args.begin(out);
+                self.stream_args.call(&name, out);
+                self.stream_args.delta("{}", out);
+            } else {
+                out.push(OutputChunk::ToolCall { tool_name: name, arguments: "{}".into() });
+            }
             self.mode = Mode::Content;
             return true;
         }
-        self.call.as_mut().expect("a call is open").name = name;
+        self.call.as_mut().expect("a call is open").name = name.clone();
+        // Name check before emitting: a call with an unreadable name is never
+        // streamed as a tool call (it is returned as content on loss).
+        if self.stream_args.enabled() && name_is_readable(&name, None) {
+            self.stream_args.begin(out);
+            self.stream_args.call(&name, out);
+            self.stream_args.delta("{", out);
+            self.streamed = true;
+        }
         self.mode = Mode::Key;
         true
     }
@@ -298,20 +330,38 @@ impl GlmOutputParser {
             self.mode = Mode::Lost("unreadable argument key");
             return true;
         }
-        self.call.as_mut().expect("a call is open").key = Some(key);
+        let call = self.call.as_mut().expect("a call is open");
+        call.key = Some(key);
+        call.skip_value = false;
         self.mode = Mode::ValueStart;
         true
     }
 
-    fn step_value_start(&mut self) -> bool {
+    fn step_value_start(&mut self, out: &mut Vec<OutputChunk>) -> bool {
         self.take_whitespace();
         if self.pending.starts_with(ARG_VALUE) {
             self.take(ARG_VALUE.len());
-            let call = self.call.as_mut().expect("a call is open");
-            let key = call.key.as_deref().expect("a key precedes its value");
-            if accepts_string(&call.name, key, self.options.tools.as_deref().unwrap_or_default()) {
-                call.value.push(format!("{}:\"", serde_json::to_string(key).expect("string key")));
-                call.string_open = true;
+            let (label, duplicate) = {
+                let call = self.call.as_mut().expect("a call is open");
+                let key = call.key.as_deref().expect("a key precedes its value");
+                let duplicate = call.arguments.iter().any(|argument| argument.0 == key);
+                // Streaming cannot retract a value already sent, so a repeated
+                // key keeps its first value there. The hold path keeps the last
+                // value, in the place of its first, as standard JSON does.
+                if self.streamed && duplicate {
+                    call.skip_value = true;
+                }
+                if accepts_string(&call.name, key, self.options.tools.as_deref().unwrap_or_default()) {
+                    let label = format!("{}:\"", serde_json::to_string(key).expect("string key"));
+                    call.value.push(label.clone());
+                    call.string_open = true;
+                    (Some(label), duplicate)
+                } else {
+                    (None, duplicate)
+                }
+            };
+            if let Some(label) = label.filter(|_| !duplicate) {
+                self.stream_label(&label, out);
             }
             self.mode = Mode::Value;
             return true;
@@ -323,14 +373,17 @@ impl GlmOutputParser {
         true
     }
 
-    fn step_value(&mut self) -> bool {
+    fn step_value(&mut self, out: &mut Vec<OutputChunk>) -> bool {
         let string_open = self.call.as_ref().expect("a call is open").string_open;
+        let skip = self.call.as_ref().expect("a call is open").skip_value;
         let Some(end) = self.pending.find(ARG_VALUE_END) else {
             if !string_open { return false; }
             let emit = self.pending.len() - held_prefix(&self.pending, ARG_VALUE_END);
             if emit == 0 { return false; }
             let fragment = self.take(emit);
-            self.call.as_mut().expect("a call is open").value.push(json_string_contents(&fragment));
+            let escaped = json_string_contents(&fragment);
+            self.call.as_mut().expect("a call is open").value.push(escaped.clone());
+            if self.streamed && !skip { self.stream_args.delta(&escaped, out); }
             return true;
         };
         let raw = self.take(end);
@@ -338,7 +391,8 @@ impl GlmOutputParser {
         let tools = self.options.tools.as_deref().unwrap_or_default();
         let call = self.call.as_mut().expect("a call is open");
         let key = call.key.take().expect("a key precedes its value");
-        let last = if call.string_open {
+        let string_open = call.string_open;
+        let last = if string_open {
             call.string_open = false;
             format!("{}\"", json_string_contents(&raw))
         } else {
@@ -346,18 +400,46 @@ impl GlmOutputParser {
             format!("{}:{}", serde_json::to_string(&key).expect("string key"),
                 serde_json::to_string(&value).expect("JSON value"))
         };
-        call.value.push(last);
-        let value = std::mem::take(&mut call.value);
-        match call.arguments.iter_mut().find(|argument| argument.0 == key) {
-            Some(argument) => {
-                tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
-                    "GLM tool call argument repeated; the last value is kept");
-                argument.1 = value;
+        call.value.push(last.clone());
+        if self.streamed && !skip {
+            if string_open {
+                // The label and earlier fragments were emitted as they arrived;
+                // this is the last fragment plus the closing quote.
+                self.stream_args.delta(&last, out);
+            } else {
+                // A non-string value is typed at its close, so it is emitted
+                // whole, with the comma that separates it from the previous
+                // argument.
+                let index = call.arguments.len();
+                if index > 0 { self.stream_args.delta(",", out); }
+                self.stream_args.delta(&last, out);
             }
-            None => call.arguments.push((key, value)),
+        }
+        let value = std::mem::take(&mut call.value);
+        if skip {
+            tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
+                "GLM tool call argument repeated; the first value is kept");
+        } else {
+            match call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(argument) => {
+                    tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
+                        "GLM tool call argument repeated; the last value is kept");
+                    argument.1 = value;
+                }
+                None => call.arguments.push((key, value)),
+            }
         }
         self.mode = Mode::KeyOrEnd;
         true
+    }
+
+    /// Emit an argument's `"key":` label now, with the comma that separates it
+    /// from the previous argument, when streaming.
+    fn stream_label(&mut self, label: &str, out: &mut Vec<OutputChunk>) {
+        if !self.streamed { return; }
+        let index = self.call.as_ref().map_or(0, |call| call.arguments.len());
+        if index > 0 { self.stream_args.delta(",", out); }
+        self.stream_args.delta(label, out);
     }
 
     fn step_key_or_end(&mut self, out: &mut Vec<OutputChunk>) -> bool {
@@ -384,12 +466,18 @@ impl GlmOutputParser {
     /// The call closed: send it, a comma before each argument but the first.
     fn release(&mut self, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
-        out.push(OutputChunk::ToolCall { tool_name: call.name, arguments: "{".into() });
-        for (index, (_, mut pieces)) in call.arguments.into_iter().enumerate() {
-            if index > 0 { pieces[0].insert(0, ','); }
-            out.extend(pieces.into_iter().map(arguments));
+        if self.streamed {
+            // The deltas were emitted as they arrived; only the close is owed.
+            self.stream_args.delta("}", out);
+            self.streamed = false;
+        } else {
+            out.push(OutputChunk::ToolCall { tool_name: call.name, arguments: "{".into() });
+            for (index, (_, mut pieces)) in call.arguments.into_iter().enumerate() {
+                if index > 0 { pieces[0].insert(0, ','); }
+                out.extend(pieces.into_iter().map(arguments));
+            }
+            out.push(arguments("}".into()));
         }
-        out.push(arguments("}".into()));
         self.calls += 1;
         self.mode = Mode::Content;
     }
@@ -423,27 +511,27 @@ impl GlmOutputParser {
 
     /// Return a call that cannot be read as content, from its opening tag
     /// (after the whitespace that preceded it), and log it.
+    ///
+    /// A call that was already streamed cannot be retracted: it is counted so
+    /// the finish is `tool_calls`, and the validator rejects its assembled
+    /// arguments with a clean 400/SSE error rather than a 500.
     fn lose(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
-        tracing::warn!(id = %self.options.id, reason, text = %excerpt(&call.text), "GLM tool call returned as content");
-        self.held_whitespace = call.before;
-        self.emit_content(&call.text, out);
+        if std::mem::take(&mut self.streamed) {
+            self.calls += 1;
+            tracing::warn!(id = %self.options.id, reason, text = %excerpt(&call.text),
+                "GLM tool call streamed, then found unreadable");
+        } else {
+            tracing::warn!(id = %self.options.id, reason, text = %excerpt(&call.text),
+                "GLM tool call returned as content");
+            self.held_whitespace = call.before;
+            self.emit_content(&call.text, out);
+        }
         self.mode = Mode::Content;
     }
 }
 
 fn arguments(content: String) -> OutputChunk { OutputChunk::ToolArgumentsDelta { content } }
-
-/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
-    let longest = text.len().min(marker.len().saturating_sub(1));
-    (1..=longest).rev()
-        .find(|length| {
-            let start = text.len() - length;
-            text.is_char_boundary(start) && marker.starts_with(&text[start..])
-        })
-        .unwrap_or(0)
-}
 
 /// The earliest of `tags` in `text`: (index, tag).
 fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {
@@ -468,11 +556,6 @@ fn excerpt(text: &str) -> String {
         Some((cut, _)) => format!("{:?}...", &text[..cut]),
         None => format!("{text:?}"),
     }
-}
-
-fn json_string_contents(value: &str) -> String {
-    let quoted = serde_json::to_string(value).expect("string serializes");
-    quoted[1..quoted.len() - 1].to_owned()
 }
 
 fn parse_value(tool: &str, key: &str, raw: &str, tools: &[ToolDefinition]) -> Value {

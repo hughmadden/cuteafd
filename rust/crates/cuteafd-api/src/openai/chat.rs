@@ -7,3 +7,4 @@ pub mod muse;
 pub mod mistral;
 pub mod qwen4;
 pub mod step5;
+pub mod stream_args;
