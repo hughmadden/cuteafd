@@ -979,7 +979,19 @@ exec python3 -c "$code" "$@"
     deployment_stub.write_text("""import json, os, subprocess, sys
 args = sys.argv[1:]
 if os.environ.get("STUB_REAL_PLANNER"):
+    # The stub runs on the host, so honor the container's bind namespace.
+    binds = []
+    for index, arg in enumerate(args[:-1]):
+        if arg in ("-v", "--volume"):
+            source, destination, *_ = args[index + 1].split(":")
+            binds.append((source, destination.rstrip("/")))
+    binds.sort(key=lambda bind: len(bind[1]), reverse=True)
     args = args[args.index("plan"):]
+    for index, arg in enumerate(args):
+        for source, destination in binds:
+            if arg == destination or arg.startswith(destination + "/"):
+                args[index] = source + arg[len(destination):]
+                break
     args[1] = os.environ["STUB_REAL_SNAPSHOT"]
     args += ["--workspace-manifest", os.environ["STUB_REAL_PROGRAMS"],
              "--hf-home", os.environ["STUB_REAL_HF_HOME"]]
