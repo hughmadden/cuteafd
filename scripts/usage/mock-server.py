@@ -8,7 +8,9 @@ import math
 import random
 import time
 from collections import defaultdict
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import count
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -250,6 +252,35 @@ for session in range(8):
         title=f"Synthetic conversation {session + 1}: inspect the parser and add a regression test", edits=1, bytes=7000))
 
 
+def expert_snapshot(tick):
+    geometry = dict(layers=12, experts=32, topk=2, routed_layers=list(range(1, 12)))
+
+    def window(scale):
+        prefill, decode = [0] * 384, [0] * 384
+        for layer in geometry["routed_layers"]:
+            for expert in range(32):
+                index = layer * 32 + expert
+                prefill[index] = scale * (tick + layer) * (1 + (expert + layer) % 7) if expert < 24 else 0
+                decode[index] = scale * (tick + 2) * (1 + (expert * 3 + layer + tick) % 13) if (expert + tick) % 5 else 0
+
+        def summarize(values):
+            layers = [values[layer * 32:(layer + 1) * 32] for layer in geometry["routed_layers"]]
+            touched = sum(value > 0 for row in layers for value in row)
+            active = [row for row in layers if sum(row)]
+            return dict(touched=touched, possible=352, coverage=touched / 352,
+                        routed_rows=sum(values) // geometry["topk"],
+                        concentration=sum(sum((value / sum(row)) ** 2 for value in row) for row in active) / len(active))
+
+        return dict(elapsed_s=min(60.0, tick * .5) * scale,
+                    prefill_routed_rows=prefill, decode_routed_rows=decode,
+                    prefill=summarize(prefill), decode=summarize(decode),
+                    combined=summarize([a + b for a, b in zip(prefill, decode)]))
+
+    return dict(enabled=True, semantics="executed_routed_rows", geometry=geometry,
+                sampled_s=tick * .5, error=None, fixture="Synthetic expert fixture",
+                windows={name: window(scale) for name, scale in [("short", 1), ("long", 4), ("total", 12)]})
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(fmt % args, flush=True)
@@ -273,7 +304,16 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         query = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
-        assets = {"/usage": "rust/crates/cuteafd-usage/assets/usage.html",
+        cookies = SimpleCookie(self.headers.get("Cookie", ""))
+        unlocked = cookies.get("cuteafd_console") is not None and cookies["cuteafd_console"].value == "mock-unlock"
+        if path == "/console/status":
+            return self.send(dict(unlocked=unlocked, link_command=None))
+        if path == "/console/expert-usage":
+            if not unlocked:
+                return self.send({"error": {"type": "console_locked"}}, 401)
+            return self.send({"enabled": False} if self.server.expert_usage == "disabled" else expert_snapshot(next(self.server.expert_ticks)))
+        assets = {"/experts": "rust/crates/cuteafd-api/assets/experts.html",
+                  "/usage": "rust/crates/cuteafd-usage/assets/usage.html",
                   "/": "rust/crates/cuteafd-api/assets/console.html",
                   "/bench": "rust/crates/cuteafd-bench/assets/bench.html",
                   "/assets/cuteafd-ui.css": "rust/crates/cuteafd-api/assets/cuteafd-ui.css",
@@ -443,9 +483,12 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--locked", action="store_true")
+    parser.add_argument("--expert-usage", choices=["live", "disabled"], default="live")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.locked = args.locked
+    server.expert_usage = args.expert_usage
+    server.expert_ticks = count(1)
     print(f"Synthetic usage server: http://{args.host}:{args.port}/usage", flush=True)
     server.serve_forever()
 

@@ -16,6 +16,9 @@ p { margin: 0; color: var(--ink-2); }
 .intro { display: grid; gap: 8px; padding: 16px 2px 4px; }
 #notice { min-height: 1.5em; color: var(--ink-2); font: 12px var(--mono); }
 #sample { font: 11px var(--mono); color: var(--ink-2); }
+#unavailable { padding: 24px 0; display: grid; gap: 8px; }
+#unavailable h2 { margin: 0; font-size: 18px; font-weight: 500; }
+#unavailable p { max-width: 66ch; line-height: 1.6; }
 .summary { display: flex; gap: 24px; flex-wrap: wrap; padding: 6px 0; font: 12px var(--mono); color: var(--ink-2); }
 .summary b { color: var(--ink); font-size: 18px; font-weight: 500; }
 .plot-scroll { overflow: auto; max-width: 100%; background: var(--well); border-radius: 6px; }
@@ -52,6 +55,11 @@ thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--in
 <span id="sample"></span>
 </div>
 <div id="notice" role="status">Connecting to expert telemetry...</div>
+<div id="unavailable" hidden>
+<h2>Expert telemetry is unavailable</h2>
+<p>This model has no active expert-usage adapter, or telemetry is disabled. Launch a supported MoE family with <code>EXPERT_USAGE=on</code> to see routed expert work here.</p>
+<p>Dense-only models have no routed experts to display.</p>
+</div>
 <div class="summary" id="summary" hidden>
 <span><b id="touched">0</b> touched / <span id="possible">0</span></span>
 <span><b id="coverage">0%</b> coverage</span>
@@ -91,7 +99,8 @@ const ramp = ['#184f95', '#256abf', '#3987e5', '#6da7ec', '#9ec5f4', '#cde2fb'];
 ramp.forEach((color) => { const swatch = document.createElement('i'); swatch.style.background = color; $('ramp').append(swatch); });
 const canvas = $('matrix'), ctx = canvas.getContext('2d');
 let snapshot = null, view = null, selected = { row: 0, expert: 0 }, paused = false;
-let layout = null, clock = null, lastChange = performance.now();
+let layout = null, clock = null, lastChange = performance.now(), inspected = false, inFlight = false;
+const REFRESH_MS = 500, REQUEST_TIMEOUT_MS = 5000;
 const pct = (n) => (n * 100).toFixed(2) + '%';
 const number = (n) => UI.fmt.n0(n);
 function cell(row, expert) {
@@ -101,9 +110,16 @@ function cell(row, expert) {
   return { layer, expert, count, share: total > 0 ? count / total : 0 };
 }
 function description(c) { return `Layer ${c.layer} / expert ${c.expert}\n${number(c.count)} routed selections / ${pct(c.share)} of layer`; }
+function updateReadout() {
+  if (!view || !inspected) return;
+  const text = description(cell(selected.row, selected.expert));
+  const readout = text.replace('\n', ' - ');
+  if ($('readout').textContent !== readout) $('readout').textContent = readout;
+  if (!$('tooltip').hidden) $('tooltip').textContent = text;
+}
 function inspect(row, expert) {
-  selected = { row, expert };
-  $('readout').textContent = description(cell(row, expert)).replace('\n', ' - ');
+  selected = { row, expert }; inspected = true;
+  updateReadout();
   draw();
 }
 function draw() {
@@ -157,10 +173,18 @@ function table() {
 }
 function render() {
   if (!snapshot?.enabled) {
-    $('notice').textContent = 'Expert usage is off. Launch a supported family with EXPERT_USAGE=on.';
+    view = null; layout = null; clock = null; inspected = false;
+    selected = { row: 0, expert: 0 };
+    $('notice').textContent = 'No active expert telemetry.';
+    $('unavailable').hidden = false;
+    $('sample').textContent = ''; header.status.textContent = 'UNAVAILABLE';
+    header.meta.replaceChildren(); $('layer').replaceChildren(); $('table-body').replaceChildren();
+    $('tooltip').hidden = true;
+    $('readout').textContent = 'Hover, tap, or use arrow keys to inspect a cell.';
     for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = true;
     return;
   }
+  $('unavailable').hidden = true;
   const g = snapshot.geometry, w = snapshot.windows?.[$('window').value];
   if (!g || !w || !Number.isInteger(g.layers) || !Number.isInteger(g.experts) || !g.routed_layers?.length) throw new Error('Invalid expert geometry');
   const prefill = w.prefill_routed_rows, decode = w.decode_routed_rows;
@@ -182,14 +206,14 @@ function render() {
   $('rows').textContent = number(summary.routed_rows); $('peak').textContent = pct(peak) + ' peak share';
   $('sample').textContent = `Sample t+${snapshot.sampled_s.toFixed(1)} s / window ${w.elapsed_s.toFixed(1)} s`;
   const stalled = performance.now() - lastChange > 5000;
-  $('notice').textContent = snapshot.error ? 'Snapshot worker stopped: ' + snapshot.error : paused ? 'Paused on the last received snapshot.' : stalled ? 'No new snapshot for over 5 seconds; showing the last sample.' : 'Live - sampled about once per second. Arrow keys inspect the matrix.';
+  $('notice').textContent = snapshot.error ? 'Snapshot worker stopped: ' + snapshot.error : paused ? 'Paused on the last received snapshot.' : stalled ? 'No new snapshot for over 5 seconds; showing the last sample.' : 'Live - refreshed every 500 ms; device snapshots about once per second. Arrow keys inspect the matrix.';
   header.status.textContent = snapshot.error || stalled ? 'STALE' : paused ? 'PAUSED' : 'LIVE';
   for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = false;
   if (JSON.stringify(oldGeometry) !== JSON.stringify(g)) {
     $('layer').replaceChildren(...g.routed_layers.map((layer) => { const o = document.createElement('option'); o.value = String(layer); o.textContent = String(layer); return o; }));
     UI.facts(header.meta, [['layers', number(g.routed_layers.length)], ['experts', number(g.experts)], ['top-k', number(g.topk)]]);
   }
-  draw(); table();
+  draw(); table(); updateReadout();
 }
 function hit(event) {
   if (!layout || !view) return null;
@@ -224,20 +248,36 @@ canvas.addEventListener('keydown', (event) => {
 });
 for (const id of ['phase', 'window', 'texture']) $(id).addEventListener('change', render);
 $('layer').addEventListener('change', table);
-$('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; render(); };
+$('pause').onclick = () => {
+  paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; render();
+  if (!paused) void refresh();
+};
 window.addEventListener('resize', draw);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
 async function refresh() {
-  if (paused || document.hidden) return;
+  if (paused || document.hidden || inFlight) return;
+  inFlight = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch('/console/expert-usage', { credentials: 'same-origin', cache: 'no-store' });
+    const response = await fetch('/console/expert-usage', { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
     if (!response.ok) throw new Error(response.status === 401 ? 'Console session locked. Reopen the admin console link.' : 'Telemetry request failed (' + response.status + ')');
-    snapshot = await response.json();
+    const next = await response.json();
+    // An in-flight response must not advance a paused or backgrounded view.
+    if (paused || document.hidden) return;
+    snapshot = next;
     if (snapshot.sampled_s !== clock) { clock = snapshot.sampled_s; lastChange = performance.now(); }
     render();
-  } catch (error) { $('notice').textContent = String(error.message || error); header.status.textContent = 'OFFLINE'; $('tooltip').hidden = true; }
+  } catch (error) {
+    if (paused || document.hidden) return;
+    $('notice').textContent = error.name === 'AbortError' ? 'Telemetry request timed out; showing the last sample.' : String(error.message || error);
+    header.status.textContent = 'OFFLINE'; $('tooltip').hidden = true;
+  } finally {
+    clearTimeout(timeout); inFlight = false;
+  }
 }
-await refresh();
-setInterval(refresh, 1000);
+void refresh();
+setInterval(refresh, REFRESH_MS);
 })();
 </script>
 </body>

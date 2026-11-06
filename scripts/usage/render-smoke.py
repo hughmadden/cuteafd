@@ -9,6 +9,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -111,11 +112,30 @@ class CDP:
         self.sock.close()
 
 
+def install_cookie_jar(client, path, base_url):
+    jar = MozillaCookieJar(str(path))
+    jar.load(ignore_discard=True, ignore_expires=True)
+    for cookie in jar:
+        # curl writes session cookies with expiry 0 in Netscape jars.
+        if cookie.expires and cookie.is_expired():
+            continue
+        params = dict(name=cookie.name, value=cookie.value, url=base_url,
+                      path=cookie.path or "/", secure=cookie.secure,
+                      httpOnly=cookie.has_nonstandard_attr("HTTPOnly"))
+        if cookie.domain_specified:
+            params["domain"] = cookie.domain
+        if cookie.expires:
+            params["expires"] = cookie.expires
+        if not client.call("Network.setCookie", params).get("success"):
+            raise RuntimeError("Chrome rejected cookie " + cookie.name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", "--url", default="http://127.0.0.1:8765")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cookie", action="append", default=[])
+    parser.add_argument("--cookie-jar", type=Path, help="Read cookies from a local Netscape jar; keeps credentials out of argv")
     parser.add_argument("--click", action="append", default=[], help="CSS selector; repeated in order")
     parser.add_argument("--eval", action="append", default=[], help="JS expression, may return a promise; repeated in order")
     parser.add_argument("--width", type=int, default=1440)
@@ -135,7 +155,7 @@ def main():
             process = subprocess.Popen(["/usr/bin/google-chrome", "--headless=new", "--disable-gpu",
                 "--disable-dev-shm-usage", "--disable-extensions", "--disable-background-networking", "--no-first-run", "--no-default-browser-check",
                 "--enable-automation", "--password-store=basic", "--no-proxy-server", "--remote-debugging-port=0", "--remote-allow-origins=http://localhost", "--user-data-dir=" + profile,
-                "--window-size=" + str(args.width) + "," + str(args.height), args.base_url.rstrip('/') + args.path],
+                "--window-size=" + str(args.width) + "," + str(args.height), "about:blank"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             deadline = time.monotonic() + args.timeout
             active = Path(profile) / "DevToolsActivePort"
@@ -158,7 +178,9 @@ def main():
                 result = client.call("Network.setCookie", dict(name=name, value=value, url=args.base_url, path="/"))
                 if not result.get("success"):
                     raise RuntimeError("Chrome rejected cookie " + name)
-            client.call("Page.reload", dict(ignoreCache=True))
+            if args.cookie_jar:
+                install_cookie_jar(client, args.cookie_jar, args.base_url)
+            client.call("Page.navigate", dict(url=args.base_url.rstrip('/') + args.path))
             while True:
                 ready = client.evaluate("document.body?.dataset.usageReady === 'true'" if args.path == "/usage" else "document.readyState === 'complete'")
                 if ready:
