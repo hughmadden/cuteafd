@@ -990,6 +990,7 @@ mod tests {
     fn shipped_max_layers_gap_is_no_worse_than_best_single_layer_move() {
         let mut recipe = recipe();
         recipe.gpus = 2;
+        recipe.hop_spec.terminal = crate::placement::TerminalHome::Replicated;
         recipe.placement = AttentionPlacement::Layers;
         recipe.context = 2_097_152;
         recipe.maximum_pages = recipe.context / PAGE_ROWS;
