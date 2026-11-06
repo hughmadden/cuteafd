@@ -25,7 +25,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
     let remote_experts = report.spark_ranks > 0 && (exlr8.is_some() || report.experts.as_ref().is_some_and(|contract|
         model.spec().moe.as_ref().is_some_and(|moe|
-            super::super::experts::spark_recipe(&contract.package, moe.intermediate, report.spark_ranks).is_ok())))
+            (super::super::experts::frozen_refusal(&contract.package, report.spark_ranks).is_none()
+                && super::super::experts::spark_recipe(&contract.package, moe.intermediate, report.spark_ranks).is_ok()))))
         && options.resolve_onboard(model.spec().moe_layers()) != Some(Onboard::Layers(model.spec().moe_layers()));
     let expert_world = if remote_experts { report.spark_ranks } else { 0 };
     let prefill = match resolve_prefill(input, report, options, expert_world,

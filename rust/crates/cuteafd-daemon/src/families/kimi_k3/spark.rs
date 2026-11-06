@@ -66,6 +66,13 @@ impl Drop for RoutedLane<'_> {
 }
 
 impl<'a> RoutedLane<'a> {
+    pub(super) fn unlinked(library_owner: &Arc<cuteafd_ffi::NativeLibrary>, local: &LocalLane<'a>,
+        waves: usize, unit: usize) -> Self {
+        Self { stream: local.stream().clone(), link: None, library_owner: Arc::clone(library_owner),
+            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
+            outstanding: std::collections::VecDeque::new() }
+    }
+
     pub(super) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
         peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize,
@@ -106,12 +113,12 @@ impl<'a> RoutedLane<'a> {
     }
 
     pub(crate) fn world_size(&self) -> Result<usize> {
-        Ok(self.link.as_ref().context("Kimi Spark link retired")?.world_size())
+        Ok(self.link.as_ref().map_or(0, SparkLink::world_size))
     }
 
     pub(crate) fn installed_grouping(&self)
         -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
-        self.link.as_ref().context("Kimi Spark link retired")?.installed_grouping()
+        self.link.as_ref().map_or_else(|| Ok(vec![]), SparkLink::installed_grouping)
     }
 
     /// Checked QP quiescence precedes copy drainage and owner release.
@@ -272,6 +279,13 @@ mod tests {
             assert_eq!(shape.row_count as usize, rows);
             assert_eq!(shape.route_count as usize, rows * TOPK);
             assert_eq!(shape.hidden_payload_bytes as usize, rows * KimiExpertInput::ROW_BYTES);
+            let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
+            for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                let real = request(92, rows, 1, kind, &layout, &vec![0; layout.bytes])?;
+                let real = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+                assert_eq!(shape.request_wire_bytes, real.request_wire_bytes);
+                assert!(shape.response_wire_bytes >= real.response_wire_bytes);
+            }
         }
         assert!(bootstrap_shape(0).is_err());
         assert!(bootstrap_shape(4097).is_err());

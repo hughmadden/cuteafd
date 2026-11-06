@@ -122,6 +122,10 @@ pub(crate) struct ServeArgs {
     api: crate::shared::api::ApiArgs,
 }
 
+fn opens_expert_sessions(working: &SparkWorkingSet) -> bool {
+    !working.spark_layers.is_empty()
+}
+
 impl ServeArgs {
     fn endpoint(&self, ingress: SparkIngress) -> SparkEndpoint {
         SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress, partial_reply_bytes: None }
@@ -143,7 +147,7 @@ impl ServeArgs {
             "Step-5 needs one GPU or two distinct actual GPUs");
         // Transport check only: the checkpoint's own format and the shared
         // width-class ranges decide the world in admission (spark_recipe).
-        ensure!(["exl3", "fp8", "nvfp4"].iter().any(|format|
+        ensure!(self.peers.is_empty() || ["exl3", "fp8", "nvfp4"].iter().any(|format|
             cuteafd_core::tp_units::spark_package_worlds("step5", format).contains(&self.peers.len())),
             "Step-5 requires a shared width-class Spark recipe");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
@@ -340,7 +344,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
     let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
-    let spark_admission = if spark_working.spark_layers.is_empty() { None } else { Some(SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
+    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
@@ -477,7 +481,7 @@ fn with_backend<T>(args: &ServeArgs,
     if !spark_working.spark_layers.is_empty() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     }
-    let transport = if spark_working.spark_layers.is_empty() { None } else {
+    let transport = if !opens_expert_sessions(&spark_working) { None } else {
         let world = SparkWorld::canonical(args.peers.len())?;
         Some(devices[0].own(|| {
         // One return slot per prefill wave.
@@ -1275,5 +1279,20 @@ mod push_admission_tests {
         assert!(matches!(policy.committed::<()>(Err(anyhow::anyhow!("peer failed"))),
             Err(PushStartupError::Delivery(_))));
         assert_eq!(PushPolicy::Mount.plan(|| -> Result<()> { panic!("mounted startup must not plan push") }).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod session_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn onboarded_layers_open_no_session() {
+        let mut working = SparkWorkingSet { rtx_layers: (3..91).collect(), spark_layers: vec![],
+            spark_ranks: 6, prefill_lanes: 1 };
+        assert!(!opens_expert_sessions(&working));
+        working.rtx_layers.pop();
+        working.spark_layers.push(90);
+        assert!(opens_expert_sessions(&working));
     }
 }

@@ -1830,6 +1830,20 @@ mod tests {
                 assert_eq!(shape.row_count as usize, rows);
                 assert_eq!(shape.route_count as usize, rows * 8);
                 assert_ne!(shape.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                    let descriptors = (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                        row_id: row as u64, source_kind: kind, source_request_id: 1,
+                        token_position: row as u64, route_offset: row * 8, route_count: 8,
+                    }).collect();
+                    let routes = (0..rows * 8).map(|i| ExpertProtocolV2RouteEntry {
+                        row_index: (i / 8) as u32, expert_id: (i % 288) as u32, gate_weight: 0.0,
+                    }).collect();
+                    let real = expert_request(1, 17, 88, dtype, descriptors, routes,
+                        vec![0; rows * row_bytes].into())?;
+                    let real = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+                    assert_eq!(shape.request_wire_bytes, real.request_wire_bytes);
+                    assert!(shape.response_wire_bytes >= real.response_wire_bytes);
+                }
             }
             for rows in [0, 4097] { assert!(bootstrap_shape(rows, &format).is_err()); }
         }

@@ -776,8 +776,10 @@ pub(crate) mod tests {
             assert!(matches!(admission::prepare(&input, 188, true, process), Err(planner::Refusal::InvalidFact(_))));
         }
         input.onboard = Onboard::Layers(input.experts.len());
+        input.spark_ranks = 0;
         let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         process.encoders = vec![encoder(EncoderKind::Spark { rank: 0 })];
+        process.physical_sparks = 1;
         let admitted = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
         assert!(admitted.working.spark_layers.is_empty());
         assert!(admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("glmf.encoder."))

@@ -45,11 +45,11 @@ pub(crate) struct MuseSparkPath<'a> {
 impl MuseSparkPath<'_> {
     /// Every Spark rank's installed expert grouping (the draft policy prices verify rows with it).
     pub(crate) fn installed_grouping(&self) -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
-        self.link.as_ref().context("Muse Spark link released")?.installed_grouping()
+        self.link.as_ref().map_or_else(|| Ok(vec![]), SparkLink::installed_grouping)
     }
 
     pub(crate) fn world_size(&self) -> Result<usize> {
-        Ok(self.link.as_ref().context("Muse Spark link released")?.world_size())
+        Ok(self.link.as_ref().map_or(0, SparkLink::world_size))
     }
 }
 
@@ -86,13 +86,13 @@ impl<'a> MuseSparkPath<'a> {
     /// (`replies::intake_row_bytes`): the same charge admission accepted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, stream: Rc<Stream<'a>>,
-        world: SparkWorld, peers: Vec<SocketAddr>, config: TcpTransportConfig,
+        world: Option<SparkWorld>, peers: Vec<SocketAddr>, config: TcpTransportConfig,
         cutoff: Cutoff, unit: usize, waves: usize, intake_row_bytes: usize) -> Result<Self> {
         ensure!(std::ptr::eq(library_owner.as_ref(), stream.device.library),
             "Muse Spark library owner differs from the lane device");
         ensure!(cuteafd_core::expert_geometry() == cuteafd_core::ExpertGeometry::MUSE_SPARK,
             "Muse Spark path requires the process expert geometry before native loading");
-        ensure!((2..=MAX_RANKS).contains(&peers.len()), "Muse Spark serves 2..={MAX_RANKS} Spark ranks");
+        ensure!(world.is_none() || (1..=MAX_RANKS).contains(&peers.len()), "Muse Spark peer inventory");
         ensure!(intake_row_bytes % 16 == 0 && unit > 0, "Muse partial planes must keep 16-byte record bases");
         let library = library_owner.as_ref();
         let layout = CombineTables { capacity: unit };
@@ -100,19 +100,22 @@ impl<'a> MuseSparkPath<'a> {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse combine tables");
             Allocation::new(stream.device, layout.bytes() * waves)?
         };
-        let mut link = stream.device.run(|| SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config,
-            intake_row_bytes, waves, u32::try_from(unit)?))?;
-        // Ownership setup cannot queue work; failure here uses the ordinary empty-link drop.
-        stream.device.run(|| link.enable_terminal_ownership(Arc::clone(library_owner)))?;
-        let mut path = Self { stream, link: Some(link), library_owner: Arc::clone(library_owner), cutoff, tables, layout,
+        let link = world.map(|world| -> Result<_> {
+            let mut link = stream.device.run(|| SparkLink::new_waves(library, world, &peers,
+                u32::try_from(unit)?, config, intake_row_bytes, waves, u32::try_from(unit)?))?;
+            stream.device.run(|| link.enable_terminal_ownership(Arc::clone(library_owner)))?;
+            Ok(link)
+        }).transpose()?;
+        let mut path = Self { stream, link, library_owner: Arc::clone(library_owner), cutoff, tables, layout,
             unit, waves, sequence: 0, in_flight: VecDeque::new(), terminal: false };
         // Install the owner before any fallible bootstrap so errors use the
         // same checked quiesce/drain/release path as normal shutdown.
         path.stream.device.run(|| {
-            let link = path.link.as_mut().context("Muse Spark link absent")?;
-            ensure!(link.world_size() == peers.len(), "Muse Spark transport world differs from its peers");
-            link.bootstrap(&bootstrap_shape(unit, cutoff)?)?;
-            ensure!(link.installed_grouping()?.len() == peers.len(), "Muse bootstrap requires every rank's grouping");
+            if let Some(link) = &mut path.link {
+                ensure!(link.world_size() == peers.len(), "Muse Spark transport world differs from its peers");
+                link.bootstrap(&bootstrap_shape(unit, cutoff)?)?;
+                ensure!(link.installed_grouping()?.len() == peers.len(), "Muse bootstrap requires every rank's grouping");
+            }
             for slot in 0..waves {
                 let table = Self::slot_tables(&path.tables, layout, slot);
                 // SAFETY: a live admitted allocation on the lane's device and stream.
@@ -242,6 +245,14 @@ mod tests {
             let shape = bootstrap_shape(rows, cutoff)?;
             assert_eq!(shape.row_count as usize, rows);
             assert_eq!(shape.hidden_payload_bytes as usize, rows * WIRE_ROW_BYTES);
+            let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
+            let bytes = vec![0; layout.bytes];
+            let real = wave_request(3, 1, ExpertV2SourceKind::Prefill,
+                &[WaveSegment { request: 1, rows }], cutoff, layout.routes(&bytes)?,
+                bytes::Bytes::copy_from_slice(layout.wire(&bytes)?))?;
+            let real = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+            assert!(shape.request_wire_bytes >= real.request_wire_bytes);
+            assert!(shape.response_wire_bytes >= real.response_wire_bytes);
             let partial = wire_plan(&ReplyPlan::for_phase(cutoff, &[rows], true))?;
             assert_eq!(shape.response_wire_bytes,
                 cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + partial.payload(TOPK, WIDTH)?.3);

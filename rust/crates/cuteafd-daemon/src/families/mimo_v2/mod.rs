@@ -1465,8 +1465,12 @@ impl Opened {
         crate::shared::memory_report::release_load_staging(&self.library)?;
         // Decode keeps fixed graph-safe planes and the probed landing path;
         // only prefill owns overlapping waves and per-slot GPU landing planes.
-        let decode = link(0, 1, &decode_shape)?;
-        let prefill = link(1, lanes, &prefill_shape)?;
+        let mut decode = link(0, 1, &decode_shape)?;
+        let mut prefill = link(1, lanes, &prefill_shape)?;
+        let started = Instant::now();
+        decode.warm_experts(&decode_shape, moe_layers[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Decode)?;
+        prefill.warm_experts(&prefill_shape, moe_layers[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transports warm");
         tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
             prefill: std::cell::RefCell::new(prefill) }))

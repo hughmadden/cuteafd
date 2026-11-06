@@ -1980,6 +1980,8 @@ impl Opened {
                 .context("host embedding tensor missing")?.meta.byte_length
         } else { 0 };
         process.encoders = args.serving_encoder.iter().cloned().collect();
+        process.physical_sparks = process.encoders.iter().flat_map(|encoder| encoder.spark_ranks())
+            .max().map_or(0, |rank| rank + 1);
         process.media_cache_bytes = args.serving_media_bytes;
         process.serving(&inputs, host_config.as_ref().map_or(0, |c| c.bytes),
             host_config.as_ref().map_or(0, |c| c.chunk_bytes), host_embedding, 0)?;
@@ -2912,6 +2914,9 @@ impl Opened {
         transport.enable_terminal_ownership(self.library.clone())?;
         let shape = engine::spark_session_shape(&self.cfg, args.expert_rows(), self.checkpoint.spark_input_is_bf16())?;
         transport.bootstrap(&shape)?;
+        let started = Instant::now();
+        transport.warm_experts(&shape, selected[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }
 }

@@ -5247,8 +5247,8 @@ fn glm_flash_all_onboarded_preserves_tower_only_spark() {
             encoder.admitted_bytes());
         let options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
         let deployment = super::deployment::DeploymentSpec::from_report(&report, &options).unwrap();
-        assert_eq!((deployment.spark_ranks, deployment.spark_expert_world), (1, 0));
-        assert_eq!(deployment.spark_roles[0].rank, rank);
+        assert_eq!(deployment.spark_expert_world, 0);
+        assert_eq!(deployment.spark_roles.iter().map(|role| role.rank).collect::<Vec<_>>(), vec![rank]);
         assert!(!deployment.spark_roles[0].experts && deployment.peers.is_empty());
         assert_eq!(deployment.spark_roles[0].encoder.as_ref(), Some(encoder));
     }

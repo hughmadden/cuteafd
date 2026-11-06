@@ -11,6 +11,8 @@ pub struct ProcessOwners {
     pub links: Vec<PreparedSparkLink>,
     /// Physical media ranks remain available when their expert package is absent.
     pub remote_experts: bool,
+    /// Additional admitted media hosts, independent of expert peers.
+    pub physical_sparks: usize,
     pub native_load: Option<NativeLoad>,
     pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
@@ -181,7 +183,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, native_load: None, mount_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
             draft_push: None }
     }
@@ -444,6 +446,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     }
     let facts = facts(i).map_err(invalid)?;
     let gpus = i.gpus.len();
+    let physical_sparks = i.spark_ranks.max(process.physical_sparks);
+    if physical_sparks > 8 { return Err(invalid("Flash encoder Spark rank outside transport inventory")); }
     if i.max_context == 0 || i.spark_ranks > 8
         || i.graphs.ranks.iter().any(|rank| rank.margin > rank.bytes)
         || i.gpus.iter().any(|(total, baseline)| *total == 0
@@ -521,8 +525,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             let locations = match &encoder.kind {
                 EncoderKind::Off => vec![],
                 EncoderKind::Rtx { gpu } if *gpu < gpus => vec![p::Location::coordinator(*gpu as u8)],
-                EncoderKind::Spark { .. } if i.spark_ranks > 0 => {
-                    if encoder.spark_ranks().iter().any(|&rank| rank >= i.spark_ranks) {
+                EncoderKind::Spark { .. } => {
+                    if encoder.spark_ranks().iter().any(|&rank| rank >= physical_sparks) {
                         return Err(invalid("Flash encoder Spark rank absent"));
                     }
                     encoder.spark_ranks().into_iter().map(|rank| p::Location {
@@ -580,7 +584,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         physical_bytes: host.0, logical_bytes: host.0, headroom: process.host_headroom,
         baseline: p::Baseline::Sampled { free: host.1, phase: p::Phase::Load,
             source: "MemAvailable plus process anonymous RSS".into() } });
-    for rank in 0..i.spark_ranks {
+    for rank in 0..physical_sparks {
         budgets.push(p::Budget { id: format!("spark{rank}"), locations: vec![p::Location {
             device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }],
             physical_bytes: 121 << 30, logical_bytes: 121 << 30, headroom: 0,

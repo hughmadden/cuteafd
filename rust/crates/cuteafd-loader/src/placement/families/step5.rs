@@ -476,10 +476,18 @@ impl Recipe for Step5Recipe<'_> {
             });
             index
         });
-        contract.variables.push(Variable::ExpertHome {
-            layers: self.routes.clone(),
-            rank_sets: vec![(0..self.inputs.inventory.spark_ranks as u8).collect()],
-        });
+        if self.inputs.inventory.spark_ranks > 0 {
+            contract.variables.push(Variable::ExpertHome {
+                layers: self.routes.clone(),
+                rank_sets: vec![(0..self.inputs.inventory.spark_ranks as u8).collect()],
+            });
+        } else if let Some(variable) = onboard {
+            for option in 0..self.routes.len() {
+                contract.requires.push(Requires { when: Choice { variable, option }, any_of: vec![] });
+            }
+        } else {
+            return Err(Refusal::Unsupported);
+        }
         for demand in &self.figures.fixed {
             let location = Location::coordinator(demand.gpu);
             let owner = Allocation::buffer(

@@ -148,6 +148,7 @@ impl<'a> DeploymentSpec<'a> {
             experts: rank < ranks, layers: if rank < ranks { layers.clone() } else { Vec::new() },
             encoder: encoder_ranks.contains(&rank).then(|| report.encoder.clone()).flatten(),
             audio_encoder: audio_ranks.contains(&rank).then(|| report.audio_encoder.clone()).flatten(),
+            // Drafter placement is coordinator-only until a solved Spark owner exists.
             drafter: None,
         }).filter(|role| role.experts || role.encoder.is_some() || role.audio_encoder.is_some()
             || role.drafter.is_some()).collect::<Vec<_>>();

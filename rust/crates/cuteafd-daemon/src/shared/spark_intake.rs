@@ -982,6 +982,24 @@ impl StreamLibrary for NativeLibrary {
     }
 }
 
+fn warm_request(shape: &cuteafd_transport::SparkSessionShape, layer: usize, experts: usize,
+    kind: cuteafd_transport::ExpertV2SourceKind) -> Result<cuteafd_transport::ExpertProtocolV2Request> {
+    ensure!(experts > 0 && shape.row_count > 0 && shape.route_count % shape.row_count == 0,
+        "Spark warm-up expert geometry");
+    let topk = shape.route_count / shape.row_count;
+    let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, u32::try_from(layer)?,
+        shape.hidden_dim, shape.hidden_dtype,
+        (0..shape.row_count).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk, route_count: topk,
+        }).collect(),
+        (0..shape.route_count).map(|route| cuteafd_transport::ExpertProtocolV2RouteEntry {
+            row_index: route / topk, expert_id: (route as usize % experts) as u32, gate_weight: 0.0,
+        }).collect(), vec![0; usize::try_from(shape.hidden_payload_bytes)?])?;
+    request.header.flags = shape.flags;
+    Ok(request)
+}
+
 /// The temporary stream a start-up Spark transport warm-up receives its waves on. [`Self::finish`]
 /// drains and destroys it and returns either failure; any other way out (an early return or `?`)
 /// drops it, which drains and destroys it too and logs failures. Declare it after the transports
@@ -1620,6 +1638,18 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn world(&self) -> cuteafd_transport::expert::SparkWorld { self.world }
     /// The most rows any request on this link may carry.
     pub(crate) fn capacity(&self) -> u32 { self.capacity }
+    /// Execute a full-capacity wave only after the caller has solved remote ownership.
+    pub(crate) fn warm_experts(&mut self, shape: &cuteafd_transport::SparkSessionShape,
+        layer: usize, experts: usize, kind: cuteafd_transport::ExpertV2SourceKind) -> Result<()> {
+        let request = warm_request(shape, layer, experts, kind)?;
+        let stream = WarmStream::new(self.intake.library())?;
+        let exchange = self.exchange()?;
+        let payload = exchange.compact_payload(shape.row_count as usize);
+        let ticket = exchange.send_request(request, payload)?;
+        exchange.land_drained(ticket, stream.raw())?;
+        stream.finish()
+    }
+
     /// The intake planes' device (the reduce's GPU).
     pub(crate) fn device(&self) -> i32 { self.intake.device() }
 
@@ -2347,5 +2377,34 @@ mod tests {
         assert_eq!(choice(IntakeMode::Gpu).mode_for(4 * 4096 * 4096 * 2).0, IntakeMode::Gpu);
         assert_eq!(choice(IntakeMode::Gpu).mode_for(6 * 4096 * 7168 * 2).0, IntakeMode::Gpu);
         assert_eq!(choice(IntakeMode::Pinned).mode_for(1).0, IntakeMode::Pinned);
+    }
+}
+
+#[cfg(test)]
+mod session_capacity_tests {
+    use super::*;
+    use cuteafd_core::ExpertGeometry as G;
+    use cuteafd_transport::{ExpertV2Dtype, ExpertV2SourceKind, SparkSessionShape};
+
+    #[test]
+    fn every_family_session_covers_decode_and_widest_prefill_requests() -> Result<()> {
+        for geometry in [G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO, G::DEEPSEEK_V41,
+            G::GLM5, G::GLM5_FLASH, G::MIMO_V2_FLASH, G::QWEN4, G::KIMI_K3, G::STEP5] {
+            for rows in [64, 640, 2048, 2752, 4096] {
+                for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
+                    let mut session = SparkSessionShape::new(rows, geometry.hidden, geometry.topk, dtype)?;
+                    session.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                    for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                        let request = warm_request(&session, 24, geometry.experts as usize, kind)?;
+                        let actual = SparkSessionShape::from_request(&request)?;
+                        assert_eq!(actual.request_wire_bytes, session.request_wire_bytes);
+                        assert!(actual.response_wire_bytes <= session.response_wire_bytes);
+                        assert_eq!(request.header.layer_id, 24);
+                        assert_eq!(request.routes.len(), rows as usize * geometry.topk as usize);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

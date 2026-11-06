@@ -1647,6 +1647,14 @@ impl Opened {
             None => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        if let Some(&layer) = working.spark_layers.first() {
+            let started = Instant::now();
+            for (link, kind) in transport.iter_mut().map(|link| (link, cuteafd_transport::ExpertV2SourceKind::Decode))
+                .chain(prefill_link.iter_mut().map(|link| (link, cuteafd_transport::ExpertV2SourceKind::Prefill))) {
+                link.warm_experts(&session_shape(link.capacity() as usize)?, layer, self.cfg.experts, kind)?;
+            }
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transports warm");
+        }
         *engine.prefill_link.borrow_mut() = prefill_link;
         engine.prefill_runtime = Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?);
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;

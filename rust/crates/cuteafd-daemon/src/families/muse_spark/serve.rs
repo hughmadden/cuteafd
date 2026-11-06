@@ -102,7 +102,7 @@ impl ServeArgs {
         let distinct = self.peers.iter().collect::<std::collections::HashSet<_>>().len();
         // Every Spark world the shared package range data gives the checkpoint's width.
         let worlds = cuteafd_loader::plan::experts::spark_worlds(cuteafd_loader::plan::families::muse_spark::PACKAGE, 4096);
-        ensure!(worlds.contains(&self.peers.len()) && distinct == self.peers.len(),
+        ensure!((self.peers.is_empty() || worlds.contains(&self.peers.len())) && distinct == self.peers.len(),
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
         ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
@@ -205,9 +205,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
-    let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
+    let admission_plan = (!args.peers.is_empty()).then(|| crate::shared::placement::SparkAdmission::plan(&args.snapshot,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
-        spark.model.clone())?;
+        spark.model.clone())).transpose()?;
     let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
         .collect::<Vec<_>>();
     let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
@@ -235,7 +235,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let prepared = policy.plan(|| {
         let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
-        if admission_plan.coordinator_pushes() {
+        if admission_plan.as_ref().is_some_and(|plan| plan.coordinator_pushes()) {
             let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), gpus, experts, built.push.clone())?;
             Ok((push, Some((streams, ranks)), args.peers.len()))
         } else {
@@ -246,10 +246,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         Some((push, coordinator, sparks)) => (Some(push), coordinator, sparks),
         None => (None, None, 0),
     };
-    let admission = admission_plan.start_with(&args.peers, coordinator)?;
+    let admission = admission_plan.map(|plan| plan.start_with(&args.peers, coordinator)).transpose()?;
     let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
         .collect::<Result<Vec<_>>>()?;
-    let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
+    let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(admission, || {
         let load = || -> Result<_> {
             let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
                 crate::shared::memory::EmbedPlacement::Gpu, || {

@@ -561,7 +561,7 @@ pub(crate) fn with_engine<T>(
                     matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect(),
                 spark_ranks: peers.len(), prefill_lanes: 1,
             };
-            if !working.spark_layers.is_empty() { crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
+            if !peers.is_empty() { crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
                 peers.len(), None, admission::spark_model(
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
@@ -761,7 +761,13 @@ pub(crate) fn with_engine<T>(
         let identity = if !remote_experts { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
             &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, spark_world.context("worker identity needs a declared world")?)?) };
         let mut installed = None;
-        for transport in &mut transports {
+        for (index, transport) in transports.iter_mut().enumerate() {
+            let layer = placement.layers.iter().position(|home|
+                home.experts == cuteafd_loader::placement::ExpertHome::Spark).context("remote V4 layer")?;
+            let rows = if index == 0 { engine.decode_rows } else { engine.prefill_rows };
+            let kind = if index == 0 { cuteafd_transport::ExpertV2SourceKind::Decode }
+                else { cuteafd_transport::ExpertV2SourceKind::Prefill };
+            transport.warm_experts(&engine.session_shape(rows)?, layer, loaded.cfg.n_routed_experts, kind)?;
             let reports = transport.installed_grouping()?;
             for (rank, report) in reports.iter().enumerate() {
                 report.validate_for(identity.as_ref().context("Spark worker identity")?, rank,
@@ -771,7 +777,7 @@ pub(crate) fn with_engine<T>(
                 ensure!(previous == &reports, "Spark transports report different installed expert packages");
             } else { installed = Some(reports); }
         }
-        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+        if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
