@@ -156,7 +156,9 @@ mod tests {
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         let native_projections = projections.into_iter().filter(|(name, ..)|
             !name.ends_with(".self_attn.o_proj")).collect::<Vec<_>>();
-        let mut manifest = testing::exl3_manifest(&config["quantization_config"], &native_projections);
+        let mut native_quant = testing::exl3_compact(4);
+        native_quant.as_object_mut().unwrap().extend(config["quantization_config"].as_object().unwrap().clone());
+        let mut manifest = testing::exl3_manifest(&native_quant, &native_projections);
         manifest["attention_view"] = attention_view;
         manifest["native_attention"] = serde_json::Value::Object((0..62).map(|layer| {
             let module = format!("{PREFIX}{layer}.self_attn.o_proj");
