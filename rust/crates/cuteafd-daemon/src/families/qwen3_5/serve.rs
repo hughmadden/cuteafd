@@ -142,7 +142,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, _lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         ensure!(args.prefix_partial == Toggle::Off, "dense Qwen supports exact prefix frontiers only");
         let family = if let Some(mtp) = &self.mtp { DensePrefix::with_mtp(self.engine, mtp.clone())? }
             else { DensePrefix::with_draft(self.engine, self.drafter.clone())? };
@@ -150,7 +150,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let shape = self.geometry();
         let args = &args.with_scoring(if shape.full_prefill_logits { shape.prefill_rows } else { shape.decode_rows },
             shape.prefill_rows, shape.vocab_size)?;
-        let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
+        let host = self.engine.borrow().admitted_host_config.clone().map(|config|
             CudaCopyEngine::registered_retained(self.library, family.snapshot_owners(),
                 self.drafter.iter().cloned().map(|draft| draft as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>)
                     .chain(self.mtp.iter().cloned().map(|mtp| mtp as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>))
@@ -585,13 +585,17 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             let draft_config = engine_args.draft.as_ref().map(|snapshot| {
                 block_dspark::check_checkpoint(snapshot, header.config.hidden, header.config.vocab, header.config.attention.len())?;
                 let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-                super::engine::DrafterBytes::block_dspark(&config, lanes, library.sm_count()? as u64, header.config.max_context)
+                super::engine::DrafterBytes::block_dspark(snapshot, &config, lanes, library.sm_count()? as u64, header.config.max_context)
             }).transpose()?;
             ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
+            let startup_audit = crate::shared::inventory::startup_probe_enabled()
+                .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
-                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
+                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
+                Some((&engine_args.prefix, lanes,
+                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device)), false)?);
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
@@ -613,6 +617,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
+                    let history = startup_audit.map(|audit| audit.finish());
+                    crate::shared::inventory::startup_probe(&library, &[engine_args.device], "qwen3_5/ready",
+                        crate::shared::inventory::StartupEvidence { history: history.as_ref(), ..Default::default() })?;
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Ok(backend.geometry().max_context));
                     }
@@ -672,6 +679,52 @@ mod tests {
     }
 
     #[test]
+    fn explicit_plan_and_serve_host_quotas_have_identical_recipe_owners() -> Result<()> {
+        use cuteafd_loader::placement::{families::qwen3_5::{self, DenseFacts, NativeBuffers, NativeWeights},
+            planner::{self, Operation, Pin, PrefillShape, Request}};
+        use cuteafd_loader::families::{qwen::{GdnGeometry, GdnOutputGate, HybridAttention}, qwen3_5::Qwen35Config};
+        let cfg = Qwen35Config { hidden: 4096, intermediate: 12288, vocab: 64,
+            attention: vec![HybridAttention::Gdn, HybridAttention::Full], heads: 16, kv_heads: 4, head_dim: 256,
+            gdn: GdnGeometry { key_heads: 16, value_heads: 32, key_dim: 128, value_dim: 128,
+                conv_kernel: 4, output_gate: GdnOutputGate::Silu }, rope_dim: 64, rope_theta: 10000000.,
+            rms_norm_eps: 1e-6, max_context: 262144, mtp_layers: 0, tied_embeddings: false };
+        let buffers = NativeBuffers::new(&cfg, 1024, 4, 2, false)?;
+        let weights = NativeWeights { layers: vec![256; 2], norm: 256, head: 256, embedding: 256 };
+        let geometry = qwen3_5::host_prefix_geometry(&cfg, 4096, buffers.mark_bytes as u64);
+        let memory = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        for value in ["auto", "0", "1GiB"] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/model", "--host-cache-bytes", value])?;
+            let crate::cli::Commands::Plan(plan) = cli.command else { unreachable!() };
+            let serve = Cli::try_parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib.so",
+                "--host-cache-bytes", value])?.serve;
+            assert_eq!(plan.host_cache_bytes, serve.prefix.host_cache_bytes);
+            let live = serve.prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
+                page_rows: 64, pages: 4096, page_bytes: geometry.page_bytes as usize,
+                mark_bytes: buffers.mark_bytes, draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+                mark_store: Default::default(), page_owners: Default::default() }, cfg.max_context, 4)?;
+            let quota = if value == "0" { 0 } else { geometry.resolve(
+                if value == "auto" { None } else { Some(plan.host_cache_bytes.explicit_bytes()) },
+                cfg.max_context as u64, 4, memory.0, geometry.chunk_bytes()).unwrap() };
+            let owner = planner::serving::HostPrefixOwners { quota_bytes: quota,
+                chunk_bytes: geometry.chunk_bytes().min(quota) };
+            assert_eq!(live.as_ref().map_or(0, |c| c.bytes), owner.quota_bytes);
+            assert_eq!(live.as_ref().map_or(0, |c| c.chunk_bytes), owner.chunk_bytes);
+            let admitted = qwen3_5::admit(Request { context: cfg.max_context as u64,
+                pool: Pin::Exact(cfg.max_context as u64), onboard: Pin::Auto,
+                prefill: Pin::Exact(PrefillShape { rows: 4096, waves: 1 }), operation: Operation::Serving,
+                resident_weight_limit: None, spark_reply_formats: Default::default() },
+                qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
+                    96 << 30, 0, (128 << 30, 128 << 30))?,
+                DenseFacts { cfg: &cfg, weights: &weights, buffers: &buffers, slots: 4,
+                    record_bytes: 4096, drafter: None, serving: None, host_prefix: owner, verify_check: false })?;
+            let pinned: u64 = admitted.facts.allocations.iter().filter(|a| a.id.starts_with("host.prefix."))
+                .map(|a| a.bytes).sum();
+            assert_eq!(pinned, if quota == 0 { 0 } else { quota / owner.chunk_bytes * owner.chunk_bytes });
+        }
+        Ok(())
+    }
+
+    #[test]
     fn dense_anchor_enables_drafting_after_prefill_or_restore() {
         use scheduler::DraftState as _;
         let mut state = DraftState::default();
@@ -695,12 +748,12 @@ mod tests {
         let cfg = Qwen35Config::read(&snapshot)?;
         let checkpoint = Checkpoint::open(&snapshot)?;
         let config = serde_json::from_slice(&std::fs::read(draft_snapshot.join("config.json"))?)?;
-        let bytes = super::super::engine::DrafterBytes::block_dspark(&config, 4,
+        let bytes = super::super::engine::DrafterBytes::block_dspark(&draft_snapshot, &config, 4,
             library.sm_count()? as u64, cfg.max_context)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let draft = {
             let target = engine.borrow();
             let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
@@ -732,7 +785,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(admission.bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);
         let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
         let mut backend = DenseBackend::new(&engine, &library);

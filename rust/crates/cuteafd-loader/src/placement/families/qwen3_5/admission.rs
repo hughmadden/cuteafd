@@ -19,18 +19,10 @@ pub struct ServingFacts {
 
 impl ServingFacts {
     fn allocations(self, vocab: usize) -> Result<Vec<Allocation>, Refusal> {
-        serving::ServingOwners {
-            selector: serving::SelectorOwners {
-                location: Location::coordinator(0),
-                capacity: self.capacity as usize,
-                vocab,
-                device_sampling: self.device_sampling,
-            },
-            // Dense Qwen has no host-retained prefix tier yet; its retained
-            // marks are device owners below.
-            prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 },
-        }
-        .allocations()
+        serving::SelectorOwners {
+            location: Location::coordinator(0), capacity: self.capacity as usize,
+            vocab, device_sampling: self.device_sampling,
+        }.allocations("selector", serving::ServingOwners::LIFETIME)
     }
 }
 
@@ -43,6 +35,9 @@ pub struct DenseFacts<'a> {
     pub record_bytes: u64,
     pub drafter: Option<DrafterBytes>,
     pub serving: Option<ServingFacts>,
+    pub host_prefix: serving::HostPrefixOwners,
+    /// Diagnostic resets retain one ordered-upload buffer per GDN state region.
+    pub verify_check: bool,
 }
 
 /// Offline forecast: the physical card class supplies the CUDA context and
@@ -135,6 +130,18 @@ impl Recipe for DenseFacts<'_> {
             contract.set_byte_extent("draft.kv",
                 ByteCurve::linear(draft.pool_unit, draft.pool_unit, maximum))?;
         }
+        if self.drafter.is_some() {
+            let home = contract.variables.len();
+            contract.variables.push(Variable::DraftHome(vec![0]));
+            for component in &mut contract.components {
+                let draft = match &component.kind {
+                    ComponentKind::Allocation { template, .. } => template.id.starts_with("draft."),
+                    ComponentKind::ResidentWeight(owner) => owner.id.starts_with("draft."),
+                    _ => false,
+                };
+                if draft { component.activation = Activation::choice(home, 0); }
+            }
+        }
         Ok(contract)
     }
 }
@@ -212,6 +219,16 @@ impl DenseFacts<'_> {
                 add(id.into(), gpu, bytes.max(256), Lifetime::TARGET, category, group);
             }
         }
+        if self.verify_check {
+            for ordinal in 0..layers {
+                for slot in 0..self.slots {
+                    for (region, bytes) in [("conv", conv_slot), ("state", state_slot)] {
+                        add(format!("gdn.{region}.{ordinal}.slot.{slot}.upload"), Location::PINNED,
+                            bytes, Lifetime::TARGET, Category::Staging, "diagnostic GDN reset staging");
+                    }
+                }
+            }
+        }
         for (layer, kind) in self.cfg.attention.iter().enumerate() {
             if *kind == HybridAttention::Full {
                 add(format!("kv.{layer}"), gpu, pages.checked_mul(PAGE_ROWS)
@@ -222,6 +239,9 @@ impl DenseFacts<'_> {
         }
         if let Some(draft) = self.drafter {
             let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            add("draft.prefetch".into(), Location::HOST, draft.host_prefetch,
+                Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
+                "drafter prefetched checkpoint tensors");
             if draft.weights.0 > 0 {
                 resident_weights.push(ResidentWeight { id: "draft.weights".into(), location: gpu,
                     weights: draft.weights });
@@ -266,6 +286,7 @@ impl DenseFacts<'_> {
         if let Some(serving) = self.serving {
             allocations.extend(serving.allocations(self.cfg.vocab)?);
         }
+        allocations.extend(self.host_prefix.allocations("host.prefix", serving::ServingOwners::LIFETIME)?);
         // One ownerless allowance remains from the old recipe: CUDA/driver
         // growth beyond the named workspaces. It is an explicit estimate.
         let mut allowances = vec![
@@ -278,12 +299,6 @@ impl DenseFacts<'_> {
                 source: "estimated: one packed operand read and Vec capacity; read_exact_at, no shard buffer".into(),
                 assumed: true },
         ];
-        if self.drafter.is_some() {
-            allowances.push(Allowance { location: Location::HOST, bytes: step,
-                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
-                source: "estimated: one drafter tensor read and Vec capacity; ordinary Rust heap".into(),
-                assumed: true });
-        }
         allowances.retain(|allowance| allowance.bytes > 0);
         Ok(Facts { resident_weights, phase_order: PhaseOrder::TARGET_THEN_DRAFT, allocations,
             deferred: vec![], sequential: vec![], reservations: vec![], allowances })

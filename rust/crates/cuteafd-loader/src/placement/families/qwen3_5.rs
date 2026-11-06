@@ -22,6 +22,8 @@ pub struct DrafterBytes {
     pub scratch: u64,
     /// Full-context draft K/V per target pool page, not per sequence/context.
     pub pool_unit: u64,
+    /// All wanted checkpoint tensors coexist in the prefetch HashMap at DraftLoad.
+    pub host_prefetch: u64,
 }
 
 impl DrafterBytes {
@@ -68,10 +70,10 @@ impl DrafterBytes {
         // The independent greedy selector owns one ID/status/log-probability row.
         owned += 12;
         let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
-        Ok(Self { owned, weights, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
+        Ok(Self { owned, weights, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64, host_prefetch: 0 })
     }
 
-    pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
+    pub fn block_dspark(snapshot: &std::path::Path, config: &serde_json::Value, slots: usize, sms: u64, context: usize)
         -> anyhow::Result<Self> {
         use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
         use crate::families::qwen4::Qwen4KvCache;
@@ -80,9 +82,21 @@ impl DrafterBytes {
         let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
         let residency = block_dspark_paged_resident_bytes(config, slots, slots, sms,
             GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        let host_prefetch = crate::read_safetensors_metadata(&snapshot.join("model.safetensors"))?.iter()
+            .filter(|tensor| tensor.name != "embed_tokens.weight" && tensor.name != "lm_head.weight")
+            .try_fold(0u64, |bytes, tensor| bytes.checked_add(tensor.byte_length))
+            .ok_or_else(|| anyhow::anyhow!("drafter prefetch bytes overflow"))?;
         Ok(Self { owned: residency.owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
-            weights: residency.weights, scratch: residency.scratch, pool_unit: layout.full_bytes })
+            weights: residency.weights, scratch: residency.scratch, pool_unit: layout.full_bytes, host_prefetch })
     }
+}
+
+/// Geometry shared by offline admission and the live exact-prefix adapter.
+pub fn host_prefix_geometry(cfg: &Qwen35Config, record_bytes: u64, mark_bytes: u64)
+    -> cuteafd_core::prefix::HostCacheGeometry {
+    let full = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Full).count() as u64;
+    cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE_ROWS,
+        page_bytes: PAGE_ROWS * full * record_bytes, mark_bytes, draft_bytes: 0 }
 }
 
 pub const PREFILL_ROWS: usize = 4096;

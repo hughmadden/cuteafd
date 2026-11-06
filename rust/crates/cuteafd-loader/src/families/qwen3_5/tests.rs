@@ -122,6 +122,11 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         "enable_confidence_head":true,"confidence_head_with_markov":true,
         "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
     std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"), &[
+        t("fc.weight", "BF16", &[4096, 4096]),
+        t("embed_tokens.weight", "BF16", &[64, 4096]),
+        t("lm_head.weight", "BF16", &[64, 4096]),
+    ]);
     for c in [17, 32, 33, 64] {
         let layout = options.layout.as_mut().unwrap();
         layout.concurrency = c;
@@ -531,4 +536,26 @@ fn native_compact_admission_keeps_fixed_slots_and_spends_half_the_pool_bytes() {
     let after = memories[1].get(&Category::Kv).copied().unwrap();
     // Fixture has one GQA layer; the actual 9B checkpoint has eight.
     assert_eq!(before - after, 2_097_152 * (4096 - 2080));
+}
+
+#[test]
+fn host_prefix_recipe_uses_the_live_geometry_and_explicit_quota() {
+    use crate::placement::{families::qwen3_5::host_prefix_geometry, planner::Phase};
+    let (dir, mut options, buffers, _) = native_planner_fixture();
+    let cfg = Qwen35Config::from_hf(&config(4096, 12288, 16, 32, 4)).unwrap();
+    let geometry = host_prefix_geometry(&cfg, 4096, buffers.mark_bytes as u64);
+    for quota in [Some(0), Some(1 << 30), None] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.host_cache_bytes = quota;
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits, "{:?}", report.hints);
+        let expected = if quota == Some(0) { 0 } else {
+            geometry.resolve(quota, cfg.max_context as u64, 4, 128 << 30,
+                geometry.chunk_bytes()).unwrap()
+        };
+        assert_eq!(report.host_budget_bytes, expected);
+        let ledger = report.phase_ledger.unwrap();
+        let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
+        assert!(ready.owned >= expected);
+    }
 }

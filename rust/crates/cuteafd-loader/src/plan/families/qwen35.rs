@@ -181,7 +181,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         let draft = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config)?;
         ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
             "dense dSpark checkpoint differs from target geometry");
-        qwen3_5::DrafterBytes::block_dspark(&config, slots, sms as u64, cfg.max_context)
+        qwen3_5::DrafterBytes::block_dspark(snapshot, &config, slots, sms as u64, cfg.max_context)
     }).transpose()?;
     let drafter = if options.dense_qwen_mtp {
         Some(qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
@@ -204,16 +204,23 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         spark_reply_formats: options.spark_reply_formats,
     };
     let record_bytes = options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
+    let geometry = qwen3_5::host_prefix_geometry(cfg, record_bytes, mark as u64);
+    let chunk = geometry.chunk_bytes();
+    let quota = if options.prefix_entries("qwen3_5") == 0 || options.host_cache_bytes == Some(0) { 0 }
+        else { geometry.resolve(options.host_cache_bytes, cfg.max_context as u64,
+            options.resolved_concurrency("qwen3_5"), host.0, chunk)
+            .context("dense host prefix quota")? };
     let facts = DenseFacts { cfg, weights: &weights, buffers: &buffers, slots, record_bytes, drafter,
         // The shared scheduler's one selector holds `decode_rows` rows and
         // selects on the device by default.
-        serving: Some(ServingFacts { capacity: qwen3_5::VERIFY_ROWS as u32, device_sampling: true }) };
+        serving: Some(ServingFacts { capacity: qwen3_5::VERIFY_ROWS as u32, device_sampling: true }),
+        host_prefix: crate::placement::planner::serving::HostPrefixOwners {
+            quota_bytes: quota, chunk_bytes: chunk.min(quota) }, verify_check: false };
     let plan = qwen3_5::admit(request, budgets, facts)?;
     let pool_tokens = plan.pool_tokens;
     let items = plan.items(Location::coordinator(0))?;
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&plan));
-    // No host-retained prefix tier: the exact marks live in the device arena.
-    report.host_budget_bytes = 0;
+    report.host_budget_bytes = quota;
     let mut notes = vec![
         format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv),
         format!("shared planner: pool {pool_tokens} tokens ({} pages of {} rows), {} prefill row unit, {} lanes, {} resident weight bytes, {} physical owners", 

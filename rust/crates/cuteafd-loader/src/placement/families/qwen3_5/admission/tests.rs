@@ -25,7 +25,8 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers)
     -> DenseFacts<'a> {
-    DenseFacts { cfg, weights, buffers, slots: 4, record_bytes: 4096, drafter: None, serving: None }
+    DenseFacts { cfg, weights, buffers, slots: 4, record_bytes: 4096, drafter: None, serving: None,
+        host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
 }
 
 #[test]
@@ -73,7 +74,7 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
 #[test]
 fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     let (cfg, weights, buffers) = fixture();
-    let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024), scratch: 512, pool_unit: 4096 };
+    let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000 };
     let mut input = facts(&cfg, &weights, &buffers);
     input.drafter = Some(drafter);
     let contract = input.prepare(&request()).unwrap();
@@ -82,6 +83,10 @@ fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     let pages = plan.pool_tokens / PAGE_ROWS;
     let owner = |id: &str| plan.facts.allocations.iter().find(|owner| owner.id == id).unwrap();
     assert_eq!(owner("draft.kv").bytes, pages * 4096);
+    assert_eq!(plan.decisions.draft_home, Some(0));
+    assert_eq!(owner("draft.prefetch").bytes, 2_720_000_000);
+    assert_eq!(owner("draft.prefetch").location, Location::HOST);
+    assert_eq!(owner("draft.prefetch").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad });
     assert_eq!(owner("draft.weights").bytes, 1024);
     assert_eq!(owner("draft.runtime").bytes, owned_rest());
     assert_eq!(owner("draft.scratch").bytes, 512);
@@ -274,4 +279,28 @@ fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
     // Phase evaluation reconciles against the sample, never a second solve.
     let row = planner::evaluate(&plan.facts, &plan.budgets).unwrap();
     assert_eq!(row, plan.phases);
+}
+
+#[test]
+fn host_chunks_and_diagnostic_staging_are_physical_owners_not_allowances() {
+    let (cfg, weights, buffers) = fixture();
+    let mut input = facts(&cfg, &weights, &buffers);
+    input.host_prefix = serving::HostPrefixOwners { quota_bytes: (1 << 30) + 17, chunk_bytes: 256 << 20 };
+    input.verify_check = true;
+    let plan = admit(request(), budgets(), input).unwrap();
+    let owners = &plan.facts.allocations;
+    let chunks: Vec<_> = owners.iter().filter(|owner| owner.id.starts_with("host.prefix.")).collect();
+    assert_eq!(chunks.len(), 4);
+    assert!(chunks.iter().all(|owner| owner.location == Location::PINNED && owner.bytes == 256 << 20));
+    let reset: u64 = owners.iter().filter(|owner| owner.group == "diagnostic GDN reset staging")
+        .map(|owner| owner.bytes).sum();
+    let gdn = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count();
+    assert_eq!(reset, (buffers.state_per_layer * input.slots * gdn) as u64);
+    assert!(!owners.iter().any(|owner| owner.id.starts_with("selector")));
+    input.host_prefix.quota_bytes = 0;
+    input.host_prefix.chunk_bytes = 0;
+    input.verify_check = false;
+    let plain = admit(request(), budgets(), input).unwrap();
+    assert!(!plain.facts.allocations.iter().any(|owner|
+        owner.id.starts_with("host.prefix.") || owner.group == "diagnostic GDN reset staging"));
 }
