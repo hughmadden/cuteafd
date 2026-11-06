@@ -90,7 +90,8 @@ impl Model {
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         let mut complete = checkpoint.missing_shards.is_empty();
         for (name, expected) in &tensors {
-            if core.get_weight(name).is_some() { continue; }
+            if core.get_weight(name).is_some()
+                || core.native.contains_key(name.strip_suffix(".weight").unwrap_or(name)) { continue; }
             let Some(meta) = headers.get(name.as_str()) else {
                 ensure!(checkpoint.contains_tensor(name), "Muse Spark checkpoint lacks {name}");
                 complete = false;
@@ -265,6 +266,15 @@ impl FamilyModel for Model {
             // Report the logical extent; the head's stored N128 padding stays the loader's.
             operand.logical = projection.shape.to_vec();
             return Ok(());
+        }
+        if let Some(projection) = self.core.native.get(stem) {
+            return super::require(operand.logical == projection.shape
+                && (operand.is_plain(&[format::Encoding::Bf16])
+                    || operand.is_fp8_block(128, &[format::ScaleEncoding::F32]))
+                && operand.input_scale.is_none() && operand.global_scale.is_none()
+                && operand.companions.is_empty(), ||
+                format!("{stem}: expected selected native BF16 or E4M3/F32 block128 {:?}, found {}",
+                    projection.shape, super::describe(operand)));
         }
         if role.component == Component::RoutedExpert && role.expert.is_some() {
             let expected = match super::leaf(stem) {

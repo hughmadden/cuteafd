@@ -35,6 +35,7 @@ pub(crate) struct Measured {
 pub(crate) struct Options<'a> {
     pub cfg: &'a MuseSparkConfig,
     pub core: &'a CoreInventory,
+    pub projections: Vec<cuteafd_loader::families::muse_spark::weight_layout::RankProjections>,
     pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
     pub manifest: &'a serde_json::Value,
     pub measured: Vec<Measured>,
@@ -65,10 +66,13 @@ pub(crate) struct Options<'a> {
 pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let gpus = options.measured.len();
     shared::executor(gpus)?;
+    ensure!(options.projections.len() == gpus, "Muse native projection rank count differs from samples");
     let programs = ProgramSet::from_manifest(options.manifest, shared::program_families(gpus));
     let mut fixed = Vec::with_capacity(gpus);
     let mut budgets = Vec::with_capacity(gpus + options.spark_ranks);
     for (rank, sample) in options.measured.iter().enumerate() {
+        let mut programs = programs.clone();
+        options.projections[rank].include_native_programs(&mut programs);
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", sample.total_bytes);
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2,
             rank as u8, arch, Some(&programs));
@@ -82,7 +86,8 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let maximum_pool_tokens = shared::maximum_pool_tokens(&capacities, context, options.pool_tokens);
     let media = options.media.unwrap_or(shared::MediaOptions { vision: cuteafd_loader::plan::MediaMode::Off,
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
-    let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, catalog: options.catalog,
+    let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, projections: options.projections,
+        catalog: options.catalog,
         budgets, host: options.host, prefill: options.prefill, full_prefill_logits: options.full_prefill_logits, slots: options.slots,
         mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
@@ -196,6 +201,8 @@ mod tests {
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &preflight(&path, gpus)?,
+                projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
+                    gpus, prefill.unit_rows as usize)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
                 full_prefill_logits: opts.full_prefill_logits,
@@ -274,6 +281,8 @@ mod tests {
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &inventory,
+                projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
+                    gpus, prefill.unit_rows as usize)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
                 full_prefill_logits: opts.full_prefill_logits,
@@ -321,6 +330,8 @@ mod tests {
                     reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                     media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                     manifest: &inventory,
+                projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
+                    gpus, prefill.unit_rows as usize)?,
                     measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
                     full_prefill_logits: opts.full_prefill_logits,
@@ -396,6 +407,8 @@ mod tests {
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
             manifest: &preflight(&path, gpus)?,
+                projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
+                    gpus, prefill.unit_rows as usize)?,
             measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
             full_prefill_logits: opts.full_prefill_logits,

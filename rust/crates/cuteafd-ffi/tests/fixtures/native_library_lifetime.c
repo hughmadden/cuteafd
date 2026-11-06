@@ -18,6 +18,18 @@ void fixture_quiet_events(int quiet) { quiet_events = quiet; }
 static int pack_status, drain_status, drain_calls, drain_after;
 /* Per thread, as CUDA's current device: two GPU loader threads bind their own. */
 static _Thread_local int current_device;
+static int strict_device_free, free_owner = -1, free_current = -1;
+static size_t device_free_mismatches;
+void fixture_strict_device_free(int enabled) {
+    strict_device_free = enabled;
+    device_free_mismatches = 0;
+    free_owner = free_current = -1;
+}
+size_t fixture_device_free_mismatch(int *owner, int *current) {
+    *owner = free_owner;
+    *current = free_current;
+    return device_free_mismatches;
+}
 static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
@@ -337,6 +349,12 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
 }
 
 int cuteafd_free_device_buffer(struct device_buffer *buffer) {
+    if (strict_device_free && buffer->ptr && buffer->device_id != current_device) {
+        ++device_free_mismatches;
+        free_owner = buffer->device_id;
+        free_current = current_device;
+        return 1;
+    }
     event('d');
     if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
     if (extent_only && buffer->flags == 1) {

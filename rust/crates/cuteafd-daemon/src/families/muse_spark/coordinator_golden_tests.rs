@@ -103,6 +103,9 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         host: shared::HostInput { total: host_total, available: host_available, reserve: 8 << 30,
             prefix_bytes: Some(0), prefix_entries: 0, media_bytes: Some(0), device_sampling: true },
         cfg: &cfg, core: &core,
+        projections: cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
+            &cfg, &core, GPUS, usize::try_from(prefill.unit_rows)?,
+            Some(&cuteafd_loader::placement::inventory::ProgramsManifest::from_manifest(&manifest)?))?,
         catalog: &catalog, manifest: &manifest, measured, headroom_bytes: 2 << 30, spark_ranks: SPARKS,
         prefill, full_prefill_logits: false, slots: SEQUENCES as u64,
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,
@@ -111,7 +114,8 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         partial_reply_formats: Default::default(),
         local: shared::local_workspace(&catalog, Some(&manifest_path), GPUS, prefill.unit_rows)?,
-        drafter, media: Some(super::media::inventory(&snapshot, MediaMode::Off, MediaMode::Off, 1)?) })?;
+        drafter, media: Some(super::media::inventory(checkpoint.view.as_ref()
+            .context("Muse push dump requires its selected checkpoint view")?, MediaMode::Off, MediaMode::Off, 1)?) })?;
     let placement = &built.placement;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,

@@ -4,7 +4,7 @@
 //! require must equal the one admission charged
 //! (`weight_layout::projections`), or startup refuses before allocating it.
 use crate::shared::{dense_trellis::{CoreWeights, Projection, ProjectionLayout, ProjectionScratch},
-    memory::device::Device};
+    memory::device::{Allocation, Device}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{dense_trellis::TrellisDType, programs::Programs, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::families::muse_spark::weight_layout::{projection_key, ProjectionKey, ProjectionOutput,
@@ -15,6 +15,80 @@ pub(crate) struct CorePrograms<'a> {
     exact_cap: usize,
     projections: BTreeMap<(ProjectionKey, ProjectionOutput), Projection<'a>>,
     pub(crate) scratch: Option<ProjectionScratch<'a>>,
+    native: NativePrograms<'a>,
+}
+
+struct NativePrograms<'a> {
+    bf16: cuteafd_ffi::draft_projection::DraftProjections<'a>,
+    bf16_f32: cuteafd_ffi::draft_projection::DraftProjections<'a>,
+    fp8: Option<cuteafd_ffi::native_attention::Fp8Projections<'a>>,
+    fp8_f32: Option<cuteafd_ffi::native_attention::Fp8Projections<'a>>,
+    scratch: Option<Allocation<'a>>,
+    rows: usize,
+}
+
+impl<'a> NativePrograms<'a> {
+    fn load(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections) -> Result<Self> {
+        use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput as Output};
+        use cuteafd_ffi::native_attention::Fp8Projections;
+        use cuteafd_loader::placement::planner::native_attention::NativeResolution;
+        ensure!(admitted.native.is_empty() || admitted.native_programs.resolution == NativeResolution::Exact,
+            "Muse runtime requires exact native export admission");
+        let shapes = |fp8, output| admitted.native.iter().filter(|request|
+            request.layout.fp8 == fp8 && request.output == output)
+            .map(|request| (request.layout.shape[1], request.layout.shape[0]))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let rows = admitted.native_rows;
+        let bf16 = device.run(|| Ok(DraftProjections::load_with_output(programs,
+            &shapes(false, ProjectionOutput::Bf16), rows, Output::Bf16)?))?;
+        let bf16_f32 = device.run(|| Ok(DraftProjections::load_with_output(programs,
+            &shapes(false, ProjectionOutput::F32), rows, Output::F32)?))?;
+        let mut required = 0usize;
+        let mut load_fp8 = |output, dtype| -> Result<Option<Fp8Projections<'a>>> {
+            let shapes = shapes(true, output);
+            if shapes.is_empty() { return Ok(None); }
+            let registry = device.run(|| Ok(Fp8Projections::load(programs, &shapes, rows, dtype)?))?;
+            for (k, n) in shapes { required = required.max(registry.scratch_bytes(k, n)?); }
+            Ok(Some(registry))
+        };
+        let fp8 = load_fp8(ProjectionOutput::Bf16, Output::Bf16)?;
+        let fp8_f32 = load_fp8(ProjectionOutput::F32, Output::F32)?;
+        ensure!(u64::try_from(required)? == admitted.native_programs.fp8_scratch_bytes,
+            "Muse native scratch differs from exact admission");
+        let scratch = if required == 0 { None } else { Some(Allocation::new(device, required)?) };
+        Ok(Self { bf16, bf16_f32, fp8, fp8_f32, scratch, rows })
+    }
+
+    fn launch(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
+        output: Buffer, stream: *mut c_void) -> Result<()> {
+        use cuteafd_ffi::draft_projection::ProjectionOutput as Output;
+        use cuteafd_loader::formats::trellis_core::CoreSplit;
+        let dtype = if weight.layout.ranks > 1 && weight.layout.split == CoreSplit::Input {
+            Output::F32
+        } else { Output::Bf16 };
+        let [n, k] = weight.layout.shape;
+        let bytes = rows.checked_mul(k).and_then(|bytes| bytes.checked_mul(2))
+            .context("Muse native input extent overflow")?;
+        ensure!(rows > 0 && rows <= self.rows && input.bytes >= bytes
+            && input.device_id == output.device_id && weight.values.buffer.device_id == output.device_id,
+            "Muse native projection exceeds admitted rows/buffers or device differs");
+        if weight.layout.fp8 {
+            let registry = match dtype { Output::Bf16 => &self.fp8, Output::F32 => &self.fp8_f32 }
+                .as_ref().context("Muse native FP8 output registry absent")?;
+            let scales = weight.scales.as_ref().context("Muse native FP8 scales absent")?.buffer;
+            let scratch = self.scratch.as_ref().context("Muse native FP8 scratch absent")?.buffer;
+            ensure!(scales.device_id == output.device_id, "Muse native scales device differs");
+            // SAFETY: admitted resident weights and lane-private buffers survive queued stream work.
+            unsafe { registry.launch(input.ptr, weight.values.buffer.ptr, scales.ptr,
+                output, scratch, rows, k, n, stream)?; }
+        } else {
+            ensure!(weight.scales.is_none(), "Muse native BF16 projection has unexpected scales");
+            let registry = match dtype { Output::Bf16 => &self.bf16, Output::F32 => &self.bf16_f32 };
+            // SAFETY: admitted resident weights and lane buffers survive queued stream work; output is checked.
+            unsafe { registry.launch_checked(input.ptr, weight.values.buffer.ptr, output, rows, k, n, stream)?; }
+        }
+        Ok(())
+    }
 }
 
 fn dtype(output: ProjectionOutput) -> TrellisDType {
@@ -73,11 +147,19 @@ impl<'a> CorePrograms<'a> {
                 let policy = projection.program.policy();
                 [&policy.native_input, &policy.native, &policy.output_program].into_iter()
                     .map(|name| (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))
-            }), usize::MAX)?;
-        Ok(Self { projections, scratch, exact_cap })
+            }).chain(admitted.native_programs.programs.iter().map(|name|
+                (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))),
+            admitted.native_rows)?;
+        let native = NativePrograms::load(programs, device, admitted)?;
+        Ok(Self { projections, scratch, exact_cap, native })
     }
 
     pub(crate) fn packed_cap(&self) -> usize { self.exact_cap }
+
+    pub(crate) fn native(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
+        output: Buffer, stream: *mut c_void) -> Result<()> {
+        self.native.launch(rows, input, weight, output, stream)
+    }
 
     fn projection(&self, weights: &CoreWeights<'_>, output: ProjectionOutput) -> Result<&Projection<'a>> {
         let key = projection_key(&cuteafd_loader::formats::trellis_core::CoreWeightLayout {
@@ -127,6 +209,92 @@ impl<'a> CorePrograms<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_registries_preserve_output_stage_rows_and_exact_scratch() -> Result<()> {
+        use cuteafd_ffi::{draft_projection::ProjectionOutput as Output, native_library_lifetime_fixture::Fixture};
+        use cuteafd_loader::{families::muse_spark::{core::NativeLayout, weight_layout::NativeRequest},
+            formats::trellis_core::CoreSplit, placement::inventory::ProgramsManifest};
+        use cuteafd_loader::placement::planner::native_attention::{NativeProgram, NativePrograms as Resolved};
+        use serde_json::json;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let mut entries = Vec::new();
+        for output in [Output::Bf16, Output::F32] {
+            entries.push(json!({"name":output.program_name(128,128),"capacity_rows":4096,
+                "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],"scalars":[{"type":"int32"}],
+                "scratch_bytes_at_capacity":{},"geometry":{"width":128,"outputs":128,
+                    "output_dtype":output.torch_dtype(),"reduction":"ordered_k16","tiles_by_rows":[[1,16,32,2]],
+                    "exact_row_cap":4096}}));
+            for stage in [64, 4096] {
+                let suffix = if output == Output::F32 { "_f32" } else { "" };
+                entries.push(json!({"name":format!("native_attention_n128_k128_m{stage}{suffix}"),
+                    "capacity_rows":stage,"pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},
+                        {"name":"out"},{"name":"scratch"}],"scalars":[{"type":"int32"}],
+                    "scratch_bytes_at_capacity":{"scratch":if output == Output::F32 {2048} else {512}},
+                    "geometry":{"input_features":128,"output_features":128,"output_dtype":output.torch_dtype(),
+                        "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                        "reduction":"canonical_fp8_gemv64_w8a16","exact_row_cap":stage}}));
+            }
+        }
+        fixture.register_programs(&library, &entries)?;
+        for index in 0..entries.len() { fixture.register_reply(&library, index as u32, 7, b'P')?; }
+        let manifest = json!({"programs":entries});
+        let path = tempfile::tempdir()?;
+        let file = path.path().join("PROGRAMS.json");
+        std::fs::write(&file, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&file)?;
+        let typed = ProgramsManifest::from_manifest(&manifest)?;
+        let device = Device { library: &library, id: 1 };
+        for ceiling in [64, 2752] {
+            let owners = [false, true].into_iter().flat_map(|fp8| [ProjectionOutput::Bf16, ProjectionOutput::F32]
+                .into_iter().map(move |output| NativeRequest {
+                    layout: NativeLayout { stem: format!("{fp8}-{output:?}"), shape: [128,128], fp8,
+                        rank: 1, ranks: 2, split: if output == ProjectionOutput::F32 { CoreSplit::Input }
+                            else { CoreSplit::Output } }, output })).collect::<Vec<_>>();
+            let requests = owners.iter().map(|owner| NativeProgram { layout: &owner.layout,
+                output: if owner.output == ProjectionOutput::F32 { Output::F32 } else { Output::Bf16 } })
+                .collect::<Vec<_>>();
+            let mut admitted = RankProjections { programs: Default::default(), scratch: None,
+                native_rows: ceiling, native_programs: Resolved::resolve(&requests, ceiling, Some(&typed))?,
+                native: owners.clone() };
+            let registry = NativePrograms::load(&programs, device, &admitted)?;
+            assert_eq!(registry.scratch.as_ref().unwrap().buffer.bytes, 2048);
+            for owner in &owners {
+                let weight = device.own(|| {
+                    use crate::shared::{memory::DeviceAllocation, native_attention::NativeAttentionWeights};
+                    Ok(NativeAttentionWeights { layout: owner.layout.clone(),
+                        values: DeviceAllocation::new(&library, 128 * 128 * if owner.layout.fp8 {1} else {2})?,
+                        scales: owner.layout.fp8.then(|| DeviceAllocation::new(&library, 4)).transpose()? })
+                })?;
+                let input = Allocation::new(device, (ceiling + 1) * 128 * 2)?;
+                device.run(|| library.copy_h2d(input.buffer, &7u32.to_ne_bytes()))?;
+                let output_bytes = if owner.output == ProjectionOutput::F32 {4} else {2};
+                let output = Allocation::new(device, (ceiling + 1) * 128 * output_bytes)?;
+                let before = fixture.events()?.bytes().filter(|&event| event == b'P').count();
+                for rows in [1, 4, 64, ceiling] {
+                    device.run(|| registry.launch(rows, input.buffer, &weight, output.buffer, std::ptr::null_mut()))?;
+                }
+                assert_eq!(fixture.events()?.bytes().filter(|&event| event == b'P').count(), before + 4);
+                assert!(registry.launch(ceiling + 1, input.buffer, &weight, output.buffer, std::ptr::null_mut()).is_err());
+                assert!(registry.launch(1, input.buffer, &weight, Buffer { bytes: 128 * output_bytes - 1,
+                    ..output.buffer }, std::ptr::null_mut()).is_err());
+                assert!(registry.launch(1, input.buffer, &weight, Buffer { device_id: 0,
+                    ..output.buffer }, std::ptr::null_mut()).is_err());
+                assert_eq!(fixture.events()?.bytes().filter(|&event| event == b'P').count(), before + 4);
+            }
+            library.cuda_set_device(0)?;
+            drop(registry);
+            admitted.native_programs.fp8_scratch_bytes += 256;
+            assert!(NativePrograms::load(&programs, device, &admitted).is_err());
+            admitted.native_programs = Resolved::resolve(&requests, ceiling, None)?;
+            assert!(NativePrograms::load(&programs, device, &admitted).is_err());
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
 
     #[test]
     fn tp2_package_admission_preserves_f32_until_post_egress_narrowing() -> Result<()> {

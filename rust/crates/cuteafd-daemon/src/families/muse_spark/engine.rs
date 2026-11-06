@@ -119,6 +119,14 @@ impl<'a> RankResources<'a> {
         let ranks = built.layouts.first().map_or(0, Vec::len);
         ensure!(rank < ranks && placement.items.len() == ranks, "Muse rank {rank} of {ranks} placement ranks");
         let library = device.library;
+        let actual_core = cuteafd_loader::families::muse_spark::core::CoreInventory::from_checkpoint(cfg, checkpoint)?;
+        let actual_native = (0..cfg.layers).map(|layer|
+            cuteafd_loader::families::muse_spark::weight_layout::LayerLayout::ranks(cfg, layer, ranks, &actual_core))
+            .collect::<Result<Vec<_>>>()?.into_iter().flat_map(|layouts| layouts[rank].native.values()
+                .cloned().map(cuteafd_loader::families::muse_spark::weight_layout::NativeRequest::new)
+                .collect::<Vec<_>>()).collect::<Vec<_>>();
+        built.projections.get(rank).context("Muse rank projections")?
+            .validate_native_owners(&actual_native, unit_rows)?;
         // Programs before any allocation: a missing export refuses here.
         let bound = device.run(|| RankPrograms::bind(programs, ranks))?;
         let core = CorePrograms::load(programs, device, built.projections.get(rank).context("Muse rank projections")?)?;
@@ -133,8 +141,7 @@ impl<'a> RankResources<'a> {
             Ok(Tp2Ops { add: library.f32_add()?, narrow: library.f32_bf16_narrow()? })
         }).transpose()?;
         let step = StepStorage::allocate(device, tables)?;
-        let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg,
-            &cuteafd_loader::families::muse_spark::core::CoreInventory::from_checkpoint(cfg, checkpoint)?)?;
+        let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &actual_core)?;
         let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks)?;
         let head = match &globals.head {
             Some(weights) => {

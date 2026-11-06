@@ -173,6 +173,9 @@ impl RankDevice<'_, '_> {
         if let Some(core) = weights.core(name) {
             return self.core.local(rows, input, core, output, self.stream);
         }
+        if let Some(native) = weights.native(name) {
+            return self.core.native(rows, input, native, output, self.stream);
+        }
         // BF16 checkpoint projections (gate_proj): the exported BF16 projection.
         ensure!(name == "attn.gate", "Muse BF16 projection {name} has no program");
         // SAFETY: lane planes and resident weights are live and sized by admission.
@@ -266,7 +269,11 @@ impl RankDevice<'_, '_> {
             (1, Some(core)) => self.core.local(rows, gated, core, attended, self.stream),
             (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended,
                 peer.context("Muse TP2 o_proj needs the peer exchange")?),
-            _ => anyhow::bail!("Muse o_proj must be a K6 core projection"),
+            (1, None) => self.project(layer, "attn.o", rows, gated, attended),
+            (2, None) => self.native_k_split(rows, gated,
+                weights.native("attn.o").context("Muse TP2 o_proj owner absent")?, attended,
+                peer.context("Muse native TP2 o_proj needs the peer exchange")?),
+            _ => anyhow::bail!("Muse attention needs one or two coordinator ranks"),
         }
     }
 
@@ -296,6 +303,25 @@ impl RankDevice<'_, '_> {
         // post-egress value is narrowed, never either rank's partial sum.
         self.core.reduced(&ops.add, rows, rank0, rank1, self.lane.rows("o_reduced", rows)?, core, local, self.stream)?;
         crate::shared::dense_trellis::retain_partial(&ops.narrow, local, output, rows * self.cfg.hidden, self.stream)
+    }
+
+    fn native_k_split(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
+        output: Buffer, peer: &mut dyn PeerExchange) -> Result<()> {
+        use cuteafd_loader::formats::trellis_core::CoreSplit;
+        ensure!(weight.layout.ranks == 2 && weight.layout.rank == self.rank
+            && weight.layout.split == CoreSplit::Input && weight.layout.shape[0] == self.cfg.hidden,
+            "Muse native TP2 o_proj differs from admitted input split");
+        let ops = self.tp2.context("Muse native TP2 needs F32 add/narrow helpers")?;
+        let local = self.lane.rows("o_core", rows)?;
+        self.core.native(rows, input, weight, local, self.stream)?;
+        let received = peer.swap(Channel::Attention, local)?;
+        let (rank0, rank1) = if self.rank == 0 { (local, received) } else { (received, local) };
+        let reduced = self.lane.rows("o_reduced", rows)?;
+        let count = rows.checked_mul(self.cfg.hidden).context("Muse native TP2 reduction extent")?;
+        // SAFETY: peer completion orders the received F32 rows; lane owners survive all queued work.
+        unsafe { ops.add.launch(rank0, rank1, reduced, count, self.stream)?; }
+        // Native partials are unrotated: no K6 H128 egress belongs between add and narrow.
+        crate::shared::dense_trellis::retain_partial(&ops.narrow, reduced, output, count, self.stream)
     }
 
     /// `rows` rows of `width` bytes from `source` (pitch `source_pitch`) into

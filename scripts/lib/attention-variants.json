@@ -4,5 +4,5 @@
   "mistral_large4": false,
   "kimi_k3": false,
   "step5": false,
-  "muse_spark": false
+  "muse_spark": true
 }
