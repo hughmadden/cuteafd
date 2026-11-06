@@ -364,10 +364,13 @@ mod tests {
         }
         let mode = MediaMode::Spark(Some(2));
         let endpoints = "127.0.0.1:1234,127.0.0.2:1234";
-        let args = parse(mode, Some("2,5"), endpoints);
-        assert_eq!(RemoteVision::from_args(&args).unwrap().unwrap().placement(mode).unwrap(),
-            (EncoderKind::Spark { rank: 2 }, vec![5]));
-        for ranks in ["2", "2,2", "2,8", "5,2", "2,no"] {
+        for replica in [0, 5] {
+            let ranks = format!("2,{replica}");
+            let args = parse(mode, Some(&ranks), endpoints);
+            assert_eq!(RemoteVision::from_args(&args).unwrap().unwrap().placement(mode).unwrap(),
+                (EncoderKind::Spark { rank: 2 }, vec![replica]));
+        }
+        for ranks in ["2", "2,2", "2,8", "0,2", "5,2", "2,no"] {
             assert!(RemoteVision::from_args(&parse(mode, Some(ranks), endpoints)).is_err(), "{ranks}");
         }
         assert!(RemoteVision::from_args(&parse(mode, None, endpoints)).unwrap().unwrap().placement(mode).is_err());
