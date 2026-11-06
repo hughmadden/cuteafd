@@ -1155,6 +1155,17 @@ def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
 
 
+def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                          programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Flash's local/Spark layouts through its actual launcher and contract."""
+    _, deployment = _capture_real_planner_launch(snapshot, example, binary, programs, hf_home,
+        temporary, "test/glmf-real-plan", "glm5_flash")
+    local = deployment["spark_ranks"] == 0
+    assert deployment["prefill_unit_rows"] == (4096 if local else 2752), deployment
+    assert deployment["prefill_waves"] == (1 if local else 3), deployment
+    assert deployment["report"]["phase_ledger"], deployment
+
+
 def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                      programs: Path, hf_home: Path, temporary: Path) -> None:
     """Muse's shipped min/max configs through the real launcher and contract."""
