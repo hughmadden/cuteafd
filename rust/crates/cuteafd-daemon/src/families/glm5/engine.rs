@@ -228,6 +228,7 @@ impl<'a> Buf<'a> {
 /// the GPU's one stream, and no hook reads that storage after it returns.
 #[derive(Clone)]
 struct Workspace<'a> {
+    usage_rows: Option<Buf<'a>>,
     rows: usize,
     lane: usize,
     h: Buf<'a>,
@@ -293,6 +294,36 @@ fn decode_graph_eligible(decode: bool, logit_rows: usize, hooked: bool,
     decode && logit_rows > 0 && !hooked && complete && !pending_media
 }
 
+fn usage_lookup() -> Vec<i32> {
+    use cuteafd_loader::placement::families::glm5::USAGE_MAX_ROWS;
+    [false, true].into_iter().flat_map(|decode| (0..=USAGE_MAX_ROWS).flat_map(move |rows| {
+        if decode { [0, rows as i32] } else { [rows as i32, 0] }
+    })).collect()
+}
+
+fn usage_lookup_offset(decode: bool, rows: usize) -> Result<usize> {
+    use cuteafd_loader::placement::families::glm5::USAGE_MAX_ROWS;
+    ensure!(rows <= USAGE_MAX_ROWS, "GLM usage rows exceed the admitted unit");
+    Ok((usize::from(decode) * (USAGE_MAX_ROWS + 1) + rows) * 8)
+}
+
+/// # Safety
+/// Canonical IDs/row metadata and stream remain live through counter graph retirement.
+unsafe fn record_glm_routes(usage: Option<&cuteafd_ffi::expert_usage::ExpertUsage<'_>>,
+    device: i32, rank: usize, index: usize, ids: *const c_void, rows: usize,
+    real_rows: Option<*const i32>, stream: *mut c_void) -> Result<()> {
+    if rank != 0 { return Ok(()); }
+    let Some(usage) = usage else { return Ok(()); };
+    let real_rows = real_rows.context("GLM canonical usage metadata missing")?;
+    for (phase, offset) in [(cuteafd_ffi::expert_usage::UsagePhase::Prefill, 0),
+        (cuteafd_ffi::expert_usage::UsagePhase::Decode, 1)] {
+        // SAFETY: the replay metadata holds both phase counts; only one is nonzero.
+        unsafe { usage.routes(device, index, phase)?.record(ids, rows, Some(real_rows.add(offset)),
+            u32::MAX, true, stream)?; }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod media_unit_tests {
     #[test]
@@ -354,6 +385,7 @@ struct StepRows<'a> {
     select: Buf<'a>,
     payload: Option<Buf<'a>>,
     page_tables: Vec<Buf<'a>>,
+    usage_rows: Vec<Buf<'a>>,
     core_rows: Option<[Buf<'a>; 3]>,
 }
 
@@ -368,7 +400,7 @@ impl<'a> StepRows<'a> {
             if width == 0 { return Ok(self.arenas[index].clone()); }
             self.arenas[index].view(first * width, rows * width)
         };
-        Ok(Workspace { rows, lane, h: field(0)?, x: field(1)?, query: field(2)?, q_resid: field(3)?, q_fp8: field(4)?,
+        Ok(Workspace { usage_rows: self.usage_rows.get(lane).cloned(), rows, lane, h: field(0)?, x: field(1)?, query: field(2)?, q_resid: field(3)?, q_fp8: field(4)?,
             head_weights: field(5)?, indices: field(6)?, lengths: field(7)?, attn: field(8)?, delta: field(9)?,
             positions: field(10)?, slots: field(11)?, page_table, cache_lengths: field(12)?,
             scratch: shared.scratch.clone(), topk_scratch: shared.topk_scratch.clone(), logits: self.logits.clone(),
@@ -545,6 +577,9 @@ pub(crate) struct GlmEngine<'a> {
     /// routes and routed+shared output of the steps it verifies.
     pub(crate) width_taps: RefCell<Option<Vec<WidthTap>>>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    pub(super) expert_usage: Option<cuteafd_ffi::expert_usage::ExpertUsage<'a>>,
+    usage_lookup: Option<HostAllocation<'a>>,
+    pub(super) usage_active: Cell<bool>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
     graph_misses: Cell<u64>,
@@ -698,7 +733,32 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+    }
+
+    pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
+        reader: cuteafd_core::expert_usage::Reader) -> Result<()> {
+        let Some(geometry) = geometry else { return Ok(()); };
+        self.expert_usage = Some(cuteafd_ffi::expert_usage::ExpertUsage::new(self.library, geometry,
+            &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: self.device }], reader)?);
+        let _owner = cuteafd_ffi::memory_ledger::owner("glm.usage.lookup");
+        let lookup = HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES)?;
+        // SAFETY: fresh pinned owner is private; all later readers see immutable row pairs.
+        unsafe { std::ptr::copy_nonoverlapping(usage_lookup().as_ptr(), lookup.buffer.ptr.cast(),
+            cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES / 4); }
+        self.usage_lookup = Some(lookup);
+        Ok(())
+    }
+
+    fn put_usage_rows(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        let (Some(destination), Some(source)) = (&w.usage_rows, &self.usage_lookup) else { return Ok(()); };
+        let rows = if self.usage_active.get() && !self.graphs_warming.get() { tables.exchange_rows } else { 0 };
+        let offset = usage_lookup_offset(tables.decode, rows)?;
+        let source = cuteafd_ffi::CuteafdHostBuffer { ptr: source.buffer.ptr.cast::<u8>().wrapping_add(offset).cast(),
+            bytes: 8, ..source.buffer };
+        // SAFETY: immutable pinned lookup and workspace outlive the stream; outside capture.
+        // No staging reuse fence, event synchronization, or new graph capture is needed.
+        unsafe { self.library.copy_host_buffer_h2d_async(destination.buffer, source, 8, self.stream) }
     }
 
     pub(crate) fn bind_core(&mut self, admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>) -> Result<()> {
@@ -964,7 +1024,7 @@ impl<'a> GlmEngine<'a> {
         self.on(rank, || {
             let shared = self.shared_here(rank, t, decode)?;
             let rows = self.rows_here(rank, t, if decode || self.full_prefill_logits { t } else { t.min(DECODE_ROWS) },
-                if decode { t * self.pages * 4 } else { self.pages * 4 })?;
+                if decode { t * self.pages * 4 } else { self.pages * 4 }, decode)?;
             rows.view(&shared, 0, 0, t, rows.page_tables[0].clone())
         })
     }
@@ -1053,11 +1113,11 @@ impl<'a> GlmEngine<'a> {
     /// Rank `rank`'s row arenas of `rows` rows on the current device (the
     /// planner's `step_row_widths` order), `logits` logits rows, and `tables`
     /// page-table bytes for each of `slots` slots.
-    fn rows_here(&self, rank: usize, rows: usize, logits: usize, tables: usize) -> Result<StepRows<'a>> {
-        self.rows_slots_here(rank, rows, logits, tables, 1)
+    fn rows_here(&self, rank: usize, rows: usize, logits: usize, tables: usize, decode: bool) -> Result<StepRows<'a>> {
+        self.rows_slots_here(rank, rows, logits, tables, 1, decode)
     }
 
-    fn rows_slots_here(&self, rank: usize, rows: usize, logits: usize, tables: usize, slots: usize)
+    fn rows_slots_here(&self, rank: usize, rows: usize, logits: usize, tables: usize, slots: usize, decode: bool)
         -> Result<StepRows<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let lead = rank == 0;
@@ -1077,6 +1137,15 @@ impl<'a> GlmEngine<'a> {
             select: Buf::owned(self.alloc(rows * 8)?),
             payload: self.tp2.as_ref().map(|tp2| self.alloc(tp2.combine.payload_bytes(rows, self.cfg.hidden))
                 .map(Buf::owned)).transpose()?,
+            usage_rows: if lead && self.expert_usage.is_some() {
+                (0..slots).map(|slot| {
+                    let kind = if decode { "decode" } else { "prefill" };
+                    let _owner = cuteafd_ffi::memory_ledger::owner(&format!("glm.usage.{kind}.{slot}"));
+                    let buffer = self.alloc(8)?;
+                    self.library.cuda_zero_bytes(buffer.buffer, buffer.buffer.bytes)?;
+                    Ok(Buf::owned(buffer))
+                }).collect::<Result<_>>()?
+            } else { vec![] },
             page_tables: (0..slots).map(|_| self.alloc(tables).map(Buf::owned)).collect::<Result<_>>()?,
             core_rows: if self.core_programs.get(rank).is_some_and(Option::is_some) {
                 // Attention/down retain BF16; their ordered sum remains F32.
@@ -1108,7 +1177,7 @@ impl<'a> GlmEngine<'a> {
         let reserve = cuteafd_loader::placement::families::glm5::prefill_span(unit as u64, slots as u64) as usize;
         let shared = self.shared_here(rank, unit, false)?;
         let logits = if self.full_prefill_logits { unit } else { unit.min(DECODE_ROWS) };
-        let arenas = self.rows_slots_here(rank, reserve, logits, self.pages * 4, slots)?;
+        let arenas = self.rows_slots_here(rank, reserve, logits, self.pages * 4, slots, false)?;
         let views = cuteafd_loader::placement::families::glm5::slot_views(unit as u64, slots as u64).into_iter()
             .enumerate().map(|(slot, rows)| arenas.view(&shared, slot, rows.start as usize,
                 (rows.end - rows.start) as usize, arenas.page_tables[slot].clone()))
@@ -1543,10 +1612,10 @@ impl<'a> GlmEngine<'a> {
                     self.publish_projection(0, index, 0, w, layer, "down", t)?;
                 }
             } else if self.local_layer(index) {
-                self.moe_front(w, layer, t)?;
+                self.moe_front(index, w, layer, t)?;
                 self.local_ffn(index, 0, w, w1, t, cap)?;
             } else if let Some(skip) = &self.skip {
-                self.moe_front(w, layer, t)?;
+                self.moe_front(index, w, layer, t)?;
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
                 self.reduce(skip.pointers(), w, ranks, t)?;
             } else {
@@ -1653,6 +1722,7 @@ impl<'a> GlmEngine<'a> {
             // The whole buffer: its ordered staging is sized once, never regrown mid-call.
             self.on(rank, || unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, stream) })
         };
+        if rank == 0 { self.put_usage_rows(w, tables)?; }
         put(&w.positions, bytes_of(&tables.positions))?;
         put(&w.slots, bytes_of(&tables.slots))?;
         put(&w.page_table, bytes_of(&tables.page_table))?;
@@ -1662,6 +1732,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Writes a step's tables into `w` (rank 0's).
     fn put_tables(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        self.put_usage_rows(w, tables)?;
         self.put(&w.positions, &tables.positions)?;
         self.put(&w.slots, &tables.slots)?;
         self.put(&w.page_table, &tables.page_table)?;
@@ -1886,7 +1957,7 @@ impl<'a> GlmEngine<'a> {
                     }
                     Ok(())
                 } else {
-                    self.moe_front(w, layer, t)
+                    self.moe_front(index, w, layer, t)
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
@@ -2100,7 +2171,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut SparkLink<'_>) -> Result<()> {
-        self.moe_front(w, layer, t)?;
+        self.moe_front(index, w, layer, t)?;
         let waves = transport.exchange()?;
         let slot = self.moe_exchange(w, index, layer, t, cap, decode, waves)?;
         // SAFETY: the wave landed on this stream; shared and delta are live workspace views.
@@ -2108,11 +2179,11 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
-    fn moe_front(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
-        self.moe_front_on(0, w, layer, t)
+    fn moe_front(&self, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
+        self.moe_front_on(0, index, w, layer, t)
     }
 
-    fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
+    fn moe_front_on(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
         let ml4 = self.cfg.variant.ml4().is_some();
@@ -2135,6 +2206,9 @@ impl<'a> GlmEngine<'a> {
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
         }
+        // SAFETY: selector produced all t top-k IDs; workspace retains replay row metadata.
+        unsafe { record_glm_routes(self.expert_usage.as_ref(), self.device, rank, index,
+            w.route_ids.buffer.ptr, t, w.usage_rows.as_ref().map(|b| b.buffer.ptr.cast::<i32>().cast_const()), self.stream_of(rank))?; }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input())
             && !self.whole.as_ref().is_some_and(|owner| owner.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
@@ -2484,7 +2558,7 @@ impl<'a> GlmEngine<'a> {
                 }
                 Ok(())
             } else {
-                self.moe_front(w, layer, counts[unit])
+                self.moe_front(index, w, layer, counts[unit])
             }
         };
         // h += ffn (routed partials reduced first); x = the next input norm.
@@ -3293,7 +3367,7 @@ impl Drop for GlmEngine<'_> {
             || self.drafter.as_ref().is_some_and(|drafter| drafter.is_remote()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
-        if !self.native_experts.is_empty() {
+        if !self.native_experts.is_empty() || self.expert_usage.is_some() {
             // SAFETY: native shared execution and workspace owners remain live until this drain.
             crate::shared::decode_graph::fatal_drain(unsafe {
                 self.library.cuda_stream_synchronize(self.stream)
@@ -3597,3 +3671,7 @@ mod decode_extent_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "engine/usage_tests.rs"]
+mod usage_tests;

@@ -30,6 +30,12 @@ pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillAc
 pub(crate) struct EngineArgs {
     #[command(flatten)]
     pub(crate) attention: crate::cli::AttentionArgs,
+    /// Count executed expert routes; --expert-usage=false disables telemetry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Shared GQA drafter-ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -655,6 +661,24 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn expert_usage_defaults_on_and_explicit_off_or_skip_disables() {
+        for (flag, requested) in [(None, true), (Some("--expert-usage"), true),
+            (Some("--expert-usage=true"), true), (Some("--expert-usage=false"), false)] {
+            for skip in [false, true] {
+                let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native"];
+                argv.extend(flag);
+                if skip { argv.push("--skip-routed-experts"); }
+                let args = Parse::try_parse_from(argv).unwrap().engine;
+                assert_eq!(args.expert_usage, requested);
+                assert_eq!(args.expert_usage_reader.configure(args.expert_usage,
+                    args.skip_routed_experts).unwrap(), requested && !skip);
+            }
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--expert-usage=invalid"]).is_err());
+    }
+
+    #[test]
     fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
         let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
             .unwrap().engine;
@@ -900,6 +924,8 @@ impl Opened {
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>) -> Result<T> {
         let ResolvedEngineArgs { args, automatic_context } = resolved;
         let automatic_context = *automatic_context;
+        let expert_usage = args.expert_usage_reader.configure(args.expert_usage, args.skip_routed_experts)
+            .map_err(anyhow::Error::msg)?;
         let native = self.native;
         let dense_catalog = &self.catalog;
         ensure!(!args.skip_routed_experts || args.peers.is_none(),
@@ -1216,7 +1242,7 @@ impl Opened {
         let request = production_request(args.max_context as u64, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-        let admitted = ProductionInput { cfg: &self.cfg, layers, context: args.max_context as u64,
+        let admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
             maximum_pool_tokens, attention, gpus: devices.len(), prefill, target,
             draft: draft_facts.clone().with_window_marks(mark_bytes.checked_mul(args.draft_window_marks)
                 .context("GLM draft marks overflow")? as u64),
@@ -1550,6 +1576,7 @@ impl Opened {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
+        engine.initialize_usage(admitted.expert_usage.clone(), args.expert_usage_reader.clone())?;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.admitted_host_config = host_config;
         engine.exlr8_prefill_activations = args.exlr8_prefill_activations;
@@ -1687,6 +1714,7 @@ impl Opened {
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
+        engine.usage_active.set(true);
         let result = body(&engine, transport.as_mut(), &runtime);
         // Non-serving commands do not pass schedule's readiness boundary.
         drop(self.startup_audit.borrow_mut().take());

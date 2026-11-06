@@ -136,10 +136,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     }
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let profile = ModelProfile::new(
+    let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         chat_encoding(&snapshot, args.thinking_off)?,
     );
+    profile.expert_usage = args.engine.expert_usage_reader.clone();
     let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

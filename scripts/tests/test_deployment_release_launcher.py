@@ -103,7 +103,7 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
-            if entry["family"] in {"deepseek_v4", "mimo_v2", "kimi_k3"}:
+            if entry["family"] in {"deepseek_v4", "mimo_v2", "kimi_k3", "glm5"}:
                 # Telemetry defaults on in adapted families; historical captures
                 # predate it. This is the first family-specific serve argument.
                 position = before["command"].index("--embedding-placement") + 2

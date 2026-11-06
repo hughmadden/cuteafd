@@ -22,6 +22,26 @@ pub const DECODE_ROWS: u64 = 64;
 pub const DEFAULT_PREFILL_LANES: u64 = 3;
 pub const SKIP_RANKS: usize = 4;
 
+/// Immutable phase/row pairs avoid pinned-source reuse and host synchronization.
+pub const USAGE_MAX_ROWS: usize = 4096;
+pub const USAGE_LOOKUP_BYTES: usize = 2 * (USAGE_MAX_ROWS + 1) * 8;
+
+pub fn usage_metadata_components(waves: u64, maximum: u64)
+    -> Result<Vec<planner::Component>, planner::Refusal> {
+    use planner::*;
+    if !(1..=4).contains(&waves) { return Err(Refusal::InvalidFact("GLM usage waves".into())); }
+    let mut owners = vec![Allocation::buffer("glm.usage.lookup", Location::PINNED,
+        USAGE_LOOKUP_BYTES as u64, Lifetime::TARGET, Category::Staging, "expert usage replay metadata")];
+    for (kind, slots) in [("decode", 1), ("prefill", waves)] {
+        for slot in 0..slots {
+            owners.push(Allocation::buffer(format!("glm.usage.{kind}.{slot}"), Location::coordinator(0),
+                256, Lifetime::TARGET, Category::Workspace, "expert usage replay metadata"));
+        }
+    }
+    Ok(owners.into_iter().map(|owner| { let bytes = owner.bytes;
+        Component::allocation(owner, ByteCurve::fixed(bytes, maximum), false, maximum) }).collect())
+}
+
 const FLOOR: u64 = 256;
 const GIB: u64 = 1 << 30;
 

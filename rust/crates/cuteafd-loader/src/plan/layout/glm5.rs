@@ -574,7 +574,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         options.headroom_bytes, host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
-    let mut prepared = ProductionInput { cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
+    let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus, prefill, target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
         exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
@@ -704,7 +704,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
-    let admitted = ProductionInput { cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
+    let admitted = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus: gpu_count, prefill, target, draft, scratch, context_scratch: context_programs,
         exchange_element_bytes: if glm::local_exchange_f32()? { 4 } else { 2 }, peer_diagnostics: false,
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
