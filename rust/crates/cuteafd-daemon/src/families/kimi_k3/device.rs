@@ -2318,7 +2318,7 @@ mod tests {
         use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
         let cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let stem="language_model.lm_head".to_owned();
-        let core=CoreInventory{projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
+        let core=CoreInventory { native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
             codebook:Exl3Codebook::Mcg,shape:[cfg.vocab_size,cfg.hidden],stored_outputs:cfg.vocab_size,
             source_bytes:0,split:CoreSplit::Whole})])};
         for rows in [1,8,64,4096] {
@@ -2337,7 +2337,7 @@ mod tests {
         use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let stem = "language_model.lm_head".to_owned();
-        let core = CoreInventory { projections: BTreeMap::from([(stem.clone(), CoreProjection {
+        let core = CoreInventory { native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
             stem, bits: 6, codebook: Exl3Codebook::Mcg, shape: [cfg.vocab_size, cfg.hidden],
             stored_outputs: cfg.vocab_size, source_bytes: 0, split: CoreSplit::Whole })]) };
         for rows in [1, 64, 8256] {

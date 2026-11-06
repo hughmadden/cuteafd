@@ -261,8 +261,33 @@ impl<'a> KimiRecords<'_, 'a> {
             KimiAttention::Kda => self.kda(devices, layer, layouts, &mut ops, &mut core)?,
             KimiAttention::Mla => self.mla(devices, layer, layouts, &shares, &mut ops, &mut core)?,
         }
-        let weights = ops.into_iter().zip(core).zip(shares).map(|((operands, core), attention)|
-            LayerWeights { operands, attention, core }).collect::<Vec<_>>();
+        let native = layouts.iter().zip(devices).map(|(layout, &device)| {
+            layout.native.iter().map(|(&name, layout)| {
+                use crate::families::glm5_flash::weights::{attention_records, AttentionRecord, NativeAttention};
+                use crate::shared::memory::DeviceAllocation;
+                let selected = self.checkpoint.projection(&layout.stem)?;
+                let [n, k] = layout.shape;
+                let (values, scales) = device.run(|| Ok((
+                    DeviceAllocation::new(device.library, (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?,
+                    if layout.fp8 { Some(DeviceAllocation::new(device.library, (n / 128 * (k / 128) * 4).max(256))?) } else { None },
+                )))?;
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.attention_mode(),
+                    layout, crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
+                    scales.as_ref().map(|scales| scales.buffer))?;
+                let stream = self.streams.iter().find(|(id, _)| *id == device.id)
+                    .context("Kimi native attention load stream")?.1;
+                for record in records {
+                    match record {
+                        AttentionRecord::Operand(record) => self.dense.operand(record)?,
+                        AttentionRecord::Step(record) => self.dense.step(record, stream)?,
+                    }
+                }
+                Ok((name, NativeAttention { layout: layout.clone(), values, scales }))
+            }).collect::<Result<BTreeMap<_, _>>>()
+        }).collect::<Result<Vec<_>>>()?;
+        let weights = ops.into_iter().zip(core).zip(shares).zip(native)
+            .map(|(((operands, core), attention), native)| LayerWeights { operands, attention, core, native })
+            .collect::<Vec<_>>();
         for (layout, weights) in layouts.iter().zip(&weights) { layout.check_owned(weights)?; }
         Ok(weights)
     }
@@ -277,7 +302,7 @@ impl<'a> KimiRecords<'_, 'a> {
                 let layout = layouts[owner].core.get(name).context("Kimi K6 owner layout")?;
                 core[owner].insert(name, self.core(devices[owner], layout)?);
             }
-        } else {
+        } else if !layouts[owners[0]].native.contains_key(name) {
             for (index, &owner) in owners.iter().enumerate() {
                 ops[owner].insert(name, self.bf16_share(devices[owner], &format!("{stem}.weight"), shape, side,
                     owners.len(), index)?);
@@ -447,7 +472,8 @@ impl LayerLayout {
     /// Recorded owners match the admitted extents exactly (as `check` does for packed bytes).
     fn check_owned(&self, weights: &LayerWeights<'_>) -> Result<()> {
         ensure!(self.attention == weights.attention && self.operands.len() == weights.operands.len()
-            && self.core.len() == weights.core.len(), "Kimi recorded operand inventory differs from admission");
+            && self.core.len() == weights.core.len() && self.native.len() == weights.native.len(),
+            "Kimi recorded operand inventory differs from admission");
         for (name, bytes) in &self.operands {
             ensure!(weights.operands.get(name).is_some_and(|a| a.buffer.bytes == *bytes),
                 "Kimi recorded operand {name} differs from admission");
@@ -457,6 +483,12 @@ impl LayerLayout {
             ensure!(owned.shape == layout.shape && owned.side == layout.side && owned.codebook == layout.codebook
                 && owned.payload.buffer.bytes + owned.suh.buffer.bytes + owned.svh.buffer.bytes == layout.bytes,
                 "Kimi recorded K6 operand {name} differs from admission");
+        }
+        for (name, layout) in &self.native {
+            let owned = weights.native.get(name).context("Kimi recorded native operand absent")?;
+            ensure!(owned.layout == *layout
+                && (owned.values.buffer.bytes + owned.scales.as_ref().map_or(0, |s| s.buffer.bytes)) as u64 == layout.bytes()?,
+                "Kimi recorded native operand {name} differs from admission");
         }
         Ok(())
     }
